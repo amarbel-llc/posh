@@ -15,12 +15,11 @@
 #
 # Install and/or configure the system used to provide dependencies.
 #
-install()
-{
-    # Straight from https://brew.sh
-    if ! brew --version > /dev/null 2>&1; then
-	/usr/bin/ruby -e "$(curl -fsSL https://raw.githubusercontent.com/Homebrew/install/master/install)"
-    fi
+install() {
+  # Straight from https://brew.sh
+  if ! brew --version >/dev/null 2>&1; then
+    /usr/bin/ruby -e "$(curl -fsSL https://raw.githubusercontent.com/Homebrew/install/master/install)"
+  fi
 }
 
 #
@@ -29,13 +28,12 @@ install()
 # dependencies for the build system, support for things like previous
 # OS versions and fat binaries is not needed.
 #
-deps()
-{
-    brew update
-    brew update
-    brew upgrade
-    brew reinstall tmux
-    brew reinstall protobuf
+deps() {
+  brew update
+  brew update
+  brew upgrade
+  brew reinstall tmux
+  brew reinstall protobuf
 }
 
 #
@@ -47,20 +45,18 @@ deps()
 # fat library that will run on any machine.  (This takes about 15
 # minutes on current Travis infrastructure.)
 #
-package_deps()
-{
-    deps
-    brew rm protobuf
-    brew install protobuf --universal --build-bottle
+package_deps() {
+  deps
+  brew rm protobuf
+  brew install protobuf --universal --build-bottle
 }
 
 #
 # Describe the dependencies installed and used as best as possible.
 #
-describe()
-{
-    brew --version > brew-version.txt
-    brew info --json=v1 --installed > brew-info.json
+describe() {
+  brew --version >brew-version.txt
+  brew info --json=v1 --installed >brew-info.json
 }
 
 #
