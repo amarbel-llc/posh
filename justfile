@@ -100,3 +100,12 @@ clean-build:
 [group("maintenance")]
 update-nix:
     nix flake update
+
+# --- debug -----------------------------------------------------------------
+
+# Run a single autotools test by name (e.g. `just debug-test-one
+# mouse-alternate-scroll.test`) in the devShell, for fast iteration on one
+# test without the whole `make check` suite.
+[group("debug")]
+debug-test-one name: build-autotools
+    nix develop --command make -C src/tests check TESTS='{{ name }}'
