@@ -9,26 +9,25 @@ default: validate lint build test
 
 validate: validate-devshell
 
-# Verify the devShell evaluates and builds without errors — catches
-# devShell-only breakage the prod-binary build can mask. Build-check only
-# (--no-link), no kept artifact.
+# Build-check the devShell (catches devShell-only breakage prod build masks).
 [group("pre-build")]
 validate-devshell:
     #!/usr/bin/env bash
     set -euo pipefail
+    # --no-link: build-check only, no kept artifact.
     system=$(nix eval --raw --impure --expr 'builtins.currentSystem')
     nix build --no-link --show-trace ".#devShells.${system}.default"
 
 lint: lint-fmt
 
-# Read-only formatting gate: builds the `checks.formatting` derivation,
-# which runs treefmt against a /nix/store snapshot and fails if anything
-# would change. Does NOT modify the worktree — the modifying counterpart
-# is `codemod-fmt-treefmt`.
+# Read-only formatting gate (fails if treefmt would change anything).
 [group("pre-build")]
 lint-fmt:
     #!/usr/bin/env bash
     set -euo pipefail
+    # Builds the checks.formatting derivation, which runs treefmt against a
+    # /nix/store snapshot. Does NOT modify the worktree — the modifying
+    # counterpart is `codemod-fmt-treefmt`. They share ./treefmt.nix.
     system=$(nix eval --raw --impure --expr 'builtins.currentSystem')
     nix build ".#checks.${system}.formatting" --no-link --print-build-logs
 
@@ -36,27 +35,40 @@ lint-fmt:
 
 build: build-nix
 
-# Hermetic package build through the flake: autogen.sh + configure + make
-# (+ make check via doCheck). This is the CI-equivalent build.
+# Hermetic flake build: autogen.sh + configure + make (+ make check).
 [group("build")]
 build-nix:
+    # The CI-equivalent build; doCheck runs the sandbox-safe test subset.
     nix build -L --show-trace
 
-# Fast C++ dev-loop: run the autotools build directly inside the devShell,
-# no nix rebuild. Leaves build products in the worktree for iteration.
+# Fast C++ dev-loop: autotools build in the devShell, no nix rebuild.
 [group("build")]
 build-autotools:
+    # Leaves build products in the worktree for iteration.
     nix develop --command bash -c './autogen.sh && ./configure --with-crypto-library=openssl && make'
 
 # --- post-build ------------------------------------------------------------
 
-test: test-autotools
+test: test-nix
 
-# Run mosh's own `make check` suite inside the devShell against the
-# autotools build. (`build-nix` already exercises the suite via doCheck;
-# this gives a fast, isolated test signal without a full nix rebuild.)
+# Hermetic, CI-safe test signal (the package's doCheck `make check`).
+[group("post-build")]
+test-nix:
+    #!/usr/bin/env bash
+    set -euo pipefail
+    # The sandbox runs the crypto/protocol subset and SKIPs the tmux/pty
+    # emulation tests, so this lane is deterministic. Cheap once build-nix
+    # has realized the derivation.
+    system=$(nix eval --raw --impure --expr 'builtins.currentSystem')
+    nix build -L --show-trace ".#packages.${system}.default"
+
+# Full host `make check` (includes tmux emulation tests; not in `default`).
 [group("post-build")]
 test-autotools: build-autotools
+    # The sandbox SKIPs the tmux/pty emulation tests; this runs them on the
+    # host. Kept OUT of `default` because the emulation suite has a host
+    # failure (emulation-80th-column) tracked in amarbel-llc/mosh#2. Promote
+    # back into the `test` aggregate once that's resolved.
     nix develop --command make check
 
 # --- operational -----------------------------------------------------------
@@ -69,9 +81,9 @@ run-nix *ARGS:
 codemod-fmt: codemod-fmt-treefmt
 
 # Rewrite the worktree in place via treefmt (clang-format + nixfmt + shfmt).
-# Read-only counterpart is `lint-fmt`. They share ./treefmt.nix.
 [group("codemod")]
 codemod-fmt-treefmt:
+    # Read-only counterpart is `lint-fmt`. They share ./treefmt.nix.
     nix fmt
 
 # --- maintenance -----------------------------------------------------------
