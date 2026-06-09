@@ -52,8 +52,13 @@ std::string Display::open() const
 
 std::string Display::close() const
 {
+  /* 1007 (xterm alternate scroll) is reset here alongside the other mouse
+     modes. Without it, a terminal whose alternate-scroll default is on
+     (e.g. kitty) keeps translating the wheel into cursor keys in the user's
+     shell after mosh exits. */
   return std::string( "\033[?1l\033[0m\033[?25h"
                       "\033[?1003l\033[?1002l\033[?1001l\033[?1000l"
+                      "\033[?1007l"
                       "\033[?1015l\033[?1006l\033[?1005l" )
          + std::string( rmcup ? rmcup : "" );
 }
@@ -300,6 +305,16 @@ std::string Display::new_frame( bool initialized, const Framebuffer& last, const
   /* has mouse focus mode changed? */
   if ( ( !initialized ) || ( f.ds.mouse_focus_event != frame.last_frame.ds.mouse_focus_event ) ) {
     frame.append( f.ds.mouse_focus_event ? "\033[?1004h" : "\033[?1004l" );
+  }
+
+  /* has mouse alternate scroll mode changed? On the initial frame this
+     asserts mosh's state (default off) onto the outer terminal, disabling
+     the wheel-to-cursor-key translation that terminals like kitty enable by
+     default on the alternate screen -- otherwise the wheel scrolls shell
+     history at a bare prompt. An application that explicitly turns 1007 on
+     still has it propagated. */
+  if ( ( !initialized ) || ( f.ds.mouse_alternate_scroll != frame.last_frame.ds.mouse_alternate_scroll ) ) {
+    frame.append( f.ds.mouse_alternate_scroll ? "\033[?1007h" : "\033[?1007l" );
   }
 
   /* has mouse encoding mode changed? */

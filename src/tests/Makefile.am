@@ -4,6 +4,7 @@ EXTRA_DIST = \
 	e2e-test-subrs \
 	mosh-client mosh-server \
 	local.test \
+	mouse-alternate-scroll.test \
 	$(displaytests) \
 	emulation-attributes.test
 
@@ -40,7 +41,7 @@ displaytests = \
 	window-resize.test
 
 check_PROGRAMS = ocb-aes encrypt-decrypt base64 nonce-incr inpty is-utf8-locale
-TESTS = ocb-aes encrypt-decrypt base64 nonce-incr local.test $(displaytests)
+TESTS = ocb-aes encrypt-decrypt base64 nonce-incr local.test mouse-alternate-scroll.test $(displaytests)
 XFAIL_TESTS = \
 	e2e-failure.test \
 	emulation-attributes-256color8.test

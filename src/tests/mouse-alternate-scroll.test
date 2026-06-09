@@ -1,0 +1,40 @@
+#!/bin/sh
+
+#
+# Regression test for mode 1007 (xterm alternate scroll) handling.
+#
+# mosh must emit ESC[?1007l to the client terminal: on the initial frame
+# (asserting its default-off state, so a terminal like kitty whose
+# alternate-scroll default is ON does not translate the wheel into cursor
+# keys at a bare shell prompt) and again in Display::close() on teardown
+# (so the user's local shell is left clean). Neither was emitted before;
+# see amarbel-llc/mosh#1.
+#
+# The emulation-*.test harness compares tmux screen captures, which cannot
+# observe a private mode that has no on-screen effect. So, like local.test,
+# this runs mosh under inpty and inspects mosh's RAW output bytes for the
+# 1007 reset sequence.
+#
+
+. "$(dirname "$0")/e2e-test-subrs"
+if ! set_locale; then
+    echo "$0: no usable locale" >&2
+    exit 99
+fi
+
+set -eu
+out=$(
+    TERM=xterm \
+        ./inpty \
+        ../../scripts/mosh \
+        --client="../frontend/mosh-client" \
+        --server="$PWD/../frontend/mosh-server" \
+        --local --bind-server=127.0.0.1 127.0.0.1 \
+        -- printf 'done\n' | cat -v)
+
+# cat -v renders ESC as ^[, so ESC[?1007l becomes ^[[?1007l.
+case "$out" in
+    *'^[[?1007l'*) exit 0;;
+    *) printf 'mosh did not emit ESC[?1007l (alternate scroll reset)\n' >&2
+       exit 1;;
+esac
