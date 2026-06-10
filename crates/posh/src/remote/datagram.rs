@@ -154,6 +154,10 @@ pub struct Connection {
     remote: Option<SocketAddr>,
     saved_timestamp: Option<(u16, u64)>, // (peer timestamp, received_at)
     rtt: RttEstimator,
+    /// Next sequence number expected from the peer (mosh
+    /// expected_receiver_seq): only datagrams at or above it may update the
+    /// timestamp echo, RTT estimate, or roamed remote address.
+    expected_receiver_seq: u64,
 }
 
 impl Connection {
@@ -175,6 +179,7 @@ impl Connection {
                     remote: None,
                     saved_timestamp: None,
                     rtt: RttEstimator::new(),
+                    expected_receiver_seq: 0,
                 };
                 return Ok((conn, port));
             }
@@ -197,6 +202,7 @@ impl Connection {
             remote: Some(remote),
             saved_timestamp: None,
             rtt: RttEstimator::new(),
+            expected_receiver_seq: 0,
         })
     }
 
@@ -248,25 +254,33 @@ impl Connection {
     pub fn recv(&mut self) -> std::io::Result<Option<Vec<u8>>> {
         let mut buf = [0u8; 2048];
         let (n, from) = self.sock.recv_from(&mut buf)?;
-        let Ok((_seq, plaintext)) = self.session.open(&buf[..n]) else {
+        let Ok((seq, plaintext)) = self.session.open(&buf[..n]) else {
             return Ok(None);
         };
         if plaintext.len() < 4 {
             return Ok(None);
         }
-        let now = now_ms();
-        let ts = u16::from_be_bytes([plaintext[0], plaintext[1]]);
-        let reply = u16::from_be_bytes([plaintext[2], plaintext[3]]);
-        if ts != TS_NONE {
-            self.saved_timestamp = Some((ts, now));
-        }
-        if reply != TS_NONE {
-            self.rtt
-                .sample(timestamp_diff(timestamp16(now), reply) as f64);
-        }
-        if self.is_server {
-            // Roaming: adopt the source address of the last authentic packet.
-            self.remote = Some(from);
+        // Late in-window reorders still deliver their payload, but only the
+        // newest datagram may update the timestamp echo, RTT estimate, or
+        // (server) the roamed remote address — a stale packet from a
+        // pre-roam or spoofed source must not re-target the stream
+        // (mosh network.cc expected_receiver_seq guard).
+        if seq >= self.expected_receiver_seq {
+            self.expected_receiver_seq = seq + 1;
+            let now = now_ms();
+            let ts = u16::from_be_bytes([plaintext[0], plaintext[1]]);
+            let reply = u16::from_be_bytes([plaintext[2], plaintext[3]]);
+            if ts != TS_NONE {
+                self.saved_timestamp = Some((ts, now));
+            }
+            if reply != TS_NONE {
+                self.rtt
+                    .sample(timestamp_diff(timestamp16(now), reply) as f64);
+            }
+            if self.is_server {
+                // Roaming: adopt the source of the newest authentic packet.
+                self.remote = Some(from);
+            }
         }
         Ok(Some(plaintext[4..].to_vec()))
     }
@@ -390,6 +404,59 @@ mod tests {
             }
         }
         panic!("ipv4 datagram never arrived on the auto-family socket");
+    }
+
+    /// Drains one payload out of a nonblocking connection.
+    fn recv_one(conn: &mut Connection) -> Vec<u8> {
+        for _ in 0..50 {
+            match conn.recv() {
+                Ok(Some(p)) => return p,
+                Ok(None) => {}
+                Err(e) if e.kind() == std::io::ErrorKind::WouldBlock => {
+                    std::thread::sleep(std::time::Duration::from_millis(10));
+                }
+                Err(e) => panic!("recv: {e}"),
+            }
+        }
+        panic!("datagram never arrived");
+    }
+
+    #[test]
+    fn stale_datagram_does_not_re_target_roaming() {
+        let key = Key::random();
+        let (mut server, port) = Connection::server((62000, 62099), &key, Family::Inet).unwrap();
+        let addr: SocketAddr = format!("127.0.0.1:{port}").parse().unwrap();
+
+        // Seal two client->server packets from one session, then deliver
+        // them out of order from two different source addresses.
+        let mut session = Session::new(&key, Direction::ToServer);
+        let seal = |payload: &[u8], s: &mut Session| {
+            let mut pt = Vec::new();
+            pt.extend_from_slice(&TS_NONE.to_be_bytes());
+            pt.extend_from_slice(&TS_NONE.to_be_bytes());
+            pt.extend_from_slice(payload);
+            s.seal(&pt).unwrap()
+        };
+        let first = seal(b"first", &mut session); // seq 0
+        let second = seal(b"second", &mut session); // seq 1
+
+        let new_addr = UdpSocket::bind((Ipv4Addr::LOCALHOST, 0)).unwrap();
+        let old_addr = UdpSocket::bind((Ipv4Addr::LOCALHOST, 0)).unwrap();
+
+        new_addr.send_to(&second, addr).unwrap();
+        assert_eq!(recv_one(&mut server), b"second");
+        assert_eq!(server.remote, Some(new_addr.local_addr().unwrap()));
+
+        // The late seq-0 packet (in-window reorder) from a different source
+        // still delivers its payload, but must not re-point the server at
+        // the stale address.
+        old_addr.send_to(&first, addr).unwrap();
+        assert_eq!(recv_one(&mut server), b"first");
+        assert_eq!(
+            server.remote,
+            Some(new_addr.local_addr().unwrap()),
+            "stale datagram re-targeted the roaming address"
+        );
     }
 
     #[test]
