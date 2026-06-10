@@ -195,7 +195,11 @@ pub enum FrameBody {
 pub struct ServerFrame {
     pub flags: u8,
     pub frame_num: u64,
+    /// Input-stream offset received (clears the client's outbox).
     pub input_ack: u64,
+    /// Input-stream offset whose application echo is reflected in this
+    /// frame's screen state (mosh's echo ack; validates predictions).
+    pub echo_ack: u64,
     pub body: FrameBody,
 }
 
@@ -209,6 +213,7 @@ impl ServerFrame {
         out.push(self.flags);
         out.extend_from_slice(&self.frame_num.to_le_bytes());
         out.extend_from_slice(&self.input_ack.to_le_bytes());
+        out.extend_from_slice(&self.echo_ack.to_le_bytes());
         match &self.body {
             FrameBody::Full(bytes) => {
                 out.push(BODY_FULL);
@@ -225,22 +230,23 @@ impl ServerFrame {
     }
 
     pub fn decode(data: &[u8]) -> Result<ServerFrame> {
-        if data.len() < 18 {
+        if data.len() < 26 {
             return Err(Error::from("server frame too short"));
         }
         let flags = data[0];
         let frame_num = u64::from_le_bytes(data[1..9].try_into().unwrap());
         let input_ack = u64::from_le_bytes(data[9..17].try_into().unwrap());
-        let body = match data[17] {
-            BODY_FULL => FrameBody::Full(data[18..].to_vec()),
+        let echo_ack = u64::from_le_bytes(data[17..25].try_into().unwrap());
+        let body = match data[25] {
+            BODY_FULL => FrameBody::Full(data[26..].to_vec()),
             BODY_DIFF => {
-                if data.len() < 26 {
+                if data.len() < 34 {
                     return Err(Error::from("diff frame too short"));
                 }
-                let base = u64::from_le_bytes(data[18..26].try_into().unwrap());
+                let base = u64::from_le_bytes(data[26..34].try_into().unwrap());
                 FrameBody::Diff {
                     base,
-                    diff: data[26..].to_vec(),
+                    diff: data[34..].to_vec(),
                 }
             }
             BODY_EMPTY => FrameBody::Empty,
@@ -250,8 +256,61 @@ impl ServerFrame {
             flags,
             frame_num,
             input_ack,
+            echo_ack,
             body,
         })
+    }
+}
+
+/// Server-side echo-ack tracker (port of mosh's `Complete` echo ack with
+/// `ECHO_TIMEOUT`): input written to the application is considered echoed
+/// into the screen state once a grace period has elapsed, so the client can
+/// validate predictions against a frame that should contain the echo.
+pub const ECHO_TIMEOUT: u64 = 50; // ms, as in mosh
+
+#[derive(Default)]
+pub struct EchoAck {
+    pending: std::collections::VecDeque<(u64, u64)>, // (offset, written_at)
+    acked: u64,
+}
+
+impl EchoAck {
+    pub fn new() -> EchoAck {
+        EchoAck::default()
+    }
+
+    /// Records that input through `offset` was written to the application.
+    pub fn record(&mut self, offset: u64, now: u64) {
+        let newest = self.pending.back().map_or(self.acked, |&(o, _)| o);
+        if offset > newest {
+            self.pending.push_back((offset, now));
+        }
+    }
+
+    /// Advances the ack over entries older than `ECHO_TIMEOUT`. Returns
+    /// true when the ack moved (the server should send a fresh frame).
+    pub fn update(&mut self, now: u64) -> bool {
+        let mut changed = false;
+        while let Some(&(offset, at)) = self.pending.front() {
+            if now.saturating_sub(at) < ECHO_TIMEOUT {
+                break;
+            }
+            self.acked = offset;
+            self.pending.pop_front();
+            changed = true;
+        }
+        changed
+    }
+
+    pub fn ack(&self) -> u64 {
+        self.acked
+    }
+
+    /// Time until the next pending entry matures, for poll deadlines.
+    pub fn wait_time(&self, now: u64) -> Option<u64> {
+        self.pending
+            .front()
+            .map(|&(_, at)| (at + ECHO_TIMEOUT).saturating_sub(now))
     }
 }
 
@@ -259,8 +318,13 @@ impl ServerFrame {
 // Client->server messages: frame ack, current terminal size, and the unacked
 // tail of the cumulative input byte stream.
 
+/// Client requests a clean shutdown (Ctrl-^ . quit sequence): the server
+/// hangs up the shell and acknowledges with `FLAG_SHUTDOWN` frames.
+pub const CLIENT_FLAG_SHUTDOWN: u8 = 1;
+
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct ClientMessage {
+    pub flags: u8,
     pub acked_frame: u64,
     pub rows: u16,
     pub cols: u16,
@@ -270,7 +334,8 @@ pub struct ClientMessage {
 
 impl ClientMessage {
     pub fn encode(&self) -> Vec<u8> {
-        let mut out = Vec::with_capacity(20 + self.input.len());
+        let mut out = Vec::with_capacity(21 + self.input.len());
+        out.push(self.flags);
         out.extend_from_slice(&self.acked_frame.to_le_bytes());
         out.extend_from_slice(&self.rows.to_le_bytes());
         out.extend_from_slice(&self.cols.to_le_bytes());
@@ -280,15 +345,16 @@ impl ClientMessage {
     }
 
     pub fn decode(data: &[u8]) -> Result<ClientMessage> {
-        if data.len() < 20 {
+        if data.len() < 21 {
             return Err(Error::from("client message too short"));
         }
         Ok(ClientMessage {
-            acked_frame: u64::from_le_bytes(data[0..8].try_into().unwrap()),
-            rows: u16::from_le_bytes([data[8], data[9]]),
-            cols: u16::from_le_bytes([data[10], data[11]]),
-            input_base: u64::from_le_bytes(data[12..20].try_into().unwrap()),
-            input: data[20..].to_vec(),
+            flags: data[0],
+            acked_frame: u64::from_le_bytes(data[1..9].try_into().unwrap()),
+            rows: u16::from_le_bytes([data[9], data[10]]),
+            cols: u16::from_le_bytes([data[11], data[12]]),
+            input_base: u64::from_le_bytes(data[13..21].try_into().unwrap()),
+            input: data[21..].to_vec(),
         })
     }
 }
@@ -322,6 +388,12 @@ impl InputOutbox {
 
     pub fn base(&self) -> u64 {
         self.base
+    }
+
+    /// Offset one past the newest byte pushed (the server's next expected
+    /// offset once everything pending is delivered).
+    pub fn end_offset(&self) -> u64 {
+        self.base + self.buf.len() as u64
     }
 
     pub fn pending(&self) -> &[u8] {
@@ -466,12 +538,14 @@ mod tests {
                 flags: 0,
                 frame_num: 7,
                 input_ack: 99,
+                echo_ack: 95,
                 body: FrameBody::Full(b"dump".to_vec()),
             },
             ServerFrame {
                 flags: FLAG_SHUTDOWN,
                 frame_num: 8,
                 input_ack: 100,
+                echo_ack: 100,
                 body: FrameBody::Diff {
                     base: 7,
                     diff: b"delta".to_vec(),
@@ -481,6 +555,7 @@ mod tests {
                 flags: 0,
                 frame_num: 0,
                 input_ack: 0,
+                echo_ack: 0,
                 body: FrameBody::Empty,
             },
         ];
@@ -491,8 +566,24 @@ mod tests {
     }
 
     #[test]
+    fn frame_echo_ack_distinct_from_input_ack() {
+        // The echo ack lags the input ack; both must roundtrip independently.
+        let frame = ServerFrame {
+            flags: 0,
+            frame_num: 3,
+            input_ack: 42,
+            echo_ack: 17,
+            body: FrameBody::Empty,
+        };
+        let decoded = ServerFrame::decode(&frame.encode()).unwrap();
+        assert_eq!(decoded.input_ack, 42);
+        assert_eq!(decoded.echo_ack, 17);
+    }
+
+    #[test]
     fn client_message_roundtrip() {
         let msg = ClientMessage {
+            flags: CLIENT_FLAG_SHUTDOWN,
             acked_frame: 12,
             rows: 50,
             cols: 132,
@@ -501,6 +592,35 @@ mod tests {
         };
         assert_eq!(ClientMessage::decode(&msg.encode()).unwrap(), msg);
         assert!(ClientMessage::decode(b"nope").is_err());
+    }
+
+    #[test]
+    fn echo_ack_advances_after_timeout() {
+        let mut echo = EchoAck::new();
+        assert_eq!(echo.ack(), 0);
+        echo.record(5, 1000);
+        // Not yet matured.
+        assert!(!echo.update(1000 + ECHO_TIMEOUT - 1));
+        assert_eq!(echo.ack(), 0);
+        assert_eq!(echo.wait_time(1000), Some(ECHO_TIMEOUT));
+        // Matured.
+        assert!(echo.update(1000 + ECHO_TIMEOUT));
+        assert_eq!(echo.ack(), 5);
+        assert_eq!(echo.wait_time(2000), None);
+        // No double-advance.
+        assert!(!echo.update(10_000));
+    }
+
+    #[test]
+    fn echo_ack_collapses_multiple_entries() {
+        let mut echo = EchoAck::new();
+        echo.record(3, 100);
+        echo.record(3, 120); // duplicate offset ignored
+        echo.record(9, 130);
+        assert!(echo.update(100 + ECHO_TIMEOUT));
+        assert_eq!(echo.ack(), 3);
+        assert!(echo.update(130 + ECHO_TIMEOUT));
+        assert_eq!(echo.ack(), 9);
     }
 
     #[test]

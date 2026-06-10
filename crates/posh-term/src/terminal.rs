@@ -3,7 +3,7 @@
 use std::collections::HashMap;
 
 use crate::cell::{default_palette, Cell, Style};
-use crate::graphics::{GraphicsState, Image, Placement};
+use crate::graphics::{AnimationState, Frame, GraphicsState, Image, Placement};
 use crate::kitty_keys::{KittyFlags, KittyKeyStack};
 use crate::modes::{Modes, MouseMode, MouseProtocol};
 use crate::parser::{Action, Parser};
@@ -53,6 +53,15 @@ pub(crate) struct CursorState {
     pub shift: u8,
 }
 
+/// One XTPUSHCOLORS stack entry: palette plus dynamic colors.
+#[derive(Debug, Clone)]
+pub(crate) struct ColorStackEntry {
+    pub palette: [(u8, u8, u8); 256],
+    pub fg: Option<(u8, u8, u8)>,
+    pub bg: Option<(u8, u8, u8)>,
+    pub cursor: Option<(u8, u8, u8)>,
+}
+
 #[derive(Debug, Clone, Copy, Default)]
 pub(crate) struct SavedCursor {
     pub cursor: CursorState,
@@ -91,6 +100,12 @@ pub struct Terminal {
     pub(crate) bg_color: Option<(u8, u8, u8)>,
     pub(crate) cursor_color: Option<(u8, u8, u8)>,
     pub(crate) clipboard: Vec<u8>,
+    /// OSC 52 `p` (primary) and `s` (select) slots; `clipboard` is `c`.
+    pub(crate) primary_selection: Vec<u8>,
+    pub(crate) select_selection: Vec<u8>,
+    pub(crate) color_stack: Vec<ColorStackEntry>,
+    /// Raw metadata + text of the last OSC 66 (kitty text sizing).
+    pub(crate) last_text_size: Option<String>,
     pub(crate) hyperlinks: HashMap<u32, Hyperlink>,
     pub(crate) next_hyperlink: u32,
     /// Raw DECSCUSR parameter (0..=6).
@@ -135,6 +150,10 @@ impl Terminal {
             bg_color: None,
             cursor_color: None,
             clipboard: Vec::new(),
+            primary_selection: Vec::new(),
+            select_selection: Vec::new(),
+            color_stack: Vec::new(),
+            last_text_size: None,
             hyperlinks: HashMap::new(),
             next_hyperlink: 0,
             cursor_style_raw: 0,
@@ -593,18 +612,27 @@ impl Terminal {
         self.kitty_alt.reset();
         self.graphics.reset();
         self.last_printed = None;
+        self.color_stack.clear();
+        self.last_text_size = None;
         self.touch();
     }
 
+    /// DECSTR (CSI ! p) per xterm ctlseqs: shows the cursor (DECTCEM),
+    /// replace mode (IRM), absolute origin (DECOM), no autowrap (DECAWM),
+    /// normal cursor keys (DECCKM), numeric keypad (DECNKM), full-screen
+    /// margins (DECSTBM), normal SGR, unprotected (DECSCA), default
+    /// charsets, and clears the DECSC saved-cursor state. Unlike RIS it
+    /// does not move the cursor, clear the screen, or touch other modes.
     pub(crate) fn soft_reset(&mut self) {
         self.modes.cursor_visible = true;
         self.modes.origin = false;
         self.modes.insert = false;
-        self.modes.autowrap = true;
+        self.modes.autowrap = false;
         self.modes.cursor_keys = false;
         self.modes.keypad_app = false;
         self.scroll_top = 0;
         self.scroll_bot = self.rows() - 1;
+        // Style::default() also drops DECSCA protection from the pen.
         self.cursor.style = Style::default();
         self.cursor.hyperlink = 0;
         self.cursor.pending_wrap = false;
@@ -612,6 +640,36 @@ impl Terminal {
         self.cursor.g1 = Charset::Ascii;
         self.cursor.shift = 0;
         self.cursor_style_raw = 0;
+        if self.alt_active {
+            self.saved_alt = SavedCursor::default();
+        } else {
+            self.saved_primary = SavedCursor::default();
+        }
+        // The kitty keyboard spec resets flags and stack on DECSTR too.
+        self.kitty_stack_mut().reset();
+        self.touch();
+    }
+
+    /// DECCOLM (DECSET/DECRST 3): switch between 132 and 80 columns. Only
+    /// honored after DECSET 40 (allow DECCOLM), matching xterm. Resets the
+    /// margins, homes the cursor, and clears the screen unless DECNCSM
+    /// (mode 95) is set.
+    pub(crate) fn set_deccolm(&mut self, set: bool) {
+        if !self.modes.allow_deccolm {
+            return;
+        }
+        self.modes.deccolm = set;
+        let cols = if set { 132 } else { 80 };
+        self.resize(self.rows(), cols);
+        self.scroll_top = 0;
+        self.scroll_bot = self.rows() - 1;
+        if !self.modes.no_clear_on_deccolm {
+            let style = self.blank_style();
+            self.scr_mut().clear_grid(style);
+        }
+        self.cursor.row = 0;
+        self.cursor.col = 0;
+        self.cursor.pending_wrap = false;
         self.touch();
     }
 
@@ -655,8 +713,18 @@ impl Terminal {
             return;
         };
         let cursor = (self.cursor.row, self.cursor.col);
-        if let Some(resp) = self.graphics.dispatch(rest, cursor) {
+        let (resp, advance) = self.graphics.dispatch(rest, cursor);
+        if let Some(resp) = resp {
             self.respond(&resp);
+        }
+        if let Some((cols, rows)) = advance {
+            // Kitty moves the cursor to the cell after the image's
+            // bottom-right corner (suppressed by C=1); clamped to the grid.
+            let down = rows.saturating_sub(1).min(u32::from(u16::MAX)) as u16;
+            let right = cols.min(u32::from(u16::MAX)) as u16;
+            self.cursor.row = self.cursor.row.saturating_add(down).min(self.rows() - 1);
+            self.cursor.col = self.cursor.col.saturating_add(right).min(self.cols() - 1);
+            self.cursor.pending_wrap = false;
         }
         self.touch();
     }
@@ -669,17 +737,20 @@ impl Terminal {
         if rows == self.rows() && cols == self.cols() {
             return;
         }
-        let mut primary_row = if self.alt_active { 0 } else { self.cursor.row };
-        let mut alt_row = if self.alt_active { self.cursor.row } else { 0 };
-        self.primary.resize(rows, cols, &mut primary_row, true);
-        self.alt.resize(rows, cols, &mut alt_row, false);
-        self.cursor.row = if self.alt_active {
-            alt_row
+        let here = (self.cursor.row, self.cursor.col);
+        let mut primary_cur = if self.alt_active { (0, 0) } else { here };
+        let mut alt_cur = if self.alt_active { here } else { (0, 0) };
+        // Primary reflows on width changes; the alt screen truncates/pads
+        // (kitty behavior).
+        self.primary.resize(rows, cols, &mut primary_cur, true);
+        self.alt.resize(rows, cols, &mut alt_cur, false);
+        let cur = if self.alt_active {
+            alt_cur
         } else {
-            primary_row
+            primary_cur
         };
-        self.cursor.row = self.cursor.row.min(rows - 1);
-        self.cursor.col = self.cursor.col.min(cols - 1);
+        self.cursor.row = cur.0.min(rows - 1);
+        self.cursor.col = cur.1.min(cols - 1);
         self.cursor.pending_wrap = false;
         self.scroll_top = 0;
         self.scroll_bot = rows - 1;
@@ -827,6 +898,22 @@ impl Terminal {
         &self.clipboard
     }
 
+    /// OSC 52 selection slot: `'c'` clipboard, `'p'` primary, `'s'` select.
+    pub fn selection(&self, kind: char) -> &[u8] {
+        match kind {
+            'p' => &self.primary_selection,
+            's' => &self.select_selection,
+            _ => &self.clipboard,
+        }
+    }
+
+    /// Raw `metadata;text` payload of the last OSC 66 (kitty text-sizing
+    /// protocol). Only the `w:` width key affects layout; other keys are
+    /// preserved here for callers.
+    pub fn last_text_size(&self) -> Option<&str> {
+        self.last_text_size.as_deref()
+    }
+
     /// DECSTBM scroll region, 0-based inclusive.
     pub fn scroll_region(&self) -> (u16, u16) {
         self.region()
@@ -845,6 +932,16 @@ impl Terminal {
     /// Active kitty graphics placements.
     pub fn placements(&self) -> &[Placement] {
         self.graphics.placements()
+    }
+
+    /// Animation frames stored for a kitty graphics image (a=f).
+    pub fn image_frames(&self, image_id: u32) -> &[Frame] {
+        self.graphics.frames(image_id)
+    }
+
+    /// Animation play state set with kitty graphics a=a.
+    pub fn animation_state(&self, image_id: u32) -> Option<AnimationState> {
+        self.graphics.animation(image_id)
     }
 }
 

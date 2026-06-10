@@ -6,21 +6,56 @@ use posh_term::Terminal;
 
 use crate::pty;
 use crate::remote::crypto::Key;
-use crate::remote::datagram::{Connection, DEFAULT_PORT_RANGE};
+use crate::remote::datagram::{Connection, Family, DEFAULT_PORT_RANGE};
 use crate::remote::sync::{
-    self, ClientMessage, FragmentAssembly, Fragmenter, FrameBody, InputInbox, ServerFrame,
+    self, ClientMessage, EchoAck, FragmentAssembly, Fragmenter, FrameBody, InputInbox, ServerFrame,
 };
 use crate::util::{self, now_ms, Result};
 
 const SEND_INTERVAL_MIN: u64 = 20; // ms between fresh frames
 const HEARTBEAT_INTERVAL: u64 = 3000; // ms between empty keepalives
 const SHUTDOWN_GRACE: u64 = 10_000; // ms to wait for the final-state ack
+/// Silence after which the peer is forgotten (sending stops, the session
+/// stays alive waiting for the client to come back).
+const PEER_TIMEOUT: u64 = 60_000; // ms
 
-pub fn run(port_range: Option<(u16, u16)>, command: Option<Vec<String>>) -> Result<()> {
+/// POSH_SERVER_NETWORK_TMOUT / POSH_SERVER_SIGNAL_TMOUT, in seconds
+/// (0 = disabled), as mosh's MOSH_SERVER_*_TMOUT.
+fn timeout_env(name: &str) -> u64 {
+    match std::env::var(name) {
+        Ok(v) if !v.is_empty() => match v.parse::<i64>() {
+            Ok(n) if n >= 0 => n as u64,
+            Ok(_) => {
+                eprintln!("{name} is negative, ignoring");
+                0
+            }
+            Err(_) => {
+                eprintln!("{name} not a valid integer, ignoring");
+                0
+            }
+        },
+        _ => 0,
+    }
+}
+
+pub fn run(
+    port_range: Option<(u16, u16)>,
+    family: Family,
+    command: Option<Vec<String>>,
+) -> Result<()> {
+    util::check_utf8_locale("posh-server")?;
+
     let key = Key::random();
-    let (conn, port) = Connection::server(port_range.unwrap_or(DEFAULT_PORT_RANGE), &key)?;
+    let (conn, port) = Connection::server(port_range.unwrap_or(DEFAULT_PORT_RANGE), &key, family)?;
 
-    // The ssh wrapper parses this line; it must be the only stdout output.
+    // The ssh wrapper parses these lines; they must be the only stdout
+    // output. POSH IP reports the address the client should dial (the
+    // server side of the ssh connection), as mosh.pl's "MOSH IP".
+    if let Ok(ssh_connection) = std::env::var("SSH_CONNECTION") {
+        if let Some(ip) = ssh_connection.split_whitespace().nth(2) {
+            println!("POSH IP {ip}");
+        }
+    }
     println!("POSH CONNECT {port} {}", key.to_base64());
     use std::io::Write;
     std::io::stdout().flush()?;
@@ -31,6 +66,7 @@ pub fn run(port_range: Option<(u16, u16)>, command: Option<Vec<String>>) -> Resu
         return Ok(());
     }
     util::redirect_stdio_devnull();
+    util::install_sigusr1_handler();
 
     let (rows, cols) = (24u16, 80u16);
     let child = pty::spawn_shell(command.as_deref(), rows, cols, &[])?;
@@ -50,6 +86,12 @@ fn server_loop(mut conn: Connection, child: pty::PtyChild, rows: u16, cols: u16)
     let mut fragmenter = Fragmenter::new();
     let mut assembly = FragmentAssembly::new();
     let mut inbox = InputInbox::new();
+    let mut echo = EchoAck::new();
+
+    // Idle timeouts (seconds; 0 = never). NETWORK fires on its own; SIGNAL
+    // only fires when SIGUSR1 has been received.
+    let network_tmout = timeout_env("POSH_SERVER_NETWORK_TMOUT") * 1000;
+    let signal_tmout = timeout_env("POSH_SERVER_SIGNAL_TMOUT") * 1000;
 
     // Frame 0 is the implicit empty initial state shared with the client, so
     // the very first real frame can already be expressed as a diff.
@@ -65,6 +107,7 @@ fn server_loop(mut conn: Connection, child: pty::PtyChild, rows: u16, cols: u16)
 
     let mut last_gen = term.generation();
     let mut last_send: u64 = 0;
+    let mut last_heard: u64 = now_ms();
     let mut client_size: (u16, u16) = (rows, cols);
     let mut pty_open = true;
     let mut shutdown = false;
@@ -76,7 +119,20 @@ fn server_loop(mut conn: Connection, child: pty::PtyChild, rows: u16, cols: u16)
 
     loop {
         let now = now_ms();
-        let timeout = if conn.has_remote() {
+        // A silent peer is forgotten after a minute: sending stops (the
+        // session stays alive) until an authentic datagram arrives again.
+        let peer_active = conn.has_remote() && now.saturating_sub(last_heard) < PEER_TIMEOUT;
+        if network_tmout > 0 && now.saturating_sub(last_heard) >= network_tmout {
+            break; // POSH_SERVER_NETWORK_TMOUT expired: give up the session
+        }
+        if util::take_flag(&util::SIGUSR1_RECEIVED)
+            && signal_tmout > 0
+            && now.saturating_sub(last_heard) >= signal_tmout
+        {
+            break; // signaled and idle long enough
+        }
+
+        let timeout = if peer_active {
             let mut deadline = last_send + HEARTBEAT_INTERVAL;
             if acked_num < current.num {
                 deadline = deadline.min(last_send + conn.rto());
@@ -87,10 +143,15 @@ fn server_loop(mut conn: Connection, child: pty::PtyChild, rows: u16, cols: u16)
             if shutdown {
                 deadline = deadline.min(shutdown_at + SHUTDOWN_GRACE);
             }
+            if let Some(wait) = echo.wait_time(now) {
+                deadline = deadline.min(now + wait);
+            }
             deadline.saturating_sub(now).min(1000) as i32
         } else if shutdown {
-            // Shell exited before any client appeared; nothing to wait for.
+            // Shell exited with no reachable client; nothing to wait for.
             break;
+        } else if network_tmout > 0 {
+            (last_heard + network_tmout).saturating_sub(now).min(1000) as i32
         } else {
             -1
         };
@@ -151,15 +212,29 @@ fn server_loop(mut conn: Connection, child: pty::PtyChild, rows: u16, cols: u16)
                         let Ok(msg) = ClientMessage::decode(&assembled) else {
                             continue;
                         };
+                        last_heard = now_ms();
                         handle_client_message(
                             &msg,
                             &mut term,
                             &child,
                             pty_open,
                             &mut inbox,
+                            &mut echo,
                             &mut client_size,
                             &mut force_ack,
                         );
+                        if msg.flags & sync::CLIENT_FLAG_SHUTDOWN != 0 && !shutdown {
+                            // Client asked to quit: hang up the shell and
+                            // start the shutdown handshake.
+                            shutdown = true;
+                            shutdown_at = now_ms();
+                            force_frame = true;
+                            if pty_open {
+                                unsafe {
+                                    libc::kill(-child.pid, libc::SIGHUP);
+                                }
+                            }
+                        }
                         update_acks(
                             &msg,
                             &current,
@@ -177,7 +252,13 @@ fn server_loop(mut conn: Connection, child: pty::PtyChild, rows: u16, cols: u16)
 
         // Frame production and (re)transmission.
         let now = now_ms();
-        if conn.has_remote() {
+        if echo.update(now) {
+            // The echo ack advanced: tell the client so its predictions
+            // can be validated even when the screen did not change.
+            force_ack = true;
+        }
+        let peer_active = conn.has_remote() && now.saturating_sub(last_heard) < PEER_TIMEOUT;
+        if peer_active {
             let dirty = term.generation() != last_gen;
             let mut send_frame = false;
             let mut send_empty = false;
@@ -206,7 +287,10 @@ fn server_loop(mut conn: Connection, child: pty::PtyChild, rows: u16, cols: u16)
                 // the client can clear its outbox.
                 send_empty = true;
             }
-            force_ack = false;
+            if send_frame || send_empty {
+                // Every frame carries the latest input/echo acks.
+                force_ack = false;
+            }
 
             let flags = if shutdown { sync::FLAG_SHUTDOWN } else { 0 };
             if send_frame {
@@ -228,6 +312,7 @@ fn server_loop(mut conn: Connection, child: pty::PtyChild, rows: u16, cols: u16)
                     flags,
                     frame_num: current.num,
                     input_ack: inbox.next_offset(),
+                    echo_ack: echo.ack(),
                     body,
                 };
                 send_payload(&mut conn, &mut fragmenter, &frame.encode());
@@ -237,6 +322,7 @@ fn server_loop(mut conn: Connection, child: pty::PtyChild, rows: u16, cols: u16)
                     flags,
                     frame_num: current.num,
                     input_ack: inbox.next_offset(),
+                    echo_ack: echo.ack(),
                     body: FrameBody::Empty,
                 };
                 send_payload(&mut conn, &mut fragmenter, &frame.encode());
@@ -247,8 +333,13 @@ fn server_loop(mut conn: Connection, child: pty::PtyChild, rows: u16, cols: u16)
         if shutdown {
             // The shell has exited: announce it (frames now carry the
             // shutdown flag) and leave once the client confirmed the final
-            // state, or after the grace period.
-            if !force_frame && term.generation() == last_gen && acked_num >= current.num {
+            // state and the echo ack caught up, or after the grace period.
+            if !force_frame
+                && !force_ack
+                && term.generation() == last_gen
+                && acked_num >= current.num
+                && echo.ack() >= inbox.next_offset()
+            {
                 break;
             }
             if now_ms().saturating_sub(shutdown_at) >= SHUTDOWN_GRACE {
@@ -275,6 +366,7 @@ fn handle_client_message(
     child: &pty::PtyChild,
     pty_open: bool,
     inbox: &mut InputInbox,
+    echo: &mut EchoAck,
     client_size: &mut (u16, u16),
     force_ack: &mut bool,
 ) {
@@ -287,6 +379,7 @@ fn handle_client_message(
         if pty_open {
             let _ = util::write_all_retry(child.master, new_input, 500);
         }
+        echo.record(inbox.next_offset(), now_ms());
         *force_ack = true;
     }
 }
@@ -327,11 +420,11 @@ mod tests {
 
     /// Drives a real server_loop over loopback UDP: the PTY runs a shell
     /// that reads one line and exits, so a single test covers input
-    /// delivery+ack, frame flow, and the shutdown handshake.
+    /// delivery+ack, the echo ack, frame flow, and the shutdown handshake.
     #[test]
     fn server_loop_input_and_shutdown_handshake() {
         let key = Key::random();
-        let (server_conn, port) = Connection::server((62100, 62199), &key).unwrap();
+        let (server_conn, port) = Connection::server((62100, 62199), &key, Family::Inet).unwrap();
         let cmd: Vec<String> = vec!["/bin/sh".into(), "-c".into(), "read x; exit 0".into()];
         let child = crate::pty::spawn_shell(Some(&cmd), 24, 80, &[]).unwrap();
         util::set_nonblocking(child.master).unwrap();
@@ -346,10 +439,12 @@ mod tests {
 
         let mut acked_frame = 0u64;
         let mut input_acked = 0u64;
+        let mut echo_acked = 0u64;
         let mut saw_shutdown = false;
         let deadline = now_ms() + 15_000;
         while now_ms() < deadline {
             let msg = ClientMessage {
+                flags: 0,
                 acked_frame,
                 rows: 24,
                 cols: 80,
@@ -359,7 +454,7 @@ mod tests {
             for frag in fragmenter.make_fragments(&msg.encode(), sync::FRAGMENT_CONTENTS_MAX) {
                 conn.send(&frag.to_bytes()).unwrap();
             }
-            if saw_shutdown && acked_frame > 0 {
+            if saw_shutdown && acked_frame > 0 && echo_acked == 6 {
                 break; // shutdown frame acked in the message just sent
             }
             std::thread::sleep(std::time::Duration::from_millis(50));
@@ -377,6 +472,7 @@ mod tests {
                         };
                         acked_frame = acked_frame.max(frame.frame_num);
                         input_acked = input_acked.max(frame.input_ack);
+                        echo_acked = echo_acked.max(frame.echo_ack);
                         if frame.flags & sync::FLAG_SHUTDOWN != 0 {
                             saw_shutdown = true;
                         }
@@ -390,6 +486,81 @@ mod tests {
 
         assert!(saw_shutdown, "never saw the shutdown flag");
         assert_eq!(input_acked, 6, "input stream not fully acked");
+        assert_eq!(echo_acked, 6, "echo ack never caught up to the input");
         server.join().unwrap();
+    }
+
+    #[test]
+    fn client_shutdown_flag_winds_down_the_server() {
+        let key = Key::random();
+        let (server_conn, port) = Connection::server((62200, 62299), &key, Family::Inet).unwrap();
+        // A shell that would run forever without the client's quit request.
+        let cmd: Vec<String> = vec!["/bin/sh".into(), "-c".into(), "sleep 600".into()];
+        let child = crate::pty::spawn_shell(Some(&cmd), 24, 80, &[]).unwrap();
+        util::set_nonblocking(child.master).unwrap();
+        let server = std::thread::spawn(move || server_loop(server_conn, child, 24, 80));
+
+        let addr = format!("127.0.0.1:{port}").parse().unwrap();
+        let mut conn = Connection::client(addr, &key).unwrap();
+        let mut fragmenter = Fragmenter::new();
+        let mut assembly = FragmentAssembly::new();
+
+        let mut acked_frame = 0u64;
+        let mut saw_shutdown = false;
+        let deadline = now_ms() + 15_000;
+        while now_ms() < deadline {
+            let msg = ClientMessage {
+                flags: sync::CLIENT_FLAG_SHUTDOWN,
+                acked_frame,
+                rows: 24,
+                cols: 80,
+                input_base: 0,
+                input: Vec::new(),
+            };
+            for frag in fragmenter.make_fragments(&msg.encode(), sync::FRAGMENT_CONTENTS_MAX) {
+                conn.send(&frag.to_bytes()).unwrap();
+            }
+            if saw_shutdown && acked_frame > 0 {
+                break;
+            }
+            std::thread::sleep(std::time::Duration::from_millis(50));
+            loop {
+                match conn.recv() {
+                    Ok(Some(payload)) => {
+                        let Ok(frag) = sync::Fragment::from_bytes(&payload) else {
+                            continue;
+                        };
+                        let Some(assembled) = assembly.add(frag) else {
+                            continue;
+                        };
+                        let Ok(frame) = ServerFrame::decode(&assembled) else {
+                            continue;
+                        };
+                        acked_frame = acked_frame.max(frame.frame_num);
+                        if frame.flags & sync::FLAG_SHUTDOWN != 0 {
+                            saw_shutdown = true;
+                        }
+                    }
+                    Ok(None) => continue,
+                    Err(e) if e.kind() == std::io::ErrorKind::WouldBlock => break,
+                    Err(_) => break,
+                }
+            }
+        }
+
+        assert!(saw_shutdown, "server never confirmed the client shutdown");
+        server.join().unwrap();
+    }
+
+    #[test]
+    fn timeout_env_parsing() {
+        std::env::remove_var("POSH_TEST_TMOUT_A");
+        assert_eq!(timeout_env("POSH_TEST_TMOUT_A"), 0);
+        std::env::set_var("POSH_TEST_TMOUT_B", "30");
+        assert_eq!(timeout_env("POSH_TEST_TMOUT_B"), 30);
+        std::env::set_var("POSH_TEST_TMOUT_C", "-5");
+        assert_eq!(timeout_env("POSH_TEST_TMOUT_C"), 0);
+        std::env::set_var("POSH_TEST_TMOUT_D", "junk");
+        assert_eq!(timeout_env("POSH_TEST_TMOUT_D"), 0);
     }
 }

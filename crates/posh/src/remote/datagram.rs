@@ -4,7 +4,7 @@
 //! authenticated datagram).
 
 use std::net::{Ipv4Addr, Ipv6Addr, SocketAddr, UdpSocket};
-use std::os::fd::{AsRawFd, RawFd};
+use std::os::fd::{AsRawFd, FromRawFd, RawFd};
 
 use crate::remote::crypto::{Direction, Key, Session};
 use crate::util::{now_ms, Error, Result};
@@ -13,6 +13,75 @@ pub const DEFAULT_PORT_RANGE: (u16, u16) = (60001, 60999);
 const MIN_RTO: u64 = 50; // ms
 const MAX_RTO: u64 = 1000; // ms
 const TS_NONE: u16 = 0xffff;
+// mosh transportsender SEND_INTERVAL_MIN/MAX: pacing derived from SRTT.
+const SEND_INTERVAL_MIN: u64 = 20; // ms
+const SEND_INTERVAL_MAX: u64 = 250; // ms
+
+/// Address family selection (-4 / -6 flags; mosh --family).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum Family {
+    /// Dual-stack server bind when possible; client prefers IPv4.
+    #[default]
+    Auto,
+    Inet,
+    Inet6,
+}
+
+impl Family {
+    /// Parses a `-4`/`-6` flag; None for anything else.
+    pub fn from_flag(flag: &str) -> Option<Family> {
+        match flag {
+            "-4" => Some(Family::Inet),
+            "-6" => Some(Family::Inet6),
+            _ => None,
+        }
+    }
+}
+
+/// Binds an IPv6 UDP wildcard socket; `v6only=false` requests a dual-stack
+/// socket that also accepts IPv4 (as v4-mapped addresses).
+fn bind_udp_v6(port: u16, v6only: bool) -> std::io::Result<UdpSocket> {
+    unsafe {
+        let fd = libc::socket(libc::AF_INET6, libc::SOCK_DGRAM | libc::SOCK_CLOEXEC, 0);
+        if fd < 0 {
+            return Err(std::io::Error::last_os_error());
+        }
+        let on: libc::c_int = v6only as libc::c_int;
+        libc::setsockopt(
+            fd,
+            libc::IPPROTO_IPV6,
+            libc::IPV6_V6ONLY,
+            &on as *const _ as *const libc::c_void,
+            std::mem::size_of::<libc::c_int>() as libc::socklen_t,
+        );
+        let mut addr: libc::sockaddr_in6 = std::mem::zeroed();
+        addr.sin6_family = libc::AF_INET6 as libc::sa_family_t;
+        addr.sin6_port = port.to_be();
+        if libc::bind(
+            fd,
+            &addr as *const _ as *const libc::sockaddr,
+            std::mem::size_of::<libc::sockaddr_in6>() as libc::socklen_t,
+        ) < 0
+        {
+            let err = std::io::Error::last_os_error();
+            libc::close(fd);
+            return Err(err);
+        }
+        Ok(UdpSocket::from_raw_fd(fd))
+    }
+}
+
+fn bind_server_socket(port: u16, family: Family) -> std::io::Result<UdpSocket> {
+    match family {
+        Family::Inet => UdpSocket::bind((Ipv4Addr::UNSPECIFIED, port)),
+        Family::Inet6 => bind_udp_v6(port, true),
+        // Prefer one dual-stack socket; fall back to plain IPv4 on hosts
+        // without IPv6.
+        Family::Auto => {
+            bind_udp_v6(port, false).or_else(|_| UdpSocket::bind((Ipv4Addr::UNSPECIFIED, port)))
+        }
+    }
+}
 
 /// 16-bit wallclock used in packet timestamps; 0xffff is reserved for "none".
 pub fn timestamp16(now: u64) -> u16 {
@@ -71,6 +140,10 @@ impl RttEstimator {
         let rto = (self.srtt + 4.0 * self.rttvar).ceil() as u64;
         rto.clamp(MIN_RTO, MAX_RTO)
     }
+
+    pub fn srtt(&self) -> f64 {
+        self.srtt
+    }
 }
 
 pub struct Connection {
@@ -83,15 +156,16 @@ pub struct Connection {
 }
 
 impl Connection {
-    /// Server side: binds the first free UDP port in the range (IPv4
-    /// wildcard; mosh additionally tries per-family binds).
-    pub fn server(range: (u16, u16), key: &Key) -> Result<(Connection, u16)> {
+    /// Server side: binds the first free UDP port in the range. With
+    /// `Family::Auto` this is a dual-stack IPv6 socket when the host
+    /// supports it, otherwise an IPv4 wildcard.
+    pub fn server(range: (u16, u16), key: &Key, family: Family) -> Result<(Connection, u16)> {
         let (low, high) = range;
         if low > high || low == 0 {
             return Err(Error::from("invalid port range"));
         }
         for port in low..=high {
-            if let Ok(sock) = UdpSocket::bind((Ipv4Addr::UNSPECIFIED, port)) {
+            if let Ok(sock) = bind_server_socket(port, family) {
                 sock.set_nonblocking(true)?;
                 let conn = Connection {
                     sock,
@@ -135,6 +209,12 @@ impl Connection {
 
     pub fn rto(&self) -> u64 {
         self.rtt.rto()
+    }
+
+    /// mosh's send interval: half the smoothed RTT, clamped. Drives the
+    /// prediction engine's SRTT trigger.
+    pub fn send_interval(&self) -> u64 {
+        ((self.rtt.srtt() / 2.0).ceil() as u64).clamp(SEND_INTERVAL_MIN, SEND_INTERVAL_MAX)
     }
 
     /// Seals and sends one payload. Send errors are swallowed: with roaming,
@@ -240,9 +320,81 @@ mod tests {
     }
 
     #[test]
+    fn family_flag_parsing() {
+        assert_eq!(Family::from_flag("-4"), Some(Family::Inet));
+        assert_eq!(Family::from_flag("-6"), Some(Family::Inet6));
+        assert_eq!(Family::from_flag("-5"), None);
+        assert_eq!(Family::from_flag("--ipv4"), None);
+    }
+
+    #[test]
+    fn send_interval_tracks_srtt() {
+        let key = Key::random();
+        let (conn, _) = Connection::server((61400, 61499), &key, Family::Inet).unwrap();
+        // Initial SRTT is 1000ms -> clamped to the 250ms max.
+        assert_eq!(conn.send_interval(), 250);
+        let mut est = RttEstimator::new();
+        est.sample(10.0);
+        assert_eq!(est.srtt(), 10.0);
+        let interval = ((est.srtt() / 2.0).ceil() as u64).clamp(20, 250);
+        assert_eq!(interval, 20); // clamped to the minimum
+    }
+
+    #[test]
+    fn ipv6_loopback_roundtrip() {
+        let key = Key::random();
+        // Skip quietly on hosts without IPv6.
+        let Ok((mut server, port)) = Connection::server((61700, 61799), &key, Family::Inet6) else {
+            return;
+        };
+        let addr: SocketAddr = format!("[::1]:{port}").parse().unwrap();
+        assert!(addr.is_ipv6());
+        let mut client = Connection::client(addr, &key).unwrap();
+        client.send(b"v6 hello").unwrap();
+        for _ in 0..50 {
+            match server.recv() {
+                Ok(Some(p)) => {
+                    assert_eq!(p, b"v6 hello");
+                    return;
+                }
+                Ok(None) => {}
+                Err(e) if e.kind() == std::io::ErrorKind::WouldBlock => {
+                    std::thread::sleep(std::time::Duration::from_millis(10));
+                }
+                Err(e) => panic!("recv: {e}"),
+            }
+        }
+        panic!("ipv6 datagram never arrived");
+    }
+
+    #[test]
+    fn dual_stack_accepts_ipv4_client() {
+        let key = Key::random();
+        let (mut server, port) = Connection::server((61800, 61899), &key, Family::Auto).unwrap();
+        let addr: SocketAddr = format!("127.0.0.1:{port}").parse().unwrap();
+        let mut client = Connection::client(addr, &key).unwrap();
+        client.send(b"v4 over auto").unwrap();
+        for _ in 0..50 {
+            match server.recv() {
+                Ok(Some(p)) => {
+                    assert_eq!(p, b"v4 over auto");
+                    assert!(server.has_remote());
+                    return;
+                }
+                Ok(None) => {}
+                Err(e) if e.kind() == std::io::ErrorKind::WouldBlock => {
+                    std::thread::sleep(std::time::Duration::from_millis(10));
+                }
+                Err(e) => panic!("recv: {e}"),
+            }
+        }
+        panic!("ipv4 datagram never arrived on the auto-family socket");
+    }
+
+    #[test]
     fn loopback_roundtrip_with_roaming_adoption() {
         let key = Key::random();
-        let (mut server, port) = Connection::server((61500, 61999), &key).unwrap();
+        let (mut server, port) = Connection::server((61500, 61999), &key, Family::Inet).unwrap();
         let addr: SocketAddr = format!("127.0.0.1:{port}").parse().unwrap();
         let mut client = Connection::client(addr, &key).unwrap();
 

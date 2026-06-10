@@ -797,15 +797,23 @@ fn decstr_soft_reset() {
 // --- resize -------------------------------------------------------------------------------
 
 #[test]
-fn resize_pads_and_truncates() {
+fn resize_reflows_primary() {
     let mut t = term();
     feed(&mut t, "hello\r\nworld");
     t.resize(3, 4);
     assert_eq!((t.rows(), t.cols()), (3, 4));
-    assert_eq!(row_text(&t, 0), "hell");
+    // Logical lines rewrapped; the head of the first line scrolled out.
+    assert_eq!(t.screen().scrollback_row(0).unwrap().text(true), "hell");
+    assert_eq!(row_text(&t, 0), "o");
     assert_eq!(row_text(&t, 1), "worl");
+    assert_eq!(row_text(&t, 2), "d");
+    assert_eq!(pos(&t), (2, 1));
+    // Widening rejoins the wrapped lines and restores the original text.
     t.resize(5, 10);
-    assert_eq!(row_text(&t, 0), "hell");
+    assert_eq!(row_text(&t, 0), "hello");
+    assert_eq!(row_text(&t, 1), "world");
+    assert_eq!(pos(&t), (1, 5));
+    assert_eq!(t.screen().scrollback_len(), 0);
 }
 
 #[test]

@@ -45,6 +45,11 @@ impl KittyKeyStack {
         KittyFlags(self.stack.last().copied().unwrap_or(0))
     }
 
+    /// Pushed entries, oldest first (for dump_vt replay).
+    pub fn entries(&self) -> &[u8] {
+        &self.stack
+    }
+
     pub fn push(&mut self, flags: u8) {
         if self.stack.len() >= MAX_STACK {
             self.stack.remove(0);

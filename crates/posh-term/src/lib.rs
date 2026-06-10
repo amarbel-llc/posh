@@ -1,10 +1,12 @@
 //! posh-term: a standalone terminal emulation library.
 //!
 //! This crate is a from-scratch Rust rewrite of the ghostty-vt terminal core.
-//! It has no dependencies and no I/O: callers feed it bytes from a PTY via
+//! It has no dependencies: callers feed it bytes from a PTY via
 //! [`Terminal::process`], query the resulting screen state, and drain any
 //! bytes the emulator wants to send back to the application (query replies)
-//! via [`Terminal::take_responses`].
+//! via [`Terminal::take_responses`]. The only I/O it performs is reading
+//! files named by kitty graphics `t=f`/`t=t` transmissions (shared-memory
+//! `t=s` is answered with `EUNSUPPORTED`).
 //!
 //! # Frozen public API contract
 //!
@@ -33,6 +35,7 @@ mod dump;
 mod graphics;
 mod kitty_keys;
 mod modes;
+mod mouse;
 mod osc;
 mod parser;
 mod screen;
@@ -40,9 +43,10 @@ mod terminal;
 mod wcwidth;
 
 pub use cell::{Cell, Color, Style, UnderlineStyle};
-pub use graphics::{Image, ImageFormat, Placement};
+pub use graphics::{AnimationState, Frame, Image, ImageFormat, Placement};
 pub use kitty_keys::{encode_key, KeyCode, KeyEvent, KeyEventType, KittyFlags, Modifiers};
 pub use modes::{MouseMode, MouseProtocol};
+pub use mouse::{encode_mouse, MouseButton, MouseEvent, MouseEventKind};
 pub use screen::{Row, Screen, SemanticMark};
 pub use terminal::{Cursor, CursorShape, Terminal};
 pub use wcwidth::wcwidth;

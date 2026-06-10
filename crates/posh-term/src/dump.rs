@@ -83,9 +83,16 @@ pub(crate) fn sgr_params(style: &Style) -> String {
 }
 
 /// Pen state tracked while emitting cells, for minimal transitions.
+/// `style.protected` mirrors the target's DECSCA state, which is toggled
+/// with `CSI " q` (SGR emissions never change it).
 struct EmitState {
     style: Style,
     hyperlink: u32,
+}
+
+/// Emits the DECSCA toggle reaching `protected`.
+fn emit_protect(out: &mut String, protected: bool) {
+    out.push_str(if protected { "\x1b[1\"q" } else { "\x1b[0\"q" });
 }
 
 impl Terminal {
@@ -175,9 +182,10 @@ impl Terminal {
                 saved.cursor.row + 1,
                 saved.cursor.col + 1
             );
-            let pf = self.kitty_primary.flags().0;
-            if pf != 0 {
-                let _ = write!(out, "\x1b[={pf};1u");
+            // Replay the primary screen's kitty keyboard stack before
+            // switching (the alt screen's own stack is emitted with modes).
+            for &f in self.kitty_primary.entries() {
+                let _ = write!(out, "\x1b[>{f}u");
             }
             out.push_str("\x1b[?1049h");
             self.draw_grid(&mut out, &self.alt, &mut st);
@@ -244,6 +252,12 @@ impl Terminal {
             if cell.width == 0 {
                 continue; // wide spacer
             }
+            // Sync DECSCA first so the SGR comparison below sees styles
+            // that differ only in real SGR attributes.
+            if cell.style.protected != st.style.protected {
+                emit_protect(out, cell.style.protected);
+                st.style.protected = cell.style.protected;
+            }
             if cell.style != st.style {
                 let _ = write!(out, "\x1b[{}m", sgr_params(&cell.style));
                 st.style = cell.style;
@@ -272,6 +286,10 @@ impl Terminal {
     }
 
     fn reset_pen(&self, out: &mut String, st: &mut EmitState) {
+        if st.style.protected {
+            emit_protect(out, false);
+            st.style.protected = false;
+        }
         if st.style != Style::default() {
             out.push_str("\x1b[0m");
             st.style = Style::default();
@@ -283,6 +301,23 @@ impl Terminal {
     }
 
     fn dump_modes(&self, out: &mut String) {
+        // DECCOLM family first: replaying DECSET 3 homes the cursor and
+        // resets the margins, so it must precede the region and cursor
+        // dumps. DECNCSM is forced on around it to keep the drawn grid.
+        if self.modes.allow_deccolm || self.modes.deccolm {
+            out.push_str("\x1b[?40h");
+        }
+        if self.modes.deccolm && self.cols() == 132 {
+            out.push_str("\x1b[?95h\x1b[?3h");
+            if !self.modes.no_clear_on_deccolm {
+                out.push_str("\x1b[?95l");
+            }
+        } else if self.modes.no_clear_on_deccolm {
+            out.push_str("\x1b[?95h");
+        }
+        if self.modes.deccolm && !self.modes.allow_deccolm {
+            out.push_str("\x1b[?40l");
+        }
         let (top, bot) = self.region();
         if top != 0 || bot != self.rows() - 1 {
             let _ = write!(out, "\x1b[{};{}r", top + 1, bot + 1);
@@ -290,11 +325,16 @@ impl Terminal {
         if self.modes.origin {
             out.push_str("\x1b[?6h");
         }
-        if self.cursor.g0 == Charset::DecSpecial {
-            out.push_str("\x1b(0");
+        self.dump_tabs(out);
+        match self.cursor.g0 {
+            Charset::DecSpecial => out.push_str("\x1b(0"),
+            Charset::Uk => out.push_str("\x1b(A"),
+            Charset::Ascii => {}
         }
-        if self.cursor.g1 == Charset::DecSpecial {
-            out.push_str("\x1b)0");
+        match self.cursor.g1 {
+            Charset::DecSpecial => out.push_str("\x1b)0"),
+            Charset::Uk => out.push_str("\x1b)A"),
+            Charset::Ascii => {}
         }
         if self.cursor.shift == 1 {
             out.push('\x0e');
@@ -319,6 +359,9 @@ impl Terminal {
         }
         if self.modes.focus_reporting {
             out.push_str("\x1b[?1004h");
+        }
+        if self.modes.synchronized {
+            out.push_str("\x1b[?2026h");
         }
         if self.modes.insert {
             out.push_str("\x1b[4h");
@@ -348,9 +391,28 @@ impl Terminal {
         if let Some(p) = proto {
             let _ = write!(out, "\x1b[?{p}h");
         }
-        let kf = self.kitty_flags().0;
-        if kf != 0 {
-            let _ = write!(out, "\x1b[={kf};1u");
+        // Replay the active screen's kitty keyboard stack push by push so
+        // later pops on the target find the same entries.
+        let stack = if self.alt_active {
+            &self.kitty_alt
+        } else {
+            &self.kitty_primary
+        };
+        for &f in stack.entries() {
+            let _ = write!(out, "\x1b[>{f}u");
+        }
+    }
+
+    /// Re-creates non-default tab stops: clear all, then HTS at each.
+    fn dump_tabs(&self, out: &mut String) {
+        if self.tabs == crate::terminal::default_tabs(self.cols()) {
+            return;
+        }
+        out.push_str("\x1b[3g");
+        for (i, &t) in self.tabs.iter().enumerate() {
+            if t {
+                let _ = write!(out, "\x1b[1;{}H\x1bH", i + 1);
+            }
         }
     }
 
@@ -359,6 +421,10 @@ impl Terminal {
             let _ = write!(out, "\x1b[{} q", self.cursor_style_raw);
         }
         // Restore the application's pen and hyperlink state.
+        if self.cursor.style.protected != st.style.protected {
+            emit_protect(out, self.cursor.style.protected);
+            st.style.protected = self.cursor.style.protected;
+        }
         if self.cursor.style != st.style {
             let _ = write!(out, "\x1b[{}m", sgr_params(&self.cursor.style));
             st.style = self.cursor.style;
@@ -381,16 +447,27 @@ impl Terminal {
             self.cursor.col + 1
         );
         if self.cursor.pending_wrap {
-            // Re-print the final cell to regenerate the pending-wrap state.
+            // Re-print the final cell to regenerate the pending-wrap state,
+            // then restore the pen (SGR and DECSCA independently).
             if let Some(cell) = self.scr().cell(self.cursor.row, self.cursor.col) {
                 if cell.width == 1 {
-                    if cell.style != st.style {
+                    let pen = st.style;
+                    let toggle = cell.style.protected != pen.protected;
+                    let mut sgr_want = cell.style;
+                    sgr_want.protected = pen.protected;
+                    if toggle {
+                        emit_protect(out, cell.style.protected);
+                    }
+                    if sgr_want != pen {
                         let _ = write!(out, "\x1b[{}m", sgr_params(&cell.style));
                     }
                     out.push(if cell.ch == '\0' { ' ' } else { cell.ch });
                     out.extend(cell.extra.iter());
-                    if cell.style != st.style {
-                        let _ = write!(out, "\x1b[{}m", sgr_params(&st.style));
+                    if sgr_want != pen {
+                        let _ = write!(out, "\x1b[{}m", sgr_params(&pen));
+                    }
+                    if toggle {
+                        emit_protect(out, pen.protected);
                     }
                 }
             }

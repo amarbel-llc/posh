@@ -55,9 +55,19 @@ relies on fully supported:
   roundtrip tests). This is what powers session replay on attach and remote
   state sync.
 
-Known simplifications: resize truncates/pads rather than reflowing; DECCOLM
-is ignored; graphics animation and shared-memory transmission answer with
-error ACKs.
+Also implemented: reflow on resize (logical lines rewrap via wrap flags,
+wide-char aware, scrollback included; alt screen truncates/pads like kitty),
+DECCOLM/DECNCSM column switching, kitty graphics relative placements and
+animation frame storage with the full delete-specifier set, file-based
+graphics transmission, OSC 52 per-selection slots, the xterm color stack
+(XTPUSHCOLORS/XTPOPCOLORS/XTREPORTCOLORS), DECSTR soft reset, selective
+erase (DECSCA/DECSED/DECSEL), and a client-side `encode_mouse` covering
+X10/normal/UTF-8/SGR/SGR-pixel.
+
+Known simplifications: PNG payloads are stored, not decoded; animation
+frames are stored, not composited; shared-memory graphics transmission
+answers EUNSUPPORTED; OSC 66 text sizing is parsed but scale is not
+rendered.
 
 ### crates/posh
 
@@ -68,10 +78,14 @@ originals.
 
 ```
 posh attach <name> [command...]    # or bare: posh <name>; detach: Ctrl-\
-posh list [--short]
+posh list [--short|--json]
 posh run <name> [--] <command...>
-posh detach [<name>]
+posh fork [<name>]                 # fork current session (same cmd + cwd)
+posh detach [<name>] | detach-all
 posh kill <name>
+posh groups
+posh history <name> [--vt]
+posh completions <bash|zsh|fish>
 ```
 
 Daemon-per-session over Unix sockets with zmx's binary IPC framing (1-byte
@@ -85,9 +99,9 @@ Sessions export `POSH_SESSION`/`POSH_GROUP`.
 **Remote roaming (mosh port):**
 
 ```
-posh ssh [user@]host [-- command]  # bootstrap over ssh, like mosh(1)
-posh server [new] [-p PORT[:PORT2]] [-- command...]
-posh client <host> <port>          # key via POSH_KEY, never on argv
+posh ssh [-4|-6] [-p RANGE] [user@]host [-- command]   # like mosh(1)
+posh server [new] [-p PORT[:PORT2]] [-4|-6] [-- command...]
+posh client [-4|-6] <host> <port>  # key via POSH_KEY, never on argv
 ```
 
 Encrypted UDP datagrams using AES-128-GCM with mosh's nonce layout
@@ -98,9 +112,23 @@ authenticated datagram. State sync sends complete `dump_vt()` frames (or a
 prefix/suffix diff against the last acked frame); user input is delivered
 reliably via cumulative offsets and retransmission.
 
-Known simplifications relative to mosh: no speculative local echo /
-prediction overlay, no mosh SSP protobuf instructions or zlib, IPv4 only,
-no port hopping or utmp integration.
+The client renders mosh-style: it maintains a local `posh_term::Terminal`,
+morphs the real tty with minimal per-cell diffs (a port of
+`terminaldisplay.cc`), and runs a faithful port of mosh's prediction engine
+(`terminaloverlay.cc`): speculative local echo with epochs, confirmation
+against server echo-acks, adaptive display with mosh's SRTT/glitch/flagging
+constants, and underlined predictions when the link is slow
+(`POSH_PREDICTION`: always/never/adaptive/experimental). A reverse-video
+"Last contact N seconds ago" banner appears after 6.5s of silence; the quit
+sequence is Ctrl-^ then `.`. Servers bind dual-stack IPv6 when possible,
+report `POSH IP` from `$SSH_CONNECTION` for the ssh wrapper, require UTF-8
+locales on both ends (forwarding LANG/LC_* over ssh), and honor
+`POSH_SERVER_NETWORK_TMOUT` / `POSH_SERVER_SIGNAL_TMOUT`.
+
+Known simplifications relative to mosh: frames carry `dump_vt()` state (or
+a prefix/suffix diff) rather than mosh's SSP protobuf instructions with
+zlib; no utmp/motd integration; the diff renderer does not use scroll
+optimization.
 
 ## Building and testing
 
@@ -109,8 +137,9 @@ cargo build --workspace
 cargo test  --workspace
 ```
 
-The workspace builds warning-free and carries ~195 tests (parser state
-machine, UTF-8 and wide-char edge cases, SGR colon forms, kitty keyboard
-encode vectors, graphics ACK paths, dump_vt roundtrips, IPC framing, crypto
-seal/open/replay/tamper, fragmentation, RTT, and daemon lifecycle
-integration tests).
+The workspace builds warning-free and carries ~340 tests (parser state
+machine, UTF-8 and wide-char edge cases, reflow, SGR colon forms, kitty
+keyboard encode vectors, graphics ACK paths, dump_vt roundtrips, IPC
+framing, crypto seal/open/replay/tamper, fragmentation, RTT, prediction
+engine state transitions with injected clocks, display-diff morphing
+roundtrips, IPv6 loopback, and daemon lifecycle integration tests).

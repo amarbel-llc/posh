@@ -3,7 +3,7 @@
 use crate::cell::{Cell, Color, Style, UnderlineStyle};
 use crate::modes::{MouseMode, MouseProtocol};
 use crate::parser::{param, param_or};
-use crate::terminal::Terminal;
+use crate::terminal::{ColorStackEntry, Terminal};
 
 impl Terminal {
     pub(crate) fn csi_dispatch(
@@ -41,8 +41,11 @@ impl Terminal {
                     self.horizontal_tab();
                 }
             }
-            (0 | b'?', None, b'J') => self.erase_display(param(params, 0, 0)),
-            (0 | b'?', None, b'K') => self.erase_line(param(params, 0, 0)),
+            (0, None, b'J') => self.erase_display(param(params, 0, 0), false),
+            (0, None, b'K') => self.erase_line(param(params, 0, 0), false),
+            // DECSED / DECSEL: selective erase honors DECSCA protection.
+            (b'?', None, b'J') => self.erase_display(param(params, 0, 0), true),
+            (b'?', None, b'K') => self.erase_line(param(params, 0, 0), true),
             (0, None, b'L') => self.insert_lines(param_or(params, 0, 1)),
             (0, None, b'M') => self.delete_lines(param_or(params, 0, 1)),
             (0, None, b'P') => self.delete_chars(param_or(params, 0, 1)),
@@ -136,6 +139,13 @@ impl Terminal {
             (b'?', Some(b'$'), b'p') => self.decrqm_dec(param(params, 0, 0)),
             (0, Some(b'$'), b'p') => self.decrqm_ansi(param(params, 0, 0)),
             (0, Some(b'!'), b'p') => self.soft_reset(),
+            (0, Some(b'"'), b'q') => {
+                // DECSCA: 1 = protected, 0/2 = unprotected.
+                self.cursor.style.protected = param(params, 0, 0) == 1;
+            }
+            (0, Some(b'#'), b'P') => self.push_colors(),
+            (0, Some(b'#'), b'Q') => self.pop_colors(),
+            (0, Some(b'#'), b'R') => self.report_colors(),
             (0, Some(b' '), b'q') => {
                 // DECSCUSR
                 let n = param(params, 0, 0);
@@ -241,7 +251,29 @@ impl Terminal {
 
     // --- erase / edit -----------------------------------------------------------
 
-    fn erase_display(&mut self, mode: u16) {
+    /// One cell of ED/EL; the selective forms (DECSED/DECSEL) skip cells
+    /// protected by DECSCA.
+    fn erase_cell(&mut self, row: u16, col: u16, style: Style, selective: bool) {
+        let cell = self.scr_mut().cell_mut(row, col);
+        if selective && cell.style.protected {
+            return;
+        }
+        *cell = Cell::blank(style);
+    }
+
+    fn erase_row(&mut self, r: u16, style: Style, selective: bool) {
+        if selective {
+            for c in 0..self.cols() {
+                self.erase_cell(r, c, style, true);
+            }
+            self.scr_mut().row_mut(r).wrapped = false;
+        } else {
+            let cols = self.cols() as usize;
+            *self.scr_mut().row_mut(r) = crate::screen::Row::blank(cols, style);
+        }
+    }
+
+    fn erase_display(&mut self, mode: u16, selective: bool) {
         let style = self.blank_style();
         let (rows, cols) = (self.rows(), self.cols());
         let (row, col) = (self.cursor.row, self.cursor.col);
@@ -249,29 +281,33 @@ impl Terminal {
         match mode {
             0 => {
                 for c in col..cols {
-                    *self.scr_mut().cell_mut(row, c) = Cell::blank(style);
+                    self.erase_cell(row, c, style, selective);
                 }
                 self.scr_mut().row_mut(row).wrapped = false;
                 for r in row + 1..rows {
-                    *self.scr_mut().row_mut(r) = crate::screen::Row::blank(cols as usize, style);
+                    self.erase_row(r, style, selective);
                 }
             }
             1 => {
                 for r in 0..row {
-                    *self.scr_mut().row_mut(r) = crate::screen::Row::blank(cols as usize, style);
+                    self.erase_row(r, style, selective);
                 }
                 for c in 0..=col {
-                    *self.scr_mut().cell_mut(row, c) = Cell::blank(style);
+                    self.erase_cell(row, c, style, selective);
                 }
             }
-            2 => self.scr_mut().clear_grid(style),
+            2 => {
+                for r in 0..rows {
+                    self.erase_row(r, style, selective);
+                }
+            }
             3 => self.scr_mut().clear_scrollback(),
             _ => {}
         }
         self.touch();
     }
 
-    fn erase_line(&mut self, mode: u16) {
+    fn erase_line(&mut self, mode: u16, selective: bool) {
         let style = self.blank_style();
         let cols = self.cols();
         let (row, col) = (self.cursor.row, self.cursor.col);
@@ -283,7 +319,7 @@ impl Terminal {
             _ => return,
         };
         for c in from..=to {
-            *self.scr_mut().cell_mut(row, c) = Cell::blank(style);
+            self.erase_cell(row, c, style, selective);
         }
         if mode == 0 || mode == 2 {
             self.scr_mut().row_mut(row).wrapped = false;
@@ -387,6 +423,7 @@ impl Terminal {
     pub(crate) fn set_dec_mode(&mut self, n: u16, set: bool) {
         match n {
             1 => self.modes.cursor_keys = set,
+            3 => self.set_deccolm(set),
             5 => self.modes.reverse_video = set,
             6 => {
                 self.modes.origin = set;
@@ -402,6 +439,8 @@ impl Terminal {
             9 => self.modes.mouse_mode = if set { MouseMode::X10 } else { MouseMode::None },
             12 => self.modes.cursor_blink = set,
             25 => self.modes.cursor_visible = set,
+            40 => self.modes.allow_deccolm = set,
+            95 => self.modes.no_clear_on_deccolm = set,
             47 | 1047 | 1049 => self.set_alt_screen(n, set),
             66 => self.modes.keypad_app = set,
             1000 => {
@@ -466,6 +505,7 @@ impl Terminal {
         let b = |v: bool| if v { 1 } else { 2 };
         match n {
             1 => b(self.modes.cursor_keys),
+            3 => b(self.modes.deccolm),
             5 => b(self.modes.reverse_video),
             6 => b(self.modes.origin),
             7 => b(self.modes.autowrap),
@@ -473,6 +513,8 @@ impl Terminal {
             9 => b(self.modes.mouse_mode == MouseMode::X10),
             12 => b(self.modes.cursor_blink),
             25 => b(self.modes.cursor_visible),
+            40 => b(self.modes.allow_deccolm),
+            95 => b(self.modes.no_clear_on_deccolm),
             47 | 1047 | 1049 => b(self.alt_active),
             66 => b(self.modes.keypad_app),
             1000 => b(self.modes.mouse_mode == MouseMode::Normal),
@@ -482,6 +524,9 @@ impl Terminal {
             1005 => b(self.modes.mouse_protocol == MouseProtocol::Utf8),
             1006 => b(self.modes.mouse_protocol == MouseProtocol::Sgr),
             1016 => b(self.modes.mouse_protocol == MouseProtocol::SgrPixel),
+            // DECSC save/restore (1048) carries no queryable state: it is
+            // reported as reset, matching a terminal that never blocks it.
+            1048 => 2,
             2004 => b(self.modes.bracketed_paste),
             2026 => b(self.modes.synchronized),
             _ => 0,
@@ -536,12 +581,51 @@ impl Terminal {
         }
     }
 
+    // --- color stack -----------------------------------------------------------
+
+    /// XTPUSHCOLORS (CSI # P): saves the palette and dynamic colors.
+    /// xterm keeps up to 10 entries; pushing past that drops the oldest.
+    fn push_colors(&mut self) {
+        if self.color_stack.len() >= 10 {
+            self.color_stack.remove(0);
+        }
+        self.color_stack.push(ColorStackEntry {
+            palette: self.palette,
+            fg: self.fg_color,
+            bg: self.bg_color,
+            cursor: self.cursor_color,
+        });
+    }
+
+    /// XTPOPCOLORS (CSI # Q).
+    fn pop_colors(&mut self) {
+        if let Some(e) = self.color_stack.pop() {
+            self.palette = e.palette;
+            self.fg_color = e.fg;
+            self.bg_color = e.bg;
+            self.cursor_color = e.cursor;
+            self.touch();
+        }
+    }
+
+    /// XTREPORTCOLORS (CSI # R): replies `CSI ? Pi ; Ps # Q` with the
+    /// current stack entry and the number of entries stored.
+    fn report_colors(&mut self) {
+        let n = self.color_stack.len();
+        let resp = format!("\x1b[?{n};{n}#Q");
+        self.respond(&resp);
+    }
+
     // --- SGR -----------------------------------------------------------------
 
     pub(crate) fn sgr(&mut self, params: &[Vec<u16>]) {
+        // DECSCA protection rides in Style but is not an SGR attribute:
+        // SGR 0 must not clear it.
+        let protected = self.cursor.style.protected;
         let style = &mut self.cursor.style;
         if params.is_empty() {
             *style = Style::default();
+            style.protected = protected;
             return;
         }
         let mut i = 0;
@@ -612,6 +696,7 @@ impl Terminal {
             }
             i += 1;
         }
+        self.cursor.style.protected = protected;
         self.touch();
     }
 }

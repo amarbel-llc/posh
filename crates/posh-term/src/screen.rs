@@ -62,7 +62,7 @@ impl Row {
     }
 
     /// Plain text of the row; `trim` removes trailing whitespace.
-    pub(crate) fn text(&self, trim: bool) -> String {
+    pub fn text(&self, trim: bool) -> String {
         let mut s = String::new();
         for cell in &self.cells {
             if cell.width == 0 {
@@ -184,30 +184,31 @@ impl Screen {
         }
     }
 
-    /// Resizes the grid. Width changes truncate or pad each row (no
-    /// reflow); height changes exchange rows with the scrollback buffer
-    /// when `use_scrollback` is set, keeping the cursor row in view.
-    pub(crate) fn resize(
-        &mut self,
-        rows: u16,
-        cols: u16,
-        cursor_row: &mut u16,
-        use_scrollback: bool,
-    ) {
+    /// Resizes the grid. With `reflow` set (primary screen), width changes
+    /// rewrap logical lines kitty-style and the cursor follows its logical
+    /// cell; otherwise each row truncates or pads (alt screen). Height
+    /// changes exchange rows with the scrollback buffer when `reflow` is
+    /// set, keeping the cursor row in view.
+    pub(crate) fn resize(&mut self, rows: u16, cols: u16, cursor: &mut (u16, u16), reflow: bool) {
         let rows = rows.max(1);
         let cols = cols.max(1);
         if cols != self.cols {
-            for row in &mut self.grid {
-                row.resize_width(cols as usize);
+            if reflow {
+                self.reflow_width(cols, cursor);
+            } else {
+                for row in &mut self.grid {
+                    row.resize_width(cols as usize);
+                }
+                for row in &mut self.scrollback {
+                    row.resize_width(cols as usize);
+                }
+                self.cols = cols;
             }
-            for row in &mut self.scrollback {
-                row.resize_width(cols as usize);
-            }
-            self.cols = cols;
+            cursor.1 = cursor.1.min(cols - 1);
         }
         let target = rows as usize;
         while self.grid.len() > target {
-            let cursor_at_end = (*cursor_row as usize) >= self.grid.len() - 1;
+            let cursor_at_end = (cursor.0 as usize) >= self.grid.len() - 1;
             let bottom_blank = self
                 .grid
                 .last()
@@ -215,7 +216,7 @@ impl Screen {
                 .unwrap_or(true);
             if bottom_blank && !cursor_at_end {
                 self.grid.pop();
-            } else if use_scrollback {
+            } else if reflow {
                 let row = self.grid.remove(0);
                 if self.max_scrollback > 0 {
                     if self.scrollback.len() >= self.max_scrollback {
@@ -223,23 +224,204 @@ impl Screen {
                     }
                     self.scrollback.push_back(row);
                 }
-                *cursor_row = cursor_row.saturating_sub(1);
+                cursor.0 = cursor.0.saturating_sub(1);
             } else {
                 self.grid.pop();
             }
         }
         while self.grid.len() < target {
-            if use_scrollback {
+            if reflow {
                 if let Some(row) = self.scrollback.pop_back() {
                     self.grid.insert(0, row);
-                    *cursor_row = (*cursor_row).saturating_add(1);
+                    cursor.0 = cursor.0.saturating_add(1);
                     continue;
                 }
             }
             self.grid.push(Row::blank(cols as usize, Style::default()));
         }
         self.rows = rows;
-        *cursor_row = (*cursor_row).min(rows - 1);
+        cursor.0 = cursor.0.min(rows - 1);
+    }
+
+    /// Rewraps every logical line (scrollback included) to `new_cols`,
+    /// keeping the cursor on the cell it occupied within its logical line.
+    /// Wide characters never split: one that no longer fits at a line's end
+    /// moves to the next row, leaving blank padding behind (kitty behavior).
+    fn reflow_width(&mut self, new_cols: u16, cursor: &mut (u16, u16)) {
+        let width = new_cols as usize;
+        let cursor_abs = self.scrollback.len() + cursor.0 as usize;
+
+        let mut old: Vec<Row> = self.scrollback.drain(..).collect();
+        old.append(&mut self.grid);
+        // Drop trailing all-blank rows (below the cursor) so padding at the
+        // bottom of the grid does not push content into scrollback.
+        while old.len() > cursor_abs + 1 {
+            let last = old.last().unwrap();
+            if last.cells.iter().all(|c| c.is_dump_skippable()) && !last.wrapped {
+                old.pop();
+            } else {
+                break;
+            }
+        }
+
+        let mut new_rows: Vec<Row> = Vec::new();
+        let mut new_cursor: Option<(usize, u16)> = None;
+        let mut i = 0;
+        while i < old.len() {
+            // Unwrap one logical line.
+            let mut line: Vec<Cell> = Vec::new();
+            let mut mark = None;
+            let mut cursor_off: Option<usize> = None;
+            loop {
+                let row = &mut old[i];
+                if mark.is_none() {
+                    mark = row.mark;
+                }
+                if i == cursor_abs {
+                    cursor_off = Some(line.len() + cursor.1 as usize);
+                }
+                let wrapped = row.wrapped;
+                line.append(&mut row.cells);
+                i += 1;
+                if !wrapped || i == old.len() {
+                    break;
+                }
+            }
+            // Trim trailing blanks, but never past the cursor cell.
+            let mut keep = line
+                .iter()
+                .rposition(|c| !c.is_dump_skippable())
+                .map(|p| p + 1)
+                .unwrap_or(0);
+            if let Some(off) = cursor_off {
+                keep = keep.max(off + 1);
+            }
+            line.truncate(keep);
+
+            // Rewrap the logical line to the new width.
+            let first_new = new_rows.len();
+            let mut cur: Vec<Cell> = Vec::with_capacity(width);
+            let mut j = 0;
+            while j < line.len() {
+                let cell = &line[j];
+                if cell.width == 0 {
+                    // Spacers are re-synthesized after their head.
+                    if cursor_off == Some(j) && new_cursor.is_none() {
+                        new_cursor = Some((new_rows.len(), cur.len().min(width - 1) as u16));
+                    }
+                    j += 1;
+                    continue;
+                }
+                let w = cell.width.max(1) as usize;
+                if w > width {
+                    // A wide char cannot fit at any position: blank it.
+                    if let Some(off) = cursor_off {
+                        if off == j || off == j + 1 {
+                            new_cursor = Some((new_rows.len(), cur.len() as u16));
+                        }
+                    }
+                    let skip = if line.get(j + 1).map(|c| c.width == 0).unwrap_or(false) {
+                        2
+                    } else {
+                        1
+                    };
+                    cur.push(Cell::blank(Style::default()));
+                    j += skip;
+                    if cur.len() == width && j < line.len() {
+                        new_rows.push(Row {
+                            cells: std::mem::take(&mut cur),
+                            wrapped: true,
+                            mark: None,
+                        });
+                    }
+                    continue;
+                }
+                if cur.len() + w > width {
+                    // Wide char at the edge: pad and move it to the next row.
+                    while cur.len() < width {
+                        cur.push(Cell::blank(Style::default()));
+                    }
+                    new_rows.push(Row {
+                        cells: std::mem::take(&mut cur),
+                        wrapped: true,
+                        mark: None,
+                    });
+                }
+                if let Some(off) = cursor_off {
+                    if off == j || (w == 2 && off == j + 1) {
+                        new_cursor = Some((new_rows.len(), (cur.len() + (off - j)) as u16));
+                    }
+                }
+                let head = cell.clone();
+                let spacer = Cell {
+                    ch: '\0',
+                    style: head.style,
+                    width: 0,
+                    extra: Vec::new(),
+                    hyperlink: head.hyperlink,
+                };
+                cur.push(head);
+                if w == 2 {
+                    cur.push(spacer);
+                    // Consume the original spacer when it survived trimming.
+                    j += if line.get(j + 1).map(|c| c.width == 0).unwrap_or(false) {
+                        2
+                    } else {
+                        1
+                    };
+                } else {
+                    j += 1;
+                }
+                if cur.len() == width && j < line.len() {
+                    new_rows.push(Row {
+                        cells: std::mem::take(&mut cur),
+                        wrapped: true,
+                        mark: None,
+                    });
+                }
+            }
+            cur.resize(width, Cell::blank(Style::default()));
+            new_rows.push(Row {
+                cells: cur,
+                wrapped: false,
+                mark: None,
+            });
+            new_rows[first_new].mark = mark;
+            if cursor_off.is_some() && new_cursor.is_none() {
+                // Fallback: cursor cell vanished (orphan spacer); park it at
+                // the end of the rewrapped line.
+                let last = new_rows.len() - 1;
+                let col = new_rows[last]
+                    .cells
+                    .iter()
+                    .rposition(|c| !c.is_dump_skippable())
+                    .map(|p| p + 1)
+                    .unwrap_or(0)
+                    .min(width - 1);
+                new_cursor = Some((last, col as u16));
+            }
+        }
+
+        let (cur_abs, cur_col) = new_cursor.unwrap_or((0, 0));
+        let total = new_rows.len();
+        let mut start = total.saturating_sub(self.rows as usize);
+        if cur_abs < start {
+            // Keep the cursor on screen even if rows below it overflow.
+            start = cur_abs;
+            new_rows.truncate(start + self.rows as usize);
+        }
+        let grid = new_rows.split_off(start);
+        let mut scrollback: VecDeque<Row> = new_rows.into();
+        while scrollback.len() > self.max_scrollback {
+            scrollback.pop_front();
+        }
+        self.grid = grid;
+        self.scrollback = scrollback;
+        self.cols = new_cols;
+        while self.grid.len() < self.rows as usize {
+            self.grid.push(Row::blank(width, Style::default()));
+        }
+        *cursor = ((cur_abs - start) as u16, cur_col);
     }
 }
 
@@ -291,13 +473,26 @@ mod tests {
     }
 
     #[test]
-    fn resize_narrower_truncates() {
+    fn resize_narrower_reflows() {
         let mut s = Screen::new(2, 8, 10);
         put(&mut s, 0, "abcdefgh");
-        let mut cur = 0u16;
+        let mut cur = (0u16, 0u16);
         s.resize(2, 4, &mut cur, true);
-        assert_eq!(s.row(0).unwrap().text(true), "abcd");
         assert_eq!(s.cols(), 4);
+        assert_eq!(s.row(0).unwrap().text(true), "abcd");
+        assert!(s.row(0).unwrap().wrapped());
+        assert_eq!(s.row(1).unwrap().text(true), "efgh");
+        assert!(!s.row(1).unwrap().wrapped());
+    }
+
+    #[test]
+    fn resize_narrower_without_reflow_truncates() {
+        let mut s = Screen::new(2, 8, 0);
+        put(&mut s, 0, "abcdefgh");
+        let mut cur = (0u16, 0u16);
+        s.resize(2, 4, &mut cur, false);
+        assert_eq!(s.row(0).unwrap().text(true), "abcd");
+        assert!(!s.row(0).unwrap().wrapped());
     }
 
     #[test]
@@ -307,12 +502,12 @@ mod tests {
         put(&mut s, 1, "b");
         put(&mut s, 2, "c");
         put(&mut s, 3, "d");
-        let mut cur = 3u16;
+        let mut cur = (3u16, 0u16);
         s.resize(2, 10, &mut cur, true);
         assert_eq!(s.scrollback_len(), 2);
         assert_eq!(s.row(0).unwrap().text(true), "c");
         assert_eq!(s.row(1).unwrap().text(true), "d");
-        assert_eq!(cur, 1);
+        assert_eq!(cur.0, 1);
     }
 
     #[test]
@@ -320,23 +515,23 @@ mod tests {
         let mut s = Screen::new(2, 10, 10);
         put(&mut s, 0, "x");
         s.scroll_up(0, 1, 1, true, Style::default());
-        let mut cur = 1u16;
+        let mut cur = (1u16, 0u16);
         s.resize(3, 10, &mut cur, true);
         assert_eq!(s.scrollback_len(), 0);
         assert_eq!(s.row(0).unwrap().text(true), "x");
-        assert_eq!(cur, 2);
+        assert_eq!(cur.0, 2);
     }
 
     #[test]
     fn resize_shrink_trims_blank_bottom_first() {
         let mut s = Screen::new(4, 10, 10);
         put(&mut s, 0, "a");
-        let mut cur = 0u16;
+        let mut cur = (0u16, 0u16);
         s.resize(2, 10, &mut cur, true);
         // Blank bottom rows were trimmed; nothing went to scrollback.
         assert_eq!(s.scrollback_len(), 0);
         assert_eq!(s.row(0).unwrap().text(true), "a");
-        assert_eq!(cur, 0);
+        assert_eq!(cur.0, 0);
     }
 
     #[test]
@@ -352,9 +547,71 @@ mod tests {
             c.ch = '\0';
             c.width = 0;
         }
-        let mut cur = 0u16;
+        let mut cur = (0u16, 0u16);
         s.resize(1, 3, &mut cur, false);
         assert!(s.cell(0, 2).unwrap().is_blank());
         assert_eq!(s.cell(0, 2).unwrap().width, 1);
+    }
+
+    #[test]
+    fn reflow_widen_rejoins_wrapped_lines() {
+        let mut s = Screen::new(3, 4, 10);
+        put(&mut s, 0, "abcd");
+        s.row_mut(0).wrapped = true;
+        put(&mut s, 1, "ef");
+        let mut cur = (1u16, 2u16);
+        s.resize(3, 10, &mut cur, true);
+        assert_eq!(s.row(0).unwrap().text(true), "abcdef");
+        assert!(!s.row(0).unwrap().wrapped());
+        assert_eq!(cur, (0, 6));
+    }
+
+    #[test]
+    fn reflow_cursor_follows_logical_cell() {
+        let mut s = Screen::new(3, 8, 10);
+        put(&mut s, 0, "abcdefgh");
+        s.row_mut(0).wrapped = true;
+        put(&mut s, 1, "ij");
+        // Cursor on 'g' (logical offset 6).
+        let mut cur = (0u16, 6u16);
+        s.resize(3, 4, &mut cur, true);
+        assert_eq!(s.row(1).unwrap().text(true), "efgh");
+        assert_eq!(cur, (1, 2));
+    }
+
+    #[test]
+    fn reflow_moves_unfit_wide_char_to_next_row() {
+        let mut s = Screen::new(2, 6, 10);
+        put(&mut s, 0, "abcd");
+        {
+            let c = s.cell_mut(0, 4);
+            c.ch = '中';
+            c.width = 2;
+        }
+        {
+            let c = s.cell_mut(0, 5);
+            c.ch = '\0';
+            c.width = 0;
+        }
+        let mut cur = (0u16, 0u16);
+        s.resize(2, 5, &mut cur, true);
+        // The wide char cannot straddle column 5: it moves down whole.
+        assert_eq!(s.row(0).unwrap().text(true), "abcd");
+        assert!(s.row(0).unwrap().wrapped());
+        assert_eq!(s.cell(1, 0).unwrap().ch, '中');
+        assert_eq!(s.cell(1, 0).unwrap().width, 2);
+    }
+
+    #[test]
+    fn reflow_scrollback_rewraps_too() {
+        let mut s = Screen::new(2, 8, 10);
+        put(&mut s, 0, "12345678");
+        s.scroll_up(0, 1, 1, true, Style::default());
+        let mut cur = (0u16, 0u16);
+        s.resize(2, 4, &mut cur, true);
+        let joined: Vec<String> = (0..s.scrollback_len())
+            .map(|i| s.scrollback_row(i).unwrap().text(true))
+            .collect();
+        assert!(joined.concat().contains("1234"), "{joined:?}");
     }
 }

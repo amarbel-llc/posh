@@ -4,6 +4,8 @@
 pub mod client;
 pub mod crypto;
 pub mod datagram;
+pub mod display;
+pub mod predict;
 pub mod server;
 pub mod sshwrap;
 pub mod sync;

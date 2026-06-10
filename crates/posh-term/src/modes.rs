@@ -57,6 +57,12 @@ pub(crate) struct Modes {
     pub reverse_video: bool,
     /// DECSET 12: cursor blink override.
     pub cursor_blink: bool,
+    /// DECCOLM (DECSET 3): 132-column mode.
+    pub deccolm: bool,
+    /// DECSET 40: allow DECCOLM (xterm gates mode 3 behind this).
+    pub allow_deccolm: bool,
+    /// DECNCSM (DECSET 95): DECCOLM does not clear the screen.
+    pub no_clear_on_deccolm: bool,
     pub mouse_mode: MouseMode,
     pub mouse_protocol: MouseProtocol,
 }
@@ -77,6 +83,9 @@ impl Default for Modes {
             keypad_app: false,
             reverse_video: false,
             cursor_blink: false,
+            deccolm: false,
+            allow_deccolm: false,
+            no_clear_on_deccolm: false,
             mouse_mode: MouseMode::None,
             mouse_protocol: MouseProtocol::Normal,
         }

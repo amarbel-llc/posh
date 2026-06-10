@@ -92,6 +92,67 @@ pub fn decode_session_name(encoded: &str) -> String {
 }
 
 // ---------------------------------------------------------------------------
+// Locale checks (mosh locale_utils.cc port): posh moves raw UTF-8 bytes
+// between the endpoints, so both sides must run a UTF-8 charset.
+
+/// The variable controlling LC_CTYPE: LC_ALL > LC_CTYPE > LANG. Returns
+/// (variable name, value); empty name when none is set.
+pub fn ctype_locale(
+    lc_all: Option<&str>,
+    lc_ctype: Option<&str>,
+    lang: Option<&str>,
+) -> (String, String) {
+    for (name, value) in [("LC_ALL", lc_all), ("LC_CTYPE", lc_ctype), ("LANG", lang)] {
+        if let Some(v) = value.filter(|v| !v.is_empty()) {
+            return (name.to_string(), v.to_string());
+        }
+    }
+    (String::new(), String::new())
+}
+
+/// Charset implied by a locale value: the codeset after '.', with any
+/// '@modifier' stripped. Bare "C"/"POSIX" (and unset) mean US-ASCII.
+pub fn locale_charset(value: &str) -> String {
+    let v = value.split('@').next().unwrap_or(value);
+    let cs = match v.split_once('.') {
+        Some((_, cs)) => cs,
+        None => v,
+    };
+    match cs {
+        "" | "C" | "POSIX" | "ANSI_X3.4-1968" => "US-ASCII".to_string(),
+        other => other.to_string(),
+    }
+}
+
+pub fn charset_is_utf8(charset: &str) -> bool {
+    charset.eq_ignore_ascii_case("UTF-8") || charset.eq_ignore_ascii_case("utf8")
+}
+
+/// Refuses to run without a UTF-8 charset, with the mosh-style explanation.
+pub fn check_utf8_locale(program: &str) -> Result<()> {
+    let env = |k: &str| std::env::var(k).ok();
+    let (name, value) = ctype_locale(
+        env("LC_ALL").as_deref(),
+        env("LC_CTYPE").as_deref(),
+        env("LANG").as_deref(),
+    );
+    let charset = locale_charset(&value);
+    if charset_is_utf8(&charset) {
+        return Ok(());
+    }
+    let var = if name.is_empty() {
+        "[no charset variables]".to_string()
+    } else {
+        format!("{name}={value}")
+    };
+    Err(Error(format!(
+        "{program} needs a UTF-8 native locale to run.\n\n\
+         Unfortunately, the environment ({var}) specifies\n\
+         the character set \"{charset}\"."
+    )))
+}
+
+// ---------------------------------------------------------------------------
 // poll() and raw-fd helpers
 
 pub fn pollfd(fd: RawFd, events: i16) -> libc::pollfd {
@@ -168,6 +229,7 @@ pub fn set_nonblocking(fd: RawFd) -> std::io::Result<()> {
 
 pub static SIGWINCH_RECEIVED: AtomicBool = AtomicBool::new(false);
 pub static SIGTERM_RECEIVED: AtomicBool = AtomicBool::new(false);
+pub static SIGUSR1_RECEIVED: AtomicBool = AtomicBool::new(false);
 
 extern "C" fn on_sigwinch(_: libc::c_int) {
     SIGWINCH_RECEIVED.store(true, Ordering::Release);
@@ -175,6 +237,10 @@ extern "C" fn on_sigwinch(_: libc::c_int) {
 
 extern "C" fn on_sigterm(_: libc::c_int) {
     SIGTERM_RECEIVED.store(true, Ordering::Release);
+}
+
+extern "C" fn on_sigusr1(_: libc::c_int) {
+    SIGUSR1_RECEIVED.store(true, Ordering::Release);
 }
 
 fn install_handler(signo: libc::c_int, handler: usize) {
@@ -199,6 +265,13 @@ pub fn install_sigterm_handler() {
     install_handler(
         libc::SIGTERM,
         on_sigterm as extern "C" fn(libc::c_int) as usize,
+    );
+}
+
+pub fn install_sigusr1_handler() {
+    install_handler(
+        libc::SIGUSR1,
+        on_sigusr1 as extern "C" fn(libc::c_int) as usize,
     );
 }
 
@@ -329,6 +402,48 @@ mod tests {
     fn decode_preserves_invalid_escapes() {
         assert_eq!(decode_session_name("50%"), "50%");
         assert_eq!(decode_session_name("a%zz"), "a%zz");
+    }
+
+    #[test]
+    fn ctype_locale_priority() {
+        assert_eq!(
+            ctype_locale(Some("C"), Some("en_US.UTF-8"), Some("de_DE.UTF-8")),
+            ("LC_ALL".to_string(), "C".to_string())
+        );
+        assert_eq!(
+            ctype_locale(None, Some("en_US.UTF-8"), Some("de_DE.UTF-8")),
+            ("LC_CTYPE".to_string(), "en_US.UTF-8".to_string())
+        );
+        assert_eq!(
+            ctype_locale(None, None, Some("de_DE.UTF-8")),
+            ("LANG".to_string(), "de_DE.UTF-8".to_string())
+        );
+        assert_eq!(
+            ctype_locale(Some(""), None, None),
+            (String::new(), String::new())
+        );
+    }
+
+    #[test]
+    fn locale_charset_extraction() {
+        assert_eq!(locale_charset("en_US.UTF-8"), "UTF-8");
+        assert_eq!(locale_charset("C.UTF-8"), "UTF-8");
+        assert_eq!(locale_charset("de_DE.utf8"), "utf8");
+        assert_eq!(locale_charset("ja_JP.eucJP"), "eucJP");
+        assert_eq!(locale_charset("de_DE.UTF-8@euro"), "UTF-8");
+        assert_eq!(locale_charset("C"), "US-ASCII");
+        assert_eq!(locale_charset("POSIX"), "US-ASCII");
+        assert_eq!(locale_charset(""), "US-ASCII");
+    }
+
+    #[test]
+    fn utf8_charset_detection() {
+        assert!(charset_is_utf8("UTF-8"));
+        assert!(charset_is_utf8("utf-8"));
+        assert!(charset_is_utf8("utf8"));
+        assert!(charset_is_utf8("UTF8"));
+        assert!(!charset_is_utf8("US-ASCII"));
+        assert!(!charset_is_utf8("ISO-8859-1"));
     }
 
     #[test]

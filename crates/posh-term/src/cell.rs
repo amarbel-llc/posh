@@ -22,7 +22,9 @@ pub enum UnderlineStyle {
     Dashed,
 }
 
-/// The full set of SGR attributes a cell can carry.
+/// The full set of SGR attributes a cell can carry, plus the DECSCA
+/// protection guard (kept with the pen attributes although SGR sequences,
+/// including SGR 0, never change it).
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
 pub struct Style {
     pub fg: Color,
@@ -36,6 +38,8 @@ pub struct Style {
     pub inverse: bool,
     pub invisible: bool,
     pub strikethrough: bool,
+    /// DECSCA (CSI " q): protected from DECSED/DECSEL selective erase.
+    pub protected: bool,
 }
 
 impl Style {

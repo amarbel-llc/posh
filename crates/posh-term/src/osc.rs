@@ -40,6 +40,7 @@ impl Terminal {
             12 => self.osc_dynamic_color(12, rest, bel),
             22 => self.pointer_shape = rest.to_string(),
             52 => self.osc_clipboard(rest, bel),
+            66 => self.osc_text_size(rest),
             99 => {
                 // Kitty notification: metadata;payload.
                 let body = rest.split_once(';').map(|(_, b)| b).unwrap_or(rest);
@@ -144,16 +145,69 @@ impl Terminal {
         self.cursor.hyperlink = self.next_hyperlink;
     }
 
-    /// OSC 52: `52;selection;base64-data`, with `?` query form.
+    /// OSC 52: `52;selection;base64-data`, with `?` query form. The
+    /// selection parameter names one or more targets — `c` clipboard, `p`
+    /// primary, `s` select (empty defaults to `c`). A set updates every
+    /// named slot; a query answers from the first.
     fn osc_clipboard(&mut self, rest: &str, bel: bool) {
-        let (_sel, payload) = rest.split_once(';').unwrap_or(("", rest));
+        let (sel, payload) = rest.split_once(';').unwrap_or(("", rest));
+        let mut kinds: Vec<char> = sel
+            .chars()
+            .filter(|c| matches!(c, 'c' | 'p' | 's'))
+            .collect();
+        if kinds.is_empty() {
+            kinds.push('c');
+        }
         if payload == "?" {
-            let resp = format!("\x1b]52;c;{}{}", base64::encode(&self.clipboard), st(bel));
+            let kind = kinds[0];
+            let data = match kind {
+                'p' => &self.primary_selection,
+                's' => &self.select_selection,
+                _ => &self.clipboard,
+            };
+            let resp = format!("\x1b]52;{kind};{}{}", base64::encode(data), st(bel));
             self.respond(&resp);
         } else if let Some(decoded) = base64::decode(payload.as_bytes()) {
-            self.clipboard = decoded;
+            for kind in kinds {
+                let slot = match kind {
+                    'p' => &mut self.primary_selection,
+                    's' => &mut self.select_selection,
+                    _ => &mut self.clipboard,
+                };
+                *slot = decoded.clone();
+            }
             self.touch();
         }
+    }
+
+    /// OSC 66 (kitty text-sizing protocol): `metadata;text` where metadata
+    /// is colon-separated `key=value` pairs. Partial support: the text is
+    /// inserted as ordinary cells, a `w=` key advances the cursor to the
+    /// declared cell width, and the raw payload is kept for callers
+    /// ([`Terminal::last_text_size`]); scale keys do not multiply glyphs.
+    fn osc_text_size(&mut self, rest: &str) {
+        let (meta, text) = rest.split_once(';').unwrap_or(("", rest));
+        self.last_text_size = Some(rest.to_string());
+        if text.is_empty() {
+            return;
+        }
+        let start = self.cursor.col;
+        for ch in text.chars() {
+            self.print(ch);
+        }
+        let width = meta.split(':').find_map(|kv| {
+            let (k, v) = kv.split_once('=')?;
+            if k == "w" {
+                v.parse::<u16>().ok()
+            } else {
+                None
+            }
+        });
+        if let Some(w) = width.filter(|&w| w > 0) {
+            self.cursor.col = start.saturating_add(w).min(self.cols() - 1);
+            self.cursor.pending_wrap = false;
+        }
+        self.touch();
     }
 
     /// OSC 133: shell integration prompt marks (fish emits these).

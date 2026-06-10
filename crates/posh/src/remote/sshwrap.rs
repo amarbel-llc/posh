@@ -1,23 +1,107 @@
 //! ssh bootstrap wrapper (mosh.pl port, simplified): run `posh server new`
-//! on the remote host over ssh, parse the POSH CONNECT line, then run the
-//! UDP client locally with the key in the environment.
+//! on the remote host over ssh, parse the POSH IP / POSH CONNECT lines,
+//! then run the UDP client locally with the key in the environment.
 
 use std::io::{BufRead, BufReader};
 use std::process::{Command, Stdio};
 
+use crate::remote::datagram::Family;
 use crate::util::{Error, Result};
 
-pub fn run(target: &str, remote_cmd: &[String]) -> Result<()> {
-    let mut server_cmd = String::from("posh server new");
+pub struct SshOptions {
+    pub family: Family,
+    /// Server-side UDP port range, already validated ("P" or "P1:P2").
+    pub port_range: Option<String>,
+}
+
+/// What the wrapped server reported on stdout.
+#[derive(Debug, Default, PartialEq, Eq)]
+pub struct ServerReport {
+    pub ip: Option<String>,
+    pub port: Option<u16>,
+    pub key: Option<String>,
+}
+
+impl ServerReport {
+    /// Feeds one line of server output; returns false for lines that are
+    /// not part of the protocol (motd etc., to be passed through), true
+    /// once the CONNECT line arrived (parsing is finished).
+    pub fn feed(&mut self, line: &str) -> Result<bool> {
+        if let Some(rest) = line.strip_prefix("POSH IP ") {
+            let ip = rest.trim();
+            if ip.is_empty() || ip.contains(char::is_whitespace) {
+                return Err(Error(format!("bad POSH IP string: {line}")));
+            }
+            self.ip = Some(ip.to_string());
+            return Ok(false);
+        }
+        if let Some(rest) = line.strip_prefix("POSH CONNECT ") {
+            let (port, key) = parse_connect(rest)
+                .ok_or_else(|| Error(format!("bad POSH CONNECT string: {line}")))?;
+            self.port = Some(port);
+            self.key = Some(key);
+            return Ok(true);
+        }
+        Ok(false)
+    }
+}
+
+/// Builds the remote command: locale variables forwarded as POSIX-sh
+/// environment prefixes (LANG/LC_*, so the server sees the client's
+/// charset), then `posh server new` with the relevant flags.
+pub fn remote_command(
+    opts: &SshOptions,
+    remote_cmd: &[String],
+    locale_vars: &[(String, String)],
+) -> String {
+    let mut cmd = String::new();
+    for (name, value) in locale_vars {
+        cmd.push_str(name);
+        cmd.push('=');
+        cmd.push_str(&shell_quote(value));
+        cmd.push(' ');
+    }
+    cmd.push_str("posh server new");
+    match opts.family {
+        Family::Inet => cmd.push_str(" -4"),
+        Family::Inet6 => cmd.push_str(" -6"),
+        Family::Auto => {}
+    }
+    if let Some(range) = &opts.port_range {
+        cmd.push_str(" -p ");
+        cmd.push_str(range);
+    }
     if !remote_cmd.is_empty() {
-        server_cmd.push_str(" --");
+        cmd.push_str(" --");
         for arg in remote_cmd {
-            server_cmd.push(' ');
-            server_cmd.push_str(&shell_quote(arg));
+            cmd.push(' ');
+            cmd.push_str(&shell_quote(arg));
         }
     }
+    cmd
+}
 
-    let mut child = Command::new("ssh")
+/// LANG plus every LC_* variable from the local environment.
+fn local_locale_vars() -> Vec<(String, String)> {
+    std::env::vars()
+        .filter(|(k, _)| k == "LANG" || k.starts_with("LC_"))
+        .collect()
+}
+
+pub fn run(target: &str, remote_cmd: &[String], opts: &SshOptions) -> Result<()> {
+    let server_cmd = remote_command(opts, remote_cmd, &local_locale_vars());
+
+    let mut ssh = Command::new("ssh");
+    match opts.family {
+        Family::Inet => {
+            ssh.arg("-4");
+        }
+        Family::Inet6 => {
+            ssh.arg("-6");
+        }
+        Family::Auto => {}
+    }
+    let mut child = ssh
         .arg(target)
         .arg("--")
         .arg(&server_cmd)
@@ -28,30 +112,32 @@ pub fn run(target: &str, remote_cmd: &[String]) -> Result<()> {
         .map_err(|e| Error(format!("cannot exec ssh: {e}")))?;
 
     let stdout = child.stdout.take().expect("piped stdout");
-    let mut connect: Option<(u16, String)> = None;
+    let mut report = ServerReport::default();
     for line in BufReader::new(stdout).lines() {
         let line = line?;
-        if let Some(rest) = line.strip_prefix("POSH CONNECT ") {
-            connect = parse_connect(rest);
-            if connect.is_none() {
-                return Err(Error(format!("bad POSH CONNECT string: {line}")));
-            }
+        if report.feed(&line)? {
             break;
         }
-        // Pass through motd and friends.
-        println!("{line}");
+        if !line.starts_with("POSH ") {
+            // Pass through motd and friends.
+            println!("{line}");
+        }
     }
     let _ = child.wait();
 
-    let (port, key) = connect.ok_or_else(|| {
-        Error::from("did not find posh server startup message (is posh installed on the server?)")
-    })?;
+    let (Some(port), Some(key)) = (report.port, report.key) else {
+        return Err(Error::from(
+            "did not find posh server startup message (is posh installed on the server?)",
+        ));
+    };
 
-    // mosh.pl uses an ssh ProxyCommand to learn the server IP; we simply
-    // reuse the hostname and resolve it locally.
-    let host = target.rsplit('@').next().unwrap_or(target);
+    // Prefer the address the server reported (third field of its
+    // $SSH_CONNECTION: the IP we actually reached it on); fall back to
+    // resolving the hostname we dialed, as mosh.pl does.
+    let fallback = target.rsplit('@').next().unwrap_or(target).to_string();
+    let host = report.ip.unwrap_or(fallback);
     std::env::set_var("POSH_KEY", key);
-    crate::remote::client::run(host, port)
+    crate::remote::client::run(&host, port, opts.family)
 }
 
 fn parse_connect(rest: &str) -> Option<(u16, String)> {
@@ -87,5 +173,63 @@ mod tests {
     fn shell_quote_escapes_single_quotes() {
         assert_eq!(shell_quote("plain"), "'plain'");
         assert_eq!(shell_quote("it's"), "'it'\\''s'");
+    }
+
+    #[test]
+    fn server_report_prefers_posh_ip() {
+        let mut report = ServerReport::default();
+        assert_eq!(report.feed("Welcome to examplehost!").unwrap(), false);
+        assert_eq!(report.feed("POSH IP 192.0.2.7").unwrap(), false);
+        assert_eq!(
+            report
+                .feed("POSH CONNECT 60001 AAAAAAAAAAAAAAAAAAAAAA")
+                .unwrap(),
+            true
+        );
+        assert_eq!(report.ip.as_deref(), Some("192.0.2.7"));
+        assert_eq!(report.port, Some(60001));
+        assert_eq!(report.key.as_deref(), Some("AAAAAAAAAAAAAAAAAAAAAA"));
+    }
+
+    #[test]
+    fn server_report_without_ip_line() {
+        let mut report = ServerReport::default();
+        assert!(report
+            .feed("POSH CONNECT 60044 AAAAAAAAAAAAAAAAAAAAAA")
+            .unwrap());
+        assert_eq!(report.ip, None);
+        assert_eq!(report.port, Some(60044));
+    }
+
+    #[test]
+    fn server_report_rejects_garbage() {
+        let mut report = ServerReport::default();
+        assert!(report.feed("POSH CONNECT nope nope").is_err());
+        assert!(report.feed("POSH IP ").is_err());
+        assert!(report.feed("POSH IP two words").is_err());
+    }
+
+    #[test]
+    fn remote_command_includes_flags_and_locale() {
+        let opts = SshOptions {
+            family: Family::Inet6,
+            port_range: Some("60100:60200".to_string()),
+        };
+        let locale = vec![("LANG".to_string(), "en_US.UTF-8".to_string())];
+        let cmd = remote_command(&opts, &["htop".to_string(), "-d".to_string()], &locale);
+        assert_eq!(
+            cmd,
+            "LANG='en_US.UTF-8' posh server new -6 -p 60100:60200 -- 'htop' '-d'"
+        );
+
+        let plain = remote_command(
+            &SshOptions {
+                family: Family::Auto,
+                port_range: None,
+            },
+            &[],
+            &[],
+        );
+        assert_eq!(plain, "posh server new");
     }
 }

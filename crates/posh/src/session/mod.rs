@@ -144,6 +144,7 @@ fn cleanup_stale_socket(path: &Path) {
 pub enum ListFormat {
     Default,
     Short,
+    Json,
 }
 
 struct SessionEntry {
@@ -195,17 +196,80 @@ pub fn cmd_list(cfg: &Config, format: ListFormat) -> Result<()> {
     }
 
     if sessions.is_empty() {
-        if format == ListFormat::Default {
-            println!("no sessions found in {}", cfg.socket_dir.display());
+        match format {
+            ListFormat::Default => println!("no sessions found in {}", cfg.socket_dir.display()),
+            ListFormat::Json => println!("[]"),
+            ListFormat::Short => {}
         }
         return Ok(());
     }
 
     sessions.sort_by(|a, b| a.name.cmp(&b.name));
+    if format == ListFormat::Json {
+        println!("{}", json_list(&sessions, current.as_deref()));
+        return Ok(());
+    }
     for s in &sessions {
         print_session_line(s, format, current.as_deref());
     }
     Ok(())
+}
+
+/// JSON list output, field-for-field compatible with zmx's `list --json`.
+fn json_list(sessions: &[SessionEntry], current: Option<&str>) -> String {
+    let mut out = String::from("[");
+    for (i, s) in sessions.iter().enumerate() {
+        if i > 0 {
+            out.push(',');
+        }
+        out.push_str("{\"name\":");
+        out.push_str(&json_string(&s.name));
+        if let Some(err) = &s.error {
+            out.push_str(",\"error\":true,\"status\":");
+            out.push_str(&json_string(err));
+        } else {
+            let is_current = current == Some(s.name.as_str());
+            out.push_str(&format!(
+                ",\"pid\":{},\"clients\":{}",
+                s.pid.unwrap_or(0),
+                s.clients.unwrap_or(0)
+            ));
+            if let Some(cwd) = &s.cwd {
+                out.push_str(",\"cwd\":");
+                out.push_str(&json_string(cwd));
+            }
+            if let Some(cmd) = &s.cmd {
+                out.push_str(",\"cmd\":");
+                out.push_str(&json_string(cmd));
+            }
+            out.push_str(&format!(",\"current\":{is_current}"));
+        }
+        out.push('}');
+    }
+    out.push(']');
+    out
+}
+
+fn json_string(s: &str) -> String {
+    let mut out = String::with_capacity(s.len() + 2);
+    out.push('"');
+    for ch in s.chars() {
+        match ch {
+            '"' => out.push_str("\\\""),
+            '\\' => out.push_str("\\\\"),
+            '\n' => out.push_str("\\n"),
+            '\r' => out.push_str("\\r"),
+            '\t' => out.push_str("\\t"),
+            '\u{8}' => out.push_str("\\b"),
+            '\u{c}' => out.push_str("\\f"),
+            c if (c as u32) < 0x20 => {
+                out.push_str(&format!("\\u{:04x}", c as u32));
+            }
+            c => out.push(c),
+        }
+    }
+    out.push('"');
+    out
 }
 
 fn print_session_line(s: &SessionEntry, format: ListFormat, current: Option<&str>) {
@@ -296,6 +360,28 @@ pub fn cmd_detach(cfg: &Config, name: Option<&str>) -> Result<()> {
     }
 }
 
+/// Detaches all clients from every session in the group.
+pub fn cmd_detach_all(cfg: &Config) -> Result<()> {
+    for entry in std::fs::read_dir(&cfg.socket_dir)? {
+        let Ok(entry) = entry else { continue };
+        let Ok(file_type) = entry.file_type() else {
+            continue;
+        };
+        if !file_type.is_socket() {
+            continue;
+        }
+        let path = entry.path();
+        match probe_session(&path) {
+            Ok(probe) => {
+                let fd = std::os::fd::AsRawFd::as_raw_fd(&probe.stream);
+                let _ = ipc::send(fd, Tag::DetachAll, b"");
+            }
+            Err(_) => cleanup_stale_socket(&path),
+        }
+    }
+    Ok(())
+}
+
 /// Runs a command inside a session (creating it if needed) without attaching:
 /// the command text is written to the session PTY as if typed.
 pub fn cmd_run(cfg: &Config, name: &str, args: &[String]) -> Result<()> {
@@ -352,9 +438,221 @@ pub fn cmd_run(cfg: &Config, name: &str, args: &[String]) -> Result<()> {
     }
 }
 
+// ---------------------------------------------------------------------------
+// fork / groups / history (zmx parity)
+
+/// `posh fork [name]`: clone the current session's command and working
+/// directory into a new detached session. Without a name, the first free
+/// "<current>-N" is used.
+pub fn cmd_fork(cfg: &Config, target: Option<&str>) -> Result<()> {
+    let source = std::env::var("POSH_SESSION").map_err(|_| {
+        Error::from("POSH_SESSION env var not found: are you inside a posh session?")
+    })?;
+
+    // Probe the source session for its command and cwd.
+    let source_path = cfg.socket_path(&source)?;
+    let probe = match probe_session(&source_path) {
+        Ok(p) => p,
+        Err(e) => {
+            cleanup_stale_socket(&source_path);
+            return Err(Error(format!("source session unresponsive: {e}")));
+        }
+    };
+    let info = probe.info;
+    drop(probe.stream);
+
+    let target_name = match target {
+        Some(name) => name.to_string(),
+        None => next_fork_name(cfg, &source)?,
+    };
+    let target_path = cfg.socket_path(&target_name)?;
+    if session_socket_exists(&target_path) {
+        return Err(Error(format!("session already exists: {target_name}")));
+    }
+
+    let args: Vec<String> = info.cmd.split_whitespace().map(|s| s.to_string()).collect();
+    let command = (!args.is_empty()).then_some(args);
+
+    // chdir so the new daemon inherits the source session's cwd.
+    if !info.cwd.is_empty() {
+        if let Err(e) = std::env::set_current_dir(&info.cwd) {
+            util::log_write("warn", &format!("could not chdir to {}: {e}", info.cwd));
+        }
+    }
+
+    let created = daemon::ensure_session(cfg, &target_name, command)?;
+    if created {
+        println!("forked session \"{source}\" into \"{target_name}\"");
+    }
+    Ok(())
+}
+
+fn next_fork_name(cfg: &Config, base: &str) -> Result<String> {
+    for i in 1..1000u32 {
+        let candidate = format!("{base}-{i}");
+        let Ok(path) = cfg.socket_path(&candidate) else {
+            continue;
+        };
+        if std::fs::symlink_metadata(&path).is_err() {
+            return Ok(candidate);
+        }
+    }
+    Err(Error::from("too many sessions"))
+}
+
+/// `posh groups`: list groups (socket-base subdirectories with at least one
+/// socket in them), sorted.
+pub fn cmd_groups() -> Result<()> {
+    let env = |k: &str| std::env::var(k).ok();
+    let uid = unsafe { libc::getuid() };
+    let base = resolve_socket_base(
+        env("POSH_DIR").as_deref(),
+        env("XDG_RUNTIME_DIR").as_deref(),
+        env("TMPDIR").as_deref(),
+        uid,
+    );
+    let Ok(entries) = std::fs::read_dir(&base) else {
+        return Ok(()); // no base directory yet: no groups
+    };
+    let mut groups: Vec<String> = Vec::new();
+    for entry in entries.flatten() {
+        let Ok(file_type) = entry.file_type() else {
+            continue;
+        };
+        if !file_type.is_dir() {
+            continue;
+        }
+        let Ok(group_entries) = std::fs::read_dir(entry.path()) else {
+            continue;
+        };
+        let has_sessions = group_entries.flatten().any(|e| {
+            e.file_type()
+                .map(|t| t.is_socket() || t.is_file())
+                .unwrap_or(false)
+        });
+        if has_sessions {
+            groups.push(entry.file_name().to_string_lossy().into_owned());
+        }
+    }
+    groups.sort();
+    for group in groups {
+        println!("{group}");
+    }
+    Ok(())
+}
+
+/// `posh history <name> [--vt]`: fetch the session's scrollback through the
+/// History IPC message (payload byte 1 = vt escape stream, 0 = plain text).
+pub fn cmd_history(cfg: &Config, name: &str, vt: bool) -> Result<()> {
+    let path = cfg.socket_path(name)?;
+    if !session_socket_exists(&path) {
+        return Err(Error(format!("session does not exist session_name={name}")));
+    }
+    let probe = match probe_session(&path) {
+        Ok(p) => p,
+        Err(e) => {
+            cleanup_stale_socket(&path);
+            return Err(Error(format!("session unresponsive: {e}")));
+        }
+    };
+    let fd = std::os::fd::AsRawFd::as_raw_fd(&probe.stream);
+    ipc::send(fd, Tag::History, &[u8::from(vt)])?;
+
+    probe
+        .stream
+        .set_read_timeout(Some(Duration::from_secs(5)))?;
+    let mut fb = ipc::FrameBuffer::new();
+    let mut stream_ref = &probe.stream;
+    loop {
+        if let Some(frame) = fb.next() {
+            if frame.tag == Tag::History {
+                use std::io::Write;
+                std::io::stdout().write_all(&frame.payload)?;
+                return Ok(());
+            }
+            continue;
+        }
+        let mut tmp = [0u8; 4096];
+        let n = stream_ref
+            .read(&mut tmp)
+            .map_err(|_| Error::from("timeout waiting for history response"))?;
+        if n == 0 {
+            return Err(Error::from("connection closed before history arrived"));
+        }
+        fb.feed(&tmp[..n]);
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn json_list_shape_matches_zmx() {
+        let sessions = vec![
+            SessionEntry {
+                name: "alpha".to_string(),
+                pid: Some(1234),
+                clients: Some(2),
+                error: None,
+                cmd: Some("htop -d 10".to_string()),
+                cwd: Some("/home/user".to_string()),
+            },
+            SessionEntry {
+                name: "broken".to_string(),
+                pid: None,
+                clients: None,
+                error: Some("ConnectionRefused".to_string()),
+                cmd: None,
+                cwd: None,
+            },
+            SessionEntry {
+                name: "minimal".to_string(),
+                pid: Some(9),
+                clients: Some(0),
+                error: None,
+                cmd: None,
+                cwd: None,
+            },
+        ];
+        let json = json_list(&sessions, Some("minimal"));
+        assert_eq!(
+            json,
+            concat!(
+                "[",
+                "{\"name\":\"alpha\",\"pid\":1234,\"clients\":2,",
+                "\"cwd\":\"/home/user\",\"cmd\":\"htop -d 10\",\"current\":false},",
+                "{\"name\":\"broken\",\"error\":true,\"status\":\"ConnectionRefused\"},",
+                "{\"name\":\"minimal\",\"pid\":9,\"clients\":0,\"current\":true}",
+                "]"
+            )
+        );
+    }
+
+    #[test]
+    fn json_string_escaping() {
+        assert_eq!(json_string("plain"), "\"plain\"");
+        assert_eq!(json_string("with \"quotes\""), "\"with \\\"quotes\\\"\"");
+        assert_eq!(json_string("back\\slash"), "\"back\\\\slash\"");
+        assert_eq!(json_string("tab\there"), "\"tab\\there\"");
+        assert_eq!(json_string("nl\n"), "\"nl\\n\"");
+        assert_eq!(json_string("\u{1}"), "\"\\u0001\"");
+        assert_eq!(json_string("uni→ok"), "\"uni→ok\"");
+    }
+
+    #[test]
+    fn json_list_empty_current() {
+        let sessions = vec![SessionEntry {
+            name: "x".to_string(),
+            pid: Some(1),
+            clients: Some(0),
+            error: None,
+            cmd: None,
+            cwd: None,
+        }];
+        let json = json_list(&sessions, None);
+        assert!(json.contains("\"current\":false"));
+    }
 
     #[test]
     fn socket_base_prefers_posh_dir() {
