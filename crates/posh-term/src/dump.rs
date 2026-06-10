@@ -4,6 +4,7 @@
 use std::fmt::Write;
 
 use crate::cell::{Color, Style, UnderlineStyle};
+use crate::graphics::ImageFormat;
 use crate::screen::{Row, Screen, SemanticMark};
 use crate::terminal::{Charset, Terminal};
 
@@ -213,9 +214,84 @@ impl Terminal {
             self.draw_grid(&mut out, &self.alt, &mut st);
         }
 
+        self.dump_graphics(&mut out);
         self.dump_modes(&mut out);
         self.dump_cursor(&mut out, &mut st);
         out.into_bytes()
+    }
+
+    /// Replays kitty graphics: stored images as (chunked) APC
+    /// transmissions, animation frames and play state, then placements
+    /// anchored by absolute cursor positioning. Relative placements
+    /// (`P=`/`Q=`) were resolved to absolute cells at creation time, so
+    /// they replay as absolute and the inert parent linkage is dropped.
+    /// `q=2` keeps the replay response-quiet. PNG transmissions are stored
+    /// decoded, so they replay as raw RGBA.
+    fn dump_graphics(&self, out: &mut String) {
+        let fmt_key = |f: ImageFormat| if f == ImageFormat::Rgb { 24 } else { 32 };
+        let mut ids: Vec<u32> = self.graphics.images().keys().copied().collect();
+        ids.sort_unstable();
+        for id in ids {
+            let img = &self.graphics.images()[&id];
+            let mut keys = format!(
+                "a=t,q=2,f={},s={},v={},i={id}",
+                fmt_key(img.format),
+                img.width,
+                img.height
+            );
+            if img.number != 0 {
+                let _ = write!(keys, ",I={}", img.number);
+            }
+            emit_apc_chunks(out, &keys, &img.data);
+            for fr in self.graphics.frames(id) {
+                let mut keys = format!(
+                    "a=f,q=2,i={id},r={},f={},s={},v={},x={},y={},z={},c={}",
+                    fr.number,
+                    fmt_key(fr.format),
+                    fr.width,
+                    fr.height,
+                    fr.x,
+                    fr.y,
+                    fr.gap_ms,
+                    fr.base_frame
+                );
+                if fr.replace {
+                    keys.push_str(",X=1");
+                }
+                emit_apc_chunks(out, &keys, &fr.data);
+            }
+            if let Some(anim) = self.graphics.animation(id) {
+                let _ = write!(
+                    out,
+                    "\x1b_Ga=a,q=2,i={id},s={},v={},c={}\x1b\\",
+                    anim.state, anim.loops, anim.current_frame
+                );
+            }
+        }
+        for p in self.graphics.placements() {
+            if !p.unicode {
+                let _ = write!(out, "\x1b[{};{}H", p.row + 1, p.col + 1);
+            }
+            let _ = write!(
+                out,
+                "\x1b_Ga=p,q=2,i={},p={},x={},y={},w={},h={},c={},r={},z={},X={},Y={}",
+                p.image_id,
+                p.placement_id,
+                p.src_x,
+                p.src_y,
+                p.src_w,
+                p.src_h,
+                p.cols,
+                p.rows,
+                p.z,
+                p.cell_x,
+                p.cell_y
+            );
+            if p.unicode {
+                out.push_str(",U=1");
+            }
+            out.push_str("\x1b\\");
+        }
     }
 
     fn dump_colors(&self, out: &mut String) {
@@ -502,4 +578,25 @@ impl Terminal {
 
 fn spec(r: u8, g: u8, b: u8) -> String {
     format!("rgb:{r:02x}/{g:02x}/{b:02x}")
+}
+
+/// Emits one data-bearing kitty APC command, splitting the base64 payload
+/// into ≤4096-byte chunks (`m=1` continuations) per the kitty spec so the
+/// stream is valid for a real terminal, not just our own parser.
+fn emit_apc_chunks(out: &mut String, keys: &str, data: &[u8]) {
+    const CHUNK: usize = 4096;
+    let payload = crate::base64::encode(data);
+    if payload.len() <= CHUNK {
+        let _ = write!(out, "\x1b_G{keys};{payload}\x1b\\");
+        return;
+    }
+    let mut chunks = payload.as_bytes().chunks(CHUNK).peekable();
+    // base64 output is ASCII, so chunk boundaries stay valid UTF-8.
+    let first = std::str::from_utf8(chunks.next().unwrap()).unwrap();
+    let _ = write!(out, "\x1b_G{keys},m=1;{first}\x1b\\");
+    while let Some(chunk) = chunks.next() {
+        let more = u8::from(chunks.peek().is_some());
+        let chunk = std::str::from_utf8(chunk).unwrap();
+        let _ = write!(out, "\x1b_Gm={more};{chunk}\x1b\\");
+    }
 }

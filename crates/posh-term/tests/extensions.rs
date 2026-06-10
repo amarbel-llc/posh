@@ -35,6 +35,98 @@ fn roundtrip(t: &Terminal) -> Terminal {
     t2
 }
 
+// --- kitty graphics over dump_vt ------------------------------------------------
+
+#[test]
+fn dump_vt_replays_kitty_graphics() {
+    // github #29: images, placements, animation frames, and play state
+    // must survive a dump_vt roundtrip (remote sync / attach replay).
+    let mut t = term();
+    let rgba = posh_term::base64::encode(&[1, 2, 3, 4]);
+    let rgb = posh_term::base64::encode(&[9, 8, 7]);
+
+    // Image 9: transmit+place (cursor-anchored) at row 2, col 3.
+    feed(&mut t, "\x1b[3;4H");
+    feed(&mut t, &format!("\x1b_Ga=T,f=32,s=1,v=1,i=9;{rgba}\x1b\\"));
+    // Image 7: RGB transmit, then an explicit placement with size/z.
+    feed(&mut t, &format!("\x1b_Ga=t,f=24,s=1,v=1,i=7;{rgb}\x1b\\"));
+    feed(&mut t, "\x1b[1;1H");
+    feed(&mut t, "\x1b_Ga=p,i=7,p=2,z=5,c=3,r=2\x1b\\");
+    // An animation frame and a play state on image 9.
+    feed(&mut t, &format!("\x1b_Ga=f,i=9,s=1,v=1,z=120;{rgba}\x1b\\"));
+    feed(&mut t, "\x1b_Ga=a,i=9,s=3,v=1\x1b\\");
+    let _ = t.take_responses();
+
+    let mut r = roundtrip(&t);
+    assert_eq!(responses(&mut r), "", "graphics replay must be quiet (q=2)");
+
+    assert_eq!(r.images().len(), 2, "both images replayed");
+    assert_eq!(r.images()[&9].data, vec![1, 2, 3, 4]);
+    assert_eq!(r.images()[&7].data, vec![9, 8, 7]);
+    assert_eq!((r.images()[&7].width, r.images()[&7].height), (1, 1));
+
+    let snap = |t: &Terminal| {
+        let mut v: Vec<_> = t
+            .placements()
+            .iter()
+            .map(|p| {
+                (
+                    p.image_id,
+                    p.placement_id,
+                    p.row,
+                    p.col,
+                    p.z,
+                    p.cols,
+                    p.rows,
+                    p.src_w,
+                    p.src_h,
+                )
+            })
+            .collect();
+        v.sort();
+        v
+    };
+    assert_eq!(snap(&r), snap(&t), "placements replayed at their cells");
+
+    let frames = r.image_frames(9);
+    assert_eq!(frames.len(), 1, "animation frame replayed");
+    assert_eq!(frames[0].gap_ms, 120);
+    assert_eq!(frames[0].data, vec![1, 2, 3, 4]);
+    assert_eq!(r.animation_state(9), t.animation_state(9));
+}
+
+#[test]
+fn dump_vt_chunks_large_graphics_payloads() {
+    // The kitty spec caps APC payload chunks at 4096 bytes; a 60x60 RGBA
+    // image (19200 base64 bytes) must be emitted chunked and reassemble.
+    let mut t = term();
+    let data: Vec<u8> = (0..60 * 60 * 4).map(|i| (i % 251) as u8).collect();
+    feed(
+        &mut t,
+        &format!(
+            "\x1b_Ga=t,f=32,s=60,v=60,i=3;{}\x1b\\",
+            posh_term::base64::encode(&data)
+        ),
+    );
+    let _ = t.take_responses();
+
+    let dump = t.dump_vt();
+    let s = String::from_utf8_lossy(&dump);
+    for apc in s.split("\x1b_G").skip(1) {
+        let body = apc.split("\x1b\\").next().unwrap();
+        let payload = body.split(';').nth(1).unwrap_or("");
+        assert!(
+            payload.len() <= 4096,
+            "APC chunk exceeds the kitty 4096-byte cap: {} bytes",
+            payload.len()
+        );
+    }
+
+    let mut r = roundtrip(&t);
+    assert_eq!(responses(&mut r), "");
+    assert_eq!(r.images()[&3].data, data);
+}
+
 // --- resize reflow ------------------------------------------------------------
 
 #[test]
