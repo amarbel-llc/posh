@@ -93,6 +93,11 @@ impl Fragmenter {
     }
 }
 
+/// Upper bound on fragments per instruction (~11 MB of payload at MTU-sized
+/// chunks): bounds allocation driven by a buggy or hostile authenticated
+/// peer, which could otherwise force a 32768-slot buffer per id.
+const MAX_FRAGMENTS: usize = 8192;
+
 #[derive(Default)]
 pub struct FragmentAssembly {
     current_id: Option<u64>,
@@ -117,6 +122,17 @@ impl FragmentAssembly {
             self.total = None;
         }
         let idx = frag.num as usize;
+        // Drop fragments that cannot belong to a well-formed instruction:
+        // past the allocation cap, past a known final index, or a final
+        // contradicting fragments already received beyond it. Bogus
+        // fragments must not grow the buffer or poison the completion gate.
+        if idx >= MAX_FRAGMENTS
+            || self.total.is_some_and(|t| idx >= t)
+            || (frag.is_final
+                && (self.fragments.len() > idx + 1 || self.total.is_some_and(|t| t != idx + 1)))
+        {
+            return None;
+        }
         if self.fragments.len() <= idx {
             self.fragments.resize(idx + 1, None);
         }
@@ -485,6 +501,48 @@ mod tests {
         let frags_b = fr.make_fragments(&[2u8; 150], 100);
         assert_eq!(asm.add(frags_b[0].clone()), None);
         assert_eq!(asm.add(frags_b[1].clone()), Some(vec![2u8; 150]));
+    }
+
+    #[test]
+    fn fragment_past_final_rejected_without_wedging_assembly() {
+        let frag = |num: u16, is_final: bool, contents: &[u8]| Fragment {
+            id: 1,
+            num,
+            is_final,
+            contents: contents.to_vec(),
+        };
+        let mut asm = FragmentAssembly::new();
+        assert_eq!(asm.add(frag(2, true, b"c")), None);
+        // A stray fragment past the final index must be dropped, not grow
+        // the buffer and make the completion gate unsatisfiable.
+        assert_eq!(asm.add(frag(5, false, b"x")), None);
+        // ...as must a second final contradicting the known total.
+        assert_eq!(asm.add(frag(4, true, b"y")), None);
+        assert_eq!(asm.add(frag(1, false, b"b")), None);
+        assert_eq!(
+            asm.add(frag(0, false, b"a")).as_deref(),
+            Some(b"abc".as_slice()),
+            "assembly wedged after rejecting bogus fragments"
+        );
+    }
+
+    #[test]
+    fn fragment_count_capped() {
+        let mut asm = FragmentAssembly::new();
+        assert_eq!(
+            asm.add(Fragment {
+                id: 1,
+                num: 0x7fff,
+                is_final: false,
+                contents: vec![0u8; 8],
+            }),
+            None
+        );
+        assert!(
+            asm.fragments.len() <= MAX_FRAGMENTS,
+            "fragment buffer grew past the cap: {}",
+            asm.fragments.len()
+        );
     }
 
     #[test]
