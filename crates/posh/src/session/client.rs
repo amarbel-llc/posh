@@ -159,7 +159,7 @@ fn client_loop(stream: UnixStream) -> Result<()> {
             // SIGTERM/SIGINT/SIGHUP: best-effort detach notice, then leave;
             // cmd_attach restores the tty on the way out either way.
             ipc::append_frame(&mut sock_write_buf, Tag::Detach, b"");
-            let _ = stream_writer.write(&sock_write_buf);
+            let _ = util::write_all_retry(sock_fd, &sock_write_buf, 100);
             return Ok(());
         }
 
@@ -184,7 +184,11 @@ fn client_loop(stream: UnixStream) -> Result<()> {
             fds.push(util::pollfd(STDOUT, libc::POLLOUT));
         }
 
-        match util::poll(&mut fds, -1) {
+        // Bounded timeout: a signal landing between the flag checks above
+        // and this poll sets the flag without an EINTR; an infinite poll
+        // would then sit raw-mode until unrelated activity. One wakeup per
+        // second bounds that race (the remote loop does the same).
+        match util::poll(&mut fds, 1000) {
             Ok(_) => {}
             Err(e) if e.kind() == std::io::ErrorKind::Interrupted => continue,
             Err(e) => return Err(e.into()),
