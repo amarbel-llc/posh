@@ -25,6 +25,24 @@
 //! - `Terminal::take_responses(&mut self) -> Vec<u8>` (DA/DSR/etc. replies)
 //! - `Terminal::screen(&self) -> &Screen` (cell-level read access)
 
-mod stub;
+mod base64;
+mod cell;
+mod csi;
+mod dcs;
+mod dump;
+mod graphics;
+mod kitty_keys;
+mod modes;
+mod osc;
+mod parser;
+mod screen;
+mod terminal;
+mod wcwidth;
 
-pub use stub::{Cell, Color, Cursor, CursorShape, Screen, Style, Terminal, UnderlineStyle};
+pub use cell::{Cell, Color, Style, UnderlineStyle};
+pub use graphics::{Image, ImageFormat, Placement};
+pub use kitty_keys::{encode_key, KeyCode, KeyEvent, KeyEventType, KittyFlags, Modifiers};
+pub use modes::{MouseMode, MouseProtocol};
+pub use screen::{Row, Screen, SemanticMark};
+pub use terminal::{Cursor, CursorShape, Terminal};
+pub use wcwidth::wcwidth;

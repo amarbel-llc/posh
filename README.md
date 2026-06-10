@@ -1,5 +1,9 @@
 [![ci](https://github.com/mobile-shell/mosh/actions/workflows/ci.yml/badge.svg)](https://github.com/mobile-shell/mosh/actions/workflows/ci.yml)
 
+> **Note:** this fork is becoming **posh**, a Rust rewrite that combines mosh
+> with zmx (terminal session persistence). See [POSH.md](POSH.md). The C++
+> tree below remains as the porting reference.
+
 Mosh: the mobile shell
 ======================
 
