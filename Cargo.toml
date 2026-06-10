@@ -1,0 +1,12 @@
+[workspace]
+resolver = "2"
+members = ["crates/posh-term", "crates/posh"]
+
+[workspace.package]
+edition = "2021"
+license = "GPL-3.0-or-later"
+repository = "https://github.com/amarbel-llc/mosh"
+
+[profile.release]
+lto = "thin"
+strip = true

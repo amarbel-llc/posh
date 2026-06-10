@@ -39,3 +39,4 @@ src/include/stamp-h1
 /VERSION.stamp
 /scripts/mosh
 src/include/version.h
+/target

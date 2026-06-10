@@ -1,0 +1,9 @@
+[package]
+name = "posh-term"
+version = "0.1.0"
+description = "A standalone terminal emulation library: a Rust rewrite of the ghostty-vt core, targeting full kitty feature parity"
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+
+[dependencies]

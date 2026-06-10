@@ -1,0 +1,14 @@
+[package]
+name = "posh"
+version = "0.1.0"
+description = "Persistent, roaming terminal sessions: a combined Rust rewrite of zmx and mosh"
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+
+[dependencies]
+posh-term = { path = "../posh-term" }
+libc = "0.2"
+aes-gcm = "0.10"
+rand = "0.8"
+base64 = "0.22"
