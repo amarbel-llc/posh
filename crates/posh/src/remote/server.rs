@@ -383,7 +383,10 @@ fn update_acks(
     acked_num: &mut u64,
     acked_data: &mut Option<Vec<u8>>,
 ) {
-    if msg.acked_frame <= *acked_num {
+    // Ignore acks for frames never sent: an authenticated client claiming a
+    // future frame would otherwise clear `outstanding`, disable retransmits,
+    // and satisfy the shutdown gate without confirming the real final state.
+    if msg.acked_frame <= *acked_num || msg.acked_frame > current.num {
         return;
     }
     *acked_num = msg.acked_frame;
@@ -542,6 +545,62 @@ mod tests {
 
         assert!(saw_shutdown, "server never confirmed the client shutdown");
         server.join().unwrap();
+    }
+
+    #[test]
+    fn update_acks_rejects_frames_never_sent() {
+        let current = FrameState {
+            num: 3,
+            data: b"current".to_vec(),
+        };
+        let mut outstanding = vec![
+            FrameState {
+                num: 1,
+                data: b"one".to_vec(),
+            },
+            FrameState {
+                num: 2,
+                data: b"two".to_vec(),
+            },
+        ];
+        let mut acked_num = 1u64;
+        let mut acked_data = Some(b"one".to_vec());
+        let msg = ClientMessage {
+            flags: 0,
+            acked_frame: u64::MAX,
+            rows: 24,
+            cols: 80,
+            input_base: 0,
+            input: Vec::new(),
+        };
+
+        update_acks(
+            &msg,
+            &current,
+            &mut outstanding,
+            &mut acked_num,
+            &mut acked_data,
+        );
+
+        assert_eq!(acked_num, 1, "ack for a frame never sent must be ignored");
+        assert_eq!(acked_data.as_deref(), Some(b"one".as_slice()));
+        assert_eq!(outstanding.len(), 2, "outstanding frames must be kept");
+
+        // A legitimate ack of the newest frame still works.
+        let msg = ClientMessage {
+            acked_frame: 3,
+            ..msg
+        };
+        update_acks(
+            &msg,
+            &current,
+            &mut outstanding,
+            &mut acked_num,
+            &mut acked_data,
+        );
+        assert_eq!(acked_num, 3);
+        assert_eq!(acked_data.as_deref(), Some(b"current".as_slice()));
+        assert!(outstanding.is_empty());
     }
 
     #[test]
