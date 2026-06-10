@@ -170,9 +170,11 @@ impl Terminal {
             );
             self.respond(&resp);
         } else if let Some(decoded) = base64::decode(payload.as_bytes()) {
-            for kind in kinds {
+            for &kind in &kinds {
                 *self.selection_slot_mut(kind) = decoded.clone();
             }
+            self.clipboard_seq += 1;
+            self.clipboard_kinds = kinds.into_iter().collect();
             self.touch();
         }
     }

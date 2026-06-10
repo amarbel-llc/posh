@@ -631,6 +631,25 @@ fn osc52_clipboard() {
 }
 
 #[test]
+fn osc52_writes_bump_sequence() {
+    // The remote client forwards copies on seq change, so duplicate
+    // payloads must still advance the counter; queries must not. github #27.
+    let mut t = term();
+    assert_eq!(t.clipboard_seq(), 0);
+    feed(&mut t, "\x1b]52;c;aGVsbG8=\x07");
+    assert_eq!(t.clipboard_seq(), 1);
+    assert_eq!(t.clipboard_kinds(), "c");
+    feed(&mut t, "\x1b]52;c;aGVsbG8=\x07"); // identical copy
+    assert_eq!(t.clipboard_seq(), 2);
+    feed(&mut t, "\x1b]52;p;eWFuaw==\x07"); // primary slot
+    assert_eq!(t.clipboard_seq(), 3);
+    assert_eq!(t.clipboard_kinds(), "p");
+    feed(&mut t, "\x1b]52;c;?\x07"); // query: no write
+    let _ = t.take_responses();
+    assert_eq!(t.clipboard_seq(), 3);
+}
+
+#[test]
 fn osc133_prompt_marks() {
     let mut t = term();
     feed(

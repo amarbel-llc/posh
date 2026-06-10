@@ -9,7 +9,7 @@
 use std::collections::HashMap;
 use std::fmt::Write;
 
-use posh_term::{sgr_params, wcwidth, Cell, Style, Terminal};
+use posh_term::{base64, sgr_params, wcwidth, Cell, Style, Terminal};
 
 /// A frozen picture of what a terminal shows: the visible grid plus the
 /// handful of modes the renderer keeps in sync on the outer terminal.
@@ -24,6 +24,13 @@ pub struct Snapshot {
     pub cursor_col: u16,
     pub cursor_visible: bool,
     pub title: String,
+    /// Cumulative BEL count; the renderer rings once per frame on change.
+    pub bell_count: u64,
+    /// OSC 52 write sequence/slots/payload of the most recent remote copy;
+    /// forwarded on sequence change so duplicate copies still propagate.
+    pub clipboard_seq: u64,
+    pub clipboard_kinds: String,
+    pub clipboard: Vec<u8>,
     pub reverse_video: bool,
     pub bracketed_paste: bool,
     pub focus_reporting: bool,
@@ -59,6 +66,10 @@ impl Snapshot {
             cursor_col: 0,
             cursor_visible: true,
             title: String::new(),
+            bell_count: 0,
+            clipboard_seq: 0,
+            clipboard_kinds: String::from("c"),
+            clipboard: Vec::new(),
             reverse_video: false,
             bracketed_paste: false,
             focus_reporting: false,
@@ -99,6 +110,12 @@ impl Snapshot {
             cursor_col: cursor.col.min(cols - 1),
             cursor_visible: cursor.visible,
             title: term.title().to_string(),
+            bell_count: term.bell_count(),
+            clipboard_seq: term.clipboard_seq(),
+            clipboard_kinds: term.clipboard_kinds().to_string(),
+            clipboard: term
+                .selection(term.clipboard_kinds().chars().next().unwrap_or('c'))
+                .to_vec(),
             reverse_video: term.reverse_video(),
             bracketed_paste: term.bracketed_paste(),
             focus_reporting: term.focus_reporting(),
@@ -241,6 +258,23 @@ pub fn new_frame(initialized: bool, last: &Snapshot, f: &Snapshot) -> Vec<u8> {
     // Title.
     if !init || f.title != last.title {
         let _ = write!(frame.out, "\x1b]0;{}\x07", f.title);
+    }
+
+    // Remote bell: ring once per frame when the model's count advanced
+    // (mosh terminaldisplay.cc).
+    if f.bell_count != last.bell_count {
+        frame.append("\x07");
+    }
+
+    // Remote OSC 52 copy: forward to the local terminal's clipboard.
+    // Sequence-based so an identical re-copy still propagates.
+    if f.clipboard_seq != last.clipboard_seq {
+        let _ = write!(
+            frame.out,
+            "\x1b]52;{};{}\x1b\\",
+            f.clipboard_kinds,
+            base64::encode(&f.clipboard)
+        );
     }
 
     // Reverse video.
@@ -1114,6 +1148,44 @@ mod tests {
         );
         let s = String::from_utf8_lossy(&diff);
         assert!(s.contains("https://new.example"), "{s:?}");
+    }
+
+    #[test]
+    fn bell_and_clipboard_forwarded() {
+        // mosh terminaldisplay.cc: ring on bell_count change, emit OSC 52
+        // on clipboard change — both were dropped at the Snapshot seam.
+        // github #27.
+        let prev = term_with(3, 20, b"");
+        let mut next = term_with(3, 20, b"");
+        next.process(b"\x07");
+        let diff = new_frame(
+            true,
+            &Snapshot::from_term(&prev),
+            &Snapshot::from_term(&next),
+        );
+        assert!(diff.contains(&0x07), "remote BEL must ring locally");
+
+        let mut copied = term_with(3, 20, b"");
+        copied.process(b"\x1b]52;c;aGVsbG8=\x07");
+        let diff = new_frame(
+            true,
+            &Snapshot::from_term(&prev),
+            &Snapshot::from_term(&copied),
+        );
+        let s = String::from_utf8_lossy(&diff);
+        assert!(s.contains("\x1b]52;c;aGVsbG8=\x1b\\"), "{s:?}");
+
+        // An identical re-copy still forwards (sequence-based, not
+        // content-based)...
+        let before = Snapshot::from_term(&copied);
+        copied.process(b"\x1b]52;c;aGVsbG8=\x07");
+        let diff = new_frame(true, &before, &Snapshot::from_term(&copied));
+        let s = String::from_utf8_lossy(&diff);
+        assert!(s.contains("\x1b]52;c;aGVsbG8=\x1b\\"), "{s:?}");
+
+        // ...and a no-op frame stays silent.
+        let snap = Snapshot::from_term(&copied);
+        assert!(new_frame(true, &snap, &snap).is_empty());
     }
 
     #[test]

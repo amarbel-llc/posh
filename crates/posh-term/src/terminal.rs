@@ -100,6 +100,11 @@ pub struct Terminal {
     pub(crate) bg_color: Option<(u8, u8, u8)>,
     pub(crate) cursor_color: Option<(u8, u8, u8)>,
     pub(crate) clipboard: Vec<u8>,
+    /// Count of OSC 52 writes and the slot letters of the most recent one:
+    /// lets a consumer forward every copy (duplicates included) by watching
+    /// the sequence number.
+    pub(crate) clipboard_seq: u64,
+    pub(crate) clipboard_kinds: String,
     /// OSC 52 `p` (primary) and `s` (select) slots; `clipboard` is `c`.
     pub(crate) primary_selection: Vec<u8>,
     pub(crate) select_selection: Vec<u8>,
@@ -150,6 +155,8 @@ impl Terminal {
             bg_color: None,
             cursor_color: None,
             clipboard: Vec::new(),
+            clipboard_seq: 0,
+            clipboard_kinds: String::from("c"),
             primary_selection: Vec::new(),
             select_selection: Vec::new(),
             color_stack: Vec::new(),
@@ -939,6 +946,17 @@ impl Terminal {
     /// Last OSC 52 clipboard payload (decoded).
     pub fn clipboard(&self) -> &[u8] {
         &self.clipboard
+    }
+
+    /// Number of OSC 52 writes so far (queries excluded). Forwarders watch
+    /// this so identical re-copies are still propagated.
+    pub fn clipboard_seq(&self) -> u64 {
+        self.clipboard_seq
+    }
+
+    /// Slot letters (`c`/`p`/`s`) of the most recent OSC 52 write.
+    pub fn clipboard_kinds(&self) -> &str {
+        &self.clipboard_kinds
     }
 
     /// OSC 52 selection slot: `'c'` clipboard, `'p'` primary, `'s'` select.
