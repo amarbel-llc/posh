@@ -346,6 +346,13 @@ fn apply_frame(st: &mut ClientState, frame: &ServerFrame) -> bool {
     }
     let mut term = Terminal::with_scrollback(st.rows, st.cols, 0);
     term.process(&bytes);
+    // A DECCOLM replayed from the server dump resizes the model to 132/80
+    // columns regardless of the real tty: clamp back so renders never paint
+    // a wider image than the tty can show (the server-side mode is the
+    // server model's concern, not the local render width).
+    if term.rows() != st.rows || term.cols() != st.cols {
+        term.resize(st.rows, st.cols);
+    }
     st.server_term = term;
     st.applied_num = frame.frame_num;
     st.applied_data = bytes;
@@ -414,5 +421,51 @@ mod tests {
             SocketAddr::V6(a) => assert_eq!(a.ip().to_string(), "::1"),
             SocketAddr::V4(_) => panic!("expected v6"),
         }
+    }
+
+    #[test]
+    fn deccolm_frame_does_not_resize_local_model_past_tty_width() {
+        let key = Key::random();
+        let conn = Connection::client("127.0.0.1:9".parse().unwrap(), &key).unwrap();
+        let now = now_ms();
+        let (rows, cols) = (24u16, 80u16);
+        let mut st = ClientState {
+            conn,
+            fragmenter: Fragmenter::new(),
+            outbox: InputOutbox::new(),
+            rows,
+            cols,
+            flags: 0,
+            last_send: 0,
+            applied_num: 0,
+            applied_data: Vec::new(),
+            server_term: Terminal::with_scrollback(rows, cols, 0),
+            last_drawn: Snapshot::blank(rows, cols),
+            initialized: false,
+            predict: PredictionEngine::new(DisplayPreference::Never, false),
+            notify: NotificationEngine::new(now),
+            quit_pending: false,
+            shutdown_requested: false,
+            shutdown_requested_at: 0,
+            shutdown_seen: false,
+        };
+
+        // Server dump replaying 132-column mode (DECSET 40 allows DECCOLM,
+        // DECSET 3 switches): the local model must stay at the tty size or
+        // every subsequent render paints a 132-col image onto 80 cols.
+        let frame = ServerFrame {
+            flags: 0,
+            frame_num: 1,
+            input_ack: 0,
+            echo_ack: 0,
+            body: FrameBody::Full(b"\x1b[?40h\x1b[?3h132-col mode".to_vec()),
+        };
+        assert!(apply_frame(&mut st, &frame));
+        assert_eq!(st.server_term.rows(), rows);
+        assert_eq!(
+            st.server_term.cols(),
+            cols,
+            "DECCOLM resized the client model away from the tty width"
+        );
     }
 }
