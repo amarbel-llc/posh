@@ -61,12 +61,15 @@ pub fn spawn_shell(
     let mut master: libc::c_int = -1;
     let mut slave: libc::c_int = -1;
     unsafe {
+        // openpty's termios/winsize params are *const on Linux but *mut on
+        // macOS/BSD; cast to let each platform's signature resolve the
+        // mutability. See docs/decisions/0001-posh-term-libc-portability.md.
         if libc::openpty(
             &mut master,
             &mut slave,
             std::ptr::null_mut(),
-            std::ptr::null(),
-            &ws,
+            std::ptr::null::<libc::termios>() as *mut _,
+            &ws as *const _ as *mut _,
         ) < 0
         {
             return Err(std::io::Error::last_os_error().into());
@@ -80,7 +83,9 @@ pub fn spawn_shell(
         if pid == 0 {
             // Child: new session, slave PTY becomes the controlling terminal.
             libc::setsid();
-            libc::ioctl(slave, libc::TIOCSCTTY, 0);
+            // ioctl request is c_int-width on Linux, c_ulong on macOS; cast
+            // the constant to match.
+            libc::ioctl(slave, libc::TIOCSCTTY as _, 0);
             libc::dup2(slave, 0);
             libc::dup2(slave, 1);
             libc::dup2(slave, 2);

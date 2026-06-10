@@ -43,9 +43,24 @@ impl Family {
 /// socket that also accepts IPv4 (as v4-mapped addresses).
 fn bind_udp_v6(port: u16, v6only: bool) -> std::io::Result<UdpSocket> {
     unsafe {
+        // Linux can request close-on-exec atomically via the SOCK_CLOEXEC type
+        // flag; macOS/BSD have no such constant, so set FD_CLOEXEC with a
+        // follow-up fcntl. See docs/decisions/0001-posh-term-libc-portability.md.
+        #[cfg(target_os = "linux")]
         let fd = libc::socket(libc::AF_INET6, libc::SOCK_DGRAM | libc::SOCK_CLOEXEC, 0);
+        #[cfg(not(target_os = "linux"))]
+        let fd = libc::socket(libc::AF_INET6, libc::SOCK_DGRAM, 0);
         if fd < 0 {
             return Err(std::io::Error::last_os_error());
+        }
+        #[cfg(not(target_os = "linux"))]
+        {
+            let flags = libc::fcntl(fd, libc::F_GETFD);
+            if flags < 0 || libc::fcntl(fd, libc::F_SETFD, flags | libc::FD_CLOEXEC) < 0 {
+                let err = std::io::Error::last_os_error();
+                libc::close(fd);
+                return Err(err);
+            }
         }
         let on: libc::c_int = v6only as libc::c_int;
         libc::setsockopt(
