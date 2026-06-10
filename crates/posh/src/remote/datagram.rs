@@ -1,7 +1,7 @@
 //! Encrypted UDP transport (mosh network.cc port): timestamped packets,
 //! RFC 6298-style RTT estimation from the timestamp echo, and server-side
-//! roaming (the server re-targets replies at the source address of the last
-//! authenticated datagram).
+//! roaming (the server re-targets replies at the source address of the
+//! newest authenticated datagram).
 
 use std::net::{Ipv4Addr, Ipv6Addr, SocketAddr, UdpSocket};
 use std::os::fd::{AsRawFd, FromRawFd, RawFd};

@@ -112,8 +112,8 @@ posh client [-4|-6] <host> <port>  # key via POSH_KEY, never on argv
 Encrypted UDP datagrams using AES-128-GCM with mosh's nonce layout
 (direction bit + 63-bit sequence number), replay protection with a reorder
 window, timestamp echo for RFC 6298 RTT estimation, fragmentation for large
-frames, and server-side roaming by adopting the source address of the last
-authenticated datagram. State sync sends complete `dump_vt()` frames (or a
+frames, and server-side roaming by adopting the source address of the newest
+authenticated datagram (late reorders never re-target the stream). State sync sends complete `dump_vt()` frames (or a
 prefix/suffix diff against the last acked frame); user input is delivered
 reliably via cumulative offsets and retransmission.
 
