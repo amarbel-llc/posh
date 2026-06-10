@@ -391,16 +391,30 @@ impl PredictionEngine {
         self.local_frame_sent = x;
     }
 
+    // The ack setters clamp with max: callers feed them from every decoded
+    // frame, including reordered/stale retransmissions whose acks are older
+    // than what we already processed (mosh's transport-layer equivalents are
+    // monotonic by construction).
     pub fn set_local_frame_acked(&mut self, x: u64) {
-        self.local_frame_acked = x;
+        self.local_frame_acked = self.local_frame_acked.max(x);
     }
 
     pub fn set_local_frame_late_acked(&mut self, x: u64) {
-        self.local_frame_late_acked = x;
+        self.local_frame_late_acked = self.local_frame_late_acked.max(x);
     }
 
     pub fn set_send_interval(&mut self, x: u64) {
         self.send_interval = x;
+    }
+
+    #[cfg(test)]
+    pub fn local_frame_acked(&self) -> u64 {
+        self.local_frame_acked
+    }
+
+    #[cfg(test)]
+    pub fn local_frame_late_acked(&self) -> u64 {
+        self.local_frame_late_acked
     }
 
     #[cfg(test)]
@@ -976,6 +990,20 @@ mod tests {
         let fb = snapshot(5, 20, b"$ ");
         eng.new_user_byte(b'x', &fb, 100);
         assert!(!eng.active());
+    }
+
+    #[test]
+    fn ack_counters_are_monotonic_across_reordered_frames() {
+        // A reordered/stale server frame carries older acks than what we
+        // already processed; they must not drive the counters backward
+        // (mosh's transport-layer equivalents are monotonic).
+        let mut eng = engine(DisplayPreference::Always);
+        eng.set_local_frame_acked(5);
+        eng.set_local_frame_late_acked(4);
+        eng.set_local_frame_acked(3);
+        eng.set_local_frame_late_acked(2);
+        assert_eq!(eng.local_frame_acked(), 5);
+        assert_eq!(eng.local_frame_late_acked(), 4);
     }
 
     #[test]
