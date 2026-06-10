@@ -52,7 +52,13 @@ pub fn cmd_attach(
     let result = client_loop(stream);
     let _ = util::write_fd(STDOUT, RESTORE_SEQ);
     drop(raw);
-    result
+    // When the session ended (rather than detached), carry the shell's
+    // exit status out as our own. github #18.
+    match result {
+        Ok(code) if code != 0 => std::process::exit(code),
+        Ok(_) => Ok(()),
+        Err(e) => Err(e),
+    }
 }
 
 /// The detach key Ctrl-\ as kitty keyboard CSI-u encodings (92 = backslash,
@@ -125,7 +131,9 @@ impl DetachMatcher {
     }
 }
 
-fn client_loop(stream: UnixStream) -> Result<()> {
+/// Bridges the tty to the daemon until detach or session end. Returns the
+/// session shell's exit status (0 on detach or connection loss).
+fn client_loop(stream: UnixStream) -> Result<i32> {
     util::install_client_signal_handlers();
     stream.set_nonblocking(true)?;
     let sock_fd = stream.as_raw_fd();
@@ -161,7 +169,7 @@ fn client_loop(stream: UnixStream) -> Result<()> {
             // cmd_attach restores the tty on the way out either way.
             ipc::append_frame(&mut sock_write_buf, Tag::Detach, b"");
             let _ = util::write_all_retry(sock_fd, &sock_write_buf, 100);
-            return Ok(());
+            return Ok(0);
         }
 
         if util::take_flag(&util::SIGCONT_RECEIVED) {
@@ -199,7 +207,7 @@ fn client_loop(stream: UnixStream) -> Result<()> {
         if fds[0].revents & (libc::POLLIN | err_events) != 0 {
             let mut buf = [0u8; 4096];
             match util::read_fd(STDIN, &mut buf) {
-                Ok(0) => return Ok(()),
+                Ok(0) => return Ok(0),
                 Ok(n) => {
                     let (forward, detached) = detach.feed(&buf[..n]);
                     if !forward.is_empty() {
@@ -217,14 +225,23 @@ fn client_loop(stream: UnixStream) -> Result<()> {
         // daemon -> stdout
         if fds[1].revents & libc::POLLIN != 0 {
             match read_buf.read_from(sock_fd) {
-                Ok(0) => return Ok(()),
+                Ok(0) => return Ok(0),
                 Ok(_) => loop {
                     match read_buf.next() {
-                        Ok(Some(frame)) => {
-                            if frame.tag == Tag::Output && !frame.payload.is_empty() {
+                        Ok(Some(frame)) => match frame.tag {
+                            Tag::Output if !frame.payload.is_empty() => {
                                 stdout_buf.extend_from_slice(&frame.payload);
                             }
-                        }
+                            Tag::Exit => {
+                                // Session over: flush the final output and
+                                // carry the shell's status out.
+                                if !stdout_buf.is_empty() {
+                                    let _ = util::write_all_retry(STDOUT, &stdout_buf, 1000);
+                                }
+                                return Ok(ipc::decode_exit(&frame.payload).unwrap_or(0));
+                            }
+                            _ => {}
+                        },
                         Ok(None) => break,
                         Err(e) => return Err(e),
                     }
@@ -234,7 +251,7 @@ fn client_loop(stream: UnixStream) -> Result<()> {
                     if e.kind() == std::io::ErrorKind::ConnectionReset
                         || e.kind() == std::io::ErrorKind::BrokenPipe =>
                 {
-                    return Ok(());
+                    return Ok(0);
                 }
                 Err(e) => return Err(e.into()),
             }
@@ -251,7 +268,7 @@ fn client_loop(stream: UnixStream) -> Result<()> {
                     if e.kind() == std::io::ErrorKind::ConnectionReset
                         || e.kind() == std::io::ErrorKind::BrokenPipe =>
                 {
-                    return Ok(());
+                    return Ok(0);
                 }
                 Err(e) => return Err(e.into()),
             }
@@ -268,7 +285,7 @@ fn client_loop(stream: UnixStream) -> Result<()> {
         }
 
         if fds[1].revents & err_events != 0 {
-            return Ok(());
+            return Ok(0);
         }
     }
 }

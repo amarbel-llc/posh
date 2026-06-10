@@ -20,6 +20,9 @@ pub enum Tag {
     History = 8,
     Run = 9,
     Ack = 10,
+    /// Daemon -> client at teardown: the shell's exit status, so an
+    /// attached client can exit with the session's real code. github #18.
+    Exit = 11,
 }
 
 impl Tag {
@@ -36,6 +39,7 @@ impl Tag {
             8 => Tag::History,
             9 => Tag::Run,
             10 => Tag::Ack,
+            11 => Tag::Exit,
             _ => return None,
         })
     }
@@ -91,6 +95,16 @@ pub fn decode_resize(payload: &[u8]) -> Option<(u16, u16)> {
     let rows = u16::from_le_bytes([payload[0], payload[1]]);
     let cols = u16::from_le_bytes([payload[2], payload[3]]);
     Some((rows, cols))
+}
+
+/// Exit-status payload: the session shell's exit code, little-endian i32
+/// (shell convention: WEXITSTATUS, or 128+signal when signaled).
+pub fn encode_exit(code: i32) -> [u8; 4] {
+    code.to_le_bytes()
+}
+
+pub fn decode_exit(payload: &[u8]) -> Option<i32> {
+    Some(i32::from_le_bytes(payload.try_into().ok()?))
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -236,6 +250,21 @@ impl SessionInfo {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn exit_status_roundtrip() {
+        assert_eq!(decode_exit(&encode_exit(0)), Some(0));
+        assert_eq!(decode_exit(&encode_exit(7)), Some(7));
+        assert_eq!(decode_exit(&encode_exit(128 + 9)), Some(137));
+        assert_eq!(decode_exit(b""), None);
+        assert_eq!(decode_exit(b"abc"), None);
+        // And through the frame layer.
+        let mut buf = FrameBuffer::new();
+        buf.feed(&encode_frame(Tag::Exit, &encode_exit(7)));
+        let frame = buf.next().unwrap().unwrap();
+        assert_eq!(frame.tag, Tag::Exit);
+        assert_eq!(decode_exit(&frame.payload), Some(7));
+    }
 
     #[test]
     fn frame_roundtrip() {

@@ -146,23 +146,44 @@ fn daemon_main(
 
     daemon_loop(&listener, &child, &mut term, &mut clients, &info_cmd, &cwd);
 
-    // Teardown: drop client connections (their EOF is the detach notice),
-    // then bring the shell down: SIGHUP first (shells ignore SIGTERM), then
-    // SIGKILL, both to the whole process group.
+    // Teardown. Reap the shell first: when it already exited (the pty-EIO
+    // path) WNOHANG returns its real status immediately; otherwise bring it
+    // down — SIGHUP first (shells ignore SIGTERM), then SIGKILL, both to
+    // the whole process group — and reap.
     util::log_write("info", &format!("shutting down daemon session={name}"));
-    clients.clear();
-    unsafe {
-        libc::kill(-child.pid, libc::SIGHUP);
+    let mut status = 0;
+    let reaped = unsafe { libc::waitpid(child.pid, &mut status, libc::WNOHANG) } == child.pid;
+    if !reaped {
+        unsafe {
+            libc::kill(-child.pid, libc::SIGHUP);
+        }
+        std::thread::sleep(std::time::Duration::from_millis(500));
+        unsafe {
+            libc::kill(-child.pid, libc::SIGKILL);
+            libc::waitpid(child.pid, &mut status, 0);
+        }
     }
-    std::thread::sleep(std::time::Duration::from_millis(500));
     unsafe {
-        libc::kill(-child.pid, libc::SIGKILL);
-        let mut status = 0;
-        libc::waitpid(child.pid, &mut status, 0);
         libc::close(child.master);
     }
+    // Shell-style exit code: WEXITSTATUS, or 128+signal when signaled.
+    let code = if libc::WIFEXITED(status) {
+        libc::WEXITSTATUS(status)
+    } else if libc::WIFSIGNALED(status) {
+        128 + libc::WTERMSIG(status)
+    } else {
+        0
+    };
+    // Tell attached clients the real status before hanging up (their EOF
+    // is the detach notice). Best-effort: a stuck client cannot block
+    // teardown. github #18.
+    for c in clients.iter_mut() {
+        ipc::append_frame(&mut c.write_buf, Tag::Exit, &ipc::encode_exit(code));
+        let _ = util::write_all_retry(c.stream.as_raw_fd(), &c.write_buf, 100);
+    }
+    clients.clear();
     let _ = std::fs::remove_file(&socket_path);
-    std::process::exit(0);
+    std::process::exit(code);
 }
 
 fn daemon_loop(
@@ -370,7 +391,8 @@ fn daemon_loop(
                                     let _ = util::write_all_retry(pty_fd, &frame.payload, 1000);
                                     c.queue(Tag::Ack, b"");
                                 }
-                                Tag::Output | Tag::Ack => {}
+                                // Exit is daemon->client only.
+                                Tag::Output | Tag::Ack | Tag::Exit => {}
                             }
                         }
                     }

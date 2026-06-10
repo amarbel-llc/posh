@@ -143,6 +143,42 @@ fn attach_client_exits_cleanly_on_sigterm() {
 }
 
 #[test]
+fn attach_client_exits_with_session_exit_status() {
+    // github #18: the daemon propagates the shell's waitpid status via a
+    // Tag::Exit frame at teardown, and the attach client exits with it.
+    let base = std::env::temp_dir();
+    let base = if base.as_os_str().len() > 40 {
+        std::path::PathBuf::from("/tmp")
+    } else {
+        base
+    };
+    let dir = base.join(format!("posh-exitstatus-{}", std::process::id()));
+    std::fs::create_dir_all(&dir).unwrap();
+
+    let (master, slave) = open_pty_pair();
+    let mut cmd = posh_cmd();
+    cmd.args(["attach", "exitstatus", "sh", "-c", "read x; exit 7"])
+        .env("POSH_DIR", &dir)
+        .env_remove("POSH_SESSION")
+        .env_remove("POSH_GROUP");
+    let mut child = spawn_on_pty(&mut cmd, slave);
+    wait_for_pty_output(master, "attach client first output");
+
+    // Wake the shell so it exits with code 7.
+    let n = unsafe { libc::write(master, b"go\n".as_ptr() as *const libc::c_void, 3) };
+    assert_eq!(n, 3, "writing to the pty failed");
+
+    let status = wait_for_exit(&mut child, master, 10);
+    assert_eq!(
+        status.code(),
+        Some(7),
+        "client must exit with the session shell's status, got {status:?}"
+    );
+
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+#[test]
 fn remote_client_reports_dead_server_and_times_out() {
     // github #31: nothing listening on the port — the client must say so
     // within a moment and give up with a clear error instead of hanging
