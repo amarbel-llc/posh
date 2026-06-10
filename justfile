@@ -33,13 +33,19 @@ lint-fmt:
 
 # --- build -----------------------------------------------------------------
 
-build: build-nix
+build: build-nix build-rust
 
 # Hermetic flake build: autogen.sh + configure + make (+ make check).
 [group("build")]
 build-nix:
     # The CI-equivalent build; doCheck runs the sandbox-safe test subset.
     nix build -L --show-trace
+
+# Hermetic Rust workspace build (cargo test --workspace in checkPhase).
+[group("build")]
+build-rust:
+    # The Rust CI gate (github #33); leaves ./result-posh for the binary.
+    nix build -L --show-trace ".#posh" -o result-posh
 
 # Fast C++ dev-loop: autotools build in the devShell, no nix rebuild.
 [group("build")]
@@ -49,7 +55,7 @@ build-autotools:
 
 # --- post-build ------------------------------------------------------------
 
-test: test-nix
+test: test-nix test-rust
 
 # Hermetic, CI-safe test signal (the package's doCheck `make check`).
 [group("post-build")]
@@ -61,6 +67,12 @@ test-nix:
     # has realized the derivation.
     system=$(nix eval --raw --impure --expr 'builtins.currentSystem')
     nix build -L --show-trace ".#packages.${system}.default"
+
+# Hermetic Rust test signal (cargo test --workspace in the posh checkPhase).
+[group("post-build")]
+test-rust:
+    # Cheap once build-rust has realized the derivation. github #33.
+    nix build -L --show-trace --no-link ".#posh"
 
 # Full host `make check` (includes tmux emulation tests; not in `default`).
 [group("post-build")]
@@ -103,11 +115,11 @@ update-nix:
 
 # --- debug -----------------------------------------------------------------
 
-# Run cargo against the Rust workspace via nixpkgs (the devShell has no cargo
-# yet — drop this once the flake learns about the Cargo workspace).
+# Run cargo against the Rust workspace in the devShell — the fast dev-loop
+# (incremental, in-worktree). The hermetic gate is build-rust/test-rust.
 [group("debug")]
 debug-cargo *ARGS:
-    nix shell nixpkgs#cargo nixpkgs#rustc --command cargo {{ ARGS }}
+    nix develop --command cargo {{ ARGS }}
 
 # Run a single autotools test by name in the devShell (fast iteration).
 [group("debug")]

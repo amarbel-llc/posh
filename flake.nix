@@ -131,6 +131,29 @@
           };
         };
 
+        # The Rust workspace: the posh rewrite (crates/posh-term +
+        # crates/posh). `cargo test --workspace` runs in the sandboxed
+        # checkPhase, making this the hermetic Rust CI gate (github #33).
+        # The e2e tests drive ptys and loopback UDP — both available in the
+        # Linux sandbox (the same facilities the C++ --local tests use).
+        # Version single source of truth: crates/posh/Cargo.toml.
+        posh = pkgs.rustPlatform.buildRustPackage {
+          pname = "posh";
+          version = (lib.importTOML ./crates/posh/Cargo.toml).package.version;
+
+          src = ./.;
+          cargoLock.lockFile = ./Cargo.lock;
+
+          doCheck = true;
+
+          meta = with lib; {
+            description = "Persistent, roaming terminal sessions: a combined Rust rewrite of zmx and mosh";
+            license = licenses.gpl3Plus;
+            mainProgram = "posh";
+            platforms = platforms.linux ++ platforms.darwin;
+          };
+        };
+
         # Tree-wide formatter: clang-format (C++) + nixfmt + shfmt under one
         # wrapper. Exposed as `formatter.${system}` (so `nix fmt` works) and
         # dropped into the devShell. See ./treefmt.nix.
@@ -138,8 +161,11 @@
       in
       {
         packages = {
+          # The C++ reference tree stays the default while the rewrite
+          # stabilizes; the Rust binary is `nix build .#posh`.
           default = mosh;
           mosh = mosh;
+          posh = posh;
         };
 
         checks = {
@@ -158,6 +184,8 @@
             ++ [
               pkgs.just
               pkgs.clang-tools # clang-format for the devShell + editor LSP
+              pkgs.cargo # Rust workspace dev-loop (just debug-cargo)
+              pkgs.rustc
               treefmtEval.config.build.wrapper
             ];
         };

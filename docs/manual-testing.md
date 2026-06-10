@@ -6,15 +6,16 @@ top-to-bottom on a fresh clone; each section ends with what you should see.
 
 ## 0. Build
 
-The devShell has **no Rust toolchain yet**
-([#33](https://github.com/amarbel-llc/posh/issues/33)) — build with an
-ad-hoc nix shell (or rustup if the host has one):
+The flake builds the Rust binary
+([#33](https://github.com/amarbel-llc/posh/issues/33)):
 
 ```sh
-nix shell nixpkgs#cargo nixpkgs#rustc --command cargo build --release --workspace
-# equivalently: just debug-cargo build --release --workspace
-P=$PWD/target/release/posh
+nix build .#posh          # or: just build-rust (leaves ./result-posh)
+P=$PWD/result/bin/posh
 ```
+
+For an iterative dev-loop build instead:
+`just debug-cargo build --release --workspace` → `target/release/posh`.
 
 Both ends of any remote test need a UTF-8 locale (`LC_ALL=C.UTF-8` works).
 
