@@ -154,6 +154,20 @@ impl Terminal {
             let _ = write!(out, "\x1b]7;file://{}\x1b\\", self.pwd);
         }
 
+        // Seed the inactive alternate screen's kitty keyboard stack (the
+        // active screen's stack is replayed by dump_modes, and the alt stack
+        // when alt is active is replayed in the alt block below). When the
+        // primary is active, briefly enter the alt screen — which does not
+        // reset the kitty stack — to replay its pushes, then return so the
+        // app finds the right flags after a later `?1049h`.
+        if !self.alt_active && !self.kitty_alt.entries().is_empty() {
+            out.push_str("\x1b[?1049h");
+            for &f in self.kitty_alt.entries() {
+                let _ = write!(out, "\x1b[>{f}u");
+            }
+            out.push_str("\x1b[?1049l");
+        }
+
         // Primary screen: replay scrollback by printing and scrolling it
         // off, then draw the visible grid in flow order (preserving soft
         // wrap flags).
@@ -430,17 +444,32 @@ impl Terminal {
         } else {
             0
         };
+        // When a wide glyph armed pending-wrap, the cursor sits on the
+        // width-0 spacer in the last column; the glyph that re-arms the wrap
+        // is the wide head one column to the left, so aim the CUP there.
+        let wide_pending = self.cursor.pending_wrap
+            && self.cursor.col > 0
+            && self
+                .scr()
+                .cell(self.cursor.row, self.cursor.col)
+                .is_some_and(|cell| cell.width == 0);
+        let print_col = if wide_pending {
+            self.cursor.col - 1
+        } else {
+            self.cursor.col
+        };
         let _ = write!(
             out,
             "\x1b[{};{}H",
-            self.cursor.row - top + 1,
-            self.cursor.col + 1
+            self.cursor.row.saturating_sub(top) + 1,
+            print_col + 1
         );
         if self.cursor.pending_wrap {
-            // Re-print the final cell to regenerate the pending-wrap state,
-            // then restore the pen (SGR and DECSCA independently).
-            if let Some(cell) = self.scr().cell(self.cursor.row, self.cursor.col) {
-                if cell.width == 1 {
+            // Re-print the final cell (a width-1 cell, or a width-2 head whose
+            // spacer regenerates) to regenerate pending-wrap, restoring the
+            // pen (SGR and DECSCA independently) around it.
+            if let Some(cell) = self.scr().cell(self.cursor.row, print_col) {
+                if cell.width == 1 || cell.width == 2 {
                     let pen = st.style;
                     let toggle = cell.style.protected != pen.protected;
                     let mut sgr_want = cell.style;

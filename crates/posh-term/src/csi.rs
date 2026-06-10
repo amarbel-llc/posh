@@ -61,7 +61,7 @@ impl Terminal {
             (0, None, b'a') => {
                 // HPR
                 let n = param_or(params, 0, 1);
-                self.cursor.col = (self.cursor.col + n).min(self.cols() - 1);
+                self.cursor.col = self.cursor.col.saturating_add(n).min(self.cols() - 1);
                 self.cursor.pending_wrap = false;
                 self.touch();
             }
@@ -77,7 +77,7 @@ impl Terminal {
                 // VPA
                 let row = param_or(params, 0, 1) - 1;
                 let row = if self.modes.origin {
-                    self.region().0 + row
+                    self.region().0.saturating_add(row)
                 } else {
                     row
                 };
@@ -89,7 +89,7 @@ impl Terminal {
             (0, None, b'e') => {
                 // VPR
                 let n = param_or(params, 0, 1);
-                self.cursor.row = (self.cursor.row + n).min(self.rows() - 1);
+                self.cursor.row = self.cursor.row.saturating_add(n).min(self.rows() - 1);
                 self.cursor.pending_wrap = false;
                 self.touch();
             }
@@ -122,7 +122,7 @@ impl Terminal {
                     };
                     let resp = format!(
                         "\x1b[{};{}R",
-                        self.cursor.row - top + 1,
+                        self.cursor.row.saturating_sub(top) + 1,
                         self.cursor.col + 1
                     );
                     self.respond(&resp);
@@ -159,11 +159,13 @@ impl Terminal {
                 self.respond("\x1bP>|posh-term 0.1.0\x1b\\");
             }
             (0, None, b'r') => {
-                // DECSTBM
+                // DECSTBM. An oversized bottom (a common "to the end" idiom,
+                // e.g. `CSI 5;999r`) clamps to the last row rather than
+                // voiding the whole region, matching xterm.
                 let rows = self.rows();
                 let top = param_or(params, 0, 1) - 1;
-                let bot = param_or(params, 1, rows) - 1;
-                if top < bot && bot < rows {
+                let bot = (param_or(params, 1, rows) - 1).min(rows - 1);
+                if top < bot {
                     self.scroll_top = top;
                     self.scroll_bot = bot;
                     self.move_to(0, 0);
@@ -211,13 +213,13 @@ impl Terminal {
         } else {
             self.rows() - 1
         };
-        self.cursor.row = (self.cursor.row + n).min(limit);
+        self.cursor.row = self.cursor.row.saturating_add(n).min(limit);
         self.cursor.pending_wrap = false;
         self.touch();
     }
 
     fn cursor_right(&mut self, n: u16) {
-        self.cursor.col = (self.cursor.col + n).min(self.cols() - 1);
+        self.cursor.col = self.cursor.col.saturating_add(n).min(self.cols() - 1);
         self.cursor.pending_wrap = false;
         self.touch();
     }
@@ -232,7 +234,7 @@ impl Terminal {
     pub(crate) fn move_to(&mut self, row: u16, col: u16) {
         let (top, bot) = self.region();
         let row = if self.modes.origin {
-            (top + row).min(bot)
+            top.saturating_add(row).min(bot)
         } else {
             row.min(self.rows() - 1)
         };
@@ -242,7 +244,7 @@ impl Terminal {
         self.touch();
     }
 
-    fn clamp_to_region_if_origin(&mut self) {
+    pub(crate) fn clamp_to_region_if_origin(&mut self) {
         if self.modes.origin {
             let (top, bot) = self.region();
             self.cursor.row = self.cursor.row.clamp(top, bot);
@@ -361,6 +363,7 @@ impl Terminal {
             r.cells.pop();
             r.cells.insert(col as usize, Cell::blank(style));
         }
+        self.repair_wide_halves(row);
         self.cursor.pending_wrap = false;
         self.touch();
     }
@@ -375,6 +378,7 @@ impl Terminal {
                 r.cells.push(Cell::blank(style));
             }
         }
+        self.repair_wide_halves(row);
         self.cursor.pending_wrap = false;
         self.touch();
     }
@@ -383,9 +387,10 @@ impl Terminal {
         let style = self.blank_style();
         let cols = self.cols();
         let (row, col) = (self.cursor.row, self.cursor.col);
-        for c in col..(col + n).min(cols) {
+        for c in col..col.saturating_add(n).min(cols) {
             *self.scr_mut().cell_mut(row, c) = Cell::blank(style);
         }
+        self.repair_wide_halves(row);
         self.cursor.pending_wrap = false;
         self.touch();
     }

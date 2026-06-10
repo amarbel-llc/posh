@@ -574,3 +574,112 @@ fn encode_mouse_follows_terminal_modes() {
         None
     );
 }
+
+// --- Wave A regression: overflow, DECSTBM clamp, wide-char edits, dump_vt ---
+
+#[test]
+fn huge_cursor_params_clamp_without_overflow() {
+    // Params are capped at u16::MAX; cursor ops must widen/saturate, not panic
+    // (debug) or wrap (release). github #19.
+    let mut t = Terminal::new(5, 10);
+    feed(&mut t, "\x1b[65535C"); // CUF far past the edge
+    assert_eq!(pos(&t).1, 9);
+    feed(&mut t, "\x1b[65535B"); // CUD
+    assert_eq!(pos(&t).0, 4);
+    feed(&mut t, "\x1b[1;1H\x1b[65535a"); // HPR
+    assert_eq!(pos(&t).1, 9);
+    feed(&mut t, "\x1b[1;1H\x1b[65535e"); // VPR
+    assert_eq!(pos(&t).0, 4);
+    feed(&mut t, "\x1b[65535X"); // ECH must not overflow col+n
+    feed(&mut t, "\x1b[65535d"); // VPA
+    assert_eq!(pos(&t).0, 4);
+}
+
+#[test]
+fn decstbm_clamps_oversized_bottom() {
+    // `CSI 3;999r` means "rows 3..end"; the region must clamp to the screen,
+    // not be voided. github #20.
+    let mut t = Terminal::new(5, 4);
+    feed(&mut t, "r0\r\nr1\r\nr2\r\nr3\r\nr4");
+    feed(&mut t, "\x1b[3;999r"); // region = rows idx2..4
+    feed(&mut t, "\x1b[5;1H\n"); // cursor to last row, LF scrolls the region
+    assert_eq!(row_text(&t, 0), "r0"); // outside region: untouched
+    assert_eq!(row_text(&t, 1), "r1"); // outside region: untouched
+    assert_eq!(row_text(&t, 2), "r3"); // region scrolled up by one
+}
+
+#[test]
+fn wide_char_delete_repairs_orphaned_spacer() {
+    // DCH on a wide head must not leave the width-0 spacer orphaned (which
+    // would desync every later column). github #21.
+    let mut t = Terminal::new(2, 10);
+    feed(&mut t, "x中y"); // x@0, 中@1-2, y@3
+    feed(&mut t, "\x1b[1;2H\x1b[P"); // delete the wide head at col 1
+    assert_eq!(row_text(&t, 0), "x y");
+}
+
+#[test]
+fn wide_char_erase_repairs_orphaned_half() {
+    let mut t = Terminal::new(2, 10);
+    feed(&mut t, "x中y");
+    feed(&mut t, "\x1b[1;3H\x1b[X"); // ECH the spacer at col 2; head must clear
+    // The wide char occupied cols 1-2; clearing one half blanks both in place.
+    assert_eq!(row_text(&t, 0), "x  y");
+}
+
+#[test]
+fn pending_wrap_after_wide_char_survives_roundtrip() {
+    // A wide glyph ending at the last column arms pending-wrap; dump_vt must
+    // re-arm it so the next char wraps rather than overwriting. github #22.
+    let mut t = Terminal::new(3, 5);
+    feed(&mut t, "abc中"); // 中 fills cols 3-4, pending wrap armed
+    let mut t2 = roundtrip(&t);
+    assert_eq!(row_text(&t2, 0), "abc中");
+    t.process(b"Z");
+    t2.process(b"Z");
+    assert_eq!(row_text(&t2, 1), "Z"); // wrapped to next row, not overwritten
+    assert_eq!(row_text(&t, 1), row_text(&t2, 1));
+    assert_eq!(row_text(&t2, 0), "abc中");
+}
+
+#[test]
+fn inactive_alt_kitty_stack_survives_roundtrip() {
+    // Kitty flags pushed on the alt screen then left active must survive a
+    // dump_vt roundtrip. github #22.
+    let mut t = Terminal::new(4, 8);
+    feed(&mut t, "\x1b[?1049h\x1b[>5u\x1b[?1049l"); // push on alt, return to primary
+    assert_eq!(t.kitty_flags(), KittyFlags(0)); // primary stack empty
+    let mut t2 = roundtrip(&t);
+    t2.process(b"\x1b[?1049h"); // re-enter alt
+    let mut t1 = t;
+    t1.process(b"\x1b[?1049h");
+    assert_eq!(t2.kitty_flags(), t1.kitty_flags());
+    assert_eq!(t2.kitty_flags(), KittyFlags(5));
+}
+
+#[test]
+fn origin_save_restore_then_narrow_region_dumps_without_panic() {
+    // Save cursor under DECOM near the region top, then narrow the region so
+    // the saved row sits above the new top; restore + dump_vt must not
+    // underflow the origin-relative CUP. github #19.
+    let mut t = Terminal::new(6, 8);
+    feed(&mut t, "\x1b[2;5r\x1b[?6h"); // region rows idx1..4, origin on
+    feed(&mut t, "\x1b[1;1H\x1b[s"); // home (region top), save
+    feed(&mut t, "\x1b[4;6r"); // new region rows idx3..5 (top moved down)
+    feed(&mut t, "\x1b[u"); // restore: cursor clamps into [3,5]
+    assert!(t.cursor().row >= 3);
+    let _ = t.dump_vt(); // must not panic
+}
+
+#[test]
+fn application_keypad_bumps_generation() {
+    // ESC = / ESC > change Snapshot-visible state and must bump generation so
+    // the remote/server loop emits a frame. github #24.
+    let mut t = Terminal::new(4, 8);
+    let g = t.generation();
+    t.process(b"\x1b=");
+    assert!(t.generation() > g);
+    let g2 = t.generation();
+    t.process(b"\x1b>");
+    assert!(t.generation() > g2);
+}

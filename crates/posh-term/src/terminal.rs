@@ -297,6 +297,7 @@ impl Terminal {
                 r.cells.pop();
                 r.cells.insert(col as usize, blank.clone());
             }
+            self.repair_wide_halves(row);
         }
         self.clean_wide(row, col, w);
         let style = self.cursor.style;
@@ -356,6 +357,29 @@ impl Terminal {
             {
                 let style = self.blank_style();
                 *self.scr_mut().cell_mut(row, c + 1) = Cell::blank(style);
+            }
+        }
+    }
+
+    /// Repair orphaned wide-character halves across a row after a structural
+    /// edit (ICH/DCH/ECH/insert-mode) that may have split a head from its
+    /// width-0 spacer. A width-2 head not followed by its spacer, and a
+    /// width-0 spacer not preceded by its head, are both blanked.
+    pub(crate) fn repair_wide_halves(&mut self, row: u16) {
+        let cols = self.cols();
+        let style = self.blank_style();
+        for c in 0..cols {
+            let width = self.scr().cell(row, c).map_or(1, |x| x.width);
+            let orphaned = match width {
+                2 => {
+                    c + 1 >= cols
+                        || !self.scr().cell(row, c + 1).is_some_and(|x| x.width == 0)
+                }
+                0 => c == 0 || !self.scr().cell(row, c - 1).is_some_and(|x| x.width == 2),
+                _ => false,
+            };
+            if orphaned {
+                *self.scr_mut().cell_mut(row, c) = Cell::blank(style);
             }
         }
     }
@@ -534,8 +558,14 @@ impl Terminal {
             }
             (None, b'M') => self.reverse_index(),
             (None, b'c') => self.full_reset(),
-            (None, b'=') => self.modes.keypad_app = true,
-            (None, b'>') => self.modes.keypad_app = false,
+            (None, b'=') => {
+                self.modes.keypad_app = true;
+                self.touch();
+            }
+            (None, b'>') => {
+                self.modes.keypad_app = false;
+                self.touch();
+            }
             (None, b'Z') => self.respond("\x1b[?62;22c"),
             (Some(b'#'), b'8') => self.decaln(),
             (Some(b'('), f) => self.cursor.g0 = charset_for(f),
@@ -566,6 +596,10 @@ impl Terminal {
         self.modes.origin = saved.origin;
         self.cursor.row = self.cursor.row.min(self.rows() - 1);
         self.cursor.col = self.cursor.col.min(self.cols() - 1);
+        // Under origin mode the cursor stays within the scroll region, so a
+        // region narrowed since the save must not leave it above the top
+        // (which would underflow the origin-relative CUP in dump_vt).
+        self.clamp_to_region_if_origin();
         self.touch();
     }
 
