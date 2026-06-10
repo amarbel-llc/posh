@@ -9,5 +9,9 @@ repository.workspace = true
 [dependencies]
 posh-term = { path = "../posh-term" }
 libc = "0.2"
-aes-gcm = "0.10"
-rand = "0.8"
+# default-features off drops the unused getrandom/rand_core pull-in; key
+# generation reads OS entropy directly (remote/crypto.rs fill_random).
+aes-gcm = { version = "0.10", default-features = false, features = [
+    "aes",
+    "alloc",
+] }

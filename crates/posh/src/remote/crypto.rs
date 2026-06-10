@@ -10,8 +10,6 @@
 use aes_gcm::aead::{Aead, KeyInit};
 use aes_gcm::{Aes128Gcm, Nonce};
 use posh_term::base64;
-use rand::rngs::OsRng;
-use rand::RngCore;
 
 use crate::util::{Error, Result};
 
@@ -26,10 +24,24 @@ const SEQUENCE_MASK: u64 = !DIRECTION_MASK;
 #[derive(Clone)]
 pub struct Key(pub [u8; KEY_LEN]);
 
+/// Fills `buf` from the OS CSPRNG: getentropy(2) — glibc ≥ 2.25 and macOS,
+/// valid for requests up to 256 bytes — with a /dev/urandom read as the
+/// portable fallback. Panics if no entropy source exists: a session key
+/// must never be generated from anything weaker.
+fn fill_random(buf: &mut [u8]) {
+    debug_assert!(buf.len() <= 256, "getentropy caps requests at 256 bytes");
+    let rc = unsafe { libc::getentropy(buf.as_mut_ptr().cast(), buf.len()) };
+    if rc == 0 {
+        return;
+    }
+    let mut urandom = std::fs::File::open("/dev/urandom").expect("no OS entropy source");
+    std::io::Read::read_exact(&mut urandom, buf).expect("short read from /dev/urandom");
+}
+
 impl Key {
     pub fn random() -> Key {
         let mut k = [0u8; KEY_LEN];
-        OsRng.fill_bytes(&mut k);
+        fill_random(&mut k);
         Key(k)
     }
 
@@ -186,6 +198,16 @@ mod tests {
             Session::new(&key, Direction::ToClient),
             Session::new(&key, Direction::ToServer),
         )
+    }
+
+    #[test]
+    fn random_keys_are_distinct_and_nonzero() {
+        // Guards the OS-entropy path (github #32): a silently failing
+        // source would hand out zeroed or repeated keys.
+        let a = Key::random();
+        let b = Key::random();
+        assert_ne!(a.0, [0u8; KEY_LEN], "key must not be all zeros");
+        assert_ne!(a.0, b.0, "two random keys must differ");
     }
 
     #[test]
