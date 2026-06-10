@@ -943,6 +943,13 @@ impl Terminal {
     pub fn animation_state(&self, image_id: u32) -> Option<AnimationState> {
         self.graphics.animation(image_id)
     }
+
+    /// Full RGBA canvas of a kitty graphics animation frame, composed onto
+    /// its base chain (`c=` frames, alpha blended or replaced per `X=1`).
+    /// Frame 0 is the root image itself.
+    pub fn composed_frame(&self, image_id: u32, frame_no: u32) -> Option<Vec<u8>> {
+        self.graphics.composed_frame(image_id, frame_no)
+    }
 }
 
 pub(crate) fn default_tabs(cols: u16) -> Vec<bool> {

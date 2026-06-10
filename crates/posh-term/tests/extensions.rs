@@ -220,6 +220,69 @@ fn graphics_unicode_placeholder_flag() {
     assert_eq!(pos(&t), (0, 0)); // virtual placements don't move the cursor
 }
 
+/// Base64 of a 2x2 RGB PNG (red, green / blue, white), generated with
+/// Python3 zlib+struct at test-authoring time.
+const PNG_2X2_B64: &str = "iVBORw0KGgoAAAANSUhEUgAAAAIAAAACCAIAAAD91JpzAAAAEk\
+lEQVR4nGP4z8DAAMIM/4EAAB/uBfsL2WiLAAAAAElFTkSuQmCC";
+
+#[test]
+fn graphics_png_decoded_via_escape_stream() {
+    let mut t = term();
+    feed(&mut t, &format!("\x1b_Ga=t,f=100,i=1;{PNG_2X2_B64}\x1b\\"));
+    assert!(responses(&mut t).contains("OK"));
+    let img = &t.images()[&1];
+    assert_eq!((img.width, img.height), (2, 2));
+    #[rustfmt::skip]
+    assert_eq!(img.data, [
+        255, 0, 0, 255,   0, 255, 0, 255,
+        0, 0, 255, 255,   255, 255, 255, 255,
+    ]);
+}
+
+#[test]
+fn graphics_bad_png_acks_ebadpng() {
+    let mut t = term();
+    // "\x89PNG\r\n\x1a\nfake" in base64.
+    feed(&mut t, "\x1b_Ga=t,f=100,i=1;iVBORw0KGgpmYWtl\x1b\\");
+    assert!(responses(&mut t).contains("EBADPNG"));
+    assert!(t.images().is_empty());
+}
+
+#[test]
+fn graphics_zlib_payload_roundtrip() {
+    let mut t = term();
+    // zlib.compress of 2x2 RGBA (10,20,30),(40,50,60)/(70,80,90),(100,110,120).
+    feed(
+        &mut t,
+        "\x1b_Ga=t,f=32,s=2,v=2,o=z,i=2;eJzjEpH7r2Fk898tIOp/Sl7FfwAwCAcJ\x1b\\",
+    );
+    assert_eq!(responses(&mut t), "\x1b_Gi=2;OK\x1b\\");
+    #[rustfmt::skip]
+    assert_eq!(t.images()[&2].data, [
+        10, 20, 30, 255,   40, 50, 60, 255,
+        70, 80, 90, 255,   100, 110, 120, 255,
+    ]);
+}
+
+#[test]
+fn graphics_composed_frame_getter() {
+    let mut t = term();
+    // 2x2 root of (10,20,30,255), then a red 1x1 frame at (1,1).
+    feed(
+        &mut t,
+        "\x1b_Ga=t,f=32,s=2,v=2,i=3;ChQe/woUHv8KFB7/ChQe/w==\x1b\\",
+    );
+    feed(&mut t, "\x1b_Ga=f,f=32,s=1,v=1,i=3,x=1,y=1;/wAA/w==\x1b\\");
+    t.take_responses();
+    assert_eq!(t.composed_frame(3, 0).unwrap(), [10, 20, 30, 255].repeat(4));
+    #[rustfmt::skip]
+    assert_eq!(t.composed_frame(3, 1).unwrap(), [
+        10, 20, 30, 255,   10, 20, 30, 255,
+        10, 20, 30, 255,   255, 0, 0, 255,
+    ]);
+    assert!(t.composed_frame(3, 2).is_none());
+}
+
 // --- dump_vt additions ---------------------------------------------------------
 
 #[test]

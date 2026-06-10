@@ -64,10 +64,15 @@ graphics transmission, OSC 52 per-selection slots, the xterm color stack
 erase (DECSCA/DECSED/DECSEL), and a client-side `encode_mouse` covering
 X10/normal/UTF-8/SGR/SGR-pixel.
 
-Known simplifications: PNG payloads are stored, not decoded; animation
-frames are stored, not composited; shared-memory graphics transmission
-answers EUNSUPPORTED; OSC 66 text sizing is parsed but scale is not
-rendered.
+Graphics payloads are fully decoded in-crate with no dependencies: a
+hand-written RFC 1950/1951 inflate (for `o=z`) and a PNG decoder (8-bit
+gray/gray+alpha/RGB/RGBA/indexed, all filters, PLTE/tRNS, CRC-verified)
+feed `f=100` images and animation frames as RGBA, with frame compositing
+(`a=c`, blend or replace) and `composed_frame()` for renderers.
+
+Known simplifications: Adam7-interlaced and 16-bit PNGs are rejected;
+shared-memory graphics transmission answers EUNSUPPORTED (sandbox-safe);
+OSC 66 text sizing is parsed but scale is not rendered.
 
 ### crates/posh
 
@@ -125,10 +130,13 @@ report `POSH IP` from `$SSH_CONNECTION` for the ssh wrapper, require UTF-8
 locales on both ends (forwarding LANG/LC_* over ssh), and honor
 `POSH_SERVER_NETWORK_TMOUT` / `POSH_SERVER_SIGNAL_TMOUT`.
 
+The renderer also ports mosh's scroll optimization (matched rows are
+scrolled with `\r\n` runs or a DECSTBM region instead of being rewritten)
+and emits OSC 8 hyperlinks.
+
 Known simplifications relative to mosh: frames carry `dump_vt()` state (or
 a prefix/suffix diff) rather than mosh's SSP protobuf instructions with
-zlib; no utmp/motd integration; the diff renderer does not use scroll
-optimization.
+zlib; no utmp/motd integration.
 
 ## Building and testing
 
@@ -137,9 +145,11 @@ cargo build --workspace
 cargo test  --workspace
 ```
 
-The workspace builds warning-free and carries ~340 tests (parser state
+The workspace builds warning-free and carries ~400 tests (parser state
 machine, UTF-8 and wide-char edge cases, reflow, SGR colon forms, kitty
-keyboard encode vectors, graphics ACK paths, dump_vt roundtrips, IPC
-framing, crypto seal/open/replay/tamper, fragmentation, RTT, prediction
-engine state transitions with injected clocks, display-diff morphing
-roundtrips, IPv6 loopback, and daemon lifecycle integration tests).
+keyboard encode vectors, graphics ACK paths, inflate and PNG decode
+vectors, frame compositing, dump_vt roundtrips, IPC framing, crypto
+seal/open/replay/tamper, fragmentation, RTT, prediction engine state
+transitions with injected clocks, display-diff and scroll-optimization
+morphing roundtrips, IPv6 loopback, and daemon lifecycle integration
+tests).

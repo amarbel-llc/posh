@@ -1,10 +1,11 @@
-//! Kitty graphics protocol: APC `G` parsing, image storage, placements
-//! (including relative placements), deletes, animation frame storage, and
-//! OK/error acknowledgements.
+//! Kitty graphics protocol: APC `G` parsing, image storage (raw RGB/RGBA,
+//! PNG decoded on receipt, zlib `o=z` payloads), placements (including
+//! relative placements), deletes, animation frame storage and compositing,
+//! and OK/error acknowledgements.
 
 use std::collections::HashMap;
 
-use crate::base64;
+use crate::{base64, inflate, png};
 
 /// 320 MB storage quota; oldest images are evicted past this.
 const QUOTA_BYTES: usize = 320 * 1024 * 1024;
@@ -19,7 +20,8 @@ pub enum ImageFormat {
     Rgb,
     /// f=32: raw RGBA, 4 bytes per pixel.
     Rgba,
-    /// f=100: PNG, stored compressed without decoding.
+    /// f=100: transmitted as PNG, decoded to RGBA8 (4 bytes per pixel) on
+    /// receipt; `data` holds the decoded pixels.
     Png,
 }
 
@@ -29,7 +31,7 @@ pub struct Image {
     /// Client-assigned image number (`I=`), 0 if unused.
     pub number: u32,
     pub format: ImageFormat,
-    /// Pixel dimensions; 0 for PNG (not decoded).
+    /// Pixel dimensions (for PNG, taken from the decoded image).
     pub width: u32,
     pub height: u32,
     pub data: Vec<u8>,
@@ -37,24 +39,27 @@ pub struct Image {
     pub(crate) seq: u64,
 }
 
-/// One animation frame transmitted with `a=f`. Frames are stored verbatim;
-/// composition and playback rendering are left to the caller.
+/// One animation frame transmitted with `a=f`. The stored data is the
+/// transmitted block; [`GraphicsState::composed_frame`] composes it onto its
+/// base chain into a full canvas. Playback timing is the caller's concern.
 #[derive(Debug, Clone)]
 pub struct Frame {
     /// 1-based frame number (`r=`; new frames get the next free number).
     pub number: u32,
     /// Gap before the next frame in milliseconds (`z=`).
     pub gap_ms: i32,
-    /// 1-based frame composed beneath this one (`c=`), 0 = none.
+    /// 1-based frame composed beneath this one (`c=`), 0 = the root image.
     pub base_frame: u32,
     /// Composition offset of this data within the frame (`x=`, `y=`).
     pub x: u32,
     pub y: u32,
     pub format: ImageFormat,
-    /// Pixel dimensions of the transmitted block; 0 for PNG.
+    /// Pixel dimensions of the transmitted block (decoded, for PNG).
     pub width: u32,
     pub height: u32,
     pub data: Vec<u8>,
+    /// `X=1`: overwrite the base pixels instead of alpha blending.
+    pub replace: bool,
 }
 
 /// Animation control state set with `a=a`.
@@ -136,6 +141,8 @@ struct Command {
     /// O= / S=: byte offset and size for file transmissions.
     file_offset: u64,
     file_size: u64,
+    /// o=z: payload is zlib-compressed.
+    compression: u8,
 }
 
 #[derive(Debug)]
@@ -236,7 +243,7 @@ impl GraphicsState {
         payload: &[u8],
         cursor: (u16, u16),
     ) -> (Option<String>, Advance) {
-        let data = match cmd.transmission {
+        let mut data = match cmd.transmission {
             0 | b'd' => match base64::decode(payload) {
                 Some(d) => d,
                 None => return (respond(&cmd, "EINVAL:invalid base64 payload"), None),
@@ -261,12 +268,39 @@ impl GraphicsState {
                 )
             }
         };
+        // o=z: zlib-compressed payload; the quota applies to the
+        // decompressed size.
+        if cmd.compression != 0 {
+            if cmd.compression != b'z' {
+                return (respond(&cmd, "EINVAL:unknown compression"), None);
+            }
+            data = match inflate::zlib_decompress(&data, QUOTA_BYTES) {
+                Ok(d) => d,
+                Err(inflate::InflateError::TooLarge) => {
+                    return (
+                        respond(&cmd, "EFBIG:decompressed data exceeds storage quota"),
+                        None,
+                    )
+                }
+                Err(_) => return (respond(&cmd, "EINVAL:invalid zlib stream"), None),
+            };
+        }
         let format = match cmd.format {
             24 => ImageFormat::Rgb,
             0 | 32 => ImageFormat::Rgba,
             100 => ImageFormat::Png,
             _ => return (respond(&cmd, "EINVAL:unknown format"), None),
         };
+        if format == ImageFormat::Png {
+            match png::decode(&data) {
+                Ok(decoded) => {
+                    cmd.width = decoded.width;
+                    cmd.height = decoded.height;
+                    data = decoded.rgba;
+                }
+                Err(_) => return (respond(&cmd, "EBADPNG:failed to decode PNG"), None),
+            }
+        }
         if matches!(format, ImageFormat::Rgb | ImageFormat::Rgba) {
             let bpp = if format == ImageFormat::Rgb { 3 } else { 4 };
             let expect = cmd.width as usize * cmd.height as usize * bpp;
@@ -338,6 +372,7 @@ impl GraphicsState {
             width: cmd.width,
             height: cmd.height,
             data,
+            replace: cmd.cell_x == 1,
         };
         self.total_bytes += frame.data.len();
         if let Some(existing) = frames.iter_mut().find(|f| f.number == number) {
@@ -369,18 +404,105 @@ impl GraphicsState {
         respond(cmd, "OK")
     }
 
-    /// `a=c`: frame composition request. Validated and acknowledged; the
-    /// actual pixel composition is left to the renderer.
+    /// `a=c`: composes a rectangle of one frame onto another. `c=`/`r=`
+    /// name the source and destination frames, `x=`/`y=` position the
+    /// rectangle in the destination, `X=`/`Y=` in the source, `w=`/`h=`
+    /// size it (default: whole frame), and `C=1` overwrites instead of
+    /// alpha blending. The destination frame is rewritten as a
+    /// self-contained full canvas.
     fn compose(&mut self, cmd: &Command) -> Option<String> {
         let Some(id) = self.resolve_id(cmd) else {
             return respond(cmd, "ENOENT:no such image");
         };
-        let frames = self.frames.get(&id).map(|v| &v[..]).unwrap_or(&[]);
-        let have = |n: u32| n == 0 || frames.iter().any(|f| f.number == n);
+        let (iw, ih) = {
+            let img = &self.images[&id];
+            (img.width, img.height)
+        };
+        let have = |n: u32| {
+            n != 0
+                && self
+                    .frames
+                    .get(&id)
+                    .is_some_and(|v| v.iter().any(|f| f.number == n))
+        };
         if !have(cmd.rows) || !have(cmd.cols) {
             return respond(cmd, "ENOENT:no such frame");
         }
+        let (Some(src), Some(mut dst)) = (
+            self.composed_frame(id, cmd.cols),
+            self.composed_frame(id, cmd.rows),
+        ) else {
+            return respond(cmd, "EINVAL:could not compose frame");
+        };
+        let w = if cmd.src_w != 0 { cmd.src_w } else { iw };
+        let h = if cmd.src_h != 0 { cmd.src_h } else { ih };
+        compose_rect(
+            &mut dst,
+            (iw, ih),
+            &src,
+            (iw, ih),
+            (cmd.cell_x, cmd.cell_y),
+            (cmd.src_x, cmd.src_y),
+            (w, h),
+            cmd.no_cursor_move,
+        );
+        let frames = self.frames.get_mut(&id).expect("frame presence checked");
+        let frame = frames
+            .iter_mut()
+            .find(|f| f.number == cmd.rows)
+            .expect("frame presence checked");
+        let old = frame.data.len();
+        frame.data = dst;
+        frame.format = ImageFormat::Rgba;
+        frame.x = 0;
+        frame.y = 0;
+        frame.width = iw;
+        frame.height = ih;
+        frame.base_frame = 0;
+        frame.replace = true;
+        let new = frame.data.len();
+        self.total_bytes = self.total_bytes - old + new;
+        self.enforce_quota();
         respond(cmd, "OK")
+    }
+
+    /// Full RGBA canvas (`width * height * 4` of the owning image) of an
+    /// animation frame composed onto its base chain. Frame 0 is the root
+    /// image itself. Returns `None` for unknown images/frames or a
+    /// base-frame cycle.
+    pub fn composed_frame(&self, image_id: u32, frame_no: u32) -> Option<Vec<u8>> {
+        let img = self.images.get(&image_id)?;
+        if img.width == 0 || img.height == 0 {
+            return None;
+        }
+        self.compose_chain(img, frame_no, &mut Vec::new())
+    }
+
+    fn compose_chain(&self, img: &Image, frame_no: u32, seen: &mut Vec<u32>) -> Option<Vec<u8>> {
+        if frame_no == 0 {
+            return Some(as_rgba(img.format, &img.data));
+        }
+        if seen.contains(&frame_no) {
+            return None; // base-frame cycle
+        }
+        seen.push(frame_no);
+        let frame = self
+            .frames
+            .get(&img.id)?
+            .iter()
+            .find(|f| f.number == frame_no)?;
+        let mut canvas = self.compose_chain(img, frame.base_frame, seen)?;
+        compose_rect(
+            &mut canvas,
+            (img.width, img.height),
+            &as_rgba(frame.format, &frame.data),
+            (frame.width, frame.height),
+            (0, 0),
+            (frame.x, frame.y),
+            (frame.width, frame.height),
+            frame.replace,
+        );
+        Some(canvas)
     }
 
     fn enforce_quota(&mut self) {
@@ -673,6 +795,74 @@ fn clamp_cell(v: u32) -> u16 {
     v.min(u32::from(u16::MAX)) as u16
 }
 
+/// Pixels as RGBA8: RGB gains an opaque alpha channel; RGBA and decoded PNG
+/// data are already in the right layout.
+fn as_rgba(format: ImageFormat, data: &[u8]) -> Vec<u8> {
+    match format {
+        ImageFormat::Rgb => {
+            let mut out = Vec::with_capacity(data.len() / 3 * 4);
+            for px in data.chunks_exact(3) {
+                out.extend_from_slice(&[px[0], px[1], px[2], 255]);
+            }
+            out
+        }
+        ImageFormat::Rgba | ImageFormat::Png => data.to_vec(),
+    }
+}
+
+/// Straight-alpha "over" blend of source pixel `s` onto destination `d`.
+fn blend_px(d: &mut [u8], s: &[u8]) {
+    let sa = u32::from(s[3]);
+    if sa == 255 {
+        d.copy_from_slice(&s[..4]);
+        return;
+    }
+    let da = u32::from(d[3]);
+    let oa = sa * 255 + da * (255 - sa); // output alpha, scaled by 255
+    if oa == 0 {
+        d[..4].fill(0);
+        return;
+    }
+    for c in 0..3 {
+        let sc = u32::from(s[c]) * sa * 255;
+        let dc = u32::from(d[c]) * da * (255 - sa);
+        d[c] = ((sc + dc) / oa) as u8;
+    }
+    d[3] = (oa / 255) as u8;
+}
+
+/// Composes a `(w, h)` rectangle of RGBA `src` (read at `src_pos`) onto
+/// RGBA `dst` (written at `dst_pos`), clipped to both buffers. `replace`
+/// overwrites pixels instead of alpha blending.
+#[allow(clippy::too_many_arguments)]
+fn compose_rect(
+    dst: &mut [u8],
+    (dw, dh): (u32, u32),
+    src: &[u8],
+    (sw, sh): (u32, u32),
+    (sx, sy): (u32, u32),
+    (dx, dy): (u32, u32),
+    (w, h): (u32, u32),
+    replace: bool,
+) {
+    let w = w.min(sw.saturating_sub(sx)).min(dw.saturating_sub(dx)) as usize;
+    let h = h.min(sh.saturating_sub(sy)).min(dh.saturating_sub(dy)) as usize;
+    let (sw, dw) = (sw as usize, dw as usize);
+    for row in 0..h {
+        let s_at = ((sy as usize + row) * sw + sx as usize) * 4;
+        let d_at = ((dy as usize + row) * dw + dx as usize) * 4;
+        for col in 0..w {
+            let s = &src[s_at + col * 4..s_at + col * 4 + 4];
+            let d = &mut dst[d_at + col * 4..d_at + col * 4 + 4];
+            if replace {
+                d.copy_from_slice(s);
+            } else {
+                blend_px(d, s);
+            }
+        }
+    }
+}
+
 /// Splits `key=value,...;payload`.
 fn split_control(data: &[u8]) -> (&[u8], &[u8]) {
     match data.iter().position(|&b| b == b';') {
@@ -723,6 +913,7 @@ fn parse_command(control: &[u8]) -> Option<Command> {
             b"Y" => cmd.cell_y = int() as u32,
             b"O" => cmd.file_offset = int() as u64,
             b"S" => cmd.file_size = int() as u64,
+            b"o" => cmd.compression = ch(),
             _ => {} // unknown keys ignored
         }
     }
@@ -814,15 +1005,98 @@ mod tests {
         assert!(g.images().is_empty());
     }
 
+    /// 2x2 RGB PNG (red, green / blue, white), built with Python3
+    /// zlib+struct at test-authoring time.
+    const PNG_RGB_2X2: &[u8] = &[
+        137, 80, 78, 71, 13, 10, 26, 10, 0, 0, 0, 13, 73, 72, 68, 82, 0, 0, 0, 2, 0, 0, 0, 2, 8, 2,
+        0, 0, 0, 253, 212, 154, 115, 0, 0, 0, 18, 73, 68, 65, 84, 120, 156, 99, 248, 207, 192, 192,
+        0, 194, 12, 255, 129, 0, 0, 31, 238, 5, 251, 11, 217, 104, 139, 0, 0, 0, 0, 73, 69, 78, 68,
+        174, 66, 96, 130,
+    ];
+
+    /// `zlib.compress` of the 2x2 RGBA pixels
+    /// (10,20,30,255),(40,50,60,255) / (70,80,90,255),(100,110,120,255).
+    const ZLIB_RGBA_2X2: &[u8] = &[
+        120, 156, 227, 18, 145, 251, 175, 97, 100, 243, 223, 45, 32, 234, 127, 74, 94, 197, 127, 0,
+        48, 8, 7, 9,
+    ];
+
     #[test]
-    fn png_stored_compressed() {
+    fn png_decoded_on_receipt() {
         let mut g = GraphicsState::default();
-        let bytes = b"\x89PNG\r\n\x1a\nfake";
-        let payload = base64::encode(bytes);
-        run(&mut g, &format!("a=t,f=100,i=1;{payload}"));
+        let payload = base64::encode(PNG_RGB_2X2);
+        let resp = run(&mut g, &format!("a=t,f=100,i=1;{payload}"));
+        assert_eq!(resp.unwrap(), "\x1b_Gi=1;OK\x1b\\");
         let img = &g.images()[&1];
         assert_eq!(img.format, ImageFormat::Png);
-        assert_eq!(img.data, bytes);
+        assert_eq!((img.width, img.height), (2, 2));
+        #[rustfmt::skip]
+        assert_eq!(img.data, [
+            255, 0, 0, 255,   0, 255, 0, 255,
+            0, 0, 255, 255,   255, 255, 255, 255,
+        ]);
+    }
+
+    #[test]
+    fn bad_png_is_ebadpng() {
+        let mut g = GraphicsState::default();
+        let payload = base64::encode(b"\x89PNG\r\n\x1a\nfake");
+        let resp = run(&mut g, &format!("a=t,f=100,i=1;{payload}"));
+        assert!(resp.unwrap().contains("EBADPNG"));
+        assert!(g.images().is_empty());
+    }
+
+    #[test]
+    fn png_placement_extent_from_decoded_size() {
+        let mut g = GraphicsState::default();
+        let payload = base64::encode(PNG_RGB_2X2);
+        let (resp, adv) = g.dispatch(format!("a=T,f=100,i=1;{payload}").as_bytes(), (0, 0));
+        assert!(resp.unwrap().contains("OK"));
+        assert_eq!(adv, Some((1, 1))); // 2x2 px fits in one cell
+    }
+
+    // --- compressed (o=z) payloads ------------------------------------------
+
+    #[test]
+    fn zlib_payload_inflated() {
+        let mut g = GraphicsState::default();
+        let payload = base64::encode(ZLIB_RGBA_2X2);
+        let resp = run(&mut g, &format!("a=t,f=32,s=2,v=2,o=z,i=9;{payload}"));
+        assert_eq!(resp.unwrap(), "\x1b_Gi=9;OK\x1b\\");
+        let img = &g.images()[&9];
+        #[rustfmt::skip]
+        assert_eq!(img.data, [
+            10, 20, 30, 255,   40, 50, 60, 255,
+            70, 80, 90, 255,   100, 110, 120, 255,
+        ]);
+    }
+
+    #[test]
+    fn zlib_payload_chunked() {
+        let mut g = GraphicsState::default();
+        let full = base64::encode(ZLIB_RGBA_2X2);
+        let (a, b) = full.split_at(8);
+        assert!(run(&mut g, &format!("a=t,f=32,s=2,v=2,o=z,i=9,m=1;{a}")).is_none());
+        let resp = run(&mut g, &format!("m=0;{b}"));
+        assert_eq!(resp.unwrap(), "\x1b_Gi=9;OK\x1b\\");
+        assert_eq!(g.images()[&9].data.len(), 16);
+    }
+
+    #[test]
+    fn corrupt_zlib_payload_is_einval() {
+        let mut g = GraphicsState::default();
+        let payload = base64::encode(b"not a zlib stream");
+        let resp = run(&mut g, &format!("a=t,f=32,s=2,v=2,o=z,i=9;{payload}"));
+        assert!(resp.unwrap().contains("EINVAL"));
+        assert!(g.images().is_empty());
+    }
+
+    #[test]
+    fn unknown_compression_is_einval() {
+        let mut g = GraphicsState::default();
+        let payload = rgba(1, 1);
+        let resp = run(&mut g, &format!("a=t,f=32,s=1,v=1,o=q,i=9;{payload}"));
+        assert!(resp.unwrap().contains("EINVAL"));
     }
 
     #[test]
@@ -1098,6 +1372,130 @@ mod tests {
         assert!(run(&mut g, "a=c,i=6,r=9;").unwrap().contains("ENOENT"));
     }
 
+    // --- frame compositing ---------------------------------------------------
+
+    /// Transmits a 2x2 RGBA root image with the given per-pixel color.
+    fn root_2x2(g: &mut GraphicsState, id: u32, px: [u8; 4]) {
+        let payload = base64::encode(&px.repeat(4));
+        let resp = run(g, &format!("a=t,f=32,s=2,v=2,i={id};{payload}"));
+        assert!(resp.unwrap().contains("OK"));
+    }
+
+    /// Transmits one animation frame with the given pixels and extra keys.
+    fn frame(g: &mut GraphicsState, id: u32, w: u32, h: u32, extra: &str, px: &[u8]) {
+        let payload = base64::encode(px);
+        let resp = run(g, &format!("a=f,f=32,s={w},v={h},i={id}{extra};{payload}"));
+        assert!(resp.unwrap().contains("OK"));
+    }
+
+    #[test]
+    fn composed_frame_zero_is_root_image() {
+        let mut g = GraphicsState::default();
+        root_2x2(&mut g, 1, [10, 20, 30, 255]);
+        let canvas = g.composed_frame(1, 0).unwrap();
+        assert_eq!(canvas, [10, 20, 30, 255].repeat(4));
+        // RGB roots gain an opaque alpha channel.
+        let payload = base64::encode(&[7u8, 8, 9]);
+        run(&mut g, &format!("a=t,f=24,s=1,v=1,i=2;{payload}"));
+        assert_eq!(g.composed_frame(2, 0).unwrap(), [7, 8, 9, 255]);
+        assert!(g.composed_frame(99, 0).is_none());
+    }
+
+    #[test]
+    fn frame_composes_at_offset_onto_root() {
+        let mut g = GraphicsState::default();
+        root_2x2(&mut g, 1, [10, 20, 30, 255]);
+        frame(&mut g, 1, 1, 1, ",x=1,y=1", &[255, 0, 0, 255]);
+        let canvas = g.composed_frame(1, 1).unwrap();
+        #[rustfmt::skip]
+        assert_eq!(canvas, [
+            10, 20, 30, 255,   10, 20, 30, 255,
+            10, 20, 30, 255,   255, 0, 0, 255,
+        ]);
+        assert!(g.composed_frame(1, 2).is_none()); // no such frame
+    }
+
+    #[test]
+    fn frame_alpha_blends_onto_base() {
+        let mut g = GraphicsState::default();
+        root_2x2(&mut g, 1, [100, 100, 100, 255]);
+        frame(&mut g, 1, 2, 2, "", &[200, 200, 200, 128].repeat(4));
+        // over(200 @ a=128, 100 @ opaque): (200*128 + 100*127) / 255 = 150.
+        let canvas = g.composed_frame(1, 1).unwrap();
+        assert_eq!(canvas, [150, 150, 150, 255].repeat(4));
+    }
+
+    #[test]
+    fn frame_replace_mode_overwrites() {
+        let mut g = GraphicsState::default();
+        root_2x2(&mut g, 1, [100, 100, 100, 255]);
+        frame(&mut g, 1, 2, 2, ",X=1", &[200, 200, 200, 128].repeat(4));
+        assert!(g.frames(1)[0].replace);
+        let canvas = g.composed_frame(1, 1).unwrap();
+        assert_eq!(canvas, [200, 200, 200, 128].repeat(4));
+    }
+
+    #[test]
+    fn frame_base_chain_composes_recursively() {
+        let mut g = GraphicsState::default();
+        root_2x2(&mut g, 1, [10, 20, 30, 255]);
+        frame(&mut g, 1, 1, 1, ",x=1,y=1", &[255, 0, 0, 255]);
+        // Frame 2 builds on frame 1 and paints the top-left pixel green.
+        frame(&mut g, 1, 1, 1, ",c=1", &[0, 255, 0, 255]);
+        let canvas = g.composed_frame(1, 2).unwrap();
+        #[rustfmt::skip]
+        assert_eq!(canvas, [
+            0, 255, 0, 255,    10, 20, 30, 255,
+            10, 20, 30, 255,   255, 0, 0, 255,
+        ]);
+    }
+
+    #[test]
+    fn frame_base_cycle_returns_none() {
+        let mut g = GraphicsState::default();
+        root_2x2(&mut g, 1, [0, 0, 0, 255]);
+        frame(&mut g, 1, 1, 1, "", &[1, 1, 1, 255]);
+        frame(&mut g, 1, 1, 1, ",c=1", &[2, 2, 2, 255]);
+        // Re-transmit frame 1 (r=1) based on frame 2: 1 -> 2 -> 1.
+        frame(&mut g, 1, 1, 1, ",r=1,c=2", &[3, 3, 3, 255]);
+        assert!(g.composed_frame(1, 1).is_none());
+        assert!(g.composed_frame(1, 2).is_none());
+        assert!(g.composed_frame(1, 0).is_some()); // root is unaffected
+    }
+
+    #[test]
+    fn compose_action_copies_rect_between_frames() {
+        let mut g = GraphicsState::default();
+        root_2x2(&mut g, 1, [0, 0, 0, 255]);
+        frame(&mut g, 1, 2, 2, "", &[50, 50, 50, 255].repeat(4));
+        frame(&mut g, 1, 2, 2, "", &[200, 0, 0, 255].repeat(4));
+        // Copy a 1x1 rect from frame 2 at (X,Y)=(0,0) onto frame 1 at (1,1).
+        let resp = run(&mut g, "a=c,i=1,c=2,r=1,w=1,h=1,x=1,y=1,X=0,Y=0,C=1");
+        assert!(resp.unwrap().contains("OK"));
+        let canvas = g.composed_frame(1, 1).unwrap();
+        #[rustfmt::skip]
+        assert_eq!(canvas, [
+            50, 50, 50, 255,   50, 50, 50, 255,
+            50, 50, 50, 255,   200, 0, 0, 255,
+        ]);
+        // The destination frame is now a self-contained full canvas.
+        let f = g.frames(1).iter().find(|f| f.number == 1).unwrap();
+        assert_eq!((f.width, f.height, f.base_frame), (2, 2, 0));
+    }
+
+    #[test]
+    fn compose_action_blends_without_c1() {
+        let mut g = GraphicsState::default();
+        root_2x2(&mut g, 1, [0, 0, 0, 255]);
+        frame(&mut g, 1, 2, 2, "", &[100, 100, 100, 255].repeat(4));
+        frame(&mut g, 1, 2, 2, ",X=1", &[200, 200, 200, 128].repeat(4));
+        let resp = run(&mut g, "a=c,i=1,c=2,r=1");
+        assert!(resp.unwrap().contains("OK"));
+        // Same blend as frame_alpha_blends_onto_base.
+        let canvas = g.composed_frame(1, 1).unwrap();
+        assert_eq!(canvas, [150, 150, 150, 255].repeat(4));
+    }
+
     #[test]
     fn frame_delete_with_image() {
         let mut g = GraphicsState::default();
@@ -1150,6 +1548,21 @@ mod tests {
         let resp = run(&mut g, &format!("a=t,t=t,f=32,s=1,v=1,i=8;{payload}"));
         assert!(resp.unwrap().contains("OK"));
         assert!(!path.exists());
+    }
+
+    #[test]
+    fn file_transmission_of_png_is_decoded() {
+        let mut g = GraphicsState::default();
+        let dir = std::env::temp_dir();
+        let path = dir.join(format!("posh-term-gfx-{}.png", std::process::id()));
+        std::fs::write(&path, PNG_RGB_2X2).unwrap();
+        let payload = base64::encode(path.to_str().unwrap().as_bytes());
+        let resp = run(&mut g, &format!("a=t,t=f,f=100,i=8;{payload}"));
+        assert!(resp.unwrap().contains("OK"));
+        let img = &g.images()[&8];
+        assert_eq!((img.width, img.height), (2, 2));
+        assert_eq!(img.data.len(), 16); // decoded RGBA, not the PNG bytes
+        std::fs::remove_file(&path).ok();
     }
 
     #[test]
