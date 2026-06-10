@@ -67,3 +67,4 @@ This decision is **exploring**, not settled: the only thing separating Option 1 
 
 * Failing build: `just build-rust` on `aarch64-apple-darwin` (passed on Linux), errors `E0425` (`SOCK_CLOEXEC`), `E0308` (`openpty` pointer mutability, `TIOCSCTTY` width).
 * Implementation: `crates/posh/src/remote/datagram.rs` (`bind_udp_v6`), `crates/posh/src/pty.rs` (`spawn_shell`). Both sites carry a comment pointing back to this ADR.
+* Structural reinforcement: `connection_sockets_are_close_on_exec` (`datagram.rs` tests) pins the load-bearing *outcome* — `FD_CLOEXEC` present on every `Connection` constructor path — on both platforms, whichever idiom set it. A regression fails the suite instead of silently leaking the transport fd across `spawn_shell`'s exec, and the test keeps holding if this ADR later collapses to Option 2 (or to a safe-wrapper crate under the #36 unsafe audit).

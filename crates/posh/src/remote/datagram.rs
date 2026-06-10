@@ -306,6 +306,36 @@ mod tests {
     use super::*;
 
     #[test]
+    fn connection_sockets_are_close_on_exec() {
+        // The load-bearing invariant behind the platform split in
+        // bind_udp_v6 (docs/decisions/0001-posh-term-libc-portability.md):
+        // the encrypted-transport fd must never leak across spawn_shell's
+        // exec into the user's shell. Linux sets it atomically via
+        // SOCK_CLOEXEC, other platforms via a follow-up fcntl, and std
+        // covers the sockets it creates — this pins the OUTCOME for every
+        // Connection constructor path, whichever idiom produced it.
+        let assert_cloexec = |fd: RawFd, what: &str| {
+            let flags = unsafe { libc::fcntl(fd, libc::F_GETFD) };
+            assert!(flags >= 0, "F_GETFD failed for {what}");
+            assert!(
+                flags & libc::FD_CLOEXEC != 0,
+                "{what} socket missing FD_CLOEXEC"
+            );
+        };
+        let key = Key::random();
+        let (server, _) = Connection::server((62600, 62699), &key, Family::Auto).unwrap();
+        assert_cloexec(server.raw_fd(), "auto/dual-stack server");
+        let (server4, port4) = Connection::server((62600, 62699), &key, Family::Inet).unwrap();
+        assert_cloexec(server4.raw_fd(), "ipv4 server");
+        if let Ok((server6, _)) = Connection::server((62600, 62699), &key, Family::Inet6) {
+            assert_cloexec(server6.raw_fd(), "ipv6 server");
+        }
+        let client =
+            Connection::client(format!("127.0.0.1:{port4}").parse().unwrap(), &key).unwrap();
+        assert_cloexec(client.raw_fd(), "client");
+    }
+
+    #[test]
     fn rtt_first_sample_initializes() {
         let mut est = RttEstimator::new();
         est.sample(100.0);
