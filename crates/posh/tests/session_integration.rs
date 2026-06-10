@@ -25,9 +25,22 @@ fn wait_for<F: FnMut() -> bool>(mut cond: F, what: &str) {
     panic!("timed out waiting for {what}");
 }
 
+/// Unix socket paths cap at ~107 bytes; the deeply nested TMPDIR that
+/// `nix develop` exports blows that through temp_dir(), so fall back to
+/// /tmp when the base is already long.
+fn test_dir(prefix: &str) -> PathBuf {
+    let base = std::env::temp_dir();
+    let base = if base.as_os_str().len() > 40 {
+        PathBuf::from("/tmp")
+    } else {
+        base
+    };
+    base.join(format!("{prefix}-{}", std::process::id()))
+}
+
 #[test]
 fn daemon_lifecycle_create_list_kill() {
-    let dir = std::env::temp_dir().join(format!("posh-itest-{}", std::process::id()));
+    let dir = test_dir("posh-itest");
     std::fs::create_dir_all(&dir).unwrap();
 
     // Create without attaching; the daemon runs `sleep 300` in a PTY.
@@ -88,7 +101,7 @@ fn daemon_lifecycle_create_list_kill() {
 
 #[test]
 fn run_sends_command_into_new_session() {
-    let dir = std::env::temp_dir().join(format!("posh-itest-run-{}", std::process::id()));
+    let dir = test_dir("posh-itest-run");
     std::fs::create_dir_all(&dir).unwrap();
 
     // `run` must create the session (default shell) and ack the command.

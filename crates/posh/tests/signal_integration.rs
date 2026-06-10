@@ -97,7 +97,16 @@ fn wait_for_exit(child: &mut Child, master: RawFd, secs: u64) -> std::process::E
 
 #[test]
 fn attach_client_exits_cleanly_on_sigterm() {
-    let dir = std::env::temp_dir().join(format!("posh-sigtest-{}", std::process::id()));
+    // Unix socket paths cap at ~107 bytes; the deeply nested TMPDIR that
+    // `nix develop` exports blows that through temp_dir(), so fall back
+    // to /tmp when the base is already long.
+    let base = std::env::temp_dir();
+    let base = if base.as_os_str().len() > 40 {
+        std::path::PathBuf::from("/tmp")
+    } else {
+        base
+    };
+    let dir = base.join(format!("posh-sigtest-{}", std::process::id()));
     std::fs::create_dir_all(&dir).unwrap();
 
     let out = posh_cmd()

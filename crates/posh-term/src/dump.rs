@@ -221,12 +221,13 @@ impl Terminal {
     }
 
     /// Replays kitty graphics: stored images as (chunked) APC
-    /// transmissions, animation frames and play state, then placements
-    /// anchored by absolute cursor positioning. Relative placements
-    /// (`P=`/`Q=`) were resolved to absolute cells at creation time, so
-    /// they replay as absolute and the inert parent linkage is dropped.
-    /// `q=2` keeps the replay response-quiet. PNG transmissions are stored
-    /// decoded, so they replay as raw RGBA.
+    /// transmissions, animation frames and play state, then placements.
+    /// Absolute placements are anchored by cursor positioning; relative
+    /// ones re-emit their `P=`/`Q=`/`H=`/`V=` linkage — the parent was
+    /// created (and so replays) first, re-resolving to the same cells
+    /// while keeping the parent fields in the replayed model. `q=2` keeps
+    /// the replay response-quiet. PNG transmissions are stored decoded, so
+    /// they replay as raw RGBA.
     fn dump_graphics(&self, out: &mut String) {
         let fmt_key = |f: ImageFormat| if f == ImageFormat::Rgb { 24 } else { 32 };
         let mut ids: Vec<u32> = self.graphics.images().keys().copied().collect();
@@ -269,7 +270,7 @@ impl Terminal {
             }
         }
         for p in self.graphics.placements() {
-            if !p.unicode {
+            if p.parent_image == 0 && !p.unicode {
                 let _ = write!(out, "\x1b[{};{}H", p.row + 1, p.col + 1);
             }
             let _ = write!(
@@ -287,6 +288,13 @@ impl Terminal {
                 p.cell_x,
                 p.cell_y
             );
+            if p.parent_image != 0 {
+                let _ = write!(
+                    out,
+                    ",P={},Q={},H={},V={}",
+                    p.parent_image, p.parent_placement, p.h_off, p.v_off
+                );
+            }
             if p.unicode {
                 out.push_str(",U=1");
             }

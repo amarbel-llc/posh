@@ -52,6 +52,8 @@ fn dump_vt_replays_kitty_graphics() {
     feed(&mut t, &format!("\x1b_Ga=t,f=24,s=1,v=1,i=7;{rgb}\x1b\\"));
     feed(&mut t, "\x1b[1;1H");
     feed(&mut t, "\x1b_Ga=p,i=7,p=2,z=5,c=3,r=2\x1b\\");
+    // A relative placement: image 7 anchored to image 9's placement.
+    feed(&mut t, "\x1b_Ga=p,i=7,p=8,P=9,H=1,V=1\x1b\\");
     // An animation frame and a play state on image 9.
     feed(&mut t, &format!("\x1b_Ga=f,i=9,s=1,v=1,z=120;{rgba}\x1b\\"));
     feed(&mut t, "\x1b_Ga=a,i=9,s=3,v=1\x1b\\");
@@ -80,6 +82,8 @@ fn dump_vt_replays_kitty_graphics() {
                     p.rows,
                     p.src_w,
                     p.src_h,
+                    p.parent_image,
+                    p.parent_placement,
                 )
             })
             .collect();
