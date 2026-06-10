@@ -28,6 +28,14 @@ fn open_pty_pair() -> (RawFd, RawFd) {
         );
         let slave = libc::open(name.as_ptr(), libc::O_RDWR | libc::O_NOCTTY);
         assert!(slave >= 0, "open pty slave failed");
+        // A real window size: banner/render assertions need columns.
+        let ws = libc::winsize {
+            ws_row: 24,
+            ws_col: 80,
+            ws_xpixel: 0,
+            ws_ypixel: 0,
+        };
+        libc::ioctl(master, libc::TIOCSWINSZ, &ws);
         let flags = libc::fcntl(master, libc::F_GETFL);
         libc::fcntl(master, libc::F_SETFL, flags | libc::O_NONBLOCK);
         (master, slave)
@@ -43,7 +51,7 @@ fn spawn_on_pty(cmd: &mut Command, slave: RawFd) -> Child {
         .expect("spawn posh on pty")
 }
 
-fn drain(master: RawFd) -> usize {
+fn drain_into(master: RawFd, out: &mut Vec<u8>) -> usize {
     let mut total = 0;
     let mut buf = [0u8; 4096];
     loop {
@@ -51,8 +59,13 @@ fn drain(master: RawFd) -> usize {
         if n <= 0 {
             return total;
         }
+        out.extend_from_slice(&buf[..n as usize]);
         total += n as usize;
     }
+}
+
+fn drain(master: RawFd) -> usize {
+    drain_into(master, &mut Vec::new())
 }
 
 fn wait_for_pty_output(master: RawFd, what: &str) {
@@ -118,6 +131,44 @@ fn attach_client_exits_cleanly_on_sigterm() {
         .env("POSH_DIR", &dir)
         .output();
     let _ = std::fs::remove_dir_all(&dir);
+}
+
+#[test]
+fn remote_client_reports_dead_server_and_times_out() {
+    // github #31: nothing listening on the port — the client must say so
+    // within a moment and give up with a clear error instead of hanging
+    // forever. POSH_CONNECT_TMOUT shrinks the 15s default for the test.
+    let (master, slave) = open_pty_pair();
+    let mut cmd = posh_cmd();
+    cmd.args(["client", "127.0.0.1", "62999"])
+        .env("LC_ALL", "C.UTF-8")
+        .env("POSH_CONNECT_TMOUT", "3")
+        .env("POSH_KEY", "AAAAAAAAAAAAAAAAAAAAAA");
+    let mut child = spawn_on_pty(&mut cmd, slave);
+
+    let mut pane = Vec::new();
+    let deadline = Instant::now() + Duration::from_secs(10);
+    let mut status = None;
+    while Instant::now() < deadline {
+        drain_into(master, &mut pane);
+        if let Some(s) = child.try_wait().expect("try_wait") {
+            status = Some(s);
+            break;
+        }
+        std::thread::sleep(Duration::from_millis(25));
+    }
+    drain_into(master, &mut pane);
+    let text = String::from_utf8_lossy(&pane);
+    assert!(
+        text.contains("Nothing received from server on UDP port 62999"),
+        "no early diagnostic banner in pane: {text:?}"
+    );
+    assert!(
+        text.contains("imed out waiting for server"),
+        "no timeout message in pane: {text:?}"
+    );
+    let status = status.expect("client never exited after the connect timeout");
+    assert!(!status.success(), "timeout must exit nonzero, got {status:?}");
 }
 
 #[test]

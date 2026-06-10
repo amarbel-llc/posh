@@ -47,7 +47,7 @@ pub fn run(host: &str, port: u16, family: Family) -> Result<()> {
     let conn = Connection::client(addr, &key)?;
 
     let raw = RawMode::enable(STDIN)?;
-    let result = client_loop(conn, prediction, predict_overwrite, &raw);
+    let result = client_loop(conn, prediction, predict_overwrite, &raw, addr.port());
     let _ = util::write_all_retry(STDOUT, display::close(), 1000);
     drop(raw);
     eprintln!("\nposh: [client exited]");
@@ -100,6 +100,7 @@ fn client_loop(
     prediction: DisplayPreference,
     predict_overwrite: bool,
     raw: &RawMode,
+    port: u16,
 ) -> Result<()> {
     util::install_client_signal_handlers();
     util::set_nonblocking(STDIN)?;
@@ -128,6 +129,18 @@ fn client_loop(
     };
     let mut assembly = FragmentAssembly::new();
 
+    // Connect diagnostics (mosh stmclient): before the first authentic
+    // frame, hint after 250ms and give up after POSH_CONNECT_TMOUT seconds
+    // (default 15, 0 disables) instead of waiting forever on a firewalled
+    // port or a server that failed to start.
+    let started = now_ms();
+    let connect_timeout: u64 = std::env::var("POSH_CONNECT_TMOUT")
+        .ok()
+        .and_then(|v| v.parse::<u64>().ok())
+        .map(|s| s.saturating_mul(1000))
+        .unwrap_or(15_000);
+    let mut heard = false;
+
     // Hello: teaches the server our address and terminal size.
     send_message(&mut st);
 
@@ -141,6 +154,10 @@ fn client_loop(
         if st.predict.needs_timer() {
             // Outstanding predictions need 50ms ticks for glitch detection.
             deadline = deadline.min(now + 50);
+        }
+        if !heard {
+            // Pre-contact: tick for the 250ms hint / connect timeout.
+            deadline = deadline.min(now + 250);
         }
         let timeout = deadline.saturating_sub(now).min(1000) as i32;
 
@@ -211,6 +228,12 @@ fn client_loop(
                         let Ok(frame) = ServerFrame::decode(&assembled) else {
                             continue;
                         };
+                        if !heard {
+                            heard = true;
+                            if st.notify.message().starts_with("Nothing received") {
+                                st.notify.set_message("", false, now_ms());
+                            }
+                        }
                         if process_frame(&mut st, &frame) {
                             send_now = true; // ack the new state promptly
                         }
@@ -223,6 +246,21 @@ fn client_loop(
         }
 
         let now = now_ms();
+        if !heard {
+            let waited = now.saturating_sub(started);
+            if connect_timeout > 0 && waited >= connect_timeout {
+                return Err(Error(format!(
+                    "Timed out waiting for server on UDP port {port}."
+                )));
+            }
+            if waited >= 250 && st.notify.message().is_empty() {
+                st.notify.set_message(
+                    &format!("Nothing received from server on UDP port {port}."),
+                    true,
+                    now,
+                );
+            }
+        }
         render(&mut st, now);
 
         if send_now
