@@ -253,14 +253,17 @@ pub fn cmd_list(cfg: &Config, format: ListFormat) -> Result<()> {
         let name = util::decode_session_name(&encoded);
         let path = entry.path();
         match probe_session(&path) {
-            Ok(probe) => sessions.push(SessionEntry {
-                name,
-                pid: Some(probe.info.pid),
-                clients: Some(probe.info.clients),
-                error: None,
-                cmd: (!probe.info.cmd.is_empty()).then_some(probe.info.cmd),
-                cwd: (!probe.info.cwd.is_empty()).then_some(probe.info.cwd),
-            }),
+            Ok(probe) => {
+                let cmd = probe.info.cmd_display();
+                sessions.push(SessionEntry {
+                    name,
+                    pid: Some(probe.info.pid),
+                    clients: Some(probe.info.clients),
+                    error: None,
+                    cmd: (!cmd.is_empty()).then_some(cmd),
+                    cwd: (!probe.info.cwd.is_empty()).then_some(probe.info.cwd),
+                })
+            }
             Err(e) => {
                 sessions.push(SessionEntry {
                     name,
@@ -539,7 +542,7 @@ pub fn cmd_fork(cfg: &Config, target: Option<&str>) -> Result<()> {
         return Err(Error(format!("session already exists: {target_name}")));
     }
 
-    let args: Vec<String> = info.cmd.split_whitespace().map(|s| s.to_string()).collect();
+    let args = info.cmd_argv();
     let command = (!args.is_empty()).then_some(args);
 
     // chdir so the new daemon inherits the source session's cwd.

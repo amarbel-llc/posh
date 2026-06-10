@@ -140,7 +140,9 @@ fn daemon_main(
 
     let mut term = Terminal::with_scrollback(rows, cols, SCROLLBACK);
     let mut clients: Vec<ClientConn> = Vec::new();
-    let info_cmd = command.as_ref().map(|c| c.join(" ")).unwrap_or_default();
+    // Join argv with NUL (not spaces) so `posh fork` can recover arguments
+    // that contain spaces losslessly. github #18.
+    let info_cmd = command.as_ref().map(|c| c.join("\0")).unwrap_or_default();
 
     daemon_loop(&listener, &child, &mut term, &mut clients, &info_cmd, &cwd);
 

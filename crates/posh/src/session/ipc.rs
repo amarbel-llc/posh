@@ -177,6 +177,23 @@ pub struct SessionInfo {
 }
 
 impl SessionInfo {
+    /// The session command as an argv vector. The wire `cmd` joins argv with
+    /// NUL so arguments containing spaces survive the round-trip (a plain
+    /// space-join would corrupt them on fork). github #18.
+    pub fn cmd_argv(&self) -> Vec<String> {
+        self.cmd
+            .split('\0')
+            .filter(|s| !s.is_empty())
+            .map(str::to_string)
+            .collect()
+    }
+
+    /// Human-readable command for display (argv NUL separators rendered as
+    /// spaces).
+    pub fn cmd_display(&self) -> String {
+        self.cmd.replace('\0', " ")
+    }
+
     pub fn encode(&self) -> Vec<u8> {
         let mut out = Vec::with_capacity(INFO_LEN);
         let cmd = self.cmd.as_bytes();
@@ -309,6 +326,26 @@ mod tests {
         let bytes = info.encode();
         assert_eq!(bytes.len(), INFO_LEN);
         assert_eq!(SessionInfo::decode(&bytes), Some(info));
+    }
+
+    #[test]
+    fn cmd_argv_preserves_spaced_arguments() {
+        // The wire form NUL-joins argv so an argument with spaces survives a
+        // fork instead of being re-split on whitespace. github #18.
+        let argv = vec![
+            "vim".to_string(),
+            "a b.txt".to_string(),
+            "--cmd=set ai".to_string(),
+        ];
+        let info = SessionInfo {
+            clients: 0,
+            pid: 1,
+            cmd: argv.join("\0"),
+            cwd: String::new(),
+        };
+        let decoded = SessionInfo::decode(&info.encode()).unwrap();
+        assert_eq!(decoded.cmd_argv(), argv);
+        assert_eq!(decoded.cmd_display(), "vim a b.txt --cmd=set ai");
     }
 
     #[test]
