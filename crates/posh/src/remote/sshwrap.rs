@@ -48,7 +48,9 @@ impl ServerReport {
 
 /// Builds the remote command: locale variables forwarded as POSIX-sh
 /// environment prefixes (LANG/LC_*, so the server sees the client's
-/// charset), then `posh server new` with the relevant flags.
+/// charset), then `posh-server new` with the relevant flags — mosh
+/// (`mosh-server new`) parity; the package installs posh-server as an
+/// alias of posh.
 pub fn remote_command(
     opts: &SshOptions,
     remote_cmd: &[String],
@@ -61,7 +63,7 @@ pub fn remote_command(
         cmd.push_str(&shell_quote(value));
         cmd.push(' ');
     }
-    cmd.push_str("posh server new");
+    cmd.push_str("posh-server new");
     match opts.family {
         Family::Inet => cmd.push_str(" -4"),
         Family::Inet6 => cmd.push_str(" -6"),
@@ -141,7 +143,8 @@ pub fn run(target: &str, remote_cmd: &[String], opts: &SshOptions) -> Result<()>
 
     let (Some(port), Some(key)) = (report.port, report.key) else {
         return Err(Error::from(
-            "did not find posh server startup message (is posh installed on the server?)",
+            "did not find posh server startup message \
+             (is posh-server on the server's non-interactive PATH?)",
         ));
     };
 
@@ -244,7 +247,7 @@ mod tests {
         let cmd = remote_command(&opts, &["htop".to_string(), "-d".to_string()], &locale);
         assert_eq!(
             cmd,
-            "LANG='en_US.UTF-8' posh server new -6 -p 60100:60200 -- 'htop' '-d'"
+            "LANG='en_US.UTF-8' posh-server new -6 -p 60100:60200 -- 'htop' '-d'"
         );
 
         let plain = remote_command(
@@ -255,6 +258,6 @@ mod tests {
             &[],
             &[],
         );
-        assert_eq!(plain, "posh server new");
+        assert_eq!(plain, "posh-server new");
     }
 }

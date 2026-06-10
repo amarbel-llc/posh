@@ -6,12 +6,12 @@ top-to-bottom on a fresh clone; each section ends with what you should see.
 
 ## 0. Build
 
-The flake builds the Rust binary
+posh is the flake's default package
 ([#33](https://github.com/amarbel-llc/posh/issues/33)):
 
 ```sh
-nix build .#posh          # or: just build-rust (leaves ./result-posh)
-P=$PWD/result/bin/posh
+nix build                 # or: just build-rust
+P=$PWD/result/bin/posh    # bin/posh-server is installed alongside
 ```
 
 For an iterative dev-loop build instead:
@@ -68,13 +68,15 @@ POSH_KEY=<key> $P client 127.0.0.1 <port>
 ## 4. Cross-host
 
 ```sh
-$P ssh user@otherhost            # runs literal `posh server new` over ssh
+$P user@otherhost                # mosh-style: bare args containing @ . or :
+$P ssh otherhost                 # explicit form (for bare ssh aliases)
 ```
 
-Server-host requirements: `posh` on the **non-interactive ssh PATH**
-(e.g. symlink `target/release/posh` into `~/.local/bin`) — otherwise the
-wrapper reports "did not find posh server startup message" — and UDP
-60001–60999 reachable.
+Both run `posh-server new` over ssh. Server-host requirements:
+`posh-server` on the **non-interactive ssh PATH** (the nix package installs
+it next to posh; for a cargo build, symlink `target/release/posh` to
+`~/.local/bin/posh-server`) — otherwise the wrapper reports "did not find
+posh server startup message" — and UDP 60001–60999 reachable.
 
 - [ ] Session comes up; typing survives suspending the laptop / switching
       networks (roaming).

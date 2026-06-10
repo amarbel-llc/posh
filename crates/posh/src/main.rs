@@ -24,6 +24,21 @@ fn main() {
 
 fn run() -> Result<()> {
     let argv: Vec<String> = std::env::args().skip(1).collect();
+
+    // mosh-server parity: the package installs `bin/posh-server -> posh`;
+    // invoked under that name every argument belongs to the server
+    // subcommand (`posh-server new -p ...` == `posh server new -p ...`),
+    // which is what the ssh bootstrap runs on the remote host.
+    let invoked_as_server = std::env::args()
+        .next()
+        .as_deref()
+        .map(std::path::Path::new)
+        .and_then(|p| p.file_name())
+        .is_some_and(|n| n == "posh-server");
+    if invoked_as_server {
+        return cmd_server(&argv);
+    }
+
     let mut group = std::env::var("POSH_GROUP").unwrap_or_else(|_| "default".to_string());
 
     let mut i = 0;
@@ -102,8 +117,15 @@ fn run() -> Result<()> {
         "client" => cmd_client(args),
         "ssh" => cmd_ssh(args),
         name if !name.starts_with('-') => {
-            // Bare `posh <name>` attaches (creating the session if needed).
-            cmd_attach(&group, rest)
+            if looks_like_ssh_destination(name) {
+                // mosh parity: `posh [user@]host [-- command...]` connects
+                // remotely over ssh + encrypted UDP.
+                cmd_ssh(rest)
+            } else {
+                // Bare `posh <name>` attaches (creating the session if
+                // needed).
+                cmd_attach(&group, rest)
+            }
         }
         flag => Err(Error(format!("unknown option {flag} (see posh help)"))),
     }
@@ -214,6 +236,15 @@ fn cmd_client(args: &[String]) -> Result<()> {
     remote::client::run(host, port, family)
 }
 
+/// mosh-style dispatch for a bare first argument: host-shaped strings
+/// (`user@host`, `host.domain`, IPv6 literals / `host:` forms) connect
+/// remotely; bare words remain local session names (attach-or-create).
+/// Dotted or @-containing SESSION names need explicit `posh attach`;
+/// bare-word ssh aliases need explicit `posh ssh`.
+fn looks_like_ssh_destination(arg: &str) -> bool {
+    arg.contains('@') || arg.contains('.') || arg.contains(':')
+}
+
 fn cmd_ssh(args: &[String]) -> Result<()> {
     let usage = "usage: posh ssh [-4|-6] [-p PORT[:PORT2]] [user@]host [-- command...]";
     let mut family = Family::Auto;
@@ -259,6 +290,9 @@ NAME
 SYNOPSIS
     posh [-g GROUP] <command> [args]
     posh <name>                       (shorthand for: posh attach <name>)
+    posh [user@]host [-- command...]  (shorthand for: posh ssh ...; a bare
+                                       first argument containing @ . or :
+                                       is treated as an ssh destination)
 
 GLOBAL OPTIONS
     -g, --group GROUP
@@ -319,9 +353,13 @@ REMOTE COMMANDS (roaming over encrypted UDP)
         Quit sequence: Ctrl-^ then \".\" (Ctrl-^ twice for a literal one).
 
     ssh [-4|-6] [-p PORT[:PORT2]] [user@]host [-- command...]
-        Convenience wrapper: start `posh server new` on the host via ssh
-        (forwarding LANG/LC_* and the -p/-4/-6 flags), then connect to the
-        address the server reports. Survives IP changes and sleep/resume.
+        Convenience wrapper (mosh-style; also reachable as a bare
+        `posh [user@]host` when the host contains @ . or :): start
+        `posh-server new` on the host via ssh (forwarding LANG/LC_* and
+        the -p/-4/-6 flags), then connect to the address the server
+        reports. The remote host needs `posh-server` on its
+        non-interactive PATH (the nix package installs it next to posh).
+        Survives IP changes and sleep/resume.
 
 ENVIRONMENT
     POSH_DIR        Socket directory (default: $XDG_RUNTIME_DIR/posh, then
@@ -358,6 +396,18 @@ mod tests {
         assert!(parse_port_range("70000").is_err());
         assert!(parse_port_range("100:50").is_err());
         assert!(parse_port_range("abc").is_err());
+    }
+
+    #[test]
+    fn ssh_destination_heuristic() {
+        // mosh-parity dispatch: host-shaped bare args go remote, bare
+        // words stay session names.
+        assert!(looks_like_ssh_destination("user@host"));
+        assert!(looks_like_ssh_destination("host.example.com"));
+        assert!(looks_like_ssh_destination("fe80::1"));
+        assert!(!looks_like_ssh_destination("dev"));
+        assert!(!looks_like_ssh_destination("my-session"));
+        assert!(!looks_like_ssh_destination("scratch2"));
     }
 
     #[test]

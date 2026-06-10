@@ -189,6 +189,30 @@ fn attach_client_exits_with_session_exit_status() {
 }
 
 #[test]
+fn argv0_posh_server_dispatches_to_server() {
+    // The package installs `bin/posh-server -> posh`; invoked under that
+    // name the binary IS the server subcommand (mosh-server parity — this
+    // is exactly what the ssh bootstrap runs on the remote host).
+    let dir = test_posh_dir("posh-argv0");
+    let alias = dir.join("posh-server");
+    let _ = std::fs::remove_file(&alias);
+    std::os::unix::fs::symlink(env!("CARGO_BIN_EXE_posh"), &alias).unwrap();
+    let out = Command::new(&alias)
+        .args(["new", "-p", "62700:62799", "--", "sleep", "1"])
+        .env("LC_ALL", "C.UTF-8")
+        .env("POSH_SERVER_NETWORK_TMOUT", "5")
+        .output()
+        .unwrap();
+    assert!(out.status.success(), "posh-server failed: {out:?}");
+    let stdout = String::from_utf8_lossy(&out.stdout);
+    assert!(
+        stdout.contains("POSH CONNECT "),
+        "no connect line under argv0=posh-server: {stdout:?}"
+    );
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+#[test]
 fn remote_client_reports_dead_server_and_times_out() {
     // github #31: nothing listening on the port — the client must say so
     // within a moment and give up with a clear error instead of hanging

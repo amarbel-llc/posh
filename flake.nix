@@ -75,7 +75,10 @@
           pname = "mosh";
           version = moshVersion;
 
-          src = ./.;
+          # The C++ reference tree lives under zz-mosh/ (top level is the
+          # posh Rust workspace); sourcing the subtree also keeps Rust-only
+          # changes from rebuilding the C++ derivation.
+          src = ./zz-mosh;
 
           nativeBuildInputs = moshNativeBuildInputs;
           buildInputs = moshBuildInputs;
@@ -146,6 +149,13 @@
 
           doCheck = true;
 
+          # mosh-server parity: the ssh bootstrap runs `posh-server new` on
+          # the remote host, so the package provides that name too (same
+          # binary; `posh-server ...` == `posh server ...` via argv[0]).
+          postInstall = ''
+            ln -s posh $out/bin/posh-server
+          '';
+
           meta = with lib; {
             description = "Persistent, roaming terminal sessions: a combined Rust rewrite of zmx and mosh";
             license = licenses.gpl3Plus;
@@ -161,11 +171,11 @@
       in
       {
         packages = {
-          # The C++ reference tree stays the default while the rewrite
-          # stabilizes; the Rust binary is `nix build .#posh`.
-          default = mosh;
-          mosh = mosh;
+          # posh is the product; the C++ reference tree stays buildable as
+          # `nix build .#mosh`.
+          default = posh;
           posh = posh;
+          mosh = mosh;
         };
 
         checks = {
