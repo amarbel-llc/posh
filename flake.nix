@@ -102,6 +102,15 @@
           # un-sandboxable.
           doCheck = true;
 
+          # local.test / mouse-alternate-scroll.test exec the generated
+          # scripts/mosh, which inherits mosh.pl's `#!/usr/bin/env perl`
+          # shebang — absent in the sandbox, so inpty's execve fails and
+          # both tests FAIL instead of asserting. Patch the shebang so the
+          # --local round-trip tests really run in this lane. github #4.
+          preCheck = ''
+            patchShebangs scripts/mosh
+          '';
+
           # The installed `mosh` client is a Perl script (generated from
           # scripts/mosh.pl). Wrap it so perl is on PATH at runtime
           # regardless of the user's environment — mirrors piggy's
