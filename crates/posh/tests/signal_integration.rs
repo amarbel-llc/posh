@@ -11,6 +11,21 @@ fn posh_cmd() -> Command {
     Command::new(env!("CARGO_BIN_EXE_posh"))
 }
 
+/// Per-test POSH_DIR. Unix socket paths cap at ~107 bytes; the deeply
+/// nested TMPDIR that `nix develop` exports blows that through temp_dir(),
+/// so fall back to /tmp when the base is already long.
+fn test_posh_dir(prefix: &str) -> std::path::PathBuf {
+    let base = std::env::temp_dir();
+    let base = if base.as_os_str().len() > 40 {
+        std::path::PathBuf::from("/tmp")
+    } else {
+        base
+    };
+    let dir = base.join(format!("{prefix}-{}", std::process::id()));
+    std::fs::create_dir_all(&dir).unwrap();
+    dir
+}
+
 /// posix_openpt master/slave pair; the slave becomes the child's stdio so
 /// RawMode::enable and term_size see a real tty. The master is left
 /// nonblocking for drain().
@@ -97,17 +112,7 @@ fn wait_for_exit(child: &mut Child, master: RawFd, secs: u64) -> std::process::E
 
 #[test]
 fn attach_client_exits_cleanly_on_sigterm() {
-    // Unix socket paths cap at ~107 bytes; the deeply nested TMPDIR that
-    // `nix develop` exports blows that through temp_dir(), so fall back
-    // to /tmp when the base is already long.
-    let base = std::env::temp_dir();
-    let base = if base.as_os_str().len() > 40 {
-        std::path::PathBuf::from("/tmp")
-    } else {
-        base
-    };
-    let dir = base.join(format!("posh-sigtest-{}", std::process::id()));
-    std::fs::create_dir_all(&dir).unwrap();
+    let dir = test_posh_dir("posh-sigtest");
 
     let out = posh_cmd()
         .args(["attach", "--detach", "sigtest", "sleep", "300"])
@@ -146,14 +151,7 @@ fn attach_client_exits_cleanly_on_sigterm() {
 fn attach_client_exits_with_session_exit_status() {
     // github #18: the daemon propagates the shell's waitpid status via a
     // Tag::Exit frame at teardown, and the attach client exits with it.
-    let base = std::env::temp_dir();
-    let base = if base.as_os_str().len() > 40 {
-        std::path::PathBuf::from("/tmp")
-    } else {
-        base
-    };
-    let dir = base.join(format!("posh-exitstatus-{}", std::process::id()));
-    std::fs::create_dir_all(&dir).unwrap();
+    let dir = test_posh_dir("posh-exitstatus");
 
     let (master, slave) = open_pty_pair();
     let mut cmd = posh_cmd();

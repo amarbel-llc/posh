@@ -147,19 +147,22 @@ fn daemon_main(
     daemon_loop(&listener, &child, &mut term, &mut clients, &info_cmd, &cwd);
 
     // Teardown. Reap the shell first: when it already exited (the pty-EIO
-    // path) WNOHANG returns its real status immediately; otherwise bring it
-    // down — SIGHUP first (shells ignore SIGTERM), then SIGKILL, both to
-    // the whole process group — and reap.
+    // path) WNOHANG captures its real status before the group kills below.
+    // The SIGHUP -> grace -> SIGKILL sequence always runs against the whole
+    // process group regardless — background jobs survive the shell's own
+    // exit and must not outlive the session.
     util::log_write("info", &format!("shutting down daemon session={name}"));
     let mut status = 0;
     let reaped = unsafe { libc::waitpid(child.pid, &mut status, libc::WNOHANG) } == child.pid;
+    unsafe {
+        libc::kill(-child.pid, libc::SIGHUP);
+    }
+    std::thread::sleep(std::time::Duration::from_millis(500));
+    unsafe {
+        libc::kill(-child.pid, libc::SIGKILL);
+    }
     if !reaped {
         unsafe {
-            libc::kill(-child.pid, libc::SIGHUP);
-        }
-        std::thread::sleep(std::time::Duration::from_millis(500));
-        unsafe {
-            libc::kill(-child.pid, libc::SIGKILL);
             libc::waitpid(child.pid, &mut status, 0);
         }
     }
