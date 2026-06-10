@@ -11,4 +11,3 @@ posh-term = { path = "../posh-term" }
 libc = "0.2"
 aes-gcm = "0.10"
 rand = "0.8"
-base64 = "0.22"

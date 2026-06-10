@@ -343,7 +343,7 @@ fn encode_kitty(ev: KeyEvent, flags: KittyFlags, app_cursor: bool) -> Vec<u8> {
         }
         // While the kitty protocol is active DECCKM is ignored; F1-F4 keep
         // their SS3 legacy form when unmodified.
-        return csi_form("1", None, mods, ev.event_type, flags, letter).unwrap_or_else(|| {
+        return csi_form("1", mods, ev.event_type, flags, letter).unwrap_or_else(|| {
             if ss3_ok {
                 format!("\x1b[{letter}").into_bytes()
             } else {
@@ -355,7 +355,7 @@ fn encode_kitty(ev: KeyEvent, flags: KittyFlags, app_cursor: bool) -> Vec<u8> {
         if ev.event_type == KeyEventType::Release && !report_events {
             return Vec::new();
         }
-        return csi_form(&n.to_string(), None, mods, ev.event_type, flags, '~')
+        return csi_form(&n.to_string(), mods, ev.event_type, flags, '~')
             .unwrap_or_else(|| format!("\x1b[{n}~").into_bytes());
     }
 
@@ -440,7 +440,6 @@ fn encode_kitty(ev: KeyEvent, flags: KittyFlags, app_cursor: bool) -> Vec<u8> {
 /// must be encoded; returns `None` when the bare legacy form suffices.
 fn csi_form(
     num: &str,
-    _alt: Option<u32>,
     mods: Modifiers,
     event_type: KeyEventType,
     flags: KittyFlags,

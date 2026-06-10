@@ -15,6 +15,19 @@ pub enum MouseMode {
     AnyEvent,
 }
 
+impl MouseMode {
+    /// The DECSET parameter that enables this mode (`None` for no tracking).
+    pub fn decset(self) -> Option<u16> {
+        match self {
+            MouseMode::None => None,
+            MouseMode::X10 => Some(9),
+            MouseMode::Normal => Some(1000),
+            MouseMode::ButtonEvent => Some(1002),
+            MouseMode::AnyEvent => Some(1003),
+        }
+    }
+}
+
 /// Mouse coordinate encoding protocol.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
 pub enum MouseProtocol {
@@ -27,6 +40,18 @@ pub enum MouseProtocol {
     Sgr,
     /// DECSET 1016: SGR with pixel coordinates.
     SgrPixel,
+}
+
+impl MouseProtocol {
+    /// The DECSET parameter that selects this protocol (`None` for legacy).
+    pub fn decset(self) -> Option<u16> {
+        match self {
+            MouseProtocol::Normal => None,
+            MouseProtocol::Utf8 => Some(1005),
+            MouseProtocol::Sgr => Some(1006),
+            MouseProtocol::SgrPixel => Some(1016),
+        }
+    }
 }
 
 #[derive(Debug, Clone)]

@@ -20,7 +20,10 @@ impl Terminal {
                 self.icon_title = rest.to_string();
                 self.touch();
             }
-            1 => self.icon_title = rest.to_string(),
+            1 => {
+                self.icon_title = rest.to_string();
+                self.touch();
+            }
             2 => {
                 self.title = rest.to_string();
                 self.touch();
@@ -160,21 +163,15 @@ impl Terminal {
         }
         if payload == "?" {
             let kind = kinds[0];
-            let data = match kind {
-                'p' => &self.primary_selection,
-                's' => &self.select_selection,
-                _ => &self.clipboard,
-            };
-            let resp = format!("\x1b]52;{kind};{}{}", base64::encode(data), st(bel));
+            let resp = format!(
+                "\x1b]52;{kind};{}{}",
+                base64::encode(self.selection(kind)),
+                st(bel)
+            );
             self.respond(&resp);
         } else if let Some(decoded) = base64::decode(payload.as_bytes()) {
             for kind in kinds {
-                let slot = match kind {
-                    'p' => &mut self.primary_selection,
-                    's' => &mut self.select_selection,
-                    _ => &mut self.clipboard,
-                };
-                *slot = decoded.clone();
+                *self.selection_slot_mut(kind) = decoded.clone();
             }
             self.touch();
         }

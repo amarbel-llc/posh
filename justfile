@@ -103,6 +103,12 @@ update-nix:
 
 # --- debug -----------------------------------------------------------------
 
+# Run cargo against the Rust workspace via nixpkgs (the devShell has no cargo
+# yet — drop this once the flake learns about the Cargo workspace).
+[group("debug")]
+debug-cargo *ARGS:
+    nix shell nixpkgs#cargo nixpkgs#rustc --command cargo {{ ARGS }}
+
 # Run a single autotools test by name in the devShell (fast iteration).
 [group("debug")]
 debug-test-one name: build-autotools

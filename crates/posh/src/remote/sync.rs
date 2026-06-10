@@ -5,6 +5,10 @@
 
 use crate::util::{Error, Result};
 
+/// Keepalive cadence shared by both ends of the protocol: each side emits
+/// an empty message/frame when this long has passed since its last send.
+pub const HEARTBEAT_INTERVAL: u64 = 3000; // ms
+
 // ---------------------------------------------------------------------------
 // Fragmentation. Header (big-endian, as in mosh): u64 instruction id, then
 // u16 with the final bit in the top bit and the fragment number below.

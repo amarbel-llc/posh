@@ -287,11 +287,6 @@ fn daemon_loop(
                                     if has_pty_output && has_had_client {
                                         let dump = term.dump_vt();
                                         c.queue(Tag::Output, &dump);
-                                        let title = term.title();
-                                        if !title.is_empty() {
-                                            let seq = format!("\x1b]0;{title}\x07");
-                                            c.queue(Tag::Output, seq.as_bytes());
-                                        }
                                     }
                                     has_had_client = true;
                                 }
@@ -321,9 +316,7 @@ fn daemon_loop(
                                     c.queue(Tag::Info, &info.encode());
                                 }
                                 Tag::History => {
-                                    // Payload byte 0 selects the format: 1 = vt
-                                    // escape stream, anything else plain text.
-                                    let out = if frame.payload.first() == Some(&1) {
+                                    let out = if ipc::decode_history_format(&frame.payload) {
                                         term.dump_vt()
                                     } else {
                                         term.dump_text().into_bytes()

@@ -3,7 +3,7 @@
 
 const ALPHABET: &[u8; 64] = b"ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/";
 
-pub(crate) fn encode(data: &[u8]) -> String {
+pub fn encode(data: &[u8]) -> String {
     let mut out = String::with_capacity(data.len().div_ceil(3) * 4);
     for chunk in data.chunks(3) {
         let b = [
@@ -41,7 +41,7 @@ fn decode_digit(b: u8) -> Option<u32> {
 
 /// Decodes base64, ignoring whitespace and tolerating missing padding.
 /// Returns `None` on any other invalid input.
-pub(crate) fn decode(data: &[u8]) -> Option<Vec<u8>> {
+pub fn decode(data: &[u8]) -> Option<Vec<u8>> {
     let mut out = Vec::with_capacity(data.len() / 4 * 3);
     let mut acc: u32 = 0;
     let mut bits: u32 = 0;

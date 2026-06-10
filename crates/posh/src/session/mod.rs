@@ -107,23 +107,29 @@ pub fn probe_session(path: &Path) -> Result<Probe> {
     let stream = UnixStream::connect(path).map_err(|e| Error(format!("connect: {e}")))?;
     stream.set_read_timeout(Some(Duration::from_secs(1)))?;
     ipc::send(std::os::fd::AsRawFd::as_raw_fd(&stream), Tag::Info, b"")?;
+    let frame = wait_for_frame(&stream, Tag::Info, "info")?;
+    let info =
+        SessionInfo::decode(&frame.payload).ok_or_else(|| Error::from("bad info payload"))?;
+    Ok(Probe { stream, info })
+}
+
+/// Reads frames off `stream` (honoring its read timeout) until one tagged
+/// `tag` arrives, skipping others. `what` names the wait in errors.
+fn wait_for_frame(mut stream: &UnixStream, tag: Tag, what: &str) -> Result<ipc::Frame> {
     let mut fb = ipc::FrameBuffer::new();
-    let mut stream_ref = &stream;
     loop {
         if let Some(frame) = fb.next() {
-            if frame.tag == Tag::Info {
-                let info = SessionInfo::decode(&frame.payload)
-                    .ok_or_else(|| Error::from("bad info payload"))?;
-                return Ok(Probe { stream, info });
+            if frame.tag == tag {
+                return Ok(frame);
             }
             continue;
         }
         let mut tmp = [0u8; 4096];
-        let n = stream_ref
+        let n = stream
             .read(&mut tmp)
-            .map_err(|e| Error(format!("probe read: {e}")))?;
+            .map_err(|e| Error(format!("waiting for {what}: {e}")))?;
         if n == 0 {
-            return Err(Error::from("connection closed during probe"));
+            return Err(Error(format!("connection closed waiting for {what}")));
         }
         fb.feed(&tmp[..n]);
     }
@@ -417,25 +423,9 @@ pub fn cmd_run(cfg: &Config, name: &str, args: &[String]) -> Result<()> {
     probe
         .stream
         .set_read_timeout(Some(Duration::from_secs(5)))?;
-    let mut fb = ipc::FrameBuffer::new();
-    let mut stream_ref = &probe.stream;
-    loop {
-        if let Some(frame) = fb.next() {
-            if frame.tag == Tag::Ack {
-                println!("command sent");
-                return Ok(());
-            }
-            continue;
-        }
-        let mut tmp = [0u8; 4096];
-        let n = stream_ref
-            .read(&mut tmp)
-            .map_err(|_| Error::from("timeout waiting for ack"))?;
-        if n == 0 {
-            return Err(Error::from("connection closed before ack"));
-        }
-        fb.feed(&tmp[..n]);
-    }
+    wait_for_frame(&probe.stream, Tag::Ack, "ack")?;
+    println!("command sent");
+    Ok(())
 }
 
 // ---------------------------------------------------------------------------
@@ -556,31 +546,15 @@ pub fn cmd_history(cfg: &Config, name: &str, vt: bool) -> Result<()> {
         }
     };
     let fd = std::os::fd::AsRawFd::as_raw_fd(&probe.stream);
-    ipc::send(fd, Tag::History, &[u8::from(vt)])?;
+    ipc::send(fd, Tag::History, &ipc::encode_history_format(vt))?;
 
     probe
         .stream
         .set_read_timeout(Some(Duration::from_secs(5)))?;
-    let mut fb = ipc::FrameBuffer::new();
-    let mut stream_ref = &probe.stream;
-    loop {
-        if let Some(frame) = fb.next() {
-            if frame.tag == Tag::History {
-                use std::io::Write;
-                std::io::stdout().write_all(&frame.payload)?;
-                return Ok(());
-            }
-            continue;
-        }
-        let mut tmp = [0u8; 4096];
-        let n = stream_ref
-            .read(&mut tmp)
-            .map_err(|_| Error::from("timeout waiting for history response"))?;
-        if n == 0 {
-            return Err(Error::from("connection closed before history arrived"));
-        }
-        fb.feed(&tmp[..n]);
-    }
+    let frame = wait_for_frame(&probe.stream, Tag::History, "history response")?;
+    use std::io::Write;
+    std::io::stdout().write_all(&frame.payload)?;
+    Ok(())
 }
 
 #[cfg(test)]

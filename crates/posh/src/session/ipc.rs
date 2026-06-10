@@ -43,6 +43,16 @@ impl Tag {
 
 pub const HEADER_LEN: usize = 5;
 
+/// History payload format selector (single byte): vt escape stream vs
+/// plain text. Encode on the client, decode in the daemon.
+pub fn encode_history_format(vt: bool) -> [u8; 1] {
+    [u8::from(vt)]
+}
+
+pub fn decode_history_format(payload: &[u8]) -> bool {
+    payload.first() == Some(&1)
+}
+
 pub fn append_frame(buf: &mut Vec<u8>, tag: Tag, payload: &[u8]) {
     buf.push(tag as u8);
     buf.extend_from_slice(&(payload.len() as u32).to_le_bytes());

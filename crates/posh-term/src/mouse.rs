@@ -5,10 +5,7 @@
 use crate::kitty_keys::Modifiers;
 use crate::modes::{MouseMode, MouseProtocol};
 
-/// Placeholder cell size in pixels for SGR-pixel coordinates when the
-/// event carries none, matching the XTWINOPS report.
-const CELL_W: u32 = 10;
-const CELL_H: u32 = 20;
+use crate::{CELL_H, CELL_W};
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum MouseButton {

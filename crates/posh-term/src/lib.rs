@@ -27,7 +27,13 @@
 //! - `Terminal::take_responses(&mut self) -> Vec<u8>` (DA/DSR/etc. replies)
 //! - `Terminal::screen(&self) -> &Screen` (cell-level read access)
 
-mod base64;
+/// Placeholder cell size in pixels, shared by the XTWINOPS reports, kitty
+/// graphics extents, and SGR-pixel mouse coordinates so the three stay in
+/// agreement.
+pub(crate) const CELL_W: u32 = 10;
+pub(crate) const CELL_H: u32 = 20;
+
+pub mod base64;
 mod cell;
 mod csi;
 mod dcs;
@@ -45,6 +51,7 @@ mod terminal;
 mod wcwidth;
 
 pub use cell::{Cell, Color, Style, UnderlineStyle};
+pub use dump::sgr_params;
 pub use graphics::{AnimationState, Frame, Image, ImageFormat, Placement};
 pub use kitty_keys::{encode_key, KeyCode, KeyEvent, KeyEventType, KittyFlags, Modifiers};
 pub use modes::{MouseMode, MouseProtocol};

@@ -160,7 +160,6 @@ impl Parser {
         }
         match b {
             0x1B => self.state = State::Escape,
-            0x18 | 0x1A => out.push(Action::Execute(b)),
             0x00..=0x1F => out.push(Action::Execute(b)),
             0x20..=0x7E => out.push(Action::Print(b as char)),
             0x7F => {} // DEL ignored

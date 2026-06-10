@@ -561,18 +561,18 @@ impl Terminal {
         self.respond(&resp);
     }
 
-    /// XTWINOPS reports. Pixel sizes use a 10x20 per-cell placeholder.
+    /// XTWINOPS reports. Pixel sizes use the crate's placeholder cell size.
     fn window_ops(&mut self, params: &[Vec<u16>]) {
         match param(params, 0, 0) {
             14 => {
                 let resp = format!(
                     "\x1b[4;{};{}t",
-                    u32::from(self.rows()) * 20,
-                    u32::from(self.cols()) * 10
+                    u32::from(self.rows()) * crate::CELL_H,
+                    u32::from(self.cols()) * crate::CELL_W
                 );
                 self.respond(&resp);
             }
-            16 => self.respond("\x1b[6;20;10t"),
+            16 => self.respond(&format!("\x1b[6;{};{}t", crate::CELL_H, crate::CELL_W)),
             18 => {
                 let resp = format!("\x1b[8;{};{}t", self.rows(), self.cols());
                 self.respond(&resp);

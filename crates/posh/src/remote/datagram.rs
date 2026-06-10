@@ -14,7 +14,8 @@ const MIN_RTO: u64 = 50; // ms
 const MAX_RTO: u64 = 1000; // ms
 const TS_NONE: u16 = 0xffff;
 // mosh transportsender SEND_INTERVAL_MIN/MAX: pacing derived from SRTT.
-const SEND_INTERVAL_MIN: u64 = 20; // ms
+// MIN is also the server's floor between fresh frames.
+pub const SEND_INTERVAL_MIN: u64 = 20; // ms
 const SEND_INTERVAL_MAX: u64 = 250; // ms
 
 /// Address family selection (-4 / -6 flags; mosh --family).

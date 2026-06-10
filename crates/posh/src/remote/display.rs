@@ -9,7 +9,7 @@
 use std::collections::HashMap;
 use std::fmt::Write;
 
-use posh_term::{wcwidth, Cell, Color, MouseMode, MouseProtocol, Style, Terminal, UnderlineStyle};
+use posh_term::{sgr_params, wcwidth, Cell, Style, Terminal};
 
 /// A frozen picture of what a terminal shows: the visible grid plus the
 /// handful of modes the renderer keeps in sync on the outer terminal.
@@ -38,11 +38,7 @@ pub struct Snapshot {
 }
 
 pub fn blank_cell() -> Cell {
-    Cell {
-        ch: ' ',
-        width: 1,
-        ..Cell::default()
-    }
+    Cell::blank(Style::default())
 }
 
 impl Snapshot {
@@ -104,19 +100,8 @@ impl Snapshot {
             focus_reporting: term.focus_reporting(),
             app_cursor_keys: term.app_cursor_keys(),
             app_keypad: term.app_keypad(),
-            mouse_mode: match term.mouse_mode() {
-                MouseMode::None => 0,
-                MouseMode::X10 => 9,
-                MouseMode::Normal => 1000,
-                MouseMode::ButtonEvent => 1002,
-                MouseMode::AnyEvent => 1003,
-            },
-            mouse_encoding: match term.mouse_protocol() {
-                MouseProtocol::Normal => 0,
-                MouseProtocol::Utf8 => 1005,
-                MouseProtocol::Sgr => 1006,
-                MouseProtocol::SgrPixel => 1016,
-            },
+            mouse_mode: term.mouse_mode().decset().unwrap_or(0),
+            mouse_encoding: term.mouse_protocol().decset().unwrap_or(0),
             hyperlinks,
         }
     }
@@ -143,69 +128,6 @@ impl Snapshot {
 pub fn close() -> &'static [u8] {
     b"\x1b[0m\x1b[?25h\x1b[?1l\x1b>\x1b[?1003l\x1b[?1002l\x1b[?1000l\x1b[?9l\
       \x1b[?1016l\x1b[?1006l\x1b[?1005l\x1b[?2004l\x1b[?1004l\x1b[r"
-}
-
-/// SGR parameter string reproducing `style` from a reset pen.
-fn sgr_params(style: &Style) -> String {
-    let mut s = String::from("0");
-    if style.bold {
-        s.push_str(";1");
-    }
-    if style.dim {
-        s.push_str(";2");
-    }
-    if style.italic {
-        s.push_str(";3");
-    }
-    match style.underline {
-        UnderlineStyle::None => {}
-        UnderlineStyle::Single => s.push_str(";4"),
-        UnderlineStyle::Double => s.push_str(";4:2"),
-        UnderlineStyle::Curly => s.push_str(";4:3"),
-        UnderlineStyle::Dotted => s.push_str(";4:4"),
-        UnderlineStyle::Dashed => s.push_str(";4:5"),
-    }
-    if style.blink {
-        s.push_str(";5");
-    }
-    if style.inverse {
-        s.push_str(";7");
-    }
-    if style.invisible {
-        s.push_str(";8");
-    }
-    if style.strikethrough {
-        s.push_str(";9");
-    }
-    let mut color = |base: u16, extended: u16, c: &Color| match *c {
-        Color::Default => {}
-        Color::Indexed(i) if i < 8 => {
-            let _ = write!(s, ";{}", base + u16::from(i));
-        }
-        Color::Indexed(i) if i < 16 => {
-            let _ = write!(s, ";{}", base + 60 + u16::from(i) - 8);
-        }
-        Color::Indexed(i) => {
-            let _ = write!(s, ";{extended}:5:{i}");
-        }
-        Color::Rgb(r, g, b) => {
-            let _ = write!(s, ";{extended}:2:{r}:{g}:{b}");
-        }
-    };
-    color(30, 38, &style.fg);
-    color(40, 48, &style.bg);
-    if style.underline_color != Color::Default {
-        match style.underline_color {
-            Color::Indexed(i) => {
-                let _ = write!(s, ";58:5:{i}");
-            }
-            Color::Rgb(r, g, b) => {
-                let _ = write!(s, ";58:2:{r}:{g}:{b}");
-            }
-            Color::Default => {}
-        }
-    }
-    s
 }
 
 /// Escape-stream builder with cursor/pen bookkeeping (mosh FrameState).
@@ -661,7 +583,6 @@ pub struct NotificationEngine {
     message: String,
     /// None = permanent message.
     message_expiration: Option<u64>,
-    show_quit_keystroke: bool,
 }
 
 fn human_readable_duration(num_seconds: u64) -> String {
@@ -685,7 +606,6 @@ impl NotificationEngine {
             last_word_from_server: now,
             message: String::new(),
             message_expiration: Some(0),
-            show_quit_keystroke: true,
         }
     }
 
@@ -758,11 +678,7 @@ impl NotificationEngine {
         fb.wrapped[0] = false;
 
         let since_heard = now.saturating_sub(self.last_word_from_server) / 1000;
-        let keystroke = if self.show_quit_keystroke {
-            " [To quit: Ctrl-^ .]"
-        } else {
-            ""
-        };
+        let keystroke = " [To quit: Ctrl-^ .]";
         let text = if self.message.is_empty() {
             format!(
                 "posh: Last contact {} ago.{}",

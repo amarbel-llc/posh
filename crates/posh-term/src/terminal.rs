@@ -844,13 +844,18 @@ impl Terminal {
         self.modes.reverse_video
     }
 
+    /// Kitty keyboard stack for the active screen.
+    pub(crate) fn kitty_stack(&self) -> &KittyKeyStack {
+        if self.alt_active {
+            &self.kitty_alt
+        } else {
+            &self.kitty_primary
+        }
+    }
+
     /// Current kitty keyboard flags for the active screen.
     pub fn kitty_flags(&self) -> KittyFlags {
-        if self.alt_active {
-            self.kitty_alt.flags()
-        } else {
-            self.kitty_primary.flags()
-        }
+        self.kitty_stack().flags()
     }
 
     pub fn synchronized_output(&self) -> bool {
@@ -904,6 +909,14 @@ impl Terminal {
             'p' => &self.primary_selection,
             's' => &self.select_selection,
             _ => &self.clipboard,
+        }
+    }
+
+    pub(crate) fn selection_slot_mut(&mut self, kind: char) -> &mut Vec<u8> {
+        match kind {
+            'p' => &mut self.primary_selection,
+            's' => &mut self.select_selection,
+            _ => &mut self.clipboard,
         }
     }
 

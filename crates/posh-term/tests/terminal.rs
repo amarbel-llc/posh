@@ -15,17 +15,7 @@ fn feed(t: &mut Terminal, s: &str) {
 }
 
 fn row_text(t: &Terminal, r: u16) -> String {
-    let mut s = String::new();
-    let screen = t.screen();
-    for c in 0..screen.cols() {
-        let cell = screen.cell(r, c).unwrap();
-        if cell.width == 0 {
-            continue;
-        }
-        s.push(if cell.ch == '\0' { ' ' } else { cell.ch });
-        s.extend(cell.extra.iter());
-    }
-    s.trim_end().to_string()
+    t.screen().row(r).unwrap().text(true)
 }
 
 fn pos(t: &Terminal) -> (u16, u16) {

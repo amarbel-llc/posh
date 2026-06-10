@@ -62,7 +62,8 @@ pub struct Cell {
 }
 
 impl Cell {
-    pub(crate) fn blank(style: Style) -> Cell {
+    /// A space cell carrying `style` (the erased/cleared cell shape).
+    pub fn blank(style: Style) -> Cell {
         Cell {
             ch: ' ',
             style,

@@ -9,8 +9,7 @@
 
 use aes_gcm::aead::{Aead, KeyInit};
 use aes_gcm::{Aes128Gcm, Nonce};
-use base64::engine::general_purpose::STANDARD_NO_PAD;
-use base64::Engine as _;
+use posh_term::base64;
 use rand::rngs::OsRng;
 use rand::RngCore;
 
@@ -36,16 +35,17 @@ impl Key {
 
     /// mosh-style printable key: exactly 22 base64 chars, no padding.
     pub fn to_base64(&self) -> String {
-        STANDARD_NO_PAD.encode(self.0)
+        let mut s = base64::encode(&self.0);
+        s.truncate(s.trim_end_matches('=').len());
+        s
     }
 
     pub fn from_base64(s: &str) -> Result<Key> {
         if s.len() != 22 {
             return Err(Error::from("key must be 22 letters long"));
         }
-        let bytes = STANDARD_NO_PAD
-            .decode(s)
-            .map_err(|_| Error::from("key must be well-formed base64"))?;
+        let bytes = base64::decode(s.as_bytes())
+            .ok_or_else(|| Error::from("key must be well-formed base64"))?;
         let arr: [u8; KEY_LEN] = bytes
             .try_into()
             .map_err(|_| Error::from("key must decode to 16 bytes"))?;

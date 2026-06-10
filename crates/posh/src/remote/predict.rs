@@ -463,27 +463,25 @@ impl PredictionEngine {
     }
 
     fn init_cursor(&mut self, fb: &Snapshot) {
-        if self.cursors.is_empty() {
-            self.cursors.push(CursorPrediction {
-                active: true,
-                tentative_until_epoch: self.prediction_epoch,
-                expiration_frame: self.local_frame_sent + 1,
-                row: fb.cursor_row,
-                col: fb.cursor_col,
-            });
-        } else if self.cursors.last().unwrap().tentative_until_epoch != self.prediction_epoch {
-            let (row, col) = {
-                let c = self.cursors.last().unwrap();
-                (c.row, c.col)
-            };
-            self.cursors.push(CursorPrediction {
-                active: true,
-                tentative_until_epoch: self.prediction_epoch,
-                expiration_frame: self.local_frame_sent + 1,
-                row,
-                col,
-            });
+        let fresh_epoch = self
+            .cursors
+            .last()
+            .is_some_and(|c| c.tentative_until_epoch == self.prediction_epoch);
+        if fresh_epoch {
+            return;
         }
+        // Continue from the last predicted position, or seed from the frame.
+        let (row, col) = self
+            .cursors
+            .last()
+            .map_or((fb.cursor_row, fb.cursor_col), |c| (c.row, c.col));
+        self.cursors.push(CursorPrediction {
+            active: true,
+            tentative_until_epoch: self.prediction_epoch,
+            expiration_frame: self.local_frame_sent + 1,
+            row,
+            col,
+        });
     }
 
     fn get_or_make_row(&mut self, row_num: u16, num_cols: u16) -> &mut OverlayRow {

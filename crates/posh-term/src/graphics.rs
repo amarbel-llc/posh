@@ -10,9 +10,7 @@ use crate::{base64, inflate, png};
 /// 320 MB storage quota; oldest images are evicted past this.
 const QUOTA_BYTES: usize = 320 * 1024 * 1024;
 
-/// Placeholder cell size in pixels, matching the XTWINOPS report.
-const CELL_W: u32 = 10;
-const CELL_H: u32 = 20;
+use crate::{CELL_H, CELL_W};
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum ImageFormat {

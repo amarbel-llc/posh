@@ -6,14 +6,13 @@ use posh_term::Terminal;
 
 use crate::pty;
 use crate::remote::crypto::Key;
-use crate::remote::datagram::{Connection, Family, DEFAULT_PORT_RANGE};
+use crate::remote::datagram::{Connection, Family, DEFAULT_PORT_RANGE, SEND_INTERVAL_MIN};
 use crate::remote::sync::{
     self, ClientMessage, EchoAck, FragmentAssembly, Fragmenter, FrameBody, InputInbox, ServerFrame,
+    HEARTBEAT_INTERVAL,
 };
 use crate::util::{self, now_ms, Result};
 
-const SEND_INTERVAL_MIN: u64 = 20; // ms between fresh frames
-const HEARTBEAT_INTERVAL: u64 = 3000; // ms between empty keepalives
 const SHUTDOWN_GRACE: u64 = 10_000; // ms to wait for the final-state ack
 /// Silence after which the peer is forgotten (sending stops, the session
 /// stays alive waiting for the client to come back).
@@ -292,38 +291,31 @@ fn server_loop(mut conn: Connection, child: pty::PtyChild, rows: u16, cols: u16)
                 force_ack = false;
             }
 
-            let flags = if shutdown { sync::FLAG_SHUTDOWN } else { 0 };
-            if send_frame {
-                let body = match &acked_data {
-                    Some(base) => {
-                        let diff = sync::make_diff(base, &current.data);
-                        if diff.len() + 8 < current.data.len() {
-                            FrameBody::Diff {
-                                base: acked_num,
-                                diff,
+            if send_frame || send_empty {
+                let body = if !send_frame {
+                    FrameBody::Empty
+                } else {
+                    match &acked_data {
+                        Some(base) => {
+                            let diff = sync::make_diff(base, &current.data);
+                            if diff.len() + 8 < current.data.len() {
+                                FrameBody::Diff {
+                                    base: acked_num,
+                                    diff,
+                                }
+                            } else {
+                                FrameBody::Full(current.data.clone())
                             }
-                        } else {
-                            FrameBody::Full(current.data.clone())
                         }
+                        None => FrameBody::Full(current.data.clone()),
                     }
-                    None => FrameBody::Full(current.data.clone()),
                 };
                 let frame = ServerFrame {
-                    flags,
+                    flags: if shutdown { sync::FLAG_SHUTDOWN } else { 0 },
                     frame_num: current.num,
                     input_ack: inbox.next_offset(),
                     echo_ack: echo.ack(),
                     body,
-                };
-                send_payload(&mut conn, &mut fragmenter, &frame.encode());
-                last_send = now;
-            } else if send_empty {
-                let frame = ServerFrame {
-                    flags,
-                    frame_num: current.num,
-                    input_ack: inbox.next_offset(),
-                    echo_ack: echo.ack(),
-                    body: FrameBody::Empty,
                 };
                 send_payload(&mut conn, &mut fragmenter, &frame.encode());
                 last_send = now;

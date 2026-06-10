@@ -10,8 +10,8 @@ use crate::session::ipc::{self, FrameBuffer, Tag};
 use crate::session::{daemon, Config};
 use crate::util::{self, Error, Result};
 
-const STDIN: i32 = 0;
-const STDOUT: i32 = 1;
+const STDIN: i32 = libc::STDIN_FILENO;
+const STDOUT: i32 = libc::STDOUT_FILENO;
 
 /// Reset sequence written on detach: disable mouse reporting (1000/1002/
 /// 1003/1006), bracketed paste (2004), focus events (1004), alt screen

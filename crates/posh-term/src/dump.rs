@@ -9,7 +9,7 @@ use crate::terminal::{Charset, Terminal};
 
 /// SGR parameter string (without the `m`) that reproduces `style` from a
 /// reset state. Always begins with `0`.
-pub(crate) fn sgr_params(style: &Style) -> String {
+pub fn sgr_params(style: &Style) -> String {
     let mut s = String::from("0");
     if style.bold {
         s.push_str(";1");
@@ -139,8 +139,16 @@ impl Terminal {
         };
 
         self.dump_colors(&mut out);
-        if !self.title.is_empty() {
-            let _ = write!(out, "\x1b]2;{}\x07", self.title);
+        if !self.title.is_empty() && self.title == self.icon_title {
+            // OSC 0 sets window and icon title together.
+            let _ = write!(out, "\x1b]0;{}\x07", self.title);
+        } else {
+            if !self.title.is_empty() {
+                let _ = write!(out, "\x1b]2;{}\x07", self.title);
+            }
+            if !self.icon_title.is_empty() {
+                let _ = write!(out, "\x1b]1;{}\x07", self.icon_title);
+            }
         }
         if !self.pwd.is_empty() {
             let _ = write!(out, "\x1b]7;file://{}\x1b\\", self.pwd);
@@ -372,40 +380,22 @@ impl Terminal {
         if self.modes.keypad_app {
             out.push_str("\x1b=");
         }
-        let mouse = match self.modes.mouse_mode {
-            crate::modes::MouseMode::None => None,
-            crate::modes::MouseMode::X10 => Some(9),
-            crate::modes::MouseMode::Normal => Some(1000),
-            crate::modes::MouseMode::ButtonEvent => Some(1002),
-            crate::modes::MouseMode::AnyEvent => Some(1003),
-        };
-        if let Some(m) = mouse {
+        if let Some(m) = self.modes.mouse_mode.decset() {
             let _ = write!(out, "\x1b[?{m}h");
         }
-        let proto = match self.modes.mouse_protocol {
-            crate::modes::MouseProtocol::Normal => None,
-            crate::modes::MouseProtocol::Utf8 => Some(1005),
-            crate::modes::MouseProtocol::Sgr => Some(1006),
-            crate::modes::MouseProtocol::SgrPixel => Some(1016),
-        };
-        if let Some(p) = proto {
+        if let Some(p) = self.modes.mouse_protocol.decset() {
             let _ = write!(out, "\x1b[?{p}h");
         }
         // Replay the active screen's kitty keyboard stack push by push so
         // later pops on the target find the same entries.
-        let stack = if self.alt_active {
-            &self.kitty_alt
-        } else {
-            &self.kitty_primary
-        };
-        for &f in stack.entries() {
+        for &f in self.kitty_stack().entries() {
             let _ = write!(out, "\x1b[>{f}u");
         }
     }
 
     /// Re-creates non-default tab stops: clear all, then HTS at each.
     fn dump_tabs(&self, out: &mut String) {
-        if self.tabs == crate::terminal::default_tabs(self.cols()) {
+        if self.tabs.iter().enumerate().all(|(i, &t)| t == (i % 8 == 0)) {
             return;
         }
         out.push_str("\x1b[3g");

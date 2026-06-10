@@ -14,12 +14,12 @@ use crate::remote::display::{self, NotificationEngine, Snapshot};
 use crate::remote::predict::{DisplayPreference, PredictionEngine};
 use crate::remote::sync::{
     self, ClientMessage, FragmentAssembly, Fragmenter, FrameBody, InputOutbox, ServerFrame,
+    HEARTBEAT_INTERVAL,
 };
 use crate::util::{self, now_ms, Error, Result};
 
-const STDIN: i32 = 0;
-const STDOUT: i32 = 1;
-const HEARTBEAT_INTERVAL: u64 = 3000; // ms
+const STDIN: i32 = libc::STDIN_FILENO;
+const STDOUT: i32 = libc::STDOUT_FILENO;
 const SHUTDOWN_GRACE: u64 = 5000; // ms to wait for the shutdown ack
 
 /// The escape (quit-sequence) key: Ctrl-^ (0x1E), as in mosh.
@@ -252,8 +252,8 @@ fn process_user_input(st: &mut ClientState, buf: &[u8]) -> bool {
     }
 
     let mut dirty = false;
-    let push = |st: &mut ClientState, byte: u8, predict: bool| {
-        if predict && !paste {
+    let push = |st: &mut ClientState, byte: u8| {
+        if !paste {
             st.predict.set_local_frame_sent(st.outbox.end_offset());
             st.predict.new_user_byte(byte, &st.last_drawn, now);
         }
@@ -271,12 +271,12 @@ fn process_user_input(st: &mut ClientState, buf: &[u8]) -> bool {
                 }
                 ESCAPE_KEY | ESCAPE_PASS_KEY => {
                     // Ctrl-^ twice (or Ctrl-^ ^) sends a literal Ctrl-^.
-                    push(st, ESCAPE_KEY, true);
+                    push(st, ESCAPE_KEY);
                 }
                 other => {
                     // Anything else is sent literally, escape key included.
-                    push(st, ESCAPE_KEY, true);
-                    push(st, other, true);
+                    push(st, ESCAPE_KEY);
+                    push(st, other);
                 }
             }
             if st.notify.message() == ESCAPE_KEY_HELP {
@@ -297,7 +297,7 @@ fn process_user_input(st: &mut ClientState, buf: &[u8]) -> bool {
             st.initialized = false;
         }
 
-        push(st, byte, true);
+        push(st, byte);
         dirty = true;
     }
     dirty
