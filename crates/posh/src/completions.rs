@@ -27,7 +27,15 @@ impl Shell {
     }
 }
 
-const BASH_COMPLETIONS: &str = r#"_posh_completions() {
+const BASH_COMPLETIONS: &str = r#"_posh_ssh_hosts() {
+  # ssh config Host aliases (wildcard patterns dropped). Reads the user
+  # config plus the common config.d/conf.d include layouts.
+  command sed -n 's/^[[:space:]]*[Hh]ost[[:space:]]\{1,\}//p' \
+    ~/.ssh/config ~/.ssh/config.d/* ~/.ssh/conf.d/* 2>/dev/null \
+    | tr ' \t' '\n\n' | command grep -v '[*?!]' | sort -u
+}
+
+_posh_completions() {
   local cur prev words cword
   COMPREPLY=()
   cur="${COMP_WORDS[COMP_CWORD]}"
@@ -73,7 +81,11 @@ const BASH_COMPLETIONS: &str = r#"_posh_completions() {
   fi
 
   if [[ -z "$subcmd" ]]; then
-    COMPREPLY=($(compgen -W "$commands" -- "$cur"))
+    # The bare first argument is also the attach shorthand (session name)
+    # and the mosh-style remote form (ssh config alias).
+    local sessions=$(posh list --short 2>/dev/null | tr '\n' ' ')
+    local hosts=$(_posh_ssh_hosts | tr '\n' ' ')
+    COMPREPLY=($(compgen -W "$commands $sessions $hosts" -- "$cur"))
     return 0
   fi
 
@@ -89,7 +101,7 @@ const BASH_COMPLETIONS: &str = r#"_posh_completions() {
       COMPREPLY=($(compgen -W "--short --json -j" -- "$cur"))
       ;;
     ssh)
-      COMPREPLY=($(compgen -A hostname -- "$cur"))
+      COMPREPLY=($(compgen -W "$(_posh_ssh_hosts | tr '\n' ' ')" -- "$cur"))
       ;;
     *)
       ;;
@@ -112,6 +124,10 @@ const ZSH_COMPLETIONS: &str = r#"_posh() {
 
   case $state in
     commands)
+      # The bare first argument is also the attach shorthand (session
+      # name) and the mosh-style remote form (ssh config alias).
+      _posh_sessions
+      _posh_ssh_hosts
       local -a commands
       commands=(
         'attach:Attach to session, creating if needed'
@@ -151,7 +167,7 @@ const ZSH_COMPLETIONS: &str = r#"_posh() {
           _values 'options' '--short' '--json' '-j'
           ;;
         ssh)
-          _hosts
+          _posh_ssh_hosts
           ;;
       esac
       ;;
@@ -179,6 +195,16 @@ _posh_sessions() {
   fi
 
   _describe 'local session' sessions
+}
+
+_posh_ssh_hosts() {
+  # ssh config Host aliases (wildcard patterns dropped). Reads the user
+  # config plus the common config.d/conf.d include layouts.
+  local -a hosts
+  hosts=(${(f)"$(command sed -n 's/^[[:space:]]*[Hh]ost[[:space:]]\{1,\}//p' \
+    ~/.ssh/config ~/.ssh/config.d/*(N) ~/.ssh/conf.d/*(N) 2>/dev/null \
+    | tr ' \t' '\n\n' | command grep -v '[*?!]' | sort -u)"})
+  _describe 'ssh host' hosts
 }
 
 compdef _posh posh
@@ -209,6 +235,15 @@ function __posh_subcommand_is
     contains -- (__posh_subcommand) $argv
 end
 
+function __posh_ssh_config_hosts
+    # ssh config Host aliases (wildcard patterns dropped). Reads the user
+    # config plus the common config.d/conf.d include layouts.
+    for file in ~/.ssh/config ~/.ssh/config.d/* ~/.ssh/conf.d/*
+        test -r $file; or continue
+        string replace -rf '^\s*[Hh]ost\s+' '' <$file | string split ' ' | string match -rv '[*?!]'
+    end | sort -u
+end
+
 complete -c posh -f
 
 set -l subcommands attach run detach detach-all fork groups list completions kill history server client ssh version help
@@ -232,6 +267,11 @@ complete -c posh -n $no_subcmd -a ssh -d 'Start and connect to a remote server o
 complete -c posh -n $no_subcmd -a version -d 'Show version'
 complete -c posh -n $no_subcmd -a help -d 'Show help message'
 
+# The bare first argument is also the attach shorthand (session name) and
+# the mosh-style remote form (ssh config alias).
+complete -c posh -n $no_subcmd -a '(posh list --short 2>/dev/null)' -d 'Session'
+complete -c posh -n $no_subcmd -a '(__posh_ssh_config_hosts)' -d 'ssh host'
+
 complete -c posh -n "__fish_seen_subcommand_from attach run detach kill history" -a '(posh list --short 2>/dev/null)' -d 'Session name'
 
 complete -c posh -n "__posh_subcommand_is attach a" -l detach -d 'Create session without attaching'
@@ -241,7 +281,7 @@ complete -c posh -n "__fish_seen_subcommand_from completions" -a 'bash zsh fish'
 complete -c posh -n "__fish_seen_subcommand_from list" -l short -d 'Short output'
 complete -c posh -n "__fish_seen_subcommand_from list" -l json -s j -d 'JSON output'
 complete -c posh -n "__fish_seen_subcommand_from history" -l vt -d 'VT escape stream output'
-complete -c posh -n "__fish_seen_subcommand_from ssh" -a '(__fish_print_hostnames)' -d 'Host'
+complete -c posh -n "__fish_seen_subcommand_from ssh" -a '(__posh_ssh_config_hosts)' -d 'Host'
 "#;
 
 #[cfg(test)]
@@ -324,5 +364,66 @@ mod tests {
                 "{shell:?} should complete group names"
             );
         }
+    }
+
+    #[test]
+    fn bash_script_parses() {
+        // bash -n syntax-checks without executing. Skip quietly where
+        // bash is unavailable (it exists in the devShell and sandbox).
+        use std::io::Write;
+        use std::process::{Command, Stdio};
+        let Ok(mut child) = Command::new("bash")
+            .arg("-n")
+            .stdin(Stdio::piped())
+            .stderr(Stdio::piped())
+            .spawn()
+        else {
+            return;
+        };
+        child
+            .stdin
+            .as_mut()
+            .unwrap()
+            .write_all(Shell::Bash.script().as_bytes())
+            .unwrap();
+        let out = child.wait_with_output().unwrap();
+        assert!(
+            out.status.success(),
+            "bash -n rejected the completion script: {}",
+            String::from_utf8_lossy(&out.stderr)
+        );
+    }
+
+    #[test]
+    fn scripts_complete_ssh_config_aliases() {
+        // github #37: the remote forms (bare `posh <host>`, `posh ssh`)
+        // complete from ~/.ssh/config Host aliases, wildcards dropped.
+        for shell in [Shell::Bash, Shell::Zsh, Shell::Fish] {
+            let script = shell.script();
+            assert!(
+                script.contains(".ssh/config"),
+                "{shell:?} should read ssh config Host aliases"
+            );
+        }
+    }
+
+    #[test]
+    fn bare_position_completes_sessions_and_hosts() {
+        // github #37: the first argument is also the attach shorthand and
+        // the mosh-style host form, so both complete alongside commands.
+        let bash = Shell::Bash.script();
+        assert!(
+            bash.contains(r#"compgen -W "$commands $sessions $hosts""#),
+            "bash bare position must offer commands + sessions + hosts"
+        );
+        let fish = Shell::Fish.script();
+        assert!(
+            fish.contains("$no_subcmd -a '(posh list --short 2>/dev/null)'"),
+            "fish bare position must offer sessions"
+        );
+        assert!(
+            fish.contains("$no_subcmd -a '(__posh_ssh_config_hosts)'"),
+            "fish bare position must offer ssh hosts"
+        );
     }
 }
