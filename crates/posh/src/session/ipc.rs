@@ -43,6 +43,12 @@ impl Tag {
 
 pub const HEADER_LEN: usize = 5;
 
+/// Upper bound on a single frame's payload. Legitimate frames are PTY chunks
+/// (a few KiB) or a `dump_vt` replay (megabytes for a large terminal with
+/// deep scrollback); 64 MiB leaves generous headroom while bounding the
+/// buffer a hostile/confused peer can force us to allocate. github #10.
+pub const MAX_FRAME_LEN: usize = 64 * 1024 * 1024;
+
 /// History payload format selector (single byte): vt escape stream vs
 /// plain text. Encode on the client, decode in the daemon.
 pub fn encode_history_format(vt: bool) -> [u8; 1] {
@@ -121,21 +127,28 @@ impl FrameBuffer {
     }
 
     /// Returns the next complete frame, skipping frames with unknown tags.
-    pub fn next(&mut self) -> Option<Frame> {
+    /// Errors if a header announces a payload over [`MAX_FRAME_LEN`], so a
+    /// peer cannot drive unbounded buffering by claiming a huge length.
+    pub fn next(&mut self) -> util::Result<Option<Frame>> {
         loop {
             let avail = &self.buf[self.head..];
             if avail.len() < HEADER_LEN {
-                return None;
+                return Ok(None);
             }
             let len = u32::from_le_bytes([avail[1], avail[2], avail[3], avail[4]]) as usize;
+            if len > MAX_FRAME_LEN {
+                return Err(util::Error(format!(
+                    "frame length {len} exceeds maximum {MAX_FRAME_LEN}"
+                )));
+            }
             if avail.len() < HEADER_LEN + len {
-                return None;
+                return Ok(None);
             }
             let tag_byte = avail[0];
             let payload = avail[HEADER_LEN..HEADER_LEN + len].to_vec();
             self.head += HEADER_LEN + len;
             if let Some(tag) = Tag::from_u8(tag_byte) {
-                return Some(Frame { tag, payload });
+                return Ok(Some(Frame { tag, payload }));
             }
         }
     }
@@ -214,20 +227,20 @@ mod tests {
         wire.extend_from_slice(&encode_frame(Tag::Detach, b""));
         buf.feed(&wire);
         assert_eq!(
-            buf.next(),
+            buf.next().unwrap(),
             Some(Frame {
                 tag: Tag::Input,
                 payload: b"hello".to_vec()
             })
         );
         assert_eq!(
-            buf.next(),
+            buf.next().unwrap(),
             Some(Frame {
                 tag: Tag::Detach,
                 payload: vec![]
             })
         );
-        assert_eq!(buf.next(), None);
+        assert_eq!(buf.next().unwrap(), None);
     }
 
     #[test]
@@ -238,16 +251,27 @@ mod tests {
         for (i, b) in wire.iter().enumerate() {
             buf.feed(&[*b]);
             if i < wire.len() - 1 {
-                assert_eq!(buf.next(), None);
+                assert_eq!(buf.next().unwrap(), None);
             }
         }
         assert_eq!(
-            buf.next(),
+            buf.next().unwrap(),
             Some(Frame {
                 tag: Tag::Output,
                 payload: b"abcdef".to_vec()
             })
         );
+    }
+
+    #[test]
+    fn oversize_frame_length_is_rejected() {
+        // A header claiming a payload past MAX_FRAME_LEN must error rather
+        // than buffer toward it. github #10.
+        let mut wire = vec![Tag::Output as u8];
+        wire.extend_from_slice(&u32::MAX.to_le_bytes());
+        let mut buf = FrameBuffer::new();
+        buf.feed(&wire);
+        assert!(buf.next().is_err());
     }
 
     #[test]
@@ -259,7 +283,7 @@ mod tests {
         let mut buf = FrameBuffer::new();
         buf.feed(&wire);
         assert_eq!(
-            buf.next(),
+            buf.next().unwrap(),
             Some(Frame {
                 tag: Tag::Ack,
                 payload: b"ok".to_vec()

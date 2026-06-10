@@ -54,13 +54,74 @@ pub fn cmd_attach(
     result
 }
 
-/// Detects the Kitty keyboard protocol encoding of Ctrl+\ (92 = backslash,
-/// 5 = ctrl modifier, :1 = press event).
-fn is_kitty_ctrl_backslash(buf: &[u8]) -> bool {
-    fn contains(haystack: &[u8], needle: &[u8]) -> bool {
-        haystack.windows(needle.len()).any(|w| w == needle)
+/// The detach key Ctrl-\ as kitty keyboard CSI-u encodings (92 = backslash,
+/// 5 = ctrl modifier; with and without the explicit `:1` press-event suffix).
+const KITTY_DETACH_SEQS: [&[u8]; 2] = [b"\x1b[92;5u", b"\x1b[92;5:1u"];
+
+enum KittyMatch {
+    /// The slice begins with a full detach sequence.
+    Full,
+    /// The slice is a proper prefix of a detach sequence (need more bytes).
+    Partial,
+    /// No detach sequence starts here.
+    No,
+}
+
+fn match_kitty_detach(s: &[u8]) -> KittyMatch {
+    let mut partial = false;
+    for seq in KITTY_DETACH_SEQS {
+        if s.len() >= seq.len() {
+            if &s[..seq.len()] == seq {
+                return KittyMatch::Full;
+            }
+        } else if seq.starts_with(s) {
+            partial = true;
+        }
     }
-    contains(buf, b"\x1b[92;5u") || contains(buf, b"\x1b[92;5:1u")
+    if partial {
+        KittyMatch::Partial
+    } else {
+        KittyMatch::No
+    }
+}
+
+/// Scans the stdin byte stream for the detach key — raw Ctrl-\ (0x1c) at any
+/// offset, or its kitty CSI-u encodings — surviving splits across reads by
+/// holding back a trailing partial that could still complete the sequence.
+#[derive(Default)]
+struct DetachMatcher {
+    carry: Vec<u8>,
+}
+
+impl DetachMatcher {
+    /// Returns the bytes to forward to the daemon as input, and whether the
+    /// detach key was seen (in which case bytes after it are discarded).
+    fn feed(&mut self, input: &[u8]) -> (Vec<u8>, bool) {
+        let mut data = std::mem::take(&mut self.carry);
+        data.extend_from_slice(input);
+        let mut forward = Vec::new();
+        let mut i = 0;
+        while i < data.len() {
+            let b = data[i];
+            if b == 0x1c {
+                return (forward, true);
+            }
+            if b == 0x1b {
+                match match_kitty_detach(&data[i..]) {
+                    KittyMatch::Full => return (forward, true),
+                    KittyMatch::Partial => {
+                        // Hold back; the rest may arrive on the next read.
+                        self.carry = data[i..].to_vec();
+                        return (forward, false);
+                    }
+                    KittyMatch::No => {}
+                }
+            }
+            forward.push(b);
+            i += 1;
+        }
+        (forward, false)
+    }
 }
 
 fn client_loop(stream: UnixStream) -> Result<()> {
@@ -72,6 +133,7 @@ fn client_loop(stream: UnixStream) -> Result<()> {
     let mut sock_write_buf: Vec<u8> = Vec::with_capacity(4096);
     let mut stdout_buf: Vec<u8> = Vec::with_capacity(4096);
     let mut read_buf = FrameBuffer::new();
+    let mut detach = DetachMatcher::default();
     let mut stream_writer = &stream;
 
     // Announce our terminal size so the daemon can size the PTY.
@@ -115,10 +177,12 @@ fn client_loop(stream: UnixStream) -> Result<()> {
             match util::read_fd(STDIN, &mut buf) {
                 Ok(0) => return Ok(()),
                 Ok(n) => {
-                    if buf[0] == 0x1c || is_kitty_ctrl_backslash(&buf[..n]) {
+                    let (forward, detached) = detach.feed(&buf[..n]);
+                    if !forward.is_empty() {
+                        ipc::append_frame(&mut sock_write_buf, Tag::Input, &forward);
+                    }
+                    if detached {
                         ipc::append_frame(&mut sock_write_buf, Tag::Detach, b"");
-                    } else {
-                        ipc::append_frame(&mut sock_write_buf, Tag::Input, &buf[..n]);
                     }
                 }
                 Err(e) if e.kind() == std::io::ErrorKind::WouldBlock => {}
@@ -130,13 +194,17 @@ fn client_loop(stream: UnixStream) -> Result<()> {
         if fds[1].revents & libc::POLLIN != 0 {
             match read_buf.read_from(sock_fd) {
                 Ok(0) => return Ok(()),
-                Ok(_) => {
-                    while let Some(frame) = read_buf.next() {
-                        if frame.tag == Tag::Output && !frame.payload.is_empty() {
-                            stdout_buf.extend_from_slice(&frame.payload);
+                Ok(_) => loop {
+                    match read_buf.next() {
+                        Ok(Some(frame)) => {
+                            if frame.tag == Tag::Output && !frame.payload.is_empty() {
+                                stdout_buf.extend_from_slice(&frame.payload);
+                            }
                         }
+                        Ok(None) => break,
+                        Err(e) => return Err(e),
                     }
-                }
+                },
                 Err(e) if e.kind() == std::io::ErrorKind::WouldBlock => {}
                 Err(e)
                     if e.kind() == std::io::ErrorKind::ConnectionReset
@@ -186,11 +254,50 @@ mod tests {
     use super::*;
 
     #[test]
-    fn kitty_detach_sequences() {
-        assert!(is_kitty_ctrl_backslash(b"\x1b[92;5u"));
-        assert!(is_kitty_ctrl_backslash(b"\x1b[92;5:1u"));
-        assert!(!is_kitty_ctrl_backslash(b"\x1b[92;5:3u"));
-        assert!(!is_kitty_ctrl_backslash(b"\x1b[92;1u"));
-        assert!(!is_kitty_ctrl_backslash(b"garbage"));
+    fn raw_ctrl_backslash_detaches() {
+        let mut m = DetachMatcher::default();
+        assert_eq!(m.feed(b"\x1c"), (vec![], true));
+    }
+
+    #[test]
+    fn bytes_before_detach_are_forwarded() {
+        // Ctrl-\ mid-buffer: the preceding keystrokes must still reach the app
+        // (the old matcher dropped the whole buffer). github #17.
+        let mut m = DetachMatcher::default();
+        assert_eq!(m.feed(b"abc\x1c"), (b"abc".to_vec(), true));
+    }
+
+    #[test]
+    fn plain_input_passes_through() {
+        let mut m = DetachMatcher::default();
+        assert_eq!(m.feed(b"hello"), (b"hello".to_vec(), false));
+    }
+
+    #[test]
+    fn kitty_detach_in_one_read() {
+        let mut m = DetachMatcher::default();
+        assert_eq!(m.feed(b"\x1b[92;5u"), (vec![], true));
+        let mut m2 = DetachMatcher::default();
+        assert_eq!(m2.feed(b"\x1b[92;5:1u"), (vec![], true));
+    }
+
+    #[test]
+    fn kitty_detach_split_across_reads() {
+        // The 7-byte CSI-u sequence arriving in two reads must still detach
+        // (the old substring scan missed this). github #17.
+        let mut m = DetachMatcher::default();
+        assert_eq!(m.feed(b"\x1b[92"), (vec![], false)); // held back as partial
+        assert_eq!(m.feed(b";5u"), (vec![], true));
+    }
+
+    #[test]
+    fn non_detach_kitty_key_is_forwarded_after_split() {
+        // A different CSI-u key sharing the `\x1b[9` prefix must be delivered,
+        // not swallowed, once disambiguated on the next read.
+        let mut m = DetachMatcher::default();
+        assert_eq!(m.feed(b"\x1b[9"), (vec![], false));
+        let (fwd, detached) = m.feed(b"7;5u");
+        assert!(!detached);
+        assert_eq!(fwd, b"\x1b[97;5u");
     }
 }

@@ -6,7 +6,7 @@ pub mod daemon;
 pub mod ipc;
 
 use std::io::Read;
-use std::os::unix::fs::{DirBuilderExt, FileTypeExt};
+use std::os::unix::fs::{DirBuilderExt, FileTypeExt, MetadataExt};
 use std::os::unix::net::UnixStream;
 use std::path::{Path, PathBuf};
 use std::time::Duration;
@@ -58,12 +58,22 @@ impl Config {
             env("TMPDIR").as_deref(),
             uid,
         );
+        // A pre-existing base (notably the world-writable `/tmp/posh-<uid>`
+        // fallback) must be a real, private, self-owned directory — a
+        // recursive create silently trusts whatever is already there, which
+        // an attacker on a shared host could have planted. github #7.
+        // The base only needs to be a real, self-owned directory (no symlink
+        // redirect); it may be group-readable like any `/tmp` intermediate.
+        validate_session_dir(&base, uid, false)?;
         let socket_dir = base.join(group);
         let mut builder = std::fs::DirBuilder::new();
         builder.recursive(true).mode(0o700);
         builder
             .create(&socket_dir)
             .map_err(|e| Error(format!("cannot create {}: {e}", socket_dir.display())))?;
+        // The leaf that actually holds the sockets must be private (0700) and
+        // self-owned — reject an attacker-planted group dir. github #7.
+        validate_session_dir(&socket_dir, uid, true)?;
         Ok(Config {
             socket_dir,
             group: group.to_string(),
@@ -118,7 +128,7 @@ pub fn probe_session(path: &Path) -> Result<Probe> {
 fn wait_for_frame(mut stream: &UnixStream, tag: Tag, what: &str) -> Result<ipc::Frame> {
     let mut fb = ipc::FrameBuffer::new();
     loop {
-        if let Some(frame) = fb.next() {
+        if let Some(frame) = fb.next()? {
             if frame.tag == tag {
                 return Ok(frame);
             }
@@ -135,12 +145,76 @@ fn wait_for_frame(mut stream: &UnixStream, tag: Tag, what: &str) -> Result<ipc::
     }
 }
 
-fn cleanup_stale_socket(path: &Path) {
+/// Validates an existing session directory: it must be a real directory (not
+/// a symlink) owned by `uid`. With `require_private`, it must additionally
+/// have no group/other access (0700). A path that does not exist yet is fine
+/// (the caller creates it). github #7.
+fn validate_session_dir(path: &Path, uid: u32, require_private: bool) -> Result<()> {
+    let meta = match std::fs::symlink_metadata(path) {
+        Ok(m) => m,
+        Err(_) => return Ok(()),
+    };
+    let ft = meta.file_type();
+    if ft.is_symlink() {
+        return Err(Error(format!(
+            "refusing symlinked session dir: {}",
+            path.display()
+        )));
+    }
+    if !ft.is_dir() {
+        return Err(Error(format!(
+            "session dir is not a directory: {}",
+            path.display()
+        )));
+    }
+    if meta.uid() != uid {
+        return Err(Error(format!(
+            "session dir {} is not owned by uid {uid}",
+            path.display()
+        )));
+    }
+    if require_private && meta.mode() & 0o077 != 0 {
+        return Err(Error(format!(
+            "session dir {} is group/other-accessible (mode {:o})",
+            path.display(),
+            meta.mode() & 0o777
+        )));
+    }
+    Ok(())
+}
+
+/// True only when the socket is genuinely dead — connect is refused or the
+/// path is gone — as opposed to a live daemon that was merely slow to reply.
+fn socket_is_dead(path: &Path) -> bool {
+    match UnixStream::connect(path) {
+        Ok(_) => false,
+        Err(e) => matches!(
+            e.kind(),
+            std::io::ErrorKind::ConnectionRefused | std::io::ErrorKind::NotFound
+        ),
+    }
+}
+
+/// Removes a socket file, but only when the daemon behind it is genuinely
+/// gone. A transient probe timeout against a live-but-busy daemon must not
+/// orphan a running session. Returns whether the file was removed. github #15.
+pub(crate) fn cleanup_stale_socket(path: &Path) -> bool {
+    if !socket_is_dead(path) {
+        util::log_write(
+            "warn",
+            &format!(
+                "{} did not answer a probe but still accepts connections; not removing",
+                path.display()
+            ),
+        );
+        return false;
+    }
     util::log_write(
         "warn",
         &format!("stale socket found, cleaning up {}", path.display()),
     );
     let _ = std::fs::remove_file(path);
+    true
 }
 
 // ---------------------------------------------------------------------------
@@ -328,9 +402,12 @@ pub fn cmd_kill(cfg: &Config, name: &str) -> Result<()> {
             let _ = ipc::send(fd, Tag::Kill, b"");
             println!("killed session {name}");
         }
-        Err(_) => {
-            cleanup_stale_socket(&path);
-            println!("cleaned up stale session {name}");
+        Err(e) => {
+            if cleanup_stale_socket(&path) {
+                println!("cleaned up stale session {name}");
+            } else {
+                return Err(Error(format!("session {name} is unresponsive: {e}")));
+            }
         }
     }
     Ok(())
@@ -382,7 +459,9 @@ pub fn cmd_detach_all(cfg: &Config) -> Result<()> {
                 let fd = std::os::fd::AsRawFd::as_raw_fd(&probe.stream);
                 let _ = ipc::send(fd, Tag::DetachAll, b"");
             }
-            Err(_) => cleanup_stale_socket(&path),
+            Err(_) => {
+                cleanup_stale_socket(&path);
+            }
         }
     }
     Ok(())

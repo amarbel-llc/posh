@@ -14,6 +14,11 @@ use crate::util::{self, Error, Result};
 
 const SCROLLBACK: usize = 10_000;
 
+/// A client whose unsent backlog grows past this is treated as a stuck
+/// reader and dropped, so one wedged terminal can't OOM the daemon and take
+/// down every other attached client. github #11.
+const MAX_CLIENT_BACKLOG: usize = 16 * 1024 * 1024;
+
 /// Ensures the session exists, forking off a daemon when needed. Returns
 /// true when a new session was created. The daemon is a double-forked
 /// grandchild that never returns from this function (it exits the process).
@@ -31,7 +36,12 @@ pub fn ensure_session(cfg: &Config, name: &str, command: Option<Vec<String>>) ->
                 return Ok(false);
             }
             Err(_) => {
-                let _ = std::fs::remove_file(&path);
+                // Only reclaim the socket if the daemon is genuinely gone; a
+                // slow-but-live daemon means the session already exists, so
+                // don't remove its socket and spawn a duplicate. github #15.
+                if !session::cleanup_stale_socket(&path) {
+                    return Ok(false);
+                }
             }
         }
     } else if std::fs::symlink_metadata(&path).is_ok() {
@@ -164,7 +174,6 @@ fn daemon_loop(
     let listener_fd = listener.as_raw_fd();
     let pty_fd = child.master;
     let mut has_pty_output = false;
-    let mut has_had_client = false;
     let err_events = libc::POLLHUP | libc::POLLERR | libc::POLLNVAL;
 
     'daemon: loop {
@@ -172,6 +181,24 @@ fn daemon_loop(
             util::log_write("info", "SIGTERM received, shutting down gracefully");
             break;
         }
+
+        // Drop stuck readers before building the pollfd set (so the fd<->client
+        // index mapping stays consistent for this iteration). github #11.
+        clients.retain(|c| {
+            if c.write_buf.len() > MAX_CLIENT_BACKLOG {
+                util::log_write(
+                    "warn",
+                    &format!(
+                        "dropping slow client fd={} backlog={}",
+                        c.stream.as_raw_fd(),
+                        c.write_buf.len()
+                    ),
+                );
+                false
+            } else {
+                true
+            }
+        });
 
         let mut fds = Vec::with_capacity(2 + clients.len());
         fds.push(util::pollfd(listener_fd, libc::POLLIN));
@@ -226,8 +253,14 @@ fn daemon_loop(
                 }
                 Ok(n) => {
                     term.process(&buf[..n]);
+                    // The model answers the app's queries (DA/DSR/kitty/...)
+                    // only when no real terminal is attached. When clients are
+                    // present, their terminals answer and the answers return
+                    // as Tag::Input, so the model staying silent avoids a
+                    // duplicate (and lets the real terminal's capabilities
+                    // win). github #13.
                     let responses = term.take_responses();
-                    if !responses.is_empty() {
+                    if !responses.is_empty() && clients.is_empty() {
                         let _ = util::write_all_retry(pty_fd, &responses, 100);
                     }
                     has_pty_output = true;
@@ -258,6 +291,7 @@ fn daemon_loop(
             }
             let mut remove = false;
             let mut resized = false;
+            let mut needs_replay = false;
             let mut detach_all = false;
             let total_clients = clients.len();
             {
@@ -270,7 +304,16 @@ fn daemon_loop(
                         Err(_) => remove = true,
                     }
                     if !remove {
-                        while let Some(frame) = c.read_buf.next() {
+                        loop {
+                            let frame = match c.read_buf.next() {
+                                Ok(Some(frame)) => frame,
+                                Ok(None) => break,
+                                // Oversize/corrupt framing from this peer: drop it.
+                                Err(_) => {
+                                    remove = true;
+                                    break;
+                                }
+                            };
                             match frame.tag {
                                 Tag::Input => {
                                     let _ = util::write_all_retry(pty_fd, &frame.payload, 100);
@@ -281,14 +324,12 @@ fn daemon_loop(
                                         c.cols = w;
                                         resized = true;
                                     }
-                                    // Replay terminal state only on re-attach:
-                                    // on the very first attach the live stream
-                                    // (shell init, DA queries) must win.
-                                    if has_pty_output && has_had_client {
-                                        let dump = term.dump_vt();
-                                        c.queue(Tag::Output, &dump);
-                                    }
-                                    has_had_client = true;
+                                    // Replay the current screen so the client
+                                    // sees state it missed (including the first
+                                    // attach to a detached-created session). The
+                                    // dump is queued after the resize below so
+                                    // it reflects the new client size. github #16.
+                                    needs_replay = has_pty_output;
                                 }
                                 Tag::Resize => {
                                     if let Some((r, w)) = ipc::decode_resize(&frame.payload) {
@@ -326,7 +367,6 @@ fn daemon_loop(
                                 Tag::Run => {
                                     let _ = util::write_all_retry(pty_fd, &frame.payload, 1000);
                                     c.queue(Tag::Ack, b"");
-                                    has_had_client = true;
                                 }
                                 Tag::Output | Tag::Ack => {}
                             }
@@ -363,6 +403,12 @@ fn daemon_loop(
             }
             if resized {
                 apply_client_size(clients, pty_fd, term);
+            }
+            // Replay after the resize so the dump reflects the client's size.
+            // Skip if the client was removed this iteration. github #16.
+            if needs_replay && !remove && i < clients.len() {
+                let dump = term.dump_vt();
+                clients[i].queue(Tag::Output, &dump);
             }
         }
     }
