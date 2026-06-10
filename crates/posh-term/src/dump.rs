@@ -270,7 +270,15 @@ impl Terminal {
             }
         }
         for p in self.graphics.placements() {
-            if p.parent_image == 0 && !p.unicode {
+            // A relative placement whose parent has since vanished (quota
+            // eviction) would be rejected on replay; anchor it absolutely
+            // at its resolved cell instead.
+            let parent_alive = p.parent_image != 0
+                && self.graphics.placements().iter().any(|q| {
+                    q.image_id == p.parent_image
+                        && (p.parent_placement == 0 || q.placement_id == p.parent_placement)
+                });
+            if !parent_alive && !p.unicode {
                 let _ = write!(out, "\x1b[{};{}H", p.row + 1, p.col + 1);
             }
             let _ = write!(
@@ -288,7 +296,7 @@ impl Terminal {
                 p.cell_x,
                 p.cell_y
             );
-            if p.parent_image != 0 {
+            if parent_alive {
                 let _ = write!(
                     out,
                     ",P={},Q={},H={},V={}",
