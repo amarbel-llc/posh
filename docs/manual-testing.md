@@ -32,6 +32,7 @@ $P kill demo
 - [ ] Detach returns you to your shell cleanly (no raw-mode garbage).
 - [ ] Reattach replays the screen: prior output, cursor position, modes.
 - [ ] `posh list` counts clients correctly before/after.
+- [ ] Exit status: `$P attach ec sh -c 'exit 7'; echo $?` prints 7 (#18).
 
 ## 2. Signal handling (#14 — newest fix, highest attention)
 
@@ -95,5 +96,3 @@ Tracked Wave D/E work
   ([#29](https://github.com/amarbel-llc/posh/issues/29)).
 - No connect/timeout diagnostics — a firewalled port waits silently
   ([#31](https://github.com/amarbel-llc/posh/issues/31)).
-- Session exit status not propagated; `posh attach` exits 0 regardless
-  ([#18](https://github.com/amarbel-llc/posh/issues/18), partial).

@@ -96,7 +96,9 @@ posh completions <bash|zsh|fish>
 
 Daemon-per-session over Unix sockets with zmx's binary IPC framing (1-byte
 tag + u32 LE length; Input/Output/Resize/Detach/DetachAll/Kill/Info/Init/
-History/Run/Ack). Each daemon feeds PTY output through a `posh_term::Terminal`
+History/Run/Ack/Exit — Exit carries the shell's status so an attached
+client exits with the session's real code). Each daemon feeds PTY output
+through a `posh_term::Terminal`
 so re-attaching clients receive a full state replay via `dump_vt()`. Session
 groups via `-g/--group` or `POSH_GROUP`; socket directory resolution:
 `POSH_DIR` > `XDG_RUNTIME_DIR/posh` > `TMPDIR/posh-{uid}` > `/tmp/posh-{uid}`.
