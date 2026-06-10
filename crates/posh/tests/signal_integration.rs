@@ -35,12 +35,24 @@ fn open_pty_pair() -> (RawFd, RawFd) {
         assert!(master >= 0, "posix_openpt failed");
         assert_eq!(libc::grantpt(master), 0, "grantpt failed");
         assert_eq!(libc::unlockpt(master), 0, "unlockpt failed");
+        // ptsname_r (reentrant, buffer-out) is glibc-only; macOS/BSD has only
+        // the non-reentrant ptsname(fd) -> *mut c_char returning an internal
+        // buffer. Copy that into `name` so the open() below is identical.
         let mut name = [0 as libc::c_char; 128];
+        #[cfg(target_os = "linux")]
         assert_eq!(
             libc::ptsname_r(master, name.as_mut_ptr(), name.len()),
             0,
             "ptsname_r failed"
         );
+        #[cfg(not(target_os = "linux"))]
+        {
+            let p = libc::ptsname(master);
+            assert!(!p.is_null(), "ptsname failed");
+            let len = libc::strlen(p);
+            assert!(len < name.len(), "pts name too long for buffer");
+            std::ptr::copy_nonoverlapping(p, name.as_mut_ptr(), len);
+        }
         let slave = libc::open(name.as_ptr(), libc::O_RDWR | libc::O_NOCTTY);
         assert!(slave >= 0, "open pty slave failed");
         // A real window size: banner/render assertions need columns.
