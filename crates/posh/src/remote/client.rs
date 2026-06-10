@@ -295,9 +295,7 @@ fn suspend(st: &mut ClientState, raw: &RawMode) {
     let _ = util::write_all_retry(STDOUT, display::close(), 1000);
     raw.restore();
     let _ = util::write_all_retry(STDOUT, b"\r\n\x1b[37;44m[posh is suspended.]\x1b[m\r\n", 1000);
-    unsafe {
-        libc::kill(0, libc::SIGSTOP);
-    }
+    util::stop_own_pgroup();
     // Execution resumes here after SIGCONT (fg).
     raw.reapply();
     st.predict.reset();

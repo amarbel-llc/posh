@@ -6,6 +6,7 @@ use std::os::fd::RawFd;
 use crate::util::{Error, Result};
 
 pub fn term_size(fd: RawFd) -> (u16, u16) {
+    // SAFETY: TIOCGWINSZ writes through a valid &mut winsize.
     unsafe {
         let mut ws: libc::winsize = std::mem::zeroed();
         if libc::ioctl(fd, libc::TIOCGWINSZ, &mut ws) == 0 && ws.ws_row > 0 && ws.ws_col > 0 {
@@ -22,6 +23,7 @@ pub fn set_term_size(fd: RawFd, rows: u16, cols: u16) {
         ws_xpixel: 0,
         ws_ypixel: 0,
     };
+    // SAFETY: TIOCSWINSZ reads from a valid &winsize.
     unsafe {
         libc::ioctl(fd, libc::TIOCSWINSZ, &ws);
     }
@@ -60,6 +62,10 @@ pub fn spawn_shell(
     };
     let mut master: libc::c_int = -1;
     let mut slave: libc::c_int = -1;
+    // SAFETY: all pointers passed below (argv, env, paths) outlive the
+    // calls; the forked child touches only async-signal-safe functions
+    // (setsid/ioctl/dup2/close/putenv-of-preallocated/execvp/_exit) — no
+    // allocation happens between fork and exec.
     unsafe {
         // openpty's termios/winsize params are *const on Linux but *mut on
         // macOS/BSD; cast to let each platform's signature resolve the
@@ -134,6 +140,7 @@ pub struct RawMode {
 
 fn raw_termios(orig: &libc::termios) -> libc::termios {
     let mut raw = *orig;
+    // SAFETY: cfmakeraw mutates a valid &mut termios in place.
     unsafe { libc::cfmakeraw(&mut raw) };
     // _POSIX_VDISABLE: free Ctrl-V (literal-next) and Ctrl-\ (SIGQUIT)
     // so the latter can be used as the detach key.
@@ -146,6 +153,8 @@ fn raw_termios(orig: &libc::termios) -> libc::termios {
 
 impl RawMode {
     pub fn enable(fd: RawFd) -> Result<RawMode> {
+        // SAFETY: tcgetattr writes through a valid &mut termios before it
+        // is read; tcsetattr reads from a valid reference.
         unsafe {
             let mut orig: libc::termios = std::mem::zeroed();
             if libc::tcgetattr(fd, &mut orig) != 0 {
@@ -161,6 +170,7 @@ impl RawMode {
     /// Temporarily restores the original termios (suspend); pair with
     /// [`RawMode::reapply`] on resume.
     pub fn restore(&self) {
+        // SAFETY: tcsetattr reads from a valid &termios.
         unsafe {
             libc::tcsetattr(self.fd, libc::TCSANOW, &self.orig);
         }
@@ -168,6 +178,7 @@ impl RawMode {
 
     /// Re-enters raw mode after [`RawMode::restore`] (resume from suspend).
     pub fn reapply(&self) {
+        // SAFETY: tcsetattr reads from a valid temporary termios.
         unsafe {
             libc::tcsetattr(self.fd, libc::TCSANOW, &raw_termios(&self.orig));
         }
@@ -176,6 +187,7 @@ impl RawMode {
 
 impl Drop for RawMode {
     fn drop(&mut self) {
+        // SAFETY: tcsetattr reads from a valid &termios.
         unsafe {
             libc::tcsetattr(self.fd, libc::TCSAFLUSH, &self.orig);
         }

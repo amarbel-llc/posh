@@ -42,6 +42,10 @@ impl Family {
 /// Binds an IPv6 UDP wildcard socket; `v6only=false` requests a dual-stack
 /// socket that also accepts IPv4 (as v4-mapped addresses).
 fn bind_udp_v6(port: u16, v6only: bool) -> std::io::Result<UdpSocket> {
+    // SAFETY: socket/setsockopt/bind/fcntl on a plain integer fd; the
+    // sockaddr is zero-initialized then fully set, and its size is passed
+    // alongside. The fd is owned by the returned UdpSocket (or closed on
+    // every error path).
     unsafe {
         // Linux can request close-on-exec atomically via the SOCK_CLOEXEC type
         // flag; macOS/BSD have no such constant, so set FD_CLOEXEC with a

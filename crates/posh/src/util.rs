@@ -166,6 +166,7 @@ pub fn pollfd(fd: RawFd, events: i16) -> libc::pollfd {
 /// Thin poll(2) wrapper. EINTR is surfaced as ErrorKind::Interrupted so event
 /// loops can re-check their signal flags.
 pub fn poll(fds: &mut [libc::pollfd], timeout_ms: i32) -> std::io::Result<usize> {
+    // SAFETY: pointer and length come from the same live slice.
     let rc = unsafe { libc::poll(fds.as_mut_ptr(), fds.len() as libc::nfds_t, timeout_ms) };
     if rc < 0 {
         Err(std::io::Error::last_os_error())
@@ -175,6 +176,7 @@ pub fn poll(fds: &mut [libc::pollfd], timeout_ms: i32) -> std::io::Result<usize>
 }
 
 pub fn read_fd(fd: RawFd, buf: &mut [u8]) -> std::io::Result<usize> {
+    // SAFETY: pointer and length come from the same live slice.
     let n = unsafe { libc::read(fd, buf.as_mut_ptr() as *mut libc::c_void, buf.len()) };
     if n < 0 {
         Err(std::io::Error::last_os_error())
@@ -184,6 +186,7 @@ pub fn read_fd(fd: RawFd, buf: &mut [u8]) -> std::io::Result<usize> {
 }
 
 pub fn write_fd(fd: RawFd, buf: &[u8]) -> std::io::Result<usize> {
+    // SAFETY: pointer and length come from the same live slice.
     let n = unsafe { libc::write(fd, buf.as_ptr() as *const libc::c_void, buf.len()) };
     if n < 0 {
         Err(std::io::Error::last_os_error())
@@ -214,7 +217,74 @@ pub fn write_all_retry(fd: RawFd, mut data: &[u8], max_wait_ms: u64) -> std::io:
     Ok(())
 }
 
+// ---------------------------------------------------------------------------
+// Process control — the safe surface over the scattered libc FFI (github
+// #36). Call sites outside this module and pty.rs should use these rather
+// than raw libc.
+
+/// Sends `signal` to `pid`'s whole process group.
+pub fn kill_pgroup(pid: libc::pid_t, signal: libc::c_int) {
+    // SAFETY: kill(2) takes two plain integers; a negative pid addresses
+    // the process group.
+    unsafe { libc::kill(-pid, signal) };
+}
+
+/// Stops our own process group (job-control suspend; SIGCONT resumes).
+pub fn stop_own_pgroup() {
+    // SAFETY: kill(2) with pid 0 signals the caller's own process group.
+    unsafe { libc::kill(0, libc::SIGSTOP) };
+}
+
+/// Non-blocking reap: `Some(raw wait status)` when `pid` was reaped.
+pub fn try_reap(pid: libc::pid_t) -> Option<libc::c_int> {
+    let mut status = 0;
+    // SAFETY: waitpid(2) writes the status through a valid &mut int.
+    if unsafe { libc::waitpid(pid, &mut status, libc::WNOHANG) } == pid {
+        Some(status)
+    } else {
+        None
+    }
+}
+
+/// Blocking reap; returns the raw wait status (0 when nothing was reaped).
+pub fn reap(pid: libc::pid_t) -> libc::c_int {
+    let mut status = 0;
+    // SAFETY: as try_reap.
+    unsafe { libc::waitpid(pid, &mut status, 0) };
+    status
+}
+
+/// Shell-style exit code from a raw wait status: WEXITSTATUS, or
+/// 128+signal when signaled.
+pub fn exit_code(status: libc::c_int) -> i32 {
+    if libc::WIFEXITED(status) {
+        libc::WEXITSTATUS(status)
+    } else if libc::WIFSIGNALED(status) {
+        128 + libc::WTERMSIG(status)
+    } else {
+        0
+    }
+}
+
+pub fn close_fd(fd: RawFd) {
+    // SAFETY: close(2) on a plain integer fd.
+    unsafe { libc::close(fd) };
+}
+
+/// Real uid of the process (cannot fail).
+pub fn uid() -> u32 {
+    // SAFETY: getuid(2) takes no arguments and always succeeds.
+    unsafe { libc::getuid() }
+}
+
+/// Whether `fd` refers to a terminal.
+pub fn is_tty(fd: RawFd) -> bool {
+    // SAFETY: isatty(2) on a plain integer fd.
+    (unsafe { libc::isatty(fd) }) == 1
+}
+
 pub fn set_nonblocking(fd: RawFd) -> std::io::Result<()> {
+    // SAFETY: two fcntl(2) calls on a plain integer fd.
     unsafe {
         let flags = libc::fcntl(fd, libc::F_GETFL, 0);
         if flags < 0 || libc::fcntl(fd, libc::F_SETFL, flags | libc::O_NONBLOCK) < 0 {
@@ -249,6 +319,8 @@ extern "C" fn on_sigcont(_: libc::c_int) {
 }
 
 fn install_handler(signo: libc::c_int, handler: usize) {
+    // SAFETY: sigaction is zero-initialized then fully set; every handler
+    // routed here only stores to an AtomicBool (async-signal-safe).
     unsafe {
         let mut sa: libc::sigaction = std::mem::zeroed();
         sa.sa_sigaction = handler;
@@ -309,6 +381,10 @@ pub fn take_flag(flag: &AtomicBool) -> bool {
 /// after the intermediate child has been reaped; the grandchild (the daemon)
 /// gets false. The intermediate process never returns.
 pub fn double_fork() -> Result<bool> {
+    // SAFETY: the process is single-threaded at every call site (daemon and
+    // server startup, before any event loop), so fork(2) is not racing
+    // allocator or lock state; the intermediate child only calls
+    // async-signal-safe functions before _exit.
     unsafe {
         let pid = libc::fork();
         if pid < 0 {
@@ -330,6 +406,8 @@ pub fn double_fork() -> Result<bool> {
 }
 
 pub fn redirect_stdio_devnull() {
+    // SAFETY: open(2)/dup2(2)/close(2) on integer fds; the path is a
+    // static NUL-terminated literal.
     unsafe {
         let nullfd = libc::open(c"/dev/null".as_ptr(), libc::O_RDWR);
         if nullfd >= 0 {
@@ -421,6 +499,15 @@ mod tests {
     fn decode_preserves_invalid_escapes() {
         assert_eq!(decode_session_name("50%"), "50%");
         assert_eq!(decode_session_name("a%zz"), "a%zz");
+    }
+
+    #[test]
+    fn exit_code_maps_wait_status_shell_style() {
+        // Raw wait statuses: exit code in bits 8..16, signal in bits 0..7.
+        assert_eq!(exit_code(0), 0);
+        assert_eq!(exit_code(7 << 8), 7);
+        assert_eq!(exit_code(libc::SIGKILL), 128 + libc::SIGKILL);
+        assert_eq!(exit_code(libc::SIGTERM), 128 + libc::SIGTERM);
     }
 
     #[test]

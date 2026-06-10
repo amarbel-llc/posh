@@ -51,7 +51,7 @@ impl Config {
             return Err(Error(format!("invalid group name: {group}")));
         }
         let env = |k: &str| std::env::var(k).ok();
-        let uid = unsafe { libc::getuid() };
+        let uid = util::uid();
         let base = resolve_socket_base(
             env("POSH_DIR").as_deref(),
             env("XDG_RUNTIME_DIR").as_deref(),
@@ -480,7 +480,7 @@ pub fn cmd_run(cfg: &Config, name: &str, args: &[String]) -> Result<()> {
 
     let mut text = if args.is_empty() {
         // No argv: accept the command on stdin when it is not a tty.
-        if unsafe { libc::isatty(0) } == 1 {
+        if util::is_tty(0) {
             String::new()
         } else {
             let mut buf = String::new();
@@ -576,7 +576,7 @@ fn next_fork_name(cfg: &Config, base: &str) -> Result<String> {
 /// socket in them), sorted.
 pub fn cmd_groups() -> Result<()> {
     let env = |k: &str| std::env::var(k).ok();
-    let uid = unsafe { libc::getuid() };
+    let uid = util::uid();
     let base = resolve_socket_base(
         env("POSH_DIR").as_deref(),
         env("XDG_RUNTIME_DIR").as_deref(),

@@ -195,10 +195,7 @@ fn server_loop(mut conn: Connection, child: pty::PtyChild, rows: u16, cols: u16)
                 shutdown = true;
                 shutdown_at = now_ms();
                 force_frame = true;
-                unsafe {
-                    let mut status = 0;
-                    libc::waitpid(child.pid, &mut status, libc::WNOHANG);
-                }
+                let _ = util::try_reap(child.pid);
             }
         }
 
@@ -234,9 +231,7 @@ fn server_loop(mut conn: Connection, child: pty::PtyChild, rows: u16, cols: u16)
                             shutdown_at = now_ms();
                             force_frame = true;
                             if pty_open {
-                                unsafe {
-                                    libc::kill(-child.pid, libc::SIGHUP);
-                                }
+                                util::kill_pgroup(child.pid, libc::SIGHUP);
                             }
                         }
                         update_acks(
@@ -349,15 +344,10 @@ fn server_loop(mut conn: Connection, child: pty::PtyChild, rows: u16, cols: u16)
     }
 
     if pty_open {
-        unsafe {
-            libc::kill(-child.pid, libc::SIGHUP);
-        }
+        util::kill_pgroup(child.pid, libc::SIGHUP);
     }
-    unsafe {
-        let mut status = 0;
-        libc::waitpid(child.pid, &mut status, libc::WNOHANG);
-        libc::close(child.master);
-    }
+    let _ = util::try_reap(child.pid);
+    util::close_fd(child.master);
 }
 
 fn handle_client_message(

@@ -1,5 +1,8 @@
 //! posh-term: a standalone terminal emulation library.
 //!
+//! The crate is 100% safe Rust and intends to stay that way (github #36);
+//! all libc FFI lives in the `posh` binary crate.
+//!
 //! This crate is a from-scratch Rust rewrite of the ghostty-vt terminal core.
 //! It has no dependencies: callers feed it bytes from a PTY via
 //! [`Terminal::process`], query the resulting screen state, and drain any
@@ -26,6 +29,7 @@
 //! - `Terminal::dump_text(&self) -> String` (plain text, scrollback included)
 //! - `Terminal::take_responses(&mut self) -> Vec<u8>` (DA/DSR/etc. replies)
 //! - `Terminal::screen(&self) -> &Screen` (cell-level read access)
+#![forbid(unsafe_code)]
 
 /// Placeholder cell size in pixels, shared by the XTWINOPS reports, kitty
 /// graphics extents, and SGR-pixel mouse coordinates so the three stay in

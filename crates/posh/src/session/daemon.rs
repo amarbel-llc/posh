@@ -152,31 +152,13 @@ fn daemon_main(
     // process group regardless — background jobs survive the shell's own
     // exit and must not outlive the session.
     util::log_write("info", &format!("shutting down daemon session={name}"));
-    let mut status = 0;
-    let reaped = unsafe { libc::waitpid(child.pid, &mut status, libc::WNOHANG) } == child.pid;
-    unsafe {
-        libc::kill(-child.pid, libc::SIGHUP);
-    }
+    let reaped = util::try_reap(child.pid);
+    util::kill_pgroup(child.pid, libc::SIGHUP);
     std::thread::sleep(std::time::Duration::from_millis(500));
-    unsafe {
-        libc::kill(-child.pid, libc::SIGKILL);
-    }
-    if !reaped {
-        unsafe {
-            libc::waitpid(child.pid, &mut status, 0);
-        }
-    }
-    unsafe {
-        libc::close(child.master);
-    }
-    // Shell-style exit code: WEXITSTATUS, or 128+signal when signaled.
-    let code = if libc::WIFEXITED(status) {
-        libc::WEXITSTATUS(status)
-    } else if libc::WIFSIGNALED(status) {
-        128 + libc::WTERMSIG(status)
-    } else {
-        0
-    };
+    util::kill_pgroup(child.pid, libc::SIGKILL);
+    let status = reaped.unwrap_or_else(|| util::reap(child.pid));
+    util::close_fd(child.master);
+    let code = util::exit_code(status);
     // Tell attached clients the real status before hanging up (their EOF
     // is the detach notice). Best-effort: a stuck client cannot block
     // teardown. github #18.
