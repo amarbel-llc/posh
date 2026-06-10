@@ -503,6 +503,29 @@ fn decrqm_reports() {
 }
 
 #[test]
+fn alternate_scroll_tracked_reported_and_replayed() {
+    // DECSET 1007 (alternate scroll): kitty defaults it ON, so the model
+    // must track the app's setting for the client to sync/reset. github #28.
+    let mut t = term();
+    assert!(!t.alternate_scroll());
+    feed(&mut t, "\x1b[?1007h");
+    assert!(t.alternate_scroll());
+    feed(&mut t, "\x1b[?1007$p");
+    assert_eq!(t.take_responses(), b"\x1b[?1007;1$y");
+
+    // dump_vt replays the mode (attach replay / remote sync).
+    let dump = t.dump_vt();
+    let mut r = term();
+    r.process(&dump);
+    assert!(r.alternate_scroll(), "dump_vt must replay DECSET 1007");
+
+    feed(&mut t, "\x1b[?1007l");
+    assert!(!t.alternate_scroll());
+    feed(&mut t, "\x1b[?1007$p");
+    assert_eq!(t.take_responses(), b"\x1b[?1007;2$y");
+}
+
+#[test]
 fn xtversion_reports_posh_term() {
     let mut t = term();
     feed(&mut t, "\x1b[>0q");

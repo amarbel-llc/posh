@@ -27,6 +27,9 @@ pub struct Snapshot {
     pub reverse_video: bool,
     pub bracketed_paste: bool,
     pub focus_reporting: bool,
+    /// DECSET 1007: alternate scroll (synced because the outer terminal's
+    /// default may differ — kitty defaults it on).
+    pub alternate_scroll: bool,
     pub app_cursor_keys: bool,
     pub app_keypad: bool,
     /// 0 = off, else the DECSET number (9/1000/1002/1003).
@@ -59,6 +62,7 @@ impl Snapshot {
             reverse_video: false,
             bracketed_paste: false,
             focus_reporting: false,
+            alternate_scroll: false,
             app_cursor_keys: false,
             app_keypad: false,
             mouse_mode: 0,
@@ -98,6 +102,7 @@ impl Snapshot {
             reverse_video: term.reverse_video(),
             bracketed_paste: term.bracketed_paste(),
             focus_reporting: term.focus_reporting(),
+            alternate_scroll: term.alternate_scroll(),
             app_cursor_keys: term.app_cursor_keys(),
             app_keypad: term.app_keypad(),
             mouse_mode: term.mouse_mode().decset().unwrap_or(0),
@@ -127,7 +132,7 @@ impl Snapshot {
 /// visible cursor, mouse/paste/focus modes off, scroll region reset.
 pub fn close() -> &'static [u8] {
     b"\x1b[0m\x1b[?25h\x1b[?1l\x1b>\x1b[?1003l\x1b[?1002l\x1b[?1000l\x1b[?9l\
-      \x1b[?1016l\x1b[?1006l\x1b[?1005l\x1b[?2004l\x1b[?1004l\x1b[r"
+      \x1b[?1016l\x1b[?1006l\x1b[?1005l\x1b[?2004l\x1b[?1004l\x1b[?1007l\x1b[r"
 }
 
 /// Escape-stream builder with cursor/pen bookkeeping (mosh FrameState).
@@ -423,6 +428,17 @@ pub fn new_frame(initialized: bool, last: &Snapshot, f: &Snapshot) -> Vec<u8> {
             "\x1b[?1004h"
         } else {
             "\x1b[?1004l"
+        });
+    }
+
+    // Alternate scroll (DECSET 1007): synced even when "off" because the
+    // outer terminal's default may be on (kitty), which would turn the
+    // wheel into arrow keys at a bare prompt.
+    if !init || f.alternate_scroll != last.alternate_scroll {
+        frame.append(if f.alternate_scroll {
+            "\x1b[?1007h"
+        } else {
+            "\x1b[?1007l"
         });
     }
 
@@ -1155,6 +1171,39 @@ mod tests {
         let s = String::from_utf8_lossy(&diff_off);
         assert!(s.contains("\x1b[?2004l"), "{s:?}");
         assert!(s.contains("\x1b[?1000l"), "{s:?}");
+    }
+
+    #[test]
+    fn alternate_scroll_synced_and_reset() {
+        // kitty defaults alternate-scroll ON: the first frame must assert
+        // the model's default-off state, app changes must sync both ways,
+        // and teardown must reset — or the wheel sprays arrow keys at a
+        // prompt and the mode leaks to the local shell. github #28.
+        let term = term_with(3, 20, b"");
+        let bytes = new_frame(false, &Snapshot::blank(3, 20), &Snapshot::from_term(&term));
+        assert!(
+            String::from_utf8_lossy(&bytes).contains("\x1b[?1007l"),
+            "initial frame must assert default-off 1007: {:?}",
+            String::from_utf8_lossy(&bytes)
+        );
+
+        let prev = term_with(3, 20, b"");
+        let mut next = term_with(3, 20, b"");
+        next.process(b"\x1b[?1007h");
+        let diff = new_frame(
+            true,
+            &Snapshot::from_term(&prev),
+            &Snapshot::from_term(&next),
+        );
+        assert!(String::from_utf8_lossy(&diff).contains("\x1b[?1007h"));
+        let diff_off = new_frame(
+            true,
+            &Snapshot::from_term(&next),
+            &Snapshot::from_term(&prev),
+        );
+        assert!(String::from_utf8_lossy(&diff_off).contains("\x1b[?1007l"));
+
+        assert!(String::from_utf8_lossy(close()).contains("\x1b[?1007l"));
     }
 
     #[test]

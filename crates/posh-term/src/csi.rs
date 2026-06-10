@@ -470,6 +470,7 @@ impl Terminal {
                 }
             }
             1004 => self.modes.focus_reporting = set,
+            1007 => self.modes.alternate_scroll = set,
             1005 => {
                 self.modes.mouse_protocol = if set {
                     MouseProtocol::Utf8
@@ -526,6 +527,7 @@ impl Terminal {
             1002 => b(self.modes.mouse_mode == MouseMode::ButtonEvent),
             1003 => b(self.modes.mouse_mode == MouseMode::AnyEvent),
             1004 => b(self.modes.focus_reporting),
+            1007 => b(self.modes.alternate_scroll),
             1005 => b(self.modes.mouse_protocol == MouseProtocol::Utf8),
             1006 => b(self.modes.mouse_protocol == MouseProtocol::Sgr),
             1016 => b(self.modes.mouse_protocol == MouseProtocol::SgrPixel),

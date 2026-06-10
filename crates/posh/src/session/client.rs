@@ -14,10 +14,11 @@ const STDIN: i32 = libc::STDIN_FILENO;
 const STDOUT: i32 = libc::STDOUT_FILENO;
 
 /// Reset sequence written on detach: disable mouse reporting (1000/1002/
-/// 1003/1006), bracketed paste (2004), focus events (1004), alt screen
-/// (1049), and re-show the cursor. The screen is intentionally not cleared.
+/// 1003/1006), alternate scroll (1007), bracketed paste (2004), focus
+/// events (1004), alt screen (1049), and re-show the cursor. The screen is
+/// intentionally not cleared.
 const RESTORE_SEQ: &[u8] =
-    b"\x1b[?1000l\x1b[?1002l\x1b[?1003l\x1b[?1006l\x1b[?2004l\x1b[?1004l\x1b[?1049l\x1b[?25h";
+    b"\x1b[?1000l\x1b[?1002l\x1b[?1003l\x1b[?1006l\x1b[?1007l\x1b[?2004l\x1b[?1004l\x1b[?1049l\x1b[?25h";
 
 pub fn cmd_attach(
     cfg: &Config,

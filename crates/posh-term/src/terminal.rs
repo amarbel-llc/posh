@@ -874,6 +874,10 @@ impl Terminal {
         self.modes.focus_reporting
     }
 
+    pub fn alternate_scroll(&self) -> bool {
+        self.modes.alternate_scroll
+    }
+
     pub fn reverse_video(&self) -> bool {
         self.modes.reverse_video
     }

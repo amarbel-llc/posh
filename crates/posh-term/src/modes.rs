@@ -68,6 +68,10 @@ pub(crate) struct Modes {
     pub bracketed_paste: bool,
     /// DECSET 1004: focus in/out reporting.
     pub focus_reporting: bool,
+    /// DECSET 1007: alternate scroll (wheel sends arrow keys on the alt
+    /// screen). Tracked so the remote client can sync/reset the outer
+    /// terminal, whose default may differ (kitty defaults it on).
+    pub alternate_scroll: bool,
     /// DECSET 2026: synchronized output.
     pub synchronized: bool,
     /// IRM (SM 4): insert mode.
@@ -101,6 +105,7 @@ impl Default for Modes {
             cursor_visible: true,
             bracketed_paste: false,
             focus_reporting: false,
+            alternate_scroll: false,
             synchronized: false,
             insert: false,
             lnm: false,

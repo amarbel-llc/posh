@@ -382,6 +382,9 @@ impl Terminal {
         if self.modes.focus_reporting {
             out.push_str("\x1b[?1004h");
         }
+        if self.modes.alternate_scroll {
+            out.push_str("\x1b[?1007h");
+        }
         if self.modes.synchronized {
             out.push_str("\x1b[?2026h");
         }
