@@ -189,6 +189,62 @@ fn attach_client_exits_with_session_exit_status() {
 }
 
 #[test]
+fn attach_takes_over_and_restores_the_alt_screen() {
+    // FDR 0002: the attach byte stream begins by entering the outer
+    // terminal's alternate screen (the user's shell screen waits
+    // underneath) and ends, after the mode resets, by leaving it — so the
+    // pre-attach screen comes back exactly as it was.
+    let dir = test_posh_dir("posh-takeover");
+
+    let (master, slave) = open_pty_pair();
+    let mut cmd = posh_cmd();
+    cmd.args(["attach", "takeover", "sh", "-c", "read x; exit 0"])
+        .env("POSH_DIR", &dir)
+        .env_remove("POSH_SESSION")
+        .env_remove("POSH_GROUP");
+    let mut child = spawn_on_pty(&mut cmd, slave);
+
+    let mut bytes = Vec::new();
+    for _ in 0..400 {
+        if drain_into(master, &mut bytes) > 0 {
+            break;
+        }
+        std::thread::sleep(Duration::from_millis(25));
+    }
+    assert!(!bytes.is_empty(), "no attach output");
+
+    // Wake the shell so the session ends and the client restores the tty.
+    let n = unsafe { libc::write(master, b"go\n".as_ptr() as *const libc::c_void, 3) };
+    assert_eq!(n, 3, "writing to the pty failed");
+    let deadline = Instant::now() + Duration::from_secs(10);
+    loop {
+        drain_into(master, &mut bytes);
+        if child.try_wait().expect("try_wait").is_some() {
+            break;
+        }
+        if Instant::now() >= deadline {
+            let _ = child.kill();
+            panic!("client did not exit after session end");
+        }
+        std::thread::sleep(Duration::from_millis(25));
+    }
+    drain_into(master, &mut bytes);
+
+    assert!(
+        bytes.starts_with(b"\x1b[?1049h\x1b[2J\x1b[H"),
+        "attach must start by taking the alt screen, got {:?}",
+        String::from_utf8_lossy(&bytes[..bytes.len().min(24)])
+    );
+    assert!(
+        bytes.ends_with(b"\x1b[?1049l\x1b[?25h"),
+        "exit must end by leaving the alt screen, got {:?}",
+        String::from_utf8_lossy(&bytes[bytes.len().saturating_sub(48)..])
+    );
+
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+#[test]
 fn argv0_posh_server_dispatches_to_server() {
     // The package installs `bin/posh-server -> posh`; invoked under that
     // name the binary IS the server subcommand (mosh-server parity — this

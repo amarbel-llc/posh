@@ -74,6 +74,21 @@ pub(crate) struct Hyperlink {
     pub uri: String,
 }
 
+/// A just-processed control that changes which screen the raw byte stream
+/// is drawing on. Consumers that pin the real terminal to a single screen
+/// (the session daemon's attach broadcast) must not forward the triggering
+/// sequence raw; they substitute a repaint instead. See
+/// [`Terminal::take_screen_switch`].
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ScreenSwitch {
+    /// DECSET/DECRST 47, 1047, or 1049 — including no-op re-entries, so the
+    /// raw sequence is never forwarded to a terminal that must not switch.
+    Alt,
+    /// RIS (`ESC c`): a full reset, which on a real terminal also returns
+    /// to the primary screen and resets shared modes.
+    Reset,
+}
+
 #[derive(Debug)]
 pub struct Terminal {
     parser: Parser,
@@ -121,6 +136,8 @@ pub struct Terminal {
     pub(crate) last_notification: Option<String>,
     pub(crate) pointer_shape: String,
     pub(crate) last_printed: Option<char>,
+    /// Pending screen-switch event; taken via `take_screen_switch`.
+    screen_switch: Option<ScreenSwitch>,
 }
 
 impl Terminal {
@@ -170,6 +187,7 @@ impl Terminal {
             last_notification: None,
             pointer_shape: String::new(),
             last_printed: None,
+            screen_switch: None,
         }
     }
 
@@ -633,6 +651,7 @@ impl Terminal {
     }
 
     pub(crate) fn full_reset(&mut self) {
+        self.screen_switch = Some(ScreenSwitch::Reset);
         let (rows, cols) = (self.rows(), self.cols());
         self.alt_active = false;
         self.primary.clear_grid(Style::default());
@@ -716,6 +735,10 @@ impl Terminal {
 
     /// Alt-screen switching for modes 47 / 1047 / 1049.
     pub(crate) fn set_alt_screen(&mut self, mode: u16, on: bool) {
+        // Reported even when nothing flips: the raw sequence still must not
+        // reach a terminal that pins a single screen (real terminals diverge
+        // on what a redundant 1049h does).
+        self.screen_switch = Some(ScreenSwitch::Alt);
         if on && !self.alt_active {
             if mode == 1049 {
                 self.save_cursor();
@@ -855,6 +878,24 @@ impl Terminal {
 
     pub fn is_alt_screen(&self) -> bool {
         self.alt_active
+    }
+
+    /// Takes the pending [`ScreenSwitch`] event recorded by the last
+    /// processed bytes (alt-screen DECSET/DECRST or RIS). A consumer that
+    /// forwards the raw byte stream to a real terminal it must keep on a
+    /// single screen checks this after feeding each byte: when set, the
+    /// sequence that completed on that byte must be withheld and replaced
+    /// with a repaint (see [`Terminal::dump_screen_switch`]).
+    pub fn take_screen_switch(&mut self) -> Option<ScreenSwitch> {
+        self.screen_switch.take()
+    }
+
+    /// True while the parser is inside an ESC or CSI sequence — i.e. bytes
+    /// fed so far could still complete into a screen switch and are not yet
+    /// safe to forward raw. Ground state and string payloads (OSC/DCS/APC)
+    /// return false; those can never dispatch a switch.
+    pub fn mid_escape(&self) -> bool {
+        self.parser.mid_escape()
     }
 
     pub fn mouse_mode(&self) -> MouseMode {

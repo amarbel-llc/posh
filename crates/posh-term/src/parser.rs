@@ -94,6 +94,21 @@ impl Parser {
         Parser::default()
     }
 
+    /// True in the ESC and CSI accumulation states — the only states from
+    /// which a screen-switch action (DECSET/DECRST 47/1047/1049, RIS) can
+    /// still dispatch. String states are excluded so their (potentially
+    /// huge) payloads never need to be withheld by a streaming consumer.
+    pub(crate) fn mid_escape(&self) -> bool {
+        matches!(
+            self.state,
+            State::Escape
+                | State::EscapeIntermediate
+                | State::CsiEntry
+                | State::CsiParam
+                | State::CsiIntermediate
+        )
+    }
+
     pub fn advance(&mut self, b: u8, out: &mut Vec<Action>) {
         match self.state {
             State::Ground => self.ground(b, out),

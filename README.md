@@ -97,12 +97,21 @@ posh history <name> [--vt]
 posh completions <bash|zsh|fish>
 ```
 
+Attaching takes over the outer terminal's alternate screen and detaching
+restores it, so the shell prompt you attached from comes back exactly as
+you left it (FDR 0002: `docs/features/`). The daemon virtualizes the
+session's own alt-screen switches and RIS in the broadcast — replaced
+with model-generated repaints — so full-screen apps inside the session
+can never flip the outer terminal off posh's screen. Session scrollback
+is reached via `posh history` (the outer terminal's native scrollback
+stays the shell's own).
+
 Daemon-per-session over Unix sockets with zmx's binary IPC framing (1-byte
 tag + u32 LE length; Input/Output/Resize/Detach/DetachAll/Kill/Info/Init/
 History/Run/Ack/Exit — Exit carries the shell's status so an attached
 client exits with the session's real code). Each daemon feeds PTY output
 through a `posh_term::Terminal`
-so re-attaching clients receive a full state replay via `dump_vt()`. Session
+so re-attaching clients receive a full state replay via `dump_vt_flat()`. Session
 groups via `-g/--group` or `POSH_GROUP`; socket directory resolution:
 `POSH_DIR` > `XDG_RUNTIME_DIR/posh` > `TMPDIR/posh-{uid}` > `/tmp/posh-{uid}`.
 Sessions export `POSH_SESSION`/`POSH_GROUP`.
@@ -138,7 +147,9 @@ authenticated datagram (late reorders never re-target the stream). State sync se
 prefix/suffix diff against the last acked frame); user input is delivered
 reliably via cumulative offsets and retransmission.
 
-The client renders mosh-style: it maintains a local `posh_term::Terminal`,
+The client takes over the alternate screen for the whole connection
+(mosh's smcup/rmcup) and restores the pre-connect shell screen on exit
+and around suspend. It renders mosh-style: it maintains a local `posh_term::Terminal`,
 morphs the real tty with minimal per-cell diffs (a port of
 `terminaldisplay.cc`), and runs a faithful port of mosh's prediction engine
 (`terminaloverlay.cc`): speculative local echo with epochs, confirmation

@@ -48,6 +48,9 @@ pub fn run(host: &str, port: u16, family: Family) -> Result<()> {
     let conn = Connection::client(addr, &key)?;
 
     let raw = RawMode::enable(STDIN)?;
+    // Take over the alternate screen (mosh smcup); close() below restores
+    // the user's pre-connect shell screen on the way out.
+    let _ = util::write_all_retry(STDOUT, display::open(), 1000);
     let result = client_loop(conn, prediction, predict_overwrite, &raw, addr.port());
     let _ = util::write_all_retry(STDOUT, display::close(), 1000);
     drop(raw);
@@ -307,8 +310,10 @@ fn suspend(st: &mut ClientState, raw: &RawMode) {
     raw.restore();
     let _ = util::write_all_retry(STDOUT, b"\r\n\x1b[37;44m[posh is suspended.]\x1b[m\r\n", 1000);
     util::stop_own_pgroup();
-    // Execution resumes here after SIGCONT (fg).
+    // Execution resumes here after SIGCONT (fg): back onto the alternate
+    // screen before the forced repaint below redraws it.
     raw.reapply();
+    let _ = util::write_all_retry(STDOUT, display::open(), 1000);
     st.predict.reset();
     st.initialized = false;
 }

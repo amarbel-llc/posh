@@ -2,8 +2,8 @@
 //! through the public API.
 
 use posh_term::{
-    Color, Cursor, CursorShape, KittyFlags, MouseMode, MouseProtocol, SemanticMark, Style,
-    Terminal, UnderlineStyle,
+    Color, Cursor, CursorShape, KittyFlags, MouseMode, MouseProtocol, ScreenSwitch, SemanticMark,
+    Style, Terminal, UnderlineStyle,
 };
 
 fn term() -> Terminal {
@@ -1092,6 +1092,129 @@ fn dump_vt_roundtrip_full_session() {
     assert_state_equal(&t, &t2);
     assert_eq!(t.dump_text(), t2.dump_text());
     assert_eq!(t2.pwd(), "/home/user");
+}
+
+// --- screen-switch detection & single-screen dumps (terminal takeover) ------
+
+#[test]
+fn take_screen_switch_reports_alt_and_reset() {
+    let mut t = term();
+    assert_eq!(t.take_screen_switch(), None);
+    feed(&mut t, "\x1b[?1049h");
+    assert_eq!(t.take_screen_switch(), Some(ScreenSwitch::Alt));
+    assert_eq!(t.take_screen_switch(), None); // taken
+    // Redundant re-entry still reports: the raw bytes must be withheld
+    // from a single-screen target either way.
+    feed(&mut t, "\x1b[?1049h");
+    assert_eq!(t.take_screen_switch(), Some(ScreenSwitch::Alt));
+    feed(&mut t, "\x1b[?1047l");
+    assert_eq!(t.take_screen_switch(), Some(ScreenSwitch::Alt));
+    feed(&mut t, "\x1b[?47h");
+    assert_eq!(t.take_screen_switch(), Some(ScreenSwitch::Alt));
+    feed(&mut t, "\x1bc");
+    assert_eq!(t.take_screen_switch(), Some(ScreenSwitch::Reset));
+}
+
+#[test]
+fn screen_switch_not_reported_for_queries_or_other_modes() {
+    let mut t = term();
+    // DECRQM mentions 1049 but switches nothing.
+    feed(&mut t, "\x1b[?1049$p");
+    assert_eq!(t.take_screen_switch(), None);
+    feed(&mut t, "\x1b[?2004h\x1b[?1000h\x1b[!p");
+    assert_eq!(t.take_screen_switch(), None);
+}
+
+#[test]
+fn mid_escape_tracks_esc_and_csi_but_not_strings() {
+    let mut t = term();
+    t.process(b"\x1b");
+    assert!(t.mid_escape());
+    t.process(b"[?10");
+    assert!(t.mid_escape());
+    t.process(b"49h");
+    assert!(!t.mid_escape());
+    // String payloads are not held: only their introducing ESC is.
+    t.process(b"\x1b]2;tit");
+    assert!(!t.mid_escape());
+    t.process(b"le\x07");
+    assert!(!t.mid_escape());
+}
+
+#[test]
+fn dump_vt_flat_never_switches_screens() {
+    let mut t = term();
+    feed(&mut t, "primary\x1b[?1049halt text\x1b[2;2H");
+    let flat = t.dump_vt_flat();
+    let s = String::from_utf8(flat.clone()).unwrap();
+    assert!(!s.contains("\x1b[?1049"), "flat dump must not switch: {s:?}");
+    // A fresh terminal fed the flat dump shows the active (alt) grid and
+    // cursor on its single screen.
+    let mut v = Terminal::new(t.rows(), t.cols());
+    v.process(&flat);
+    assert_grids_equal(&t, &v);
+    assert_eq!(pos(&t), pos(&v));
+    assert!(!v.is_alt_screen());
+}
+
+#[test]
+fn dump_vt_flat_draws_grid_without_scrollback_replay() {
+    let mut t = term();
+    for i in 0..9 {
+        feed(&mut t, &format!("line {i}\r\n"));
+    }
+    let mut v = Terminal::new(t.rows(), t.cols());
+    v.process(&t.dump_vt_flat());
+    assert_grids_equal(&t, &v);
+    assert_eq!(pos(&t), pos(&v));
+    assert_eq!(v.screen().scrollback_len(), 0);
+}
+
+#[test]
+fn dump_screen_switch_repaints_active_screen_in_place() {
+    // `outer` plays the attached client's real terminal: it mirrored the
+    // session byte for byte up to the switch, which it receives as the
+    // substitute repaint instead of the raw 1049.
+    let mut session = term();
+    let mut outer = term();
+    let before = "primary one\r\ntwo\x1b[1;3H";
+    feed(&mut session, before);
+    feed(&mut outer, before);
+
+    feed(&mut session, "\x1b[?1049h");
+    outer.process(&session.dump_screen_switch());
+    // Post-switch drawing passes through raw again.
+    feed(&mut session, "ALT");
+    feed(&mut outer, "ALT");
+    assert_grids_equal(&session, &outer);
+    assert_eq!(pos(&session), pos(&outer));
+    assert!(!outer.is_alt_screen(), "outer must never switch buffers");
+
+    // Leaving the alt screen restores the primary content and the
+    // 1049-saved cursor, again without the outer switching.
+    feed(&mut session, "\x1b[?1049l");
+    outer.process(&session.dump_screen_switch());
+    assert_grids_equal(&session, &outer);
+    assert_eq!(pos(&session), pos(&outer));
+    assert!(!outer.is_alt_screen());
+}
+
+#[test]
+fn dump_screen_switch_restores_region_and_modes_it_normalizes() {
+    let mut session = Terminal::new(6, 20);
+    let mut outer = Terminal::new(6, 20);
+    // Scroll region + origin mode + autowrap off, kept in sync raw.
+    let before = "\x1b[2;4r\x1b[?6h\x1b[?7lcontent";
+    feed(&mut session, before);
+    feed(&mut outer, before);
+    feed(&mut session, "\x1b[?1049h");
+    outer.process(&session.dump_screen_switch());
+    assert_eq!(session.scroll_region(), outer.scroll_region());
+    // Both must interpret origin-relative addressing identically after.
+    feed(&mut session, "\x1b[1;1HY");
+    feed(&mut outer, "\x1b[1;1HY");
+    assert_grids_equal(&session, &outer);
+    assert_eq!(pos(&session), pos(&outer));
 }
 
 // --- misc public surface -----------------------------------------------------------------

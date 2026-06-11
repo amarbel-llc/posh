@@ -13,12 +13,22 @@ use crate::util::{self, Error, Result};
 const STDIN: i32 = libc::STDIN_FILENO;
 const STDOUT: i32 = libc::STDOUT_FILENO;
 
+/// Takeover sequence written on attach: the whole attach lives on the
+/// outer terminal's alternate screen, so detach can put the user's shell
+/// back exactly as it was — prompt, scrollback, and all. 1049h saves the
+/// cursor and switches; the explicit clear covers terminals whose alt
+/// buffer isn't cleared on entry. The daemon virtualizes the inner
+/// application's own 1049 switches so the outer terminal never leaves
+/// this screen mid-attach.
+const ENTER_SEQ: &[u8] = b"\x1b[?1049h\x1b[2J\x1b[H";
+
 /// Reset sequence written on detach: disable mouse reporting (1000/1002/
 /// 1003/1006), alternate scroll (1007), bracketed paste (2004), focus
-/// events (1004), alt screen (1049), and re-show the cursor. The screen is
-/// intentionally not cleared.
+/// events (1004), reset the pen, then leave the alternate screen —
+/// restoring the user's pre-attach screen and cursor — and re-show the
+/// cursor.
 const RESTORE_SEQ: &[u8] =
-    b"\x1b[?1000l\x1b[?1002l\x1b[?1003l\x1b[?1006l\x1b[?1007l\x1b[?2004l\x1b[?1004l\x1b[?1049l\x1b[?25h";
+    b"\x1b[?1000l\x1b[?1002l\x1b[?1003l\x1b[?1006l\x1b[?1007l\x1b[?2004l\x1b[?1004l\x1b[0m\x1b[?1049l\x1b[?25h";
 
 pub fn cmd_attach(
     cfg: &Config,
@@ -47,8 +57,9 @@ pub fn cmd_attach(
         .map_err(|e| Error(format!("connect {}: {e}", path.display())))?;
 
     let raw = RawMode::enable(STDIN)?;
-    // Clean slate before the daemon replays the session state.
-    let _ = util::write_fd(STDOUT, b"\x1b[2J\x1b[H");
+    // Take over the alternate screen before the daemon replays the
+    // session state; the user's shell screen waits underneath.
+    let _ = util::write_fd(STDOUT, ENTER_SEQ);
     let result = client_loop(stream);
     let _ = util::write_fd(STDOUT, RESTORE_SEQ);
     drop(raw);
@@ -173,8 +184,11 @@ fn client_loop(stream: UnixStream) -> Result<i32> {
         }
 
         if util::take_flag(&util::SIGCONT_RECEIVED) {
-            // Resumed after SIGSTOP/fg: re-Init so the daemon replays the
-            // screen (and picks up any size change while stopped).
+            // Resumed after SIGSTOP/fg: the outer terminal may have left
+            // our alternate screen while we were stopped, so re-enter it,
+            // then re-Init so the daemon replays the screen (and picks up
+            // any size change while stopped).
+            let _ = util::write_fd(STDOUT, ENTER_SEQ);
             let (rows, cols) = pty::term_size(STDOUT);
             ipc::append_frame(
                 &mut sock_write_buf,

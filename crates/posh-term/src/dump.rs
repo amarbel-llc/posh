@@ -133,6 +133,20 @@ impl Terminal {
     /// attributes, cursor, modes, title, scroll region) on a fresh
     /// terminal of the same size.
     pub fn dump_vt(&self) -> Vec<u8> {
+        self.dump_vt_impl(false)
+    }
+
+    /// Like [`Terminal::dump_vt`] but single-screen: draws only the active
+    /// grid and never switches the target's screen buffers (no scrollback
+    /// replay, no 1049 enter/exit, no inactive-screen kitty seeding). For
+    /// attach clients that pin the outer terminal to its own alternate
+    /// screen, where the target's primary buffer belongs to the user's
+    /// shell. Assumes a fresh, cleared target screen like `dump_vt`.
+    pub fn dump_vt_flat(&self) -> Vec<u8> {
+        self.dump_vt_impl(true)
+    }
+
+    fn dump_vt_impl(&self, flat: bool) -> Vec<u8> {
         let mut out = String::new();
         let mut st = EmitState {
             style: Style::default(),
@@ -161,12 +175,22 @@ impl Terminal {
         // primary is active, briefly enter the alt screen — which does not
         // reset the kitty stack — to replay its pushes, then return so the
         // app finds the right flags after a later `?1049h`.
-        if !self.alt_active && !self.kitty_alt.entries().is_empty() {
+        if !flat && !self.alt_active && !self.kitty_alt.entries().is_empty() {
             out.push_str("\x1b[?1049h");
             for &f in self.kitty_alt.entries() {
                 let _ = write!(out, "\x1b[>{f}u");
             }
             out.push_str("\x1b[?1049l");
+        }
+
+        if flat {
+            // Single-screen target: just the active grid from home.
+            out.push_str("\x1b[H");
+            self.draw_grid(&mut out, self.scr(), &mut st);
+            self.dump_graphics(&mut out);
+            self.dump_modes(&mut out);
+            self.dump_cursor(&mut out, &mut st);
+            return out.into_bytes();
         }
 
         // Primary screen. With scrollback, replay it and the visible grid
@@ -227,6 +251,69 @@ impl Terminal {
         out.into_bytes()
     }
 
+    /// Escape stream that morphs a mode-synced terminal showing the
+    /// previously active screen into one showing the newly active screen,
+    /// without ever switching the target's own buffers.
+    ///
+    /// The session daemon substitutes this for the application's own
+    /// alt-screen switches (DECSET/DECRST 47/1047/1049, RIS) in the raw
+    /// attach broadcast: clients pin the outer terminal to its alternate
+    /// screen, so the inner switch has to repaint in place. Everything the
+    /// raw passthrough keeps in sync (shared modes, colors, title) is left
+    /// alone; only screen content, the cursor, and drawing-relevant modes
+    /// that the repaint itself must normalize (region, origin, charsets,
+    /// insert, autowrap) are emitted.
+    pub fn dump_screen_switch(&self) -> Vec<u8> {
+        let mut out = String::new();
+        let mut st = EmitState {
+            style: Style::default(),
+            hyperlink: 0,
+        };
+        // Hide the cursor for the repaint, and normalize the target to a
+        // drawable state: full-screen region, absolute addressing, ASCII
+        // G0 shifted in, replace mode, autowrap on (draw_grid regenerates
+        // soft-wrap flags by autowrapping), default pen, no open link.
+        out.push_str("\x1b[?25l\x1b[r\x1b[?6l\x1b(B\x0f\x1b[4l\x1b[?7h\x1b[0m\x1b[0\"q\x1b]8;;\x1b\\");
+        out.push_str("\x1b[2J\x1b[H");
+        self.draw_grid(&mut out, self.scr(), &mut st);
+        // Re-assert what normalization may have pushed away from the model.
+        let (top, bot) = self.region();
+        if top != 0 || bot != self.rows() - 1 {
+            let _ = write!(out, "\x1b[{};{}r", top + 1, bot + 1);
+        }
+        if self.modes.origin {
+            out.push_str("\x1b[?6h");
+        }
+        match self.cursor.g0 {
+            Charset::DecSpecial => out.push_str("\x1b(0"),
+            Charset::Uk => out.push_str("\x1b(A"),
+            Charset::Ascii => {}
+        }
+        match self.cursor.g1 {
+            Charset::DecSpecial => out.push_str("\x1b)0"),
+            Charset::Uk => out.push_str("\x1b)A"),
+            Charset::Ascii => {}
+        }
+        if self.cursor.shift == 1 {
+            out.push('\x0e');
+        }
+        if self.modes.insert {
+            out.push_str("\x1b[4h");
+        }
+        if !self.modes.autowrap {
+            out.push_str("\x1b[?7l");
+        }
+        // The clear deleted any visible kitty placements on the target;
+        // re-place from the model (image data already lives in the target
+        // from the original raw transmission).
+        self.dump_placements(&mut out);
+        self.dump_cursor(&mut out, &mut st);
+        if self.modes.cursor_visible {
+            out.push_str("\x1b[?25h");
+        }
+        out.into_bytes()
+    }
+
     /// Replays kitty graphics: stored images as (chunked) APC
     /// transmissions, animation frames and play state, then placements.
     /// Absolute placements are anchored by cursor positioning; relative
@@ -276,6 +363,12 @@ impl Terminal {
                 );
             }
         }
+        self.dump_placements(out);
+    }
+
+    /// Replays kitty graphics placements only (cheap `a=p` references to
+    /// image ids the target already stores), without re-transmitting data.
+    fn dump_placements(&self, out: &mut String) {
         for p in self.graphics.placements() {
             // A relative placement whose parent has since vanished (quota
             // eviction) would be rejected on replay; anchor it absolutely

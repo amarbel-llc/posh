@@ -30,7 +30,15 @@ $P kill demo
 ```
 
 - [ ] Detach returns you to your shell cleanly (no raw-mode garbage).
+- [ ] Takeover/restore (FDR 0002): attach from a prompt with visible
+      history; after detach the *pre-attach* screen is back — old prompt,
+      old output, cursor on the shell line. Same after session exit.
 - [ ] Reattach replays the screen: prior output, cursor position, modes.
+- [ ] Inside the session: open `vim`, quit it → session shell screen
+      repaints in place; then detach → original outer screen restored
+      (the inner alt-screen cycle must not leak to the outer terminal).
+- [ ] Inside the session: run `reset` (RIS) → session screen resets but
+      the outer terminal stays on posh's screen; detach still restores.
 - [ ] `posh list` counts clients correctly before/after.
 - [ ] Exit status: `$P attach ec sh -c 'exit 7'; echo $?` prints 7 (#18).
 
@@ -56,6 +64,9 @@ POSH_KEY=<key> $P client 127.0.0.1 <port>
 ```
 
 - [ ] Interactive shell works; quit sequence `Ctrl-^` then `.` exits clean.
+- [ ] Quit restores the pre-connect shell screen (FDR 0002); the
+      `posh: [client exited]` notice prints on it. `Ctrl-^ Ctrl-Z` suspend
+      shows the shell screen, `fg` returns to the session repainted.
 - [ ] SIGTERM the client from another terminal → clean exit **and** the
       server winds down (`pgrep -f 'posh server'` goes empty) instead of
       lingering until the 60s peer timeout.

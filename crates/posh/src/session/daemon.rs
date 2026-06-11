@@ -5,7 +5,7 @@ use std::io::Write;
 use std::os::fd::{AsRawFd, RawFd};
 use std::os::unix::net::{UnixListener, UnixStream};
 
-use posh_term::Terminal;
+use posh_term::{ScreenSwitch, Terminal};
 
 use crate::pty::{self, PtyChild};
 use crate::session::ipc::{self, FrameBuffer, SessionInfo, Tag};
@@ -75,6 +75,114 @@ struct ClientConn {
 impl ClientConn {
     fn queue(&mut self, tag: Tag, payload: &[u8]) {
         ipc::append_frame(&mut self.write_buf, tag, payload);
+    }
+}
+
+/// Substituted for RIS in the broadcast: the model performed a full reset,
+/// so push the outer terminal's shared modes back to defaults without
+/// letting it leave the alternate screen the client pinned it to (a raw
+/// RIS would switch the outer terminal to its primary buffer — the user's
+/// shell — and clear it). DECSTR covers cursor/charsets/SGR/region/keypad
+/// and the kitty key stack; the explicit resets cover what DECSTR leaves
+/// (mouse, paste, focus, alternate scroll, cursor blink/visibility,
+/// DECCKM/reverse-video/autorepeat/LNM/insert, a pending synchronized
+/// update, dynamic colors). A repaint of the (now empty) model screen
+/// follows from the caller.
+const RIS_SUBSTITUTE: &[u8] = b"\x1b[!p\
+    \x1b[?1000l\x1b[?1002l\x1b[?1003l\x1b[?9l\x1b[?1005l\x1b[?1006l\x1b[?1016l\
+    \x1b[?2004l\x1b[?1004l\x1b[?1007l\x1b[?12l\x1b[?25h\x1b[?1l\x1b[?5l\x1b[?8h\
+    \x1b[?2026l\x1b>\x1b[20l\x1b[4l\x1b]104\x07\x1b]110\x07\x1b]111\x07\x1b]112\x07";
+
+/// Rebuilds a DECSET/DECRST sequence with the alt-screen modes (47/1047/
+/// 1049) stripped, so co-set modes still reach the outer terminal (e.g.
+/// `CSI ? 1049 ; 2004 h` forwards as `CSI ? 2004 h`). Returns None when
+/// nothing remains or the held bytes aren't the plain `ESC [ ? params h/l`
+/// shape (interleaved C0s, C1 CSI restarts); dropping the sequence whole
+/// is safe because the model-faithful repaint follows either way.
+fn strip_alt_screen_params(seq: &[u8]) -> Option<Vec<u8>> {
+    let body = seq.strip_prefix(b"\x1b[?")?;
+    let (&final_byte, params) = body.split_last()?;
+    if !matches!(final_byte, b'h' | b'l') {
+        return None;
+    }
+    let mut kept: Vec<&[u8]> = Vec::new();
+    for part in params.split(|&b| b == b';') {
+        if !part.iter().all(u8::is_ascii_digit) {
+            return None;
+        }
+        // Match numerically so leading zeros ("0047") can't sneak through.
+        let n: u32 = std::str::from_utf8(part).ok()?.parse().unwrap_or(0);
+        if !matches!(n, 47 | 1047 | 1049) {
+            kept.push(part);
+        }
+    }
+    if kept.is_empty() {
+        return None;
+    }
+    let mut out = b"\x1b[?".to_vec();
+    out.extend_from_slice(&kept.join(&b';'));
+    out.push(final_byte);
+    Some(out)
+}
+
+/// Virtualizes the application's screen switches in the raw output
+/// broadcast.
+///
+/// Attached clients hold the outer terminal on ITS alternate screen for
+/// the whole attach, so detach can restore the user's shell exactly as it
+/// was. The inner application's own switch sequences (DECSET/DECRST
+/// 47/1047/1049) and RIS must therefore never reach the outer terminal
+/// raw: each is excised from the stream and replaced with a repaint of the
+/// newly active screen generated from the daemon's terminal model.
+///
+/// Bytes are held back while the parser is mid-escape/CSI (the only states
+/// that can complete into a switch), which also keeps sequences split
+/// across PTY reads from being forwarded in halves.
+#[derive(Default)]
+struct ScreenSwitchFilter {
+    held: Vec<u8>,
+}
+
+/// Cap on bytes held back mid-sequence; see the flush in `feed`.
+const MAX_HELD: usize = 4096;
+
+impl ScreenSwitchFilter {
+    /// Feeds one PTY chunk through the model and appends the broadcast
+    /// bytes (raw passthrough with switches substituted) to `out`.
+    fn feed(&mut self, term: &mut Terminal, chunk: &[u8], out: &mut Vec<u8>) {
+        // Fast path: nothing held, parser at rest, and no byte that could
+        // begin an escape sequence (0x1b, or 0x9b as a raw C1 CSI).
+        if self.held.is_empty()
+            && !term.mid_escape()
+            && !chunk.iter().any(|&b| b == 0x1b || b == 0x9b)
+        {
+            term.process(chunk);
+            out.extend_from_slice(chunk);
+            return;
+        }
+        for &b in chunk {
+            self.held.push(b);
+            term.process(&[b]);
+            if let Some(kind) = term.take_screen_switch() {
+                let seq = std::mem::take(&mut self.held);
+                match kind {
+                    ScreenSwitch::Reset => out.extend_from_slice(RIS_SUBSTITUTE),
+                    ScreenSwitch::Alt => {
+                        if let Some(rest) = strip_alt_screen_params(&seq) {
+                            out.extend_from_slice(&rest);
+                        }
+                    }
+                }
+                out.extend_from_slice(&term.dump_screen_switch());
+            } else if !term.mid_escape() {
+                out.append(&mut self.held);
+            } else if self.held.len() > MAX_HELD {
+                // A real switch sequence is ~10 bytes; an escape this long
+                // is garbage that can't be excised later anyway. Flush it
+                // so a malicious stream can't grow the hold buffer.
+                out.append(&mut self.held);
+            }
+        }
     }
 }
 
@@ -182,6 +290,7 @@ fn daemon_loop(
     let listener_fd = listener.as_raw_fd();
     let pty_fd = child.master;
     let mut has_pty_output = false;
+    let mut filter = ScreenSwitchFilter::default();
     let err_events = libc::POLLHUP | libc::POLLERR | libc::POLLNVAL;
 
     'daemon: loop {
@@ -251,7 +360,9 @@ fn daemon_loop(
         }
 
         // PTY output: feed the terminal model, return any query replies to
-        // the application, and broadcast raw bytes to all clients.
+        // the application, and broadcast the bytes to all clients — raw,
+        // except that screen switches are virtualized (clients pin the
+        // outer terminal to its alternate screen for the whole attach).
         if fds[1].revents & (libc::POLLIN | err_events) != 0 {
             let mut buf = [0u8; 4096];
             match util::read_fd(pty_fd, &mut buf) {
@@ -260,7 +371,8 @@ fn daemon_loop(
                     break;
                 }
                 Ok(n) => {
-                    term.process(&buf[..n]);
+                    let mut bcast = Vec::with_capacity(n);
+                    filter.feed(term, &buf[..n], &mut bcast);
                     // The model answers the app's queries (DA/DSR/kitty/...)
                     // only when no real terminal is attached. When clients are
                     // present, their terminals answer and the answers return
@@ -272,8 +384,10 @@ fn daemon_loop(
                         let _ = util::write_all_retry(pty_fd, &responses, 100);
                     }
                     has_pty_output = true;
-                    for c in clients.iter_mut() {
-                        c.queue(Tag::Output, &buf[..n]);
+                    if !bcast.is_empty() {
+                        for c in clients.iter_mut() {
+                            c.queue(Tag::Output, &bcast);
+                        }
                     }
                 }
                 Err(e)
@@ -415,10 +529,161 @@ fn daemon_loop(
             }
             // Replay after the resize so the dump reflects the client's size.
             // Skip if the client was removed this iteration. github #16.
+            // Flat dump: the client pinned the outer terminal to its alt
+            // screen, so the replay must never switch the outer's buffers
+            // (the outer primary belongs to the user's shell). Session
+            // scrollback stays reachable via `posh history`.
             if needs_replay && !remove && i < clients.len() {
-                let dump = term.dump_vt();
+                let dump = term.dump_vt_flat();
                 clients[i].queue(Tag::Output, &dump);
             }
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn new_term() -> Terminal {
+        Terminal::with_scrollback(5, 20, 100)
+    }
+
+    /// Feeds chunks through a fresh filter+model, returning the broadcast.
+    fn run_filter(term: &mut Terminal, chunks: &[&[u8]]) -> Vec<u8> {
+        let mut filter = ScreenSwitchFilter::default();
+        let mut out = Vec::new();
+        for chunk in chunks {
+            filter.feed(term, chunk, &mut out);
+        }
+        out
+    }
+
+    fn row_text(t: &Terminal, r: u16) -> String {
+        t.screen().row(r).unwrap().text(true)
+    }
+
+    fn assert_mirrors(session: &Terminal, outer: &Terminal) {
+        for r in 0..session.rows() {
+            assert_eq!(
+                row_text(session, r),
+                row_text(outer, r),
+                "row {r} diverged"
+            );
+        }
+        assert_eq!(session.cursor().row, outer.cursor().row, "cursor row");
+        assert_eq!(session.cursor().col, outer.cursor().col, "cursor col");
+    }
+
+    #[test]
+    fn passthrough_without_switches_is_byte_identical() {
+        let mut term = new_term();
+        let input: &[u8] = b"hello \x1b[31mred\x1b[0m\r\n\x1b]2;title\x07done";
+        let out = run_filter(&mut term, &[input]);
+        assert_eq!(out, input);
+    }
+
+    #[test]
+    fn fast_path_plain_text_is_byte_identical() {
+        let mut term = new_term();
+        let input: &[u8] = b"no escapes at all, just text\r\n";
+        let out = run_filter(&mut term, &[input]);
+        assert_eq!(out, input);
+    }
+
+    #[test]
+    fn alt_switch_is_excised_and_substituted() {
+        let mut term = new_term();
+        let out = run_filter(&mut term, &[b"abc\x1b[?1049hdef"]);
+        let s = String::from_utf8_lossy(&out);
+        assert!(s.starts_with("abc"), "{s:?}");
+        assert!(s.ends_with("def"), "{s:?}");
+        assert!(!s.contains("\x1b[?1049"), "raw switch leaked: {s:?}");
+        assert!(s.contains("\x1b[2J"), "no repaint substitute: {s:?}");
+    }
+
+    #[test]
+    fn switch_split_across_reads_is_still_excised() {
+        let mut term = new_term();
+        let out = run_filter(&mut term, &[b"x\x1b[?10", b"49h", b"y"]);
+        let s = String::from_utf8_lossy(&out);
+        assert!(!s.contains("\x1b[?1049"), "raw switch leaked: {s:?}");
+        assert!(s.starts_with('x') && s.ends_with('y'), "{s:?}");
+    }
+
+    #[test]
+    fn co_set_modes_survive_the_strip() {
+        let mut term = new_term();
+        let out = run_filter(&mut term, &[b"\x1b[?1049;2004h"]);
+        let s = String::from_utf8_lossy(&out);
+        assert!(s.contains("\x1b[?2004h"), "co-set mode lost: {s:?}");
+        assert!(!s.contains("1049"), "{s:?}");
+    }
+
+    #[test]
+    fn non_switch_private_modes_pass_raw() {
+        let mut term = new_term();
+        let out = run_filter(&mut term, &[b"\x1b[?2004h\x1b[?1000h\x1b[?1049$p"]);
+        assert_eq!(out, b"\x1b[?2004h\x1b[?1000h\x1b[?1049$p");
+    }
+
+    #[test]
+    fn outer_terminal_mirrors_session_through_a_vim_cycle() {
+        // `outer` is the attached client's real terminal: it receives the
+        // filtered broadcast and must show the same screen as the session
+        // model at every step, without ever switching its own buffers.
+        let mut session = new_term();
+        let mut outer = new_term();
+        let mut filter = ScreenSwitchFilter::default();
+        let mut play = |session: &mut Terminal, outer: &mut Terminal, bytes: &[u8]| {
+            let mut filter_out = Vec::new();
+            filter.feed(session, bytes, &mut filter_out);
+            outer.process(&filter_out);
+        };
+        play(&mut session, &mut outer, b"$ ls\r\nfile.txt\r\n$ vim\x1b[1;7H");
+        assert_mirrors(&session, &outer);
+        play(
+            &mut session,
+            &mut outer,
+            b"\x1b[?1049h\x1b[2J\x1b[H~ VIM ~\x1b[2;1H\x1b[?2004h",
+        );
+        assert_mirrors(&session, &outer);
+        assert!(session.is_alt_screen());
+        assert!(!outer.is_alt_screen(), "outer must never switch buffers");
+        play(&mut session, &mut outer, b"\x1b[?2004l\x1b[?1049l");
+        assert_mirrors(&session, &outer);
+        assert!(!outer.is_alt_screen());
+        assert_eq!(row_text(&outer, 0), "$ ls");
+        assert_eq!(row_text(&outer, 1), "file.txt");
+    }
+
+    #[test]
+    fn ris_is_substituted_with_reset_preamble() {
+        let mut term = new_term();
+        let out = run_filter(&mut term, &[b"junk\x1bcafter"]);
+        let s = String::from_utf8_lossy(&out);
+        assert!(!s.contains("\x1bc"), "raw RIS leaked: {s:?}");
+        assert!(s.contains("\x1b[!p"), "no soft reset in substitute: {s:?}");
+        assert!(s.contains("\x1b[2J"), "no repaint after reset: {s:?}");
+        assert!(s.ends_with("after"), "{s:?}");
+    }
+
+    #[test]
+    fn strip_alt_screen_params_shapes() {
+        assert_eq!(strip_alt_screen_params(b"\x1b[?1049h"), None);
+        assert_eq!(strip_alt_screen_params(b"\x1b[?47l"), None);
+        // Leading zeros still match numerically.
+        assert_eq!(strip_alt_screen_params(b"\x1b[?0047h"), None);
+        assert_eq!(
+            strip_alt_screen_params(b"\x1b[?1049;2004h").as_deref(),
+            Some(b"\x1b[?2004h".as_slice())
+        );
+        assert_eq!(
+            strip_alt_screen_params(b"\x1b[?2004;1049;1000l").as_deref(),
+            Some(b"\x1b[?2004;1000l".as_slice())
+        );
+        // Unexpected shapes are dropped whole (the repaint follows anyway).
+        assert_eq!(strip_alt_screen_params(b"\x1b[?10\x0749h"), None);
+        assert_eq!(strip_alt_screen_params(b"\x1bc"), None);
     }
 }

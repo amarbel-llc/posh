@@ -26,6 +26,13 @@
 //! - `Terminal::generation(&self) -> u64` (bumped on every visible change)
 //! - `Terminal::dump_vt(&self) -> Vec<u8>` (escape stream that reconstructs
 //!   the screen, including attributes, cursor, and modes, on a real terminal)
+//! - `Terminal::dump_vt_flat(&self) -> Vec<u8>` (single-screen variant: active
+//!   grid only, never switches the target's buffers)
+//! - `Terminal::dump_screen_switch(&self) -> Vec<u8>` (in-place repaint that
+//!   substitutes an application screen switch on a single-screen target)
+//! - `Terminal::take_screen_switch(&mut self) -> Option<ScreenSwitch>` /
+//!   `Terminal::mid_escape(&self) -> bool` (switch detection for raw-stream
+//!   forwarders)
 //! - `Terminal::dump_text(&self) -> String` (plain text, scrollback included)
 //! - `Terminal::take_responses(&mut self) -> Vec<u8>` (DA/DSR/etc. replies)
 //! - `Terminal::screen(&self) -> &Screen` (cell-level read access)
@@ -61,5 +68,5 @@ pub use kitty_keys::{encode_key, KeyCode, KeyEvent, KeyEventType, KittyFlags, Mo
 pub use modes::{MouseMode, MouseProtocol};
 pub use mouse::{encode_mouse, MouseButton, MouseEvent, MouseEventKind};
 pub use screen::{Row, Screen, SemanticMark};
-pub use terminal::{Cursor, CursorShape, Terminal};
+pub use terminal::{Cursor, CursorShape, ScreenSwitch, Terminal};
 pub use wcwidth::wcwidth;

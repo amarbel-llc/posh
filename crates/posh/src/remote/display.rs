@@ -145,11 +145,24 @@ impl Snapshot {
     }
 }
 
+/// Takes over the outer terminal on startup (mosh Display::open's smcup):
+/// the whole connection lives on the alternate screen so close() can
+/// restore the user's shell exactly as it was. The renderer is fully
+/// model-driven, so the remote application's own alt-screen switches never
+/// reach the outer terminal raw. The explicit clear covers terminals whose
+/// alt buffer isn't cleared on entry.
+pub fn open() -> &'static [u8] {
+    b"\x1b[?1049h\x1b[2J\x1b[H"
+}
+
 /// Restores the outer terminal on exit (mosh Display::close): default pen,
-/// visible cursor, mouse/paste/focus modes off, scroll region reset.
+/// visible cursor, mouse/paste/focus modes off, scroll region reset, and
+/// finally back to the primary screen (rmcup) — the user's pre-connect
+/// shell, prompt and all.
 pub fn close() -> &'static [u8] {
     b"\x1b[0m\x1b[?25h\x1b[?1l\x1b>\x1b[?1003l\x1b[?1002l\x1b[?1000l\x1b[?9l\
-      \x1b[?1016l\x1b[?1006l\x1b[?1005l\x1b[?2004l\x1b[?1004l\x1b[?1007l\x1b[r"
+      \x1b[?1016l\x1b[?1006l\x1b[?1005l\x1b[?2004l\x1b[?1004l\x1b[?1007l\x1b[r\
+      \x1b[?1049l"
 }
 
 /// Escape-stream builder with cursor/pen bookkeeping (mosh FrameState).
@@ -1276,6 +1289,17 @@ mod tests {
         assert!(String::from_utf8_lossy(&diff_off).contains("\x1b[?1007l"));
 
         assert!(String::from_utf8_lossy(close()).contains("\x1b[?1007l"));
+    }
+
+    #[test]
+    fn open_takes_and_close_releases_the_alt_screen() {
+        let open_s = String::from_utf8_lossy(open());
+        assert!(open_s.starts_with("\x1b[?1049h"), "{open_s:?}");
+        let close_s = String::from_utf8_lossy(close());
+        // rmcup must come last so every mode reset lands before the screen
+        // flips back to the user's shell (cursor re-show aside, which is
+        // global across buffers).
+        assert!(close_s.ends_with("\x1b[?1049l"), "{close_s:?}");
     }
 
     #[test]
