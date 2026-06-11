@@ -15,9 +15,9 @@ fi
 host=$1
 shift
 
-# Ask the remote what to build for.
-kernel=$(ssh "$host" uname -s | tr '[:upper:]' '[:lower:]')
-machine=$(ssh "$host" uname -m)
+# Ask the remote what to build for (one ssh round-trip).
+read -r kernel machine < <(ssh "$host" uname -sm)
+kernel=$(tr '[:upper:]' '[:lower:]' <<<"$kernel")
 case $machine in
 x86_64) arch=amd64 ;;
 aarch64 | arm64) arch=arm64 ;;
@@ -35,14 +35,17 @@ echo ">> building posht for $kernel/$arch" >&2
 CGO_ENABLED=0 GOOS=$kernel GOARCH=$arch \
   go -C "$src" build -trimpath -ldflags='-s -w' -o "$bin" .
 
-echo ">> copying to $host:/tmp/posht" >&2
-scp -q "$bin" "$host:/tmp/posht"
+# Unique per-invocation path: a fixed /tmp/posht would clobber (and run)
+# another user's binary on a shared host.
+dest="/tmp/posht.$$"
+echo ">> copying to $host:$dest" >&2
+scp -q "$bin" "$host:$dest"
 
 # posh ssh runs the command over the roaming transport, which is the
 # pipeline posht is there to judge; fall back to ssh so the tool still
 # works for baseline (non-posh) runs.
 if command -v posh >/dev/null 2>&1; then
-  exec posh ssh "$host" -- /tmp/posht "$@"
+  exec posh ssh "$host" -- "$dest" "$@"
 else
-  exec ssh -t "$host" /tmp/posht "$@"
+  exec ssh -t "$host" "$dest" "$@"
 fi

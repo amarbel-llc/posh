@@ -41,7 +41,10 @@ func main() {
 		}
 		return
 	}
-	applyFilters(tests, *only, *skip)
+	if err := applyFilters(tests, *only, *skip); err != nil {
+		fmt.Fprintln(os.Stderr, "posht:", err)
+		os.Exit(64)
+	}
 
 	p := tea.NewProgram(newRoot(tests), tea.WithAltScreen())
 	res, err := p.Run()
@@ -67,21 +70,42 @@ func main() {
 	}
 }
 
-func applyFilters(tests []*Test, only, skip string) {
+func applyFilters(tests []*Test, only, skip string) error {
+	known := make(map[string]bool, len(tests))
+	for _, t := range tests {
+		known[t.ID] = true
+	}
 	if only != "" {
 		want := splitIDs(only)
+		// A typo'd ID must not silently select nothing and exit 0.
+		if err := checkIDs(want, known, "--only"); err != nil {
+			return err
+		}
 		for _, t := range tests {
 			t.Selected = want[t.ID]
 		}
 	}
 	if skip != "" {
 		drop := splitIDs(skip)
+		if err := checkIDs(drop, known, "--skip"); err != nil {
+			return err
+		}
 		for _, t := range tests {
 			if drop[t.ID] {
 				t.Selected = false
 			}
 		}
 	}
+	return nil
+}
+
+func checkIDs(ids, known map[string]bool, flagName string) error {
+	for id := range ids {
+		if !known[id] {
+			return fmt.Errorf("%s: unknown test id %q (see --list)", flagName, id)
+		}
+	}
+	return nil
 }
 
 func splitIDs(s string) map[string]bool {

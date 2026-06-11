@@ -106,3 +106,9 @@ update-nix:
 [group("debug")]
 debug-cargo *ARGS:
     nix develop --command cargo {{ ARGS }}
+
+# Run go against the posht tool via nixpkgs (no Go in the devShell yet —
+# posht is a standalone static TUI, see docs/posht.md / PR #38).
+[group("debug")]
+debug-go *ARGS:
+    nix shell nixpkgs#go --command bash -c 'cd posht && go {{ ARGS }}'

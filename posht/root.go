@@ -49,6 +49,11 @@ func (m *rootModel) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 		m.width, m.height = size.Width, size.Height
 	}
 	if key, ok := msg.(tea.KeyMsg); ok && key.Type == tea.KeyCtrlC {
+		// Restore any test-modified terminal state (cursor shape, title)
+		// on the way out — the framework only restores what it owns.
+		if clean := m.cleanupCmd(); clean != nil {
+			return m, tea.Sequence(clean, tea.Quit)
+		}
 		return m, tea.Quit
 	}
 	switch m.phase {
