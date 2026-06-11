@@ -198,10 +198,14 @@ fn attach_takes_over_and_restores_the_alt_screen() {
 
     let (master, slave) = open_pty_pair();
     let mut cmd = posh_cmd();
+    // No $TERM: the terminfo lookup falls back to the hardcoded 1049
+    // bracket, making the expected bytes machine-independent.
     cmd.args(["attach", "takeover", "sh", "-c", "read x; exit 0"])
         .env("POSH_DIR", &dir)
         .env_remove("POSH_SESSION")
-        .env_remove("POSH_GROUP");
+        .env_remove("POSH_GROUP")
+        .env_remove("TERM")
+        .env_remove("POSH_NO_TERM_INIT");
     let mut child = spawn_on_pty(&mut cmd, slave);
 
     let mut bytes = Vec::new();
@@ -238,6 +242,65 @@ fn attach_takes_over_and_restores_the_alt_screen() {
     assert!(
         bytes.ends_with(b"\x1b[?1049l\x1b[?25h"),
         "exit must end by leaving the alt screen, got {:?}",
+        String::from_utf8_lossy(&bytes[bytes.len().saturating_sub(48)..])
+    );
+
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+#[test]
+fn no_init_skips_the_alt_screen_takeover() {
+    // --no-init (mosh parity, also $POSH_NO_TERM_INIT): the attach stream
+    // must contain no alt-screen switch at all — historical clear-in-place
+    // behavior, mode resets still present at the end.
+    let dir = test_posh_dir("posh-noinit");
+
+    let (master, slave) = open_pty_pair();
+    let mut cmd = posh_cmd();
+    cmd.args(["--no-init", "attach", "noinit", "sh", "-c", "read x; exit 0"])
+        .env("POSH_DIR", &dir)
+        .env_remove("POSH_SESSION")
+        .env_remove("POSH_GROUP")
+        .env_remove("TERM");
+    let mut child = spawn_on_pty(&mut cmd, slave);
+
+    let mut bytes = Vec::new();
+    for _ in 0..400 {
+        if drain_into(master, &mut bytes) > 0 {
+            break;
+        }
+        std::thread::sleep(Duration::from_millis(25));
+    }
+    assert!(!bytes.is_empty(), "no attach output");
+
+    let n = unsafe { libc::write(master, b"go\n".as_ptr() as *const libc::c_void, 3) };
+    assert_eq!(n, 3, "writing to the pty failed");
+    let deadline = Instant::now() + Duration::from_secs(10);
+    loop {
+        drain_into(master, &mut bytes);
+        if child.try_wait().expect("try_wait").is_some() {
+            break;
+        }
+        if Instant::now() >= deadline {
+            let _ = child.kill();
+            panic!("client did not exit after session end");
+        }
+        std::thread::sleep(Duration::from_millis(25));
+    }
+    drain_into(master, &mut bytes);
+
+    assert!(
+        bytes.starts_with(b"\x1b[2J\x1b[H"),
+        "no-init must clear in place, got {:?}",
+        String::from_utf8_lossy(&bytes[..bytes.len().min(24)])
+    );
+    assert!(
+        !bytes.windows(8).any(|w| w == b"\x1b[?1049h" || w == b"\x1b[?1049l"),
+        "no-init stream must not switch screens"
+    );
+    assert!(
+        bytes.ends_with(b"\x1b[?25h"),
+        "mode restore must still run, got {:?}",
         String::from_utf8_lossy(&bytes[bytes.len().saturating_sub(48)..])
     );
 

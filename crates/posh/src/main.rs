@@ -8,6 +8,7 @@ mod pty;
 mod remote;
 mod session;
 mod target;
+mod terminfo;
 mod util;
 
 use remote::datagram::Family;
@@ -51,6 +52,13 @@ fn run() -> Result<()> {
                     .ok_or_else(|| Error::from("--group requires a value"))?
                     .clone();
                 i += 2;
+            }
+            "--no-init" => {
+                // mosh --no-init parity: travels as an environment variable
+                // (like MOSH_NO_TERM_INIT) so it reaches the attach/remote
+                // client wherever the grammar dispatch lands.
+                std::env::set_var("POSH_NO_TERM_INIT", "1");
+                i += 1;
             }
             _ => break,
         }
@@ -395,6 +403,14 @@ GLOBAL OPTIONS
     -g, --group GROUP
         Session group (default: \"default\", or $POSH_GROUP). Each group is
         a subdirectory of the socket directory.
+
+    --no-init
+        Do not take over the terminal's alternate screen on attach/connect
+        (mosh --no-init parity; also $POSH_NO_TERM_INIT). The takeover
+        sequences normally come from terminfo smcup/rmcup for $TERM,
+        falling back to DECSET 1049 when no database entry is found; a
+        terminal whose entry defines no alternate screen is never taken
+        over. FDR 0002.
 
 SESSION COMMANDS (local persistence)
     attach <name> [command...] [--detach]      (alias: a)

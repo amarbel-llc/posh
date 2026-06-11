@@ -149,20 +149,41 @@ impl Snapshot {
 /// the whole connection lives on the alternate screen so close() can
 /// restore the user's shell exactly as it was. The renderer is fully
 /// model-driven, so the remote application's own alt-screen switches never
-/// reach the outer terminal raw. The explicit clear covers terminals whose
-/// alt buffer isn't cleared on entry.
-pub fn open() -> &'static [u8] {
-    b"\x1b[?1049h\x1b[2J\x1b[H"
+/// reach the outer terminal raw. The smcup string comes from terminfo for
+/// $TERM (hardcoded 1049 when no database answers; nothing under
+/// --no-init or when the entry defines no alternate screen); the explicit
+/// clear covers terminals whose alt buffer isn't cleared on entry.
+pub fn open() -> Vec<u8> {
+    open_with(&crate::terminfo::ca_mode_bracket())
+}
+
+fn open_with(bracket: &Option<(Vec<u8>, Vec<u8>)>) -> Vec<u8> {
+    let mut out = Vec::new();
+    if let Some((smcup, _)) = bracket {
+        out.extend_from_slice(smcup);
+    }
+    out.extend_from_slice(b"\x1b[2J\x1b[H");
+    out
 }
 
 /// Restores the outer terminal on exit (mosh Display::close): default pen,
 /// visible cursor, mouse/paste/focus modes off, scroll region reset, and
-/// finally back to the primary screen (rmcup) — the user's pre-connect
-/// shell, prompt and all.
-pub fn close() -> &'static [u8] {
-    b"\x1b[0m\x1b[?25h\x1b[?1l\x1b>\x1b[?1003l\x1b[?1002l\x1b[?1000l\x1b[?9l\
-      \x1b[?1016l\x1b[?1006l\x1b[?1005l\x1b[?2004l\x1b[?1004l\x1b[?1007l\x1b[r\
-      \x1b[?1049l"
+/// finally back to the primary screen (terminfo rmcup) — the user's
+/// pre-connect shell, prompt and all.
+pub fn close() -> Vec<u8> {
+    close_with(&crate::terminfo::ca_mode_bracket())
+}
+
+fn close_with(bracket: &Option<(Vec<u8>, Vec<u8>)>) -> Vec<u8> {
+    let mut out = Vec::from(
+        b"\x1b[0m\x1b[?25h\x1b[?1l\x1b>\x1b[?1003l\x1b[?1002l\x1b[?1000l\x1b[?9l\
+          \x1b[?1016l\x1b[?1006l\x1b[?1005l\x1b[?2004l\x1b[?1004l\x1b[?1007l\x1b[r"
+            .as_slice(),
+    );
+    if let Some((_, rmcup)) = bracket {
+        out.extend_from_slice(rmcup);
+    }
+    out
 }
 
 /// Escape-stream builder with cursor/pen bookkeeping (mosh FrameState).
@@ -1288,18 +1309,24 @@ mod tests {
         );
         assert!(String::from_utf8_lossy(&diff_off).contains("\x1b[?1007l"));
 
-        assert!(String::from_utf8_lossy(close()).contains("\x1b[?1007l"));
+        assert!(String::from_utf8_lossy(&close()).contains("\x1b[?1007l"));
     }
 
     #[test]
     fn open_takes_and_close_releases_the_alt_screen() {
-        let open_s = String::from_utf8_lossy(open());
+        let bracket = Some((b"\x1b[?1049h".to_vec(), b"\x1b[?1049l".to_vec()));
+        let open_s = String::from_utf8(open_with(&bracket)).unwrap();
         assert!(open_s.starts_with("\x1b[?1049h"), "{open_s:?}");
-        let close_s = String::from_utf8_lossy(close());
+        let close_s = String::from_utf8(close_with(&bracket)).unwrap();
         // rmcup must come last so every mode reset lands before the screen
-        // flips back to the user's shell (cursor re-show aside, which is
-        // global across buffers).
+        // flips back to the user's shell.
         assert!(close_s.ends_with("\x1b[?1049l"), "{close_s:?}");
+        // --no-init / no-alt-screen terminals: same stream minus the bracket.
+        let open_s = String::from_utf8(open_with(&None)).unwrap();
+        assert!(!open_s.contains("1049"), "{open_s:?}");
+        let close_s = String::from_utf8(close_with(&None)).unwrap();
+        assert!(!close_s.contains("1049"), "{close_s:?}");
+        assert!(close_s.contains("\x1b[?1000l"), "{close_s:?}");
     }
 
     #[test]

@@ -39,6 +39,9 @@ $P kill demo
       (the inner alt-screen cycle must not leak to the outer terminal).
 - [ ] Inside the session: run `reset` (RIS) → session screen resets but
       the outer terminal stays on posh's screen; detach still restores.
+- [ ] `posh --no-init attach demo` → no alt-screen switch (attach clears
+      in place like pre-FDR-0002); detach leaves the session's last
+      screen visible, prompt usable.
 - [ ] `posh list` counts clients correctly before/after.
 - [ ] Exit status: `$P attach ec sh -c 'exit 7'; echo $?` prints 7 (#18).
 

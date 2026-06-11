@@ -13,22 +13,41 @@ use crate::util::{self, Error, Result};
 const STDIN: i32 = libc::STDIN_FILENO;
 const STDOUT: i32 = libc::STDOUT_FILENO;
 
-/// Takeover sequence written on attach: the whole attach lives on the
-/// outer terminal's alternate screen, so detach can put the user's shell
-/// back exactly as it was — prompt, scrollback, and all. 1049h saves the
-/// cursor and switches; the explicit clear covers terminals whose alt
-/// buffer isn't cleared on entry. The daemon virtualizes the inner
-/// application's own 1049 switches so the outer terminal never leaves
-/// this screen mid-attach.
-const ENTER_SEQ: &[u8] = b"\x1b[?1049h\x1b[2J\x1b[H";
+/// Mode resets written on detach before leaving the alternate screen:
+/// mouse reporting (1000/1002/1003/1006), alternate scroll (1007),
+/// bracketed paste (2004), focus events (1004), and the pen.
+const MODES_OFF_SEQ: &[u8] =
+    b"\x1b[?1000l\x1b[?1002l\x1b[?1003l\x1b[?1006l\x1b[?1007l\x1b[?2004l\x1b[?1004l\x1b[0m";
 
-/// Reset sequence written on detach: disable mouse reporting (1000/1002/
-/// 1003/1006), alternate scroll (1007), bracketed paste (2004), focus
-/// events (1004), reset the pen, then leave the alternate screen —
-/// restoring the user's pre-attach screen and cursor — and re-show the
+/// Takeover sequence written on attach (and SIGCONT resume): terminfo
+/// smcup for $TERM puts the whole attach on the outer terminal's
+/// alternate screen, so detach can put the user's shell back exactly as
+/// it was; the explicit clear covers terminals whose alt buffer isn't
+/// cleared on entry and gives the replay its clean slate either way. The
+/// daemon virtualizes the inner application's own switches so the outer
+/// terminal never leaves this screen mid-attach. Under --no-init (or a
+/// terminfo entry with no alternate screen) the bracket is empty and this
+/// degrades to the historical clear-in-place behavior.
+fn enter_seq(bracket: &Option<(Vec<u8>, Vec<u8>)>) -> Vec<u8> {
+    let mut out = Vec::new();
+    if let Some((smcup, _)) = bracket {
+        out.extend_from_slice(smcup);
+    }
+    out.extend_from_slice(b"\x1b[2J\x1b[H");
+    out
+}
+
+/// Restore sequence written on the way out: mode resets, terminfo rmcup
+/// (restoring the user's pre-attach screen and cursor), re-show the
 /// cursor.
-const RESTORE_SEQ: &[u8] =
-    b"\x1b[?1000l\x1b[?1002l\x1b[?1003l\x1b[?1006l\x1b[?1007l\x1b[?2004l\x1b[?1004l\x1b[0m\x1b[?1049l\x1b[?25h";
+fn restore_seq(bracket: &Option<(Vec<u8>, Vec<u8>)>) -> Vec<u8> {
+    let mut out = Vec::from(MODES_OFF_SEQ);
+    if let Some((_, rmcup)) = bracket {
+        out.extend_from_slice(rmcup);
+    }
+    out.extend_from_slice(b"\x1b[?25h");
+    out
+}
 
 pub fn cmd_attach(
     cfg: &Config,
@@ -59,9 +78,11 @@ pub fn cmd_attach(
     let raw = RawMode::enable(STDIN)?;
     // Take over the alternate screen before the daemon replays the
     // session state; the user's shell screen waits underneath.
-    let _ = util::write_fd(STDOUT, ENTER_SEQ);
-    let result = client_loop(stream);
-    let _ = util::write_fd(STDOUT, RESTORE_SEQ);
+    let bracket = crate::terminfo::ca_mode_bracket();
+    let enter = enter_seq(&bracket);
+    let _ = util::write_fd(STDOUT, &enter);
+    let result = client_loop(stream, &enter);
+    let _ = util::write_fd(STDOUT, &restore_seq(&bracket));
     drop(raw);
     // When the session ended (rather than detached), carry the shell's
     // exit status out as our own. github #18.
@@ -144,7 +165,9 @@ impl DetachMatcher {
 
 /// Bridges the tty to the daemon until detach or session end. Returns the
 /// session shell's exit status (0 on detach or connection loss).
-fn client_loop(stream: UnixStream) -> Result<i32> {
+/// `enter` is re-written on SIGCONT, when the outer terminal may have
+/// left our alternate screen while we were stopped.
+fn client_loop(stream: UnixStream, enter: &[u8]) -> Result<i32> {
     util::install_client_signal_handlers();
     stream.set_nonblocking(true)?;
     let sock_fd = stream.as_raw_fd();
@@ -188,7 +211,7 @@ fn client_loop(stream: UnixStream) -> Result<i32> {
             // our alternate screen while we were stopped, so re-enter it,
             // then re-Init so the daemon replays the screen (and picks up
             // any size change while stopped).
-            let _ = util::write_fd(STDOUT, ENTER_SEQ);
+            let _ = util::write_fd(STDOUT, enter);
             let (rows, cols) = pty::term_size(STDOUT);
             ipc::append_frame(
                 &mut sock_write_buf,
@@ -307,6 +330,22 @@ fn client_loop(stream: UnixStream) -> Result<i32> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn takeover_sequences_wrap_the_bracket() {
+        let bracket = Some((b"\x1b[?1049h".to_vec(), b"\x1b[?1049l".to_vec()));
+        assert_eq!(enter_seq(&bracket), b"\x1b[?1049h\x1b[2J\x1b[H");
+        let restore = restore_seq(&bracket);
+        assert!(restore.starts_with(MODES_OFF_SEQ));
+        assert!(restore.ends_with(b"\x1b[?1049l\x1b[?25h"));
+        // --no-init / no-alt-screen terminal: historical clear-in-place,
+        // mode resets still run.
+        assert_eq!(enter_seq(&None), b"\x1b[2J\x1b[H");
+        let restore = restore_seq(&None);
+        assert!(restore.starts_with(MODES_OFF_SEQ));
+        assert!(restore.ends_with(b"\x1b[?25h"));
+        assert!(!restore.windows(4).any(|w| w == b"1049"));
+    }
 
     #[test]
     fn raw_ctrl_backslash_detaches() {

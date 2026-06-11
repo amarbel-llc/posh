@@ -97,9 +97,12 @@ posh history <name> [--vt]
 posh completions <bash|zsh|fish>
 ```
 
-Attaching takes over the outer terminal's alternate screen and detaching
-restores it, so the shell prompt you attached from comes back exactly as
-you left it (FDR 0002: `docs/features/`). The daemon virtualizes the
+Attaching takes over the outer terminal's alternate screen (terminfo
+smcup/rmcup for $TERM via a built-in term(5) reader, hardcoded 1049 when
+no database answers, skipped under `--no-init`/$POSH_NO_TERM_INIT or for
+terminals without an alternate screen) and detaching restores it, so the
+shell prompt you attached from comes back exactly as you left it
+(FDR 0002: `docs/features/`). The daemon virtualizes the
 session's own alt-screen switches and RIS in the broadcast — replaced
 with model-generated repaints — so full-screen apps inside the session
 can never flip the outer terminal off posh's screen. Session scrollback

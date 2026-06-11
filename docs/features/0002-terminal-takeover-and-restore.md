@@ -50,6 +50,25 @@ Attach replay now uses `Terminal::dump_vt_flat()`: the active grid only,
 never switching the outer terminal's buffers and never replaying
 scrollback into the outer terminal.
 
+The enter/exit sequences come from **terminfo** (mosh parity): the
+`smcup`/`rmcup` capabilities of `$TERM`, read by a built-in term(5)
+parser (`crates/posh/src/terminfo.rs` — no ncurses linkage; legacy and
+32-bit magics, ncurses search order, `$<..>` padding stripped). Three
+outcomes:
+
+- entry defines both → those exact strings (e.g. xterm's title-stack
+  pushes ride along);
+- entry exists without them (`dumb`, `vt100`) → **no takeover**: the
+  terminal said it can't, so posh degrades to the historical
+  clear-in-place attach;
+- no `$TERM` / no database (static deploys, sandboxes) → hardcoded
+  DECSET 1049 bracket, so a missing database never degrades the restore
+  guarantee on modern terminals.
+
+`posh --no-init <anything>` (or `POSH_NO_TERM_INIT=1`, mosh's
+`--no-init`/`MOSH_NO_TERM_INIT` parity) disables the takeover outright;
+mode resets on exit still run.
+
 ## Examples
 
     $ echo precious prompt state
