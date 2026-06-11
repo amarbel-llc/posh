@@ -107,15 +107,24 @@ groups via `-g/--group` or `POSH_GROUP`; socket directory resolution:
 `POSH_DIR` > `XDG_RUNTIME_DIR/posh` > `TMPDIR/posh-{uid}` > `/tmp/posh-{uid}`.
 Sessions export `POSH_SESSION`/`POSH_GROUP`.
 
-**Remote roaming (mosh port):**
+**Remote roaming (mosh port) and the unified namespace:**
 
 ```
-posh [user@]host [-- command]      # like mosh(1); a bare first argument
-                                   # containing @ . or : is an ssh target
+posh [user@]host [-- command]      # like mosh(1): plain roaming shell
+posh [user@]host:[group/]session   # persistent session on the host over
+                                   # the roaming transport — attach-or-
+                                   # create, detach here, reattach from
+                                   # anywhere; [fe80::1]:dev for IPv6
+posh :[group/]session              # explicit local attach
+posh list host:                    # remote listing, host-prefixed names
 posh ssh [-4|-6] [-p RANGE] [user@]host [-- command]
 posh server [new] [-p PORT[:PORT2]] [-4|-6] [-- command...]
 posh client [-4|-6] <host> <port>  # key via POSH_KEY, never on argv
 ```
+
+The grammar is scp-style and total (RFC 0001: `docs/rfcs/`); every
+pre-namespace form keeps its meaning. The remote session's exit status
+propagates: `posh box:dev; echo $?` reports the session shell's code.
 
 The ssh bootstrap runs `posh-server new` on the remote host (mosh-server
 parity); the package installs `posh-server` as an alias of `posh`, so the

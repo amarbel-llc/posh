@@ -1,5 +1,5 @@
 ---
-status: proposed
+status: experimental
 date: 2026-06-11
 promotion-criteria: >
   proposed -> experimental: the v1 implementation (typed parser, transport

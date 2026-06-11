@@ -68,20 +68,28 @@ POSH_KEY=<key> $P client 127.0.0.1 <port>
 ## 4. Cross-host
 
 ```sh
-$P user@otherhost                # mosh-style: bare args containing @ . or :
+$P user@otherhost                # mosh-style: plain roaming shell
 $P ssh otherhost                 # explicit form (for bare ssh aliases)
+$P otherhost:dev                 # persistent session over the transport
+$P list otherhost:               # remote session listing
 ```
 
-Both run `posh-server new` over ssh. Server-host requirements:
-`posh-server` on the **non-interactive ssh PATH** (the nix package installs
-it next to posh; for a cargo build, symlink `target/release/posh` to
-`~/.local/bin/posh-server`) — otherwise the wrapper reports "did not find
-posh server startup message" — and UDP 60001–60999 reachable.
+All run `posh-server new` over ssh (the session form wraps an inner
+`posh attach`). Server-host requirements: `posh-server` AND `posh` on the
+**non-interactive ssh PATH** (the nix package installs both; for a cargo
+build, symlink `target/release/posh` to `~/.local/bin/posh-server`) —
+otherwise the wrapper reports "did not find posh server startup message"
+— and UDP 60001–60999 reachable.
 
 - [ ] Session comes up; typing survives suspending the laptop / switching
       networks (roaming).
 - [ ] "Last contact N seconds ago" banner appears ~6.5s after cutting the
       network, clears on reconnect.
+- [ ] `posh otherhost:dev`, `Ctrl-\` to detach, reattach from a second
+      machine: full replay, both machines can take turns.
+- [ ] Exit the session shell with `exit 3`; `echo $?` locally prints 3.
+- [ ] `posh otherhost:<Tab>` completes the remote session names (second
+      Tab is instant — cached).
 
 ## Known gaps — do not file as new bugs
 
