@@ -72,6 +72,16 @@ fn run() -> Result<()> {
             Ok(())
         }
         "list" | "ls" | "l" => {
+            // `posh list box:` — remote listing through the namespace
+            // (RFC 0001 §1): a trailing-colon host runs the same query
+            // completion uses, output prefixed so names paste back in.
+            if let Some(arg) = args.iter().find(|a| !a.starts_with('-')) {
+                if arg.ends_with(':') {
+                    if let target::Target::Host { user, host } = target::Target::parse(arg) {
+                        return cmd_list_remote(user, host);
+                    }
+                }
+            }
             let format = if args.iter().any(|a| a == "--json" || a == "-j") {
                 ListFormat::Json
             } else if args.iter().any(|a| a == "--short") {
@@ -285,6 +295,50 @@ fn cmd_ssh_session(
     remote::sshwrap::run(&dest, &inner, &opts)
 }
 
+/// The ssh argv behind `posh list host:` (separated for testability).
+fn remote_list_argv(user: Option<&str>, host: &str) -> Vec<String> {
+    let dest = match user {
+        Some(u) => format!("{u}@{host}"),
+        None => host.to_string(),
+    };
+    [
+        "ssh",
+        "-o",
+        "BatchMode=yes",
+        &dest,
+        "posh",
+        "list",
+        "--short",
+    ]
+    .iter()
+    .map(|s| s.to_string())
+    .collect()
+}
+
+fn cmd_list_remote(user: Option<String>, host: String) -> Result<()> {
+    let argv = remote_list_argv(user.as_deref(), &host);
+    let out = std::process::Command::new(&argv[0])
+        .args(&argv[1..])
+        .output()
+        .map_err(|e| Error(format!("ssh: {e}")))?;
+    if !out.status.success() {
+        use std::io::Write;
+        let _ = std::io::stderr().write_all(&out.stderr);
+        return Err(Error(format!("remote list failed on {host}")));
+    }
+    // Every printed name is itself a valid RemoteSession target.
+    let prefix = match &user {
+        Some(u) => format!("{u}@{host}"),
+        None => host.clone(),
+    };
+    for line in String::from_utf8_lossy(&out.stdout).lines() {
+        if !line.is_empty() {
+            println!("{prefix}:{line}");
+        }
+    }
+    Ok(())
+}
+
 fn cmd_ssh(args: &[String]) -> Result<()> {
     let usage = "usage: posh ssh [-4|-6] [-p PORT[:PORT2]] [user@]host [-- command...]";
     let mut family = Family::Auto;
@@ -439,6 +493,18 @@ mod tests {
         assert!(parse_port_range("70000").is_err());
         assert!(parse_port_range("100:50").is_err());
         assert!(parse_port_range("abc").is_err());
+    }
+
+    #[test]
+    fn remote_list_command_shape() {
+        // `posh list box:` runs a BatchMode ssh so completion-time and
+        // script callers can never hang on an auth prompt.
+        assert_eq!(
+            remote_list_argv(Some("user"), "box"),
+            ["ssh", "-o", "BatchMode=yes", "user@box", "posh", "list", "--short"]
+                .map(String::from)
+        );
+        assert_eq!(remote_list_argv(None, "box")[3], "box");
     }
 
     #[test]

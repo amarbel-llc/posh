@@ -27,7 +27,22 @@ impl Shell {
     }
 }
 
-const BASH_COMPLETIONS: &str = r#"_posh_ssh_hosts() {
+const BASH_COMPLETIONS: &str = r#"_posh_remote_sessions() {
+  # Remote session names for host:<Tab>, via a short-TTL cache so repeated
+  # tabs are instant and a dead host stalls at most once per window. The
+  # 2s connect timeout and ~30s TTL are tuning levers (FDR 0001).
+  local host=$1
+  local cache_dir=${XDG_CACHE_HOME:-$HOME/.cache}/posh
+  local cache=$cache_dir/sessions-$host
+  if [ -z "$(find "$cache" -newermt '-30 seconds' 2>/dev/null)" ]; then
+    mkdir -p "$cache_dir"
+    ssh -o BatchMode=yes -o ConnectTimeout=2 "$host" posh list --short \
+      >"$cache.new" 2>/dev/null && mv "$cache.new" "$cache"
+  fi
+  cat "$cache" 2>/dev/null
+}
+
+_posh_ssh_hosts() {
   # ssh config Host aliases (wildcard patterns dropped). Reads the user
   # config plus the common config.d/conf.d include layouts.
   command sed -n 's/^[[:space:]]*[Hh]ost[[:space:]]\{1,\}//p' \
@@ -81,6 +96,13 @@ _posh_completions() {
   fi
 
   if [[ -z "$subcmd" ]]; then
+    # host:<Tab> — complete the host's session names (RFC 0001 namespace).
+    if [[ "$cur" == ?*:* && "$cur" != \[* ]]; then
+      local rhost="${cur%%:*}"
+      local rsessions=$(_posh_remote_sessions "$rhost" | sed "s|^|$rhost:|" | tr '\n' ' ')
+      COMPREPLY=($(compgen -W "$rsessions" -- "$cur"))
+      return 0
+    fi
     # The bare first argument is also the attach shorthand (session name)
     # and the mosh-style remote form (ssh config alias).
     local sessions=$(posh list --short 2>/dev/null | tr '\n' ' ')
@@ -244,6 +266,29 @@ function __posh_ssh_config_hosts
     end | sort -u
 end
 
+function __posh_remote_sessions
+    # Remote session names for host:<Tab>, via a short-TTL cache so
+    # repeated tabs are instant and a dead host stalls at most once per
+    # window. The 2s connect timeout and ~30s TTL are tuning levers
+    # (FDR 0001).
+    set -l host $argv[1]
+    set -l cache_dir $HOME/.cache/posh
+    set -q XDG_CACHE_HOME; and set cache_dir $XDG_CACHE_HOME/posh
+    set -l cache $cache_dir/sessions-$host
+    if test -z "$(find $cache -newermt '-30 seconds' 2>/dev/null)"
+        mkdir -p $cache_dir
+        ssh -o BatchMode=yes -o ConnectTimeout=2 $host posh list --short >$cache.new 2>/dev/null
+        and mv $cache.new $cache
+    end
+    cat $cache 2>/dev/null
+end
+
+function __posh_complete_remote_target
+    # host:<Tab> -> host:session candidates (RFC 0001 namespace).
+    set -l m (string match -r '^([^:\[]+):' -- (commandline -ct)); or return
+    __posh_remote_sessions $m[2] | string replace -r '^' "$m[2]:"
+end
+
 complete -c posh -f
 
 set -l subcommands attach run detach detach-all fork groups list completions kill history server client ssh version help
@@ -268,9 +313,11 @@ complete -c posh -n $no_subcmd -a version -d 'Show version'
 complete -c posh -n $no_subcmd -a help -d 'Show help message'
 
 # The bare first argument is also the attach shorthand (session name) and
-# the mosh-style remote form (ssh config alias).
+# the mosh-style remote form (ssh config alias); host:<Tab> completes the
+# host's session names (RFC 0001 namespace).
 complete -c posh -n $no_subcmd -a '(posh list --short 2>/dev/null)' -d 'Session'
 complete -c posh -n $no_subcmd -a '(__posh_ssh_config_hosts)' -d 'ssh host'
+complete -c posh -n $no_subcmd -a '(__posh_complete_remote_target)' -d 'Remote session'
 
 complete -c posh -n "__fish_seen_subcommand_from attach run detach kill history" -a '(posh list --short 2>/dev/null)' -d 'Session name'
 
@@ -404,6 +451,22 @@ mod tests {
                 script.contains(".ssh/config"),
                 "{shell:?} should read ssh config Host aliases"
             );
+        }
+    }
+
+    #[test]
+    fn remote_session_completion_is_cached_and_batchmode() {
+        // RFC 0001 namespace: host:<Tab> queries the host's sessions over
+        // ssh — BatchMode so a Tab can never hang on auth, a bounded
+        // connect timeout, and a short-TTL cache (FDR 0001 tuning levers).
+        for shell in [Shell::Bash, Shell::Fish] {
+            let script = shell.script();
+            for needle in ["BatchMode=yes", "ConnectTimeout=2", "/posh", "sessions-"] {
+                assert!(
+                    script.contains(needle),
+                    "{shell:?} remote completion missing {needle}"
+                );
+            }
         }
     }
 
