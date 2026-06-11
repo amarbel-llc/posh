@@ -85,16 +85,12 @@ posh server startup message" — and UDP 60001–60999 reachable.
 
 ## Known gaps — do not file as new bugs
 
-Tracked Wave D/E work
-([#34](https://github.com/amarbel-llc/posh/issues/34)):
+None currently. The Wave D/E gaps that used to live here — wheel scroll
+(#28), remote suspend (#30), BEL/OSC 52 forwarding (#27), kitty graphics
+over remote (#29), connect diagnostics (#31) — were all fixed as of
+2026-06-10 ([#34](https://github.com/amarbel-llc/posh/issues/34)). A
+failure in any of those areas is a regression: file it.
 
-- Wheel scrolling under kitty sprays arrow keys at a prompt
-  ([#28](https://github.com/amarbel-llc/posh/issues/28)).
-- No Ctrl-Z suspend of the *remote* client
-  ([#30](https://github.com/amarbel-llc/posh/issues/30)).
-- Remote BEL / OSC 52 clipboard not forwarded
-  ([#27](https://github.com/amarbel-llc/posh/issues/27)).
-- Kitty graphics lost over remote sync and attach replay
-  ([#29](https://github.com/amarbel-llc/posh/issues/29)).
-- No connect/timeout diagnostics — a firewalled port waits silently
-  ([#31](https://github.com/amarbel-llc/posh/issues/31)).
+For a guided capability pass (instead of ad-hoc probes), run
+[posht](posht.md): `just run-posht` locally, `just run-posht <host>`
+through the whole posh pipeline.

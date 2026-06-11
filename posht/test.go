@@ -144,23 +144,23 @@ func registry() []*Test {
 		{
 			ID: "clipboard", Title: "clipboard write",
 			Desc: "OSC 52 copies a marker string to your local clipboard",
-			Notes: "remote OSC 52 forwarding is a known posh gap (posh#27) — " +
-				"over a posh remote this may legitimately fail today",
+			Notes: "remote OSC 52 forwarding was fixed by posh#27 — a FAIL " +
+				"over a posh remote is a regression; file it",
 			New: func() TestModel { return &clipModel{} },
 		},
 		{
 			ID: "bell", Title: "bell",
 			Desc: "BEL rings an audible or visual bell",
-			Notes: "remote BEL forwarding is a known posh gap (posh#27) — " +
-				"over a posh remote this may legitimately fail today",
+			Notes: "remote BEL forwarding was fixed by posh#27. Locally, check " +
+				"the terminal's bell config first (kitty is often silent)",
 			New: func() TestModel { return &bellModel{} },
 		},
 		{
 			ID: "graphics", Title: "kitty graphics",
 			Desc: "inline image via the kitty graphics protocol (APC G)",
-			Notes: "needs a kitty-graphics terminal locally; lost over posh remote " +
-				"sync and attach replay today (posh#29)",
-			New: func() TestModel { return staticModel{render: graphicsView} },
+			Notes: "needs a kitty-graphics terminal; remote sync and attach " +
+				"replay were fixed by posh#29 — a remote FAIL is a regression",
+			New: func() TestModel { return graphicsModel{} },
 		},
 	}
 	for _, t := range tests {

@@ -184,3 +184,19 @@ func graphicsView(int) string {
 		"  Nothing between the markers means the kitty graphics protocol\n" +
 		"  was dropped (fine for non-kitty terminals — mark skip instead).\n"
 }
+
+type graphicsModel struct{}
+
+func (graphicsModel) Init() tea.Cmd                       { return nil }
+func (m graphicsModel) Update(tea.Msg) (TestModel, tea.Cmd) { return m, nil }
+func (graphicsModel) View(w int) string                   { return graphicsView(w) }
+
+// Cleanup deletes the placed image: kitty placements live independently
+// of the text they were emitted with, so without this the gradient
+// square outlives the test screen.
+func (graphicsModel) Cleanup() tea.Cmd {
+	return func() tea.Msg {
+		fmt.Print("\x1b_Ga=d,d=I,i=31337,q=2\x1b\\")
+		return nil
+	}
+}
