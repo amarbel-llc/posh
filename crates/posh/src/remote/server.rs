@@ -315,6 +315,7 @@ fn server_loop(mut conn: Connection, child: pty::PtyChild, rows: u16, cols: u16)
                 };
                 let frame = ServerFrame {
                     flags: if shutdown { sync::FLAG_SHUTDOWN } else { 0 },
+                    caps: vec![], // populated when EXIT_STATUS lands (plan task 6)
                     frame_num: current.num,
                     input_ack: inbox.next_offset(),
                     echo_ack: echo.ack(),
@@ -438,6 +439,7 @@ mod tests {
         while now_ms() < deadline {
             let msg = ClientMessage {
                 flags: 0,
+                caps: vec![],
                 acked_frame,
                 rows: 24,
                 cols: 80,
@@ -504,6 +506,7 @@ mod tests {
         while now_ms() < deadline {
             let msg = ClientMessage {
                 flags: sync::CLIENT_FLAG_SHUTDOWN,
+                caps: vec![],
                 acked_frame,
                 rows: 24,
                 cols: 80,
@@ -607,6 +610,7 @@ mod tests {
         // it; distinct frame numbers count fresh productions.
         let hello = ClientMessage {
             flags: 0,
+            caps: vec![],
             acked_frame: 0,
             rows: 24,
             cols: 80,
@@ -641,6 +645,7 @@ mod tests {
         while now_ms() < deadline {
             let msg = ClientMessage {
                 flags: sync::CLIENT_FLAG_SHUTDOWN,
+                caps: vec![],
                 acked_frame: highest,
                 rows: 24,
                 cols: 80,
@@ -685,6 +690,7 @@ mod tests {
         let mut acked_data = Some(b"one".to_vec());
         let msg = ClientMessage {
             flags: 0,
+            caps: vec![],
             acked_frame: u64::MAX,
             rows: 24,
             cols: 80,

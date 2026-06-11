@@ -483,6 +483,7 @@ fn compose_frame(st: &mut ClientState, now: u64) -> Vec<u8> {
 fn send_message(st: &mut ClientState) {
     let msg = ClientMessage {
         flags: st.flags,
+        caps: vec![], // populated when EXIT_STATUS lands (plan task 6)
         acked_frame: st.applied_num,
         rows: st.rows,
         cols: st.cols,
@@ -586,6 +587,7 @@ mod tests {
         let _ = compose_frame(&mut st, 0);
         let frame = ServerFrame {
             flags: 0,
+            caps: vec![],
             frame_num: 1,
             input_ack: 0,
             echo_ack: 0,
@@ -613,6 +615,7 @@ mod tests {
         // every subsequent render paints a 132-col image onto 80 cols.
         let frame = ServerFrame {
             flags: 0,
+            caps: vec![],
             frame_num: 1,
             input_ack: 0,
             echo_ack: 0,

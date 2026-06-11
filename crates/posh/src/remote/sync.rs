@@ -3,6 +3,7 @@
 //! binary diff, and the reliable cumulative user-input stream (a simplified
 //! mosh UserStream).
 
+use crate::remote::caps;
 use crate::util::{Error, Result};
 
 /// Keepalive cadence shared by both ends of the protocol: each side emits
@@ -213,7 +214,12 @@ pub enum FrameBody {
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct ServerFrame {
+    /// Runtime signal bits only (FLAG_SHUTDOWN). The EXTENSION bit is a
+    /// wire-format detail: set on encode when `caps` is non-empty,
+    /// stripped on decode.
     pub flags: u8,
+    /// RFC 0001 §3 capability table; empty == baseline (v0) format.
+    pub caps: Vec<caps::Cap>,
     pub frame_num: u64,
     /// Input-stream offset received (clears the client's outbox).
     pub input_ack: u64,
@@ -230,7 +236,10 @@ const BODY_EMPTY: u8 = 2;
 impl ServerFrame {
     pub fn encode(&self) -> Vec<u8> {
         let mut out = Vec::new();
-        out.push(self.flags);
+        out.push(flags_with_extension(self.flags, &self.caps));
+        if !self.caps.is_empty() {
+            out.extend_from_slice(&caps::encode_table(&self.caps));
+        }
         out.extend_from_slice(&self.frame_num.to_le_bytes());
         out.extend_from_slice(&self.input_ack.to_le_bytes());
         out.extend_from_slice(&self.echo_ack.to_le_bytes());
@@ -250,23 +259,24 @@ impl ServerFrame {
     }
 
     pub fn decode(data: &[u8]) -> Result<ServerFrame> {
-        if data.len() < 26 {
+        let (flags, caps, at) = decode_flags_and_caps(data)?;
+        if data.len() < at + 25 {
             return Err(Error::from("server frame too short"));
         }
-        let flags = data[0];
-        let frame_num = u64::from_le_bytes(data[1..9].try_into().unwrap());
-        let input_ack = u64::from_le_bytes(data[9..17].try_into().unwrap());
-        let echo_ack = u64::from_le_bytes(data[17..25].try_into().unwrap());
-        let body = match data[25] {
-            BODY_FULL => FrameBody::Full(data[26..].to_vec()),
+        let frame_num = u64::from_le_bytes(data[at..at + 8].try_into().unwrap());
+        let input_ack = u64::from_le_bytes(data[at + 8..at + 16].try_into().unwrap());
+        let echo_ack = u64::from_le_bytes(data[at + 16..at + 24].try_into().unwrap());
+        let at = at + 24;
+        let body = match data[at] {
+            BODY_FULL => FrameBody::Full(data[at + 1..].to_vec()),
             BODY_DIFF => {
-                if data.len() < 34 {
+                if data.len() < at + 9 {
                     return Err(Error::from("diff frame too short"));
                 }
-                let base = u64::from_le_bytes(data[26..34].try_into().unwrap());
+                let base = u64::from_le_bytes(data[at + 1..at + 9].try_into().unwrap());
                 FrameBody::Diff {
                     base,
-                    diff: data[34..].to_vec(),
+                    diff: data[at + 9..].to_vec(),
                 }
             }
             BODY_EMPTY => FrameBody::Empty,
@@ -274,12 +284,38 @@ impl ServerFrame {
         };
         Ok(ServerFrame {
             flags,
+            caps,
             frame_num,
             input_ack,
             echo_ack,
             body,
         })
     }
+}
+
+/// Sets the EXTENSION bit when a table will follow the flags byte.
+fn flags_with_extension(flags: u8, table: &[caps::Cap]) -> u8 {
+    debug_assert_eq!(flags & caps::FLAG_EXTENSION, 0, "0x02 is reserved");
+    if table.is_empty() {
+        flags
+    } else {
+        flags | caps::FLAG_EXTENSION
+    }
+}
+
+/// Reads the flags byte and, when the EXTENSION bit is set, the capability
+/// table behind it. Returns (runtime flags, table, offset of the fixed
+/// fields). Baseline (v0) peers never set the bit, so they parse with an
+/// empty table at offset 1 — exactly the pre-capability format.
+fn decode_flags_and_caps(data: &[u8]) -> Result<(u8, Vec<caps::Cap>, usize)> {
+    let Some(&first) = data.first() else {
+        return Err(Error::from("message too short"));
+    };
+    if first & caps::FLAG_EXTENSION == 0 {
+        return Ok((first, Vec::new(), 1));
+    }
+    let (table, used) = caps::decode_table(&data[1..])?;
+    Ok((first & !caps::FLAG_EXTENSION, table, 1 + used))
 }
 
 /// Server-side echo-ack tracker (port of mosh's `Complete` echo ack with
@@ -344,7 +380,11 @@ pub const CLIENT_FLAG_SHUTDOWN: u8 = 1;
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct ClientMessage {
+    /// Runtime signal bits only (CLIENT_FLAG_SHUTDOWN); the EXTENSION bit
+    /// is handled by encode/decode like on [`ServerFrame`].
     pub flags: u8,
+    /// RFC 0001 §3 capability table; empty == baseline (v0) format.
+    pub caps: Vec<caps::Cap>,
     pub acked_frame: u64,
     pub rows: u16,
     pub cols: u16,
@@ -355,7 +395,10 @@ pub struct ClientMessage {
 impl ClientMessage {
     pub fn encode(&self) -> Vec<u8> {
         let mut out = Vec::with_capacity(21 + self.input.len());
-        out.push(self.flags);
+        out.push(flags_with_extension(self.flags, &self.caps));
+        if !self.caps.is_empty() {
+            out.extend_from_slice(&caps::encode_table(&self.caps));
+        }
         out.extend_from_slice(&self.acked_frame.to_le_bytes());
         out.extend_from_slice(&self.rows.to_le_bytes());
         out.extend_from_slice(&self.cols.to_le_bytes());
@@ -365,16 +408,18 @@ impl ClientMessage {
     }
 
     pub fn decode(data: &[u8]) -> Result<ClientMessage> {
-        if data.len() < 21 {
+        let (flags, caps, at) = decode_flags_and_caps(data)?;
+        if data.len() < at + 20 {
             return Err(Error::from("client message too short"));
         }
         Ok(ClientMessage {
-            flags: data[0],
-            acked_frame: u64::from_le_bytes(data[1..9].try_into().unwrap()),
-            rows: u16::from_le_bytes([data[9], data[10]]),
-            cols: u16::from_le_bytes([data[11], data[12]]),
-            input_base: u64::from_le_bytes(data[13..21].try_into().unwrap()),
-            input: data[21..].to_vec(),
+            flags,
+            caps,
+            acked_frame: u64::from_le_bytes(data[at..at + 8].try_into().unwrap()),
+            rows: u16::from_le_bytes([data[at + 8], data[at + 9]]),
+            cols: u16::from_le_bytes([data[at + 10], data[at + 11]]),
+            input_base: u64::from_le_bytes(data[at + 12..at + 20].try_into().unwrap()),
+            input: data[at + 20..].to_vec(),
         })
     }
 }
@@ -598,6 +643,7 @@ mod tests {
         let cases = vec![
             ServerFrame {
                 flags: 0,
+                caps: vec![],
                 frame_num: 7,
                 input_ack: 99,
                 echo_ack: 95,
@@ -605,6 +651,7 @@ mod tests {
             },
             ServerFrame {
                 flags: FLAG_SHUTDOWN,
+                caps: vec![],
                 frame_num: 8,
                 input_ack: 100,
                 echo_ack: 100,
@@ -615,6 +662,7 @@ mod tests {
             },
             ServerFrame {
                 flags: 0,
+                caps: vec![],
                 frame_num: 0,
                 input_ack: 0,
                 echo_ack: 0,
@@ -628,10 +676,102 @@ mod tests {
     }
 
     #[test]
+    fn client_message_caps_roundtrip_and_v0_compat() {
+        // v0 bytes (no extension bit) decode to an empty table.
+        let v0 = ClientMessage {
+            flags: 0,
+            caps: vec![],
+            acked_frame: 1,
+            rows: 24,
+            cols: 80,
+            input_base: 0,
+            input: b"x".to_vec(),
+        };
+        let enc = v0.encode();
+        assert_eq!(
+            enc[0] & caps::FLAG_EXTENSION,
+            0,
+            "empty table must not set the bit"
+        );
+        assert_eq!(ClientMessage::decode(&enc).unwrap(), v0);
+
+        // v1: table rides behind the bit; fixed fields and input survive,
+        // and the EXTENSION bit never leaks into the decoded flags.
+        let v1 = ClientMessage {
+            flags: CLIENT_FLAG_SHUTDOWN,
+            caps: caps::own_table(&[caps::Cap {
+                id: caps::CAP_EXIT_STATUS,
+                payload: vec![],
+            }]),
+            acked_frame: 9,
+            rows: 50,
+            cols: 132,
+            input_base: 7,
+            input: b"hi".to_vec(),
+        };
+        let enc = v1.encode();
+        assert_ne!(enc[0] & caps::FLAG_EXTENSION, 0);
+        let dec = ClientMessage::decode(&enc).unwrap();
+        assert_eq!(dec, v1);
+        assert_eq!(dec.flags & caps::FLAG_EXTENSION, 0);
+    }
+
+    #[test]
+    fn server_frame_caps_roundtrip_and_v0_compat() {
+        let table = caps::own_table(&[caps::Cap {
+            id: caps::CAP_EXIT_STATUS,
+            payload: vec![7],
+        }]);
+        for body in [
+            FrameBody::Full(b"dump".to_vec()),
+            FrameBody::Diff {
+                base: 3,
+                diff: b"delta".to_vec(),
+            },
+            FrameBody::Empty,
+        ] {
+            for caps_case in [vec![], table.clone()] {
+                let frame = ServerFrame {
+                    flags: FLAG_SHUTDOWN,
+                    caps: caps_case,
+                    frame_num: 8,
+                    input_ack: 100,
+                    echo_ack: 99,
+                    body: body.clone(),
+                };
+                let dec = ServerFrame::decode(&frame.encode()).unwrap();
+                assert_eq!(dec, frame);
+                assert_eq!(dec.flags, FLAG_SHUTDOWN);
+            }
+        }
+    }
+
+    #[test]
+    fn truncated_caps_reject_the_message() {
+        let mut enc = ClientMessage {
+            flags: 0,
+            caps: vec![caps::Cap {
+                id: 1,
+                payload: vec![1, 2, 3],
+            }],
+            acked_frame: 0,
+            rows: 1,
+            cols: 1,
+            input_base: 0,
+            input: vec![],
+        }
+        .encode();
+        enc.truncate(3); // cut inside the table
+        assert!(ClientMessage::decode(&enc).is_err());
+        assert!(ServerFrame::decode(&enc).is_err());
+    }
+
+    #[test]
     fn frame_echo_ack_distinct_from_input_ack() {
         // The echo ack lags the input ack; both must roundtrip independently.
         let frame = ServerFrame {
             flags: 0,
+            caps: vec![],
             frame_num: 3,
             input_ack: 42,
             echo_ack: 17,
@@ -646,6 +786,7 @@ mod tests {
     fn client_message_roundtrip() {
         let msg = ClientMessage {
             flags: CLIENT_FLAG_SHUTDOWN,
+            caps: vec![],
             acked_frame: 12,
             rows: 50,
             cols: 132,
