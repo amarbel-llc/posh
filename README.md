@@ -170,6 +170,18 @@ The renderer also ports mosh's scroll optimization (matched rows are
 scrolled with `\r\n` runs or a DECSTBM region instead of being rewritten)
 and emits OSC 8 hyperlinks.
 
+Because the whole connection lives on the outer terminal's alternate screen,
+the mouse wheel at a bare prompt is at the mercy of that terminal's
+alt-screen wheel behavior — kitty, for one, turns it into arrow keys and
+ignores DECSET 1007, so posh can't suppress it the way it can in iTerm2
+(posh#3/#28). `POSH_GRAB_MOUSE=on` makes this consistent: the client grabs
+the wheel (mouse reporting) and translates wheel up/down into arrow keys
+itself, so every terminal behaves the same. It is off by default because
+grabbing the wheel takes click-to-select away from the outer terminal;
+sessions whose app already tracks the mouse (vim, tmux) are unaffected
+either way. Scrolling the session's own scrollback with the wheel is a
+separate, larger item (posh#43).
+
 Known simplifications relative to mosh: frames carry `dump_vt()` state (or
 a prefix/suffix diff) rather than mosh's SSP protobuf instructions with
 zlib; no utmp/motd integration. The full parity contract — what is

@@ -28,6 +28,29 @@ const ESCAPE_KEY: u8 = 0x1e;
 const ESCAPE_PASS_KEY: u8 = b'^';
 const ESCAPE_KEY_HELP: &str = "Commands: Ctrl-Z suspends, \".\" quits, \"^\" gives literal Ctrl-^";
 
+/// $POSH_GRAB_MOUSE: whether to grab the wheel on the outer terminal when the
+/// session app has no mouse mode of its own, translating wheel-up/down into
+/// arrow keys client-side. Off by default — grabbing costs the outer
+/// terminal's native click-to-select. See posh#50/#3/#28; the faithful
+/// wheel→scrollback behavior is posh#43.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum GrabMouse {
+    Off,
+    On,
+}
+
+impl GrabMouse {
+    fn parse(value: Option<&str>) -> Result<GrabMouse> {
+        match value {
+            None | Some("") | Some("off") | Some("never") | Some("0") | Some("false") => {
+                Ok(GrabMouse::Off)
+            }
+            Some("on") | Some("always") | Some("1") | Some("true") => Ok(GrabMouse::On),
+            Some(other) => Err(Error(format!("unknown POSH_GRAB_MOUSE setting ({other})"))),
+        }
+    }
+}
+
 pub fn run(host: &str, port: u16, family: Family) -> Result<()> {
     util::check_utf8_locale("posh-client")?;
 
@@ -43,6 +66,7 @@ pub fn run(host: &str, port: u16, family: Family) -> Result<()> {
     let predict_overwrite = std::env::var("POSH_PREDICTION_OVERWRITE")
         .map(|v| !v.is_empty())
         .unwrap_or(false);
+    let grab_mouse = GrabMouse::parse(std::env::var("POSH_GRAB_MOUSE").ok().as_deref())?;
 
     let addr = resolve(host, port, family)?;
     let conn = Connection::client(addr, &key)?;
@@ -56,7 +80,7 @@ pub fn run(host: &str, port: u16, family: Family) -> Result<()> {
     // Take over the alternate screen (mosh smcup); close() below restores
     // the user's pre-connect shell screen on the way out.
     let _ = util::write_all_retry(STDOUT, &display::open(), 1000);
-    let result = client_loop(conn, prediction, predict_overwrite, &raw, addr.port());
+    let result = client_loop(conn, prediction, predict_overwrite, grab_mouse, &raw, addr.port());
     let _ = util::write_all_retry(STDOUT, &display::close(), 1000);
     drop(raw);
     eprintln!("\nposh: [client exited]");
@@ -104,6 +128,8 @@ struct ClientState {
     initialized: bool,
     predict: PredictionEngine,
     notify: NotificationEngine,
+    /// $POSH_GRAB_MOUSE policy; gates the wheel-grab in grab_active().
+    grab_mouse: GrabMouse,
     quit_pending: bool,
     shutdown_requested: bool,
     shutdown_requested_at: u64,
@@ -121,6 +147,7 @@ fn client_loop(
     conn: Connection,
     prediction: DisplayPreference,
     predict_overwrite: bool,
+    grab_mouse: GrabMouse,
     raw: &RawMode,
     port: u16,
 ) -> Result<i32> {
@@ -143,6 +170,7 @@ fn client_loop(
         initialized: false,
         predict: PredictionEngine::new(prediction, predict_overwrite),
         notify: NotificationEngine::new(now),
+        grab_mouse,
         quit_pending: false,
         shutdown_requested: false,
         shutdown_requested_at: 0,
@@ -332,11 +360,74 @@ fn request_shutdown(st: &mut ClientState) {
     }
 }
 
+/// Whether posh is grabbing the wheel on the outer terminal right now: the
+/// $POSH_GRAB_MOUSE policy is on AND the session app has set no mouse mode of
+/// its own (so the wheel would otherwise become arrows in the outer terminal).
+/// Both the render side (what mode we assert) and the input side (whether to
+/// intercept mouse events) read this, so they can never disagree.
+fn grab_active(st: &ClientState) -> bool {
+    st.grab_mouse == GrabMouse::On && st.server_term.mouse_mode() == posh_term::MouseMode::None
+}
+
+/// Rewrites a grabbed input buffer: complete SGR mouse sequences
+/// (`ESC [ < Cb ; Cx ; Cy (M|m)`) are translated — wheel-up/down (Cb 64/65)
+/// into cursor-key sequences (SS3 `ESC O A/B` under application cursor keys,
+/// else CSI `ESC [ A/B`, matching what the app expects), every other mouse
+/// event dropped (the app never requested mouse reporting). Non-mouse bytes
+/// pass through untouched. A trailing incomplete sequence (split across reads,
+/// vanishingly rare for single-tick wheel writes) is passed through as-is.
+fn translate_grabbed_mouse(buf: &[u8], app_cursor_keys: bool) -> Vec<u8> {
+    let up: &[u8] = if app_cursor_keys { b"\x1bOA" } else { b"\x1b[A" };
+    let down: &[u8] = if app_cursor_keys { b"\x1bOB" } else { b"\x1b[B" };
+    let mut out = Vec::with_capacity(buf.len());
+    let mut i = 0;
+    while i < buf.len() {
+        // SGR mouse sequences start with ESC [ < ; anything else is literal.
+        if buf[i] == 0x1b && i + 2 < buf.len() && buf[i + 1] == b'[' && buf[i + 2] == b'<' {
+            // Find the terminating M (press) or m (release).
+            if let Some(rel) = buf[i + 3..].iter().position(|&b| b == b'M' || b == b'm') {
+                let end = i + 3 + rel; // index of the M/m
+                let body = &buf[i + 3..end]; // "Cb;Cx;Cy"
+                let cb = body.split(|&b| b == b';').next().and_then(|s| {
+                    std::str::from_utf8(s).ok().and_then(|s| s.parse::<u32>().ok())
+                });
+                // Wheel-up = 64, wheel-down = 65 (SGR button codes). Translate
+                // those to arrows; drop every other mouse event.
+                match cb {
+                    Some(64) => out.extend_from_slice(up),
+                    Some(65) => out.extend_from_slice(down),
+                    _ => {}
+                }
+                i = end + 1;
+                continue;
+            }
+            // No terminator in this buffer: incomplete trailing sequence.
+            // Pass the remainder through unchanged and stop.
+            out.extend_from_slice(&buf[i..]);
+            break;
+        }
+        out.push(buf[i]);
+        i += 1;
+    }
+    out
+}
+
 /// Feeds user bytes through the Ctrl-^ quit-sequence state machine, the
 /// prediction engine, and into the reliable input stream. Returns true when
 /// anything needs sending.
 fn process_user_input(st: &mut ClientState, buf: &[u8], raw: &RawMode) -> bool {
     let now = now_ms();
+
+    // When grabbing the wheel, rewrite mouse events to arrows (or drop them)
+    // before the byte loop, so the rest of the path is unchanged.
+    let grabbed;
+    let buf: &[u8] = if grab_active(st) {
+        grabbed = translate_grabbed_mouse(buf, st.server_term.app_cursor_keys());
+        &grabbed
+    } else {
+        buf
+    };
+
     // Don't predict for bulk pastes.
     let paste = buf.len() > 100;
     if paste {
@@ -501,7 +592,8 @@ fn compose_frame(st: &mut ClientState, now: u64) -> Vec<u8> {
     st.notify.adjust(now);
     st.notify.apply(&mut next, now);
 
-    let bytes = display::new_frame(st.initialized, &st.last_drawn, &next);
+    let grab = grab_active(st);
+    let bytes = display::new_frame(st.initialized, &st.last_drawn, &next, grab);
     st.initialized = true;
     st.last_drawn = next;
     bytes
@@ -551,6 +643,54 @@ mod tests {
     }
 
     #[test]
+    fn grab_mouse_parse() {
+        use GrabMouse::*;
+        assert_eq!(GrabMouse::parse(None).unwrap(), Off);
+        assert_eq!(GrabMouse::parse(Some("")).unwrap(), Off);
+        assert_eq!(GrabMouse::parse(Some("off")).unwrap(), Off);
+        assert_eq!(GrabMouse::parse(Some("never")).unwrap(), Off);
+        assert_eq!(GrabMouse::parse(Some("on")).unwrap(), On);
+        assert_eq!(GrabMouse::parse(Some("always")).unwrap(), On);
+        assert_eq!(GrabMouse::parse(Some("1")).unwrap(), On);
+        assert!(GrabMouse::parse(Some("sometimes")).is_err());
+    }
+
+    #[test]
+    fn grabbed_wheel_becomes_arrows_and_other_events_drop() {
+        // Wheel-up (Cb 64) and wheel-down (Cb 65) → CSI cursor keys; a click
+        // (Cb 0) and motion are dropped; surrounding literal bytes survive.
+        assert_eq!(translate_grabbed_mouse(b"\x1b[<64;10;5M", false), b"\x1b[A");
+        assert_eq!(translate_grabbed_mouse(b"\x1b[<65;10;5M", false), b"\x1b[B");
+        assert_eq!(translate_grabbed_mouse(b"\x1b[<0;3;4M", false), b"");
+        assert_eq!(translate_grabbed_mouse(b"\x1b[<0;3;4m", false), b"");
+        // Application cursor keys → SS3 form.
+        assert_eq!(translate_grabbed_mouse(b"\x1b[<64;1;1M", true), b"\x1bOA");
+        assert_eq!(translate_grabbed_mouse(b"\x1b[<65;1;1M", true), b"\x1bOB");
+        // Literal bytes around a wheel event pass through; two ticks coalesce.
+        assert_eq!(
+            translate_grabbed_mouse(b"a\x1b[<64;1;1Mb\x1b[<65;1;1M", false),
+            b"a\x1b[Ab\x1b[B"
+        );
+        // A plain keystroke is untouched.
+        assert_eq!(translate_grabbed_mouse(b"x", false), b"x");
+        // An incomplete trailing sequence passes through unchanged.
+        assert_eq!(translate_grabbed_mouse(b"\x1b[<64;1", false), b"\x1b[<64;1");
+    }
+
+    #[test]
+    fn grab_active_requires_policy_on_and_app_without_mouse() {
+        let mut st = test_state(5, 20);
+        // Default policy is Off → never grabbing.
+        assert!(!grab_active(&st));
+        st.grab_mouse = GrabMouse::On;
+        // Policy on, app has no mouse mode → grabbing.
+        assert!(grab_active(&st));
+        // App enables mouse tracking → posh steps back, passes events through.
+        st.server_term.process(b"\x1b[?1000h");
+        assert!(!grab_active(&st));
+    }
+
+    #[test]
     fn resolve_ipv6_literal_with_brackets_in_port_form() {
         let addr = resolve("::1", 60001, Family::Auto).unwrap();
         match addr {
@@ -579,6 +719,7 @@ mod tests {
             initialized: false,
             predict: PredictionEngine::new(DisplayPreference::Never, false),
             notify: NotificationEngine::new(0),
+            grab_mouse: GrabMouse::Off,
             quit_pending: false,
             shutdown_requested: false,
             shutdown_requested_at: 0,

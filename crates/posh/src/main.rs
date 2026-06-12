@@ -485,6 +485,13 @@ ENVIRONMENT
                     (default), or experimental
     POSH_PREDICTION_OVERWRITE
                     When set, predictions overwrite instead of inserting
+    POSH_GRAB_MOUSE
+                    on/off (default off): when on, the client grabs the
+                    wheel on the outer terminal at a bare prompt and turns
+                    wheel up/down into arrow keys, so scrolling behaves the
+                    same across terminals (kitty otherwise sprays arrows on
+                    its own). Costs the outer terminal's click-to-select
+                    while active; apps that grab the mouse are unaffected.
     POSH_SERVER_NETWORK_TMOUT
                     Server exits after N seconds without client contact
                     (0 = never, the default)

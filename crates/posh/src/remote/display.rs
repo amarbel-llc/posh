@@ -278,7 +278,14 @@ fn cell_width(cell: &Cell) -> u16 {
 /// showing `f`. With `initialized == false` the outer terminal state is
 /// unknown: the screen is cleared and fully repainted (first frame, resize,
 /// Ctrl-L). The stream always leaves the pen at SGR default.
-pub fn new_frame(initialized: bool, last: &Snapshot, f: &Snapshot) -> Vec<u8> {
+///
+/// `grab` requests the wheel-grab workaround (posh#50): when the session app
+/// has no mouse mode (`f.mouse_mode == 0`) but `grab` is set, the outer
+/// terminal is put into mouse reporting (`?1000h?1006h`) so the wheel arrives
+/// as SGR events the client translates to arrows, instead of the outer
+/// terminal turning the wheel into arrows itself (which kitty does
+/// unconditionally on the alt screen). Off, the mode-sync is unchanged.
+pub fn new_frame(initialized: bool, last: &Snapshot, f: &Snapshot, grab: bool) -> Vec<u8> {
     let mut init = initialized;
     let mut frame = FrameState {
         out: String::new(),
@@ -478,10 +485,27 @@ pub fn new_frame(initialized: bool, last: &Snapshot, f: &Snapshot) -> Vec<u8> {
         frame.append(if f.app_keypad { "\x1b=" } else { "\x1b>" });
     }
 
-    // Mouse reporting mode.
+    // Mouse reporting mode. When the app sets no mode but we're grabbing the
+    // wheel (posh#50), put the outer terminal into SGR mouse reporting instead
+    // of mouse-off, so wheel ticks come back as events the client can turn
+    // into arrows rather than the terminal doing its own wheel→arrow.
+    // grab is constant within a frame, so a grab-state change is always also a
+    // mouse_mode change (None<->Some) — the existing condition already catches
+    // it; no separate last_grab term is needed.
+    let want_grab = f.mouse_mode == 0 && grab;
     if !init || f.mouse_mode != last.mouse_mode {
         if f.mouse_mode == 0 {
-            frame.append("\x1b[?1003l\x1b[?1002l\x1b[?1000l\x1b[?9l");
+            if want_grab {
+                // Clear any higher tracking mode the app left set (1003/1002/9
+                // are independent DECSET registers in real terminals, not the
+                // single field posh-term models), THEN assert the grab's own
+                // Normal+SGR. Without the resets, an app that used ?1003h and
+                // then released the mouse would leave the outer terminal in
+                // any-event reporting on top of the grab's ?1000h.
+                frame.append("\x1b[?1003l\x1b[?1002l\x1b[?9l\x1b[?1000h\x1b[?1006h");
+            } else {
+                frame.append("\x1b[?1003l\x1b[?1002l\x1b[?1000l\x1b[?9l");
+            }
         } else {
             if init && last.mouse_mode != 0 {
                 let _ = write!(frame.out, "\x1b[?{}l", last.mouse_mode);
@@ -513,7 +537,16 @@ pub fn new_frame(initialized: bool, last: &Snapshot, f: &Snapshot) -> Vec<u8> {
     // Mouse encoding.
     if !init || f.mouse_encoding != last.mouse_encoding {
         if f.mouse_encoding == 0 {
-            frame.append("\x1b[?1016l\x1b[?1006l\x1b[?1005l");
+            // Under the wheel-grab, the mouse-mode block above asserted SGR
+            // (?1006h) — and the encoding block must then touch NOTHING:
+            // 1005/1006/1016 are one shared register in xterm-lineage
+            // terminals (posh-term's own csi.rs models the same), so
+            // resetting even the "unused" 1005/1016 knocks the register
+            // back to X10 and the grabbed wheel arrives X10-encoded,
+            // bypassing the client's SGR translation entirely.
+            if !want_grab {
+                frame.append("\x1b[?1016l\x1b[?1006l\x1b[?1005l");
+            }
         } else {
             if init && last.mouse_encoding != 0 {
                 let _ = write!(frame.out, "\x1b[?{}l", last.mouse_encoding);
@@ -829,7 +862,7 @@ mod tests {
 
         let prev_snap = Snapshot::from_term(&prev);
         let next_snap = Snapshot::from_term(&next_term);
-        let diff = new_frame(true, &prev_snap, &next_snap);
+        let diff = new_frame(true, &prev_snap, &next_snap, false);
 
         let mut verify = term_with(rows, cols, prev_bytes);
         verify.process(&diff);
@@ -879,7 +912,7 @@ mod tests {
     fn initial_frame_paints_everything() {
         let next = term_with(5, 20, b"hello\r\nworld");
         let blank = Snapshot::blank(5, 20);
-        let bytes = new_frame(false, &blank, &Snapshot::from_term(&next));
+        let bytes = new_frame(false, &blank, &Snapshot::from_term(&next), false);
         let s = String::from_utf8_lossy(&bytes);
         assert!(s.contains("\x1b[2J"), "first frame clears: {s:?}");
 
@@ -893,11 +926,7 @@ mod tests {
         let prev = term_with(5, 20, b"hello");
         let mut next = term_with(5, 20, b"hello");
         next.process(b" world");
-        let diff = new_frame(
-            true,
-            &Snapshot::from_term(&prev),
-            &Snapshot::from_term(&next),
-        );
+        let diff = new_frame(true, &Snapshot::from_term(&prev), &Snapshot::from_term(&next), false);
         let s = String::from_utf8_lossy(&diff);
         assert!(!s.contains("\x1b[2J"), "no clear-screen in a diff: {s:?}");
         // The unchanged "hello" (and even the blank cell after it) is
@@ -932,11 +961,7 @@ mod tests {
         let prev = term_with(5, 20, b"abc");
         let mut next = term_with(5, 20, b"abc");
         next.process(b"\x1b[4;7H");
-        let diff = new_frame(
-            true,
-            &Snapshot::from_term(&prev),
-            &Snapshot::from_term(&next),
-        );
+        let diff = new_frame(true, &Snapshot::from_term(&prev), &Snapshot::from_term(&next), false);
         let mut verify = term_with(5, 20, b"abc");
         verify.process(&diff);
         assert_eq!(verify.cursor().row, 3);
@@ -957,7 +982,7 @@ mod tests {
     fn identical_states_emit_nothing() {
         let term = term_with(5, 20, b"steady state");
         let snap = Snapshot::from_term(&term);
-        let diff = new_frame(true, &snap, &snap);
+        let diff = new_frame(true, &snap, &snap, false);
         assert!(
             diff.is_empty(),
             "no-op diff should be empty: {:?}",
@@ -1073,7 +1098,7 @@ mod tests {
         // the detector recognizes the identity case (row 0 matches itself).
         let term = term_with(5, 20, FIVE_LINES);
         let snap = Snapshot::from_term(&term);
-        let diff = new_frame(true, &snap, &snap);
+        let diff = new_frame(true, &snap, &snap, false);
         assert!(
             diff.is_empty(),
             "no-op diff should be empty: {:?}",
@@ -1099,8 +1124,8 @@ mod tests {
 
         // Paint the previous (bannered) frame from scratch, then morph.
         let mut verify = Terminal::with_scrollback(5, 40, 0);
-        verify.process(&new_frame(false, &Snapshot::blank(5, 40), &prev_snap));
-        let diff = new_frame(true, &prev_snap, &next_snap);
+        verify.process(&new_frame(false, &Snapshot::blank(5, 40), &prev_snap, false));
+        let diff = new_frame(true, &prev_snap, &next_snap, false);
         verify.process(&diff);
         let s = String::from_utf8_lossy(&diff);
         assert!(!s.contains("\x1b[r"), "no scroll under the banner: {s:?}");
@@ -1192,20 +1217,12 @@ mod tests {
         let prev = term_with(3, 20, b"");
         let mut next = term_with(3, 20, b"");
         next.process(b"\x07");
-        let diff = new_frame(
-            true,
-            &Snapshot::from_term(&prev),
-            &Snapshot::from_term(&next),
-        );
+        let diff = new_frame(true, &Snapshot::from_term(&prev), &Snapshot::from_term(&next), false);
         assert!(diff.contains(&0x07), "remote BEL must ring locally");
 
         let mut copied = term_with(3, 20, b"");
         copied.process(b"\x1b]52;c;aGVsbG8=\x07");
-        let diff = new_frame(
-            true,
-            &Snapshot::from_term(&prev),
-            &Snapshot::from_term(&copied),
-        );
+        let diff = new_frame(true, &Snapshot::from_term(&prev), &Snapshot::from_term(&copied), false);
         let s = String::from_utf8_lossy(&diff);
         assert!(s.contains("\x1b]52;c;aGVsbG8=\x1b\\"), "{s:?}");
 
@@ -1213,13 +1230,13 @@ mod tests {
         // content-based)...
         let before = Snapshot::from_term(&copied);
         copied.process(b"\x1b]52;c;aGVsbG8=\x07");
-        let diff = new_frame(true, &before, &Snapshot::from_term(&copied));
+        let diff = new_frame(true, &before, &Snapshot::from_term(&copied), false);
         let s = String::from_utf8_lossy(&diff);
         assert!(s.contains("\x1b]52;c;aGVsbG8=\x1b\\"), "{s:?}");
 
         // ...and a no-op frame stays silent.
         let snap = Snapshot::from_term(&copied);
-        assert!(new_frame(true, &snap, &snap).is_empty());
+        assert!(new_frame(true, &snap, &snap, false).is_empty());
     }
 
     #[test]
@@ -1227,11 +1244,7 @@ mod tests {
         let prev = term_with(3, 20, b"x");
         let mut next = term_with(3, 20, b"x");
         next.process(b"\x1b]0;new title\x07");
-        let diff = new_frame(
-            true,
-            &Snapshot::from_term(&prev),
-            &Snapshot::from_term(&next),
-        );
+        let diff = new_frame(true, &Snapshot::from_term(&prev), &Snapshot::from_term(&next), false);
         let s = String::from_utf8_lossy(&diff);
         assert!(s.contains("\x1b]0;new title\x07"), "{s:?}");
     }
@@ -1240,11 +1253,7 @@ mod tests {
     fn size_change_forces_repaint() {
         let prev = term_with(5, 20, b"hello");
         let next = term_with(10, 40, b"hello");
-        let diff = new_frame(
-            true,
-            &Snapshot::from_term(&prev),
-            &Snapshot::from_term(&next),
-        );
+        let diff = new_frame(true, &Snapshot::from_term(&prev), &Snapshot::from_term(&next), false);
         let s = String::from_utf8_lossy(&diff);
         assert!(s.contains("\x1b[2J"), "resize repaints: {s:?}");
         let mut verify = Terminal::with_scrollback(10, 40, 0);
@@ -1257,11 +1266,7 @@ mod tests {
         let prev = term_with(3, 20, b"");
         let mut next = term_with(3, 20, b"");
         next.process(b"\x1b[?2004h\x1b[?1000h\x1b[?1006h\x1b[?1h");
-        let diff = new_frame(
-            true,
-            &Snapshot::from_term(&prev),
-            &Snapshot::from_term(&next),
-        );
+        let diff = new_frame(true, &Snapshot::from_term(&prev), &Snapshot::from_term(&next), false);
         let s = String::from_utf8_lossy(&diff);
         assert!(s.contains("\x1b[?2004h"), "{s:?}");
         assert!(s.contains("\x1b[?1000h"), "{s:?}");
@@ -1269,14 +1274,85 @@ mod tests {
         assert!(s.contains("\x1b[?1h"), "{s:?}");
 
         // And turning them back off.
-        let diff_off = new_frame(
-            true,
-            &Snapshot::from_term(&next),
-            &Snapshot::from_term(&prev),
-        );
+        let diff_off = new_frame(true, &Snapshot::from_term(&next), &Snapshot::from_term(&prev), false);
         let s = String::from_utf8_lossy(&diff_off);
         assert!(s.contains("\x1b[?2004l"), "{s:?}");
         assert!(s.contains("\x1b[?1000l"), "{s:?}");
+    }
+
+    #[test]
+    fn grab_puts_outer_terminal_into_mouse_reporting_when_app_has_none() {
+        // posh#50: with the app setting no mouse mode and grab on, the outer
+        // terminal is put into SGR mouse reporting (so the wheel comes back as
+        // events) instead of the usual mouse-off.
+        let term = term_with(3, 20, b"");
+        let snap = Snapshot::from_term(&term);
+        assert_eq!(snap.mouse_mode, 0, "bare prompt: no app mouse mode");
+
+        let grabbed = new_frame(false, &Snapshot::blank(3, 20), &snap, true);
+        let g = String::from_utf8_lossy(&grabbed);
+        assert!(g.contains("\x1b[?1000h"), "grab must enable 1000: {g:?}");
+        assert!(g.contains("\x1b[?1006h"), "grab must enable 1006: {g:?}");
+        assert!(!g.contains("\x1b[?1000l"), "grab must not turn 1000 off: {g:?}");
+        // 1005/1006/1016 are ONE shared encoding register in xterm-lineage
+        // terminals: resetting ANY of them clears SGR back to X10, and X10
+        // wheel events bypass the client's \x1b[< translation. The grabbed
+        // frame must therefore contain no encoding reset whatsoever.
+        for reset in ["\x1b[?1006l", "\x1b[?1005l", "\x1b[?1016l"] {
+            assert!(
+                !g.contains(reset),
+                "grab frame must not touch the encoding register ({reset:?}): {g:?}"
+            );
+        }
+
+        // Without grab, the same bare-prompt frame asserts mouse-off (today).
+        let plain = new_frame(false, &Snapshot::blank(3, 20), &snap, false);
+        let p = String::from_utf8_lossy(&plain);
+        assert!(p.contains("\x1b[?1000l"), "no grab: mouse stays off: {p:?}");
+        assert!(!p.contains("\x1b[?1000h"), "no grab: never enables 1000: {p:?}");
+    }
+
+    #[test]
+    fn grab_clears_higher_tracking_modes_when_app_releases_the_mouse() {
+        // App used any-event tracking (1003), then released it back to a bare
+        // prompt with grab on. The transition frame must turn 1003/1002/9 OFF
+        // (they are independent DECSET registers in real terminals) before
+        // asserting the grab's own 1000 — or the outer terminal is left
+        // reporting every motion on top of the grab.
+        let mut prev = term_with(3, 20, b"");
+        prev.process(b"\x1b[?1003h\x1b[?1006h");
+        let mut next = term_with(3, 20, b"");
+        next.process(b"\x1b[?1003h\x1b[?1006h\x1b[?1003l"); // released
+        assert_eq!(Snapshot::from_term(&next).mouse_mode, 0, "app released");
+
+        let diff = new_frame(
+            true,
+            &Snapshot::from_term(&prev),
+            &Snapshot::from_term(&next),
+            true,
+        );
+        let s = String::from_utf8_lossy(&diff);
+        assert!(s.contains("\x1b[?1003l"), "must clear any-event 1003: {s:?}");
+        assert!(s.contains("\x1b[?1002l"), "must clear button-event 1002: {s:?}");
+        assert!(s.contains("\x1b[?9l"), "must clear X10 9: {s:?}");
+        assert!(s.contains("\x1b[?1000h"), "must assert the grab's 1000: {s:?}");
+        assert!(s.contains("\x1b[?1006h"), "must keep SGR for the grab: {s:?}");
+    }
+
+    #[test]
+    fn grab_defers_to_an_app_that_grabbed_the_mouse_itself() {
+        // When the session app sets its own mouse mode, grab is irrelevant:
+        // the app's mode is asserted verbatim, events pass through untouched.
+        let mut term = term_with(3, 20, b"");
+        term.process(b"\x1b[?1003h\x1b[?1006h"); // app wants any-motion + SGR
+        let snap = Snapshot::from_term(&term);
+        assert_eq!(snap.mouse_mode, 1003);
+
+        let grabbed = new_frame(false, &Snapshot::blank(3, 20), &snap, true);
+        let g = String::from_utf8_lossy(&grabbed);
+        assert!(g.contains("\x1b[?1003h"), "app mode asserted: {g:?}");
+        // The client computes grab=false in this case (grab_active), so this
+        // arg is moot here; the point is the app's own mode is honored.
     }
 
     #[test]
@@ -1286,7 +1362,7 @@ mod tests {
         // and teardown must reset — or the wheel sprays arrow keys at a
         // prompt and the mode leaks to the local shell. github #28.
         let term = term_with(3, 20, b"");
-        let bytes = new_frame(false, &Snapshot::blank(3, 20), &Snapshot::from_term(&term));
+        let bytes = new_frame(false, &Snapshot::blank(3, 20), &Snapshot::from_term(&term), false);
         assert!(
             String::from_utf8_lossy(&bytes).contains("\x1b[?1007l"),
             "initial frame must assert default-off 1007: {:?}",
@@ -1296,17 +1372,9 @@ mod tests {
         let prev = term_with(3, 20, b"");
         let mut next = term_with(3, 20, b"");
         next.process(b"\x1b[?1007h");
-        let diff = new_frame(
-            true,
-            &Snapshot::from_term(&prev),
-            &Snapshot::from_term(&next),
-        );
+        let diff = new_frame(true, &Snapshot::from_term(&prev), &Snapshot::from_term(&next), false);
         assert!(String::from_utf8_lossy(&diff).contains("\x1b[?1007h"));
-        let diff_off = new_frame(
-            true,
-            &Snapshot::from_term(&next),
-            &Snapshot::from_term(&prev),
-        );
+        let diff_off = new_frame(true, &Snapshot::from_term(&next), &Snapshot::from_term(&prev), false);
         assert!(String::from_utf8_lossy(&diff_off).contains("\x1b[?1007l"));
 
         assert!(String::from_utf8_lossy(&close()).contains("\x1b[?1007l"));
@@ -1334,11 +1402,7 @@ mod tests {
         let prev = term_with(3, 20, b"");
         let mut next = term_with(3, 20, b"");
         next.process(b"\x1b[?25l");
-        let diff = new_frame(
-            true,
-            &Snapshot::from_term(&prev),
-            &Snapshot::from_term(&next),
-        );
+        let diff = new_frame(true, &Snapshot::from_term(&prev), &Snapshot::from_term(&next), false);
         assert!(String::from_utf8_lossy(&diff).contains("\x1b[?25l"));
     }
 

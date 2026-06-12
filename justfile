@@ -153,3 +153,27 @@ debug-cargo *ARGS:
 [group("debug")]
 debug-go *ARGS:
     nix shell nixpkgs#go --command bash -c 'cd posht && go {{ ARGS }}'
+
+# Verify POSH_GRAB_MOUSE (#50) end-to-end over a LOCAL loopback server+client
+# pair, using freshly-built worktree binaries (the profile posh may predate the
+# change). Runs posht inside the session; the client takes over your terminal,
+# so run it in the terminal you want to test (e.g. kitty). GRAB is on|off —
+# run both and compare the altscroll receipt in ~/.local/log/posht/. ARGS go
+# to posht (default: --only altscroll). Quit posht normally; detach the client
+# with Ctrl-^ then "." . Debug-only; the hermetic gate is build-rust.
+[group("debug")]
+debug-verify-grab grab="on" *ARGS:
+    #!/usr/bin/env bash
+    set -euo pipefail
+    cd '{{ justfile_directory() }}'
+    args='{{ ARGS }}'; [ -n "$args" ] || args='--only altscroll'
+    nix develop --command cargo build -p posh
+    nix shell nixpkgs#go --command bash -c 'cd posht && go build -o posht .'
+    posh=target/debug/posh
+    # Start the loopback server running posht; it prints "POSH CONNECT <port>
+    # <key>" then detaches. Capture that line from a fifo.
+    fifo=$(mktemp -u); mkfifo "$fifo"; trap 'rm -f "$fifo"' EXIT
+    "$posh" server new -4 -- "$PWD/posht/posht" $args >"$fifo" &
+    read -r _ _ port key < <(grep -m1 '^POSH CONNECT ' "$fifo")
+    echo ">> connecting client (POSH_GRAB_MOUSE={{ grab }}) to 127.0.0.1:$port" >&2
+    POSH_KEY="$key" POSH_GRAB_MOUSE='{{ grab }}' exec "$posh" client -4 127.0.0.1 "$port"
