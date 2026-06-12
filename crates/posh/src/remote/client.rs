@@ -47,6 +47,11 @@ pub fn run(host: &str, port: u16, family: Family) -> Result<()> {
     let addr = resolve(host, port, family)?;
     let conn = Connection::client(addr, &key)?;
 
+    // Handlers go in before raw mode and the takeover write: the first
+    // byte on the tty is the outside world's readiness signal, and a
+    // SIGTERM racing it must find the handler installed, not the default
+    // disposition (github #48).
+    util::install_client_signal_handlers();
     let raw = RawMode::enable(STDIN)?;
     // Take over the alternate screen (mosh smcup); close() below restores
     // the user's pre-connect shell screen on the way out.
@@ -119,7 +124,6 @@ fn client_loop(
     raw: &RawMode,
     port: u16,
 ) -> Result<i32> {
-    util::install_client_signal_handlers();
     util::set_nonblocking(STDIN)?;
 
     let (rows, cols) = pty::term_size(STDOUT);

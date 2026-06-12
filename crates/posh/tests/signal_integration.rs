@@ -479,6 +479,88 @@ fn remote_client_exits_cleanly_on_sigterm() {
     );
 }
 
+#[test]
+fn remote_client_exits_cleanly_on_sigterm_during_takeover_write() {
+    // github #48: the takeover write is the client's first observable
+    // output — the readiness signal the world keys on — so the SIGTERM
+    // handler must already be installed when that write lands. Park the
+    // client in exactly that window by giving it a stdout pipe with zero
+    // free space: the takeover write blocks until the test drains. A
+    // SIGTERM delivered there must wind down via the shutdown handshake,
+    // not the default disposition.
+    let (port, key) = start_server("62600:62699", &["sleep", "300"], &[]);
+
+    // stdin stays a tty (RawMode needs one); stdout is the stuffed pipe.
+    let (master, slave) = open_pty_pair();
+    let mut pipe_fds = [0 as RawFd; 2];
+    assert_eq!(unsafe { libc::pipe(pipe_fds.as_mut_ptr()) }, 0, "pipe failed");
+    let (pipe_rd, pipe_wr) = (pipe_fds[0], pipe_fds[1]);
+    unsafe {
+        // Fill to capacity (chunks, then single bytes so not even a
+        // 14-byte takeover write fits) through a temporarily nonblocking
+        // write end; the client inherits it blocking so its write parks.
+        let flags = libc::fcntl(pipe_wr, libc::F_GETFL);
+        libc::fcntl(pipe_wr, libc::F_SETFL, flags | libc::O_NONBLOCK);
+        let junk = [0u8; 4096];
+        while libc::write(pipe_wr, junk.as_ptr() as *const libc::c_void, junk.len()) > 0 {}
+        while libc::write(pipe_wr, junk.as_ptr() as *const libc::c_void, 1) > 0 {}
+        libc::fcntl(pipe_wr, libc::F_SETFL, flags);
+        let rflags = libc::fcntl(pipe_rd, libc::F_GETFL);
+        libc::fcntl(pipe_rd, libc::F_SETFL, rflags | libc::O_NONBLOCK);
+    }
+
+    let stdio = |fd: RawFd| unsafe { Stdio::from_raw_fd(fd) };
+    let mut cmd = posh_cmd();
+    cmd.args(["client", "127.0.0.1", &port])
+        .env("LC_ALL", "C.UTF-8")
+        .env("POSH_KEY", key);
+    let mut child = cmd
+        .stdin(stdio(unsafe { libc::dup(slave) }))
+        .stdout(stdio(pipe_wr))
+        .stderr(stdio(slave))
+        .spawn()
+        .expect("spawn posh on pty");
+    let pid = child.id() as libc::pid_t;
+
+    // Raw mode appearing on the pty is the last observable step before
+    // the takeover write: once it shows, the client is at (or parked in)
+    // that write, and a correctly ordered client has its handlers up.
+    let deadline = Instant::now() + Duration::from_secs(10);
+    loop {
+        let mut tio = unsafe { std::mem::zeroed::<libc::termios>() };
+        assert_eq!(unsafe { libc::tcgetattr(master, &mut tio) }, 0, "tcgetattr");
+        if tio.c_lflag & libc::ICANON == 0 {
+            break;
+        }
+        assert!(Instant::now() < deadline, "client never entered raw mode");
+        std::thread::sleep(Duration::from_millis(10));
+    }
+
+    unsafe { libc::kill(pid, libc::SIGTERM) };
+    // Let the signal land while the write is still parked, then drain so
+    // the client can reach its event loop and run the handshake.
+    std::thread::sleep(Duration::from_millis(100));
+
+    let deadline = Instant::now() + Duration::from_secs(15);
+    let status = loop {
+        drain(master);
+        drain(pipe_rd);
+        if let Some(status) = child.try_wait().expect("try_wait") {
+            break status;
+        }
+        if Instant::now() >= deadline {
+            let _ = child.kill();
+            panic!("client did not exit within 15s of SIGTERM");
+        }
+        std::thread::sleep(Duration::from_millis(25));
+    };
+    assert_eq!(
+        status.code(),
+        Some(0),
+        "SIGTERM during the takeover write must wind down cleanly, got {status:?}"
+    );
+}
+
 /// Starts a detached `posh server` with `command`, parses POSH CONNECT, and
 /// returns (port, key).
 fn start_server(port_range: &str, command: &[&str], envs: &[(&str, &str)]) -> (String, String) {
