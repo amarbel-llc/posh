@@ -7,10 +7,12 @@ date: 2026-06-12
 
 ## What
 
-`posh -A box:dev` makes the user's local ssh-agent reachable from shells
+`posh box:dev` makes the user's local ssh-agent reachable from shells
 on `box` — `git push`, `ssh`, `scp` inside a posh session authenticate
 against the agent on the machine the user is physically at — with posh
-carrying the agent protocol over its own roaming UDP transport. With
+carrying the agent protocol over its own roaming UDP transport.
+Forwarding is on by default whenever a local agent is available
+(opt-out `-a`); `--forward-agent=PATH` forwards a specific socket. With
 multiple posh connections to the same host, the agent is forwarded once:
 one stable `SSH_AUTH_SOCK` path on the remote host, one live forwarding
 channel serving it. A second phase scopes a client-side connection mux
@@ -77,13 +79,44 @@ from them.
 
 ### 1. Negotiation and CLI surface
 
-- `posh -A host`, `posh -A host:session` (long form `--forward-agent`;
-  env `POSH_FORWARD_AGENT=1`). Default **off**, matching OpenSSH. With
-  `-A` but no usable local `$SSH_AUTH_SOCK`: warn and continue without
-  forwarding (OpenSSH behavior).
-- The bootstrap remote command gains the flag: `posh-server new -A …`
-  (C4). The server prepares the remote endpoint and exports
-  `SSH_AUTH_SOCK` only when started with `-A`.
+- **Default on, best-effort.** Every roaming connection forwards the
+  agent when a usable source socket exists; with none, it silently
+  proceeds without forwarding. This diverges from OpenSSH's default
+  deliberately: posh targets are overwhelmingly the user's own hosts,
+  per-invocation opt-in fits long-lived reattach workflows badly, and
+  the stable remote endpoint only pulls its weight if most connections
+  participate. The exposure this adds is owned in Security
+  considerations, not hand-waved.
+- **Flag surface** (resolution order: flag > env > default):
+  - `-a` / `--no-forward-agent` disables for this connection;
+    `POSH_FORWARD_AGENT=no` (or `0`) disables by default from the
+    environment — the profile-level opt-out for users who roam to
+    hosts they don't trust.
+  - `-A` / `--forward-agent` is an *explicit* enable: unlike the
+    best-effort default, a missing or unconnectable source socket
+    warns loudly (and forwarding stays off) rather than passing
+    silently.
+  - `--forward-agent=PATH` (equivalently `POSH_FORWARD_AGENT=PATH`,
+    any value that isn't a yes/no word) forwards PATH instead of
+    `$SSH_AUTH_SOCK` — a second agent, gpg-agent's ssh socket, etc.;
+    the same shape as OpenSSH 8.2's `ForwardAgent <path>`. The path
+    rides only in the *local* client (it is where channels connect, §5);
+    nothing about it appears on the wire or the remote host. Bare `-A`
+    stays a boolean — the path form is long-option-with-`=` only, so
+    `-A host` can never swallow the target word.
+- The source socket is resolved once at client startup; each channel
+  `OPEN` connects to that resolved path. A path that dies mid-session
+  degrades to per-request `FAIL` like any unreachable agent.
+- The bootstrap remote command carries the *outcome*, not the policy:
+  the client appends `-A` to `posh-server new …` (C4) only when
+  forwarding is actually active. The server prepares the remote
+  endpoint and exports `SSH_AUTH_SOCK` only when started with `-A`, so
+  disabled or agent-less connections leave the symlink machinery
+  completely untouched.
+- **Chaining falls out for free:** inside a forwarded posh session,
+  `SSH_AUTH_SOCK` points at `agent/sock`, so a nested `posh box2:…`
+  picks it up by default and forwards the chain another hop, requests
+  flowing all the way back to the origin agent.
 - On the wire, three new capability ids (RFC 0001 registry; final
   numbers at allocation time — see Open questions):
 
@@ -156,7 +189,7 @@ resolution (`POSH_DIR` > `XDG_RUNTIME_DIR/posh` > `TMPDIR/posh-{uid}` >
   pattern. No lock, no election protocol.
 - `SSH_AUTH_SOCK=<base>/agent/sock` is exported by posh-server before
   exec'ing the inner command (C5). That one path covers plain
-  `posh -A host` shells and sessions created through the connection
+  plain `posh host` shells and sessions created through the connection
   alike, and stays valid across detach/reattach forever.
 - **Liveness/takeover:** a server answers its unix clients only while
   its peer is active (heard within `AGENT_PEER_ACTIVE`, default 15 s —
@@ -167,7 +200,7 @@ resolution (`POSH_DIR` > `XDG_RUNTIME_DIR/posh` > `TMPDIR/posh-{uid}` >
   inactive, repoint to self. A request outstanding longer than
   `AGENT_REQUEST_TMOUT` (10 s) also returns `SSH_AGENT_FAILURE`.
 - "Forwarded once" semantics: there is one designated endpoint at one
-  stable path. Additional `-A` connections cost only their 2-byte
+  stable path. Additional forwarding-active connections cost only their 2-byte
   `AGENT_FORWARD` table entry until the symlink points at them; idle
   channels generate zero wire traffic. (Direct connections to a
   specific `srv-<pid>.sock` keep working — deterministic routing for
@@ -190,10 +223,10 @@ clients block on their unix socket meanwhile.
 | Situation | Behavior |
 |---|---|
 | Client roams / briefly offline | Requests stall up to `AGENT_PEER_ACTIVE`, then `SSH_AGENT_FAILURE`; channel stream resumes intact if the peer returns before the request timeout. |
-| Owning connection quits | Symlink repointed by the next live `-A` connection within one slow tick; until then `SSH_AGENT_FAILURE` (dangling-symlink `connect` fails fast). |
-| No `-A` connection at all | `SSH_AUTH_SOCK` points at a dangling symlink → immediate `ECONNREFUSED`/`ENOENT`, the same UX as a killed ssh-agent. |
+| Owning connection quits | Symlink repointed by the next live forwarding-active connection within one slow tick; until then `SSH_AGENT_FAILURE` (dangling-symlink `connect` fails fast). |
+| No forwarding-active connection at all | `SSH_AUTH_SOCK` points at a dangling symlink → immediate `ECONNREFUSED`/`ENOENT`, the same UX as a killed ssh-agent. |
 | Local agent gone | `FAIL` → `SSH_AGENT_FAILURE` per request. |
-| Session created without `-A`, attached later with `-A` | Shell env lacks/has stale `SSH_AUTH_SOCK` — not retrofittable without new IPC; documented, follow-up below. |
+| Session created while forwarding was off (opt-out, or no local agent) and attached later with forwarding on | Shell env lacks `SSH_AUTH_SOCK` — rarer under default-on, but not retrofittable without new IPC; documented, follow-up below. |
 
 ## Phase 2: connection mux (the ControlMaster analog)
 
@@ -259,11 +292,20 @@ implementation.
 
 - **Same trust model as `ssh -A`, and the same warning applies:**
   anyone with the same uid (or root) on the remote host can use the
-  forwarded agent while a connection is live. Forwarding is opt-in
-  per connection; the man page should recommend confirm-constrained
-  keys (`ssh-add -c`) for hostile-ish hosts. A compromised posh-server
+  forwarded agent while a connection is live. A compromised posh-server
   can request signatures at will while connected — inherent to agent
   forwarding, not introduced by this design.
+- **Default-on is a real posture change** relative to OpenSSH and must
+  be documented as such: every roaming connection exposes the agent to
+  the remote host unless opted out. Accepted because posh targets are
+  typically the user's own machines, and mitigated three ways: a
+  profile-level kill switch (`POSH_FORWARD_AGENT=no`) plus per-connection
+  `-a`; the man page recommending confirm-constrained keys
+  (`ssh-add -c`) for semi-trusted hosts; and the per-request client
+  notice (Open questions §3), which default-on argues for shipping
+  enabled. Note the agent only ever *signs* — keys never leave the
+  local machine — and nothing is reachable once the connection's
+  client goes inactive (`AGENT_PEER_ACTIVE`).
 - **Endpoint hardening:** `agent/` reuses the 0700/self-owned/no-symlink
   validation of the session dir (github #7); sockets are unlinked-on-exit
   and pid-scoped; symlink repointing is rename-atomic inside the
@@ -311,8 +353,12 @@ No new dependencies; no async runtime; macOS/Linux portability per ADR
    `agent/sock`): proposed **out of scope** as a follow-up issue —
    independently useful, orthogonal machinery.
 3. **Per-request notice** (one-line client banner "agent signature
-   requested by box", rate-limited): cheap and good for awareness, but
-   noisy under heavy git use. Default off / omit in v1?
+   requested by box", rate-limited): cheap, and default-on forwarding
+   strengthens the case for shipping it enabled — it is the only
+   ambient signal that a remote host is using the agent. Noisy under
+   heavy git use, hence rate-limited (e.g. one line per host per
+   minute). Proposal: in v1, enabled, `POSH_AGENT_NOTICE=no` to
+   silence.
 4. **`posh ssh -A`** (the plain ssh wrapper): pass through to real ssh
    semantics or route through posh forwarding? Proposal: `posh ssh`
    stays a thin wrapper; only roaming targets get posh forwarding.
