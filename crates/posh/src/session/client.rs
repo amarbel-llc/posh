@@ -75,6 +75,11 @@ pub fn cmd_attach(
     let stream = UnixStream::connect(&path)
         .map_err(|e| Error(format!("connect {}: {e}", path.display())))?;
 
+    // Handlers go in before raw mode and the takeover write: the first
+    // byte on the tty is the outside world's readiness signal, and a
+    // SIGTERM racing it must find the handler installed, not the default
+    // disposition (github #49, the attach sibling of #48).
+    util::install_client_signal_handlers();
     let raw = RawMode::enable(STDIN)?;
     // Take over the alternate screen before the daemon replays the
     // session state; the user's shell screen waits underneath.
@@ -168,7 +173,6 @@ impl DetachMatcher {
 /// `enter` is re-written on SIGCONT, when the outer terminal may have
 /// left our alternate screen while we were stopped.
 fn client_loop(stream: UnixStream, enter: &[u8]) -> Result<i32> {
-    util::install_client_signal_handlers();
     stream.set_nonblocking(true)?;
     let sock_fd = stream.as_raw_fd();
     util::set_nonblocking(STDIN)?;
