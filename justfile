@@ -185,47 +185,69 @@ bump-version new_version:
     cd '{{ justfile_directory() }}'
     sed -E -i 's/^(export POSH_VERSION)=.*/\1={{ new_version }}/' version.env
 
-# Sign + push a tag named after the current version.env. The "v" prefix
-# is added for you. Usage: just tag "release v0.1.1"
+# Sign + push the tag named after version.env (the "v" prefix is added for
+# you), then verify the signature. `message` is declared with a leading `$`
+# so just exports it into the environment instead of {{ }}-splicing it into
+# the script — a changelog body with backticks or $(...) would otherwise be
+# re-parsed by bash into the annotation (eng-versioning(7) § tag recipe).
+# Usage: just tag "posh v0.1.1"
 [group("maintenance")]
-tag message:
+tag $message:
     #!/usr/bin/env bash
     set -euo pipefail
     cd '{{ justfile_directory() }}'
     . version.env
     tag="v${POSH_VERSION:?missing POSH_VERSION in version.env}"
-    git tag -s -m "{{ message }}" "$tag"
+    git tag -s -m "$message" "$tag"
+    gum log --level info "created tag $tag"
     git push origin "$tag"
-    echo "pushed tag $tag"
+    gum log --level info "pushed $tag"
+    git tag -v "$tag"
 
-# Cut a release: must be run on the default branch. Generates a
-# changelog (commits since the previous v* tag) BEFORE bumping so the
-# bump commit doesn't appear in its own changelog, then bumps version.env
-# (the only versioned file), commits, signs+pushes a v<sem> tag, and
-# creates a GitHub release whose body is the changelog.
-# Usage: just release 0.1.1
+# Cut a release from the default branch (eng-versioning(7) § release):
+# refuse off master; generate the changelog (commits since the previous v*
+# tag) BEFORE bumping so the bump commit isn't in its own changelog; bump
+# version.env (the only versioned file — Pattern B, no Cargo.toml resync),
+# commit, sign+push+verify a v<sem> tag, and create the GitHub release with
+# the changelog as the body. The bump+commit is idempotent: skipped when
+# version.env already holds <new>. Usage: just release 0.1.1
 [group("maintenance")]
 release new_version:
     #!/usr/bin/env bash
     set -euo pipefail
     cd '{{ justfile_directory() }}'
+
+    # Release only from the default branch.
+    branch="$(git rev-parse --abbrev-ref HEAD)"
+    if [ "$branch" != "master" ]; then
+        gum log --level error "release only allowed from master (on '$branch')"
+        exit 1
+    fi
+
     header="posh v{{ new_version }}"
-    # Commits since the last v* tag (all history when none exists yet).
+    # Commits since the last v* tag (all history when none exists yet),
+    # computed BEFORE the bump so the bump commit isn't in its own changelog.
     last_tag="$(git describe --tags --abbrev=0 --match 'v*' 2>/dev/null || true)"
     if [ -n "$last_tag" ]; then
-      range="${last_tag}..HEAD"
+        changelog="$(git log --no-merges --pretty='- %s' "${last_tag}..HEAD")"
     else
-      range=""
+        changelog="$(git log --no-merges --pretty='- %s')"
     fi
-    changelog="$(git log --no-merges --pretty='- %s' $range)"
     notes="$header"$'\n\n'"${changelog:-- (no changes recorded)}"
 
-    just bump-version "{{ new_version }}"
-    git add version.env
-    git commit -m "$header"
+    # Idempotent bump: skip when version.env already holds the target, else
+    # `git commit` would abort with "nothing to commit".
+    . version.env
+    if [ "${POSH_VERSION:-}" != "{{ new_version }}" ]; then
+        just bump-version "{{ new_version }}"
+        git add version.env
+        git commit -m "$header"
+    else
+        gum log --level info "version.env already at {{ new_version }}; skipping bump/commit"
+    fi
 
-    just tag "$header"
-
+    # The full changelog rides as the tag annotation (safe via tag's $message).
+    just tag "$notes"
     gh release create "v{{ new_version }}" --title "$header" --notes "$notes"
 
 # --- debug -----------------------------------------------------------------

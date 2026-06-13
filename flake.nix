@@ -272,6 +272,8 @@
               pkgs.cargo # Rust workspace dev-loop (just debug-cargo)
               pkgs.rustc
               pkgs.scdoc # compile/lint doc/*.scd man pages (just lint-doc)
+              pkgs.gum # terminal UI for the maintenance recipes (eng-versioning(7))
+              pkgs.gh # `just release` -> gh release create
               treefmtEval.config.build.wrapper
             ];
         };
