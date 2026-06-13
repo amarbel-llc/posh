@@ -59,6 +59,21 @@ pub struct Stats {
     dump_vt_count: u64,
 }
 
+/// Client prediction gauges sampled at flush time (POSH_DEBUG_LOG). Bundled so
+/// the flush signatures don't sprout a dozen positional `u64`s that are easy to
+/// transpose. `active`/`shown`/`epoch_lag` are instantaneous; the rest are
+/// cumulative counters.
+#[derive(Clone, Copy, Default)]
+pub struct PredictSample {
+    pub active: bool,
+    pub shown: u64,
+    pub epoch_lag: u64,
+    pub resets: u64,
+    pub correct: u64,
+    pub nocredit: u64,
+    pub incorrect: u64,
+}
+
 impl Stats {
     /// Reads `$POSH_DEBUG_LOG`; on a non-empty path that `log_init` accepts the
     /// collector is enabled, otherwise it is an inert no-op.
@@ -210,15 +225,14 @@ impl Stats {
         srtt: f64,
         rto: u64,
         send_interval: u64,
-        predict_active: bool,
+        predict: PredictSample,
         srtt_trig: bool,
         bytes_rx: u64,
         bytes_tx: u64,
     ) {
         if self.should_flush(now) {
             self.emit_client(
-                "client", now, srtt, rto, send_interval, predict_active, srtt_trig, bytes_rx,
-                bytes_tx,
+                "client", now, srtt, rto, send_interval, predict, srtt_trig, bytes_rx, bytes_tx,
             );
         }
     }
@@ -231,15 +245,15 @@ impl Stats {
         srtt: f64,
         rto: u64,
         send_interval: u64,
-        predict_active: bool,
+        predict: PredictSample,
         srtt_trig: bool,
         bytes_rx: u64,
         bytes_tx: u64,
     ) {
         if self.enabled {
             self.emit_client(
-                "client final", now, srtt, rto, send_interval, predict_active, srtt_trig,
-                bytes_rx, bytes_tx,
+                "client final", now, srtt, rto, send_interval, predict, srtt_trig, bytes_rx,
+                bytes_tx,
             );
         }
     }
@@ -252,7 +266,7 @@ impl Stats {
         srtt: f64,
         rto: u64,
         send_interval: u64,
-        predict_active: bool,
+        predict: PredictSample,
         srtt_trig: bool,
         bytes_rx: u64,
         bytes_tx: u64,
@@ -263,14 +277,22 @@ impl Stats {
             &format!(
                 "{label} srtt={srtt:.0}ms rto={rto}ms send_int={send_interval}ms \
                  frames rx={} (full={} diff={} empty={}) bytes_rx={bytes_rx} bw_down={} \
-                 predict active={} srtt_trig={} render writes={} bytes_out={} skipped_idle={} \
+                 predict active={} shown={} epoch_lag={} resets={} \
+                 correct={} nocredit={} incorrect={} srtt_trig={} \
+                 render writes={} bytes_out={} skipped_idle={} \
                  apply_us={} compose_us={}",
                 self.frames_total,
                 self.frames_full,
                 self.frames_diff,
                 self.frames_empty,
                 human_rate(bw_down),
-                predict_active as u8,
+                predict.active as u8,
+                predict.shown,
+                predict.epoch_lag,
+                predict.resets,
+                predict.correct,
+                predict.nocredit,
+                predict.incorrect,
                 srtt_trig as u8,
                 self.render_writes,
                 self.render_bytes_out,
@@ -417,7 +439,17 @@ mod tests {
     fn emit_resets_dirty_and_advances_window() {
         let mut s = enabled_stats();
         s.record_frame_full();
-        s.emit_client("client", 2000, 50.0, 200, 30, false, false, 4096, 1024);
+        s.emit_client(
+            "client",
+            2000,
+            50.0,
+            200,
+            30,
+            PredictSample::default(),
+            false,
+            4096,
+            1024,
+        );
         assert!(!s.dirty, "emit clears the dirty flag");
         assert_eq!(s.last_flush, 2000);
         assert_eq!(s.last_bytes_rx, 4096);
@@ -448,7 +480,21 @@ mod tests {
         c.record_frame_diff();
         c.record_apply_us(40);
         c.record_compose_us(60);
-        c.emit_client("client", 1000, 42.0, 200, 21, true, false, 8192, 256);
+        c.emit_client(
+            "client",
+            1000,
+            42.0,
+            200,
+            21,
+            PredictSample {
+                active: true,
+                shown: 1,
+                ..Default::default()
+            },
+            false,
+            8192,
+            256,
+        );
 
         let mut s = enabled_stats();
         s.record_frame_full();
@@ -462,7 +508,7 @@ mod tests {
             "client srtt=42ms",
             "frames rx=1 (full=0 diff=1",
             "bw_down=",
-            "predict active=1 srtt_trig=0",
+            "predict active=1 shown=1 epoch_lag=0 resets=0 correct=0 nocredit=0 incorrect=0 srtt_trig=0",
             "apply_us=40",
             "compose_us=60",
         ] {

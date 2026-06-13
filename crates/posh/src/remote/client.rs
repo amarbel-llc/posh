@@ -14,7 +14,7 @@ use crate::remote::crypto::Key;
 use crate::remote::datagram::{Connection, Family};
 use crate::remote::display::{self, NotificationEngine, Snapshot};
 use crate::remote::predict::{DisplayPreference, PredictionEngine};
-use crate::remote::stats::Stats;
+use crate::remote::stats::{PredictSample, Stats};
 use crate::remote::sync::{
     self, ClientMessage, FragmentAssembly, Fragmenter, FrameBody, InputOutbox, ServerFrame,
     HEARTBEAT_INTERVAL,
@@ -218,7 +218,7 @@ fn client_loop(
         st.conn.srtt(),
         st.conn.rto(),
         st.conn.send_interval(),
-        st.predict.active(),
+        predict_sample(&st.predict),
         st.predict.srtt_trigger_on(),
         st.conn.bytes_rx(),
         st.conn.bytes_tx(),
@@ -369,7 +369,7 @@ fn drive_client(st: &mut ClientState, raw: &RawMode, port: u16) -> Result<i32> {
             st.conn.srtt(),
             st.conn.rto(),
             st.conn.send_interval(),
-            st.predict.active(),
+            predict_sample(&st.predict),
             st.predict.srtt_trigger_on(),
             st.conn.bytes_rx(),
             st.conn.bytes_tx(),
@@ -809,6 +809,20 @@ fn compose_frame(st: &mut ClientState, now: u64) -> Vec<u8> {
         st.stats.record_compose_us(t.elapsed().as_micros() as u64);
     }
     bytes
+}
+
+/// Snapshots the prediction engine's display gauges for the stats log.
+fn predict_sample(predict: &PredictionEngine) -> PredictSample {
+    let (correct, nocredit, incorrect) = predict.prediction_outcomes();
+    PredictSample {
+        active: predict.active(),
+        shown: predict.shown_cells(),
+        epoch_lag: predict.epoch_lag(),
+        resets: predict.mispredict_resets(),
+        correct,
+        nocredit,
+        incorrect,
+    }
 }
 
 fn send_message(st: &mut ClientState) {

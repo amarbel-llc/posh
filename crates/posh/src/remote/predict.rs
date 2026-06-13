@@ -362,6 +362,16 @@ pub struct PredictionEngine {
 
     display_preference: DisplayPreference,
     predict_overwrite: bool,
+
+    /// Cumulative count of misprediction resets (a prediction validated wrong
+    /// against a server frame, wiping the whole overlay). Instrumentation only.
+    mispredict_resets: u64,
+    /// Cumulative per-cell validation outcomes (instrumentation only). Only
+    /// `pred_correct` advances `confirmed_epoch`; the split tells confirmation
+    /// failure (nocredit dominates) from thrash (incorrect dominates).
+    pred_correct: u64,
+    pred_nocredit: u64,
+    pred_incorrect: u64,
 }
 
 impl PredictionEngine {
@@ -384,6 +394,10 @@ impl PredictionEngine {
             last_width: 0,
             display_preference,
             predict_overwrite,
+            mispredict_resets: 0,
+            pred_correct: 0,
+            pred_nocredit: 0,
+            pred_incorrect: 0,
         }
     }
 
@@ -445,6 +459,44 @@ impl PredictionEngine {
                 .overlays
                 .iter()
                 .any(|row| row.cells.iter().any(|c| c.active))
+    }
+
+    /// Cells that `apply()` would actually paint right now: shown by the
+    /// adaptive trigger AND past the tentative-epoch gate. The honest "is local
+    /// echo visible" gauge, vs `active()` which also counts hidden predictions.
+    pub fn shown_cells(&self) -> u64 {
+        if !self.shown() {
+            return 0;
+        }
+        self.overlays
+            .iter()
+            .flat_map(|row| row.cells.iter())
+            .filter(|c| c.active && !c.tentative(self.confirmed_epoch))
+            .count() as u64
+    }
+
+    /// How far prediction has run ahead of confirmation
+    /// (`prediction_epoch - confirmed_epoch`). Healthy sessions sit at 0-1; a
+    /// growing lag means predictions are not being confirmed and so stay
+    /// hidden behind the tentative-epoch gate.
+    pub fn epoch_lag(&self) -> u64 {
+        self.prediction_epoch.saturating_sub(self.confirmed_epoch)
+    }
+
+    /// Cumulative misprediction resets: a prediction validated wrong against a
+    /// server frame, wiping the overlay. Rising during typing means predictions
+    /// are thrashing (re-bumping the epoch) rather than confirming.
+    pub fn mispredict_resets(&self) -> u64 {
+        self.mispredict_resets
+    }
+
+    /// Cumulative per-cell validation outcomes: (correct-with-credit,
+    /// correct-no-credit, incorrect-or-expired). Only `correct` advances
+    /// `confirmed_epoch`; `nocredit` climbing while `correct` stays flat is
+    /// confirmation failure (predictions resolve but never un-hide), whereas
+    /// `incorrect` climbing is thrash.
+    pub fn prediction_outcomes(&self) -> (u64, u64, u64) {
+        (self.pred_correct, self.pred_nocredit, self.pred_incorrect)
     }
 
     /// True when timing-based triggers may still fire: the caller should
@@ -586,6 +638,9 @@ impl PredictionEngine {
         let mut confirmed_epoch = self.confirmed_epoch;
         let mut glitch_trigger = self.glitch_trigger;
         let mut last_quick = self.last_quick_confirmation;
+        let mut n_correct = 0u64;
+        let mut n_nocredit = 0u64;
+        let mut n_incorrect = 0u64;
         let experimental = self.display_preference == DisplayPreference::Experimental;
 
         self.overlays.retain(|row| row.row_num < fb.rows);
@@ -595,6 +650,7 @@ impl PredictionEngine {
                 let validity = row.cells[j].get_validity(fb, row_num, late_ack);
                 match validity {
                     Validity::IncorrectOrExpired => {
+                        n_incorrect += 1;
                         let cell = &mut row.cells[j];
                         if cell.tentative(confirmed_epoch) {
                             if experimental {
@@ -610,6 +666,7 @@ impl PredictionEngine {
                         }
                     }
                     Validity::Correct => {
+                        n_correct += 1;
                         if row.cells[j].tentative_until_epoch > confirmed_epoch {
                             confirmed_epoch = row.cells[j].tentative_until_epoch;
                         }
@@ -631,6 +688,7 @@ impl PredictionEngine {
                         row.cells[j].reset();
                     }
                     Validity::CorrectNoCredit => {
+                        n_nocredit += 1;
                         row.cells[j].reset();
                     }
                     Validity::Pending => {
@@ -651,8 +709,12 @@ impl PredictionEngine {
         self.confirmed_epoch = confirmed_epoch;
         self.glitch_trigger = glitch_trigger;
         self.last_quick_confirmation = last_quick;
+        self.pred_correct += n_correct;
+        self.pred_nocredit += n_nocredit;
+        self.pred_incorrect += n_incorrect;
 
         if do_reset {
+            self.mispredict_resets += 1;
             self.reset();
             return;
         }
@@ -670,6 +732,7 @@ impl PredictionEngine {
             if experimental {
                 self.cursors.clear();
             } else {
+                self.mispredict_resets += 1;
                 self.reset();
                 return;
             }
