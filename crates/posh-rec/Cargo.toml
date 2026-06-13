@@ -1,0 +1,14 @@
+[package]
+name = "posh-rec"
+# Own version lineage, independent of POSH_VERSION: posh-rec is designed to
+# be a general, separable terminal recorder/replayer (cross-consumable by
+# crap and other terminal projects), so it does not share the posh binary's
+# version.env single-source-of-truth. Mirrors how posht keeps its own.
+version = "0.1.0"
+description = "Deterministic, step-ratcheted terminal recorder/replayer built on posh-term"
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+
+[dependencies]
+posh-term = { path = "../posh-term" }

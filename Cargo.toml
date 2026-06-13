@@ -1,6 +1,6 @@
 [workspace]
 resolver = "2"
-members = ["crates/posh-term", "crates/posh"]
+members = ["crates/posh-term", "crates/posh", "crates/posh-rec"]
 
 [workspace.package]
 edition = "2021"
