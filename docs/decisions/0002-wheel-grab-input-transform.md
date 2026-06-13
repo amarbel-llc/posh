@@ -74,3 +74,4 @@ A byte-fed machine cannot know whether a trailing `ESC` begins a mouse sequence 
 * Implementation: `crates/posh/src/remote/client.rs` — `MouseFilter` / `MouseState`, `grab_active`, the `process_user_input` grab branch; state held in `ClientState.mouse_filter`.
 * Lineage: mosh `zz-mosh/src/terminal/terminaluserinput.{h,cc}` (byte-fed `UserInput` with persistent `state`); posh-term `crates/posh-term/src/parser.rs` (Williams VT500 machine), the same incremental pattern this filter mirrors.
 * Not chosen, revisitable: if a future need makes the lone-Esc delay perceptible in practice, the standard fix is a timeout flush in the client poll loop (the `ttimeoutlen` approach) — add it then, not pre-emptively.
+* Generalized by ADR-0003 (`0003-stream-reassembly-across-reads.md`): `MouseFilter` is one of five instances of the repo-wide "carry partials across reads" convention; 0003 records the pattern and why the instances are kept separate rather than abstracted.
