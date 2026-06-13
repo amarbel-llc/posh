@@ -147,13 +147,30 @@
           src = ./.;
           cargoLock.lockFile = ./Cargo.lock;
 
+          # scdoc compiles the hand-written man pages in doc/*.scd during
+          # postInstall. See eng-manpages(7) and doc/.
+          nativeBuildInputs = [ pkgs.scdoc ];
+
           doCheck = true;
 
           # mosh-server parity: the ssh bootstrap runs `posh-server new` on
           # the remote host, so the package provides that name too (same
           # binary; `posh-server ...` == `posh server ...` via argv[0]).
+          #
+          # Man pages: compile every doc/*.scd into the matching man section,
+          # deriving the section from the filename suffix (posh.1.scd ->
+          # man1/posh.1). They land in this binary's own $out, so a consumer
+          # home-manager `programs.man` surfaces them with no extra wiring.
+          # See eng-manpages(7).
           postInstall = ''
             ln -s posh $out/bin/posh-server
+            for f in doc/*.scd; do
+              stem="$(basename "$f" .scd)"          # e.g. posh.1
+              section="''${stem##*.}"               # 1
+              name="''${stem%.*}"                   # posh
+              mkdir -p "$out/share/man/man''${section}"
+              scdoc < "$f" > "$out/share/man/man''${section}/''${name}.''${section}"
+            done
           '';
 
           meta = with lib; {
@@ -220,6 +237,7 @@
               pkgs.clang-tools # clang-format for the devShell + editor LSP
               pkgs.cargo # Rust workspace dev-loop (just debug-cargo)
               pkgs.rustc
+              pkgs.scdoc # compile/lint doc/*.scd man pages (just lint-doc)
               treefmtEval.config.build.wrapper
             ];
         };

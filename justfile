@@ -20,7 +20,7 @@ validate-devshell:
     system=$(nix eval --raw --impure --expr 'builtins.currentSystem')
     nix build --no-link --show-trace ".#devShells.${system}.default"
 
-lint: lint-fmt
+lint: lint-fmt lint-doc
 
 # Read-only formatting gate (fails if treefmt would change anything).
 [group("pre-build")]
@@ -32,6 +32,25 @@ lint-fmt:
     # counterpart is `codemod-fmt-treefmt`. They share ./treefmt.nix.
     system=$(nix eval --raw --impure --expr 'builtins.currentSystem')
     nix build ".#checks.${system}.formatting" --no-link --print-build-logs
+
+# Compile every doc/*.scd man page, failing on any scdoc parse error
+# (the nested-inline-formatting / leading-bracket pitfalls). Cheap
+# dev-loop check so a broken page is caught before the .#posh build's
+# postInstall does. See eng-manpages(7).
+[group("pre-build")]
+lint-doc:
+    #!/usr/bin/env bash
+    set -euo pipefail
+    fail=0
+    for f in doc/*.scd; do
+      if scdoc < "$f" > /dev/null; then
+        echo "ok   $f"
+      else
+        echo "FAIL $f"
+        fail=1
+      fi
+    done
+    exit "$fail"
 
 # --- build -----------------------------------------------------------------
 
