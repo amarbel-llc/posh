@@ -236,6 +236,22 @@ release new_version:
 debug-cargo *ARGS:
     nix develop --command cargo {{ ARGS }}
 
+# Prove posh-rec replay determinism (posh-rec phase 5, #61): `posh-rec assert`
+# the committed VT100 emulation fixture against its golden N times (default 50)
+# and fail loudly on the first mismatch. Zero flakes is the headline of the
+# deterministic replacement for the mosh tests' tmux capture-pane + sleep race.
+[group("debug")]
+debug-replay-loop n="50":
+    nix develop --command bash -c ' \
+      set -euo pipefail; \
+      cargo build -q -p posh-rec; \
+      f=crates/posh-rec/tests/fixtures/emulation-attributes-vt100; \
+      for i in $(seq 1 {{ n }}); do \
+        ./target/debug/posh-rec assert "$f.castx" --golden "$f.grid" \
+          || { echo "FLAKE at iteration $i"; exit 1; }; \
+      done; \
+      echo "{{ n }}/{{ n }} deterministic, zero flakes"'
+
 # Run go against the posht tool via nixpkgs (no Go in the devShell yet —
 # posht is a standalone static TUI, see docs/posht.md / PR #38).
 [group("debug")]

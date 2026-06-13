@@ -113,6 +113,9 @@ fn style_desc(s: &Style) -> String {
     if s.underline != UnderlineStyle::None {
         flags.push("underline");
     }
+    if s.blink {
+        flags.push("blink");
+    }
     if s.inverse {
         flags.push("inverse");
     }

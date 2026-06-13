@@ -228,6 +228,9 @@ fn sgr(style: &Style) -> String {
     if style.underline != UnderlineStyle::None {
         s.push_str("\x1b[4m");
     }
+    if style.blink {
+        s.push_str("\x1b[5m");
+    }
     if style.inverse {
         s.push_str("\x1b[7m");
     }

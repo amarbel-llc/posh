@@ -1,0 +1,33 @@
+# posh-rec grid golden v1
+# emu_rev: 0.1.0
+# size: 80x24
+--- text ---
+E E E E E end                                                                   
+                                                                                
+                                                                                
+                                                                                
+                                                                                
+                                                                                
+                                                                                
+                                                                                
+                                                                                
+                                                                                
+                                                                                
+                                                                                
+                                                                                
+                                                                                
+                                                                                
+                                                                                
+                                                                                
+                                                                                
+                                                                                
+                                                                                
+                                                                                
+                                                                                
+                                                                                
+                                                                                
+--- style ---
+0 2:1 fg=def bg=def bold
+0 4:1 fg=def bg=def underline
+0 6:1 fg=def bg=def blink
+0 8:1 fg=def bg=def inverse
