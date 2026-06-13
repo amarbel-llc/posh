@@ -138,6 +138,31 @@ impl Terminal {
         out
     }
 
+    /// Serializes one primary-screen scrollback row (by ring index) as the
+    /// same per-row escape stream [`Terminal::dump_vt`] emits for a row: the
+    /// row's style/hyperlink runs from a fresh default pen, self-contained
+    /// from the start of a clean line. A hard-terminated (non-soft-wrapped)
+    /// row ends in a pen reset and `\r\n`; a soft-wrapped row omits the
+    /// trailing newline, so a consumer that concatenates rows and replays
+    /// them onto an autowrapping terminal of the same width regenerates the
+    /// wrap seam itself. This is the row unit the scrollback-sync protocol
+    /// ships in a `BODY_SCROLLBACK` body (RFC 0002 §2). Returns `None` when
+    /// `i` is past the end of the ring.
+    pub fn dump_scrollback_row(&self, i: usize) -> Option<Vec<u8>> {
+        let row = self.primary.scrollback_row(i)?;
+        let mut out = String::new();
+        let mut st = EmitState {
+            style: Style::default(),
+            hyperlink: 0,
+        };
+        self.emit_row(&mut out, row, &mut st);
+        if !row.wrapped() {
+            self.reset_pen(&mut out, &mut st);
+            out.push_str("\r\n");
+        }
+        Some(out.into_bytes())
+    }
+
     /// VT escape stream that reproduces the terminal state (contents,
     /// attributes, cursor, modes, title, scroll region) on a fresh
     /// terminal of the same size.

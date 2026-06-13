@@ -16,14 +16,19 @@ use crate::remote::display::{self, NotificationEngine, Snapshot};
 use crate::remote::predict::{DisplayPreference, PredictionEngine};
 use crate::remote::stats::{PredictSample, Stats};
 use crate::remote::sync::{
-    self, ClientMessage, FragmentAssembly, Fragmenter, FrameBody, InputOutbox, ServerFrame,
-    HEARTBEAT_INTERVAL,
+    self, ClientMessage, FragmentAssembly, Fragmenter, FrameBody, InputOutbox, ScrollbackRing,
+    ServerFrame, HEARTBEAT_INTERVAL,
 };
 use crate::util::{self, now_ms, Error, Result};
 
 const STDIN: i32 = libc::STDIN_FILENO;
 const STDOUT: i32 = libc::STDOUT_FILENO;
 const SHUTDOWN_GRACE: u64 = 5000; // ms to wait for the shutdown ack
+
+/// Depth of the client's local scrollback ring (RFC 0002 §3), in rows.
+/// Matches the server's default primary ring so a durable local reader can
+/// hold roughly what the server syncs; bounds client memory.
+const SCROLLBACK_RING_DEPTH: usize = 10_000;
 
 /// The escape (quit-sequence) key: Ctrl-^ (0x1E), as in mosh.
 const ESCAPE_KEY: u8 = 0x1e;
@@ -144,6 +149,16 @@ struct ClientState {
     applied_data: Vec<u8>,
     /// Server screen state, rebuilt from the latest applied frame.
     server_term: Terminal,
+    /// Local, partial, monotonically-growing accumulation of the session's
+    /// primary-screen scrollback (RFC 0002 §3). Fed by `BODY_SCROLLBACK`
+    /// frames; survives `Full` visible resets; cleared on a width resize.
+    /// Not yet rendered (the wheel scroll-view is FDR 0005, out of the wire
+    /// contract) — this is the durable accumulation it will read from.
+    scrollback: ScrollbackRing,
+    /// Set on resize to drop the `SCROLLBACK` advertisement for exactly the
+    /// next outgoing message (RFC 0002 §4: a resize ceases scrollback so the
+    /// server restarts appended-row counting afresh at the new width).
+    suppress_scrollback_once: bool,
     /// What the physical tty currently shows.
     last_drawn: Snapshot,
     /// False when the outer terminal state is unknown (startup, resize,
@@ -194,6 +209,8 @@ fn client_loop(
         applied_num: 0,
         applied_data: Vec::new(),
         server_term: Terminal::with_scrollback(rows, cols, 0),
+        scrollback: ScrollbackRing::new(SCROLLBACK_RING_DEPTH),
+        suppress_scrollback_once: false,
         last_drawn: Snapshot::blank(rows, cols),
         initialized: false,
         predict: PredictionEngine::new(prediction, predict_overwrite),
@@ -280,6 +297,13 @@ fn drive_client(st: &mut ClientState, raw: &RawMode, port: u16) -> Result<i32> {
             st.cols = size.1;
             st.predict.reset();
             st.initialized = false; // full repaint at the new size
+            // RFC 0002 §4: a width change rewraps the server's ring, so
+            // absolute row continuity ends. Drop the accumulated ring,
+            // discard the (not-yet-built) scroll view by virtue of the
+            // repaint, and stop advertising SCROLLBACK for the resize
+            // message so the server restarts appended-row counting afresh.
+            st.scrollback.clear();
+            st.suppress_scrollback_once = true;
             send_now = true;
         }
 
@@ -690,6 +714,9 @@ fn process_frame(st: &mut ClientState, frame: &ServerFrame) -> bool {
         FrameBody::Full(_) => st.stats.record_frame_full(),
         FrameBody::Diff { .. } => st.stats.record_frame_diff(),
         FrameBody::Empty => st.stats.record_frame_empty(),
+        // Scrollback bodies carry no visible-screen change; they are not
+        // part of the Full/Diff/Empty economics the stats track.
+        FrameBody::Scrollback { .. } => {}
     }
     st.notify.server_heard(now);
     st.outbox.ack(frame.input_ack);
@@ -717,6 +744,23 @@ fn apply_frame(st: &mut ClientState, frame: &ServerFrame) -> bool {
     if frame.frame_num < st.applied_num {
         return true; // stale retransmission: re-ack our newer state
     }
+    // Scrollback growth (RFC 0002 §3): append rows to the local ring without
+    // disturbing the visible model. `base` is the frame the growth was
+    // measured from; we apply only when we are exactly at it, so a
+    // retransmitted or superseding body never double-appends. The visible
+    // `applied_data` is unchanged by a scrollback frame and stays valid as
+    // the base for a later `Diff` that builds on this frame number.
+    if let FrameBody::Scrollback { base, rows } = &frame.body {
+        if frame.frame_num == st.applied_num {
+            return true; // duplicate retransmission: re-ack, don't reapply
+        }
+        if *base != st.applied_num {
+            return true; // growth against a state we are not at; re-ack
+        }
+        st.scrollback.append(rows);
+        st.applied_num = frame.frame_num;
+        return true;
+    }
     let bytes: Vec<u8> = match &frame.body {
         FrameBody::Empty => return false,
         FrameBody::Full(bytes) => bytes.clone(),
@@ -731,6 +775,8 @@ fn apply_frame(st: &mut ClientState, frame: &ServerFrame) -> bool {
                 None => return true,
             }
         }
+        // Handled above (returns early); listed so the match stays total.
+        FrameBody::Scrollback { .. } => unreachable!("scrollback handled above"),
     };
     if frame.frame_num == st.applied_num {
         return true; // duplicate retransmission: re-ack, don't reapply
@@ -825,15 +871,31 @@ fn predict_sample(predict: &PredictionEngine) -> PredictSample {
     }
 }
 
+/// The capability table this client advertises in every message (the
+/// protocol is connectionless): protocol version, "I understand exit-status
+/// frames", and — unless this is the post-resize message that must cease
+/// scrollback (RFC 0002 §4) — "I keep a scrollback ring and understand
+/// BODY_SCROLLBACK" with payload 0 requesting the server's default ring
+/// depth (RFC 0002 §1). Consumes the one-shot resize suppression.
+fn outgoing_caps(st: &mut ClientState) -> Vec<caps::Cap> {
+    let mut extra = vec![caps::Cap {
+        id: caps::CAP_EXIT_STATUS,
+        payload: vec![],
+    }];
+    if st.suppress_scrollback_once {
+        st.suppress_scrollback_once = false;
+    } else {
+        extra.push(caps::Cap {
+            id: caps::CAP_SCROLLBACK,
+            payload: vec![0],
+        });
+    }
+    caps::own_table(&extra)
+}
 fn send_message(st: &mut ClientState) {
     let msg = ClientMessage {
         flags: st.flags,
-        // Advertised in every message (the protocol is connectionless):
-        // protocol version plus "I understand exit-status frames".
-        caps: caps::own_table(&[caps::Cap {
-            id: caps::CAP_EXIT_STATUS,
-            payload: vec![],
-        }]),
+        caps: outgoing_caps(st),
         acked_frame: st.applied_num,
         rows: st.rows,
         cols: st.cols,
@@ -1002,6 +1064,8 @@ mod tests {
             applied_num: 0,
             applied_data: Vec::new(),
             server_term: Terminal::with_scrollback(rows, cols, 0),
+            scrollback: ScrollbackRing::new(SCROLLBACK_RING_DEPTH),
+            suppress_scrollback_once: false,
             last_drawn: Snapshot::blank(rows, cols),
             initialized: false,
             predict: PredictionEngine::new(DisplayPreference::Never, false),
@@ -1066,6 +1130,136 @@ mod tests {
             compose_frame(&mut st, 20).is_empty(),
             "and the tick after it is idle again"
         );
+    }
+
+    /// RFC 0002 §3: a `BODY_SCROLLBACK` advances the accumulated ring in row
+    /// order without touching the visible model, and only when the client is
+    /// at the body's base.
+    #[test]
+    fn scrollback_frames_accumulate_in_ring_order() {
+        let mut st = test_state(3, 20);
+        // A visible frame first so applied_num advances to a real base.
+        let visible = ServerFrame {
+            flags: 0,
+            caps: vec![],
+            frame_num: 1,
+            input_ack: 0,
+            echo_ack: 0,
+            body: FrameBody::Full(b"prompt$ ".to_vec()),
+        };
+        assert!(apply_frame(&mut st, &visible));
+        assert_eq!(st.applied_num, 1);
+        assert!(st.scrollback.is_empty());
+
+        // Two scrollback frames in sequence, each anchored to the prior.
+        let sb1 = ServerFrame {
+            frame_num: 2,
+            body: FrameBody::Scrollback {
+                base: 1,
+                rows: vec![b"line one\r\n".to_vec(), b"line two\r\n".to_vec()],
+            },
+            ..visible.clone()
+        };
+        assert!(apply_frame(&mut st, &sb1));
+        assert_eq!(st.applied_num, 2);
+        assert_eq!(st.scrollback.len(), 2);
+        let sb2 = ServerFrame {
+            frame_num: 3,
+            body: FrameBody::Scrollback {
+                base: 2,
+                rows: vec![b"line three\r\n".to_vec()],
+            },
+            ..visible.clone()
+        };
+        assert!(apply_frame(&mut st, &sb2));
+        assert_eq!(st.applied_num, 3);
+        assert_eq!(st.scrollback.len(), 3);
+        assert_eq!(st.scrollback.row(0), Some(&b"line one\r\n"[..]));
+        assert_eq!(st.scrollback.row(2), Some(&b"line three\r\n"[..]));
+
+        // A body whose base does not match the client's state is not applied
+        // (no double-append), and re-acks our newer state.
+        let stale = ServerFrame {
+            frame_num: 4,
+            body: FrameBody::Scrollback {
+                base: 2, // we are at 3
+                rows: vec![b"dup\r\n".to_vec()],
+            },
+            ..visible.clone()
+        };
+        assert!(apply_frame(&mut st, &stale));
+        assert_eq!(st.scrollback.len(), 3, "base mismatch must not append");
+        assert_eq!(st.applied_num, 3);
+    }
+
+    /// RFC 0002 §1/§4: the client advertises `SCROLLBACK` in steady state,
+    /// but ceases for exactly the post-resize message so the server restarts
+    /// appended-row counting at the new width, then resumes.
+    #[test]
+    fn resize_ceases_scrollback_advertisement_for_one_message() {
+        let mut st = test_state(5, 20);
+        // Steady state: advertised every message.
+        let caps = outgoing_caps(&mut st);
+        assert!(caps::find(&caps, caps::CAP_SCROLLBACK).is_some());
+
+        // Simulate the SIGWINCH bookkeeping: ring dropped, advertisement
+        // suppressed once.
+        st.scrollback.append(&[b"row\r\n".to_vec()]);
+        st.scrollback.clear();
+        st.suppress_scrollback_once = true;
+        assert!(st.scrollback.is_empty());
+
+        // The resize message must NOT advertise scrollback (still carries
+        // the rest of the table).
+        let caps = outgoing_caps(&mut st);
+        assert!(
+            caps::find(&caps, caps::CAP_SCROLLBACK).is_none(),
+            "resize message must cease scrollback"
+        );
+        assert!(caps::find(&caps, caps::CAP_EXIT_STATUS).is_some());
+
+        // And the very next message re-advertises to resume accumulation.
+        let caps = outgoing_caps(&mut st);
+        assert!(
+            caps::find(&caps, caps::CAP_SCROLLBACK).is_some(),
+            "scrollback resumes after the resize message"
+        );
+    }
+
+    /// RFC 0002 §3: a `Full` visible reset re-establishes the visible screen
+    /// but MUST NOT clear the durable accumulated scrollback ring.
+    #[test]
+    fn full_body_preserves_accumulated_scrollback() {
+        let mut st = test_state(3, 20);
+        let base = ServerFrame {
+            flags: 0,
+            caps: vec![],
+            frame_num: 1,
+            input_ack: 0,
+            echo_ack: 0,
+            body: FrameBody::Full(b"a".to_vec()),
+        };
+        assert!(apply_frame(&mut st, &base));
+        let sb = ServerFrame {
+            frame_num: 2,
+            body: FrameBody::Scrollback {
+                base: 1,
+                rows: vec![b"kept\r\n".to_vec()],
+            },
+            ..base.clone()
+        };
+        assert!(apply_frame(&mut st, &sb));
+        assert_eq!(st.scrollback.len(), 1);
+
+        // A later Full (e.g. after loss) resets the visible model only.
+        let full = ServerFrame {
+            frame_num: 3,
+            body: FrameBody::Full(b"recovered".to_vec()),
+            ..base
+        };
+        assert!(apply_frame(&mut st, &full));
+        assert_eq!(st.scrollback.len(), 1, "Full must not clear the ring");
+        assert_eq!(st.scrollback.row(0), Some(&b"kept\r\n"[..]));
     }
 
     #[test]

@@ -87,6 +87,13 @@ pub struct Screen {
     grid: Vec<Row>,
     scrollback: VecDeque<Row>,
     max_scrollback: usize,
+    /// Monotonic count of rows ever pushed into the scrollback ring (never
+    /// decreases, unaffected by ring eviction). The remote scrollback-sync
+    /// server (RFC 0002) measures inter-frame growth against this so it can
+    /// ship only the rows that newly entered scrollback. Width reflow does
+    /// not advance it — a resize is a renumber-and-resync event for the
+    /// protocol (RFC 0002 §4), so only the steady-state scroll path counts.
+    scrollback_total: u64,
 }
 
 impl Screen {
@@ -101,6 +108,7 @@ impl Screen {
                 .collect(),
             scrollback: VecDeque::new(),
             max_scrollback,
+            scrollback_total: 0,
         }
     }
 
@@ -122,6 +130,11 @@ impl Screen {
 
     pub fn scrollback_len(&self) -> usize {
         self.scrollback.len()
+    }
+
+    /// Monotonic count of rows ever pushed into scrollback (see field docs).
+    pub fn scrollback_total(&self) -> u64 {
+        self.scrollback_total
     }
 
     pub fn scrollback_row(&self, i: usize) -> Option<&Row> {
@@ -156,6 +169,7 @@ impl Screen {
                     self.scrollback.pop_front();
                 }
                 self.scrollback.push_back(row);
+                self.scrollback_total += 1;
             }
             self.grid.insert(bot, Row::blank(self.cols as usize, style));
         }
@@ -223,6 +237,7 @@ impl Screen {
                         self.scrollback.pop_front();
                     }
                     self.scrollback.push_back(row);
+                    self.scrollback_total += 1;
                 }
                 cursor.0 = cursor.0.saturating_sub(1);
             } else {

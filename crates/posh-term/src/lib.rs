@@ -34,6 +34,11 @@
 //!   `Terminal::mid_escape(&self) -> bool` (switch detection for raw-stream
 //!   forwarders)
 //! - `Terminal::dump_text(&self) -> String` (plain text, scrollback included)
+//! - `Terminal::primary_scrollback_len(&self) -> usize` /
+//!   `Terminal::primary_scrollback_total(&self) -> u64` /
+//!   `Terminal::dump_scrollback_row(&self, i: usize) -> Option<Vec<u8>>`
+//!   (scrollback growth measurement and per-row serialization for the
+//!   remote scrollback-sync protocol, RFC 0002)
 //! - `Terminal::take_responses(&mut self) -> Vec<u8>` (DA/DSR/etc. replies)
 //! - `Terminal::screen(&self) -> &Screen` (cell-level read access)
 //! - `version() -> &'static str` (the emulator revision, flowed from

@@ -103,11 +103,27 @@ normative). A scrollback body carries the change to the client's
 accumulating row space since the frame the client last acknowledged:
 
 ```
+base:      u64 LE   -- the frame number this growth is measured from: the
+                       client's last-acknowledged frame. The client appends
+                       `rows` only when it is at exactly this frame
+                       (`base == applied_num`), which makes a retransmitted
+                       or superseding body idempotent under loss — the same
+                       anchoring the `Diff` body uses. A receiver at a newer
+                       frame discards the body and re-acks, prompting the
+                       server to re-anchor at the receiver's frame.
 appended:  u32 LE   -- count of new rows that entered scrollback at the
                        bottom (i.e. scrolled off the top of the visible
-                       grid) since the acked frame
+                       grid) since `base`
 rows:      appended × Row
 ```
+
+The `base` prefix is the one addition over a pure "count + rows" body. It
+is required because acknowledgement is unreliable: without it, a body
+re-sent after the server's view of the last-acked frame has lagged would
+re-append rows the client already holds. Anchoring to an explicit base —
+and applying only at that base — bounds the failure mode to *missing*
+rows (a partial view, a first-class state per FDR 0005), never duplicated
+or misplaced ones.
 
 where each `Row` is:
 
@@ -157,8 +173,11 @@ A conforming client maintains its local terminal model as a **persistent,
 monotonically-growing** structure with a real scrollback ring, rather than
 reconstructing it per frame:
 
-- On applying a `BODY_SCROLLBACK` body, the client MUST append its
-  `appended` rows to the bottom of its scrollback ring, in order. Because
+- On applying a `BODY_SCROLLBACK` body whose `base` equals the frame the
+  client has applied through, the client MUST append its `appended` rows to
+  the bottom of its scrollback ring, in order; a body whose `base` does not
+  match is discarded (the client re-acks its state) so it never
+  double-appends. Because
   the body is self-contained (section 2), the client does not derive
   these rows from the visible-screen body; it appends the bytes the
   `BODY_SCROLLBACK` carried. The client's ring MAY have a smaller
@@ -276,13 +295,14 @@ for end-to-end behavior, the pty integration tests in
 
 | Requirement | Test | Description |
 |---|---|---|
-| §1, server MUST NOT emit scrollback body unless client advertised `SCROLLBACK` | `remote::sync` / `remote::server` | A frame stream to a non-advertising client contains only `Full`/`Diff`/`Empty` bodies. |
-| §2, `BODY_SCROLLBACK` encode/decode roundtrip | `remote::sync` | `appended` count and each row's `len`/bytes survive encode→decode; `appended = 0` roundtrips. |
-| §2, row `len` past body MUST be rejected | `remote::sync` | A truncated scrollback body fails to decode rather than over-reading. |
-| §3, `Full` body MUST NOT clear the accumulated ring | `remote::client` (`apply_frame`) | After accumulating scrollback, a `Full` visible reset leaves the client ring intact. |
-| §3, appended rows land in ring order | `remote::client` | Rows scrolled off the grid plus `appended` rows accumulate in the correct sequence. |
-| §4, resize ceases scrollback and resets counting | `remote::client` / `remote::server` | A resize message drops `SCROLLBACK`; re-advertisement restarts appended-row counting. |
-| §2, scrollback growth diff is bounded by growth, not depth | `remote::sync` | A scroll event over a deep ring produces a body sized by `appended`, not total scrollback. |
+| §1, server MUST NOT emit scrollback body unless client advertised `SCROLLBACK` | `remote::server::server_emits_no_scrollback_to_a_non_advertising_client` | A frame stream to a non-advertising client contains only `Full`/`Diff`/`Empty` bodies even as the session scrolls. |
+| §2, `BODY_SCROLLBACK` encode/decode roundtrip | `remote::sync::scrollback_body_roundtrip` | `base`, the `appended` count and each row's `len`/bytes survive encode→decode; `appended = 0` roundtrips. |
+| §2, row `len` past body MUST be rejected | `remote::sync::scrollback_body_rejects_row_past_body` | A truncated body — and a bogus oversized `appended` — fail to decode rather than over-reading or over-allocating. |
+| §3, `Full` body MUST NOT clear the accumulated ring | `remote::client::full_body_preserves_accumulated_scrollback` | After accumulating scrollback, a `Full` visible reset leaves the client ring intact. |
+| §3, appended rows land in ring order, base-gated | `remote::client::scrollback_frames_accumulate_in_ring_order` | Sequential bodies accumulate in order; a base-mismatched body does not append. |
+| §4, resize ceases scrollback and resets counting | `remote::client::resize_ceases_scrollback_advertisement_for_one_message` | A resize message drops `SCROLLBACK`; the next message re-advertises, restarting appended-row counting. |
+| §2, scrollback growth is bounded by growth, not depth | `remote::server::server_ships_scrollback_growth_bounded_by_growth_not_depth` | The off-screen history accumulates row-once on the client, not a depth-multiplied re-dump per frame. |
+| §3, ring accumulation/eviction | `remote::sync::scrollback_ring_appends_in_order_and_evicts_oldest` | Rows append in order; past capacity the client ring evicts its own oldest (no back-fill). |
 
 Tests MUST use `bats-emo` binary injection (`require_bin POSH posh`) once
 a `zz-tests_bats/` conformance suite exists; until then the cargo suite is

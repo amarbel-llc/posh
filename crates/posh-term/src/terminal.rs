@@ -865,6 +865,22 @@ impl Terminal {
         self.scr()
     }
 
+    /// Number of rows currently held in the primary screen's scrollback ring.
+    /// (The alt screen has no scrollback by construction.)
+    pub fn primary_scrollback_len(&self) -> usize {
+        self.primary.scrollback_len()
+    }
+
+    /// Monotonic count of rows that have ever scrolled off the top of the
+    /// primary screen into its scrollback ring. Unlike
+    /// [`Terminal::primary_scrollback_len`] this never decreases when the
+    /// ring evicts its oldest rows, so the remote scrollback-sync server
+    /// (RFC 0002) can measure inter-frame growth against it. Width reflow
+    /// does not advance it (RFC 0002 §4 treats a resize as a resync event).
+    pub fn primary_scrollback_total(&self) -> u64 {
+        self.primary.scrollback_total()
+    }
+
     // --- extra getters ----------------------------------------------------------
 
     pub fn bell_count(&self) -> u64 {
