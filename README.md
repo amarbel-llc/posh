@@ -205,13 +205,16 @@ exact screen, with no live terminal and no timing to race (the
 posh-rec record [--out f.castx] -- <cmd>       # record a command under a PTY
 posh --record f.castx <session>                # record a live posh session
 posh-rec replay <file> [--dump text|vt|flat]   # or: posh rec replay ...
+posh-rec step <file> --by change --n 3         # step-debug, dump each screen
 ```
 
 The recording format is `.castx`, a strict superset of asciinema `.cast` v2
 (standard `o`/`i`/`r` events plus an ignorable `m` marker and a `posh_rec`
 header block), so any `.cast` replays through posh-rec and any `.castx` plays
-in `asciinema`. Issue #56 tracks the epic; the step-ratchet player and the
-assertion/golden surface land in later phases.
+in `asciinema`. `step` advances by an emulator-defined granularity
+(`byte`/`escape`/`write`/`change`/`frame`/`marker`) and dumps the intermediate
+screen — a deterministic VT100 frame debugger. Issue #56 tracks the epic; the
+assertion/golden-frame surface lands in a later phase.
 
 ## Building and testing
 
