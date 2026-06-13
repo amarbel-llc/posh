@@ -1,12 +1,21 @@
-# posh: persistent, roaming terminal sessions
+# POSH: the portable shell
 
-posh is a single Rust tool that combines:
+posh makes a shell session *portable*: it roams across networks and
+persists across disconnects, so the session you start follows you — survive
+a sleep, change networks, detach here and reattach from another machine,
+and the shell and its running processes are exactly where you left them.
+
+It delivers this as a single Rust tool that combines two lineages:
 
 - **zmx** (terminal session persistence — attach/detach from sessions without
   killing the underlying processes, window management delegated to the OS
   window manager), and
 - **mosh** (roaming remote terminal over encrypted UDP that survives sleep,
   network changes, and intermittent connectivity).
+
+Portability is the two together: mosh-style roaming carries a session across
+the *network*, zmx-style persistence carries it across *time and machines*,
+and the unified `host:session` namespace addresses both with one grammar.
 
 This repository hosts the rewrite as a Cargo workspace. The original C++
 mosh tree is kept under `zz-mosh/` as the porting reference (with its own
