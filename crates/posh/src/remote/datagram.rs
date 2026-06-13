@@ -177,6 +177,11 @@ pub struct Connection {
     /// expected_receiver_seq): only datagrams at or above it may update the
     /// timestamp echo, RTT estimate, or roamed remote address.
     expected_receiver_seq: u64,
+    /// Cumulative sealed-datagram bytes sent and received on the wire. Read by
+    /// the remote stats collector for the bandwidth figures; never affects
+    /// transport behavior.
+    bytes_tx: u64,
+    bytes_rx: u64,
 }
 
 impl Connection {
@@ -199,6 +204,8 @@ impl Connection {
                     saved_timestamp: None,
                     rtt: RttEstimator::new(),
                     expected_receiver_seq: 0,
+                    bytes_tx: 0,
+                    bytes_rx: 0,
                 };
                 return Ok((conn, port));
             }
@@ -222,6 +229,8 @@ impl Connection {
             saved_timestamp: None,
             rtt: RttEstimator::new(),
             expected_receiver_seq: 0,
+            bytes_tx: 0,
+            bytes_rx: 0,
         })
     }
 
@@ -235,6 +244,19 @@ impl Connection {
 
     pub fn rto(&self) -> u64 {
         self.rtt.rto()
+    }
+
+    /// Smoothed RTT in milliseconds (mosh SRTT). Surfaced for the stats log.
+    pub fn srtt(&self) -> f64 {
+        self.rtt.srtt()
+    }
+
+    /// Cumulative sealed-datagram bytes sent / received on the wire.
+    pub fn bytes_tx(&self) -> u64 {
+        self.bytes_tx
+    }
+    pub fn bytes_rx(&self) -> u64 {
+        self.bytes_rx
     }
 
     /// mosh's send interval: half the smoothed RTT, clamped. Drives the
@@ -264,6 +286,7 @@ impl Connection {
         packet.extend_from_slice(&reply.to_be_bytes());
         packet.extend_from_slice(payload);
         let dgram = self.session.seal(&packet)?;
+        self.bytes_tx += dgram.len() as u64;
         let _ = self.sock.send_to(&dgram, remote);
         Ok(())
     }
@@ -273,6 +296,9 @@ impl Connection {
     pub fn recv(&mut self) -> std::io::Result<Option<Vec<u8>>> {
         let mut buf = [0u8; 2048];
         let (n, from) = self.sock.recv_from(&mut buf)?;
+        // Count every datagram that reached the socket (including ones that
+        // fail to authenticate) as received wire bytes.
+        self.bytes_rx += n as u64;
         let Ok((seq, plaintext)) = self.session.open(&buf[..n]) else {
             return Ok(None);
         };
@@ -495,5 +521,13 @@ mod tests {
 
         server.send(b"world").unwrap();
         assert_eq!(recv_one(&mut client), b"world");
+
+        // Wire-byte counters reflect the sealed datagrams that crossed the
+        // socket (payload + 4-byte timestamp header + AEAD overhead), so each
+        // side's tx and the peer's rx are both non-zero after a roundtrip.
+        assert!(client.bytes_tx() > b"hello".len() as u64);
+        assert!(server.bytes_rx() >= client.bytes_tx());
+        assert!(server.bytes_tx() > b"world".len() as u64);
+        assert!(client.bytes_rx() >= server.bytes_tx());
     }
 }

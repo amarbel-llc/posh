@@ -181,6 +181,16 @@ _POSH_SERVER_SIGNAL_TMOUT_
 	On SIGUSR1, the server exits if the client has been silent for N
 	seconds (0 = never, the default). See *posh-server*(1).
 
+_POSH_DEBUG_LOG_
+	Path to a performance-diagnostics log for the roaming remote
+	transport. When set, *posh client* and *posh server* each append
+	periodic one-line summaries (RTT, bandwidth, frame counts, full-vs-
+	diff economics, prediction state, render activity), rotated at 5 MB.
+	For the bare _host:session_ form it is forwarded to the remote, so the
+	server logs to that path on the remote host (failing closed if it is
+	not writable there). Unset disables logging. See *posh-client*(1) and
+	*posh-server*(1).
+
 # EXAMPLES
 
 Attach to (or create) a local session:

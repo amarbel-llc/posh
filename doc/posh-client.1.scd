@@ -64,6 +64,13 @@ _POSH_NO_TERM_INIT_
 	Suppress the alternate-screen takeover (set by *posh*(1)'s
 	*--no-init*).
 
+_POSH_DEBUG_LOG_
+	When set to a writable path, the client appends periodic one-line
+	performance summaries — smoothed RTT, RTO, send interval, received
+	frame counts (full/diff/empty), download bandwidth, prediction
+	state, and render activity (writes, bytes, idle skips) — plus a
+	final line on exit. Rotated at 5 MB. Unset disables logging.
+
 # SEE ALSO
 
 *posh*(1), *posh-server*(1), *posh*(7), *mosh-client*(1)

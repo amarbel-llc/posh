@@ -1,0 +1,427 @@
+//! Optional performance instrumentation for the roaming remote transport.
+//!
+//! Gated by `$POSH_DEBUG_LOG`: when it names a writable path, the client and
+//! server each initialize the shared file logger (`util::log_init`) and flush a
+//! periodic one-line summary of transport counters through `util::log_write`
+//! (timestamped, 5 MB rotation — the same sink the session daemon uses). Unset,
+//! every method is a cheap no-op and the hot path is untouched.
+//!
+//! The collector holds only counters and primitives; the live gauges (SRTT,
+//! RTO, prediction state, wire bytes) are passed in at flush time so this stays
+//! decoupled from `Connection` and `PredictionEngine`.
+
+use std::path::Path;
+use std::time::Instant;
+
+use crate::util::{self, now_ms};
+
+/// Minimum gap between emitted summary lines: idle ticks don't spam the log.
+const FLUSH_INTERVAL_MS: u64 = 1000;
+
+#[derive(Default)]
+pub struct Stats {
+    enabled: bool,
+    last_flush: u64,
+    /// A meaningful counter advanced since the last emit. Idle-only activity
+    /// (skipped renders) deliberately does not set this, so a quiescent session
+    /// stops logging instead of repeating an unchanged line every second.
+    dirty: bool,
+    last_bytes_rx: u64,
+    last_bytes_tx: u64,
+
+    // Frame counters — client: frames received; server: frames transmitted.
+    frames_total: u64,
+    frames_full: u64,
+    frames_diff: u64,
+    frames_empty: u64,
+
+    // Client render activity.
+    render_writes: u64,
+    render_bytes_out: u64,
+    render_skipped_idle: u64,
+
+    // Server framing economics.
+    /// Sum of full-dump bytes over frames that had a diff option (whether or
+    /// not the diff was chosen) — the denominator for `diff_saved_pct`.
+    full_bytes_considered: u64,
+    /// Sum of (full_len - diff_len) over frames sent as diffs.
+    diff_saved_bytes: u64,
+    retransmits: u64,
+    dump_vt_us_total: u64,
+    dump_vt_count: u64,
+}
+
+impl Stats {
+    /// Reads `$POSH_DEBUG_LOG`; on a non-empty path that `log_init` accepts the
+    /// collector is enabled, otherwise it is an inert no-op.
+    pub fn new() -> Stats {
+        let enabled = match std::env::var_os("POSH_DEBUG_LOG") {
+            Some(p) if !p.is_empty() => util::log_init(Path::new(&p)).is_ok(),
+            _ => false,
+        };
+        Stats {
+            enabled,
+            last_flush: now_ms(),
+            ..Default::default()
+        }
+    }
+
+    // --- recording -----------------------------------------------------------
+
+    pub fn record_frame_full(&mut self) {
+        self.frames_total += 1;
+        self.frames_full += 1;
+        self.dirty = true;
+    }
+    pub fn record_frame_diff(&mut self) {
+        self.frames_total += 1;
+        self.frames_diff += 1;
+        self.dirty = true;
+    }
+    pub fn record_frame_empty(&mut self) {
+        self.frames_total += 1;
+        self.frames_empty += 1;
+        self.dirty = true;
+    }
+
+    pub fn record_render(&mut self, bytes_out: usize) {
+        self.render_writes += 1;
+        self.render_bytes_out += bytes_out as u64;
+        self.dirty = true;
+    }
+    pub fn record_render_skip(&mut self) {
+        self.render_skipped_idle += 1;
+    }
+
+    /// A frame the server sent as a diff: record the full-dump size it would
+    /// otherwise have cost and the bytes the diff saved.
+    pub fn record_diff_frame(&mut self, full_len: usize, diff_len: usize) {
+        self.full_bytes_considered += full_len as u64;
+        self.diff_saved_bytes += full_len.saturating_sub(diff_len) as u64;
+    }
+    /// A frame the server sent as a full dump despite a diff being available
+    /// (the diff wasn't smaller): it saved nothing but still counts toward the
+    /// denominator so the percentage isn't flattering.
+    pub fn record_full_frame(&mut self, full_len: usize) {
+        self.full_bytes_considered += full_len as u64;
+    }
+    pub fn record_retransmit(&mut self) {
+        self.retransmits += 1;
+        self.dirty = true;
+    }
+
+    /// Times `f` (the `dump_vt()` call) and accumulates its cost in
+    /// microseconds. When disabled the closure runs untouched.
+    pub fn time_dump_vt<F: FnOnce() -> Vec<u8>>(&mut self, f: F) -> Vec<u8> {
+        if !self.enabled {
+            return f();
+        }
+        let t = Instant::now();
+        let out = f();
+        self.dump_vt_us_total += t.elapsed().as_micros() as u64;
+        self.dump_vt_count += 1;
+        out
+    }
+
+    /// Fraction of considered full-dump bytes avoided by diffing, as a whole
+    /// percent. Zero when no frames have been sent yet.
+    pub fn diff_saved_pct(&self) -> u64 {
+        if self.full_bytes_considered == 0 {
+            0
+        } else {
+            self.diff_saved_bytes * 100 / self.full_bytes_considered
+        }
+    }
+
+    fn avg_dump_vt_us(&self) -> u64 {
+        if self.dump_vt_count == 0 {
+            0
+        } else {
+            self.dump_vt_us_total / self.dump_vt_count
+        }
+    }
+
+    // --- flushing ------------------------------------------------------------
+
+    /// Whether a periodic flush is due: enabled, something changed, and at
+    /// least `FLUSH_INTERVAL_MS` since the last emit.
+    fn should_flush(&self, now: u64) -> bool {
+        self.enabled && self.dirty && now.saturating_sub(self.last_flush) >= FLUSH_INTERVAL_MS
+    }
+
+    fn bandwidth(&self, now: u64, bytes: u64, last: u64) -> f64 {
+        let dt = now.saturating_sub(self.last_flush).max(1);
+        bytes.saturating_sub(last) as f64 * 1000.0 / dt as f64
+    }
+
+    fn mark_flushed(&mut self, now: u64, bytes_rx: u64, bytes_tx: u64) {
+        self.dirty = false;
+        self.last_flush = now;
+        self.last_bytes_rx = bytes_rx;
+        self.last_bytes_tx = bytes_tx;
+    }
+
+    /// Periodic client summary; no-op unless a flush is due.
+    #[allow(clippy::too_many_arguments)]
+    pub fn flush_client(
+        &mut self,
+        now: u64,
+        srtt: f64,
+        rto: u64,
+        send_interval: u64,
+        predict_active: bool,
+        srtt_trig: bool,
+        bytes_rx: u64,
+        bytes_tx: u64,
+    ) {
+        if self.should_flush(now) {
+            self.emit_client(
+                "client", now, srtt, rto, send_interval, predict_active, srtt_trig, bytes_rx,
+                bytes_tx,
+            );
+        }
+    }
+
+    /// Final client summary on loop exit; emitted whenever enabled.
+    #[allow(clippy::too_many_arguments)]
+    pub fn final_client(
+        &mut self,
+        now: u64,
+        srtt: f64,
+        rto: u64,
+        send_interval: u64,
+        predict_active: bool,
+        srtt_trig: bool,
+        bytes_rx: u64,
+        bytes_tx: u64,
+    ) {
+        if self.enabled {
+            self.emit_client(
+                "client final", now, srtt, rto, send_interval, predict_active, srtt_trig,
+                bytes_rx, bytes_tx,
+            );
+        }
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    fn emit_client(
+        &mut self,
+        label: &str,
+        now: u64,
+        srtt: f64,
+        rto: u64,
+        send_interval: u64,
+        predict_active: bool,
+        srtt_trig: bool,
+        bytes_rx: u64,
+        bytes_tx: u64,
+    ) {
+        let bw_down = self.bandwidth(now, bytes_rx, self.last_bytes_rx);
+        util::log_write(
+            "stats",
+            &format!(
+                "{label} srtt={srtt:.0}ms rto={rto}ms send_int={send_interval}ms \
+                 frames rx={} (full={} diff={} empty={}) bytes_rx={bytes_rx} bw_down={} \
+                 predict active={} srtt_trig={} render writes={} bytes_out={} skipped_idle={}",
+                self.frames_total,
+                self.frames_full,
+                self.frames_diff,
+                self.frames_empty,
+                human_rate(bw_down),
+                predict_active as u8,
+                srtt_trig as u8,
+                self.render_writes,
+                self.render_bytes_out,
+                self.render_skipped_idle,
+            ),
+        );
+        self.mark_flushed(now, bytes_rx, bytes_tx);
+    }
+
+    /// Periodic server summary; no-op unless a flush is due.
+    pub fn flush_server(&mut self, now: u64, srtt: f64, rto: u64, outstanding: usize, bytes_tx: u64) {
+        if self.should_flush(now) {
+            self.emit_server("server", now, srtt, rto, outstanding, bytes_tx);
+        }
+    }
+
+    /// Final server summary on loop exit; emitted whenever enabled.
+    pub fn final_server(&mut self, now: u64, srtt: f64, rto: u64, outstanding: usize, bytes_tx: u64) {
+        if self.enabled {
+            self.emit_server("server final", now, srtt, rto, outstanding, bytes_tx);
+        }
+    }
+
+    fn emit_server(
+        &mut self,
+        label: &str,
+        now: u64,
+        srtt: f64,
+        rto: u64,
+        outstanding: usize,
+        bytes_tx: u64,
+    ) {
+        let bw_up = self.bandwidth(now, bytes_tx, self.last_bytes_tx);
+        util::log_write(
+            "stats",
+            &format!(
+                "{label} srtt={srtt:.0}ms rto={rto}ms frames tx={} (full={} diff={} empty={}) \
+                 diff_saved={}% dump_vt_us={} bytes_tx={bytes_tx} bw_up={} outstanding={outstanding} \
+                 retransmit={}",
+                self.frames_total,
+                self.frames_full,
+                self.frames_diff,
+                self.frames_empty,
+                self.diff_saved_pct(),
+                self.avg_dump_vt_us(),
+                human_rate(bw_up),
+                self.retransmits,
+            ),
+        );
+        // bytes_rx is unused server-side; reuse the rx slot to track tx deltas.
+        self.mark_flushed(now, self.last_bytes_rx, bytes_tx);
+    }
+}
+
+/// Human-readable byte rate, e.g. "4.1KB/s" / "512B/s" / "2.3MB/s".
+fn human_rate(bytes_per_sec: f64) -> String {
+    const KB: f64 = 1024.0;
+    const MB: f64 = 1024.0 * 1024.0;
+    if bytes_per_sec >= MB {
+        format!("{:.1}MB/s", bytes_per_sec / MB)
+    } else if bytes_per_sec >= KB {
+        format!("{:.1}KB/s", bytes_per_sec / KB)
+    } else {
+        format!("{:.0}B/s", bytes_per_sec)
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// An enabled collector without touching the env or a real log file:
+    /// `log_write` drops silently when the logger is uninitialized, so emits
+    /// are exercised for their state transitions without producing output.
+    fn enabled_stats() -> Stats {
+        Stats {
+            enabled: true,
+            ..Default::default()
+        }
+    }
+
+    #[test]
+    fn frame_classification_counts() {
+        let mut s = enabled_stats();
+        s.record_frame_full();
+        s.record_frame_diff();
+        s.record_frame_diff();
+        s.record_frame_empty();
+        assert_eq!(s.frames_total, 4);
+        assert_eq!(s.frames_full, 1);
+        assert_eq!(s.frames_diff, 2);
+        assert_eq!(s.frames_empty, 1);
+    }
+
+    #[test]
+    fn diff_saved_percentage() {
+        let mut s = enabled_stats();
+        assert_eq!(s.diff_saved_pct(), 0, "no frames yet");
+        // One diff that saved 80 of a 100-byte dump, one full dump (saved 0).
+        s.record_diff_frame(100, 20);
+        s.record_full_frame(100);
+        assert_eq!(s.diff_saved_bytes, 80);
+        assert_eq!(s.full_bytes_considered, 200);
+        assert_eq!(s.diff_saved_pct(), 40);
+    }
+
+    #[test]
+    fn avg_dump_vt_handles_empty() {
+        let s = enabled_stats();
+        assert_eq!(s.avg_dump_vt_us(), 0);
+    }
+
+    #[test]
+    fn flush_cadence_gating() {
+        let mut s = enabled_stats();
+        // Nothing changed yet: not due even past the interval.
+        assert!(!s.should_flush(10_000));
+        // A counter change marks dirty, but the interval hasn't elapsed.
+        s.record_frame_full();
+        assert!(!s.should_flush(FLUSH_INTERVAL_MS - 1));
+        // Past the interval with pending changes: due.
+        assert!(s.should_flush(FLUSH_INTERVAL_MS));
+    }
+
+    #[test]
+    fn skipped_render_does_not_arm_a_flush() {
+        let mut s = enabled_stats();
+        s.record_render_skip();
+        // Idle-only activity must not make a flush due, or quiescent sessions
+        // would log every interval.
+        assert!(!s.should_flush(10_000));
+        assert_eq!(s.render_skipped_idle, 1);
+    }
+
+    #[test]
+    fn disabled_collector_never_flushes() {
+        let s = Stats::default(); // enabled = false
+        assert!(!s.should_flush(10_000));
+    }
+
+    #[test]
+    fn emit_resets_dirty_and_advances_window() {
+        let mut s = enabled_stats();
+        s.record_frame_full();
+        s.emit_client("client", 2000, 50.0, 200, 30, false, false, 4096, 1024);
+        assert!(!s.dirty, "emit clears the dirty flag");
+        assert_eq!(s.last_flush, 2000);
+        assert_eq!(s.last_bytes_rx, 4096);
+        assert_eq!(s.last_bytes_tx, 1024);
+        assert!(!s.should_flush(2000 + FLUSH_INTERVAL_MS), "no new changes after emit");
+    }
+
+    #[test]
+    fn human_rate_units() {
+        assert_eq!(human_rate(512.0), "512B/s");
+        assert_eq!(human_rate(2048.0), "2.0KB/s");
+        assert_eq!(human_rate(3.0 * 1024.0 * 1024.0), "3.0MB/s");
+    }
+
+    #[test]
+    fn emits_keyed_lines_through_the_real_log_sink() {
+        // End-to-end path: util::log_init -> emit_* -> the rotating file sink,
+        // proving the format strings and log_write wiring actually land on
+        // disk. This is the only unit test that initializes the per-process
+        // LOGGER; it asserts substrings, so concurrent emits from sibling tests
+        // (which append) cannot invalidate it.
+        let path =
+            std::env::temp_dir().join(format!("posh-stats-test-{}.log", std::process::id()));
+        let _ = std::fs::remove_file(&path);
+        util::log_init(&path).unwrap();
+
+        let mut c = enabled_stats();
+        c.record_frame_diff();
+        c.emit_client("client", 1000, 42.0, 200, 21, true, false, 8192, 256);
+
+        let mut s = enabled_stats();
+        s.record_frame_full();
+        s.record_diff_frame(100, 20);
+        s.emit_server("server", 2000, 42.0, 200, 3, 4096);
+
+        let body = std::fs::read_to_string(&path).unwrap();
+        let _ = std::fs::remove_file(&path);
+
+        for key in [
+            "client srtt=42ms",
+            "frames rx=1 (full=0 diff=1",
+            "bw_down=",
+            "predict active=1 srtt_trig=0",
+        ] {
+            assert!(body.contains(key), "missing client key {key:?} in:\n{body}");
+        }
+        for key in ["server srtt=42ms", "diff_saved=80%", "dump_vt_us=", "bw_up="] {
+            assert!(body.contains(key), "missing server key {key:?} in:\n{body}");
+        }
+    }
+}

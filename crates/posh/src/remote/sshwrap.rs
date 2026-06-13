@@ -97,28 +97,35 @@ fn is_shell_safe_name(name: &str) -> bool {
 }
 
 /// Environment the remote `posh-server` should see: LANG + every LC_*
-/// (charset, mosh parity) plus TERM and COLORTERM (posh#51 — so the session
-/// shell isn't left with an empty TERM, which strands color-by-$TERM tools
-/// like git and Charmbracelet TUIs). TERM rides as a *candidate*: the server
-/// resolves it against its own terminfo DB (terminfo::resolve_term). Restricted
-/// to names safe to emit as shell assignments.
+/// (charset, mosh parity); TERM and COLORTERM (posh#51 — so the session shell
+/// isn't left with an empty TERM, which strands color-by-$TERM tools like git
+/// and Charmbracelet TUIs); and POSH_DEBUG_LOG, so a single locally-set perf-log
+/// path lights up both ends (the server logs to that path on the *remote* host,
+/// failing closed if it isn't writable there). TERM rides as a *candidate*: the
+/// server resolves it against its own terminfo DB (terminfo::resolve_term).
+/// Restricted to names safe to emit as shell assignments.
 ///
 /// Contract: `terminfo::session_env` (server side) reads TERM and COLORTERM
 /// back out of `posh-server`'s process env, which is *only* populated because
 /// they're in this filter. Dropping COLORTERM here silently regresses remote
 /// truecolor (TERM degrades gracefully via resolve_term; COLORTERM has no
-/// fallback). Keep the two sides in sync.
-fn local_locale_vars() -> Vec<(String, String)> {
+/// fallback). Keep the two sides in sync. POSH_KEY is deliberately excluded —
+/// the session key never travels in the cleartext remote command string.
+fn forwarded_env_vars() -> Vec<(String, String)> {
     std::env::vars()
         .filter(|(k, _)| {
-            (k == "LANG" || k.starts_with("LC_") || k == "TERM" || k == "COLORTERM")
+            (k == "LANG"
+                || k.starts_with("LC_")
+                || k == "TERM"
+                || k == "COLORTERM"
+                || k == "POSH_DEBUG_LOG")
                 && is_shell_safe_name(k)
         })
         .collect()
 }
 
 pub fn run(target: &str, remote_cmd: &[String], opts: &SshOptions) -> Result<()> {
-    let server_cmd = remote_command(opts, remote_cmd, &local_locale_vars());
+    let server_cmd = remote_command(opts, remote_cmd, &forwarded_env_vars());
 
     let mut ssh = Command::new("ssh");
     match opts.family {
@@ -314,18 +321,24 @@ mod tests {
     }
 
     #[test]
-    fn forwarded_var_filter_admits_term_colorterm_lang_lc_only() {
-        // The membership predicate local_locale_vars applies, tested directly
+    fn forwarded_var_filter_admits_locale_term_and_debug_log_only() {
+        // The membership predicate forwarded_env_vars applies, tested directly
         // (not via process env, which is global and racy under parallel tests).
         let admit = |k: &str| {
-            (k == "LANG" || k.starts_with("LC_") || k == "TERM" || k == "COLORTERM")
+            (k == "LANG"
+                || k.starts_with("LC_")
+                || k == "TERM"
+                || k == "COLORTERM"
+                || k == "POSH_DEBUG_LOG")
                 && is_shell_safe_name(k)
         };
         assert!(admit("TERM"));
         assert!(admit("COLORTERM"));
         assert!(admit("LANG"));
         assert!(admit("LC_ALL"));
+        assert!(admit("POSH_DEBUG_LOG"));
         assert!(!admit("PATH"));
+        // The session key must never ride the cleartext remote command.
         assert!(!admit("POSH_KEY"));
     }
 }

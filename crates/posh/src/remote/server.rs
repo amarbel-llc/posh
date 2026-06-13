@@ -8,6 +8,7 @@ use crate::pty;
 use crate::remote::caps;
 use crate::remote::crypto::Key;
 use crate::remote::datagram::{Connection, Family, DEFAULT_PORT_RANGE, SEND_INTERVAL_MIN};
+use crate::remote::stats::Stats;
 use crate::remote::sync::{
     self, ClientMessage, EchoAck, FragmentAssembly, Fragmenter, FrameBody, InputInbox, ServerFrame,
     HEARTBEAT_INTERVAL,
@@ -86,6 +87,10 @@ struct FrameState {
 }
 
 fn server_loop(mut conn: Connection, child: pty::PtyChild, rows: u16, cols: u16) {
+    // Optional perf instrumentation (POSH_DEBUG_LOG). run() has already
+    // double-forked and redirected stdio to /dev/null, so this file fd is the
+    // server's only viable diagnostic sink; inert when the env var is unset.
+    let mut stats = Stats::new();
     let mut term = Terminal::new(rows, cols);
     let mut fragmenter = Fragmenter::new();
     let mut assembly = FragmentAssembly::new();
@@ -273,6 +278,9 @@ fn server_loop(mut conn: Connection, child: pty::PtyChild, rows: u16, cols: u16)
             let dirty = term.generation() != last_gen;
             let mut send_frame = false;
             let mut send_empty = false;
+            // A freshly produced frame (vs a retransmission of the current one):
+            // gates the diff-economics sampling so retransmits don't skew it.
+            let mut fresh_frame = false;
 
             // Fresh frames are paced by the SRTT-derived send interval
             // (mosh: ~two frames per RTT, clamped 20..250ms), not a fixed
@@ -289,11 +297,13 @@ fn server_loop(mut conn: Connection, child: pty::PtyChild, rows: u16, cols: u16)
                 }
                 current = FrameState {
                     num: current.num + 1,
-                    data: term.dump_vt(),
+                    data: stats.time_dump_vt(|| term.dump_vt()),
                 };
                 send_frame = true;
+                fresh_frame = true;
             } else if acked_num < current.num && now.saturating_sub(last_send) >= conn.rto() {
                 send_frame = true;
+                stats.record_retransmit();
             } else if now.saturating_sub(last_send) >= HEARTBEAT_INTERVAL {
                 send_empty = true;
             } else if force_ack && acked_num >= current.num {
@@ -308,21 +318,35 @@ fn server_loop(mut conn: Connection, child: pty::PtyChild, rows: u16, cols: u16)
 
             if send_frame || send_empty {
                 let body = if !send_frame {
+                    stats.record_frame_empty();
                     FrameBody::Empty
                 } else {
                     match &acked_data {
                         Some(base) => {
                             let diff = sync::make_diff(base, &current.data);
                             if diff.len() + 8 < current.data.len() {
+                                stats.record_frame_diff();
+                                if fresh_frame {
+                                    stats.record_diff_frame(current.data.len(), diff.len());
+                                }
                                 FrameBody::Diff {
                                     base: acked_num,
                                     diff,
                                 }
                             } else {
+                                stats.record_frame_full();
+                                if fresh_frame {
+                                    stats.record_full_frame(current.data.len());
+                                }
                                 FrameBody::Full(current.data.clone())
                             }
                         }
-                        None => FrameBody::Full(current.data.clone()),
+                        None => {
+                            // No acked base to diff against — a forced full dump,
+                            // not a strategy choice, so it skips the economics.
+                            stats.record_frame_full();
+                            FrameBody::Full(current.data.clone())
+                        }
                     }
                 };
                 if shutdown && exit_status.is_none() {
@@ -354,6 +378,7 @@ fn server_loop(mut conn: Connection, child: pty::PtyChild, rows: u16, cols: u16)
                 last_send = now;
             }
         }
+        stats.flush_server(now, conn.srtt(), conn.rto(), outstanding.len(), conn.bytes_tx());
 
         if shutdown {
             // The shell has exited: announce it (frames now carry the
@@ -372,6 +397,14 @@ fn server_loop(mut conn: Connection, child: pty::PtyChild, rows: u16, cols: u16)
             }
         }
     }
+
+    stats.final_server(
+        now_ms(),
+        conn.srtt(),
+        conn.rto(),
+        outstanding.len(),
+        conn.bytes_tx(),
+    );
 
     if pty_open {
         util::kill_pgroup(child.pid, libc::SIGHUP);

@@ -9,4 +9,5 @@ pub mod display;
 pub mod predict;
 pub mod server;
 pub mod sshwrap;
+pub mod stats;
 pub mod sync;

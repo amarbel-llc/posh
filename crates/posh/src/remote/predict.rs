@@ -427,7 +427,8 @@ impl PredictionEngine {
         self.glitch_trigger
     }
 
-    #[cfg(test)]
+    /// Whether the SRTT-based display trigger is on (link slow enough that
+    /// adaptive prediction shows). Read by the remote stats collector.
     pub fn srtt_trigger_on(&self) -> bool {
         self.srtt_trigger
     }

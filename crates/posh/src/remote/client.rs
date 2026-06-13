@@ -13,6 +13,7 @@ use crate::remote::crypto::Key;
 use crate::remote::datagram::{Connection, Family};
 use crate::remote::display::{self, NotificationEngine, Snapshot};
 use crate::remote::predict::{DisplayPreference, PredictionEngine};
+use crate::remote::stats::Stats;
 use crate::remote::sync::{
     self, ClientMessage, FragmentAssembly, Fragmenter, FrameBody, InputOutbox, ServerFrame,
     HEARTBEAT_INTERVAL,
@@ -165,6 +166,8 @@ struct ClientState {
     /// whether any overlay was live then — the idle fast-path key. github #35.
     last_render_state: (u64, u64),
     last_render_overlays: bool,
+    /// Optional performance instrumentation (POSH_DEBUG_LOG); inert when unset.
+    stats: Stats,
 }
 
 fn client_loop(
@@ -203,7 +206,28 @@ fn client_loop(
         exit_status: 0,
         last_render_state: (u64::MAX, u64::MAX),
         last_render_overlays: false,
+        stats: Stats::new(),
     };
+    let result = drive_client(&mut st, raw, port);
+    // One final summary regardless of how the loop exited (graceful, timeout,
+    // or error), so the log always ends with the last-observed transport state.
+    let now = now_ms();
+    st.stats.final_client(
+        now,
+        st.conn.srtt(),
+        st.conn.rto(),
+        st.conn.send_interval(),
+        st.predict.active(),
+        st.predict.srtt_trigger_on(),
+        st.conn.bytes_rx(),
+        st.conn.bytes_tx(),
+    );
+    result
+}
+
+/// Drives the client event loop until detach, shell exit, timeout, or error.
+/// Split from `client_loop` so the final stats flush runs on every exit path.
+fn drive_client(st: &mut ClientState, raw: &RawMode, port: u16) -> Result<i32> {
     let mut assembly = FragmentAssembly::new();
 
     // Connect diagnostics (mosh stmclient): before the first authentic
@@ -219,9 +243,9 @@ fn client_loop(
     let mut heard = false;
 
     // Hello: teaches the server our address and terminal size.
-    send_message(&mut st);
+    send_message(st);
 
-    loop {
+    let result: Result<i32> = 'client: loop {
         let now = now_ms();
         let mut deadline = st.last_send + HEARTBEAT_INTERVAL;
         if !st.outbox.is_empty() || st.flags != 0 {
@@ -246,7 +270,7 @@ fn client_loop(
         match util::poll(&mut fds, timeout) {
             Ok(_) => {}
             Err(e) if e.kind() == std::io::ErrorKind::Interrupted => {}
-            Err(e) => return Err(e.into()),
+            Err(e) => break 'client Err(e.into()),
         }
 
         if util::take_flag(&util::SIGWINCH_RECEIVED) {
@@ -262,7 +286,7 @@ fn client_loop(
             // SIGTERM/SIGINT/SIGHUP: wind down through the normal shutdown
             // handshake so run() restores the tty and the server hangs up
             // the shell instead of lingering until the network timeout.
-            request_shutdown(&mut st);
+            request_shutdown(st);
             send_now = true;
         }
 
@@ -277,17 +301,17 @@ fn client_loop(
             match util::read_fd(STDIN, &mut buf) {
                 Ok(0) => {
                     // EOF on the local tty: ask the server to wind down.
-                    request_shutdown(&mut st);
+                    request_shutdown(st);
                     send_now = true;
                 }
                 Ok(n) => {
-                    if process_user_input(&mut st, &buf[..n], raw) {
+                    if process_user_input(st, &buf[..n], raw) {
                         send_now = true;
                     }
                 }
                 Err(e) if e.kind() == std::io::ErrorKind::WouldBlock => {}
                 Err(e) if e.kind() == std::io::ErrorKind::Interrupted => {}
-                Err(e) => return Err(e.into()),
+                Err(e) => break 'client Err(e.into()),
             }
         }
 
@@ -311,7 +335,7 @@ fn client_loop(
                                 st.notify.set_message("", false, now_ms());
                             }
                         }
-                        if process_frame(&mut st, &frame) {
+                        if process_frame(st, &frame) {
                             send_now = true; // ack the new state promptly
                         }
                     }
@@ -326,7 +350,7 @@ fn client_loop(
         if !heard {
             let waited = now.saturating_sub(started);
             if connect_timeout > 0 && waited >= connect_timeout {
-                return Err(Error(format!(
+                break 'client Err(Error(format!(
                     "Timed out waiting for server on UDP port {port}."
                 )));
             }
@@ -338,25 +362,36 @@ fn client_loop(
                 );
             }
         }
-        render(&mut st, now);
+        render(st, now);
+        st.stats.flush_client(
+            now,
+            st.conn.srtt(),
+            st.conn.rto(),
+            st.conn.send_interval(),
+            st.predict.active(),
+            st.predict.srtt_trigger_on(),
+            st.conn.bytes_rx(),
+            st.conn.bytes_tx(),
+        );
 
         if send_now
             || ((!st.outbox.is_empty() || st.flags != 0)
                 && now.saturating_sub(st.last_send) >= st.conn.rto())
             || now.saturating_sub(st.last_send) >= HEARTBEAT_INTERVAL
         {
-            send_message(&mut st);
+            send_message(st);
         }
 
         if st.shutdown_seen {
             // Shell exited (or our quit was acknowledged); the final-state
             // ack went out just above.
-            return Ok(st.exit_status);
+            break 'client Ok(st.exit_status);
         }
         if st.shutdown_requested && now.saturating_sub(st.shutdown_requested_at) >= SHUTDOWN_GRACE {
-            return Ok(0); // server unreachable; leave anyway
+            break 'client Ok(0); // server unreachable; leave anyway
         }
-    }
+    };
+    result
 }
 
 /// mosh stmclient.cc suspend sequence: restore the outer terminal and the
@@ -648,6 +683,13 @@ fn process_user_input(st: &mut ClientState, buf: &[u8], raw: &RawMode) -> bool {
 /// state application. Returns true when an ack should go out.
 fn process_frame(st: &mut ClientState, frame: &ServerFrame) -> bool {
     let now = now_ms();
+    // Classify every received frame by wire body (includes retransmissions and
+    // duplicates — that is what arrived on the link).
+    match &frame.body {
+        FrameBody::Full(_) => st.stats.record_frame_full(),
+        FrameBody::Diff { .. } => st.stats.record_frame_diff(),
+        FrameBody::Empty => st.stats.record_frame_empty(),
+    }
     st.notify.server_heard(now);
     st.outbox.ack(frame.input_ack);
     st.predict.set_local_frame_acked(frame.input_ack);
@@ -711,7 +753,10 @@ fn apply_frame(st: &mut ClientState, frame: &ServerFrame) -> bool {
 /// banner, diffed against what the tty currently shows.
 fn render(st: &mut ClientState, now: u64) {
     let bytes = compose_frame(st, now);
-    if !bytes.is_empty() {
+    if bytes.is_empty() {
+        st.stats.record_render_skip();
+    } else {
+        st.stats.record_render(bytes.len());
         let _ = util::write_all_retry(STDOUT, &bytes, 1000);
     }
 }
@@ -942,6 +987,7 @@ mod tests {
             exit_status: 0,
             last_render_state: (u64::MAX, u64::MAX),
             last_render_overlays: false,
+            stats: Stats::new(),
         }
     }
 
