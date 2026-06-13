@@ -36,11 +36,25 @@
         };
         inherit (pkgs) lib;
 
-        # Single source of truth for the user-visible version; matches
-        # AC_INIT([mosh],[1.4.0]) in configure.ac. The autotools build
-        # derives its own VERSION.stamp from git-describe (absent in the
-        # nix sandbox, so it falls back to "mosh 1.4.0"); this literal is
-        # only for the derivation `version` attr. See eng-versioning(7).
+        # posh's single source of truth: version.env at the repo root
+        # (POSH_VERSION). Read here for the derivation `version` attr and
+        # passed into the build env so crates/posh/build.rs's drift guard
+        # resolves it without relying on the relative-path read. The Cargo
+        # manifest's package.version is kept in lockstep by `just
+        # bump-version`; the guard fails the build on any drift. See
+        # eng-versioning(7).
+        poshVersion = builtins.head (
+          builtins.match ".*POSH_VERSION=([^\n]+).*" (builtins.readFile ./version.env)
+        );
+
+        # Independent lineage: the vendored C++ mosh reference tracks
+        # UPSTREAM mosh (AC_INIT([mosh],[1.4.0]) in configure.ac), not an
+        # eng-released artifact, so it keeps its own literal rather than
+        # POSH_VERSION. The autotools build derives its own VERSION.stamp
+        # from git-describe (absent in the nix sandbox, so it falls back to
+        # "mosh 1.4.0"); this literal is only for the derivation `version`
+        # attr. (posht likewise keeps its Go-literal version.) See
+        # eng-versioning(7) on polyglot lineages.
         moshVersion = "1.4.0";
 
         # Build-time toolchain: autoreconf stack + protoc + pkg-config, and
@@ -139,13 +153,21 @@
         # checkPhase, making this the hermetic Rust CI gate (github #33).
         # The e2e tests drive ptys and loopback UDP — both available in the
         # Linux sandbox (the same facilities the C++ --local tests use).
-        # Version single source of truth: crates/posh/Cargo.toml.
+        # Version single source of truth: version.env (POSH_VERSION),
+        # read into poshVersion above. crates/posh/build.rs guards
+        # Cargo.toml's package.version against it.
         posh = pkgs.rustPlatform.buildRustPackage {
           pname = "posh";
-          version = (lib.importTOML ./crates/posh/Cargo.toml).package.version;
+          version = poshVersion;
 
           src = ./.;
           cargoLock.lockFile = ./Cargo.lock;
+
+          # The drift guard in crates/posh/build.rs reads POSH_VERSION from
+          # the build env (the nix `src` also carries version.env into the
+          # sandbox, but the env var makes the guard independent of the
+          # relative-path read). See eng-versioning(7).
+          POSH_VERSION = poshVersion;
 
           # scdoc compiles the hand-written man pages in doc/*.scd during
           # postInstall. See eng-manpages(7) and doc/.
