@@ -48,6 +48,13 @@
           builtins.match ".*POSH_VERSION=([^\n]+).*" (builtins.readFile ./version.env)
         );
 
+        # Git revision embedded into `posh version` (github #63). The flake
+        # exposes shortRev on a clean tree and dirtyShortRev (a "<sha>-dirty"
+        # string) on a modified one; "unknown" when built from a non-git source.
+        # Passed into the build env so crates/posh/build.rs flows it into the
+        # binary (cargo:rustc-env=POSH_GIT_SHA). See eng-versioning(7).
+        poshGitSha = self.shortRev or self.dirtyShortRev or "unknown";
+
         # Independent lineage: the vendored C++ mosh reference tracks
         # UPSTREAM mosh (AC_INIT([mosh],[1.4.0]) in configure.ac), not an
         # eng-released artifact, so it keeps its own literal rather than
@@ -170,6 +177,9 @@
           # into the sandbox, but the env var makes the build independent of
           # the relative-path read. See eng-versioning(7).
           POSH_VERSION = poshVersion;
+          # Git rev for `posh version` (#63); the sandbox has no .git, so the
+          # flake supplies it and build.rs flows it in.
+          POSH_GIT_SHA = poshGitSha;
 
           # scdoc compiles the hand-written man pages in doc/*.scd during
           # postInstall. See eng-manpages(7) and doc/.

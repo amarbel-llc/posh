@@ -38,6 +38,43 @@ fn main() {
 
     // Flow the authoritative version into the crate. Runtime: env!("POSH_VERSION").
     println!("cargo:rustc-env=POSH_VERSION={version}");
+
+    // Git revision for `posh version` (github #63). Resolves like the version:
+    //   1. $POSH_GIT_SHA in the build env (set by the nix derivation from the
+    //      flake's git rev — already carries a "-dirty" suffix when unclean).
+    //   2. `git` in a dev checkout — short sha plus "-dirty" for a modified tree.
+    //   3. "unknown" (no env, no git — e.g. a source tarball).
+    println!("cargo:rerun-if-env-changed=POSH_GIT_SHA");
+    let git_sha = env::var("POSH_GIT_SHA")
+        .ok()
+        .filter(|s| !s.is_empty())
+        .or_else(git_describe)
+        .unwrap_or_else(|| "unknown".to_string());
+    println!("cargo:rustc-env=POSH_GIT_SHA={git_sha}");
+}
+
+/// Dev-checkout git revision: `<short-sha>` plus `-dirty` when the working tree
+/// has uncommitted changes. `None` outside a git checkout (the nix build sets
+/// $POSH_GIT_SHA instead, so this never runs there).
+fn git_describe() -> Option<String> {
+    use std::process::Command;
+    let rev = Command::new("git")
+        .args(["rev-parse", "--short=12", "HEAD"])
+        .output()
+        .ok()?;
+    if !rev.status.success() {
+        return None;
+    }
+    let mut sha = String::from_utf8(rev.stdout).ok()?.trim().to_string();
+    if sha.is_empty() {
+        return None;
+    }
+    if let Ok(status) = Command::new("git").args(["status", "--porcelain"]).output() {
+        if status.status.success() && !status.stdout.is_empty() {
+            sha.push_str("-dirty");
+        }
+    }
+    Some(sha)
 }
 
 // Hand-rolled parse (no regex crate dependency in the build script):

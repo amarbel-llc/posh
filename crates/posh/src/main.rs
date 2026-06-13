@@ -18,6 +18,9 @@ use util::{Error, Result};
 
 // Flowed from version.env (POSH_VERSION) by build.rs; see eng-versioning(7).
 const VERSION: &str = env!("POSH_VERSION");
+// Git revision (short sha, "-dirty" when the tree was unclean at build), also
+// flowed by build.rs — from the nix flake's rev, or `git` in a dev checkout.
+const GIT_SHA: &str = env!("POSH_GIT_SHA");
 
 fn main() {
     if let Err(e) = run() {
@@ -89,7 +92,7 @@ fn run() -> Result<()> {
             Ok(())
         }
         "version" | "v" | "-V" | "--version" => {
-            println!("posh {VERSION}");
+            println!("posh {VERSION} ({GIT_SHA})");
             Ok(())
         }
         "list" | "ls" | "l" => {
