@@ -495,11 +495,14 @@ REMOTE COMMANDS (roaming over encrypted UDP)
         Survives IP changes and sleep/resume.
 
 TOOLS
-    rec replay <file> [--dump text|vt|flat]
+    rec replay <file> [--to-marker NAME] [--dump text|vt|flat]
+    rec step <file> --by <granularity> [--n N] [--dump ...]
         Replay a .castx / asciinema .cast v2 recording through the
-        in-process posh-term emulator and print the final screen
-        (deterministic; timing is never replayed as sleeps). Also available
-        as the standalone `posh-rec` binary.
+        in-process posh-term emulator (deterministic; timing is never
+        replayed as sleeps). `replay` prints the final screen; `step`
+        advances by byte/escape/write/change/frame/marker and prints the
+        intermediate screen. Also the standalone `posh-rec` binary, which
+        additionally records (`posh-rec record -- <cmd>`).
 
 ENVIRONMENT
     POSH_DIR        Socket directory (default: $XDG_RUNTIME_DIR/posh, then
