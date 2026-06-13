@@ -20,6 +20,7 @@
 pub mod castx;
 pub mod cli;
 pub mod json;
+pub mod player;
 
 use posh_term::{Screen, Terminal};
 
