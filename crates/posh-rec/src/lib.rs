@@ -17,6 +17,7 @@
 //! `docs/features/` for the feature record once it lands.
 #![forbid(unsafe_code)]
 
+pub mod assert;
 pub mod castx;
 pub mod cli;
 pub mod json;
