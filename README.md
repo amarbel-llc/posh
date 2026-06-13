@@ -163,7 +163,9 @@ constants, and underlined predictions when the link is slow
 sequence is Ctrl-^ then `.` (Ctrl-^ Ctrl-Z suspends the client). Servers
 bind dual-stack IPv6 when possible,
 report `POSH IP` from `$SSH_CONNECTION` for the ssh wrapper, require UTF-8
-locales on both ends (forwarding LANG/LC_* over ssh), and honor
+locales on both ends (forwarding LANG/LC_* over ssh), forward TERM and
+COLORTERM so the session isn't left color-blind (TERM resolved to an entry
+the remote's terminfo database actually has), and honor
 `POSH_SERVER_NETWORK_TMOUT` / `POSH_SERVER_SIGNAL_TMOUT`.
 
 The renderer also ports mosh's scroll optimization (matched rows are

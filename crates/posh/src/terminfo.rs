@@ -6,6 +6,11 @@
 //! $TERMINFO_DIRS, then the standard system dirs, with both single-char
 //! and Darwin-style hex subdirectories), and `$<..>` padding markers are
 //! stripped from the result.
+//!
+//! Because the terminfo-DB search lives here, this module also owns the
+//! remote session's terminal-env policy (posh#51): `resolve_term` picks a
+//! $TERM the host's DB actually has, and `session_env` bundles it with the
+//! forwarded $COLORTERM for the session shell.
 
 use std::path::PathBuf;
 
@@ -79,25 +84,75 @@ fn search_dirs() -> Vec<PathBuf> {
     dirs
 }
 
+/// Candidate compiled-entry paths for `term` across `dirs`, in ncurses search
+/// order: each dir × each subdir style. Linux uses a single-character
+/// subdirectory; Darwin/macOS databases use the character's lowercase hex
+/// code. Empty for an empty `term`. The one place the subdir layout lives.
+fn candidate_paths<'a>(term: &'a str, dirs: &'a [PathBuf]) -> impl Iterator<Item = PathBuf> + 'a {
+    let subdirs: Vec<String> = match term.chars().next() {
+        Some(first) => vec![first.to_string(), format!("{:02x}", first as u32)],
+        None => Vec::new(),
+    };
+    dirs.iter()
+        .flat_map(move |dir| subdirs.clone().into_iter().map(move |sub| dir.join(sub).join(term)))
+}
+
 /// Finds and parses $TERM's compiled entry under `dirs`. The first file
 /// that exists wins (ncurses behavior); a file that fails to parse is
 /// treated as no entry.
 pub fn lookup_ca_mode(term: &str, dirs: &[PathBuf]) -> Lookup {
-    let Some(first) = term.chars().next() else {
-        return Lookup::NoEntry;
-    };
-    // Linux uses a single-character subdirectory; Darwin/macOS databases
-    // use the character's lowercase hex code.
-    let subdirs = [first.to_string(), format!("{:02x}", first as u32)];
-    for dir in dirs {
-        for sub in &subdirs {
-            let path = dir.join(sub).join(term);
-            if let Ok(bytes) = std::fs::read(&path) {
-                return parse_ca_mode(&bytes).unwrap_or(Lookup::NoEntry);
-            }
+    for path in candidate_paths(term, dirs) {
+        if let Ok(bytes) = std::fs::read(&path) {
+            return parse_ca_mode(&bytes).unwrap_or(Lookup::NoEntry);
         }
     }
     Lookup::NoEntry
+}
+
+/// Whether a compiled terminfo entry named `term` exists under `dirs`. Pure
+/// path-presence check (the question curses' `setupterm` answers), independent
+/// of whether the entry parses — distinct from `lookup_ca_mode`, which folds
+/// an unreadable/malformed file into `NoEntry`.
+pub fn entry_exists(term: &str, dirs: &[PathBuf]) -> bool {
+    candidate_paths(term, dirs).any(|p| p.exists())
+}
+
+/// The $TERM to advertise to a remote session shell (posh#51). The session app
+/// talks to posh-term (fixed kitty-parity capabilities), so the only constraint
+/// on the *name* is that the host's terminfo DB has an entry curses can look
+/// up. Prefer the client's forwarded $TERM, then xterm-256color, then xterm;
+/// return the first the local DB actually has. Falls back to "xterm-256color"
+/// even when the DB has none — better than an empty TERM (termenv still yields
+/// ANSI256, and a DB-less host is degenerate). mosh forwards blindly and breaks
+/// when the entry is absent; resolving avoids that.
+pub fn resolve_term() -> String {
+    resolve_term_in(&std::env::var("TERM").unwrap_or_default(), &search_dirs())
+}
+
+/// Pure core of `resolve_term`: the candidate preference and fallback, with
+/// the client $TERM and search dirs injected so it is testable without
+/// touching process env. `entry_exists("")` is false, so an unset client
+/// candidate is skipped without a separate guard.
+fn resolve_term_in(client: &str, dirs: &[PathBuf]) -> String {
+    for cand in [client, "xterm-256color", "xterm"] {
+        if entry_exists(cand, dirs) {
+            return cand.to_string();
+        }
+    }
+    "xterm-256color".to_string()
+}
+
+/// Environment a freshly spawned remote session shell should receive (posh#51):
+/// a resolved TERM (never empty) plus the client's COLORTERM when it forwarded
+/// a non-empty one. TERM has a sensible server-side default; COLORTERM does
+/// not, so it is conditional. Owns the session-env policy so the server boot
+/// path doesn't, and so the COLORTERM passthrough is testable.
+pub fn session_env() -> Vec<(String, String)> {
+    let mut env = vec![("TERM".to_string(), resolve_term())];
+    if let Some(colorterm) = std::env::var("COLORTERM").ok().filter(|v| !v.is_empty()) {
+        env.push(("COLORTERM".to_string(), colorterm));
+    }
+    env
 }
 
 /// Extracts smcup/rmcup from one compiled entry. None = malformed.
@@ -298,6 +353,46 @@ mod tests {
             Lookup::Found(b"E".to_vec(), b"X".to_vec())
         );
         assert_eq!(lookup_ca_mode("missing", &[tmp.clone()]), Lookup::NoEntry);
+        let _ = std::fs::remove_dir_all(&tmp);
+    }
+
+    #[test]
+    fn entry_exists_is_a_pure_path_check() {
+        let tmp = std::env::temp_dir().join(format!("posh-ti-ex-{}", std::process::id()));
+        // Single-char subdir ('x'), and a present-but-empty file (existence is
+        // independent of whether it parses as a real terminfo entry).
+        let dir = tmp.join("x");
+        std::fs::create_dir_all(&dir).unwrap();
+        std::fs::write(dir.join("xterm-256color"), b"not a real entry").unwrap();
+        let dirs = [tmp.clone()];
+        assert!(entry_exists("xterm-256color", &dirs));
+        assert!(!entry_exists("xterm-kitty", &dirs));
+        assert!(!entry_exists("", &dirs));
+        let _ = std::fs::remove_dir_all(&tmp);
+    }
+
+    #[test]
+    fn resolve_term_in_prefers_client_then_falls_through_to_present_entry() {
+        let tmp = std::env::temp_dir().join(format!("posh-ti-rt-{}", std::process::id()));
+        let dir = tmp.join("x");
+        std::fs::create_dir_all(&dir).unwrap();
+        let dirs = [tmp.clone()];
+
+        // Only plain xterm present: a client TERM the DB lacks falls through
+        // past the missing xterm-256color candidate to xterm.
+        std::fs::write(dir.join("xterm"), b"x").unwrap();
+        assert_eq!(resolve_term_in("xterm-fancy", &dirs), "xterm");
+
+        // Client TERM present → preferred over the later candidates.
+        std::fs::write(dir.join("xterm-kitty"), b"x").unwrap();
+        assert_eq!(resolve_term_in("xterm-kitty", &dirs), "xterm-kitty");
+
+        // Empty client (unset $TERM) is skipped, not matched.
+        assert_eq!(resolve_term_in("", &dirs), "xterm"); // xterm-256color absent
+
+        // DB-less dirs: hardcoded fallback rather than empty.
+        assert_eq!(resolve_term_in("whatever", &[]), "xterm-256color");
+
         let _ = std::fs::remove_dir_all(&tmp);
     }
 

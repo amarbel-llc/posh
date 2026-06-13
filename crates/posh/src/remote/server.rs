@@ -69,7 +69,11 @@ pub fn run(
     util::install_sigusr1_handler();
 
     let (rows, cols) = (24u16, 80u16);
-    let child = pty::spawn_shell(command.as_deref(), rows, cols, &[])?;
+    // posh#51: the ssh bootstrap allocates no remote pty, so sshd set no TERM;
+    // terminfo::session_env gives the session shell a resolved TERM (+ the
+    // client's COLORTERM) so color-by-$TERM tools (git, Charmbracelet TUIs)
+    // aren't left colorless.
+    let child = pty::spawn_shell(command.as_deref(), rows, cols, &crate::terminfo::session_env())?;
     util::set_nonblocking(child.master)?;
 
     server_loop(conn, child, rows, cols);

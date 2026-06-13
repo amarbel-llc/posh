@@ -177,3 +177,24 @@ debug-verify-grab grab="on" *ARGS:
     read -r _ _ port key < <(grep -m1 '^POSH CONNECT ' "$fifo")
     echo ">> connecting client (POSH_GRAB_MOUSE={{ grab }}) to 127.0.0.1:$port" >&2
     POSH_KEY="$key" POSH_GRAB_MOUSE='{{ grab }}' exec "$posh" client -4 127.0.0.1 "$port"
+
+# Verify TERM/COLORTERM forwarding (#51) over a LOCAL loopback server+client
+# pair with freshly-built worktree binaries. Runs your $SHELL in the session;
+# inside it check `echo $TERM` is non-empty and `git -c color.ui=auto status`
+# (or a Charmbracelet TUI) shows color. Detach the client with Ctrl-^ then "."
+# Loopback note: the server inherits THIS process's env, so it sees the same
+# TERM the recipe runs under — the resolution still proves the spawn_shell
+# extra_env path; for the true ssh-strips-TERM case test over a real host.
+# Debug-only; the hermetic gate is build-rust.
+[group("debug")]
+debug-verify-term:
+    #!/usr/bin/env bash
+    set -euo pipefail
+    cd '{{ justfile_directory() }}'
+    nix develop --command cargo build -p posh
+    posh=target/debug/posh
+    fifo=$(mktemp -u); mkfifo "$fifo"; trap 'rm -f "$fifo"' EXIT
+    "$posh" server new -4 >"$fifo" &
+    read -r _ _ port key < <(grep -m1 '^POSH CONNECT ' "$fifo")
+    echo ">> connecting client to 127.0.0.1:$port — in the session, run: echo \$TERM" >&2
+    POSH_KEY="$key" exec "$posh" client -4 127.0.0.1 "$port"

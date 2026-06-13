@@ -96,11 +96,24 @@ fn is_shell_safe_name(name: &str) -> bool {
     chars.all(|c| c.is_ascii_alphanumeric() || c == '_')
 }
 
-/// LANG plus every LC_* variable from the local environment, restricted to
-/// names that are safe to emit as shell assignments.
+/// Environment the remote `posh-server` should see: LANG + every LC_*
+/// (charset, mosh parity) plus TERM and COLORTERM (posh#51 — so the session
+/// shell isn't left with an empty TERM, which strands color-by-$TERM tools
+/// like git and Charmbracelet TUIs). TERM rides as a *candidate*: the server
+/// resolves it against its own terminfo DB (terminfo::resolve_term). Restricted
+/// to names safe to emit as shell assignments.
+///
+/// Contract: `terminfo::session_env` (server side) reads TERM and COLORTERM
+/// back out of `posh-server`'s process env, which is *only* populated because
+/// they're in this filter. Dropping COLORTERM here silently regresses remote
+/// truecolor (TERM degrades gracefully via resolve_term; COLORTERM has no
+/// fallback). Keep the two sides in sync.
 fn local_locale_vars() -> Vec<(String, String)> {
     std::env::vars()
-        .filter(|(k, _)| (k == "LANG" || k.starts_with("LC_")) && is_shell_safe_name(k))
+        .filter(|(k, _)| {
+            (k == "LANG" || k.starts_with("LC_") || k == "TERM" || k == "COLORTERM")
+                && is_shell_safe_name(k)
+        })
         .collect()
 }
 
@@ -278,5 +291,41 @@ mod tests {
             &[],
         );
         assert_eq!(plain, "posh-server new");
+    }
+
+    #[test]
+    fn remote_command_forwards_term_and_colorterm_as_prefixes() {
+        // posh#51: TERM/COLORTERM ride the same env-prefix path as LANG, so the
+        // session shell isn't stranded with an empty TERM. Values are shell-
+        // quoted; the server resolves TERM against its own terminfo DB.
+        let opts = SshOptions {
+            family: Family::Auto,
+            port_range: None,
+        };
+        let env = vec![
+            ("TERM".to_string(), "xterm-kitty".to_string()),
+            ("COLORTERM".to_string(), "truecolor".to_string()),
+        ];
+        let cmd = remote_command(&opts, &[], &env);
+        assert_eq!(
+            cmd,
+            "TERM='xterm-kitty' COLORTERM='truecolor' posh-server new"
+        );
+    }
+
+    #[test]
+    fn forwarded_var_filter_admits_term_colorterm_lang_lc_only() {
+        // The membership predicate local_locale_vars applies, tested directly
+        // (not via process env, which is global and racy under parallel tests).
+        let admit = |k: &str| {
+            (k == "LANG" || k.starts_with("LC_") || k == "TERM" || k == "COLORTERM")
+                && is_shell_safe_name(k)
+        };
+        assert!(admit("TERM"));
+        assert!(admit("COLORTERM"));
+        assert!(admit("LANG"));
+        assert!(admit("LC_ALL"));
+        assert!(!admit("PATH"));
+        assert!(!admit("POSH_KEY"));
     }
 }
