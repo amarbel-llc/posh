@@ -136,6 +136,9 @@ fn run() -> Result<()> {
         "server" => cmd_server(args),
         "client" => cmd_client(args),
         "ssh" => cmd_ssh(args),
+        // `posh rec ...` == the standalone `posh-rec` binary: deterministic
+        // recording replay (posh-rec owns the logic; this is just an alias).
+        "rec" => posh_rec::cli::run(args).map_err(Error::from),
         name if !name.starts_with('-') => match target::Target::parse(name) {
             // Bare `posh <name>` attaches (creating the session if needed).
             target::Target::LocalSession { .. } => cmd_attach(&group, rest),
@@ -474,6 +477,13 @@ REMOTE COMMANDS (roaming over encrypted UDP)
         reports. The remote host needs `posh-server` on its
         non-interactive PATH (the nix package installs it next to posh).
         Survives IP changes and sleep/resume.
+
+TOOLS
+    rec replay <file> [--dump text|vt|flat]
+        Replay a .castx / asciinema .cast v2 recording through the
+        in-process posh-term emulator and print the final screen
+        (deterministic; timing is never replayed as sleeps). Also available
+        as the standalone `posh-rec` binary.
 
 ENVIRONMENT
     POSH_DIR        Socket directory (default: $XDG_RUNTIME_DIR/posh, then

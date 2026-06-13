@@ -17,6 +17,10 @@
 //! `docs/features/` for the feature record once it lands.
 #![forbid(unsafe_code)]
 
+pub mod castx;
+pub mod cli;
+pub mod json;
+
 use posh_term::{Screen, Terminal};
 
 /// A deterministic replay of a terminal output byte stream through an
@@ -53,6 +57,14 @@ impl Replay {
     pub fn feed(&mut self, bytes: &[u8]) {
         self.term.process(bytes);
         let _ = self.term.take_responses();
+    }
+
+    /// Resize the emulated terminal. Honors `.castx` `r` (resize) events on
+    /// replay. Argument order matches [`Terminal::resize`] (rows, then cols);
+    /// the caller is responsible for the asciinema `"WxH"` cols-first→rows
+    /// mapping (see [`cli`]).
+    pub fn resize(&mut self, rows: u16, cols: u16) {
+        self.term.resize(rows, cols);
     }
 
     /// Read access to the emulated screen (cells, rows, scrollback).
