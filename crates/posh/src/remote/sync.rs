@@ -210,6 +210,16 @@ pub enum FrameBody {
     Full(Vec<u8>),
     Diff { base: u64, diff: Vec<u8> },
     Empty,
+    /// Scrollback growth (RFC 0002 §2): the rows that newly entered the
+    /// server's primary-screen scrollback since the frame the client last
+    /// acknowledged. `base` is that acked frame number — the client appends
+    /// `rows` only when it is exactly at `base` (`base == applied_num`),
+    /// which makes a retransmitted or superseding body idempotent under
+    /// loss, exactly as `Diff` is anchored to its base. Each row is a
+    /// self-contained `dump_scrollback_row` byte stream (wrap implied by the
+    /// absence of a trailing newline). Visible screen state is unchanged by
+    /// this body.
+    Scrollback { base: u64, rows: Vec<Vec<u8>> },
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -232,6 +242,14 @@ pub struct ServerFrame {
 const BODY_FULL: u8 = 0;
 const BODY_DIFF: u8 = 1;
 const BODY_EMPTY: u8 = 2;
+const BODY_SCROLLBACK: u8 = 3;
+
+/// Upper bound on rows in one `BODY_SCROLLBACK` body. A single frame's
+/// payload is already bounded by the fragmentation layer, but `appended` is
+/// attacker-controlled by an authenticated peer (RFC 0002 Security
+/// Considerations): cap it so a hostile count cannot drive an unbounded
+/// allocation before the rows themselves are parsed.
+const MAX_SCROLLBACK_ROWS: usize = 1 << 20;
 
 impl ServerFrame {
     pub fn encode(&self) -> Vec<u8> {
@@ -254,6 +272,15 @@ impl ServerFrame {
                 out.extend_from_slice(diff);
             }
             FrameBody::Empty => out.push(BODY_EMPTY),
+            FrameBody::Scrollback { base, rows } => {
+                out.push(BODY_SCROLLBACK);
+                out.extend_from_slice(&base.to_le_bytes());
+                out.extend_from_slice(&(rows.len() as u32).to_le_bytes());
+                for row in rows {
+                    out.extend_from_slice(&(row.len() as u16).to_le_bytes());
+                    out.extend_from_slice(row);
+                }
+            }
         }
         out
     }
@@ -280,6 +307,37 @@ impl ServerFrame {
                 }
             }
             BODY_EMPTY => FrameBody::Empty,
+            BODY_SCROLLBACK => {
+                if data.len() < at + 13 {
+                    return Err(Error::from("scrollback frame too short"));
+                }
+                let base = u64::from_le_bytes(data[at + 1..at + 9].try_into().unwrap());
+                let appended = u32::from_le_bytes(data[at + 9..at + 13].try_into().unwrap()) as usize;
+                // Reject a count that could not possibly be backed by the
+                // remaining bytes (each row is ≥2 bytes of length header)
+                // before reserving for it, then parse row by row, treating a
+                // length that runs past the body as a discard (never an
+                // over-read). RFC 0002 Security Considerations.
+                if appended > MAX_SCROLLBACK_ROWS || appended * 2 > data.len() - (at + 13) {
+                    return Err(Error::from("scrollback row count exceeds body"));
+                }
+                let mut rows = Vec::with_capacity(appended);
+                let mut p = at + 13;
+                for _ in 0..appended {
+                    let (Some(&lo), Some(&hi)) = (data.get(p), data.get(p + 1)) else {
+                        return Err(Error::from("scrollback row header truncated"));
+                    };
+                    let len = u16::from_le_bytes([lo, hi]) as usize;
+                    p += 2;
+                    let end = p + len;
+                    let Some(bytes) = data.get(p..end) else {
+                        return Err(Error::from("scrollback row truncated"));
+                    };
+                    rows.push(bytes.to_vec());
+                    p = end;
+                }
+                FrameBody::Scrollback { base, rows }
+            }
             _ => return Err(Error::from("unknown frame body kind")),
         };
         Ok(ServerFrame {
@@ -467,6 +525,70 @@ impl InputOutbox {
 
     pub fn is_empty(&self) -> bool {
         self.buf.is_empty()
+    }
+}
+
+/// Client side of the scrollback accumulation model (RFC 0002 §3): a local,
+/// **partial, monotonically growing** view of the server's primary-screen
+/// row space. Rows arrive in `BODY_SCROLLBACK` bodies and are appended to
+/// the bottom in order; once the ring reaches `capacity` it evicts its own
+/// oldest rows (those are gone — this revision has no back-fill). The view
+/// is explicitly partial: on a fresh attach it starts empty and grows
+/// forward, and "scrolled past the top of what I hold" is the end of
+/// locally-available scrollback, not an error. A `Full` visible reset MUST
+/// NOT clear it (the ring is the durable local accumulation); a width
+/// resize MUST (RFC 0002 §4 — the caller re-accumulates at the new width).
+#[derive(Debug)]
+pub struct ScrollbackRing {
+    rows: std::collections::VecDeque<Vec<u8>>,
+    capacity: usize,
+}
+
+impl ScrollbackRing {
+    pub fn new(capacity: usize) -> ScrollbackRing {
+        ScrollbackRing {
+            rows: std::collections::VecDeque::new(),
+            capacity: capacity.max(1),
+        }
+    }
+
+    /// Appends rows to the bottom of the ring, evicting the oldest past the
+    /// capacity bound. Each row is the self-contained `dump_scrollback_row`
+    /// byte stream the server shipped (RFC 0002 §3: the client appends the
+    /// bytes the body carried; it does not derive them from the visible
+    /// body).
+    pub fn append(&mut self, rows: &[Vec<u8>]) {
+        for row in rows {
+            if self.rows.len() >= self.capacity {
+                self.rows.pop_front();
+            }
+            self.rows.push_back(row.clone());
+        }
+    }
+
+    pub fn clear(&mut self) {
+        self.rows.clear();
+    }
+
+    // The read side of the ring (`len`/`is_empty`/`row`) is the accumulated
+    // history the client's wheel scroll-view renders from. That renderer is
+    // FDR 0005's local viewport, deliberately out of this wire-contract
+    // change, so these are exercised by the conformance tests but not yet by
+    // a non-test caller.
+    #[allow(dead_code)]
+    pub fn len(&self) -> usize {
+        self.rows.len()
+    }
+
+    #[allow(dead_code)]
+    pub fn is_empty(&self) -> bool {
+        self.rows.is_empty()
+    }
+
+    /// The `i`th retained row (0 = oldest still held), or `None` past the end.
+    #[allow(dead_code)]
+    pub fn row(&self, i: usize) -> Option<&[u8]> {
+        self.rows.get(i).map(Vec::as_slice)
     }
 }
 
@@ -676,6 +798,69 @@ mod tests {
     }
 
     #[test]
+    fn scrollback_body_roundtrip() {
+        // RFC 0002 §2: `base`, the appended count, and each row's len/bytes
+        // survive encode→decode, including the empty (appended = 0) body.
+        let cases = vec![
+            ServerFrame {
+                flags: 0,
+                caps: vec![],
+                frame_num: 5,
+                input_ack: 10,
+                echo_ack: 9,
+                body: FrameBody::Scrollback {
+                    base: 4,
+                    rows: vec![b"first row\r\n".to_vec(), b"\x1b[31msecond\x1b[0m\r\n".to_vec()],
+                },
+            },
+            ServerFrame {
+                flags: 0,
+                caps: vec![],
+                frame_num: 6,
+                input_ack: 0,
+                echo_ack: 0,
+                // appended = 0 is a valid no-op body and must roundtrip.
+                body: FrameBody::Scrollback {
+                    base: 6,
+                    rows: vec![],
+                },
+            },
+        ];
+        for frame in cases {
+            assert_eq!(ServerFrame::decode(&frame.encode()).unwrap(), frame);
+        }
+    }
+
+    #[test]
+    fn scrollback_body_rejects_row_past_body() {
+        // RFC 0002 §2: a row length extending past the body must fail to
+        // decode rather than over-read or panic.
+        let good = ServerFrame {
+            flags: 0,
+            caps: vec![],
+            frame_num: 1,
+            input_ack: 0,
+            echo_ack: 0,
+            body: FrameBody::Scrollback {
+                base: 0,
+                rows: vec![b"hello".to_vec()],
+            },
+        }
+        .encode();
+        // Truncate inside the single row's bytes: the length header still
+        // claims 5 bytes but only some remain.
+        let mut truncated = good.clone();
+        truncated.truncate(truncated.len() - 2);
+        assert!(ServerFrame::decode(&truncated).is_err());
+        // A bogus appended count far larger than the body is rejected before
+        // any allocation, not parsed into a giant vector.
+        let mut huge = good;
+        let at = huge.len() - 5 /* "hello" */ - 2 /* row len */ - 4 /* appended */;
+        huge[at..at + 4].copy_from_slice(&u32::MAX.to_le_bytes());
+        assert!(ServerFrame::decode(&huge).is_err());
+    }
+
+    #[test]
     fn client_message_caps_roundtrip_and_v0_compat() {
         // v0 bytes (no extension bit) decode to an empty table.
         let v0 = ClientMessage {
@@ -841,6 +1026,26 @@ mod tests {
         ob.ack(100); // overshoot clamps
         assert!(ob.is_empty());
         assert_eq!(ob.base(), 6);
+    }
+
+    #[test]
+    fn scrollback_ring_appends_in_order_and_evicts_oldest() {
+        let mut ring = ScrollbackRing::new(3);
+        assert!(ring.is_empty());
+        ring.append(&[b"a".to_vec(), b"b".to_vec()]);
+        ring.append(&[b"c".to_vec()]);
+        assert_eq!(ring.len(), 3);
+        assert_eq!(ring.row(0), Some(&b"a"[..]));
+        assert_eq!(ring.row(2), Some(&b"c"[..]));
+        // Past capacity the oldest rows fall off the front; order is kept.
+        ring.append(&[b"d".to_vec(), b"e".to_vec()]);
+        assert_eq!(ring.len(), 3);
+        assert_eq!(ring.row(0), Some(&b"c"[..]));
+        assert_eq!(ring.row(1), Some(&b"d"[..]));
+        assert_eq!(ring.row(2), Some(&b"e"[..]));
+        assert_eq!(ring.row(3), None);
+        ring.clear();
+        assert!(ring.is_empty());
     }
 
     #[test]

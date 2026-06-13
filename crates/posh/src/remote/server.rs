@@ -83,7 +83,18 @@ pub fn run(
 
 struct FrameState {
     num: u64,
+    /// The visible-screen `dump_vt` bytes as of this frame — the diff base
+    /// for a later `Diff`. A scrollback frame leaves the visible screen
+    /// unchanged, so it records the same visible bytes as the frame before
+    /// it, keeping the diff-base chain intact across interleaved scrollback
+    /// frames.
     data: Vec<u8>,
+    /// Scrollback rows the client will have accumulated after applying this
+    /// frame (RFC 0002): the running high-water that only advances on a
+    /// scrollback frame. Acking this frame tells the server the client holds
+    /// scrollback through here, so the next body's appended count starts
+    /// from it.
+    sb_total: u64,
 }
 
 fn server_loop(mut conn: Connection, child: pty::PtyChild, rows: u16, cols: u16) {
@@ -107,12 +118,29 @@ fn server_loop(mut conn: Connection, child: pty::PtyChild, rows: u16, cols: u16)
     let mut current = FrameState {
         num: 0,
         data: Vec::new(),
+        sb_total: 0,
     };
     // Last frame the client confirmed; None data means we no longer have its
     // bytes and must send a full dump.
     let mut acked_num: u64 = 0;
     let mut acked_data: Option<Vec<u8>> = Some(Vec::new());
     let mut outstanding: Vec<FrameState> = Vec::new();
+
+    // Scrollback sync (RFC 0002). `peer_wants_scrollback` tracks whether the
+    // most recent client message advertised SCROLLBACK (capabilities do not
+    // persist; the client drops it on resize). `sb_floor` is the scrollback
+    // total at which accumulation (re)started — growth below it is never
+    // back-filled (forward-only; a resize resyncs at the new width).
+    // `sb_high` is the total covered by the latest produced frame, and
+    // `acked_sb_total` the total the client has confirmed. `current_is_sb`
+    // says whether `current` is a scrollback frame, and `last_was_sb`
+    // alternates the two kinds so heavy output does not starve either.
+    let mut peer_wants_scrollback = false;
+    let mut sb_floor: u64 = 0;
+    let mut sb_high: u64 = 0;
+    let mut acked_sb_total: u64 = 0;
+    let mut current_is_sb = false;
+    let mut last_was_sb = false;
 
     let mut last_gen = term.generation();
     let mut last_send: u64 = 0;
@@ -231,6 +259,13 @@ fn server_loop(mut conn: Connection, child: pty::PtyChild, rows: u16, cols: u16)
                         if caps::find(&msg.caps, caps::CAP_EXIT_STATUS).is_some() {
                             peer_wants_exit = true;
                         }
+                        // Per-message (caps do not persist): does the client
+                        // still want scrollback? A fresh advertisement after
+                        // a lull/resize restarts appended-row counting from
+                        // the current ring — forward-only, no back-fill
+                        // (RFC 0002 §1, §4). The resize itself is applied in
+                        // handle_client_message below, so a reactivation
+                        // message anchors to the post-resize ring.
                         handle_client_message(
                             &msg,
                             &mut term,
@@ -257,7 +292,15 @@ fn server_loop(mut conn: Connection, child: pty::PtyChild, rows: u16, cols: u16)
                             &mut outstanding,
                             &mut acked_num,
                             &mut acked_data,
+                            &mut acked_sb_total,
                         );
+                        let now_wants = caps::find(&msg.caps, caps::CAP_SCROLLBACK).is_some();
+                        if now_wants && !peer_wants_scrollback {
+                            // (Re)activation: accumulate forward from here.
+                            sb_floor = term.primary_scrollback_total();
+                            sb_high = sb_high.max(sb_floor);
+                        }
+                        peer_wants_scrollback = now_wants;
                     }
                     Ok(None) => continue,
                     Err(e) if e.kind() == std::io::ErrorKind::WouldBlock => break,
@@ -276,6 +319,7 @@ fn server_loop(mut conn: Connection, child: pty::PtyChild, rows: u16, cols: u16)
         let peer_active = conn.has_remote() && now.saturating_sub(last_heard) < PEER_TIMEOUT;
         if peer_active {
             let dirty = term.generation() != last_gen;
+            let cur_sb_total = term.primary_scrollback_total();
             let mut send_frame = false;
             let mut send_empty = false;
             // A freshly produced frame (vs a retransmission of the current one):
@@ -285,12 +329,32 @@ fn server_loop(mut conn: Connection, child: pty::PtyChild, rows: u16, cols: u16)
             // Fresh frames are paced by the SRTT-derived send interval
             // (mosh: ~two frames per RTT, clamped 20..250ms), not a fixed
             // floor — on a slow link more frames only self-congest it.
-            if (dirty || force_frame) && now.saturating_sub(last_send) >= conn.send_interval() {
+            let paced = now.saturating_sub(last_send) >= conn.send_interval();
+            let want_visible = (dirty || force_frame) && paced;
+            // Scrollback grew (RFC 0002): new rows on the primary screen, the
+            // peer wants them, and they lie beyond both the forward floor and
+            // what the latest frame already covers. Suppressed during the
+            // shutdown handshake so the final visible frame is not deferred.
+            let want_scrollback = peer_wants_scrollback
+                && !term.is_alt_screen()
+                && !force_frame
+                && !shutdown
+                && cur_sb_total > sb_high
+                && cur_sb_total > acked_sb_total.max(sb_floor)
+                && paced;
+            // At most one fresh body per opportunity; when both are ready
+            // (heavy output scrolling the screen) alternate so neither kind
+            // starves the other.
+            let make_scrollback = want_scrollback && (!want_visible || !last_was_sb);
+            let make_visible = want_visible && !make_scrollback;
+
+            if make_visible {
                 last_gen = term.generation();
                 force_frame = false;
                 outstanding.push(FrameState {
                     num: current.num,
                     data: std::mem::take(&mut current.data),
+                    sb_total: current.sb_total,
                 });
                 if outstanding.len() > 8 {
                     outstanding.remove(0);
@@ -298,9 +362,34 @@ fn server_loop(mut conn: Connection, child: pty::PtyChild, rows: u16, cols: u16)
                 current = FrameState {
                     num: current.num + 1,
                     data: stats.time_dump_vt(|| term.dump_vt()),
+                    sb_total: sb_high,
                 };
+                current_is_sb = false;
+                last_was_sb = false;
                 send_frame = true;
                 fresh_frame = true;
+            } else if make_scrollback {
+                // The visible screen is unchanged, so the scrollback frame
+                // inherits the standing visible dump as its diff base — the
+                // diff-base chain is unbroken across interleaved frames.
+                let visible = current.data.clone();
+                outstanding.push(FrameState {
+                    num: current.num,
+                    data: std::mem::take(&mut current.data),
+                    sb_total: current.sb_total,
+                });
+                if outstanding.len() > 8 {
+                    outstanding.remove(0);
+                }
+                current = FrameState {
+                    num: current.num + 1,
+                    data: visible,
+                    sb_total: cur_sb_total,
+                };
+                sb_high = cur_sb_total;
+                current_is_sb = true;
+                last_was_sb = true;
+                send_frame = true;
             } else if acked_num < current.num && now.saturating_sub(last_send) >= conn.rto() {
                 send_frame = true;
                 stats.record_retransmit();
@@ -320,6 +409,38 @@ fn server_loop(mut conn: Connection, child: pty::PtyChild, rows: u16, cols: u16)
                 let body = if !send_frame {
                     stats.record_frame_empty();
                     FrameBody::Empty
+                } else if current_is_sb {
+                    // Scrollback body (RFC 0002 §2), fresh or retransmitted:
+                    // the rows that entered scrollback between the acked
+                    // frame and this frame's coverage, anchored to the
+                    // current ack so a retransmit or supersede is idempotent.
+                    // Bounded by the rows still in the ring — anything the
+                    // ring has since evicted is gone (the client's view is
+                    // partial by design), and bounded by inter-frame growth,
+                    // never by total scrollback depth.
+                    // Work in ring positions (newest-anchored) rather than
+                    // absolute indices: a width reflow changes the ring
+                    // length without advancing the monotonic total, so
+                    // absolute mapping is unsafe. `grown` rows have entered
+                    // since this frame's coverage and sit at the tail, so the
+                    // rows this frame covers end just before them; `appended`
+                    // (rows since the ack/floor) is capped to what the ring
+                    // still holds — evicted older rows are gone by design.
+                    let ring_len = term.primary_scrollback_len();
+                    let grown = cur_sb_total.saturating_sub(current.sb_total) as usize;
+                    let end = ring_len.saturating_sub(grown);
+                    let want = current
+                        .sb_total
+                        .saturating_sub(acked_sb_total.max(sb_floor)) as usize;
+                    let appended = want.min(end);
+                    let start = end - appended;
+                    let rows: Vec<Vec<u8>> = (start..end)
+                        .map(|i| term.dump_scrollback_row(i).unwrap_or_default())
+                        .collect();
+                    FrameBody::Scrollback {
+                        base: acked_num,
+                        rows,
+                    }
                 } else {
                     match &acked_data {
                         Some(base) => {
@@ -355,16 +476,29 @@ fn server_loop(mut conn: Connection, child: pty::PtyChild, rows: u16, cols: u16)
                     // handshake frames go out.
                     exit_status = util::try_reap(child.pid).map(util::exit_code);
                 }
-                let frame_caps = match exit_status {
-                    // Only peers that advertised the capability may
-                    // receive its payload (RFC 0001 §3).
-                    Some(code) if shutdown && peer_wants_exit => {
-                        caps::own_table(&[caps::Cap {
+                // Capability table on the frame (RFC 0001 §3). Only peers
+                // that advertised a capability receive its payload.
+                let mut extras: Vec<caps::Cap> = Vec::new();
+                if peer_wants_scrollback {
+                    // Acknowledge that we emit scrollback bodies (RFC 0002
+                    // §1); empty payload.
+                    extras.push(caps::Cap {
+                        id: caps::CAP_SCROLLBACK,
+                        payload: vec![],
+                    });
+                }
+                if shutdown && peer_wants_exit {
+                    if let Some(code) = exit_status {
+                        extras.push(caps::Cap {
                             id: caps::CAP_EXIT_STATUS,
                             payload: vec![code.clamp(0, 255) as u8],
-                        }])
+                        });
                     }
-                    _ => Vec::new(),
+                }
+                let frame_caps = if extras.is_empty() {
+                    Vec::new()
+                } else {
+                    caps::own_table(&extras)
                 };
                 let frame = ServerFrame {
                     flags: if shutdown { sync::FLAG_SHUTDOWN } else { 0 },
@@ -443,6 +577,7 @@ fn update_acks(
     outstanding: &mut Vec<FrameState>,
     acked_num: &mut u64,
     acked_data: &mut Option<Vec<u8>>,
+    acked_sb_total: &mut u64,
 ) {
     // Ignore acks for frames never sent: an authenticated client claiming a
     // future frame would otherwise clear `outstanding`, disable retransmits,
@@ -451,14 +586,23 @@ fn update_acks(
         return;
     }
     *acked_num = msg.acked_frame;
-    *acked_data = if msg.acked_frame == current.num {
-        Some(current.data.clone())
+    let acked = if msg.acked_frame == current.num {
+        Some((current.data.clone(), current.sb_total))
     } else {
         outstanding
             .iter()
             .find(|f| f.num == msg.acked_frame)
-            .map(|f| f.data.clone())
+            .map(|f| (f.data.clone(), f.sb_total))
     };
+    if let Some((data, sb_total)) = acked {
+        *acked_data = Some(data);
+        // The client applies the ordered frame stream in number order, so
+        // acking this frame confirms the scrollback it carried (and any
+        // earlier scrollback frame) is held (RFC 0002 §2/§3).
+        *acked_sb_total = (*acked_sb_total).max(sb_total);
+    } else {
+        *acked_data = None;
+    }
     outstanding.retain(|f| f.num >= msg.acked_frame);
 }
 
@@ -732,24 +876,169 @@ mod tests {
         server.join().unwrap();
     }
 
+    /// Drives a real `server_loop` whose shell scrolls many lines off the
+    /// primary screen, then drains frames as a minimal client. `advertise`
+    /// controls whether the client offers `SCROLLBACK`. Returns
+    /// (scrollback_bodies_applied_in_order, total_rows_accumulated,
+    /// saw_visible_frame). Applies the RFC 0002 §3 client rule (append only
+    /// when `base == applied_num`) so retransmits never double-count.
+    fn run_scrollback_session(advertise: bool, ports: (u16, u16)) -> (usize, usize, bool) {
+        let key = Key::random();
+        let (server_conn, port) = Connection::server(ports, &key, Family::Inet).unwrap();
+        // Emit 200 lines (scrolling ~176 off a 24-row screen), idle long
+        // enough for the server's live (non-shutdown) ticks to drain the
+        // scrollback to the client, then exit so the server always winds
+        // down on its own (no dependence on the client driving shutdown,
+        // which would otherwise leave server_loop blocked on a silent peer).
+        let cmd: Vec<String> = vec![
+            "/bin/sh".into(),
+            "-c".into(),
+            "i=1; while [ $i -le 200 ]; do echo \"line $i\"; i=$((i+1)); done; sleep 6".into(),
+        ];
+        let child = crate::pty::spawn_shell(Some(&cmd), 24, 80, &[]).unwrap();
+        util::set_nonblocking(child.master).unwrap();
+        let server = std::thread::spawn(move || server_loop(server_conn, child, 24, 80));
+
+        let addr = format!("127.0.0.1:{port}").parse().unwrap();
+        let mut conn = Connection::client(addr, &key).unwrap();
+        let mut fragmenter = Fragmenter::new();
+        let mut assembly = FragmentAssembly::new();
+
+        let scrollback_cap = caps::Cap {
+            id: caps::CAP_SCROLLBACK,
+            payload: vec![0],
+        };
+        let mut applied_num = 0u64;
+        let mut sb_bodies = 0usize;
+        let mut sb_rows = 0usize;
+        let mut saw_visible = false;
+        let mut saw_shutdown = false;
+
+        let deadline = now_ms() + 25_000;
+        while now_ms() < deadline {
+            let caps = if advertise {
+                vec![scrollback_cap.clone()]
+            } else {
+                vec![]
+            };
+            let msg = ClientMessage {
+                flags: 0,
+                caps,
+                acked_frame: applied_num,
+                rows: 24,
+                cols: 80,
+                input_base: 0,
+                input: Vec::new(),
+            };
+            for frag in fragmenter.make_fragments(&msg.encode(), sync::FRAGMENT_CONTENTS_MAX) {
+                conn.send(&frag.to_bytes()).unwrap();
+            }
+            if saw_shutdown && applied_num > 0 {
+                break;
+            }
+            std::thread::sleep(std::time::Duration::from_millis(30));
+            loop {
+                match conn.recv() {
+                    Ok(Some(payload)) => {
+                        let Ok(frag) = sync::Fragment::from_bytes(&payload) else {
+                            continue;
+                        };
+                        let Some(assembled) = assembly.add(frag) else {
+                            continue;
+                        };
+                        let Ok(frame) = ServerFrame::decode(&assembled) else {
+                            continue;
+                        };
+                        if frame.flags & sync::FLAG_SHUTDOWN != 0 {
+                            saw_shutdown = true;
+                        }
+                        if frame.frame_num < applied_num {
+                            continue; // stale
+                        }
+                        match &frame.body {
+                            FrameBody::Scrollback { base, rows } => {
+                                if frame.frame_num != applied_num && *base == applied_num {
+                                    sb_bodies += 1;
+                                    sb_rows += rows.len();
+                                    applied_num = frame.frame_num;
+                                }
+                            }
+                            FrameBody::Full(_) | FrameBody::Diff { .. } => {
+                                if frame.frame_num != applied_num {
+                                    saw_visible = true;
+                                    applied_num = frame.frame_num;
+                                }
+                            }
+                            FrameBody::Empty => {}
+                        }
+                    }
+                    Ok(None) => continue,
+                    Err(e) if e.kind() == std::io::ErrorKind::WouldBlock => break,
+                    Err(_) => break,
+                }
+            }
+        }
+        // The shell exits on its own (see the command), so the server always
+        // winds down; join cannot block on a silent peer.
+        server.join().unwrap();
+        (sb_bodies, sb_rows, saw_visible)
+    }
+
+    #[test]
+    fn server_emits_no_scrollback_to_a_non_advertising_client() {
+        // RFC 0002 §1: against a client that never advertised SCROLLBACK,
+        // the frame stream carries only Full/Diff/Empty bodies, even though
+        // the session scrolled many lines off the primary screen.
+        let (bodies, rows, saw_visible) = run_scrollback_session(false, (62500, 62599));
+        assert_eq!(bodies, 0, "non-advertiser received a scrollback body");
+        assert_eq!(rows, 0);
+        assert!(saw_visible, "should still receive visible screen frames");
+    }
+
+    #[test]
+    fn server_ships_scrollback_growth_bounded_by_growth_not_depth() {
+        // RFC 0002 §2/§3: an advertising client accumulates the scrolled-off
+        // rows. Each row is shipped about once (anchored to the ack), so the
+        // total accumulated tracks the lines that scrolled — it is NOT a
+        // depth-multiplied re-dump of the whole ring on every frame.
+        let (bodies, rows, saw_visible) = run_scrollback_session(true, (62600, 62699));
+        assert!(bodies > 0, "advertiser never received a scrollback body");
+        assert!(saw_visible, "visible screen frames must still flow");
+        assert!(
+            rows >= 100,
+            "scrollback did not accumulate the off-screen history: {rows} rows"
+        );
+        // ~176 lines scroll off; allowing for prompt lines and a little
+        // retransmit slack, a correct anchored stream stays well under a
+        // full re-dump per frame.
+        assert!(
+            rows <= 400,
+            "scrollback rows look re-dumped, not growth-bounded: {rows} rows"
+        );
+    }
+
     #[test]
     fn update_acks_rejects_frames_never_sent() {
         let current = FrameState {
             num: 3,
             data: b"current".to_vec(),
+            sb_total: 7,
         };
         let mut outstanding = vec![
             FrameState {
                 num: 1,
                 data: b"one".to_vec(),
+                sb_total: 2,
             },
             FrameState {
                 num: 2,
                 data: b"two".to_vec(),
+                sb_total: 5,
             },
         ];
         let mut acked_num = 1u64;
         let mut acked_data = Some(b"one".to_vec());
+        let mut acked_sb_total = 2u64;
         let msg = ClientMessage {
             flags: 0,
             caps: vec![],
@@ -766,13 +1055,16 @@ mod tests {
             &mut outstanding,
             &mut acked_num,
             &mut acked_data,
+            &mut acked_sb_total,
         );
 
         assert_eq!(acked_num, 1, "ack for a frame never sent must be ignored");
         assert_eq!(acked_data.as_deref(), Some(b"one".as_slice()));
+        assert_eq!(acked_sb_total, 2, "scrollback ack must not advance either");
         assert_eq!(outstanding.len(), 2, "outstanding frames must be kept");
 
-        // A legitimate ack of the newest frame still works.
+        // A legitimate ack of the newest frame still works, carrying its
+        // scrollback coverage forward (RFC 0002 §2).
         let msg = ClientMessage {
             acked_frame: 3,
             ..msg
@@ -783,9 +1075,11 @@ mod tests {
             &mut outstanding,
             &mut acked_num,
             &mut acked_data,
+            &mut acked_sb_total,
         );
         assert_eq!(acked_num, 3);
         assert_eq!(acked_data.as_deref(), Some(b"current".as_slice()));
+        assert_eq!(acked_sb_total, 7, "acking a frame confirms its scrollback");
         assert!(outstanding.is_empty());
     }
 

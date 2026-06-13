@@ -11,6 +11,11 @@ pub const FLAG_EXTENSION: u8 = 0x02;
 /// Capability ids (RFC 0001 registry). 224..=255 are experimental-only.
 pub const CAP_PROTOCOL_VERSION: u8 = 0;
 pub const CAP_EXIT_STATUS: u8 = 1;
+/// Scrollback sync (RFC 0002 §1). Client entry: 1-byte payload requesting a
+/// ring depth in units of 256 rows (`0` = server default), advertising that
+/// the client understands the `BODY_SCROLLBACK` frame body. Server entry:
+/// empty payload, acknowledging it will emit scrollback bodies.
+pub const CAP_SCROLLBACK: u8 = 3;
 
 /// The post-table format version we implement (payload of
 /// [`CAP_PROTOCOL_VERSION`]).
