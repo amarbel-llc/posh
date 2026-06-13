@@ -391,6 +391,28 @@ fn sgr_colon_forms() {
 }
 
 #[test]
+fn sgr_params_emits_semicolon_color_form() {
+    // The renderer serializes cells back to the client through sgr_params;
+    // 256-color and truecolor must use the universally-accepted semicolon
+    // form, not the narrowly-supported colon subparameter form. Roundtrip
+    // tests can't catch this — the parser accepts both forms.
+    use posh_term::sgr_params;
+    let with = |f: fn(&mut Style)| {
+        let mut s = Style::default();
+        f(&mut s);
+        sgr_params(&s)
+    };
+    assert_eq!(with(|s| s.fg = Color::Indexed(1)), "0;31"); // basic
+    assert_eq!(with(|s| s.fg = Color::Indexed(12)), "0;94"); // bright
+    assert_eq!(with(|s| s.fg = Color::Indexed(123)), "0;38;5;123"); // 256
+    assert_eq!(with(|s| s.bg = Color::Rgb(10, 20, 30)), "0;48;2;10;20;30"); // truecolor
+    // Underline color (SGR 58) deliberately stays colon-delimited so terminals
+    // that don't support the extension skip it as one opaque parameter.
+    assert_eq!(with(|s| s.underline_color = Color::Indexed(5)), "0;58:5:5");
+    assert_eq!(with(|s| s.underline_color = Color::Rgb(1, 2, 3)), "0;58:2:1:2:3");
+}
+
+#[test]
 fn sgr_underline_styles_and_color() {
     let mut t = term();
     feed(&mut t, "\x1b[4:3m\x1b[58;2;250:0:0mx");

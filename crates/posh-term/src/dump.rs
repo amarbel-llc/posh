@@ -41,6 +41,12 @@ pub fn sgr_params(style: &Style) -> String {
     if style.strikethrough {
         s.push_str(";9");
     }
+    // 256-color and truecolor use the semicolon-delimited form (`38;5;n`,
+    // `38;2;r;g;b`) — what mosh emits and what every color terminal accepts.
+    // The colon subparameter form (`38:5:n`, `38:2:r:g:b`) is ITU-T T.416 and
+    // accepted by far fewer terminals; some also read the first colon arg after
+    // `2` as a colorspace id, mangling truecolor. Underline *style* below stays
+    // colon (`4:2`) because it has no semicolon equivalent.
     match style.fg {
         Color::Default => {}
         Color::Indexed(i) if i < 8 => {
@@ -50,10 +56,10 @@ pub fn sgr_params(style: &Style) -> String {
             let _ = write!(s, ";{}", 90 + u16::from(i) - 8);
         }
         Color::Indexed(i) => {
-            let _ = write!(s, ";38:5:{i}");
+            let _ = write!(s, ";38;5;{i}");
         }
         Color::Rgb(r, g, b) => {
-            let _ = write!(s, ";38:2:{r}:{g}:{b}");
+            let _ = write!(s, ";38;2;{r};{g};{b}");
         }
     }
     match style.bg {
@@ -65,12 +71,15 @@ pub fn sgr_params(style: &Style) -> String {
             let _ = write!(s, ";{}", 100 + u16::from(i) - 8);
         }
         Color::Indexed(i) => {
-            let _ = write!(s, ";48:5:{i}");
+            let _ = write!(s, ";48;5;{i}");
         }
         Color::Rgb(r, g, b) => {
-            let _ = write!(s, ";48:2:{r}:{g}:{b}");
+            let _ = write!(s, ";48;2;{r};{g};{b}");
         }
     }
+    // Underline color (SGR 58) is a non-universal extension, so it keeps the
+    // colon form: a terminal that doesn't grok it skips `58:…` as one opaque
+    // parameter, whereas `58;…` would be misread as separate SGR attributes.
     match style.underline_color {
         Color::Default => {}
         Color::Indexed(i) => {
