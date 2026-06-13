@@ -58,8 +58,13 @@ runtime=$(ps -o time= $PPID 2>/dev/null)
 if [ $? -ne 0 ]; then # Cygwin...
     runtime=-
 fi
-# Wait for tmux client screen to become up to date.
-sleep 1
+# Wait for the tmux client screen to become up to date — deterministically,
+# via the marker round-trip below, not a blind timer. The
+# "@@@ server complete @@@" marker is emitted right after the harnessed
+# command's output; mosh syncs whole-screen state, so once that marker reaches
+# the tmux log (the poll loop below), all preceding output has necessarily
+# rendered too. The former unconditional `sleep 1` here was a race-paperer the
+# marker-poll makes unnecessary (and a per-test flake source).
 printf "@@@ server complete @@@" >&2
 wait_for_clients 1
 i=0
