@@ -233,6 +233,129 @@ pub fn json_string(s: &str) -> String {
     out
 }
 
+/// Streaming `.castx` writer over any [`std::io::Write`] (a file, a buffer).
+/// The caller supplies each event's timestamp, so the writer holds no clock and
+/// stays deterministically testable.
+///
+/// Output (`o`) bytes are reassembled across calls so every emitted event is a
+/// valid-UTF-8 JSON string: a multi-byte char split across two PTY reads is
+/// held until its continuation arrives (the ADR-0003 convention). A
+/// genuinely-invalid byte is replaced with U+FFFD so the stream still makes
+/// progress. `i`/`r` events flush any held output first to preserve ordering.
+pub struct Recorder<W: std::io::Write> {
+    writer: W,
+    pending: Vec<u8>,
+    last_time: f64,
+}
+
+impl<W: std::io::Write> Recorder<W> {
+    pub fn new(writer: W) -> Recorder<W> {
+        Recorder {
+            writer,
+            pending: Vec::new(),
+            last_time: 0.0,
+        }
+    }
+
+    /// Write the header line.
+    pub fn write_header(&mut self, header: &Header) -> std::io::Result<()> {
+        self.writer.write_all(write_header(header).as_bytes())?;
+        self.writer.write_all(b"\n")
+    }
+
+    /// Record output bytes as `o` event(s), reassembling UTF-8 across calls; an
+    /// incomplete trailing sequence is held for the next call.
+    pub fn output(&mut self, time: f64, bytes: &[u8]) -> std::io::Result<()> {
+        self.last_time = time;
+        self.pending.extend_from_slice(bytes);
+        self.flush_complete(time)
+    }
+
+    /// Record a resize as an `r` event with asciinema `"COLSxROWS"` data.
+    pub fn resize(&mut self, time: f64, cols: u16, rows: u16) -> std::io::Result<()> {
+        self.last_time = time;
+        self.flush_held(time)?;
+        self.write_line(time, EventCode::Resize, &format!("{cols}x{rows}"))
+    }
+
+    /// Record input bytes as an `i` event. Keystrokes are small and usually
+    /// ASCII; invalid bytes are replaced lossily (input is never fed on replay).
+    pub fn input(&mut self, time: f64, bytes: &[u8]) -> std::io::Result<()> {
+        self.last_time = time;
+        self.flush_held(time)?;
+        let data = String::from_utf8_lossy(bytes);
+        self.write_line(time, EventCode::Input, &data)
+    }
+
+    /// Flush any held incomplete output (lossily) and the underlying writer.
+    pub fn finish(&mut self) -> std::io::Result<()> {
+        let time = self.last_time;
+        self.flush_held(time)?;
+        self.writer.flush()
+    }
+
+    /// Emit `o` events for every complete-UTF-8 run in `pending`, holding only
+    /// an incomplete trailing sequence.
+    fn flush_complete(&mut self, time: f64) -> std::io::Result<()> {
+        loop {
+            match std::str::from_utf8(&self.pending) {
+                Ok(s) => {
+                    if !s.is_empty() {
+                        let s = s.to_string();
+                        self.write_line(time, EventCode::Output, &s)?;
+                        self.pending.clear();
+                    }
+                    return Ok(());
+                }
+                Err(e) => {
+                    let valid = e.valid_up_to();
+                    match e.error_len() {
+                        // Incomplete tail at the end: emit the valid prefix,
+                        // hold the rest for the next write.
+                        None => {
+                            if valid > 0 {
+                                let s = String::from_utf8(self.pending[..valid].to_vec()).unwrap();
+                                self.write_line(time, EventCode::Output, &s)?;
+                                self.pending.drain(..valid);
+                            }
+                            return Ok(());
+                        }
+                        // Genuinely invalid byte(s): emit the valid prefix plus
+                        // one U+FFFD, drop the bad bytes, and continue.
+                        Some(bad) => {
+                            let mut s = String::from_utf8(self.pending[..valid].to_vec()).unwrap();
+                            s.push('\u{FFFD}');
+                            self.write_line(time, EventCode::Output, &s)?;
+                            self.pending.drain(..valid + bad);
+                        }
+                    }
+                }
+            }
+        }
+    }
+
+    /// Emit whatever is held (lossily) as one `o` event, before a non-output
+    /// event or at finish, so ordering is preserved.
+    fn flush_held(&mut self, time: f64) -> std::io::Result<()> {
+        if self.pending.is_empty() {
+            return Ok(());
+        }
+        let s = String::from_utf8_lossy(&self.pending).into_owned();
+        self.pending.clear();
+        self.write_line(time, EventCode::Output, &s)
+    }
+
+    fn write_line(&mut self, time: f64, code: EventCode, data: &str) -> std::io::Result<()> {
+        let event = Event {
+            time,
+            code,
+            data: data.to_string(),
+        };
+        self.writer.write_all(write_event(&event).as_bytes())?;
+        self.writer.write_all(b"\n")
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -347,5 +470,109 @@ mod tests {
             .map(Result::unwrap)
             .collect();
         assert_eq!(read, events);
+    }
+
+    /// Record into a buffer and return the resulting document, applying `f` to
+    /// a Recorder between header and finish.
+    fn record_doc(header: &Header, f: impl FnOnce(&mut Recorder<&mut Vec<u8>>)) -> String {
+        let mut buf: Vec<u8> = Vec::new();
+        {
+            let mut rec = Recorder::new(&mut buf);
+            rec.write_header(header).unwrap();
+            f(&mut rec);
+            rec.finish().unwrap();
+        }
+        String::from_utf8(buf).unwrap()
+    }
+
+    fn events_of(doc: &str) -> Vec<Event> {
+        let mut r = Reader::new(doc);
+        r.header().unwrap();
+        std::iter::from_fn(|| r.next_event())
+            .map(Result::unwrap)
+            .collect()
+    }
+
+    fn header_24x80() -> Header {
+        Header {
+            version: 2,
+            width: 80,
+            height: 24,
+            posh_rec: None,
+        }
+    }
+
+    #[test]
+    fn recorder_reassembles_utf8_split_across_writes() {
+        // 'é' is 0xC3 0xA9; split it across two output() calls.
+        let doc = record_doc(&header_24x80(), |rec| {
+            rec.output(0.0, &[0xC3]).unwrap(); // incomplete — held, emits nothing
+            rec.output(0.1, &[0xA9]).unwrap(); // completes — one 'o' event "é"
+        });
+        let outputs: Vec<String> = events_of(&doc)
+            .into_iter()
+            .filter(|e| e.code == EventCode::Output)
+            .map(|e| e.data)
+            .collect();
+        assert_eq!(outputs.concat(), "é");
+    }
+
+    #[test]
+    fn recorder_preserves_output_resize_ordering() {
+        let doc = record_doc(&header_24x80(), |rec| {
+            rec.output(0.0, b"before").unwrap();
+            rec.resize(0.1, 100, 40).unwrap();
+            rec.output(0.2, b"after").unwrap();
+        });
+        let codes: Vec<(EventCode, String)> =
+            events_of(&doc).into_iter().map(|e| (e.code, e.data)).collect();
+        assert_eq!(
+            codes,
+            vec![
+                (EventCode::Output, "before".to_string()),
+                (EventCode::Resize, "100x40".to_string()),
+                (EventCode::Output, "after".to_string()),
+            ]
+        );
+    }
+
+    #[test]
+    fn recorder_round_trips_through_reader() {
+        let header = Header {
+            version: 2,
+            width: 80,
+            height: 24,
+            posh_rec: Some(PoshRec {
+                v: 1,
+                emu_rev: "0.1.0".to_string(),
+            }),
+        };
+        let doc = record_doc(&header, |rec| {
+            rec.output(0.0, b"hello \xe2\x86\x92 world").unwrap(); // includes → (U+2192)
+            rec.input(0.5, b"q").unwrap();
+        });
+        let mut r = Reader::new(&doc);
+        assert_eq!(r.header().unwrap(), header);
+        let events = std::iter::from_fn(|| r.next_event())
+            .map(Result::unwrap)
+            .collect::<Vec<_>>();
+        assert_eq!(events[0].code, EventCode::Output);
+        assert_eq!(events[0].data, "hello → world");
+        assert_eq!(events[1].code, EventCode::Input);
+        assert_eq!(events[1].data, "q");
+    }
+
+    #[test]
+    fn recorder_finish_flushes_held_incomplete_tail() {
+        // A lone lead byte never completes; finish emits it lossily as U+FFFD.
+        let doc = record_doc(&header_24x80(), |rec| {
+            rec.output(0.0, &[0xC3]).unwrap();
+        });
+        let outputs: Vec<String> = events_of(&doc)
+            .into_iter()
+            .filter(|e| e.code == EventCode::Output)
+            .map(|e| e.data)
+            .collect();
+        assert_eq!(outputs.concat(), "\u{FFFD}");
     }
 }
