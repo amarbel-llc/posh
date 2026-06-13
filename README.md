@@ -19,7 +19,9 @@ zmx (Zig) lives in its own repository.
 crates/
   posh-term/   standalone terminal emulation library (no dependencies)
   posh/        the posh binary
-docs/          decisions (ADRs) and the manual test plan
+doc/           scdoc man-page sources (man posh, posh-server, posh-client, posh(7))
+docs/          ADRs, RFCs, feature records (FDRs), plans, and the manual test plan
+posht/         interactive terminal-capability test (Go; nix build .#posht)
 zz-mosh/       the C++ mosh reference tree (buildable: nix build .#mosh)
 ```
 
