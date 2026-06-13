@@ -202,14 +202,16 @@ exact screen, with no live terminal and no timing to race (the
 `posh-term`; surfaced as the standalone `posh-rec` binary and as `posh rec`.
 
 ```
-posh rec replay <file> [--dump text|vt|flat]   # or: posh-rec replay ...
+posh-rec record [--out f.castx] -- <cmd>       # record a command under a PTY
+posh --record f.castx <session>                # record a live posh session
+posh-rec replay <file> [--dump text|vt|flat]   # or: posh rec replay ...
 ```
 
 The recording format is `.castx`, a strict superset of asciinema `.cast` v2
 (standard `o`/`i`/`r` events plus an ignorable `m` marker and a `posh_rec`
 header block), so any `.cast` replays through posh-rec and any `.castx` plays
-in `asciinema`. Phase 1 of the epic in issue #56; the recorder, step-ratchet
-player, and assertion/golden surface land in later phases.
+in `asciinema`. Issue #56 tracks the epic; the step-ratchet player and the
+assertion/golden surface land in later phases.
 
 ## Building and testing
 
