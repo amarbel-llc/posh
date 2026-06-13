@@ -14,6 +14,41 @@ use crate::util::{self, Error, Result};
 
 const SCROLLBACK: usize = 10_000;
 
+/// A `.castx` recorder writing to a boxed sink (a file, in practice). Built
+/// when `$POSH_RECORD_FILE` is set (`posh --record FILE`); tees the session's
+/// raw PTY output so `posh-rec replay` can reproduce the screen deterministically.
+type SessionRecorder = posh_rec::castx::Recorder<Box<dyn Write>>;
+
+/// Open the recording named by `$POSH_RECORD_FILE` (if any) and write its
+/// header. A failure to open/write only logs and disables recording — it must
+/// never stop the session from starting.
+fn open_recorder(rows: u16, cols: u16) -> Option<SessionRecorder> {
+    let path = std::env::var_os("POSH_RECORD_FILE")?;
+    let file = match std::fs::File::create(&path) {
+        Ok(f) => f,
+        Err(e) => {
+            util::log_write("warn", &format!("--record: cannot open {path:?}: {e}"));
+            return None;
+        }
+    };
+    let writer: Box<dyn Write> = Box::new(std::io::BufWriter::new(file));
+    let mut rec = posh_rec::castx::Recorder::new(writer);
+    let header = posh_rec::castx::Header {
+        version: 2,
+        width: cols,
+        height: rows,
+        posh_rec: Some(posh_rec::castx::PoshRec {
+            v: 1,
+            emu_rev: posh_term::version().to_string(),
+        }),
+    };
+    if let Err(e) = rec.write_header(&header) {
+        util::log_write("warn", &format!("--record: cannot write header: {e}"));
+        return None;
+    }
+    Some(rec)
+}
+
 /// A client whose unsent backlog grows past this is treated as a stuck
 /// reader and dropped, so one wedged terminal can't OOM the daemon and take
 /// down every other attached client. github #11.
@@ -252,7 +287,13 @@ fn daemon_main(
     // that contain spaces losslessly. github #18.
     let info_cmd = command.as_ref().map(|c| c.join("\0")).unwrap_or_default();
 
-    daemon_loop(&listener, &child, &mut term, &mut clients, &info_cmd, &cwd);
+    // Optional `.castx` recording (posh --record FILE). Best-effort: a failure
+    // to open never blocks the session.
+    let recorder = open_recorder(rows, cols);
+
+    daemon_loop(
+        &listener, &child, &mut term, &mut clients, &info_cmd, &cwd, recorder,
+    );
 
     // Teardown. Reap the shell first: when it already exited (the pty-EIO
     // path) WNOHANG captures its real status before the group kills below.
@@ -279,6 +320,7 @@ fn daemon_main(
     std::process::exit(code);
 }
 
+#[allow(clippy::too_many_arguments)]
 fn daemon_loop(
     listener: &UnixListener,
     child: &PtyChild,
@@ -286,12 +328,15 @@ fn daemon_loop(
     clients: &mut Vec<ClientConn>,
     info_cmd: &str,
     cwd: &str,
+    mut recorder: Option<SessionRecorder>,
 ) {
     let listener_fd = listener.as_raw_fd();
     let pty_fd = child.master;
     let mut has_pty_output = false;
     let mut filter = ScreenSwitchFilter::default();
     let err_events = libc::POLLHUP | libc::POLLERR | libc::POLLNVAL;
+    // t=0 for recording timestamps (only used when recorder.is_some()).
+    let rec_start = std::time::Instant::now();
 
     'daemon: loop {
         if util::take_flag(&util::SIGTERM_RECEIVED) {
@@ -373,6 +418,14 @@ fn daemon_loop(
                 Ok(n) => {
                     let mut bcast = Vec::with_capacity(n);
                     filter.feed(term, &buf[..n], &mut bcast);
+                    // Record the RAW chunk (what the emulator processed), not
+                    // the screen-switch-filtered broadcast — that's what makes
+                    // a posh-rec replay reproduce this session's screen.
+                    if let Some(rec) = recorder.as_mut() {
+                        if rec.output(rec_start.elapsed().as_secs_f64(), &buf[..n]).is_err() {
+                            recorder = None; // disable on write error; never kill the session
+                        }
+                    }
                     // The model answers the app's queries (DA/DSR/kitty/...)
                     // only when no real terminal is attached. When clients are
                     // present, their terminals answer and the answers return
@@ -526,6 +579,13 @@ fn daemon_loop(
             }
             if resized {
                 apply_client_size(clients, pty_fd, term);
+                // Record the new effective size (asciinema "COLSxROWS").
+                if let Some(rec) = recorder.as_mut() {
+                    let t = rec_start.elapsed().as_secs_f64();
+                    if rec.resize(t, term.cols(), term.rows()).is_err() {
+                        recorder = None;
+                    }
+                }
             }
             // Replay after the resize so the dump reflects the client's size.
             // Skip if the client was removed this iteration. github #16.
@@ -538,6 +598,12 @@ fn daemon_loop(
                 clients[i].queue(Tag::Output, &dump);
             }
         }
+    }
+
+    // Flush the recording's held UTF-8 tail + buffered writer on the way out
+    // (shell exit / SIGTERM / kill).
+    if let Some(mut rec) = recorder {
+        let _ = rec.finish();
     }
 }
 

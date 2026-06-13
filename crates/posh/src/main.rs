@@ -61,6 +61,17 @@ fn run() -> Result<()> {
                 std::env::set_var("POSH_NO_TERM_INIT", "1");
                 i += 1;
             }
+            "--record" => {
+                // Tee the session's PTY output into a .castx recording. Travels
+                // as an env var (like --no-init) so it survives the daemon's
+                // double-fork; daemon_main opens it. posh-rec(1) replays it.
+                let file = argv
+                    .get(i + 1)
+                    .ok_or_else(|| Error::from("--record requires a value"))?
+                    .clone();
+                std::env::set_var("POSH_RECORD_FILE", &file);
+                i += 2;
+            }
             _ => break,
         }
     }
@@ -415,6 +426,11 @@ GLOBAL OPTIONS
         falling back to DECSET 1049 when no database entry is found; a
         terminal whose entry defines no alternate screen is never taken
         over. FDR 0002.
+
+    --record FILE
+        Tee this session's PTY output into a .castx recording (also
+        $POSH_RECORD_FILE). Replay it deterministically with
+        `posh-rec replay FILE` / `posh rec replay FILE`.
 
 SESSION COMMANDS (local persistence)
     attach <name> [command...] [--detach]      (alias: a)
