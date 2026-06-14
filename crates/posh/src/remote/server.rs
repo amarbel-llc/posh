@@ -362,7 +362,14 @@ fn server_loop(mut conn: Connection, child: pty::PtyChild, rows: u16, cols: u16)
                 current = FrameState {
                     num: current.num + 1,
                     data: stats.time_dump_vt(|| term.dump_vt()),
-                    sb_total: sb_high,
+                    // A visible frame carries no scrollback rows, so applying it
+                    // leaves the client at whatever scrollback it held at the
+                    // diff base (the acked frame): acked_sb_total, NOT sb_high.
+                    // sb_high counts rows put into a scrollback frame that may
+                    // have been lost; if a visible-frame ack confirmed those,
+                    // the rows of a dropped-then-superseded scrollback frame
+                    // would never be re-shipped (finding #1).
+                    sb_total: acked_sb_total,
                 };
                 current_is_sb = false;
                 last_was_sb = false;
@@ -596,9 +603,11 @@ fn update_acks(
     };
     if let Some((data, sb_total)) = acked {
         *acked_data = Some(data);
-        // The client applies the ordered frame stream in number order, so
-        // acking this frame confirms the scrollback it carried (and any
-        // earlier scrollback frame) is held (RFC 0002 §2/§3).
+        // A frame's sb_total is the scrollback the client holds after applying
+        // it: a scrollback frame advances it by the rows it carries; a visible
+        // frame inherits the acked base's total (it carries no rows). So acking
+        // any frame confirms only scrollback the client actually received, even
+        // when a scrollback frame was lost and leapfrogged (RFC 0002 §2/§3).
         *acked_sb_total = (*acked_sb_total).max(sb_total);
     } else {
         *acked_data = None;
