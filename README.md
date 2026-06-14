@@ -170,7 +170,9 @@ morphs the real tty with minimal per-cell diffs (a port of
 (`terminaloverlay.cc`): speculative local echo with epochs, confirmation
 against server echo-acks, adaptive display with mosh's SRTT/glitch/flagging
 constants, and underlined predictions when the link is slow
-(`POSH_PREDICTION`: always/never/adaptive/experimental). A reverse-video
+(`POSH_PREDICTION`: always/never/adaptive/experimental). `POSH_PREDICTION=optimistic`
+instead echoes keystrokes immediately and lets the next paint correct them, gated
+on the remote PTY's ECHO flag and alt-screen (FDR 0006). A reverse-video
 "Last contact N seconds ago" banner appears after 6.5s of silence; the quit
 sequence is Ctrl-^ then `.` (Ctrl-^ Ctrl-Z suspends the client). Servers
 bind dual-stack IPv6 when possible,

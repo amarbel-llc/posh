@@ -47,8 +47,10 @@ _POSH_KEY_
 
 _POSH_PREDICTION_
 	Local-echo prediction display: _always_, _never_, _adaptive_
-	(default), or _experimental_. The mosh _MOSH_PREDICTION_DISPLAY_
-	analog.
+	(default), _experimental_, or _optimistic_. The first four are the
+	mosh _MOSH_PREDICTION_DISPLAY_ analog; _optimistic_ (FDR 0006) echoes
+	keystrokes immediately and lets the next paint correct them, gated on
+	the remote PTY's ECHO flag and alt-screen.
 
 _POSH_PREDICTION_OVERWRITE_
 	When set, predictions overwrite the character under the cursor
