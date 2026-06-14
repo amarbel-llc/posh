@@ -155,12 +155,22 @@ impl Terminal {
             style: Style::default(),
             hyperlink: 0,
         };
-        self.emit_row(&mut out, row, &mut st);
+        self.emit_terminated_row(&mut out, row, &mut st);
+        Some(out.into_bytes())
+    }
+
+    /// Emits one row as a self-contained per-row escape stream: the row's
+    /// style/hyperlink runs, then — for a hard-terminated (non-soft-wrapped)
+    /// row — a pen reset and `\r\n`. A soft-wrapped row omits the newline so a
+    /// consumer regenerates the wrap seam by autowrapping the same-width
+    /// target. Shared by `dump_scrollback_row` and the primary-screen
+    /// scrollback replay in `dump_vt_impl`.
+    fn emit_terminated_row(&self, out: &mut String, row: &Row, st: &mut EmitState) {
+        self.emit_row(out, row, st);
         if !row.wrapped() {
-            self.reset_pen(&mut out, &mut st);
+            self.reset_pen(out, st);
             out.push_str("\r\n");
         }
-        Some(out.into_bytes())
     }
 
     /// VT escape stream that reproduces the terminal state (contents,
@@ -240,11 +250,7 @@ impl Terminal {
         if sb_len > 0 {
             for i in 0..sb_len {
                 let row = self.primary.scrollback_row(i).unwrap();
-                self.emit_row(&mut out, row, &mut st);
-                if !row.wrapped() {
-                    self.reset_pen(&mut out, &mut st);
-                    out.push_str("\r\n");
-                }
+                self.emit_terminated_row(&mut out, row, &mut st);
             }
             for r in 0..self.primary.rows() {
                 let row = self.primary.row(r).unwrap();
