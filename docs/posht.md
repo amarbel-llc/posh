@@ -90,7 +90,18 @@ posht --skip graphics,bell
 posht -o report.md    # also write the markdown report to a file
 posht --json -        # machine-readable JSON receipt to stdout
 posht --json out.json # JSON receipt to a named file (prints the path)
+posht --auto          # non-interactive: render the static tests to stdout at a
+                      # fixed 80-col width, then exit (deterministic)
 ```
+
+`--auto` skips the interactive walk entirely and renders the selected *static*
+tests (colors, attributes, gradients, wide chars, box drawing, hyperlinks) to
+stdout at a fixed width, then exits — no Bubble Tea, no alt screen, no receipt.
+The output is byte-identical across runs and terminals, so recording it over
+posh vs plain ssh (the `debug-record-posht` recipe with `--auto`) yields two
+frame-aligned recordings to diff, isolating posh's transport/render from the
+content. Interactive/stateful tests (mouse, keys, resize, cursor, …) are
+skipped — they need live input and can't self-drive deterministically.
 
 A JSON receipt is always produced. By default it is written to
 `~/.local/log/posht/<datetime>-<terminal>.json` and the **path** is printed to

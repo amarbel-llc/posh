@@ -26,6 +26,9 @@ func main() {
 	list := flag.Bool("list", false, "print test IDs and titles, then exit")
 	only := flag.String("only", "", "comma-separated test IDs: select just these")
 	skip := flag.String("skip", "", "comma-separated test IDs: start deselected")
+	auto := flag.Bool("auto", false, "non-interactively render the selected static "+
+		"capability tests to stdout at a fixed width, then exit (deterministic — for "+
+		"posh-vs-ssh recording diffs)")
 	out := flag.String("o", "", "also write the markdown report to this file")
 	jsonOut := flag.String("json", "", "JSON receipt destination: a file path, \"-\" for stdout, "+
 		"or omit for the default ~/.local/log/posht/<datetime>-<term>.json")
@@ -47,6 +50,14 @@ func main() {
 	if err := applyFilters(tests, *only, *skip); err != nil {
 		fmt.Fprintln(os.Stderr, "posht:", err)
 		os.Exit(64)
+	}
+
+	// --auto: deterministic, non-interactive render of the selected static
+	// tests, then exit. No Bubble Tea, no alt screen, no receipt — the point is
+	// a reproducible byte stream to record over posh vs ssh and diff.
+	if *auto {
+		autoRun(tests, autoWidth, os.Stdout)
+		return
 	}
 
 	p := tea.NewProgram(newRoot(tests), tea.WithAltScreen())
