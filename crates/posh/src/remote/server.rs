@@ -885,25 +885,60 @@ mod tests {
         server.join().unwrap();
     }
 
-    /// Drives a real `server_loop` whose shell scrolls many lines off the
-    /// primary screen, then drains frames as a minimal client. `advertise`
-    /// controls whether the client offers `SCROLLBACK`. Returns
-    /// (scrollback_bodies_applied_in_order, total_rows_accumulated,
-    /// saw_visible_frame). Applies the RFC 0002 §3 client rule (append only
-    /// when `base == applied_num`) so retransmits never double-count.
-    fn run_scrollback_session(advertise: bool, ports: (u16, u16)) -> (usize, usize, bool) {
+    /// Outcome of a deterministic scrollback session (see
+    /// [`run_scrollback_session`]).
+    struct ScrollbackOutcome {
+        /// Scrollback bodies the client applied (anchored at base == applied_num).
+        sb_bodies: usize,
+        /// Total rows across the applied scrollback bodies.
+        sb_rows: usize,
+        /// Whether any Full/Diff (visible-screen) frame was applied.
+        saw_visible: bool,
+        /// Sorted, de-duplicated `line N` numbers accumulated into the ring.
+        lines: Vec<u64>,
+    }
+
+    /// Extracts `N` from a scrollback row whose visible text contains "line N"
+    /// (the harness's reflected input), ignoring SGR/escape bytes.
+    fn row_line_number(row: &[u8]) -> Option<u64> {
+        let s = String::from_utf8_lossy(row);
+        let idx = s.find("line ")?;
+        s[idx + 5..]
+            .chars()
+            .take_while(|c| c.is_ascii_digit())
+            .collect::<String>()
+            .parse()
+            .ok()
+    }
+
+    /// Deterministic, input-driven scrollback harness. The server child is
+    /// `cat` with echo disabled (`stty -echo`), so every line the test sends
+    /// through the reliable input stream is reflected back exactly once as
+    /// terminal output, scrolling one row off the 24-row screen. `cat` emits
+    /// nothing until fed, and the client advertises SCROLLBACK in every
+    /// message, so the server pins `sb_floor` at 0 before any output exists —
+    /// no race against shell startup. Lines are sent one at a time, each fully
+    /// acked before the next (the loop blocks on the socket via `poll`), so
+    /// there are no `sleep`s, no burst, and nothing for parallel load to flake.
+    ///
+    /// `advertise`: whether the client offers SCROLLBACK at all. With
+    /// `lose_second_sb_frame` the client simulates a single lost scrollback
+    /// datagram: it applies the first scrollback frame, then drops every
+    /// transmission of the second (until a visible frame supersedes it), then
+    /// resumes — losing a *middle* frame, so a gap is an internal discontinuity
+    /// rather than a truncated head. (RFC 0002 §3 append rule: apply a
+    /// scrollback body only when base == applied_num.)
+    fn run_scrollback_session(
+        advertise: bool,
+        lose_second_sb_frame: bool,
+        ports: (u16, u16),
+    ) -> ScrollbackOutcome {
+        const LINES: u64 = 64; // 64 reflected lines -> 40 scroll off a 24-row screen
+
         let key = Key::random();
         let (server_conn, port) = Connection::server(ports, &key, Family::Inet).unwrap();
-        // Emit 200 lines (scrolling ~176 off a 24-row screen), idle long
-        // enough for the server's live (non-shutdown) ticks to drain the
-        // scrollback to the client, then exit so the server always winds
-        // down on its own (no dependence on the client driving shutdown,
-        // which would otherwise leave server_loop blocked on a silent peer).
-        let cmd: Vec<String> = vec![
-            "/bin/sh".into(),
-            "-c".into(),
-            "i=1; while [ $i -le 200 ]; do echo \"line $i\"; i=$((i+1)); done; sleep 6".into(),
-        ];
+        let cmd: Vec<String> =
+            vec!["/bin/sh".into(), "-c".into(), "stty -echo; exec cat".into()];
         let child = crate::pty::spawn_shell(Some(&cmd), 24, 80, &[]).unwrap();
         util::set_nonblocking(child.master).unwrap();
         let server = std::thread::spawn(move || server_loop(server_conn, child, 24, 80));
@@ -912,40 +947,71 @@ mod tests {
         let mut conn = Connection::client(addr, &key).unwrap();
         let mut fragmenter = Fragmenter::new();
         let mut assembly = FragmentAssembly::new();
-
-        let scrollback_cap = caps::Cap {
+        let mut outbox = InputOutbox::new();
+        let cap = caps::Cap {
             id: caps::CAP_SCROLLBACK,
             payload: vec![0],
         };
+
         let mut applied_num = 0u64;
         let mut sb_bodies = 0usize;
         let mut sb_rows = 0usize;
         let mut saw_visible = false;
+        let mut accumulated: std::collections::BTreeSet<u64> = std::collections::BTreeSet::new();
+        let mut sb_applied = 0u64; // distinct scrollback frames actually applied
+        let mut drop_target: Option<u64> = None;
+        let mut lines_sent = 0u64;
+        let mut applied_at_push = 0u64; // applied_num when the in-flight line went out
+        let mut waiting = false; // a line is in flight, its output not yet applied
+        let mut idle_polls = 0u32; // consecutive drains with no new applied frame
+        let mut shutdown_sent = false;
         let mut saw_shutdown = false;
 
         let deadline = now_ms() + 25_000;
         while now_ms() < deadline {
-            let caps = if advertise {
-                vec![scrollback_cap.clone()]
+            // Pace by OUTPUT, not input acks: feed the next line only once the
+            // previous line's output has been applied (one line in flight, so
+            // each scrolls a row separately and the server interleaves visible
+            // and scrollback frames). Pacing on input acks would let the input
+            // race far ahead of the output. Once all lines are sent and the
+            // scrollback stream goes quiet, wind `cat` down through the shutdown
+            // handshake — it never exits on its own.
+            if !shutdown_sent && !waiting {
+                if lines_sent < LINES {
+                    lines_sent += 1;
+                    outbox.push(format!("line {lines_sent}\n").as_bytes());
+                    applied_at_push = applied_num;
+                    waiting = true;
+                } else if idle_polls >= 3 {
+                    shutdown_sent = true;
+                }
+            }
+
+            let flags = if shutdown_sent {
+                sync::CLIENT_FLAG_SHUTDOWN
             } else {
-                vec![]
+                0
             };
             let msg = ClientMessage {
-                flags: 0,
-                caps,
+                flags,
+                caps: if advertise { vec![cap.clone()] } else { vec![] },
                 acked_frame: applied_num,
                 rows: 24,
                 cols: 80,
-                input_base: 0,
-                input: Vec::new(),
+                input_base: outbox.base(),
+                input: outbox.pending().to_vec(),
             };
             for frag in fragmenter.make_fragments(&msg.encode(), sync::FRAGMENT_CONTENTS_MAX) {
-                conn.send(&frag.to_bytes()).unwrap();
+                let _ = conn.send(&frag.to_bytes());
             }
-            if saw_shutdown && applied_num > 0 {
-                break;
+            if saw_shutdown {
+                break; // the send above acked the shutdown frame
             }
-            std::thread::sleep(std::time::Duration::from_millis(30));
+
+            // Block (bounded) until the server reacts, then drain everything.
+            let prev_applied = applied_num;
+            let mut fds = [util::pollfd(conn.raw_fd(), libc::POLLIN)];
+            let _ = util::poll(&mut fds, 200);
             loop {
                 match conn.recv() {
                     Ok(Some(payload)) => {
@@ -958,19 +1024,36 @@ mod tests {
                         let Ok(frame) = ServerFrame::decode(&assembled) else {
                             continue;
                         };
+                        outbox.ack(frame.input_ack);
                         if frame.flags & sync::FLAG_SHUTDOWN != 0 {
                             saw_shutdown = true;
                         }
                         if frame.frame_num < applied_num {
-                            continue; // stale
+                            continue; // stale (includes retransmits of a dropped frame)
                         }
                         match &frame.body {
                             FrameBody::Scrollback { base, rows } => {
-                                if frame.frame_num != applied_num && *base == applied_num {
-                                    sb_bodies += 1;
-                                    sb_rows += rows.len();
-                                    applied_num = frame.frame_num;
+                                if frame.frame_num == applied_num || *base != applied_num {
+                                    continue; // duplicate, or not anchored at our state
                                 }
+                                if drop_target == Some(frame.frame_num) {
+                                    continue; // a retransmission of the frame we "lost"
+                                }
+                                if lose_second_sb_frame && drop_target.is_none() && sb_applied == 1
+                                {
+                                    // Lose exactly the second scrollback frame.
+                                    drop_target = Some(frame.frame_num);
+                                    continue;
+                                }
+                                sb_bodies += 1;
+                                sb_rows += rows.len();
+                                for r in rows {
+                                    if let Some(n) = row_line_number(r) {
+                                        accumulated.insert(n);
+                                    }
+                                }
+                                sb_applied += 1;
+                                applied_num = frame.frame_num;
                             }
                             FrameBody::Full(_) | FrameBody::Diff { .. } => {
                                 if frame.frame_num != applied_num {
@@ -986,11 +1069,22 @@ mod tests {
                     Err(_) => break,
                 }
             }
+            if applied_num > prev_applied {
+                idle_polls = 0;
+            } else {
+                idle_polls += 1;
+            }
+            if waiting && applied_num > applied_at_push {
+                waiting = false; // this line's output landed; feed the next
+            }
         }
-        // The shell exits on its own (see the command), so the server always
-        // winds down; join cannot block on a silent peer.
         server.join().unwrap();
-        (sb_bodies, sb_rows, saw_visible)
+        ScrollbackOutcome {
+            sb_bodies,
+            sb_rows,
+            saw_visible,
+            lines: accumulated.into_iter().collect(),
+        }
     }
 
     #[test]
@@ -998,161 +1092,45 @@ mod tests {
         // RFC 0002 §1: against a client that never advertised SCROLLBACK,
         // the frame stream carries only Full/Diff/Empty bodies, even though
         // the session scrolled many lines off the primary screen.
-        let (bodies, rows, saw_visible) = run_scrollback_session(false, (62500, 62599));
-        assert_eq!(bodies, 0, "non-advertiser received a scrollback body");
-        assert_eq!(rows, 0);
-        assert!(saw_visible, "should still receive visible screen frames");
+        let out = run_scrollback_session(false, false, (62500, 62599));
+        assert_eq!(out.sb_bodies, 0, "non-advertiser received a scrollback body");
+        assert_eq!(out.sb_rows, 0);
+        assert!(out.lines.is_empty());
+        assert!(out.saw_visible, "should still receive visible screen frames");
     }
 
     #[test]
     fn server_ships_scrollback_growth_bounded_by_growth_not_depth() {
         // RFC 0002 §2/§3: an advertising client accumulates the scrolled-off
-        // rows. Each row is shipped about once (anchored to the ack), so the
-        // total accumulated tracks the lines that scrolled — it is NOT a
-        // depth-multiplied re-dump of the whole ring on every frame.
-        let (bodies, rows, saw_visible) = run_scrollback_session(true, (62600, 62699));
-        assert!(bodies > 0, "advertiser never received a scrollback body");
-        assert!(saw_visible, "visible screen frames must still flow");
+        // rows in order. 64 reflected lines scroll 40 off a 24-row screen; each
+        // row ships about once (anchored to the ack), so the accumulated set is
+        // the contiguous off-screen history, NOT a depth-multiplied re-dump.
+        let out = run_scrollback_session(true, false, (62600, 62699));
+        assert!(out.sb_bodies > 0, "advertiser never received a scrollback body");
+        assert!(out.saw_visible, "visible screen frames must still flow");
         assert!(
-            rows >= 100,
-            "scrollback did not accumulate the off-screen history: {rows} rows"
+            out.lines.len() >= 30,
+            "scrollback did not accumulate the off-screen history: {} rows",
+            out.lines.len()
         );
-        // ~176 lines scroll off; allowing for prompt lines and a little
-        // retransmit slack, a correct anchored stream stays well under a
-        // full re-dump per frame.
+        // Contiguous: an in-order history with no gaps.
+        let (min, max) = (*out.lines.first().unwrap(), *out.lines.last().unwrap());
+        assert_eq!(
+            out.lines.len(),
+            (max - min + 1) as usize,
+            "accumulated history has a gap: {:?}",
+            out.lines
+        );
+        // Growth-bounded: applied rows ≈ distinct lines (each shipped about
+        // once), NOT a whole-ring re-dump per frame (O(depth × frames)) and NOT
+        // line-discipline echo doubling (~2× the lines).
         assert!(
-            rows <= 400,
-            "scrollback rows look re-dumped, not growth-bounded: {rows} rows"
+            out.sb_rows <= out.lines.len() + 4,
+            "scrollback rows look re-dumped or echo-doubled, not growth-bounded: \
+             {} body rows vs {} distinct lines",
+            out.sb_rows,
+            out.lines.len()
         );
-    }
-
-    /// Extracts `N` from a scrollback row whose visible text contains
-    /// "line N" (the workload's echo output), ignoring SGR/escape bytes.
-    fn row_line_number(row: &[u8]) -> Option<u64> {
-        let s = String::from_utf8_lossy(row);
-        let idx = s.find("line ")?;
-        s[idx + 5..]
-            .chars()
-            .take_while(|c| c.is_ascii_digit())
-            .collect::<String>()
-            .parse()
-            .ok()
-    }
-
-    /// Like `run_scrollback_session`, but the client simulates a single lost
-    /// scrollback datagram: it applies the first scrollback frame, then drops
-    /// every transmission of the SECOND one (until a visible frame supersedes
-    /// it), then resumes applying. Losing a *middle* frame leaves rows
-    /// accumulated both before and after the gap, so a hole is an internal
-    /// discontinuity rather than a truncated head. Visible frames are applied
-    /// and acked throughout. Returns the sorted, de-duplicated `line N`
-    /// numbers the client accumulated into its scrollback ring.
-    fn run_scrollback_session_with_loss(ports: (u16, u16)) -> Vec<u64> {
-        let key = Key::random();
-        let (server_conn, port) = Connection::server(ports, &key, Family::Inet).unwrap();
-        // Paced output: each line both scrolls a row into scrollback AND
-        // changes the visible screen, so the server emits an interleaved
-        // visible/scrollback frame stream over time (a single fast burst
-        // would leave no visible frame after the scrollback to supersede the
-        // dropped one). 60 lines @ ~100ms ≈ 6s of paced activity.
-        let cmd: Vec<String> = vec![
-            "/bin/sh".into(),
-            "-c".into(),
-            "i=1; while [ $i -le 60 ]; do echo \"line $i\"; sleep 0.1; i=$((i+1)); done; sleep 3"
-                .into(),
-        ];
-        let child = crate::pty::spawn_shell(Some(&cmd), 24, 80, &[]).unwrap();
-        util::set_nonblocking(child.master).unwrap();
-        let server = std::thread::spawn(move || server_loop(server_conn, child, 24, 80));
-
-        let addr = format!("127.0.0.1:{port}").parse().unwrap();
-        let mut conn = Connection::client(addr, &key).unwrap();
-        let mut fragmenter = Fragmenter::new();
-        let mut assembly = FragmentAssembly::new();
-
-        let scrollback_cap = caps::Cap {
-            id: caps::CAP_SCROLLBACK,
-            payload: vec![0],
-        };
-        let mut applied_num = 0u64;
-        let mut sb_applied = 0u64; // distinct scrollback frames actually applied
-        let mut drop_target: Option<u64> = None;
-        let mut lines: std::collections::BTreeSet<u64> = std::collections::BTreeSet::new();
-        let mut saw_shutdown = false;
-
-        let deadline = now_ms() + 25_000;
-        while now_ms() < deadline {
-            let msg = ClientMessage {
-                flags: 0,
-                caps: vec![scrollback_cap.clone()],
-                acked_frame: applied_num,
-                rows: 24,
-                cols: 80,
-                input_base: 0,
-                input: Vec::new(),
-            };
-            for frag in fragmenter.make_fragments(&msg.encode(), sync::FRAGMENT_CONTENTS_MAX) {
-                conn.send(&frag.to_bytes()).unwrap();
-            }
-            if saw_shutdown && applied_num > 0 {
-                break;
-            }
-            std::thread::sleep(std::time::Duration::from_millis(30));
-            loop {
-                match conn.recv() {
-                    Ok(Some(payload)) => {
-                        let Ok(frag) = sync::Fragment::from_bytes(&payload) else {
-                            continue;
-                        };
-                        let Some(assembled) = assembly.add(frag) else {
-                            continue;
-                        };
-                        let Ok(frame) = ServerFrame::decode(&assembled) else {
-                            continue;
-                        };
-                        if frame.flags & sync::FLAG_SHUTDOWN != 0 {
-                            saw_shutdown = true;
-                        }
-                        if frame.frame_num < applied_num {
-                            continue; // stale (includes retransmits of a dropped frame)
-                        }
-                        match &frame.body {
-                            FrameBody::Scrollback { base, rows } => {
-                                if frame.frame_num == applied_num || *base != applied_num {
-                                    continue; // duplicate, or not anchored at our state
-                                }
-                                if drop_target == Some(frame.frame_num) {
-                                    continue; // a retransmission of the frame we "lost"
-                                }
-                                if drop_target.is_none() && sb_applied == 1 {
-                                    // Lose exactly the second scrollback frame.
-                                    drop_target = Some(frame.frame_num);
-                                    continue;
-                                }
-                                for r in rows {
-                                    if let Some(n) = row_line_number(r) {
-                                        lines.insert(n);
-                                    }
-                                }
-                                sb_applied += 1;
-                                applied_num = frame.frame_num;
-                            }
-                            FrameBody::Full(_) | FrameBody::Diff { .. } => {
-                                if frame.frame_num != applied_num {
-                                    applied_num = frame.frame_num;
-                                }
-                            }
-                            FrameBody::Empty => {}
-                        }
-                    }
-                    Ok(None) => continue,
-                    Err(e) if e.kind() == std::io::ErrorKind::WouldBlock => break,
-                    Err(_) => break,
-                }
-            }
-        }
-        server.join().unwrap();
-        lines.into_iter().collect()
     }
 
     #[test]
@@ -1164,7 +1142,8 @@ mod tests {
         // was lost — and the client leapfrogged it via a base-matching
         // visible frame — those rows are never re-shipped, leaving a permanent
         // hole in the client's accumulated history.
-        let lines = run_scrollback_session_with_loss((62700, 62799));
+        let out = run_scrollback_session(true, true, (62700, 62799));
+        let lines = out.lines;
         assert!(
             lines.len() >= 20,
             "not enough scrollback accumulated to exercise the bug: {} lines",
