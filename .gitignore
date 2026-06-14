@@ -7,3 +7,6 @@
 
 # Editor droppings
 *~
+
+# debug-record-posht output (posh-rec captures written to the repo root)
+/posht-*.castx

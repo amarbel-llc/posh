@@ -18,10 +18,27 @@ const STDIN_FD: RawFd = 0;
 const STDOUT_FD: RawFd = 1;
 
 const USAGE: &str = "\
-usage: posh-rec record [--out FILE] -- <cmd> [args...]
+usage: posh-rec record [--out FILE] [--via posh|ssh --host HOST] -- <cmd> [args...]
 
 Spawn <cmd> under a PTY, tee its output to the terminal and to a .castx
-recording (default --out recording.castx). Replay it with `posh-rec replay`.";
+recording (default --out recording.castx). Replay it with `posh-rec replay`.
+
+With --via/--host the command is run over a remote transport, for capturing a
+remote session's client-side rendering (diff a posh vs ssh recording to localize
+a drawing bug):
+  --via posh --host HOST  ->  posh HOST -- <cmd>   (roaming; HOST:session for a
+                              persistent session)
+  --via ssh  --host HOST  ->  ssh -t HOST <cmd>    (no posh in the loop — the
+                              ground-truth render)
+The remote <cmd> must already exist on HOST (e.g. deploy posht with
+posht/run-remote.sh, or install it).";
+
+/// Remote transport for `--via` (FDR 0006 capture loop).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum Via {
+    Posh,
+    Ssh,
+}
 
 /// Run `posh-rec record`. Returns the child's exit code on success.
 pub fn run(args: &[String]) -> Result<i32, String> {
@@ -66,6 +83,8 @@ pub fn run(args: &[String]) -> Result<i32, String> {
 
 fn parse_args(args: &[String]) -> Result<(String, Vec<String>), String> {
     let mut out_path = "recording.castx".to_string();
+    let mut via: Option<Via> = None;
+    let mut host: Option<String> = None;
     let mut i = 0;
     while i < args.len() {
         match args[i].as_str() {
@@ -76,18 +95,60 @@ fn parse_args(args: &[String]) -> Result<(String, Vec<String>), String> {
                     .clone();
                 i += 2;
             }
+            "--via" => {
+                via = Some(match args.get(i + 1).map(String::as_str) {
+                    Some("posh") => Via::Posh,
+                    Some("ssh") => Via::Ssh,
+                    other => {
+                        return Err(format!("--via expects posh|ssh, got {other:?}\n\n{USAGE}"))
+                    }
+                });
+                i += 2;
+            }
+            "--host" => {
+                host = Some(args.get(i + 1).ok_or("--host requires a value")?.clone());
+                i += 2;
+            }
             "-h" | "--help" => return Err(USAGE.to_string()),
             "--" => {
                 let command = args[i + 1..].to_vec();
                 if command.is_empty() {
                     return Err(format!("record requires a command after `--`\n\n{USAGE}"));
                 }
-                return Ok((out_path, command));
+                return Ok((out_path, wrap_transport(via, host, command)?));
             }
             other => return Err(format!("unexpected argument {other:?}\n\n{USAGE}")),
         }
     }
     Err(format!("record requires `-- <cmd>`\n\n{USAGE}"))
+}
+
+/// Wrap `cmd` so it runs over a remote transport: `--via posh` becomes
+/// `posh HOST -- <cmd>` (roaming; pass HOST:session for a persistent session),
+/// `--via ssh` becomes `ssh -t HOST <cmd>` (no posh in the loop). Without
+/// `--via`/`--host` the command is returned unchanged. The two flags are all or
+/// nothing — one without the other is a usage error.
+fn wrap_transport(
+    via: Option<Via>,
+    host: Option<String>,
+    cmd: Vec<String>,
+) -> Result<Vec<String>, String> {
+    match (via, host) {
+        (None, None) => Ok(cmd),
+        (Some(_), None) | (None, Some(_)) => {
+            Err(format!("--via and --host must be given together\n\n{USAGE}"))
+        }
+        (Some(Via::Posh), Some(host)) => {
+            let mut argv = vec!["posh".to_string(), host, "--".to_string()];
+            argv.extend(cmd);
+            Ok(argv)
+        }
+        (Some(Via::Ssh), Some(host)) => {
+            let mut argv = vec!["ssh".to_string(), "-t".to_string(), host];
+            argv.extend(cmd);
+            Ok(argv)
+        }
+    }
 }
 
 /// Copy bytes between the local terminal and the PTY master until the child's
@@ -338,5 +399,53 @@ fn install_sigwinch() {
         libc::sigemptyset(&mut sa.sa_mask);
         sa.sa_flags = 0;
         libc::sigaction(libc::SIGWINCH, &sa, std::ptr::null_mut());
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn argv(parts: &[&str]) -> Vec<String> {
+        parts.iter().map(|s| s.to_string()).collect()
+    }
+
+    #[test]
+    fn no_via_passes_the_command_through() {
+        let (out, cmd) = parse_args(&argv(&["--", "echo", "hi"])).unwrap();
+        assert_eq!(out, "recording.castx");
+        assert_eq!(cmd, argv(&["echo", "hi"]));
+    }
+
+    #[test]
+    fn via_posh_wraps_as_a_roaming_shell() {
+        let (out, cmd) = parse_args(&argv(&[
+            "--out", "r.castx", "--via", "posh", "--host", "box", "--", "posht", "--altscroll",
+        ]))
+        .unwrap();
+        assert_eq!(out, "r.castx");
+        assert_eq!(cmd, argv(&["posh", "box", "--", "posht", "--altscroll"]));
+    }
+
+    #[test]
+    fn via_ssh_wraps_with_a_tty_and_no_dashdash() {
+        let (_out, cmd) =
+            parse_args(&argv(&["--via", "ssh", "--host", "user@box", "--", "posht"])).unwrap();
+        assert_eq!(cmd, argv(&["ssh", "-t", "user@box", "posht"]));
+    }
+
+    #[test]
+    fn via_without_host_is_a_usage_error() {
+        assert!(parse_args(&argv(&["--via", "posh", "--", "posht"])).is_err());
+    }
+
+    #[test]
+    fn host_without_via_is_a_usage_error() {
+        assert!(parse_args(&argv(&["--host", "box", "--", "posht"])).is_err());
+    }
+
+    #[test]
+    fn unknown_via_value_is_rejected() {
+        assert!(parse_args(&argv(&["--via", "telnet", "--host", "box", "--", "posht"])).is_err());
     }
 }

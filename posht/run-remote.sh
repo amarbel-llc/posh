@@ -3,6 +3,12 @@
 # through posh's transport when posh is available, plain ssh -t otherwise.
 #
 #   ./run-remote.sh [--via ssh|session[=NAME]] <[user@]host> [posht args...]
+#   ./run-remote.sh --deploy DEST <[user@]host>
+#
+# --deploy builds posht and scp's it to host:DEST, then prints DEST and exits
+# WITHOUT launching — for callers that drive the launch themselves (e.g. the
+# debug-record-posht recipe, which records the launch through posh-rec). The
+# remote file persists at DEST.
 #
 # --via selects how posht is launched on the host:
 #   ssh             (default) over `posh ssh` — the plain-SSH wrapper path
@@ -13,6 +19,9 @@
 #                   reproduce the wheel→arrows bug, which lives in the
 #                   per-frame mode sync that the ssh wrapper does not run.
 #                   NAME defaults to "posht".
+#   plain           over plain `ssh -t` with NO posh in the loop, even when
+#                   posh is installed — the ground-truth render to diff a posh
+#                   recording against when chasing drawing bugs.
 #
 # posht is pure Go (CGO_ENABLED=0), so the binary is static and needs
 # nothing on the remote beyond a UTF-8 locale.
@@ -20,6 +29,7 @@ set -euo pipefail
 
 via=ssh
 session=posht
+deploy_dest=
 case ${1:-} in
 --via)
   # ${2:-} not $2: a bare trailing `--via` must reach the clean usage error
@@ -32,15 +42,32 @@ case ${1:-} in
   via=${1#--via=}
   shift
   ;;
+--deploy)
+  deploy_dest=${2:-}
+  if [ -z "$deploy_dest" ]; then
+    echo "$0: --deploy requires a DEST path" >&2
+    exit 64
+  fi
+  shift
+  shift || true
+  ;;
+--deploy=*)
+  deploy_dest=${1#--deploy=}
+  if [ -z "$deploy_dest" ]; then
+    echo "$0: --deploy= requires a DEST path" >&2
+    exit 64
+  fi
+  shift
+  ;;
 esac
 case $via in
 session=*)
   session=${via#session=}
   via=session
   ;;
-ssh | session) ;;
+ssh | session | plain) ;;
 *)
-  echo "$0: --via must be ssh or session[=NAME], got: $via" >&2
+  echo "$0: --via must be ssh, session[=NAME], or plain, got: $via" >&2
   exit 64
   ;;
 esac
@@ -72,16 +99,32 @@ echo ">> building posht for $kernel/$arch" >&2
 CGO_ENABLED=0 GOOS=$kernel GOARCH=$arch \
   go -C "$src" build -trimpath -ldflags='-s -w' -o "$bin" .
 
-# Unique per-invocation path: a fixed /tmp/posht would clobber (and run)
-# another user's binary on a shared host.
-dest="/tmp/posht.$$"
+# --deploy uses the caller-chosen path (stable across runs, so a recorder can
+# re-launch it); otherwise a unique per-invocation path, since a fixed /tmp/posht
+# would clobber (and run) another user's binary on a shared host.
+if [ -n "$deploy_dest" ]; then
+  dest=$deploy_dest
+else
+  dest="/tmp/posht.$$"
+fi
 echo ">> copying to $host:$dest" >&2
 scp -q "$bin" "$host:$dest"
+
+# --deploy: the caller drives the launch (e.g. records it through posh-rec).
+# Report the remote path on stdout and stop here.
+if [ -n "$deploy_dest" ]; then
+  echo "$dest"
+  exit 0
+fi
 
 # Launch posht on the host. Both posh forms put the roaming transport in
 # the loop posht judges; --via session adds session persistence and, more
 # importantly, exercises the per-frame mode sync where the 1007 bug lives.
-# Plain ssh -t is the non-posh baseline fallback.
+# --via plain (or no posh on PATH) is the non-posh baseline.
+if [ "$via" = plain ]; then
+  echo ">> launching over plain ssh -t (no posh in the loop)" >&2
+  exec ssh -t "$host" "$dest" "$@"
+fi
 if command -v posh >/dev/null 2>&1; then
   case $via in
   session) exec posh "$host:$session" -- "$dest" "$@" ;;

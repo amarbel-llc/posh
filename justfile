@@ -324,3 +324,60 @@ debug-verify-term:
     read -r _ _ port key < <(grep -m1 '^POSH CONNECT ' "$fifo")
     echo ">> connecting client to 127.0.0.1:$port — in the session, run: echo \$TERM" >&2
     POSH_KEY="$key" exec "$posh" client -4 127.0.0.1 "$port"
+
+# Record an interactive posht session over a chosen transport to a .castx, to
+# capture and diff posh's client-side rendering against the ground truth when
+# chasing drawing bugs. TRANSPORT is `posh` (posht inside a persistent posh
+# roaming session) or `ssh` (plain `ssh -t`, no posh in the loop — the
+# reference render). HOST is the remote ([user@]host); extra ARGS go to posht.
+# posht is cross-built and scp'd to /tmp/posht-rec on HOST each run; posh-rec
+# records its launch over the transport (`posh-rec record --via`).
+# Run it in the terminal you want to test (e.g. kitty); the session is teed
+# live AND recorded by posh-rec. Quit posht normally to finalize the file.
+# Usage: just debug-record-posht posh box   /   just debug-record-posht ssh box
+# Then diff the two .castx (e.g. `posh-rec` replay/dump). Debug-only; the
+# hermetic gate is build-rust/build-go.
+[group("debug")]
+debug-record-posht transport host *ARGS:
+    #!/usr/bin/env bash
+    set -euo pipefail
+    cd '{{ justfile_directory() }}'
+    case '{{ transport }}' in
+      # posh: record posht inside a persistent posh session (host:posht) — the
+      # per-frame mode-sync path where the drawing bugs live.
+      posh) via=posh; target='{{ host }}:posht' ;;
+      # ssh: plain `ssh -t`, no posh in the loop — the ground-truth render.
+      ssh) via=ssh; target='{{ host }}' ;;
+      *)
+        echo "debug-record-posht: transport must be 'posh' or 'ssh', got '{{ transport }}'" >&2
+        exit 64
+        ;;
+    esac
+    # Build the client tools: posh (the roaming transport, used by --via posh)
+    # and posh-rec (the recorder). target/debug supplies both on PATH.
+    nix develop --command cargo build -p posh -p posh-rec
+    export PATH="$PWD/target/debug:$PATH"
+    # Deploy posht to a stable remote path (static Go binary, cross-built for the
+    # host's arch). posh-rec then records its launch over the transport, so the
+    # recorder stays pure — it never touches go/scp itself.
+    remote=/tmp/posht-rec
+    nix shell nixpkgs#go --command \
+      ./posht/run-remote.sh --deploy "$remote" '{{ host }}' >&2
+    out="$PWD/posht-{{ transport }}-$(date +%Y%m%dT%H%M%S).castx"
+    echo ">> recording posht over '{{ transport }}' on '{{ host }}' -> $out" >&2
+    # posht/ssh exiting non-zero (posht's own exit code, or ^C teardown) must
+    # NOT fail the recipe — the recording is the artifact. Only a missing/empty
+    # output file is a real failure.
+    set +e
+    posh-rec record --out "$out" --via "$via" --host "$target" -- "$remote" {{ ARGS }}
+    rc=$?
+    set -e
+    if [ ! -s "$out" ]; then
+      echo ">> recording failed (rc=$rc, no output written)" >&2
+      exit "$rc"
+    fi
+    if [ "$rc" -ne 0 ]; then
+      echo ">> note: posht/ssh exited $rc (normal on quit/^C); recording still written" >&2
+    fi
+    echo ">> wrote recording: $out" >&2
+    echo ">> diff a posh vs ssh capture to localize the drawing bug" >&2
