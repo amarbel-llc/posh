@@ -156,8 +156,11 @@ Encrypted UDP datagrams using AES-128-GCM with mosh's nonce layout
 window, timestamp echo for RFC 6298 RTT estimation, fragmentation for large
 frames, and server-side roaming by adopting the source address of the newest
 authenticated datagram (late reorders never re-target the stream). State sync sends complete `dump_vt()` frames (or a
-prefix/suffix diff against the last acked frame); user input is delivered
-reliably via cumulative offsets and retransmission.
+prefix/suffix diff against the last acked frame); a client that advertises
+SCROLLBACK also accumulates the primary-screen scrollback incrementally
+(append-only rows, per-frame cost bounded by inter-frame growth rather than
+ring depth — RFC 0002); user input is delivered reliably via cumulative
+offsets and retransmission.
 
 The client takes over the alternate screen for the whole connection
 (mosh's smcup/rmcup) and restores the pre-connect shell screen on exit
