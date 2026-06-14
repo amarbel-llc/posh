@@ -1017,6 +1017,163 @@ mod tests {
         );
     }
 
+    /// Extracts `N` from a scrollback row whose visible text contains
+    /// "line N" (the workload's echo output), ignoring SGR/escape bytes.
+    fn row_line_number(row: &[u8]) -> Option<u64> {
+        let s = String::from_utf8_lossy(row);
+        let idx = s.find("line ")?;
+        s[idx + 5..]
+            .chars()
+            .take_while(|c| c.is_ascii_digit())
+            .collect::<String>()
+            .parse()
+            .ok()
+    }
+
+    /// Like `run_scrollback_session`, but the client simulates a single lost
+    /// scrollback datagram: it applies the first scrollback frame, then drops
+    /// every transmission of the SECOND one (until a visible frame supersedes
+    /// it), then resumes applying. Losing a *middle* frame leaves rows
+    /// accumulated both before and after the gap, so a hole is an internal
+    /// discontinuity rather than a truncated head. Visible frames are applied
+    /// and acked throughout. Returns the sorted, de-duplicated `line N`
+    /// numbers the client accumulated into its scrollback ring.
+    fn run_scrollback_session_with_loss(ports: (u16, u16)) -> Vec<u64> {
+        let key = Key::random();
+        let (server_conn, port) = Connection::server(ports, &key, Family::Inet).unwrap();
+        // Paced output: each line both scrolls a row into scrollback AND
+        // changes the visible screen, so the server emits an interleaved
+        // visible/scrollback frame stream over time (a single fast burst
+        // would leave no visible frame after the scrollback to supersede the
+        // dropped one). 60 lines @ ~100ms ≈ 6s of paced activity.
+        let cmd: Vec<String> = vec![
+            "/bin/sh".into(),
+            "-c".into(),
+            "i=1; while [ $i -le 60 ]; do echo \"line $i\"; sleep 0.1; i=$((i+1)); done; sleep 3"
+                .into(),
+        ];
+        let child = crate::pty::spawn_shell(Some(&cmd), 24, 80, &[]).unwrap();
+        util::set_nonblocking(child.master).unwrap();
+        let server = std::thread::spawn(move || server_loop(server_conn, child, 24, 80));
+
+        let addr = format!("127.0.0.1:{port}").parse().unwrap();
+        let mut conn = Connection::client(addr, &key).unwrap();
+        let mut fragmenter = Fragmenter::new();
+        let mut assembly = FragmentAssembly::new();
+
+        let scrollback_cap = caps::Cap {
+            id: caps::CAP_SCROLLBACK,
+            payload: vec![0],
+        };
+        let mut applied_num = 0u64;
+        let mut sb_applied = 0u64; // distinct scrollback frames actually applied
+        let mut drop_target: Option<u64> = None;
+        let mut lines: std::collections::BTreeSet<u64> = std::collections::BTreeSet::new();
+        let mut saw_shutdown = false;
+
+        let deadline = now_ms() + 25_000;
+        while now_ms() < deadline {
+            let msg = ClientMessage {
+                flags: 0,
+                caps: vec![scrollback_cap.clone()],
+                acked_frame: applied_num,
+                rows: 24,
+                cols: 80,
+                input_base: 0,
+                input: Vec::new(),
+            };
+            for frag in fragmenter.make_fragments(&msg.encode(), sync::FRAGMENT_CONTENTS_MAX) {
+                conn.send(&frag.to_bytes()).unwrap();
+            }
+            if saw_shutdown && applied_num > 0 {
+                break;
+            }
+            std::thread::sleep(std::time::Duration::from_millis(30));
+            loop {
+                match conn.recv() {
+                    Ok(Some(payload)) => {
+                        let Ok(frag) = sync::Fragment::from_bytes(&payload) else {
+                            continue;
+                        };
+                        let Some(assembled) = assembly.add(frag) else {
+                            continue;
+                        };
+                        let Ok(frame) = ServerFrame::decode(&assembled) else {
+                            continue;
+                        };
+                        if frame.flags & sync::FLAG_SHUTDOWN != 0 {
+                            saw_shutdown = true;
+                        }
+                        if frame.frame_num < applied_num {
+                            continue; // stale (includes retransmits of a dropped frame)
+                        }
+                        match &frame.body {
+                            FrameBody::Scrollback { base, rows } => {
+                                if frame.frame_num == applied_num || *base != applied_num {
+                                    continue; // duplicate, or not anchored at our state
+                                }
+                                if drop_target == Some(frame.frame_num) {
+                                    continue; // a retransmission of the frame we "lost"
+                                }
+                                if drop_target.is_none() && sb_applied == 1 {
+                                    // Lose exactly the second scrollback frame.
+                                    drop_target = Some(frame.frame_num);
+                                    continue;
+                                }
+                                for r in rows {
+                                    if let Some(n) = row_line_number(r) {
+                                        lines.insert(n);
+                                    }
+                                }
+                                sb_applied += 1;
+                                applied_num = frame.frame_num;
+                            }
+                            FrameBody::Full(_) | FrameBody::Diff { .. } => {
+                                if frame.frame_num != applied_num {
+                                    applied_num = frame.frame_num;
+                                }
+                            }
+                            FrameBody::Empty => {}
+                        }
+                    }
+                    Ok(None) => continue,
+                    Err(e) if e.kind() == std::io::ErrorKind::WouldBlock => break,
+                    Err(_) => break,
+                }
+            }
+        }
+        server.join().unwrap();
+        lines.into_iter().collect()
+    }
+
+    #[test]
+    fn scrollback_lost_frame_is_not_silently_confirmed_by_visible_ack() {
+        // Review finding #1: a visible (Full/Diff) frame inherits
+        // sb_total = sb_high, so when the client acks that visible frame the
+        // server advances acked_sb_total past scrollback rows the visible
+        // frame never carried. If the scrollback frame that *did* carry them
+        // was lost — and the client leapfrogged it via a base-matching
+        // visible frame — those rows are never re-shipped, leaving a permanent
+        // hole in the client's accumulated history.
+        let lines = run_scrollback_session_with_loss((62700, 62799));
+        assert!(
+            lines.len() >= 20,
+            "not enough scrollback accumulated to exercise the bug: {} lines",
+            lines.len()
+        );
+        let min = *lines.first().unwrap();
+        let max = *lines.last().unwrap();
+        let span = (max - min + 1) as usize;
+        let missing: Vec<u64> = lines.windows(2).flat_map(|w| w[0] + 1..w[1]).collect();
+        assert_eq!(
+            lines.len(),
+            span,
+            "scrollback history has a hole within {min}..={max} (missing lines {missing:?}): \
+             a lost scrollback frame's rows were silently confirmed by a visible-frame ack \
+             (sb_total=sb_high) and never re-shipped (finding #1)",
+        );
+    }
+
     #[test]
     fn update_acks_rejects_frames_never_sent() {
         let current = FrameState {
