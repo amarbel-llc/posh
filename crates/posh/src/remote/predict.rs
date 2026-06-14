@@ -133,11 +133,14 @@ impl OverlayCell {
         }
         let current = fb.cell(row, self.col).expect("cell in range");
         if contents_match(current, &self.replacement) {
-            if self
-                .original_contents
-                .iter()
-                .any(|c| contents_match(c, &self.replacement))
-            {
+            // Withhold credit only when the prediction is byte-identical (glyph
+            // AND rendition) to what was already on screen — a genuinely no-op
+            // prediction. A faint autosuggestion (fish) shares the glyph but not
+            // the style, so typing along it still earns credit. Using
+            // style-insensitive contents_match here scored every such keystroke
+            // CorrectNoCredit, starving confirmed_epoch and hiding all local
+            // echo (shown=0, nocredit-dominant).
+            if self.original_contents.iter().any(|c| c == &self.replacement) {
                 return Validity::CorrectNoCredit;
             }
             return Validity::Correct;
@@ -1415,5 +1418,141 @@ mod tests {
             .iter()
             .any(|r| r.cells.iter().any(|c| c.active));
         assert!(!still_cell_active, "ack retires the cell prediction");
+    }
+
+    // ---------------------------------------------------------------------
+    // Deterministic confirmation-cycle harness (github prediction-latency).
+    //
+    // Drives the engine through the *real* client cycle: a keystroke predicts
+    // locally against the displayed frame; the "server" (a posh_term::Terminal)
+    // echoes it; the server screen is serialized with `dump_vt()` and re-parsed
+    // exactly as the client rebuilds `server_term` from a frame (apply_frame),
+    // and the engine is culled against that reconstruction. That dump_vt
+    // round-trip — not a directly-constructed Snapshot — is what the live
+    // client sees, so it surfaces credit-logic / serialization discrepancies
+    // that flat-Snapshot tests miss.
+
+    /// Re-parse a `dump_vt()` byte stream into a Terminal, mirroring
+    /// client.rs::apply_frame (fresh terminal, clamp DECCOLM back to tty size).
+    fn reparse(rows: u16, cols: u16, dump: &[u8]) -> Terminal {
+        let mut t = Terminal::with_scrollback(rows, cols, 0);
+        t.process(dump);
+        if t.rows() != rows || t.cols() != cols {
+            t.resize(rows, cols);
+        }
+        t
+    }
+
+    struct PredictHarness {
+        eng: PredictionEngine,
+        server: Terminal,  // authoritative server screen
+        display: Snapshot, // what the client currently shows (predictions applied)
+        input_off: u64,    // reliable input stream offset (outbox.end_offset())
+        echo_off: u64,     // server echo-ack offset
+        now: u64,
+        rows: u16,
+        cols: u16,
+    }
+
+    impl PredictHarness {
+        fn new(rows: u16, cols: u16, init: &[u8]) -> PredictHarness {
+            let mut server = Terminal::with_scrollback(rows, cols, 0);
+            server.process(init);
+            let server_term = reparse(rows, cols, &server.dump_vt());
+            let display = Snapshot::from_term(&server_term);
+            PredictHarness {
+                eng: PredictionEngine::new(DisplayPreference::Adaptive, false),
+                server,
+                display,
+                input_off: 0,
+                echo_off: 0,
+                now: 1000,
+                rows,
+                cols,
+            }
+        }
+
+        /// Predict one keystroke locally, exactly as client.rs::process_user_input
+        /// (set_local_frame_sent at the pre-push offset, then new_user_byte).
+        fn type_byte(&mut self, b: u8) {
+            self.eng.set_local_frame_sent(self.input_off);
+            self.eng.new_user_byte(b, &self.display, self.now);
+            self.input_off += 1;
+            self.now += 5;
+        }
+
+        /// The shell echoes bytes onto the authoritative server screen; the
+        /// echo-ack catches up to the input the echo consumed (past ECHO_TIMEOUT).
+        fn server_echo(&mut self, b: &[u8]) {
+            self.server.process(b);
+            self.echo_off = self.input_off;
+            self.now += 60;
+        }
+
+        /// Deliver a server frame: rebuild server_term from dump_vt, feed the
+        /// acks, cull, and re-render the display — process_frame + compose_frame.
+        fn deliver(&mut self) {
+            let server_term = reparse(self.rows, self.cols, &self.server.dump_vt());
+            self.eng.set_local_frame_acked(self.input_off);
+            self.eng.set_local_frame_late_acked(self.echo_off);
+            self.eng.set_send_interval(50); // > SRTT_TRIGGER_HIGH so shown() is on
+            let base = Snapshot::from_term(&server_term);
+            self.eng.cull(&base, self.now);
+            let mut next = base.clone();
+            self.eng.apply(&mut next);
+            self.display = next;
+            self.now += 5;
+        }
+    }
+
+    #[test]
+    fn typed_char_is_credited_through_the_dump_vt_roundtrip() {
+        // The core local-echo cycle: at a prompt, type 'l'; the server echoes
+        // it; after culling against the dump_vt-reconstructed frame the engine
+        // must CREDIT the prediction (confirmed_epoch catches up), or local echo
+        // never un-hides (the field-observed shown=0 / nocredit-dominant bug).
+        let mut h = PredictHarness::new(24, 80, b"$ ");
+        let before = h.eng.confirmed_epoch();
+        h.type_byte(b'l');
+        h.server_echo(b"l");
+        h.deliver();
+        let (correct, nocredit, incorrect) = h.eng.prediction_outcomes();
+        assert!(
+            h.eng.confirmed_epoch() > before,
+            "typed char not credited: confirmed_epoch stuck at {} \
+             (correct={correct} nocredit={nocredit} incorrect={incorrect}, epoch_lag={})",
+            h.eng.confirmed_epoch(),
+            h.eng.epoch_lag(),
+        );
+    }
+
+    #[test]
+    fn typing_along_a_suggestion_starves_prediction_credit() {
+        // Fish (and other shells) show an autosuggestion: the grey character
+        // you are about to type, sitting at the cursor. The prediction captures
+        // that glyph in `original_contents`; `contents_match` ignores style, so
+        // when the server echoes the (now solid) char the prediction "matches
+        // what was already there" and is scored CorrectNoCredit. confirmed_epoch
+        // never advances => predictions stay tentative => local echo is never
+        // displayed. This is the field bug (shown=0, nocredit-dominant).
+        //
+        // Setup: the displayed frame already shows a GREY (SGR 90) 'x' at the
+        // cursor — a fish autosuggestion — then the user types that same 'x'.
+        // The committed echo is default-styled, so it differs from the grey
+        // suggestion in rendition: the keystroke really did cause a change and
+        // must be credited.
+        let mut h = PredictHarness::new(24, 80, b"$ \x1b[90mx\x1b[0m\x1b[3G");
+        let before = h.eng.confirmed_epoch();
+        h.type_byte(b'x'); // type the already-suggested char
+        h.server_echo(b"x"); // shell commits it (cursor advances)
+        h.deliver();
+        let (correct, nocredit, incorrect) = h.eng.prediction_outcomes();
+        assert!(
+            h.eng.confirmed_epoch() > before,
+            "typing the suggested char earned no credit: confirmed_epoch stuck at {} \
+             (correct={correct} nocredit={nocredit} incorrect={incorrect}) -> local echo can \
+             never un-hide",
+            h.eng.confirmed_epoch(),
+        );
     }
 }
