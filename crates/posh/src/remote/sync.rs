@@ -204,6 +204,12 @@ pub fn apply_diff(old: &[u8], diff: &[u8]) -> Option<Vec<u8>> {
 // ack/heartbeat carrier.
 
 pub const FLAG_SHUTDOWN: u8 = 1;
+/// The remote PTY's line-discipline `ECHO` is on, reported per frame. Lets an
+/// optimistic-echo client (`POSH_PREDICTION=optimistic`, FDR 0006) know it is
+/// safe to echo keystrokes locally; cleared at password prompts and raw-mode
+/// apps so their input is not shown. `0x02` is the reserved caps EXTENSION bit,
+/// so this is the next free runtime bit.
+pub const FLAG_ECHO: u8 = 4;
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum FrameBody {
@@ -224,8 +230,8 @@ pub enum FrameBody {
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct ServerFrame {
-    /// Runtime signal bits only (FLAG_SHUTDOWN). The EXTENSION bit is a
-    /// wire-format detail: set on encode when `caps` is non-empty,
+    /// Runtime signal bits only (FLAG_SHUTDOWN, FLAG_ECHO). The EXTENSION bit
+    /// is a wire-format detail: set on encode when `caps` is non-empty,
     /// stripped on decode.
     pub flags: u8,
     /// RFC 0001 §3 capability table; empty == baseline (v0) format.
@@ -789,6 +795,24 @@ mod tests {
                 input_ack: 0,
                 echo_ack: 0,
                 body: FrameBody::Empty,
+            },
+            // FLAG_ECHO alone and combined with FLAG_SHUTDOWN both survive the
+            // flags byte without disturbing caps decode (FDR 0006).
+            ServerFrame {
+                flags: FLAG_ECHO,
+                caps: vec![],
+                frame_num: 9,
+                input_ack: 3,
+                echo_ack: 3,
+                body: FrameBody::Empty,
+            },
+            ServerFrame {
+                flags: FLAG_SHUTDOWN | FLAG_ECHO,
+                caps: vec![],
+                frame_num: 10,
+                input_ack: 4,
+                echo_ack: 4,
+                body: FrameBody::Full(b"x".to_vec()),
             },
         ];
         for frame in cases {

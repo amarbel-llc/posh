@@ -29,6 +29,10 @@ pub enum DisplayPreference {
     Never,
     Adaptive,
     Experimental,
+    /// FDR 0006: write echoes immediately (no epoch/credit gating) and let the
+    /// next server paint correct them. The client gates this on the remote
+    /// PTY's ECHO flag and alt-screen so passwords/full-screen apps suppress.
+    Optimistic,
 }
 
 impl DisplayPreference {
@@ -39,6 +43,7 @@ impl DisplayPreference {
             Some("always") => Ok(DisplayPreference::Always),
             Some("never") => Ok(DisplayPreference::Never),
             Some("experimental") => Ok(DisplayPreference::Experimental),
+            Some("optimistic") => Ok(DisplayPreference::Optimistic),
             Some(other) => Err(format!("unknown POSH_PREDICTION setting ({other})")),
         }
     }
@@ -471,10 +476,16 @@ impl PredictionEngine {
         if !self.shown() {
             return 0;
         }
+        // Mirror apply()'s epoch: optimistic draws every active cell.
+        let confirmed = if self.is_optimistic() {
+            u64::MAX
+        } else {
+            self.confirmed_epoch
+        };
         self.overlays
             .iter()
             .flat_map(|row| row.cells.iter())
-            .filter(|c| c.active && !c.tentative(self.confirmed_epoch))
+            .filter(|c| c.active && !c.tentative(confirmed))
             .count() as u64
     }
 
@@ -511,9 +522,16 @@ impl PredictionEngine {
     fn shown(&self) -> bool {
         match self.display_preference {
             DisplayPreference::Never => false,
-            DisplayPreference::Always | DisplayPreference::Experimental => true,
+            DisplayPreference::Always
+            | DisplayPreference::Experimental
+            | DisplayPreference::Optimistic => true,
             DisplayPreference::Adaptive => self.srtt_trigger || self.glitch_trigger > 0,
         }
+    }
+
+    /// FDR 0006: the optimistic "echo now, correct on repaint" mode.
+    pub fn is_optimistic(&self) -> bool {
+        self.display_preference == DisplayPreference::Optimistic
     }
 
     pub fn reset(&mut self) {
@@ -590,14 +608,45 @@ impl PredictionEngine {
         if !self.shown() {
             return;
         }
+        // Optimistic mode draws every active prediction immediately, with no
+        // tentative/confirmed-epoch gate and no slow-link underline: force the
+        // confirmed epoch to u64::MAX (so `tentative()` is always false) and
+        // suppress flagging (FDR 0006). `apply` only reads these, so this does
+        // not disturb the engine's real epoch state.
+        let optimistic = self.is_optimistic();
+        let confirmed = if optimistic {
+            u64::MAX
+        } else {
+            self.confirmed_epoch
+        };
+        let flag = self.flagging && !optimistic;
         for cursor in &self.cursors {
-            cursor.apply(fb, self.confirmed_epoch);
+            cursor.apply(fb, confirmed);
         }
         for row in &self.overlays {
             for cell in &row.cells {
-                cell.apply(fb, self.confirmed_epoch, row.row_num, self.flagging);
+                cell.apply(fb, confirmed, row.row_num, flag);
             }
         }
+    }
+
+    /// FDR 0006 optimistic retirement: drop overlay cells and cursor
+    /// predictions once the server frame has echoed past them
+    /// (`local_frame_late_acked >= expiration_frame`), so the authoritative
+    /// paint takes over. No epoch / credit / glitch logic — a gated ECHO means
+    /// the echo always arrives, so the ack reliably retires the overlay.
+    fn cull_optimistic(&mut self) {
+        let late_ack = self.local_frame_late_acked;
+        for row in self.overlays.iter_mut() {
+            for cell in row.cells.iter_mut() {
+                if cell.active && late_ack >= cell.expiration_frame {
+                    cell.reset();
+                }
+            }
+        }
+        self.overlays
+            .retain(|row| row.cells.iter().any(|c| c.active));
+        self.cursors.retain(|c| late_ack < c.expiration_frame);
     }
 
     /// Validates predictions against the latest server framebuffer:
@@ -612,6 +661,11 @@ impl PredictionEngine {
             self.last_height = fb.rows;
             self.last_width = fb.cols;
             self.reset();
+        }
+
+        if self.is_optimistic() {
+            self.cull_optimistic();
+            return;
         }
 
         // SRTT trigger with hysteresis.
@@ -1048,6 +1102,10 @@ mod tests {
             DisplayPreference::parse(Some("experimental")),
             Ok(DisplayPreference::Experimental)
         );
+        assert_eq!(
+            DisplayPreference::parse(Some("optimistic")),
+            Ok(DisplayPreference::Optimistic)
+        );
         assert!(DisplayPreference::parse(Some("sometimes")).is_err());
     }
 
@@ -1456,12 +1514,21 @@ mod tests {
 
     impl PredictHarness {
         fn new(rows: u16, cols: u16, init: &[u8]) -> PredictHarness {
+            Self::with_pref(rows, cols, init, DisplayPreference::Adaptive)
+        }
+
+        fn with_pref(
+            rows: u16,
+            cols: u16,
+            init: &[u8],
+            pref: DisplayPreference,
+        ) -> PredictHarness {
             let mut server = Terminal::with_scrollback(rows, cols, 0);
             server.process(init);
             let server_term = reparse(rows, cols, &server.dump_vt());
             let display = Snapshot::from_term(&server_term);
             PredictHarness {
-                eng: PredictionEngine::new(DisplayPreference::Adaptive, false),
+                eng: PredictionEngine::new(pref, false),
                 server,
                 display,
                 input_off: 0,
@@ -1553,6 +1620,56 @@ mod tests {
              (correct={correct} nocredit={nocredit} incorrect={incorrect}) -> local echo can \
              never un-hide",
             h.eng.confirmed_epoch(),
+        );
+    }
+
+    #[test]
+    fn optimistic_echo_shows_the_first_char_immediately() {
+        // FDR 0006: unlike adaptive (which hides the first prediction until an
+        // epoch confirms a round-trip later), optimistic draws the keystroke at
+        // once — no tentative/confirmed-epoch gate.
+        let mut h = PredictHarness::with_pref(24, 80, b"$ ", DisplayPreference::Optimistic);
+        assert_eq!(h.eng.shown_cells(), 0, "nothing typed yet");
+        h.type_byte(b'l');
+        assert!(
+            h.eng.shown_cells() >= 1,
+            "optimistic must show the typed char immediately (shown={})",
+            h.eng.shown_cells(),
+        );
+    }
+
+    #[test]
+    fn optimistic_echo_retires_after_the_server_paint() {
+        // Once the server frame has echoed the char (echo-ack past expiration),
+        // the overlay retires and the authoritative paint stands — no lingering.
+        let mut h = PredictHarness::with_pref(24, 80, b"$ ", DisplayPreference::Optimistic);
+        h.type_byte(b'l');
+        assert!(h.eng.shown_cells() >= 1);
+        h.server_echo(b"l");
+        h.deliver();
+        assert_eq!(
+            h.eng.shown_cells(),
+            0,
+            "echoed char's overlay must retire after the paint",
+        );
+        assert_eq!(shown_char(&h.display, 0, 2), 'l', "the real paint stands");
+    }
+
+    #[test]
+    fn optimistic_shows_typing_along_a_suggestion_immediately() {
+        // The adaptive credit-starvation scenario (grey autosuggestion at the
+        // cursor): optimistic has no credit concept, so it just echoes the char.
+        let mut h = PredictHarness::with_pref(
+            24,
+            80,
+            b"$ \x1b[90mx\x1b[0m\x1b[3G",
+            DisplayPreference::Optimistic,
+        );
+        h.type_byte(b'x');
+        assert!(
+            h.eng.shown_cells() >= 1,
+            "optimistic must echo a char typed along a suggestion (shown={})",
+            h.eng.shown_cells(),
         );
     }
 }

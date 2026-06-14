@@ -191,6 +191,9 @@ struct ClientState {
     /// Idle fast-path key for the scroll view: (offset, ring len, generation)
     /// at the last scroll compose. None forces the next scroll frame to repaint.
     last_scroll_state: Option<(usize, usize, u64)>,
+    /// Latest server-reported remote-PTY ECHO state (FLAG_ECHO). Gates
+    /// optimistic local echo (FDR 0006); defaults off until the first frame.
+    echo_on: bool,
     /// Optional performance instrumentation (POSH_DEBUG_LOG); inert when unset.
     stats: Stats,
 }
@@ -235,6 +238,7 @@ fn client_loop(
         last_render_overlays: false,
         scroll_offset: 0,
         last_scroll_state: None,
+        echo_on: false,
         stats: Stats::new(),
     };
     let result = drive_client(&mut st, raw, port);
@@ -491,6 +495,14 @@ fn scroll_by(st: &mut ClientState, ticks: i32) {
     set_scroll(st, new);
 }
 
+/// Whether optimistic local echo (FDR 0006) should be active right now: the
+/// predictor is in optimistic mode, the remote PTY is echoing (server-reported
+/// FLAG_ECHO), and the primary screen is active (not a full-screen app). When
+/// false, keystrokes are not echoed locally — passwords and TUIs stay correct.
+fn optimistic_echo_on(st: &ClientState) -> bool {
+    st.predict.is_optimistic() && st.echo_on && !st.server_term.is_alt_screen()
+}
+
 /// Cap on a buffered candidate SGR mouse sequence. A real one is at most
 /// `ESC [ < 223 ; 65535 ; 65535 M` (22 bytes); a longer run with no
 /// terminator is not a mouse sequence, so the filter gives up and flushes it
@@ -716,8 +728,13 @@ fn process_user_input(st: &mut ClientState, buf: &[u8], raw: &RawMode) -> bool {
         st.predict.reset();
     }
 
+    // Optimistic echo is gated on the remote PTY echoing and the primary screen
+    // being active (FDR 0006); when gated off we feed no predictions, so nothing
+    // is echoed locally (passwords / full-screen apps). Other modes self-gate.
+    let predict_ok = !st.predict.is_optimistic() || optimistic_echo_on(st);
+
     let push = |st: &mut ClientState, byte: u8| {
-        if !paste {
+        if !paste && predict_ok {
             st.predict.set_local_frame_sent(st.outbox.end_offset());
             st.predict.new_user_byte(byte, &st.last_drawn, now);
         }
@@ -791,6 +808,8 @@ fn process_frame(st: &mut ClientState, frame: &ServerFrame) -> bool {
     st.predict.set_local_frame_acked(frame.input_ack);
     st.predict.set_local_frame_late_acked(frame.echo_ack);
     st.predict.set_send_interval(st.conn.send_interval());
+    // Remote PTY echo state for the optimistic-echo gate (FDR 0006).
+    st.echo_on = frame.flags & sync::FLAG_ECHO != 0;
     if frame.flags & sync::FLAG_SHUTDOWN != 0 {
         st.shutdown_seen = true;
         // EXIT_STATUS rides the shutdown frame's capability table; the
@@ -918,6 +937,11 @@ fn compose_frame(st: &mut ClientState, now: u64) -> Vec<u8> {
     // diff), excluding the idle fast-path above so the average reflects real
     // work. enabled() is read and dropped before the borrows below.
     let compose_timer = st.stats.enabled().then(Instant::now);
+    // Optimistic echo gated off (password prompt / full-screen app): drop any
+    // pending overlay so it is not shown; the authoritative paint stands.
+    if st.predict.is_optimistic() && !optimistic_echo_on(st) {
+        st.predict.reset();
+    }
     let base = Snapshot::from_term(&st.server_term);
     st.predict.cull(&base, now);
     let mut next = base;
@@ -1170,6 +1194,33 @@ mod tests {
     }
 
     #[test]
+    fn optimistic_echo_gate_requires_echo_on_and_primary_screen() {
+        // FDR 0006: optimistic local echo only fires when the predictor is in
+        // optimistic mode AND the remote PTY is echoing AND the primary screen
+        // is active. Echo-off (password) or alt-screen (full-screen app) suppress.
+        let mut st = test_state(24, 80);
+        st.predict = PredictionEngine::new(DisplayPreference::Optimistic, false);
+
+        assert!(!optimistic_echo_on(&st), "default echo_on=false => off");
+
+        st.echo_on = true;
+        assert!(optimistic_echo_on(&st), "echo on, primary screen => on");
+
+        st.server_term.process(b"\x1b[?1049h"); // enter alt screen
+        assert!(st.server_term.is_alt_screen());
+        assert!(!optimistic_echo_on(&st), "alt-screen suppresses");
+        st.server_term.process(b"\x1b[?1049l");
+
+        st.echo_on = false;
+        assert!(!optimistic_echo_on(&st), "echo off (password) suppresses");
+
+        // A non-optimistic predictor never engages this gate.
+        st.predict = PredictionEngine::new(DisplayPreference::Adaptive, false);
+        st.echo_on = true;
+        assert!(!optimistic_echo_on(&st), "only optimistic mode gates here");
+    }
+
+    #[test]
     fn resolve_ipv6_literal_with_brackets_in_port_form() {
         let addr = resolve("::1", 60001, Family::Auto).unwrap();
         match addr {
@@ -1211,6 +1262,7 @@ mod tests {
             last_render_overlays: false,
             scroll_offset: 0,
             last_scroll_state: None,
+            echo_on: false,
             stats: Stats::new(),
         }
     }

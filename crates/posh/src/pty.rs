@@ -29,6 +29,18 @@ pub fn set_term_size(fd: RawFd, rows: u16, cols: u16) {
     }
 }
 
+/// Whether the tty's line discipline currently echoes input (`c_lflag & ECHO`).
+/// Reading `c_lflag` off the pty master reflects the slave's termios on Linux,
+/// so the server can tell an optimistic-echo client when local echo is safe
+/// (FDR 0006). `false` when `fd` is not a tty.
+pub fn echo_on(fd: RawFd) -> bool {
+    // SAFETY: tcgetattr writes through a valid &mut termios before it is read.
+    unsafe {
+        let mut tio: libc::termios = std::mem::zeroed();
+        libc::tcgetattr(fd, &mut tio) == 0 && tio.c_lflag & libc::ECHO != 0
+    }
+}
+
 pub struct PtyChild {
     pub master: RawFd,
     pub pid: libc::pid_t,

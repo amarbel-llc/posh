@@ -1,7 +1,7 @@
 ---
-status: proposed
+status: experimental
 date: 2026-06-14
-promotion-criteria: A working `POSH_PREDICTION=optimistic` path exists in the client (immediate echo + ECHO/alt-screen gating) and has been A/B'd against `adaptive` over a real ~100ms link across line editing, autosuggestions, a password prompt, and a full-screen app.
+promotion-criteria: A/B'd against `adaptive` over a real ~100ms link across line editing, autosuggestions, a password prompt, and a full-screen app, with no echo-leak or flicker regressions.
 ---
 
 # Optimistic local echo (local echo correction)

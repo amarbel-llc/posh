@@ -507,8 +507,16 @@ fn server_loop(mut conn: Connection, child: pty::PtyChild, rows: u16, cols: u16)
                 } else {
                     caps::own_table(&extras)
                 };
+                // Report the remote PTY's ECHO state so an optimistic-echo
+                // client knows when local echo is safe (FDR 0006). Off once the
+                // pty is gone, and at password prompts / raw-mode apps.
+                let echo_flag = if pty_open && pty::echo_on(child.master) {
+                    sync::FLAG_ECHO
+                } else {
+                    0
+                };
                 let frame = ServerFrame {
-                    flags: if shutdown { sync::FLAG_SHUTDOWN } else { 0 },
+                    flags: (if shutdown { sync::FLAG_SHUTDOWN } else { 0 }) | echo_flag,
                     caps: frame_caps,
                     frame_num: current.num,
                     input_ack: inbox.next_offset(),
