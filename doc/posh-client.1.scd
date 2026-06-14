@@ -55,10 +55,14 @@ _POSH_PREDICTION_OVERWRITE_
 	instead of inserting.
 
 _POSH_GRAB_MOUSE_
-	_on_/_off_ (default _off_): when on, grab the wheel on the outer
-	terminal at a bare prompt and translate wheel up/down into arrow
-	keys, normalizing scroll behavior across terminals. Costs the
-	outer terminal's click-to-select while active.
+	_on_/_off_ (default _off_): at a bare prompt the wheel scrolls the
+	session's primary-screen scrollback locally (FDR 0005) — instant,
+	frozen while scrolled, with a top status-bar indicator; any keystroke
+	or scrolling back to the bottom resumes the live view. When _on_, the
+	wheel is instead translated into arrow keys (the legacy cross-terminal
+	scroll normalization, posh#50). Both grab the wheel from the outer
+	terminal, costing its click-to-select while active; a session app that
+	tracks the mouse itself (vim, tmux) keeps the wheel either way.
 
 _POSH_NO_TERM_INIT_
 	Suppress the alternate-screen takeover (set by *posh*(1)'s

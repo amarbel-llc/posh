@@ -173,6 +173,29 @@ impl Terminal {
         }
     }
 
+    /// Serializes the active grid's visible rows as self-contained per-row
+    /// escape streams, one `Vec<u8>` per row, in the same format as
+    /// [`Terminal::dump_scrollback_row`] (each row starts from a default pen and,
+    /// when hard-terminated, ends in a pen reset and `\r\n`). The scrollback
+    /// scroll-view (FDR 0005) concatenates the accumulated ring rows with these
+    /// to render a window of the session's logical history through `posh_term`'s
+    /// own autowrap.
+    pub fn dump_visible_rows(&self) -> Vec<Vec<u8>> {
+        let grid = self.scr();
+        (0..grid.rows())
+            .filter_map(|r| grid.row(r))
+            .map(|row| {
+                let mut out = String::new();
+                let mut st = EmitState {
+                    style: Style::default(),
+                    hyperlink: 0,
+                };
+                self.emit_terminated_row(&mut out, row, &mut st);
+                out.into_bytes()
+            })
+            .collect()
+    }
+
     /// VT escape stream that reproduces the terminal state (contents,
     /// attributes, cursor, modes, title, scroll region) on a fresh
     /// terminal of the same size.

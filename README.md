@@ -108,9 +108,9 @@ shell prompt you attached from comes back exactly as you left it
 (FDR 0002: `docs/features/`). The daemon virtualizes the
 session's own alt-screen switches and RIS in the broadcast — replaced
 with model-generated repaints — so full-screen apps inside the session
-can never flip the outer terminal off posh's screen. Session scrollback
-is reached via `posh history` (the outer terminal's native scrollback
-stays the shell's own).
+can never flip the outer terminal off posh's screen. Session scrollback is
+reached by scrolling the wheel at a bare prompt (FDR 0005) — or as text via
+`posh history`; the outer terminal's native scrollback stays the shell's own.
 
 Daemon-per-session over Unix sockets with zmx's binary IPC framing (1-byte
 tag + u32 LE length; Input/Output/Resize/Detach/DetachAll/Kill/Info/Init/
@@ -187,14 +187,16 @@ and emits OSC 8 hyperlinks.
 Because the whole connection lives on the outer terminal's alternate screen,
 the mouse wheel at a bare prompt is at the mercy of that terminal's
 alt-screen wheel behavior — kitty, for one, turns it into arrow keys and
-ignores DECSET 1007, so posh can't suppress it the way it can in iTerm2
-(posh#3/#28). `POSH_GRAB_MOUSE=on` makes this consistent: the client grabs
-the wheel (mouse reporting) and translates wheel up/down into arrow keys
-itself, so every terminal behaves the same. It is off by default because
-grabbing the wheel takes click-to-select away from the outer terminal;
-sessions whose app already tracks the mouse (vim, tmux) are unaffected
-either way. Scrolling the session's own scrollback with the wheel is a
-separate, larger item (posh#43).
+ignores DECSET 1007 (posh#3/#28). posh grabs the wheel (mouse reporting) at
+a bare prompt and, by default, scrolls the session's own primary-screen
+scrollback locally from the client's accumulated ring — instant, no
+round-trip, frozen while scrolled, with a top status-bar indicator; any
+keystroke or scrolling back to the bottom resumes the live view (FDR 0005,
+posh#43). `POSH_GRAB_MOUSE=on` reverts the wheel to the legacy transform
+(wheel up/down → arrow keys, normalizing scroll across terminals, posh#50)
+instead of scrollback. Either way, grabbing the wheel costs the outer
+terminal's click-to-select while active; a session app that tracks the mouse
+itself (vim, tmux) keeps the wheel.
 
 Known simplifications relative to mosh: frames carry `dump_vt()` state (or
 a prefix/suffix diff) rather than mosh's SSP protobuf instructions with

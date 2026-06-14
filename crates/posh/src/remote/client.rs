@@ -152,8 +152,8 @@ struct ClientState {
     /// Local, partial, monotonically-growing accumulation of the session's
     /// primary-screen scrollback (RFC 0002 §3). Fed by `BODY_SCROLLBACK`
     /// frames; survives `Full` visible resets; cleared on a width resize.
-    /// Not yet rendered (the wheel scroll-view is FDR 0005, out of the wire
-    /// contract) — this is the durable accumulation it will read from.
+    /// Rendered by the wheel scroll-view (FDR 0005): `compose_scroll_frame`
+    /// reads a window of it when `scroll_offset > 0`.
     scrollback: ScrollbackRing,
     /// Set on resize to drop the `SCROLLBACK` advertisement for exactly the
     /// next outgoing message (RFC 0002 §4: a resize ceases scrollback so the
@@ -166,10 +166,12 @@ struct ClientState {
     initialized: bool,
     predict: PredictionEngine,
     notify: NotificationEngine,
-    /// $POSH_GRAB_MOUSE policy; gates the wheel-grab in grab_active().
+    /// $POSH_GRAB_MOUSE policy; on, intercepted wheel events become arrow keys
+    /// instead of driving the scrollback scroll-view (the legacy posh#50 grab).
     grab_mouse: GrabMouse,
-    /// Byte-fed state machine that translates grabbed wheel events to arrows;
-    /// its persistent state reassembles sequences split across reads (posh#52).
+    /// Byte-fed state machine over the intercepted wheel: reports scroll ticks
+    /// (default) or translates to arrows (grab); its persistent state
+    /// reassembles sequences split across reads (posh#52).
     mouse_filter: MouseFilter,
     quit_pending: bool,
     shutdown_requested: bool,
@@ -182,6 +184,13 @@ struct ClientState {
     /// whether any overlay was live then — the idle fast-path key. github #35.
     last_render_state: (u64, u64),
     last_render_overlays: bool,
+    /// Scroll-view position (FDR 0005): rows the viewport top sits above the
+    /// live bottom. 0 = live view; > 0 freezes the live view and renders a
+    /// window of `scrollback` via `compose_scroll_frame`.
+    scroll_offset: usize,
+    /// Idle fast-path key for the scroll view: (offset, ring len, generation)
+    /// at the last scroll compose. None forces the next scroll frame to repaint.
+    last_scroll_state: Option<(usize, usize, u64)>,
     /// Optional performance instrumentation (POSH_DEBUG_LOG); inert when unset.
     stats: Stats,
 }
@@ -224,6 +233,8 @@ fn client_loop(
         exit_status: 0,
         last_render_state: (u64::MAX, u64::MAX),
         last_render_overlays: false,
+        scroll_offset: 0,
+        last_scroll_state: None,
         stats: Stats::new(),
     };
     let result = drive_client(&mut st, raw, port);
@@ -303,6 +314,7 @@ fn drive_client(st: &mut ClientState, raw: &RawMode, port: u16) -> Result<i32> {
             // repaint, and stop advertising SCROLLBACK for the resize
             // message so the server restarts appended-row counting afresh.
             st.scrollback.clear();
+            st.scroll_offset = 0; // FDR 0005: a resize returns to the live view
             st.suppress_scrollback_once = true;
             send_now = true;
         }
@@ -445,13 +457,38 @@ fn request_shutdown(st: &mut ClientState) {
     }
 }
 
-/// Whether posh is grabbing the wheel on the outer terminal right now: the
-/// $POSH_GRAB_MOUSE policy is on AND the session app has set no mouse mode of
-/// its own (so the wheel would otherwise become arrows in the outer terminal).
-/// Both the render side (what mode we assert) and the input side (whether to
-/// intercept mouse events) read this, so they can never disagree.
-fn grab_active(st: &ClientState) -> bool {
-    st.grab_mouse == GrabMouse::On && st.server_term.mouse_mode() == posh_term::MouseMode::None
+/// Whether the client intercepts the outer terminal's wheel right now: the
+/// inner app has set no mouse mode of its own AND it is on the primary screen
+/// (the only screen with scrollback). True at a bare prompt — where the wheel
+/// drives the scrollback scroll-view (FDR 0005) by default, or the legacy
+/// wheel→arrow grab transform when `POSH_GRAB_MOUSE=on` (posh#50). This is the
+/// "enable wheel reporting" predicate (render side); the input side then picks
+/// arrows-vs-scroll handling via `grab_mouse` (`POSH_GRAB_MOUSE`).
+fn wheel_active(st: &ClientState) -> bool {
+    st.server_term.mouse_mode() == posh_term::MouseMode::None && !st.server_term.is_alt_screen()
+}
+
+/// Lines moved per wheel tick (matches a typical terminal's wheel step).
+const WHEEL_STEP: usize = 3;
+
+/// Sets the scroll-view offset, clamped to the available history (the ring
+/// depth). On a real change it invalidates both render memos so the next render
+/// repaints the appropriate view (scroll or, at offset 0, live).
+fn set_scroll(st: &mut ClientState, offset: usize) {
+    let offset = offset.min(st.scrollback.len());
+    if offset != st.scroll_offset {
+        st.scroll_offset = offset;
+        st.last_render_state = (u64::MAX, u64::MAX);
+        st.last_scroll_state = None;
+    }
+}
+
+/// Applies wheel ticks to the scroll offset: + = up (scroll back into history),
+/// - = down (toward live). Reaching 0 returns to the live view (FDR 0005).
+fn scroll_by(st: &mut ClientState, ticks: i32) {
+    let delta = ticks * WHEEL_STEP as i32;
+    let new = (st.scroll_offset as i64 + i64::from(delta)).max(0) as usize;
+    set_scroll(st, new);
 }
 
 /// Cap on a buffered candidate SGR mouse sequence. A real one is at most
@@ -498,25 +535,40 @@ enum MouseState {
     Body,       // saw ESC [ < ; collecting Cb;Cx;Cy until M/m
 }
 
+/// What a `MouseFilter::feed` batch yields: the non-mouse bytes to forward, and
+/// the net wheel ticks recognized (+ = up/scroll-back, - = down). In scroll
+/// mode wheel events populate `wheel` and produce no bytes; in arrows mode
+/// (legacy `POSH_GRAB_MOUSE`) they are translated into arrow keys in `bytes`.
+#[derive(Default)]
+struct FilterOut {
+    bytes: Vec<u8>,
+    wheel: i32,
+}
+
 impl MouseFilter {
-    /// Feed one input batch; returns the rewritten bytes to forward. Any
+    /// Feed one input batch; returns the bytes to forward plus any net wheel
+    /// ticks. `scroll` selects the wheel handling: true → report ticks for the
+    /// scrollback view; false → translate to arrow keys (legacy grab). Any
     /// incomplete trailing sequence stays in `self` for the next call.
-    fn feed(&mut self, buf: &[u8], app_cursor_keys: bool) -> Vec<u8> {
-        let mut out = Vec::with_capacity(buf.len() + self.pending.len());
+    fn feed(&mut self, buf: &[u8], app_cursor_keys: bool, scroll: bool) -> FilterOut {
+        let mut out = FilterOut {
+            bytes: Vec::with_capacity(buf.len() + self.pending.len()),
+            wheel: 0,
+        };
         for &b in buf {
-            self.step(b, app_cursor_keys, &mut out);
+            self.step(b, app_cursor_keys, scroll, &mut out);
         }
         out
     }
 
-    fn step(&mut self, b: u8, app_cursor_keys: bool, out: &mut Vec<u8>) {
+    fn step(&mut self, b: u8, app_cursor_keys: bool, scroll: bool, out: &mut FilterOut) {
         match self.state {
             MouseState::Ground => {
                 if b == 0x1b {
                     self.pending.push(b);
                     self.state = MouseState::Esc;
                 } else {
-                    out.push(b);
+                    out.bytes.push(b);
                 }
             }
             MouseState::Esc => {
@@ -527,7 +579,7 @@ impl MouseFilter {
                     // Not ESC [ — a real Esc or some other ESC sequence.
                     // Flush ESC and reprocess this byte from Ground.
                     self.flush(out);
-                    self.step(b, app_cursor_keys, out);
+                    self.step(b, app_cursor_keys, scroll, out);
                 }
             }
             MouseState::Bracket => {
@@ -537,7 +589,7 @@ impl MouseFilter {
                 } else {
                     // ESC [ <other> — a real CSI (arrow, etc.), not mouse.
                     self.flush(out);
-                    self.step(b, app_cursor_keys, out);
+                    self.step(b, app_cursor_keys, scroll, out);
                 }
             }
             MouseState::Body => {
@@ -548,8 +600,12 @@ impl MouseFilter {
                         std::str::from_utf8(s).ok().and_then(|s| s.parse::<u32>().ok())
                     });
                     match cb {
-                        Some(64) => out.extend_from_slice(arrow_up(app_cursor_keys)),
-                        Some(65) => out.extend_from_slice(arrow_down(app_cursor_keys)),
+                        // Wheel up/down: report a scroll tick (scroll mode) or
+                        // translate to an arrow key (legacy grab mode).
+                        Some(64) if scroll => out.wheel += 1,
+                        Some(65) if scroll => out.wheel -= 1,
+                        Some(64) => out.bytes.extend_from_slice(arrow_up(app_cursor_keys)),
+                        Some(65) => out.bytes.extend_from_slice(arrow_down(app_cursor_keys)),
                         // click / motion / other button → dropped; a malformed
                         // ESC[<M with no button code (cb == None) drops too,
                         // which is correct: the grabbed app requested no mouse
@@ -567,7 +623,7 @@ impl MouseFilter {
                 } else {
                     // Unexpected byte in the body: not a valid mouse sequence.
                     self.flush(out);
-                    self.step(b, app_cursor_keys, out);
+                    self.step(b, app_cursor_keys, scroll, out);
                 }
             }
         }
@@ -575,8 +631,8 @@ impl MouseFilter {
 
     /// Emit the buffered candidate verbatim and reset to Ground (the bytes
     /// weren't a mouse sequence after all).
-    fn flush(&mut self, out: &mut Vec<u8>) {
-        out.extend_from_slice(&self.pending);
+    fn flush(&mut self, out: &mut FilterOut) {
+        out.bytes.extend_from_slice(&self.pending);
         self.pending.clear();
         self.state = MouseState::Ground;
     }
@@ -614,21 +670,28 @@ fn arrow_down(app_cursor_keys: bool) -> &'static [u8] {
 /// anything needs sending.
 fn process_user_input(st: &mut ClientState, buf: &[u8], raw: &RawMode) -> bool {
     let now = now_ms();
+    let mut dirty = false;
 
-    // When grabbing the wheel, run input through the mouse filter (translating
-    // wheel events to arrows, dropping other mouse events) before the byte
-    // loop, so the rest of the path is unchanged. The filter's persistent
-    // state reassembles sequences split across reads (posh#52).
+    // When we are intercepting the wheel (bare prompt, primary screen), run
+    // input through the mouse filter before the byte loop. The wheel drives the
+    // scrollback scroll-view by default, or the legacy wheel→arrow grab when
+    // POSH_GRAB_MOUSE=on; other mouse events are dropped. The filter's
+    // persistent state reassembles sequences split across reads (posh#52).
     let grabbed;
-    let buf: &[u8] = if grab_active(st) {
+    let buf: &[u8] = if wheel_active(st) {
         let app_cursor_keys = st.server_term.app_cursor_keys();
-        grabbed = st.mouse_filter.feed(buf, app_cursor_keys);
+        let scroll_mode = st.grab_mouse != GrabMouse::On;
+        let out = st.mouse_filter.feed(buf, app_cursor_keys, scroll_mode);
+        if out.wheel != 0 {
+            scroll_by(st, out.wheel); // local view change; no network send
+        }
+        grabbed = out.bytes;
         &grabbed
     } else {
-        // Not grabbing. If the filter holds a partial from when grab was last
-        // active (the app enabled its own mouse mode mid-sequence, flipping
-        // grab off between reads), hand those bytes back and prepend them so
-        // the app — which now wants mouse events — receives the complete
+        // Not intercepting. If the filter holds a partial from when interception
+        // was last active (the app enabled its own mouse mode mid-sequence,
+        // flipping it off between reads), hand those bytes back and prepend them
+        // so the app — which now wants mouse events — receives the complete
         // sequence, rather than us dropping the prefix and leaking the tail.
         let pending = st.mouse_filter.take_pending();
         if pending.is_empty() {
@@ -641,13 +704,18 @@ fn process_user_input(st: &mut ClientState, buf: &[u8], raw: &RawMode) -> bool {
         }
     };
 
+    // Any keystroke while scrolled returns to the live view (FDR 0005), then is
+    // forwarded normally below — you are about to type at the prompt.
+    if !buf.is_empty() && st.scroll_offset > 0 {
+        set_scroll(st, 0);
+    }
+
     // Don't predict for bulk pastes.
     let paste = buf.len() > 100;
     if paste {
         st.predict.reset();
     }
 
-    let mut dirty = false;
     let push = |st: &mut ClientState, byte: u8| {
         if !paste {
             st.predict.set_local_frame_sent(st.outbox.end_offset());
@@ -757,7 +825,13 @@ fn apply_frame(st: &mut ClientState, frame: &ServerFrame) -> bool {
         if *base != st.applied_num {
             return true; // growth against a state we are not at; re-ack
         }
+        let grew = rows.len();
         st.scrollback.append(rows);
+        if st.scroll_offset > 0 {
+            // Keep the frozen viewport anchored on the same content as new rows
+            // arrive (FDR 0005: output accumulates but does not yank to bottom).
+            set_scroll(st, st.scroll_offset + grew);
+        }
         st.applied_num = frame.frame_num;
         return true;
     }
@@ -805,7 +879,11 @@ fn apply_frame(st: &mut ClientState, frame: &ServerFrame) -> bool {
 /// mosh's output_new_frame: server state + prediction overlay + status
 /// banner, diffed against what the tty currently shows.
 fn render(st: &mut ClientState, now: u64) {
-    let bytes = compose_frame(st, now);
+    let bytes = if st.scroll_offset > 0 {
+        compose_scroll_frame(st)
+    } else {
+        compose_frame(st, now)
+    };
     if bytes.is_empty() {
         st.stats.record_render_skip();
     } else {
@@ -847,13 +925,64 @@ fn compose_frame(st: &mut ClientState, now: u64) -> Vec<u8> {
     st.notify.adjust(now);
     st.notify.apply(&mut next, now);
 
-    let grab = grab_active(st);
-    let bytes = display::new_frame(st.initialized, &st.last_drawn, &next, grab);
+    let wheel = wheel_active(st);
+    let bytes = display::new_frame(st.initialized, &st.last_drawn, &next, wheel);
     st.initialized = true;
     st.last_drawn = next;
     if let Some(t) = compose_timer {
         st.stats.record_compose_us(t.elapsed().as_micros() as u64);
     }
+    bytes
+}
+
+/// Builds the scroll-view escape stream (FDR 0005): a window of the accumulated
+/// scrollback ring plus the current visible grid, rendered frozen at
+/// `scroll_offset`, with a top status-bar indicator. Returns empty when the
+/// view already matches (the offset, ring length, and server generation are
+/// unchanged). The live view is bypassed while scrolled; a window resize or a
+/// keystroke returns `scroll_offset` to 0 and resumes the live path.
+fn compose_scroll_frame(st: &mut ClientState) -> Vec<u8> {
+    let memo = (st.scroll_offset, st.scrollback.len(), st.server_term.generation());
+    if st.initialized && st.last_scroll_state == Some(memo) {
+        return Vec::new();
+    }
+    st.last_scroll_state = Some(memo);
+
+    let rows = st.rows as usize;
+    let sb_len = st.scrollback.len();
+    // Visible grid rows serialized in the same per-row byte format as the ring,
+    // so the whole logical history is one uniform sequence (FDR 0005).
+    let visible = st.server_term.dump_visible_rows();
+    let total = sb_len + visible.len();
+    let offset = st.scroll_offset.min(sb_len);
+    // Viewport: the `rows` logical rows ending `offset` above the live bottom.
+    let top = total.saturating_sub(rows).saturating_sub(offset);
+    let end = (top + rows).min(total);
+
+    // Replay the window through a scratch terminal (posh_term regenerates the
+    // wrap seams by autowrapping), then diff it like any other frame.
+    let mut term = Terminal::with_scrollback(st.rows, st.cols, 0);
+    let count = end - top;
+    for (j, i) in (top..end).enumerate() {
+        let row: &[u8] = if i < sb_len {
+            st.scrollback.row(i).unwrap_or(&[])
+        } else {
+            &visible[i - sb_len]
+        };
+        // The final row drops its trailing CRLF so it doesn't scroll the grid.
+        if j + 1 == count {
+            term.process(row.strip_suffix(b"\r\n").unwrap_or(row));
+        } else {
+            term.process(row);
+        }
+    }
+
+    let mut snap = Snapshot::from_term(&term);
+    snap.cursor_visible = false; // no live cursor in history
+    display::apply_scroll_indicator(&mut snap, offset);
+    let bytes = display::new_frame(st.initialized, &st.last_drawn, &snap, wheel_active(st));
+    st.initialized = true;
+    st.last_drawn = snap;
     bytes
 }
 
@@ -943,9 +1072,10 @@ mod tests {
         assert!(GrabMouse::parse(Some("sometimes")).is_err());
     }
 
-    /// Feed a whole batch through a fresh filter (no split across reads).
+    /// Feed a whole batch through a fresh filter in legacy arrows mode (no split
+    /// across reads), returning the forwarded bytes.
     fn filter_once(buf: &[u8], app_cursor_keys: bool) -> Vec<u8> {
-        MouseFilter::default().feed(buf, app_cursor_keys)
+        MouseFilter::default().feed(buf, app_cursor_keys, false).bytes
     }
 
     #[test]
@@ -980,8 +1110,8 @@ mod tests {
         // the byte machine's nature, matching mosh's UserInput. It is not lost:
         // the next byte completes the decision and flushes it.
         let mut f = MouseFilter::default();
-        assert_eq!(f.feed(b"\x1b", false), b"", "lone ESC held pending next byte");
-        assert_eq!(f.feed(b"a", false), b"\x1ba", "next byte flushes the held ESC");
+        assert_eq!(f.feed(b"\x1b", false, false).bytes, b"", "lone ESC held pending next byte");
+        assert_eq!(f.feed(b"a", false, false).bytes, b"\x1ba", "next byte flushes the held ESC");
     }
 
     #[test]
@@ -992,8 +1122,8 @@ mod tests {
         for split in 1..b"\x1b[<64;10;5M".len() {
             let seq = b"\x1b[<64;10;5M";
             let mut f = MouseFilter::default();
-            let mut out = f.feed(&seq[..split], false);
-            out.extend(f.feed(&seq[split..], false));
+            let mut out = f.feed(&seq[..split], false, false).bytes;
+            out.extend(f.feed(&seq[split..], false, false).bytes);
             assert_eq!(out, b"\x1b[A", "split at {split} must reassemble to one arrow");
         }
     }
@@ -1004,7 +1134,7 @@ mod tests {
         // mouse) while a wheel sequence is half-read, the held prefix must be
         // handed back, not dropped — so the app receives the complete event.
         let mut f = MouseFilter::default();
-        assert_eq!(f.feed(b"\x1b[<64", false), b"", "front half held while grabbed");
+        assert_eq!(f.feed(b"\x1b[<64", false, false).bytes, b"", "front half held while grabbed");
         // Grab flips off; the caller drains the partial and prepends the tail.
         let pending = f.take_pending();
         assert_eq!(pending, b"\x1b[<64", "held prefix returned, not lost");
@@ -1012,7 +1142,7 @@ mod tests {
         delivered.extend_from_slice(b";1;1M");
         assert_eq!(delivered, b"\x1b[<64;1;1M", "app gets the whole sequence");
         // And the filter is back at Ground for whatever comes next.
-        assert_eq!(f.feed(b"x", false), b"x");
+        assert_eq!(f.feed(b"x", false, false).bytes, b"x");
     }
 
     #[test]
@@ -1027,16 +1157,16 @@ mod tests {
     }
 
     #[test]
-    fn grab_active_requires_policy_on_and_app_without_mouse() {
+    fn wheel_active_requires_primary_screen_without_app_mouse_mode() {
         let mut st = test_state(5, 20);
-        // Default policy is Off → never grabbing.
-        assert!(!grab_active(&st));
-        st.grab_mouse = GrabMouse::On;
-        // Policy on, app has no mouse mode → grabbing.
-        assert!(grab_active(&st));
+        // Bare prompt, primary screen, no app mouse mode → wheel intercepted.
+        assert!(wheel_active(&st));
         // App enables mouse tracking → posh steps back, passes events through.
         st.server_term.process(b"\x1b[?1000h");
-        assert!(!grab_active(&st));
+        assert!(!wheel_active(&st));
+        // No app mouse mode again, but on the alt screen → no scrollback there.
+        st.server_term.process(b"\x1b[?1000l\x1b[?1049h");
+        assert!(!wheel_active(&st));
     }
 
     #[test]
@@ -1079,6 +1209,8 @@ mod tests {
             exit_status: 0,
             last_render_state: (u64::MAX, u64::MAX),
             last_render_overlays: false,
+            scroll_offset: 0,
+            last_scroll_state: None,
             stats: Stats::new(),
         }
     }
@@ -1260,6 +1392,104 @@ mod tests {
         assert!(apply_frame(&mut st, &full));
         assert_eq!(st.scrollback.len(), 1, "Full must not clear the ring");
         assert_eq!(st.scrollback.row(0), Some(&b"kept\r\n"[..]));
+    }
+
+    // --- scrollback scroll-view (FDR 0005) -----------------------------------
+
+    #[test]
+    fn scroll_mode_reports_wheel_ticks_not_arrows() {
+        // scroll=true: wheel up/down become ticks (+/-), not arrow keys.
+        let up = MouseFilter::default().feed(b"\x1b[<64;1;1M", false, true);
+        assert_eq!(up.wheel, 1);
+        assert!(up.bytes.is_empty(), "scroll mode emits no arrow bytes");
+        let down = MouseFilter::default().feed(b"\x1b[<65;1;1M", false, true);
+        assert_eq!(down.wheel, -1);
+        // A click is dropped (wheel 0); surrounding keystrokes pass through.
+        let mixed = MouseFilter::default().feed(b"a\x1b[<0;3;4Mb", false, true);
+        assert_eq!(mixed.wheel, 0);
+        assert_eq!(mixed.bytes, b"ab");
+    }
+
+    #[test]
+    fn scroll_offset_clamps_to_ring_and_returns_to_live_at_bottom() {
+        let mut st = test_state(5, 20);
+        for _ in 0..2 {
+            st.scrollback.append(&[b"x\r\n".to_vec()]); // ring depth 2
+        }
+        scroll_by(&mut st, 1); // +WHEEL_STEP lines, clamped to the ring depth
+        assert_eq!(st.scroll_offset, 2);
+        scroll_by(&mut st, -1); // back down past the bottom → live view
+        assert_eq!(st.scroll_offset, 0);
+    }
+
+    #[test]
+    fn append_while_scrolled_bumps_offset_to_freeze_viewport() {
+        let mut st = test_state(3, 20);
+        for i in 0..5 {
+            st.scrollback.append(&[format!("r{i}\r\n").into_bytes()]);
+        }
+        st.applied_num = 1;
+        set_scroll(&mut st, 5); // scrolled to the top of history
+        // Two more rows scroll off while we are scrolled up.
+        let sb = ServerFrame {
+            flags: 0,
+            caps: vec![],
+            frame_num: 2,
+            input_ack: 0,
+            echo_ack: 0,
+            body: FrameBody::Scrollback {
+                base: 1,
+                rows: vec![b"r5\r\n".to_vec(), b"r6\r\n".to_vec()],
+            },
+        };
+        assert!(apply_frame(&mut st, &sb));
+        assert_eq!(st.scrollback.len(), 7);
+        assert_eq!(
+            st.scroll_offset, 7,
+            "offset bumped by the appended rows so the viewport stays anchored"
+        );
+    }
+
+    #[test]
+    fn scroll_frame_renders_history_window_with_indicator() {
+        let mut st = test_state(5, 20);
+        for s in ["line0", "line1", "line2", "line3"] {
+            st.scrollback.append(&[format!("{s}\r\n").into_bytes()]);
+        }
+        set_scroll(&mut st, 4); // scroll to the top of history
+        let bytes = compose_scroll_frame(&mut st);
+        assert!(!bytes.is_empty(), "scroll frame must render");
+
+        // Replay onto a fresh terminal of the same size and read it back.
+        let mut v = Terminal::with_scrollback(5, 20, 0);
+        v.process(&bytes);
+        let snap = Snapshot::from_term(&v);
+        let row = |r: u16| -> String {
+            (0..20)
+                .filter_map(|c| snap.cell(r, c))
+                .map(|cell| if cell.ch == '\0' { ' ' } else { cell.ch })
+                .collect::<String>()
+                .trim_end()
+                .to_string()
+        };
+        assert!(row(0).contains("SCROLLBACK"), "indicator on the top row: {:?}", row(0));
+        assert!(row(1).contains("line1"), "history rendered below the bar: {:?}", row(1));
+    }
+
+    #[test]
+    fn scroll_frame_is_memoized_until_state_changes() {
+        let mut st = test_state(5, 20);
+        for _ in 0..4 {
+            st.scrollback.append(&[b"h\r\n".to_vec()]);
+        }
+        set_scroll(&mut st, 3);
+        assert!(!compose_scroll_frame(&mut st).is_empty(), "first scroll frame paints");
+        assert!(
+            compose_scroll_frame(&mut st).is_empty(),
+            "unchanged scroll state re-renders nothing"
+        );
+        set_scroll(&mut st, 2); // offset changed → repaint
+        assert!(!compose_scroll_frame(&mut st).is_empty());
     }
 
     #[test]

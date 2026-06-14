@@ -279,13 +279,14 @@ fn cell_width(cell: &Cell) -> u16 {
 /// unknown: the screen is cleared and fully repainted (first frame, resize,
 /// Ctrl-L). The stream always leaves the pen at SGR default.
 ///
-/// `grab` requests the wheel-grab workaround (posh#50): when the session app
-/// has no mouse mode (`f.mouse_mode == 0`) but `grab` is set, the outer
-/// terminal is put into mouse reporting (`?1000h?1006h`) so the wheel arrives
-/// as SGR events the client translates to arrows, instead of the outer
+/// `wheel` requests outer-terminal wheel reporting: when the session app has
+/// no mouse mode (`f.mouse_mode == 0`) but `wheel` is set, the outer terminal
+/// is put into mouse reporting (`?1000h?1006h`) so the wheel arrives as SGR
+/// events the client consumes — for the scrollback scroll-view (FDR 0005) or
+/// the legacy wheel→arrow grab transform (posh#50) — instead of the outer
 /// terminal turning the wheel into arrows itself (which kitty does
 /// unconditionally on the alt screen). Off, the mode-sync is unchanged.
-pub fn new_frame(initialized: bool, last: &Snapshot, f: &Snapshot, grab: bool) -> Vec<u8> {
+pub fn new_frame(initialized: bool, last: &Snapshot, f: &Snapshot, wheel: bool) -> Vec<u8> {
     let mut init = initialized;
     let mut frame = FrameState {
         out: String::new(),
@@ -485,17 +486,17 @@ pub fn new_frame(initialized: bool, last: &Snapshot, f: &Snapshot, grab: bool) -
         frame.append(if f.app_keypad { "\x1b=" } else { "\x1b>" });
     }
 
-    // Mouse reporting mode. When the app sets no mode but we're grabbing the
-    // wheel (posh#50), put the outer terminal into SGR mouse reporting instead
-    // of mouse-off, so wheel ticks come back as events the client can turn
-    // into arrows rather than the terminal doing its own wheel→arrow.
-    // grab is constant within a frame, so a grab-state change is always also a
-    // mouse_mode change (None<->Some) — the existing condition already catches
-    // it; no separate last_grab term is needed.
-    let want_grab = f.mouse_mode == 0 && grab;
+    // Mouse reporting mode. When the app sets no mode but we want the wheel
+    // (scrollback scroll-view FDR 0005, or the legacy posh#50 grab transform),
+    // put the outer terminal into SGR mouse reporting instead of mouse-off, so
+    // wheel ticks come back as events the client consumes rather than the
+    // terminal doing its own wheel→arrow. `wheel` is constant within a frame, so
+    // a change is always also a mouse_mode change (None<->Some) — the existing
+    // condition already catches it; no separate last-state term is needed.
+    let want_wheel = f.mouse_mode == 0 && wheel;
     if !init || f.mouse_mode != last.mouse_mode {
         if f.mouse_mode == 0 {
-            if want_grab {
+            if want_wheel {
                 // Clear any higher tracking mode the app left set (1003/1002/9
                 // are independent DECSET registers in real terminals, not the
                 // single field posh-term models), THEN assert the grab's own
@@ -544,7 +545,7 @@ pub fn new_frame(initialized: bool, last: &Snapshot, f: &Snapshot, grab: bool) -
             // resetting even the "unused" 1005/1016 knocks the register
             // back to X10 and the grabbed wheel arrives X10-encoded,
             // bypassing the client's SGR translation entirely.
-            if !want_grab {
+            if !want_wheel {
                 frame.append("\x1b[?1016l\x1b[?1006l\x1b[?1005l");
             }
         } else {
@@ -775,25 +776,6 @@ impl NotificationEngine {
         if self.message.is_empty() && !time_expired {
             return;
         }
-
-        // Hide the cursor if it sits under the bar.
-        if fb.cursor_row == 0 {
-            fb.cursor_visible = false;
-        }
-
-        let bar_style = Style {
-            inverse: true,
-            bold: true,
-            ..Style::default()
-        };
-        for cell in fb.cells[0].iter_mut() {
-            *cell = Cell {
-                style: bar_style,
-                ..blank_cell()
-            };
-        }
-        fb.wrapped[0] = false;
-
         let since_heard = now.saturating_sub(self.last_word_from_server) / 1000;
         let keystroke = " [To quit: Ctrl-^ .]";
         let text = if self.message.is_empty() {
@@ -812,33 +794,67 @@ impl NotificationEngine {
                 keystroke
             )
         };
+        draw_top_bar(fb, &text);
+    }
+}
 
-        let mut col: u16 = 0;
-        for ch in text.chars() {
-            let w = wcwidth(ch);
-            if w == 0 {
-                continue;
-            }
-            if u16::from(col) + u16::from(w) > fb.cols {
-                break;
-            }
-            fb.cells[0][col as usize] = Cell {
-                ch,
+/// Draws `text` as a bold reverse-video status bar across the top row of `fb`,
+/// hiding the cursor when it sits on that row. Shared by the connection banner
+/// ([`NotificationEngine::apply`]) and the scrollback indicator
+/// ([`apply_scroll_indicator`]).
+fn draw_top_bar(fb: &mut Snapshot, text: &str) {
+    if fb.cursor_row == 0 {
+        fb.cursor_visible = false;
+    }
+    let bar_style = Style {
+        inverse: true,
+        bold: true,
+        ..Style::default()
+    };
+    for cell in fb.cells[0].iter_mut() {
+        *cell = Cell {
+            style: bar_style,
+            ..blank_cell()
+        };
+    }
+    fb.wrapped[0] = false;
+
+    let mut col: u16 = 0;
+    for ch in text.chars() {
+        let w = wcwidth(ch);
+        if w == 0 {
+            continue;
+        }
+        if col + u16::from(w) > fb.cols {
+            break;
+        }
+        fb.cells[0][col as usize] = Cell {
+            ch,
+            style: bar_style,
+            width: w,
+            ..Cell::default()
+        };
+        if w == 2 {
+            fb.cells[0][col as usize + 1] = Cell {
+                ch: '\0',
                 style: bar_style,
-                width: w,
+                width: 0,
                 ..Cell::default()
             };
-            if w == 2 {
-                fb.cells[0][col as usize + 1] = Cell {
-                    ch: '\0',
-                    style: bar_style,
-                    width: 0,
-                    ..Cell::default()
-                };
-            }
-            col += u16::from(w);
         }
+        col += u16::from(w);
     }
+}
+
+/// Draws the scrollback scroll-view position indicator (FDR 0005) as a bold
+/// reverse-video bar across the top row: how far up the viewport sits and how
+/// to return to the live view. `lines_up` is the row distance above the live
+/// bottom.
+pub fn apply_scroll_indicator(fb: &mut Snapshot, lines_up: usize) {
+    let plural = if lines_up == 1 { "" } else { "s" };
+    let text =
+        format!("-- SCROLLBACK · {lines_up} line{plural} up · scroll down or press a key to resume --");
+    draw_top_bar(fb, &text);
 }
 
 #[cfg(test)]

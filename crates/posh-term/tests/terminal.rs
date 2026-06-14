@@ -955,6 +955,29 @@ fn assert_state_equal(a: &Terminal, b: &Terminal) {
 }
 
 #[test]
+fn dump_visible_rows_round_trips_each_row() {
+    // Per-row serialization (FDR 0005 scroll-view): replaying the rows onto a
+    // fresh same-size terminal reproduces the visible grid.
+    let mut t = term();
+    feed(&mut t, "abc\r\ndef\r\nghi");
+    let rows = t.dump_visible_rows();
+    assert_eq!(rows.len(), 5, "one entry per visible grid row");
+
+    let mut v = term();
+    for (i, row) in rows.iter().enumerate() {
+        // Strip the final row's CRLF so it does not scroll the grid.
+        if i + 1 == rows.len() {
+            v.process(row.strip_suffix(b"\r\n").unwrap_or(row));
+        } else {
+            v.process(row);
+        }
+    }
+    for r in 0..5 {
+        assert_eq!(row_text(&v, r), row_text(&t, r), "row {r}");
+    }
+}
+
+#[test]
 fn dump_vt_roundtrip_simple() {
     let mut t = term();
     feed(&mut t, "hello\r\nworld\x1b[2;3H");
