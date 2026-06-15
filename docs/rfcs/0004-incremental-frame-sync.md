@@ -274,4 +274,5 @@ transport reconnect — with no observed display corruption.
 
 ### Informative
 
+- [#81] Tracking issue: incremental frame sync (MorphDelta shipped, CellDelta next) — `amarbel-llc/posh#81`.
 - mosh `Complete::diff_from` / `Display::new_frame` (`zz-mosh/src/statesync/completeterminal.cc`, `zz-mosh/src/frontend/terminaldisplay.cc`) — the incremental-sync architecture this codec adopts.
