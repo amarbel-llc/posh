@@ -311,6 +311,12 @@ Controls local echo as described above.  The command-line flag
 overrides this variable.
 
 .TP
+.B MOSH_PREDICTION_LOG
+If set to a writable file path, the client logs an event-level trace of its
+predictive-local-echo decisions to that file. Diagnostic only; see
+.BR mosh-client (1).
+
+.TP
 .B MOSH_TITLE_NOPREFIX
 When set, inhibits prepending "[mosh]" to window title.
 

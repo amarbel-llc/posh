@@ -36,6 +36,7 @@
 #include <list>
 #include <typeinfo>
 
+#include "src/frontend/predictionlog.h"
 #include "src/frontend/terminaloverlay.h"
 
 using namespace Overlay;
@@ -366,6 +367,11 @@ void PredictionEngine::apply( Framebuffer& fb ) const
 
 void PredictionEngine::kill_epoch( uint64_t epoch, const Framebuffer& fb )
 {
+  prediction_log( "kill-epoch epoch=%lu pred_epoch=%lu confirmed=%lu",
+                  (unsigned long)epoch,
+                  (unsigned long)prediction_epoch,
+                  (unsigned long)confirmed_epoch );
+
   for ( cursors_type::iterator it = cursors.begin(); it != cursors.end(); ) {
     cursors_type::iterator it_next = it;
     it_next++;
@@ -392,11 +398,11 @@ void PredictionEngine::kill_epoch( uint64_t epoch, const Framebuffer& fb )
 
 void PredictionEngine::reset( void )
 {
+  prediction_log(
+    "reset pred_epoch=%lu confirmed=%lu", (unsigned long)prediction_epoch, (unsigned long)confirmed_epoch );
   cursors.clear();
   overlays.clear();
   become_tentative();
-
-  //  fprintf( stderr, "RESETTING\n" );
 }
 
 void PredictionEngine::init_cursor( const Framebuffer& fb )
@@ -431,14 +437,19 @@ void PredictionEngine::cull( const Framebuffer& fb )
   uint64_t now = timestamp();
 
   /* control srtt_trigger with hysteresis */
+  bool prev_srtt_trigger = srtt_trigger;
   if ( send_interval > SRTT_TRIGGER_HIGH ) {
     srtt_trigger = true;
   } else if ( srtt_trigger && ( send_interval <= SRTT_TRIGGER_LOW ) /* 20 ms is current minimum value */
               && ( !active() ) ) { /* only turn off when no predictions being shown */
     srtt_trigger = false;
   }
+  if ( srtt_trigger != prev_srtt_trigger ) {
+    prediction_log( "srtt-trigger %s send_interval=%u", srtt_trigger ? "on" : "off", send_interval );
+  }
 
   /* control underlining with hysteresis */
+  bool prev_flagging = flagging;
   if ( send_interval > FLAG_TRIGGER_HIGH ) {
     flagging = true;
   } else if ( send_interval <= FLAG_TRIGGER_LOW ) {
@@ -448,6 +459,10 @@ void PredictionEngine::cull( const Framebuffer& fb )
   /* really big glitches also activate underlining */
   if ( glitch_trigger > GLITCH_REPAIR_COUNT ) {
     flagging = true;
+  }
+  if ( flagging != prev_flagging ) {
+    prediction_log(
+      "flagging %s send_interval=%u glitch_trigger=%u", flagging ? "on" : "off", send_interval, glitch_trigger );
   }
 
   /* go through cell predictions */
@@ -467,13 +482,15 @@ void PredictionEngine::cull( const Framebuffer& fb )
         case IncorrectOrExpired:
           if ( j->tentative( confirmed_epoch ) ) {
 
-            /*
-            fprintf( stderr, "Bad tentative prediction in row %d, col %d (think %lc, actually %lc)\n",
-                     i->row_num, j->col,
-                     j->replacement.debug_contents(),
-                     fb.get_cell( i->row_num, j->col )->debug_contents()
-                     );
-            */
+            if ( prediction_log_enabled() ) {
+              prediction_log( "mispredict-tentative row=%d col=%d think='%s' actual='%s' tue=%lu confirmed=%lu",
+                              i->row_num,
+                              j->col,
+                              j->replacement.debug_contents().c_str(),
+                              fb.get_cell( i->row_num, j->col )->debug_contents().c_str(),
+                              (unsigned long)j->tentative_until_epoch,
+                              (unsigned long)confirmed_epoch );
+            }
 
             if ( display_preference == Experimental ) {
               j->reset();
@@ -486,18 +503,15 @@ void PredictionEngine::cull( const Framebuffer& fb )
             }
             */
           } else {
-            /*
-            fprintf( stderr, "[%d=>%d] Killing prediction in row %d, col %d (think %lc, actually %lc)\n",
-                     (int)local_frame_acked, (int)j->expiration_frame,
-                     i->row_num, j->col,
-                     j->replacement.debug_contents(),
-                     fb.get_cell( i->row_num, j->col )->debug_contents() );
-            */
-            /*
-            if ( j->display_time != uint64_t(-1) ) {
-              fprintf( stderr, "TIMING %ld - %ld\n", time(NULL), now - j->display_time );
+            if ( prediction_log_enabled() ) {
+              prediction_log( "kill-all row=%d col=%d think='%s' actual='%s' acked=%lu exp=%lu",
+                              i->row_num,
+                              j->col,
+                              j->replacement.debug_contents().c_str(),
+                              fb.get_cell( i->row_num, j->col )->debug_contents().c_str(),
+                              (unsigned long)local_frame_acked,
+                              (unsigned long)j->expiration_frame );
             }
-            */
 
             if ( display_preference == Experimental ) {
               j->reset();
@@ -517,11 +531,14 @@ void PredictionEngine::cull( const Framebuffer& fb )
           if ( j->tentative_until_epoch > confirmed_epoch ) {
             confirmed_epoch = j->tentative_until_epoch;
 
-            /*
-            fprintf( stderr, "%lc in (%d,%d) confirms epoch %lu (predicting in epoch %lu)\n",
-                     j->replacement.debug_contents(), i->row_num, j->col,
-                     confirmed_epoch, prediction_epoch );
-            */
+            if ( prediction_log_enabled() ) {
+              prediction_log( "confirm-epoch ch='%s' row=%d col=%d confirmed=%lu pred_epoch=%lu",
+                              j->replacement.debug_contents().c_str(),
+                              i->row_num,
+                              j->col,
+                              (unsigned long)confirmed_epoch,
+                              (unsigned long)prediction_epoch );
+            }
           }
 
           /* When predictions come in quickly, slowly take away the glitch trigger. */
@@ -529,6 +546,7 @@ void PredictionEngine::cull( const Framebuffer& fb )
                && ( glitch_trigger > 0 && now - GLITCH_REPAIR_MININTERVAL >= last_quick_confirmation ) ) {
             glitch_trigger--;
             last_quick_confirmation = now;
+            prediction_log( "glitch-repair glitch_trigger=%u", glitch_trigger );
           }
 
           /* match rest of row to the actual renditions */
@@ -544,17 +562,23 @@ void PredictionEngine::cull( const Framebuffer& fb )
           j->reset();
 
           break;
-        case Pending:
+        case Pending: {
           /* When a prediction takes a long time to be confirmed, we
              activate the predictions even if SRTT is low */
+          unsigned int prev_glitch_trigger = glitch_trigger;
           if ( ( now - j->prediction_time ) >= GLITCH_FLAG_THRESHOLD ) {
             glitch_trigger = GLITCH_REPAIR_COUNT * 2; /* display and underline */
           } else if ( ( ( now - j->prediction_time ) >= GLITCH_THRESHOLD )
                       && ( glitch_trigger < GLITCH_REPAIR_COUNT ) ) {
             glitch_trigger = GLITCH_REPAIR_COUNT; /* just display */
           }
+          if ( glitch_trigger != prev_glitch_trigger ) {
+            prediction_log(
+              "glitch-trigger set=%u pending_ms=%lu", glitch_trigger, (unsigned long)( now - j->prediction_time ) );
+          }
 
           break;
+        }
         default:
           break;
       }
@@ -566,15 +590,12 @@ void PredictionEngine::cull( const Framebuffer& fb )
   /* go through cursor predictions */
   if ( !cursors.empty()
        && cursor().get_validity( fb, local_frame_acked, local_frame_late_acked ) == IncorrectOrExpired ) {
-    /*
-      fprintf( stderr, "Sadly, we're predicting (%d,%d) vs. (%d,%d) [tau: %ld, expiration_time=%ld, now=%ld]\n",
-      cursor().row, cursor().col,
-      fb.ds.get_cursor_row(),
-      fb.ds.get_cursor_col(),
-      cursor().tentative_until_epoch,
-      cursor().expiration_time,
-      now );
-    */
+    prediction_log( "cursor-mispredict pred=(%d,%d) actual=(%d,%d) tue=%lu",
+                    cursor().row,
+                    cursor().col,
+                    fb.ds.get_cursor_row(),
+                    fb.ds.get_cursor_col(),
+                    (unsigned long)cursor().tentative_until_epoch );
     if ( display_preference == Experimental ) {
       cursors.clear();
     } else {
@@ -660,7 +681,7 @@ void PredictionEngine::new_user_byte( char the_byte, const Framebuffer& fb )
       /* XXX handle wide characters */
 
       if ( ch == 0x7f ) { /* backspace */
-        //	fprintf( stderr, "Backspace.\n" );
+        prediction_log( "backspace row=%d col=%d", cursor().row, cursor().col );
         ConditionalOverlayRow& the_row = get_or_make_row( cursor().row, fb.ds.get_width() );
 
         if ( cursor().col > 0 ) {
@@ -711,8 +732,8 @@ void PredictionEngine::new_user_byte( char the_byte, const Framebuffer& fb )
         }
       } else if ( ( ch < 0x20 ) || ( wcwidth( ch ) != 1 ) ) {
         /* unknown print */
+        prediction_log( "unknown-print ch=0x%x -> tentative", (unsigned int)ch );
         become_tentative();
-        //	fprintf( stderr, "Unknown print 0x%x\n", ch );
       } else {
         assert( cursor().row >= 0 );
         assert( cursor().col >= 0 );
@@ -777,12 +798,13 @@ void PredictionEngine::new_user_byte( char the_byte, const Framebuffer& fb )
         cell.replacement.append( ch );
         cell.original_contents.push_back( *fb.get_cell( cursor().row, cursor().col ) );
 
-        /*
-        fprintf( stderr, "[%d=>%d] Predicting %lc in row %d, col %d [tue: %lu]\n",
-                 (int)local_frame_acked, (int)cell.expiration_frame,
-                 ch, cursor().row, cursor().col,
-                 cell.tentative_until_epoch );
-        */
+        prediction_log( "predict ch='%lc' row=%d col=%d exp_frame=%lu pred_epoch=%lu acked=%lu",
+                        ch,
+                        cursor().row,
+                        cursor().col,
+                        (unsigned long)cell.expiration_frame,
+                        (unsigned long)prediction_epoch,
+                        (unsigned long)local_frame_acked );
 
         cursor().expire( local_frame_sent + 1, now );
 
@@ -796,14 +818,15 @@ void PredictionEngine::new_user_byte( char the_byte, const Framebuffer& fb )
       }
     } else if ( type_act == typeid( Parser::Execute ) ) {
       if ( act.char_present && ( act.ch == 0x0d ) /* CR */ ) {
+        prediction_log( "carriage-return -> tentative" );
         become_tentative();
         newline_carriage_return( fb );
       } else {
-        //	fprintf( stderr, "Execute 0x%x\n", act.ch );
+        prediction_log( "execute ch=0x%x -> tentative", act.char_present ? (unsigned int)act.ch : 0u );
         become_tentative();
       }
     } else if ( type_act == typeid( Parser::Esc_Dispatch ) ) {
-      //      fprintf( stderr, "Escape sequence\n" );
+      prediction_log( "esc-dispatch -> tentative" );
       become_tentative();
     } else if ( type_act == typeid( Parser::CSI_Dispatch ) ) {
       if ( act.char_present && ( act.ch == L'C' ) ) { /* right arrow */
@@ -811,6 +834,7 @@ void PredictionEngine::new_user_byte( char the_byte, const Framebuffer& fb )
         if ( cursor().col < fb.ds.get_width() - 1 ) {
           cursor().col++;
           cursor().expire( local_frame_sent + 1, now );
+          prediction_log( "cursor-move dir=right row=%d col=%d", cursor().row, cursor().col );
         }
       } else if ( act.char_present && ( act.ch == L'D' ) ) { /* left arrow */
         init_cursor( fb );
@@ -818,9 +842,10 @@ void PredictionEngine::new_user_byte( char the_byte, const Framebuffer& fb )
         if ( cursor().col > 0 ) {
           cursor().col--;
           cursor().expire( local_frame_sent + 1, now );
+          prediction_log( "cursor-move dir=left row=%d col=%d", cursor().row, cursor().col );
         }
       } else {
-        //	fprintf( stderr, "CSI sequence %lc\n", act.ch );
+        prediction_log( "csi-sequence ch='%lc' -> tentative", act.ch );
         become_tentative();
       }
     }
@@ -868,10 +893,8 @@ void PredictionEngine::become_tentative( void )
     prediction_epoch++;
   }
 
-  /*
-  fprintf( stderr, "Now tentative in epoch %lu (confirmed=%lu)\n",
-           prediction_epoch, confirmed_epoch );
-  */
+  prediction_log(
+    "tentative pred_epoch=%lu confirmed=%lu", (unsigned long)prediction_epoch, (unsigned long)confirmed_epoch );
 }
 
 bool PredictionEngine::active( void ) const

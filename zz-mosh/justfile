@@ -86,3 +86,26 @@ debug-mosh-remote host *ARGS: build-autotools
     mosh --client="$jd/src/frontend/mosh-client" \
          --server='~/eng/repos/posh/zz-mosh/src/frontend/mosh-server' \
          "$host" {{ ARGS }} || true
+
+# Open instrumented mosh against the remote-built server, tracing every
+# prediction decision to a local log file for study (drives the posh
+# predictive-local-echo port). MOSH_PREDICTION_DISPLAY=always forces
+# predictions to show regardless of RTT so the mechanism is observable even on
+# a fast link. The trace is client-side, so the log lands locally. Run
+# debug-build-remote first; watch the trace live from another pane with
+# `tail -f /tmp/mosh-predict.log`.
+[group("debug")]
+debug-mosh-predict host *ARGS: build-autotools
+    #!/usr/bin/env bash
+    set -euo pipefail
+    host='{{ host }}'
+    jd='{{ justfile_directory() }}'
+    log="${MOSH_PREDICTION_LOG:-/tmp/mosh-predict.log}"
+    rm -f "$log" "$log.old"
+    echo "prediction trace -> $log (tail -f it in another pane)"
+    MOSH_PREDICTION_LOG="$log" \
+    MOSH_PREDICTION_DISPLAY=always \
+      mosh --client="$jd/src/frontend/mosh-client" \
+           --server='~/eng/repos/posh/zz-mosh/src/frontend/mosh-server' \
+           "$host" {{ ARGS }} || true
+    echo "prediction trace written to $log"

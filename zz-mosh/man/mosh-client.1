@@ -78,6 +78,17 @@ Controls local echo insert/overwrite as described in
 .BR mosh (1).
 
 .TP
+.B MOSH_PREDICTION_LOG
+If set to a writable file path, the client appends an event-level trace of
+every predictive-local-echo decision to that file: each predicted character,
+epoch confirmation, mispredicted/killed prediction, and trigger transition.
+This is a diagnostic and study aid (used to reverse-engineer the prediction
+algorithm for posh); it has no effect on prediction behavior and is inert when
+unset. Lines are shaped \fI[ts] [predict]: <event ...>\fP, where \fIts\fP is
+mosh's internal monotonic millisecond clock. The file is capped at 5\ MiB and
+rotated to \fI<path>.old\fP.
+
+.TP
 .B MOSH_TITLE_NOPREFIX
 See
 .BR mosh (1).
