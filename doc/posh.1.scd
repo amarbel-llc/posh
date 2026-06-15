@@ -156,10 +156,15 @@ _POSH_KEY_
 	Remote session key, read by *posh client* (never passed on the
 	command line). See *posh-client*(1).
 
-_POSH_PREDICTION_
-	Local-echo prediction display: _always_, _never_, _adaptive_
+_POSH_PREDICTION_MODEL_
+	Local-echo prediction model: _always_, _never_, _adaptive_
 	(default), _experimental_, or _optimistic_ (FDR 0006: echo
 	immediately and correct on the next paint; ECHO/alt-screen gated).
+	_POSH_PREDICTION_ is a deprecated alias. See *posh-client*(1).
+
+_POSH_PREDICTION_RENDER_
+	How predicted cells are painted, independent of the model: _replace_
+	(default) or _dim_. See *posh-client*(1).
 
 _POSH_PREDICTION_OVERWRITE_
 	When set, predictions overwrite instead of inserting.

@@ -45,12 +45,19 @@ _POSH_KEY_
 	immediately clears the variable, so the key never appears in the
 	process's argv (which is world-readable via *ps*(1)). Required.
 
-_POSH_PREDICTION_
-	Local-echo prediction display: _always_, _never_, _adaptive_
+_POSH_PREDICTION_MODEL_
+	Local-echo prediction model: _always_, _never_, _adaptive_
 	(default), _experimental_, or _optimistic_. The first four are the
 	mosh _MOSH_PREDICTION_DISPLAY_ analog; _optimistic_ (FDR 0006) echoes
 	keystrokes immediately and lets the next paint correct them, gated on
-	the remote PTY's ECHO flag and alt-screen.
+	the remote PTY's ECHO flag and alt-screen. _POSH_PREDICTION_ is a
+	deprecated alias, honored when _POSH_PREDICTION_MODEL_ is unset.
+
+_POSH_PREDICTION_RENDER_
+	How predicted cells are painted, independent of the model: _replace_
+	(default; the model's own look — replace the glyph, underline on a
+	slow link) or _dim_ (replace the glyph and mark it faint). The render
+	style and the model are separate experimentation axes.
 
 _POSH_PREDICTION_OVERWRITE_
 	When set, predictions overwrite the character under the cursor

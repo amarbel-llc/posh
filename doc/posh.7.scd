@@ -94,8 +94,9 @@ matching mosh.
 
 Like mosh, the client echoes keystrokes speculatively and reconciles
 against authoritative server state, so typing feels local even on a
-high-latency or lossy link. _$POSH_PREDICTION_ selects the display
-policy (_adaptive_ by default); see *posh-client*(1).
+high-latency or lossy link. _$POSH_PREDICTION_MODEL_ selects the
+prediction model (_adaptive_ by default) and _$POSH_PREDICTION_RENDER_
+the independent render style; see *posh-client*(1).
 
 # MORE INFORMATION
 

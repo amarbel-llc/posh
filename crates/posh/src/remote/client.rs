@@ -13,7 +13,9 @@ use crate::remote::caps;
 use crate::remote::crypto::Key;
 use crate::remote::datagram::{Connection, Family};
 use crate::remote::display::{self, NotificationEngine, Snapshot};
-use crate::remote::predict::{DisplayPreference, PredictionEngine};
+use crate::remote::predict::{
+    self, PredictionModel, PredictionRenderer, Predictor, RenderStyle,
+};
 use crate::remote::stats::{PredictSample, Stats};
 use crate::remote::sync::{
     self, ClientMessage, FragmentAssembly, Fragmenter, FrameBody, InputOutbox, ScrollbackRing,
@@ -68,8 +70,15 @@ pub fn run(host: &str, port: u16, family: Family) -> Result<()> {
     std::env::remove_var("POSH_KEY");
     let key = Key::from_base64(key_str.trim())?;
 
-    let prediction_env = std::env::var("POSH_PREDICTION").ok();
-    let prediction = DisplayPreference::parse(prediction_env.as_deref()).map_err(Error)?;
+    // Model selection: $POSH_PREDICTION_MODEL, falling back to the deprecated
+    // $POSH_PREDICTION alias. Render style: $POSH_PREDICTION_RENDER (default
+    // replace).
+    let model_env = std::env::var("POSH_PREDICTION_MODEL")
+        .ok()
+        .or_else(|| std::env::var("POSH_PREDICTION").ok());
+    let model = PredictionModel::parse(model_env.as_deref()).map_err(Error)?;
+    let render_env = std::env::var("POSH_PREDICTION_RENDER").ok();
+    let render = RenderStyle::parse(render_env.as_deref()).map_err(Error)?;
     let predict_overwrite = std::env::var("POSH_PREDICTION_OVERWRITE")
         .map(|v| !v.is_empty())
         .unwrap_or(false);
@@ -87,7 +96,7 @@ pub fn run(host: &str, port: u16, family: Family) -> Result<()> {
     // Take over the alternate screen (mosh smcup); close() below restores
     // the user's pre-connect shell screen on the way out.
     let _ = util::write_all_retry(STDOUT, &display::open(), 1000);
-    let result = client_loop(conn, prediction, predict_overwrite, grab_mouse, &raw, addr.port());
+    let result = client_loop(conn, model, render, predict_overwrite, grab_mouse, &raw, addr.port());
     let _ = util::write_all_retry(STDOUT, &display::close(), 1000);
     drop(raw);
     eprintln!("\nposh: [client exited]");
@@ -164,7 +173,8 @@ struct ClientState {
     /// False when the outer terminal state is unknown (startup, resize,
     /// Ctrl-L): the next frame repaints from scratch.
     initialized: bool,
-    predict: PredictionEngine,
+    predict: Box<dyn Predictor>,
+    renderer: Box<dyn PredictionRenderer>,
     notify: NotificationEngine,
     /// $POSH_GRAB_MOUSE policy; on, intercepted wheel events become arrow keys
     /// instead of driving the scrollback scroll-view (the legacy posh#50 grab).
@@ -198,9 +208,11 @@ struct ClientState {
     stats: Stats,
 }
 
+#[allow(clippy::too_many_arguments)]
 fn client_loop(
     conn: Connection,
-    prediction: DisplayPreference,
+    model: PredictionModel,
+    render: RenderStyle,
     predict_overwrite: bool,
     grab_mouse: GrabMouse,
     raw: &RawMode,
@@ -210,6 +222,7 @@ fn client_loop(
 
     let (rows, cols) = pty::term_size(STDOUT);
     let now = now_ms();
+    let (predict, renderer) = predict::build(model, render, predict_overwrite);
     let mut st = ClientState {
         conn,
         fragmenter: Fragmenter::new(),
@@ -225,7 +238,8 @@ fn client_loop(
         suppress_scrollback_once: false,
         last_drawn: Snapshot::blank(rows, cols),
         initialized: false,
-        predict: PredictionEngine::new(prediction, predict_overwrite),
+        predict,
+        renderer,
         notify: NotificationEngine::new(now),
         grab_mouse,
         mouse_filter: MouseFilter::default(),
@@ -245,13 +259,14 @@ fn client_loop(
     // One final summary regardless of how the loop exited (graceful, timeout,
     // or error), so the log always ends with the last-observed transport state.
     let now = now_ms();
+    let predict_stats = st.predict.stats();
     st.stats.final_client(
         now,
         st.conn.srtt(),
         st.conn.rto(),
         st.conn.send_interval(),
-        predict_sample(&st.predict),
-        st.predict.srtt_trigger_on(),
+        predict_sample(&predict_stats),
+        predict_stats.srtt_trigger,
         st.conn.bytes_rx(),
         st.conn.bytes_tx(),
     );
@@ -404,13 +419,14 @@ fn drive_client(st: &mut ClientState, raw: &RawMode, port: u16) -> Result<i32> {
             }
         }
         render(st, now);
+        let predict_stats = st.predict.stats();
         st.stats.flush_client(
             now,
             st.conn.srtt(),
             st.conn.rto(),
             st.conn.send_interval(),
-            predict_sample(&st.predict),
-            st.predict.srtt_trigger_on(),
+            predict_sample(&predict_stats),
+            predict_stats.srtt_trigger,
             st.conn.bytes_rx(),
             st.conn.bytes_tx(),
         );
@@ -495,12 +511,12 @@ fn scroll_by(st: &mut ClientState, ticks: i32) {
     set_scroll(st, new);
 }
 
-/// Whether optimistic local echo (FDR 0006) should be active right now: the
-/// predictor is in optimistic mode, the remote PTY is echoing (server-reported
-/// FLAG_ECHO), and the primary screen is active (not a full-screen app). When
-/// false, keystrokes are not echoed locally — passwords and TUIs stay correct.
+/// Whether local echo is safe to show right now: the remote PTY is echoing
+/// (server-reported FLAG_ECHO) and the primary screen is active (not a
+/// full-screen app). The optimistic model uses this (via `set_echo_safe`) to
+/// suppress echo for passwords and TUIs; other models ignore it.
 fn optimistic_echo_on(st: &ClientState) -> bool {
-    st.predict.is_optimistic() && st.echo_on && !st.server_term.is_alt_screen()
+    st.echo_on && !st.server_term.is_alt_screen()
 }
 
 /// Cap on a buffered candidate SGR mouse sequence. A real one is at most
@@ -729,14 +745,15 @@ fn process_user_input(st: &mut ClientState, buf: &[u8], raw: &RawMode) -> bool {
     }
 
     // Optimistic echo is gated on the remote PTY echoing and the primary screen
-    // being active (FDR 0006); when gated off we feed no predictions, so nothing
-    // is echoed locally (passwords / full-screen apps). Other modes self-gate.
-    let predict_ok = !st.predict.is_optimistic() || optimistic_echo_on(st);
+    // being active (FDR 0006): tell the predictor whether echo is safe so the
+    // optimistic model suppresses (passwords / full-screen apps). Other models
+    // ignore this. The compose path re-asserts the same gate before rendering.
+    st.predict.set_echo_safe(optimistic_echo_on(st));
 
     let push = |st: &mut ClientState, byte: u8| {
-        if !paste && predict_ok {
-            st.predict.set_local_frame_sent(st.outbox.end_offset());
-            st.predict.new_user_byte(byte, &st.last_drawn, now);
+        if !paste {
+            st.predict.set_frame_sent(st.outbox.end_offset());
+            st.predict.on_user_byte(byte, &st.last_drawn, now);
         }
         st.outbox.push(&[byte]);
     };
@@ -805,9 +822,8 @@ fn process_frame(st: &mut ClientState, frame: &ServerFrame) -> bool {
     }
     st.notify.server_heard(now);
     st.outbox.ack(frame.input_ack);
-    st.predict.set_local_frame_acked(frame.input_ack);
-    st.predict.set_local_frame_late_acked(frame.echo_ack);
-    st.predict.set_send_interval(st.conn.send_interval());
+    st.predict
+        .on_server_frame(frame.input_ack, frame.echo_ack, st.conn.send_interval());
     // Remote PTY echo state for the optimistic-echo gate (FDR 0006).
     st.echo_on = frame.flags & sync::FLAG_ECHO != 0;
     if frame.flags & sync::FLAG_SHUTDOWN != 0 {
@@ -937,15 +953,14 @@ fn compose_frame(st: &mut ClientState, now: u64) -> Vec<u8> {
     // diff), excluding the idle fast-path above so the average reflects real
     // work. enabled() is read and dropped before the borrows below.
     let compose_timer = st.stats.enabled().then(Instant::now);
-    // Optimistic echo gated off (password prompt / full-screen app): drop any
-    // pending overlay so it is not shown; the authoritative paint stands.
-    if st.predict.is_optimistic() && !optimistic_echo_on(st) {
-        st.predict.reset();
-    }
+    // Optimistic echo gate (FDR 0006): when echo is unsafe (password prompt /
+    // full-screen app) the optimistic model drops its pending overlay so the
+    // authoritative paint stands; other models ignore this.
+    st.predict.set_echo_safe(optimistic_echo_on(st));
     let base = Snapshot::from_term(&st.server_term);
     st.predict.cull(&base, now);
     let mut next = base;
-    st.predict.apply(&mut next);
+    st.predict.render(&mut next, &*st.renderer);
     st.notify.adjust(now);
     st.notify.apply(&mut next, now);
 
@@ -1011,13 +1026,13 @@ fn compose_scroll_frame(st: &mut ClientState) -> Vec<u8> {
 }
 
 /// Snapshots the prediction engine's display gauges for the stats log.
-fn predict_sample(predict: &PredictionEngine) -> PredictSample {
-    let (correct, nocredit, incorrect) = predict.prediction_outcomes();
+fn predict_sample(stats: &predict::PredictorStats) -> PredictSample {
+    let (correct, nocredit, incorrect) = stats.outcomes;
     PredictSample {
-        active: predict.active(),
-        shown: predict.shown_cells(),
-        epoch_lag: predict.epoch_lag(),
-        resets: predict.mispredict_resets(),
+        active: stats.active,
+        shown: stats.shown_cells,
+        epoch_lag: stats.epoch_lag,
+        resets: stats.mispredict_resets,
         correct,
         nocredit,
         incorrect,
@@ -1194,12 +1209,14 @@ mod tests {
     }
 
     #[test]
-    fn optimistic_echo_gate_requires_echo_on_and_primary_screen() {
-        // FDR 0006: optimistic local echo only fires when the predictor is in
-        // optimistic mode AND the remote PTY is echoing AND the primary screen
-        // is active. Echo-off (password) or alt-screen (full-screen app) suppress.
+    fn echo_safe_gate_requires_echo_on_and_primary_screen() {
+        // FDR 0006: echo-safety is computed from the remote PTY echoing AND the
+        // primary screen being active. Echo-off (password) or alt-screen
+        // (full-screen app) suppress. The model decides what to do with the
+        // flag via set_echo_safe — the optimistic model drops its overlay, mosh
+        // ignores it — so this gate is now model-independent.
         let mut st = test_state(24, 80);
-        st.predict = PredictionEngine::new(DisplayPreference::Optimistic, false);
+        st.predict = predict::build(PredictionModel::Optimistic, RenderStyle::Replace, false).0;
 
         assert!(!optimistic_echo_on(&st), "default echo_on=false => off");
 
@@ -1213,11 +1230,6 @@ mod tests {
 
         st.echo_on = false;
         assert!(!optimistic_echo_on(&st), "echo off (password) suppresses");
-
-        // A non-optimistic predictor never engages this gate.
-        st.predict = PredictionEngine::new(DisplayPreference::Adaptive, false);
-        st.echo_on = true;
-        assert!(!optimistic_echo_on(&st), "only optimistic mode gates here");
     }
 
     #[test]
@@ -1249,7 +1261,8 @@ mod tests {
             suppress_scrollback_once: false,
             last_drawn: Snapshot::blank(rows, cols),
             initialized: false,
-            predict: PredictionEngine::new(DisplayPreference::Never, false),
+            predict: predict::build(PredictionModel::Never, RenderStyle::Replace, false).0,
+            renderer: predict::build(PredictionModel::Never, RenderStyle::Replace, false).1,
             notify: NotificationEngine::new(0),
             grab_mouse: GrabMouse::Off,
             mouse_filter: MouseFilter::default(),
