@@ -258,6 +258,14 @@ release new_version:
 debug-cargo *ARGS:
     nix develop --command cargo {{ ARGS }}
 
+# Perf probe (prediction perf followups #13/#15): time the per-frame client
+# apply (dump_vt reparse) and compose (Snapshot::from_term) costs at
+# representative sizes, in release. Drives the measure-first perf work so
+# optimization isn't speculative. Debug-only; the hermetic gate is build-rust.
+[group("debug")]
+debug-perf-compose:
+    nix develop --command cargo test -p posh --release perf_reparse_and_from_term -- --ignored --nocapture
+
 # Prove posh-rec replay determinism (posh-rec phase 5, #61): `posh-rec assert`
 # the committed VT100 emulation fixture against its golden N times (default 50)
 # and fail loudly on the first mismatch. Zero flakes is the headline of the

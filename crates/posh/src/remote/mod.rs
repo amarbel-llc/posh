@@ -6,6 +6,8 @@ pub mod client;
 pub mod crypto;
 pub mod datagram;
 pub mod display;
+#[cfg(test)]
+mod perf_probe;
 pub mod predict;
 pub mod server;
 pub mod sshwrap;
