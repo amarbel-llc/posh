@@ -6,6 +6,7 @@ pub mod client;
 pub mod crypto;
 pub mod datagram;
 pub mod display;
+pub mod framesync;
 #[cfg(test)]
 mod perf_probe;
 pub mod predict;

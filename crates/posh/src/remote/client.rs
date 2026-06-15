@@ -13,6 +13,7 @@ use crate::remote::caps;
 use crate::remote::crypto::Key;
 use crate::remote::datagram::{Connection, Family};
 use crate::remote::display::{self, NotificationEngine, Snapshot};
+use crate::remote::framesync::{self, ApplyOutcome, FrameApplier};
 use crate::remote::predict::{
     self, PredictionModel, PredictionRenderer, Predictor, RenderStyle,
 };
@@ -204,6 +205,14 @@ struct ClientState {
     /// Latest server-reported remote-PTY ECHO state (FLAG_ECHO). Gates
     /// optimistic local echo (FDR 0006); defaults off until the first frame.
     echo_on: bool,
+    /// Frame-sync codec selection (`POSH_FRAMESYNC`, #15). Drives whether we
+    /// advertise `CAP_MORPH` and which `applier` we route visible-frame bodies
+    /// through. Defaults to DumpDiff (today's behavior) when the env is unset.
+    framesync: framesync::FrameSync,
+    /// Client-side codec that applies a received visible-frame body to
+    /// `server_term`. DumpDiff reparses a fresh model; MorphDelta morphs the
+    /// existing one in place (and falls back to a reparse for `Full` keyframes).
+    applier: Box<dyn FrameApplier>,
     /// Optional performance instrumentation (POSH_DEBUG_LOG); inert when unset.
     stats: Stats,
 }
@@ -223,6 +232,10 @@ fn client_loop(
     let (rows, cols) = pty::term_size(STDOUT);
     let now = now_ms();
     let (predict, renderer) = predict::build(model, render, predict_overwrite);
+    // Frame-sync codec (#15): opt into MorphDelta with POSH_FRAMESYNC=morph;
+    // unset/empty/other stays on DumpDiff (today's behavior, default-off).
+    let framesync = framesync::FrameSync::parse(std::env::var("POSH_FRAMESYNC").ok().as_deref());
+    let applier = framesync.applier();
     let mut st = ClientState {
         conn,
         fragmenter: Fragmenter::new(),
@@ -253,6 +266,8 @@ fn client_loop(
         scroll_offset: 0,
         last_scroll_state: None,
         echo_on: false,
+        framesync,
+        applier,
         stats: Stats::new(),
     };
     let result = drive_client(&mut st, raw, port);
@@ -814,7 +829,9 @@ fn process_frame(st: &mut ClientState, frame: &ServerFrame) -> bool {
     // duplicates — that is what arrived on the link).
     match &frame.body {
         FrameBody::Full(_) => st.stats.record_frame_full(),
-        FrameBody::Diff { .. } => st.stats.record_frame_diff(),
+        // A Morph body is the incremental analog of a Diff (a delta against the
+        // acked base), so it shares the Diff economics counter (#15).
+        FrameBody::Diff { .. } | FrameBody::Morph { .. } => st.stats.record_frame_diff(),
         FrameBody::Empty => st.stats.record_frame_empty(),
         // Scrollback bodies carry no visible-screen change; they are not
         // part of the Full/Diff/Empty economics the stats track.
@@ -870,45 +887,60 @@ fn apply_frame(st: &mut ClientState, frame: &ServerFrame) -> bool {
         st.applied_num = frame.frame_num;
         return true;
     }
-    let bytes: Vec<u8> = match &frame.body {
+    // Base-anchored bodies (Diff, Morph) apply only when we are exactly at
+    // their base; otherwise re-ack our (stale) state and let the server fall
+    // back to a Full keyframe once it sees the ack. Same base-mismatch rule
+    // for both, so a lost frame is handled identically whichever codec is in
+    // use (#15).
+    match &frame.body {
         FrameBody::Empty => return false,
-        FrameBody::Full(bytes) => bytes.clone(),
-        FrameBody::Diff { base, diff } => {
+        FrameBody::Diff { base, .. } | FrameBody::Morph { base, .. } => {
             if *base != st.applied_num {
-                // Diff against a state we do not hold; the server will fall
-                // back to a full dump once it sees our (stale) ack.
                 return true;
             }
-            match sync::apply_diff(&st.applied_data, diff) {
-                Some(bytes) => bytes,
-                None => return true,
-            }
         }
+        FrameBody::Full(_) => {}
         // Handled above (returns early); listed so the match stays total.
         FrameBody::Scrollback { .. } => unreachable!("scrollback handled above"),
-    };
+    }
     if frame.frame_num == st.applied_num {
         return true; // duplicate retransmission: re-ack, don't reapply
     }
-    let mut term = Terminal::with_scrollback(st.rows, st.cols, 0);
-    // Time the full-dump re-parse — the client-side mirror of the server's
-    // dump_vt_us, and the suspected hot spot (it grows with the dump's size).
+    // Route the body through the selected codec's applier. Time the apply —
+    // the client-side mirror of the server's dump_vt_us. For DumpDiff this is
+    // the full-dump reparse (the suspected hot spot); for MorphDelta it is the
+    // forward `process(escapes)` on the existing model (the optimization).
     let apply_timer = st.stats.enabled().then(Instant::now);
-    term.process(&bytes);
+    let outcome = st.applier.apply(
+        st.rows,
+        st.cols,
+        &st.applied_data,
+        &mut st.server_term,
+        &frame.body,
+    );
     if let Some(t) = apply_timer {
         st.stats.record_apply_us(t.elapsed().as_micros() as u64);
     }
-    // A DECCOLM replayed from the server dump resizes the model to 132/80
-    // columns regardless of the real tty: clamp back so renders never paint
-    // a wider image than the tty can show (the server-side mode is the
-    // server model's concern, not the local render width).
-    if term.rows() != st.rows || term.cols() != st.cols {
-        term.resize(st.rows, st.cols);
+    match outcome {
+        ApplyOutcome::Advanced { dump } => {
+            st.applied_num = frame.frame_num;
+            st.applied_data = dump;
+            true
+        }
+        // MorphDelta advanced the model in place without re-dumping it (#15).
+        // applied_data stays at the last Full keyframe's dump; a Morph session
+        // never sends a Diff body that would read it.
+        ApplyOutcome::AdvancedNoDump => {
+            st.applied_num = frame.frame_num;
+            true
+        }
+        // Undecodable diff / base mismatch the applier surfaced: re-ack and
+        // wait for a Full keyframe, leaving the model untouched.
+        ApplyOutcome::ReackAndWait => true,
+        // Empty is returned early above; an applier should not produce this
+        // for a visible body, but if it does, treat it as no advance.
+        ApplyOutcome::NoChange => false,
     }
-    st.server_term = term;
-    st.applied_num = frame.frame_num;
-    st.applied_data = bytes;
-    true
 }
 
 /// mosh's output_new_frame: server state + prediction overlay + status
@@ -1056,6 +1088,15 @@ fn outgoing_caps(st: &mut ClientState) -> Vec<caps::Cap> {
         extra.push(caps::Cap {
             id: caps::CAP_SCROLLBACK,
             payload: vec![0],
+        });
+    }
+    // Incremental frame sync (#15): advertise CAP_MORPH only behind the
+    // POSH_FRAMESYNC=morph opt-in. A default session never sends it, so the
+    // server selects DumpDiff and the byte stream is unchanged.
+    if st.framesync.advertises_morph() {
+        extra.push(caps::Cap {
+            id: caps::CAP_MORPH,
+            payload: vec![],
         });
     }
     caps::own_table(&extra)
@@ -1276,6 +1317,8 @@ mod tests {
             scroll_offset: 0,
             last_scroll_state: None,
             echo_on: false,
+            framesync: framesync::FrameSync::DumpDiff,
+            applier: Box::new(framesync::DumpDiff),
             stats: Stats::new(),
         }
     }

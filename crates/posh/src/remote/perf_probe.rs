@@ -3,9 +3,15 @@
 //! rather than speculative (CLAUDE.md "verify before optimizing"):
 //!
 //!   * `apply_frame`'s full-dump re-parse (`Terminal::with_scrollback` +
-//!     `process(dump_vt)`) — the suspected main gap vs mosh's incremental model.
+//!     `process(dump_vt)`) — today's DumpDiff apply, the suspected main gap vs
+//!     mosh's incremental model — against MorphDelta's incremental apply
+//!     (`process(escapes)` on the EXISTING model), the #15 optimization.
 //!   * `compose_frame`'s `Snapshot::from_term` (O(rows*cols) clone + per-cell
 //!     hyperlink scan), run every render tick while predictions are live.
+//!
+//! The MorphDelta↔DumpDiff round-trip *correctness* gate (the #15 linchpin)
+//! lives in `framesync`'s tests (`morph_roundtrip_reproduces_state_over_a_table`),
+//! not here — this file is timing only.
 //!
 //! Not a benchmark suite and not run in CI — `cargo test` skips `#[ignore]`d
 //! tests. Run via `just debug-perf-compose` (release build; debug timings are
@@ -17,7 +23,7 @@ use std::time::Instant;
 
 use posh_term::Terminal;
 
-use crate::remote::display::Snapshot;
+use crate::remote::display::{self, Snapshot};
 
 /// A full visible grid of mixed content: every cell printable, a per-row SGR
 /// colour change so the dump_vt stream carries realistic escape runs. Scrollback
@@ -86,6 +92,68 @@ fn perf_reparse_and_from_term() {
             reparse = reparse_us,
             from_term = from_term_us,
             total = reparse_us + from_term_us,
+        );
+    }
+}
+
+/// The #15 win, measured: MorphDelta's incremental apply (`process(escapes)` on
+/// an existing model that is already at state a) vs DumpDiff's full-dump reparse
+/// of state b, on the same workloads. The morph delta is a realistic per-frame
+/// edit (one new line of output + a colour change + a cursor move), so this
+/// times the steady-state typing/output frame, not a keyframe.
+#[test]
+#[ignore = "perf probe; run via `just debug-perf-compose` (--ignored --nocapture)"]
+fn perf_morph_apply_vs_dumpdiff_reparse() {
+    for &(rows, cols) in &[(24u16, 80u16), (50, 212)] {
+        // State a: a full screen of content. State b: a one-row delta on top.
+        let term_a = build_screen(rows, cols);
+        let snap_a = Snapshot::from_term(&term_a);
+        let mut term_b = build_screen(rows, cols);
+        term_b.process(b"\x1b[1;1H\x1b[1;36mfresh line of output replacing row 0\x1b[0m");
+        let snap_b = Snapshot::from_term(&term_b);
+        let dump_b = term_b.dump_vt();
+
+        // The forward and inverse escape-deltas the server would ship; applying
+        // both returns the model to state a (MorphDelta encode, both directions),
+        // so each iteration can repeat the a->b apply faithfully without Clone.
+        let fwd = display::new_frame(true, &snap_a, &snap_b, false);
+        let inv = display::new_frame(true, &snap_b, &snap_a, false);
+
+        // A live model parked at state a, morphed forward and back each iter —
+        // the client's standing server_term, mutated in place.
+        let mut model = reparse(rows, cols, &term_a.dump_vt());
+
+        let iters = 2000u32;
+        for _ in 0..50 {
+            black_box(reparse(rows, cols, &dump_b));
+            model.process(black_box(&fwd));
+            model.process(black_box(&inv));
+        }
+
+        let t0 = Instant::now();
+        for _ in 0..iters {
+            black_box(reparse(rows, cols, &dump_b));
+        }
+        let dumpdiff_us = t0.elapsed().as_nanos() as f64 / iters as f64 / 1000.0;
+
+        // Two morph applies (fwd + inv) per iteration, each just
+        // `process(escapes)` on the existing model — MorphDelta's real per-frame
+        // cost (no dump_vt refresh; #15). Halve for the per-delta figure.
+        let t1 = Instant::now();
+        for _ in 0..iters {
+            model.process(black_box(&fwd));
+            model.process(black_box(&inv));
+        }
+        let morph_us = t1.elapsed().as_nanos() as f64 / iters as f64 / 1000.0 / 2.0;
+
+        eprintln!(
+            "[perf] {rows}x{cols}  dump={dump}B  delta={delta}B  \
+             dumpdiff_reparse={dd:.1}us  morph_apply={mu:.1}us  speedup≈{x:.1}x",
+            dump = dump_b.len(),
+            delta = fwd.len(),
+            dd = dumpdiff_us,
+            mu = morph_us,
+            x = dumpdiff_us / morph_us.max(0.001),
         );
     }
 }

@@ -169,6 +169,11 @@ _POSH_PREDICTION_RENDER_
 _POSH_PREDICTION_OVERWRITE_
 	When set, predictions overwrite instead of inserting.
 
+_POSH_FRAMESYNC_
+	Server→client screen-sync codec (experimental): _morph_ for the
+	incremental escape-delta path; the default re-parses a full screen
+	dump each frame. See *posh-client*(1).
+
 _POSH_GRAB_MOUSE_
 	_on_/_off_ (default _off_): when on, the client grabs the wheel on
 	the outer terminal at a bare prompt and turns wheel up/down into

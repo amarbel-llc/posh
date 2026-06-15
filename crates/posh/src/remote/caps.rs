@@ -16,6 +16,15 @@ pub const CAP_EXIT_STATUS: u8 = 1;
 /// the client understands the `BODY_SCROLLBACK` frame body. Server entry:
 /// empty payload, acknowledging it will emit scrollback bodies.
 pub const CAP_SCROLLBACK: u8 = 3;
+/// Incremental frame sync (#15, prototype). Client entry (empty payload):
+/// "I understand the `BODY_MORPH` frame body and will apply its forward
+/// escape-delta to my existing terminal model instead of reparsing a full
+/// dump". The client advertises this only behind the `POSH_FRAMESYNC=morph`
+/// opt-in, so a default session never negotiates it and the byte stream is
+/// unchanged. The server emits Morph bodies only when the peer advertised
+/// this; a `Full` keyframe is always the fallback (first frame, base
+/// mismatch, alt-screen/resize transitions).
+pub const CAP_MORPH: u8 = 4;
 
 /// The post-table format version we implement (payload of
 /// [`CAP_PROTOCOL_VERSION`]).

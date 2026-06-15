@@ -7,6 +7,8 @@ use posh_term::Terminal;
 use crate::pty;
 use crate::remote::caps;
 use crate::remote::crypto::Key;
+use crate::remote::display::Snapshot;
+use crate::remote::framesync::{Baseline, CurrentFrame, DumpDiff, FrameEncoder, MorphDelta};
 use crate::remote::datagram::{Connection, Family, DEFAULT_PORT_RANGE, SEND_INTERVAL_MIN};
 use crate::remote::stats::Stats;
 use crate::remote::sync::{
@@ -89,6 +91,17 @@ struct FrameState {
     /// it, keeping the diff-base chain intact across interleaved scrollback
     /// frames.
     data: Vec<u8>,
+    /// The rendered screen state as of this frame — the morph base for a later
+    /// `Morph` (#15), captured alongside `data` so acking this frame gives the
+    /// MorphDelta encoder both bases. Carried for the same reason as `data` and
+    /// inherited identically by a scrollback frame.
+    snapshot: Snapshot,
+    /// Off-`Snapshot` terminal state at this frame: whether the alt screen is
+    /// active and the dimensions. The MorphDelta encoder reads these to detect
+    /// a transition a morph cannot express (alt-screen toggle, resize) and fall
+    /// back to a `Full` keyframe (#15).
+    alt_screen: bool,
+    dims: (u16, u16),
     /// Scrollback rows the client will have accumulated after applying this
     /// frame (RFC 0002): the running high-water that only advances on a
     /// scrollback frame. Acking this frame tells the server the client holds
@@ -118,13 +131,31 @@ fn server_loop(mut conn: Connection, child: pty::PtyChild, rows: u16, cols: u16)
     let mut current = FrameState {
         num: 0,
         data: Vec::new(),
+        snapshot: Snapshot::blank(rows, cols),
+        alt_screen: false,
+        dims: (rows, cols),
         sb_total: 0,
     };
     // Last frame the client confirmed; None data means we no longer have its
-    // bytes and must send a full dump.
+    // bytes and must send a full dump. `acked_baseline` mirrors `acked_data`
+    // for the MorphDelta encoder: the rendered snapshot + off-Snapshot state
+    // (alt-screen, dims) at the acked frame, so a morph can be built against
+    // it and a non-expressible transition detected (#15). It is Some exactly
+    // when `acked_data` is.
     let mut acked_num: u64 = 0;
     let mut acked_data: Option<Vec<u8>> = Some(Vec::new());
+    let mut acked_baseline: Option<(Snapshot, bool, (u16, u16))> =
+        Some((Snapshot::blank(rows, cols), false, (rows, cols)));
     let mut outstanding: Vec<FrameState> = Vec::new();
+
+    // Frame-sync codec negotiation (#15): the client advertises CAP_MORPH only
+    // behind POSH_FRAMESYNC=morph. `peer_wants_morph` tracks the latest
+    // message's advertisement (caps do not persist); when set we encode visible
+    // frames with MorphDelta, else DumpDiff (today's behavior). Both encoders
+    // are held so selection is a per-frame choice, not a reallocation.
+    let mut peer_wants_morph = false;
+    let mut dumpdiff_enc = DumpDiff;
+    let mut morph_enc = MorphDelta::default();
 
     // Scrollback sync (RFC 0002). `peer_wants_scrollback` tracks whether the
     // most recent client message advertised SCROLLBACK (capabilities do not
@@ -292,6 +323,7 @@ fn server_loop(mut conn: Connection, child: pty::PtyChild, rows: u16, cols: u16)
                             &mut outstanding,
                             &mut acked_num,
                             &mut acked_data,
+                            &mut acked_baseline,
                             &mut acked_sb_total,
                         );
                         let now_wants = caps::find(&msg.caps, caps::CAP_SCROLLBACK).is_some();
@@ -301,6 +333,8 @@ fn server_loop(mut conn: Connection, child: pty::PtyChild, rows: u16, cols: u16)
                             sb_high = sb_high.max(sb_floor);
                         }
                         peer_wants_scrollback = now_wants;
+                        // CAP_MORPH (#15): per-message, like scrollback.
+                        peer_wants_morph = caps::find(&msg.caps, caps::CAP_MORPH).is_some();
                     }
                     Ok(None) => continue,
                     Err(e) if e.kind() == std::io::ErrorKind::WouldBlock => break,
@@ -354,6 +388,9 @@ fn server_loop(mut conn: Connection, child: pty::PtyChild, rows: u16, cols: u16)
                 outstanding.push(FrameState {
                     num: current.num,
                     data: std::mem::take(&mut current.data),
+                    snapshot: std::mem::replace(&mut current.snapshot, Snapshot::blank(1, 1)),
+                    alt_screen: current.alt_screen,
+                    dims: current.dims,
                     sb_total: current.sb_total,
                 });
                 if outstanding.len() > 8 {
@@ -362,6 +399,11 @@ fn server_loop(mut conn: Connection, child: pty::PtyChild, rows: u16, cols: u16)
                 current = FrameState {
                     num: current.num + 1,
                     data: stats.time_dump_vt(|| term.dump_vt()),
+                    // The morph base for this frame (#15): the rendered state +
+                    // the off-Snapshot fields the keyframe rule reads.
+                    snapshot: Snapshot::from_term(&term),
+                    alt_screen: term.is_alt_screen(),
+                    dims: (term.rows(), term.cols()),
                     // A visible frame carries no scrollback rows, so applying it
                     // leaves the client at whatever scrollback it held at the
                     // diff base (the acked frame): acked_sb_total, NOT sb_high.
@@ -378,11 +420,19 @@ fn server_loop(mut conn: Connection, child: pty::PtyChild, rows: u16, cols: u16)
             } else if make_scrollback {
                 // The visible screen is unchanged, so the scrollback frame
                 // inherits the standing visible dump as its diff base — the
-                // diff-base chain is unbroken across interleaved frames.
+                // diff-base chain is unbroken across interleaved frames. The
+                // morph base (snapshot/alt/dims) is inherited for the same
+                // reason (#15).
                 let visible = current.data.clone();
+                let visible_snapshot = current.snapshot.clone();
+                let visible_alt = current.alt_screen;
+                let visible_dims = current.dims;
                 outstanding.push(FrameState {
                     num: current.num,
                     data: std::mem::take(&mut current.data),
+                    snapshot: std::mem::replace(&mut current.snapshot, Snapshot::blank(1, 1)),
+                    alt_screen: current.alt_screen,
+                    dims: current.dims,
                     sb_total: current.sb_total,
                 });
                 if outstanding.len() > 8 {
@@ -391,6 +441,9 @@ fn server_loop(mut conn: Connection, child: pty::PtyChild, rows: u16, cols: u16)
                 current = FrameState {
                     num: current.num + 1,
                     data: visible,
+                    snapshot: visible_snapshot,
+                    alt_screen: visible_alt,
+                    dims: visible_dims,
                     sb_total: cur_sb_total,
                 };
                 sb_high = cur_sb_total;
@@ -449,33 +502,63 @@ fn server_loop(mut conn: Connection, child: pty::PtyChild, rows: u16, cols: u16)
                         rows,
                     }
                 } else {
-                    match &acked_data {
-                        Some(base) => {
-                            let diff = sync::make_diff(base, &current.data);
-                            if diff.len() + 8 < current.data.len() {
-                                stats.record_frame_diff();
-                                if fresh_frame {
-                                    stats.record_diff_frame(current.data.len(), diff.len());
-                                }
-                                FrameBody::Diff {
-                                    base: acked_num,
-                                    diff,
-                                }
-                            } else {
-                                stats.record_frame_full();
-                                if fresh_frame {
-                                    stats.record_full_frame(current.data.len());
-                                }
-                                FrameBody::Full(current.data.clone())
+                    // Visible-frame body via the negotiated codec (#15). The
+                    // acked baseline (Some exactly when acked_data is) gives the
+                    // encoder both the byte-diff base (dump) and the morph base
+                    // (snapshot + off-Snapshot alt/dims). DumpDiff reproduces
+                    // today's behavior verbatim; MorphDelta emits a forward
+                    // escape-delta or a Full keyframe.
+                    let baseline = acked_data.as_ref().zip(acked_baseline.as_ref()).map(
+                        |(dump, (snapshot, alt, dims))| Baseline {
+                            num: acked_num,
+                            dump: dump.clone(),
+                            snapshot: snapshot.clone(),
+                            alt_screen: *alt,
+                            rows: dims.0,
+                            cols: dims.1,
+                        },
+                    );
+                    let cur = CurrentFrame {
+                        dump: &current.data,
+                        snapshot: &current.snapshot,
+                        alt_screen: current.alt_screen,
+                        rows: current.dims.0,
+                        cols: current.dims.1,
+                    };
+                    let body = if peer_wants_morph {
+                        morph_enc.encode(baseline.as_ref(), &cur)
+                    } else {
+                        dumpdiff_enc.encode(baseline.as_ref(), &cur)
+                    };
+                    // Diff economics sampling, preserved from the inline path:
+                    // a diff-shaped body (Diff/Morph) is the incremental case;
+                    // Full is the keyframe. The fresh_frame gate keeps
+                    // retransmits out of the per-strategy size sample.
+                    match &body {
+                        FrameBody::Diff { diff, .. } => {
+                            stats.record_frame_diff();
+                            if fresh_frame {
+                                stats.record_diff_frame(current.data.len(), diff.len());
                             }
                         }
-                        None => {
-                            // No acked base to diff against — a forced full dump,
-                            // not a strategy choice, so it skips the economics.
-                            stats.record_frame_full();
-                            FrameBody::Full(current.data.clone())
+                        FrameBody::Morph { escapes, .. } => {
+                            stats.record_frame_diff();
+                            if fresh_frame {
+                                stats.record_diff_frame(current.data.len(), escapes.len());
+                            }
                         }
+                        FrameBody::Full(_) => {
+                            stats.record_frame_full();
+                            // A forced full dump (no baseline) is not a strategy
+                            // choice, so it skips the per-strategy size sample —
+                            // matching the inline path's None arm.
+                            if fresh_frame && baseline.is_some() {
+                                stats.record_full_frame(current.data.len());
+                            }
+                        }
+                        _ => {}
                     }
+                    body
                 };
                 if shutdown && exit_status.is_none() {
                     // The shell may not have been reapable at pty close
@@ -586,12 +669,14 @@ fn handle_client_message(
     }
 }
 
+#[allow(clippy::too_many_arguments)]
 fn update_acks(
     msg: &ClientMessage,
     current: &FrameState,
     outstanding: &mut Vec<FrameState>,
     acked_num: &mut u64,
     acked_data: &mut Option<Vec<u8>>,
+    acked_baseline: &mut Option<(Snapshot, bool, (u16, u16))>,
     acked_sb_total: &mut u64,
 ) {
     // Ignore acks for frames never sent: an authenticated client claiming a
@@ -601,16 +686,32 @@ fn update_acks(
         return;
     }
     *acked_num = msg.acked_frame;
+    // The acked frame's bytes, morph base (snapshot + off-Snapshot alt/dims),
+    // and scrollback total, from `current` or the retained outstanding frame.
     let acked = if msg.acked_frame == current.num {
-        Some((current.data.clone(), current.sb_total))
+        Some((
+            current.data.clone(),
+            current.snapshot.clone(),
+            current.alt_screen,
+            current.dims,
+            current.sb_total,
+        ))
     } else {
-        outstanding
-            .iter()
-            .find(|f| f.num == msg.acked_frame)
-            .map(|f| (f.data.clone(), f.sb_total))
+        outstanding.iter().find(|f| f.num == msg.acked_frame).map(|f| {
+            (
+                f.data.clone(),
+                f.snapshot.clone(),
+                f.alt_screen,
+                f.dims,
+                f.sb_total,
+            )
+        })
     };
-    if let Some((data, sb_total)) = acked {
+    if let Some((data, snapshot, alt, dims, sb_total)) = acked {
         *acked_data = Some(data);
+        // The morph baseline tracks acked_data exactly (#15): both Some, or
+        // both None when we no longer hold the acked frame's state.
+        *acked_baseline = Some((snapshot, alt, dims));
         // A frame's sb_total is the scrollback the client holds after applying
         // it: a scrollback frame advances it by the rows it carries; a visible
         // frame inherits the acked base's total (it carries no rows). So acking
@@ -619,6 +720,7 @@ fn update_acks(
         *acked_sb_total = (*acked_sb_total).max(sb_total);
     } else {
         *acked_data = None;
+        *acked_baseline = None;
     }
     outstanding.retain(|f| f.num >= msg.acked_frame);
 }
@@ -1063,7 +1165,12 @@ mod tests {
                                 sb_applied += 1;
                                 applied_num = frame.frame_num;
                             }
-                            FrameBody::Full(_) | FrameBody::Diff { .. } => {
+                            // Morph never arrives here (this harness's client
+                            // does not advertise CAP_MORPH), but the match must
+                            // be total; treat it as the visible-frame case.
+                            FrameBody::Full(_)
+                            | FrameBody::Diff { .. }
+                            | FrameBody::Morph { .. } => {
                                 if frame.frame_num != applied_num {
                                     saw_visible = true;
                                     applied_num = frame.frame_num;
@@ -1172,25 +1279,22 @@ mod tests {
 
     #[test]
     fn update_acks_rejects_frames_never_sent() {
-        let current = FrameState {
-            num: 3,
-            data: b"current".to_vec(),
-            sb_total: 7,
+        // A bare FrameState for the ack bookkeeping test: the morph base fields
+        // (#15) are present but their values are immaterial here — this test
+        // exercises acked_num/acked_data/acked_sb_total movement.
+        let frame = |num: u64, data: &[u8], sb_total: u64| FrameState {
+            num,
+            data: data.to_vec(),
+            snapshot: Snapshot::blank(24, 80),
+            alt_screen: false,
+            dims: (24, 80),
+            sb_total,
         };
-        let mut outstanding = vec![
-            FrameState {
-                num: 1,
-                data: b"one".to_vec(),
-                sb_total: 2,
-            },
-            FrameState {
-                num: 2,
-                data: b"two".to_vec(),
-                sb_total: 5,
-            },
-        ];
+        let current = frame(3, b"current", 7);
+        let mut outstanding = vec![frame(1, b"one", 2), frame(2, b"two", 5)];
         let mut acked_num = 1u64;
         let mut acked_data = Some(b"one".to_vec());
+        let mut acked_baseline = Some((Snapshot::blank(24, 80), false, (24u16, 80u16)));
         let mut acked_sb_total = 2u64;
         let msg = ClientMessage {
             flags: 0,
@@ -1208,6 +1312,7 @@ mod tests {
             &mut outstanding,
             &mut acked_num,
             &mut acked_data,
+            &mut acked_baseline,
             &mut acked_sb_total,
         );
 
@@ -1228,10 +1333,13 @@ mod tests {
             &mut outstanding,
             &mut acked_num,
             &mut acked_data,
+            &mut acked_baseline,
             &mut acked_sb_total,
         );
         assert_eq!(acked_num, 3);
         assert_eq!(acked_data.as_deref(), Some(b"current".as_slice()));
+        // The morph baseline tracks acked_data: both Some after a real ack (#15).
+        assert!(acked_baseline.is_some(), "morph baseline tracks acked_data");
         assert_eq!(acked_sb_total, 7, "acking a frame confirms its scrollback");
         assert!(outstanding.is_empty());
     }

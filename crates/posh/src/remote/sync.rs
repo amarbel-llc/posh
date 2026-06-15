@@ -216,6 +216,15 @@ pub enum FrameBody {
     Full(Vec<u8>),
     Diff { base: u64, diff: Vec<u8> },
     Empty,
+    /// Incremental visible-frame sync (#15, `CAP_MORPH`): a minimal forward
+    /// escape-delta (`display::new_frame`) that morphs the client's existing
+    /// terminal model from frame `base` to this frame, instead of shipping a
+    /// full dump for it to reparse. `base` is the acked frame the escapes were
+    /// computed against; the client applies them only when it is exactly at
+    /// `base` (`base == applied_num`), so a retransmitted or superseding body
+    /// is anchored exactly like `Diff`. On a base mismatch the client re-acks
+    /// and the server falls back to a `Full` keyframe.
+    Morph { base: u64, escapes: Vec<u8> },
     /// Scrollback growth (RFC 0002 §2): the rows that newly entered the
     /// server's primary-screen scrollback since the frame the client last
     /// acknowledged. `base` is that acked frame number — the client appends
@@ -249,6 +258,7 @@ const BODY_FULL: u8 = 0;
 const BODY_DIFF: u8 = 1;
 const BODY_EMPTY: u8 = 2;
 const BODY_SCROLLBACK: u8 = 3;
+const BODY_MORPH: u8 = 4;
 
 /// Upper bound on rows in one `BODY_SCROLLBACK` body. A single frame's
 /// payload is already bounded by the fragmentation layer, but `appended` is
@@ -276,6 +286,11 @@ impl ServerFrame {
                 out.push(BODY_DIFF);
                 out.extend_from_slice(&base.to_le_bytes());
                 out.extend_from_slice(diff);
+            }
+            FrameBody::Morph { base, escapes } => {
+                out.push(BODY_MORPH);
+                out.extend_from_slice(&base.to_le_bytes());
+                out.extend_from_slice(escapes);
             }
             FrameBody::Empty => out.push(BODY_EMPTY),
             FrameBody::Scrollback { base, rows } => {
@@ -310,6 +325,16 @@ impl ServerFrame {
                 FrameBody::Diff {
                     base,
                     diff: data[at + 9..].to_vec(),
+                }
+            }
+            BODY_MORPH => {
+                if data.len() < at + 9 {
+                    return Err(Error::from("morph frame too short"));
+                }
+                let base = u64::from_le_bytes(data[at + 1..at + 9].try_into().unwrap());
+                FrameBody::Morph {
+                    base,
+                    escapes: data[at + 9..].to_vec(),
                 }
             }
             BODY_EMPTY => FrameBody::Empty,
@@ -813,6 +838,32 @@ mod tests {
                 input_ack: 4,
                 echo_ack: 4,
                 body: FrameBody::Full(b"x".to_vec()),
+            },
+            // Morph body (#15): base + forward escape-delta round-trip, base
+            // distinct from frame_num as on the wire.
+            ServerFrame {
+                flags: 0,
+                caps: vec![],
+                frame_num: 11,
+                input_ack: 5,
+                echo_ack: 5,
+                body: FrameBody::Morph {
+                    base: 9,
+                    escapes: b"\x1b[2;3Hx".to_vec(),
+                },
+            },
+            // An empty escape-delta (no visible change but the base advanced)
+            // must round-trip without being mistaken for a truncated body.
+            ServerFrame {
+                flags: 0,
+                caps: vec![],
+                frame_num: 12,
+                input_ack: 6,
+                echo_ack: 6,
+                body: FrameBody::Morph {
+                    base: 11,
+                    escapes: vec![],
+                },
             },
         ];
         for frame in cases {

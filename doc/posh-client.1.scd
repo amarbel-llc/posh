@@ -63,6 +63,16 @@ _POSH_PREDICTION_OVERWRITE_
 	When set, predictions overwrite the character under the cursor
 	instead of inserting.
 
+_POSH_FRAMESYNC_
+	Server→client screen-sync codec (experimental, #15): _morph_ opts into
+	the incremental path — the server ships a minimal forward escape-delta
+	and the client applies it to its existing screen model, instead of
+	re-parsing a full screen dump every frame (far cheaper on large/wide
+	terminals). Anything else (unset/empty/_dumpdiff_, the default) keeps the
+	full-dump path. Negotiated with the server, which falls back to the
+	full-dump path for any client that does not request _morph_, so the wire
+	is unchanged by default.
+
 _POSH_GRAB_MOUSE_
 	_on_/_off_ (default _off_): at a bare prompt the wheel scrolls the
 	session's primary-screen scrollback locally (FDR 0005) — instant,
