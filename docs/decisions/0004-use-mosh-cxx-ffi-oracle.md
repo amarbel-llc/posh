@@ -49,13 +49,13 @@ Good:
 Bad / costs accepted:
 
 * posh's build gains a C++ toolchain dependency now, and — when the predictor slice lands — ncurses/protobuf in the devShell and nix (`Cargo.lock` + vendoring updates). devShell changes require a session restart (direnv reload mid-session is unsupported here).
-* The predictor slice requires two small, behavior-preserving mosh decouplings: extract `Network::timestamp()` into a minimal `src/network/timing.h`, and parameterize `Network::ACK_INTERVAL` out of `NotificationEngine`. These must be guarded by characterization tests (see #75 / the posh-rec harness) so the refactor cannot drift mosh's behavior.
+* The predictor slice requires two small, behavior-preserving mosh decouplings: extract `Network::timestamp()` into a minimal `src/network/timing.h`, and parameterize `Network::ACK_INTERVAL` out of `NotificationEngine`. These must be guarded by characterization tests (see #75 / the poshterity harness) so the refactor cannot drift mosh's behavior.
 * Two implementations of each subsystem to keep building (maintenance surface), justified only while mosh remains the reference.
 * GPL/licensing: linking mosh C++ is consistent with posh's GPL-3.0-or-later, but binding scope must stay deliberate.
 
 ## Confirmation
 
-* The tracer test (`cargo test -p mosh-ffi`) builds the mosh terminal slice and asserts rendered output through the shim. It is currently devShell/cargo-only and **not yet wired into nix/CI** — integration (git-tracking `crates/mosh-ffi`, vendoring `cc`, devShell deps for the predictor slice) is follow-up work before `just`/the merge hook exercises it.
+* `cargo test -p mosh-ffi` builds both slices and asserts rendered output through the shim. It is gated in nix/CI by the `.#checks.<system>.mosh-ffi` flake check — isolated from the shipped `.#posh` build via workspace `default-members` — and wired into `just test` via `test-mosh-ffi`, so the merge hook exercises the oracle.
 * The decision is honored when reference-critical bugs are chased via a differential test against the mosh oracle rather than by reasoning alone.
 
 ### Criteria to go beyond oracle-only
@@ -66,6 +66,6 @@ Promote a mosh-backed impl to a shipped runtime drop-in only if: (a) the Rust im
 
 * Tracer bullet: `crates/mosh-ffi/` (shim `csrc/shim.cc`, `build.rs`), task #6.
 * Trait seams: `crates/posh/src/remote/predict/mod.rs` (`Predictor`), `crates/posh/src/remote/framesync/mod.rs` (`FrameApplier`).
-* Characterization harness for the guarded mosh refactor: #75 (let posh-rec reach the transport layer), #56 (posh-rec epic).
+* Characterization harness for the guarded mosh refactor: #75 (let poshterity reach the transport layer), #56 (poshterity epic).
 * Rewrite campaign umbrella: #34.
 * Entanglement finding: mosh's `src/terminal/` is a clean library (no network/statesync/protobuf deps); only `terminaldisplayinit.cc` needs ncurses, and the emulator does not require `Display`. The predictor (`src/frontend/terminaloverlay.*`) has exactly two network couplings, both surgically removable.

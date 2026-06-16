@@ -1,8 +1,8 @@
 # mosh characterization harness — design
 
-Status: terminal slice in build; predictor slice pending the decouple refactor.
+Status: implemented — terminal + predictor slices built, the decouple refactor landed (timing.h), gated in nix/CI via `.#checks.mosh-ffi`.
 Date: 2026-06-16
-Related: ADR 0004 (FFI oracle), #75 (posh-rec transport reach), #56 (posh-rec epic), task #4.
+Related: ADR 0004 (FFI oracle), #75 (poshterity transport reach), #56 (poshterity epic), task #4.
 
 ## Goal
 
@@ -30,10 +30,10 @@ realistic-loss check.
   `network.cc`), settable from Rust before each step, making the predictor
   deterministic by construction. This is the property the network path cannot
   give and the single reason the harness is shim-based.
-- **Reuse posh-rec's golden format.** Render mosh's framebuffer into posh-rec's
+- **Reuse poshterity's golden format.** Render mosh's framebuffer into poshterity's
   diff-friendly `Grid` shape (and later its style sidecar) so mosh goldens read
   like the rest of the suite and can be diffed directly against posh's own
-  emulator output. posh-rec `.castx` recordings become the realistic input
+  emulator output. poshterity `.castx` recordings become the realistic input
   corpus alongside handcrafted VT edge-case scripts.
 - **Guard = bless-before / assert-after.** Bless goldens from current mosh → do
   the refactor → assert byte-identical. Identical goldens ⇒ provably
@@ -81,8 +81,9 @@ has neither.
 - `just debug-mosh-bless` regenerates goldens; `just debug-cargo test -p
   mosh-ffi` asserts (the normal dev loop).
 
-## Not yet wired into nix/CI
+## nix/CI
 
-Like the tracer, this is devShell/cargo-only until `crates/mosh-ffi` is
-git-tracked and `cc` vendored. Integration is follow-up before the merge hook
-exercises it.
+`mosh-ffi` is excluded from the shipped `.#posh` build (workspace
+`default-members`) and gated by a dedicated `.#checks.<system>.mosh-ffi`
+derivation, wired into `just test` via `test-mosh-ffi` so the merge hook runs
+it (the `build(nix)` commit under ADR 0004).

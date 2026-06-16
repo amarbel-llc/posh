@@ -29,6 +29,7 @@ crates/
   posh-term/   standalone terminal emulation library (no dependencies)
   posh/        the posh binary
   poshterity/    deterministic terminal recorder/replayer (lib + poshterity bin; posh rec)
+  mosh-ffi/    C++ FFI oracle: drives mosh's terminal + predictor for differential tests (dev/test only; ADR 0004)
 doc/           scdoc man-page sources (man posh, posh-server, posh-client, poshterity, posh(7))
 docs/          ADRs, RFCs, feature records (FDRs), plans, and the manual test plan
 posht/         interactive terminal-capability test (Go; nix build .#posht)
@@ -251,10 +252,11 @@ epic; adoption + the `.castx` RFC land in the final phase.
 
 ```
 nix build                   # the full toolset: posh, posh-server, poshterity, posht (#73)
-nix build .#posh            # hermetic build + cargo test --workspace
+nix build .#posh            # hermetic build + cargo test (posh workspace; mosh-ffi gated separately)
 just build-rust             # same, via the justfile lane
-just debug-cargo test --workspace   # fast in-worktree dev-loop
+just debug-cargo test --workspace   # fast in-worktree dev-loop (includes mosh-ffi)
 nix run .#poshterity -- ... # the recorder/replayer as a standalone tool
+nix build .#checks.<sys>.mosh-ffi   # the C++ FFI oracle gate (just test-mosh-ffi)
 nix build .#posht           # the interactive capability test (just build-go;
                             # part of `just build`/`test`). See docs/posht.md.
 ```
