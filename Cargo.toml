@@ -1,6 +1,11 @@
 [workspace]
 resolver = "2"
 members = ["crates/posh-build", "crates/posh-term", "crates/posh", "crates/poshterity", "crates/mosh-ffi"]
+# mosh-ffi is the C++ FFI oracle (ADR 0004) — a dev/test crate, not shipped.
+# Keep it out of the default build/test (and thus the .#posh derivation, which
+# runs cargo build/test with no --workspace); it is gated separately by the
+# .#checks.<system>.mosh-ffi flake check (just test-mosh-ffi).
+default-members = ["crates/posh-build", "crates/posh-term", "crates/posh", "crates/poshterity"]
 
 [workspace.package]
 # NOT the source of truth. The real version is version.env (POSH_VERSION),

@@ -317,6 +317,31 @@
           # snapshot, runs treefmt, fails if any file would change. Driven
           # by `just lint-fmt` and surfaced under `nix flake check`.
           formatting = treefmtEval.config.build.check self;
+
+          # The C++ FFI oracle (ADR 0004). mosh-ffi is a dev/test crate kept out
+          # of the shipped .#posh build (workspace default-members), so this
+          # dedicated gate builds and runs its characterization tests
+          # (cargo test -p mosh-ffi) — which compile a slice of the zz-mosh C++
+          # via the cc crate (g++ from stdenv). src = ./. so zz-mosh is in the
+          # sandbox for build.rs's relative read. Driven by `just test-mosh-ffi`
+          # and surfaced under `nix flake check`. Lib-only oracle (no shipped
+          # binary): the value is the checkPhase passing.
+          mosh-ffi = pkgs.rustPlatform.buildRustPackage {
+            pname = "mosh-ffi-check";
+            version = poshVersion;
+            src = ./.;
+            cargoLock.lockFile = ./Cargo.lock;
+            cargoBuildFlags = [
+              "-p"
+              "mosh-ffi"
+            ];
+            cargoTestFlags = [
+              "-p"
+              "mosh-ffi"
+            ];
+            doCheck = true;
+            installPhase = "mkdir -p $out";
+          };
         };
 
         formatter = treefmtEval.config.build.wrapper;

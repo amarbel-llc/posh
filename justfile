@@ -95,7 +95,7 @@ build-toolset:
 
 # --- post-build ------------------------------------------------------------
 
-test: test-nix test-rust test-go
+test: test-nix test-rust test-go test-mosh-ffi
 
 # Hermetic, CI-safe C++ test signal (the mosh package's doCheck).
 [group("post-build")]
@@ -105,7 +105,8 @@ test-nix:
     # build-nix has realized the derivation.
     nix build -L --show-trace --no-link ".#mosh"
 
-# Hermetic Rust test signal (cargo test --workspace in the posh checkPhase).
+# Hermetic Rust test signal (posh checkPhase; mosh-ffi is gated separately by
+# test-mosh-ffi via workspace default-members).
 [group("post-build")]
 test-rust:
     # Cheap once build-rust has realized the derivation. github #33.
@@ -115,6 +116,17 @@ test-rust:
 [group("post-build")]
 test-go:
     nix build -L --show-trace --no-link ".#posht"
+
+# Hermetic mosh-ffi gate: the C++ FFI oracle's characterization tests (ADR
+# 0004). mosh-ffi is excluded from .#posh (workspace default-members), so this
+# builds the dedicated .#checks.<system>.mosh-ffi derivation, which runs
+# cargo test -p mosh-ffi (compiling the zz-mosh C++ slice via cc).
+[group("post-build")]
+test-mosh-ffi:
+    #!/usr/bin/env bash
+    set -euo pipefail
+    system=$(nix eval --raw --impure --expr 'builtins.currentSystem')
+    nix build -L --show-trace --no-link ".#checks.${system}.mosh-ffi"
 
 
 # --- operational -----------------------------------------------------------
