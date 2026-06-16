@@ -1,6 +1,6 @@
 [workspace]
 resolver = "2"
-members = ["crates/posh-term", "crates/posh", "crates/posh-rec"]
+members = ["crates/posh-build", "crates/posh-term", "crates/posh", "crates/posh-rec"]
 
 [workspace.package]
 # NOT the source of truth. The real version is version.env (POSH_VERSION),

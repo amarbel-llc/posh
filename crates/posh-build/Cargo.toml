@@ -1,0 +1,11 @@
+[package]
+name = "posh-build"
+version.workspace = true # inert placeholder; this crate is build-only and never ships (see root Cargo.toml)
+description = "Build-script helper: flows version.env (POSH_VERSION) + git SHA into every posh crate"
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+
+# No dependencies on purpose: build scripts stay dependency-free (the version
+# parser is hand-rolled rather than pulling regex). See eng-versioning(7).
+[dependencies]

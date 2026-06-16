@@ -7,3 +7,7 @@ license.workspace = true
 repository.workspace = true
 
 [dependencies]
+
+[build-dependencies]
+# Shared version + git-sha flow-out (github #71). See eng-versioning(7).
+posh-build = { path = "../posh-build" }

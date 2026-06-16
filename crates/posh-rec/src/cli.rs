@@ -63,7 +63,10 @@ pub fn run(args: &[String]) -> Result<(), String> {
             Ok(())
         }
         Some("version" | "-V" | "--version") => {
-            println!("posh-rec {}", posh_term::version());
+            // posh-rec's own provenance (version + git sha), flowed by build.rs
+            // (github #71). Distinct from the emulator's emu_rev stamped into
+            // recordings. See eng-versioning(7).
+            println!("posh-rec {} ({})", env!("POSH_VERSION"), env!("POSH_GIT_SHA"));
             Ok(())
         }
         Some(other) => Err(format!("unknown subcommand {other:?}\n\n{USAGE}")),

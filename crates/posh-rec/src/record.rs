@@ -56,7 +56,7 @@ pub fn run(args: &[String]) -> Result<i32, String> {
         height: rows,
         posh_rec: Some(PoshRec {
             v: 1,
-            emu_rev: posh_term::version().to_string(),
+            emu_rev: posh_term::emu_rev(),
         }),
     })
     .map_err(|e| format!("{out_path}: {e}"))?;

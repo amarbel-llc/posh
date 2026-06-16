@@ -12,3 +12,7 @@ posh-term = { path = "../posh-term" }
 # #![forbid(unsafe_code)] and never touches libc; the recorder lives in the
 # bin-only src/record.rs.
 libc = "0.2"
+
+[build-dependencies]
+# Shared version + git-sha flow-out (github #71). See eng-versioning(7).
+posh-build = { path = "../posh-build" }

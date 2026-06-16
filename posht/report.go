@@ -29,7 +29,7 @@ func reportMD(tests []*Test) string {
 	if c := os.Getenv("SSH_CONNECTION"); c != "" {
 		fmt.Fprintf(&b, "- SSH_CONNECTION: %s\n", c)
 	}
-	fmt.Fprintf(&b, "- posht: v%s\n\n", version)
+	fmt.Fprintf(&b, "- posht: v%s (%s)\n\n", version, gitSHA)
 
 	b.WriteString("| test | feature | result |\n|---|---|---|\n")
 	var pass, fail int
@@ -66,6 +66,7 @@ type receipt struct {
 	PoshSession string         `json:"posh_session,omitempty"`
 	SSHConn     string         `json:"ssh_connection,omitempty"`
 	Version     string         `json:"posht_version"`
+	GitSHA      string         `json:"posht_git_sha"`
 	ProcessTree []procInfo     `json:"process_tree"`
 	Tests       []testResult   `json:"tests"`
 	Details     map[string]any `json:"details,omitempty"`
@@ -135,6 +136,7 @@ func reportJSON(tests []*Test, details map[string]any, tree []procInfo) string {
 		PoshSession: os.Getenv("POSH_SESSION"),
 		SSHConn:     os.Getenv("SSH_CONNECTION"),
 		Version:     version,
+		GitSHA:      gitSHA,
 		ProcessTree: tree,
 		Details:     details,
 	}

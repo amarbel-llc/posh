@@ -171,8 +171,11 @@ The extensions in this section are the only differences between `.castx` and
   events (the `posh_rec` block never changes how `o`/`i`/`r` are interpreted);
   it MAY ignore extension semantics it does not understand.
 - `emu_rev` (string): the emulator revision the recording was produced
-  against — the `posh_term` version (flowed from the repo's `version.env`).
-  Its semantics are advisory and are specified in section 5.4.
+  against — `posh_term`'s `version+git-sha` (the version flowed from the
+  repo's `version.env`, joined with the build's git rev; see eng-versioning(7)
+  and `posh_term::emu_rev()`). Earlier producers emitted the bare version with
+  no `+git-sha` suffix; readers MUST treat `emu_rev` as an opaque string (it is
+  compared, never parsed — see section 5.4). Its semantics are advisory.
 - A `.castx` produced by posh-rec MUST include the `posh_rec` block. A reader
   MUST treat its absence as "this is a plain `.cast`" and replay normally
   (section 5.3).

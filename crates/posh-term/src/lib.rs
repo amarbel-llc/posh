@@ -41,8 +41,12 @@
 //!   remote scrollback-sync protocol, RFC 0002)
 //! - `Terminal::take_responses(&mut self) -> Vec<u8>` (DA/DSR/etc. replies)
 //! - `Terminal::screen(&self) -> &Screen` (cell-level read access)
-//! - `version() -> &'static str` (the emulator revision, flowed from
-//!   version.env at build time; stamped into posh-rec's `.castx` `emu_rev`)
+//! - `version() -> &'static str` (the emulator version, flowed from
+//!   version.env at build time)
+//! - `git_rev() -> &'static str` (the build's git SHA, flowed from the flake
+//!   rev or a dev `git` checkout; "unknown" from a source tarball)
+//! - `emu_rev() -> String` (`version+git_rev`, the provenance string stamped
+//!   into posh-rec's `.castx` `emu_rev` header for golden auditing)
 //! - `Color::to_rgb(self) -> Option<(u8,u8,u8)>` (palette/RGB resolution for
 //!   renderers; `None` for the terminal default)
 #![forbid(unsafe_code)]
@@ -80,10 +84,40 @@ pub use screen::{Row, Screen, SemanticMark};
 pub use terminal::{Cursor, CursorShape, ScreenSwitch, Terminal};
 pub use wcwidth::wcwidth;
 
-/// The emulator revision string. Flowed from the repo's `version.env`
-/// (`POSH_VERSION`) at build time by `build.rs` — see eng-versioning(7). Used
-/// by posh-rec to stamp the `.castx` `emu_rev` header so a recorded golden
-/// frame can be audited against the emulator version that produced it.
+/// The emulator version. Flowed from the repo's `version.env` (`POSH_VERSION`)
+/// at build time by `build.rs` — see eng-versioning(7).
 pub fn version() -> &'static str {
     env!("POSH_VERSION")
+}
+
+/// The build's git revision: `<short-sha>` (with a `-dirty` suffix when the
+/// tree was unclean), flowed from the nix flake's rev or a dev `git` checkout
+/// at build time by `build.rs`; "unknown" when built from a source tarball.
+/// See eng-versioning(7).
+pub fn git_rev() -> &'static str {
+    env!("POSH_GIT_SHA")
+}
+
+/// The emulator revision string: [`version`] and [`git_rev`] joined as
+/// `version+sha`. posh-rec stamps this into the `.castx` `emu_rev` header so a
+/// recorded golden frame can be audited against the exact emulator build that
+/// produced it (github #71). The single composition point — recorders call
+/// `emu_rev()` rather than assembling the string themselves.
+pub fn emu_rev() -> String {
+    format!("{}+{}", version(), git_rev())
+}
+
+#[cfg(test)]
+mod provenance_tests {
+    use super::{emu_rev, git_rev, version};
+
+    /// Provenance guard (github #71): the build must flow both a version and a
+    /// git sha, and `emu_rev()` must compose them as `version+sha`. A build
+    /// product shipping without provenance trips this.
+    #[test]
+    fn emu_rev_composes_version_and_git_rev() {
+        assert!(!version().is_empty(), "POSH_VERSION not flowed");
+        assert!(!git_rev().is_empty(), "POSH_GIT_SHA not flowed");
+        assert_eq!(emu_rev(), format!("{}+{}", version(), git_rev()));
+    }
 }

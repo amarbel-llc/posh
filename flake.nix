@@ -61,8 +61,9 @@
         # POSH_VERSION. The autotools build derives its own VERSION.stamp
         # from git-describe (absent in the nix sandbox, so it falls back to
         # "mosh 1.4.0"); this literal is only for the derivation `version`
-        # attr. (posht likewise keeps its Go-literal version.) See
-        # eng-versioning(7) on polyglot lineages.
+        # attr. (posht, by contrast, now flows from POSH_VERSION + git rev via
+        # ldflags — see the posht derivation below.) See eng-versioning(7) on
+        # polyglot lineages.
         moshVersion = "1.4.0";
 
         # Build-time toolchain: autoreconf stack + protoc + pkg-config, and
@@ -221,14 +222,26 @@
         # subtree keeps non-posht changes from rebuilding it. Pure Go, so the
         # binary is static and needs nothing on a target beyond a UTF-8 locale
         # — which is what lets `run-remote.sh` scp it to any host. Version
-        # single source of truth: the `version` const in posht/main.go (a Go
-        # literal, distinct from the Cargo/mosh versions). See docs/posht.md.
+        # single source of truth: version.env (POSH_VERSION, read into
+        # poshVersion above) + the git rev, flowed into the binary via
+        # -ldflags -X main.version / main.gitSHA (github #71). posht's own
+        # `var version`/`gitSHA` defaults are inert dev placeholders. See
+        # eng-versioning(7) and docs/posht.md.
         posht = pkgs.buildGoModule {
           pname = "posht";
-          version = "0.1.0"; # matches `const version` in posht/main.go
+          version = poshVersion;
 
           src = ./posht;
           vendorHash = "sha256-mR/fqtqVw4VL8LcbRkoJ+TdICQPYKTn8XZEl8yqGjuQ=";
+
+          # Flow version.env + git rev into the Go binary (github #71). -X sets
+          # the package-level `version`/`gitSHA` vars; buildGoModule already runs
+          # `go test ./...` in checkPhase (doCheck defaults on), which gates the
+          # version-format test.
+          ldflags = [
+            "-X main.version=${poshVersion}"
+            "-X main.gitSHA=${poshGitSha}"
+          ];
 
           meta = with lib; {
             description = "Interactive terminal-capability test for posh (\"diff on a POSH\")";

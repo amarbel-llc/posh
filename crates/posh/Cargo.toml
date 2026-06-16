@@ -18,3 +18,7 @@ aes-gcm = { version = "0.10", default-features = false, features = [
     "aes",
     "alloc",
 ] }
+
+[build-dependencies]
+# Shared version + git-sha flow-out (github #71). See eng-versioning(7).
+posh-build = { path = "../posh-build" }

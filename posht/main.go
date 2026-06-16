@@ -20,7 +20,22 @@ import (
 	tea "github.com/charmbracelet/bubbletea"
 )
 
-const version = "0.1.0"
+// Provenance, flowed from the repo's version.env (POSH_VERSION) + git rev by
+// the nix flake via -ldflags -X (github #71). They are `var` (not `const`) so
+// `-X` can override them; the "-dev"/"unknown" defaults mark a non-nix
+// `go build`, mirroring the Rust crates' inert 0.0.0 placeholder. See
+// eng-versioning(7).
+var (
+	version = "0.0.0-dev"
+	gitSHA  = "unknown"
+)
+
+// versionLine is the `posht --version` / report provenance string,
+// `posht <version> (<sha>)`. Factored out so the provenance guard test
+// (version_test.go, github #71) checks the exact format main prints.
+func versionLine() string {
+	return "posht " + version + " (" + gitSHA + ")"
+}
 
 func main() {
 	list := flag.Bool("list", false, "print test IDs and titles, then exit")
@@ -38,7 +53,7 @@ func main() {
 	tests := registry()
 
 	if *ver {
-		fmt.Println("posht " + version)
+		fmt.Println(versionLine())
 		return
 	}
 	if *list {

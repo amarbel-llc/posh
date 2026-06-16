@@ -39,7 +39,7 @@ fn open_recorder(rows: u16, cols: u16) -> Option<SessionRecorder> {
         height: rows,
         posh_rec: Some(posh_rec::castx::PoshRec {
             v: 1,
-            emu_rev: posh_term::version().to_string(),
+            emu_rev: posh_term::emu_rev(),
         }),
     };
     if let Err(e) = rec.write_header(&header) {
