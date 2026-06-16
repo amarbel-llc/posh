@@ -84,10 +84,13 @@ build-go:
 
 # The default output: the full posh toolset (github #73). ./result
 # aggregates posh + posh-server + poshterity + posht so a bare `nix build`
-# yields the whole set. Cheap once build-rust/build-go realized the inputs.
+# yields the whole set. Also realizes the standalone .#poshterity output
+# (`nix run .#poshterity`) so the merge gate exercises it. Cheap once
+# build-rust/build-go realized the inputs.
 [group("build")]
 build-toolset:
     nix build -L --show-trace -o result
+    nix build -L --show-trace --no-link ".#poshterity"
 
 
 # --- post-build ------------------------------------------------------------

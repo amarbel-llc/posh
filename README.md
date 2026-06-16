@@ -245,6 +245,7 @@ nix build                   # the full toolset: posh, posh-server, poshterity, p
 nix build .#posh            # hermetic build + cargo test --workspace
 just build-rust             # same, via the justfile lane
 just debug-cargo test --workspace   # fast in-worktree dev-loop
+nix run .#poshterity -- ... # the recorder/replayer as a standalone tool
 nix build .#posht           # the interactive capability test (just build-go;
                             # part of `just build`/`test`). See docs/posht.md.
 ```

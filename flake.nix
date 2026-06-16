@@ -272,6 +272,28 @@
           };
         };
 
+        # poshterity exposed as its own runnable output, so `nix run
+        # .#poshterity` runs the recorder/replayer and `nix build .#poshterity`
+        # yields just that tool (github #73). It selects the single binary and
+        # its man page out of the already-built `posh` package rather than
+        # recompiling, so the binary has one source of truth and can never
+        # diverge from the one in `posh`/the default toolset. mainProgram makes
+        # `nix run` resolve to poshterity rather than posh.
+        poshterity =
+          pkgs.runCommand "poshterity-${poshVersion}"
+            {
+              meta = {
+                description = "Deterministic, step-ratcheted terminal recorder/replayer built on posh-term";
+                mainProgram = "poshterity";
+                inherit (posh.meta) license platforms;
+              };
+            }
+            ''
+              mkdir -p "$out/bin" "$out/share/man/man1"
+              ln -s ${posh}/bin/poshterity "$out/bin/poshterity"
+              ln -s ${posh}/share/man/man1/poshterity.1.gz "$out/share/man/man1/poshterity.1.gz"
+            '';
+
         # Tree-wide formatter: clang-format (C++) + nixfmt + shfmt under one
         # wrapper. Exposed as `formatter.${system}` (so `nix fmt` works) and
         # dropped into the devShell. See ./treefmt.nix.
@@ -285,6 +307,7 @@
           # `nix build .#mosh` but out of the default.
           default = poshToolset;
           posh = posh;
+          poshterity = poshterity;
           mosh = mosh;
           posht = posht;
         };
