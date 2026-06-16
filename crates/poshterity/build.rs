@@ -1,5 +1,5 @@
 // Flow version.env (POSH_VERSION) + the git SHA (POSH_GIT_SHA) into the crate
-// as compile-time env vars; the `posh-rec version` subcommand reads
+// as compile-time env vars; the `poshterity version` subcommand reads
 // env!("POSH_VERSION") / env!("POSH_GIT_SHA"). The resolution logic is shared
 // across every posh crate in posh-build so it cannot drift (github #71). See
 // eng-versioning(7).

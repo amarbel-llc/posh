@@ -8,9 +8,9 @@ repository.workspace = true
 
 [dependencies]
 posh-term = { path = "../posh-term" }
-# `posh rec ...` aliases the standalone posh-rec binary; both call
-# posh_rec::cli::run so the replay logic lives in one place.
-posh-rec = { path = "../posh-rec" }
+# `posh rec ...` aliases the standalone poshterity binary; both call
+# poshterity::cli::run so the replay logic lives in one place.
+poshterity = { path = "../poshterity" }
 libc = "0.2"
 # default-features off drops the unused getrandom/rand_core pull-in; key
 # generation reads OS entropy directly (remote/crypto.rs fill_random).

@@ -46,7 +46,7 @@
 //! - `git_rev() -> &'static str` (the build's git SHA, flowed from the flake
 //!   rev or a dev `git` checkout; "unknown" from a source tarball)
 //! - `emu_rev() -> String` (`version+git_rev`, the provenance string stamped
-//!   into posh-rec's `.castx` `emu_rev` header for golden auditing)
+//!   into poshterity's `.castx` `emu_rev` header for golden auditing)
 //! - `Color::to_rgb(self) -> Option<(u8,u8,u8)>` (palette/RGB resolution for
 //!   renderers; `None` for the terminal default)
 #![forbid(unsafe_code)]
@@ -99,7 +99,7 @@ pub fn git_rev() -> &'static str {
 }
 
 /// The emulator revision string: [`version`] and [`git_rev`] joined as
-/// `version+sha`. posh-rec stamps this into the `.castx` `emu_rev` header so a
+/// `version+sha`. poshterity stamps this into the `.castx` `emu_rev` header so a
 /// recorded golden frame can be audited against the exact emulator build that
 /// produced it (github #71). The single composition point — recorders call
 /// `emu_rev()` rather than assembling the string themselves.

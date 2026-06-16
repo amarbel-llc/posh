@@ -16,8 +16,8 @@ const SCROLLBACK: usize = 10_000;
 
 /// A `.castx` recorder writing to a boxed sink (a file, in practice). Built
 /// when `$POSH_RECORD_FILE` is set (`posh --record FILE`); tees the session's
-/// raw PTY output so `posh-rec replay` can reproduce the screen deterministically.
-type SessionRecorder = posh_rec::castx::Recorder<Box<dyn Write>>;
+/// raw PTY output so `poshterity replay` can reproduce the screen deterministically.
+type SessionRecorder = poshterity::castx::Recorder<Box<dyn Write>>;
 
 /// Open the recording named by `$POSH_RECORD_FILE` (if any) and write its
 /// header. A failure to open/write only logs and disables recording — it must
@@ -32,12 +32,12 @@ fn open_recorder(rows: u16, cols: u16) -> Option<SessionRecorder> {
         }
     };
     let writer: Box<dyn Write> = Box::new(std::io::BufWriter::new(file));
-    let mut rec = posh_rec::castx::Recorder::new(writer);
-    let header = posh_rec::castx::Header {
+    let mut rec = poshterity::castx::Recorder::new(writer);
+    let header = poshterity::castx::Header {
         version: 2,
         width: cols,
         height: rows,
-        posh_rec: Some(posh_rec::castx::PoshRec {
+        poshterity: Some(poshterity::castx::Poshterity {
             v: 1,
             emu_rev: posh_term::emu_rev(),
         }),
@@ -420,7 +420,7 @@ fn daemon_loop(
                     filter.feed(term, &buf[..n], &mut bcast);
                     // Record the RAW chunk (what the emulator processed), not
                     // the screen-switch-filtered broadcast — that's what makes
-                    // a posh-rec replay reproduce this session's screen.
+                    // a poshterity replay reproduce this session's screen.
                     if let Some(rec) = recorder.as_mut() {
                         if rec.output(rec_start.elapsed().as_secs_f64(), &buf[..n]).is_err() {
                             recorder = None; // disable on write error; never kill the session

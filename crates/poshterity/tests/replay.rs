@@ -1,9 +1,9 @@
-//! Integration tests for posh-rec phase 1: parse a `.castx`/`.cast` recording
+//! Integration tests for poshterity phase 1: parse a `.castx`/`.cast` recording
 //! and replay it to a deterministic screen through the public API.
 
-use posh_rec::castx::{write_event, write_header, Event, EventCode, Header, Reader};
-use posh_rec::cli::{replay_source, Dump};
-use posh_rec::Replay;
+use poshterity::castx::{write_event, write_header, Event, EventCode, Header, Reader};
+use poshterity::cli::{replay_source, Dump};
+use poshterity::Replay;
 
 /// A recording built from the phase-0 fixture bytes round-trips through the
 /// writer, reader, and replay to the known screen: "hello " + SGR-red "red",
@@ -14,7 +14,7 @@ fn castx_fixture_replays_to_known_screen() {
         version: 2,
         width: 20,
         height: 5,
-        posh_rec: None,
+        poshterity: None,
     };
     let event = Event {
         time: 0.0,
@@ -30,7 +30,7 @@ fn castx_fixture_replays_to_known_screen() {
     assert!(text.contains("second line"), "{text:?}");
 }
 
-/// A stock asciinema `.cast` v2 (no `posh_rec` block) replays, and `i` (input)
+/// A stock asciinema `.cast` v2 (no `poshterity` block) replays, and `i` (input)
 /// events are recorded-but-ignored on replay.
 #[test]
 fn plain_cast_replays_and_ignores_input() {

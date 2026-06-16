@@ -9,8 +9,8 @@
 
 use std::process::Command;
 
-use posh_rec::assert::{cells_are_bold, cells_are_inverse, cells_are_underline, find_line};
-use posh_rec::player::Player;
+use poshterity::assert::{cells_are_bold, cells_are_inverse, cells_are_underline, find_line};
+use poshterity::player::Player;
 
 const CASTX: &str = concat!(
     env!("CARGO_MANIFEST_DIR"),
@@ -22,13 +22,13 @@ const GOLDEN: &str = concat!(
 );
 
 /// The committed recording replays to the committed golden — the deterministic
-/// analog of the old tmux capture-pane compare, via the `posh-rec` binary.
+/// analog of the old tmux capture-pane compare, via the `poshterity` binary.
 #[test]
 fn vt100_attributes_replay_matches_golden() {
-    let out = Command::new(env!("CARGO_BIN_EXE_posh-rec"))
+    let out = Command::new(env!("CARGO_BIN_EXE_poshterity"))
         .args(["assert", CASTX, "--golden", GOLDEN])
         .output()
-        .expect("run posh-rec assert");
+        .expect("run poshterity assert");
     assert!(
         out.status.success(),
         "golden assert failed:\n{}",

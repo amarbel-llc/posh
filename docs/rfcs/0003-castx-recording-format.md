@@ -3,25 +3,25 @@ status: proposed
 date: 2026-06-13
 ---
 
-# posh-rec `.castx` Terminal Recording Format
+# poshterity `.castx` Terminal Recording Format
 
 ## Abstract
 
 This document specifies `.castx`, the terminal-recording file format produced
-and consumed by posh-rec. `.castx` is a strict superset of the asciinema
+and consumed by poshterity. `.castx` is a strict superset of the asciinema
 `.cast` v2 format: line-delimited JSON with a header object followed by one
 event array per line. It adds two backward-compatible extensions that stock
-asciinema players ignore — a named step-marker event (`m`) and a `posh_rec`
+asciinema players ignore — a named step-marker event (`m`) and a `poshterity`
 header block carrying a format version and the emulator revision a recording
 was produced against. The contract guarantees interoperability in both
-directions: any conforming `.cast` v2 recording replays through posh-rec, and
+directions: any conforming `.cast` v2 recording replays through poshterity, and
 any `.castx` plays in asciinema. Timing is recorded but never replayed as a
 delay — a `.castx` replays to a screen that is a pure function of its bytes,
 which is what makes it usable as a deterministic test oracle.
 
 ## Introduction
 
-posh-rec records a terminal's output byte stream once and replays it through
+poshterity records a terminal's output byte stream once and replays it through
 the in-process `posh_term` emulator, so a recorded program or session can be
 re-rendered and asserted on deterministically — with no live terminal and no
 timing to race (the `tmux capture-pane` + `sleep` pattern that motivates the
@@ -40,8 +40,8 @@ rules already require players to tolerate (unknown event codes and unknown
 header keys), so the superset relationship holds without a version flag day.
 
 This RFC specifies (1) the **document structure** — header and event lines;
-(2) the **standard events** inherited from `.cast` v2; (3) the **posh-rec
-extensions** — the `m` marker event and the `posh_rec` header block; (4) the
+(2) the **standard events** inherited from `.cast` v2; (3) the **poshterity
+extensions** — the `m` marker event and the `poshterity` header block; (4) the
 **interoperability rules** that make the superset relationship normative in
 both directions; and (5) **replay and golden semantics** — how a consumer
 turns a `.castx` into a screen, and the stability rules for golden frames
@@ -49,10 +49,10 @@ anchored on it. It does not specify the posh datagram protocol (RFC 0001), the
 posh-term emulator's rendering behavior, or the asciinema `.cast` v2 format
 itself, which it references normatively.
 
-The reference implementation is the `crates/posh-rec` workspace crate: the
+The reference implementation is the `crates/poshterity` workspace crate: the
 format reader/writer and streaming `Recorder` (`castx.rs`), the step-ratchet
 replayer (`player.rs`), and the golden-frame renderer (`golden.rs`). The
-`posh-rec` binary's `record`, `replay`, `step`, `bless`, and `assert`
+`poshterity` binary's `record`, `replay`, `step`, `bless`, and `assert`
 subcommands, and `posh --record`, all produce or consume this format.
 
 ## Requirements Language
@@ -84,10 +84,10 @@ line is an **event** (a JSON array).
 ### 2. Header
 
 The header is a JSON object. It carries the asciinema v2 fields and MAY carry
-the `posh_rec` extension block (section 4.2).
+the `poshterity` extension block (section 4.2).
 
 ```json
-{"version":2,"width":80,"height":24,"env":{"TERM":"xterm-256color"},"posh_rec":{"v":1,"emu_rev":"0.1.0"}}
+{"version":2,"width":80,"height":24,"env":{"TERM":"xterm-256color"},"poshterity":{"v":1,"emu_rev":"0.1.0"}}
 ```
 
 - `version` (number): the asciinema format version. A producer MUST emit `2`.
@@ -98,9 +98,9 @@ the `posh_rec` extension block (section 4.2).
   columns and rows. A producer MUST emit both. A reader that finds either
   absent MUST substitute a conventional default of 80 columns by 24 rows.
 - `env`, `timestamp`, `title`, `idle_time_limit`, `theme` (asciinema v2
-  optional fields): a producer MAY emit them; a posh-rec reader MUST tolerate
+  optional fields): a producer MAY emit them; a poshterity reader MUST tolerate
   and MAY ignore them. They carry no replay semantics in this specification.
-- `posh_rec` (object): the posh-rec extension block, section 4.2.
+- `poshterity` (object): the poshterity extension block, section 4.2.
 
 ### 3. Standard events
 
@@ -110,7 +110,7 @@ Each event is a JSON array of the form `[time, code, data]`:
   recording. `time` is monotonically non-decreasing across the event stream;
   a producer SHOULD emit events in non-decreasing `time` order. `time` is
   recorded for playback tooling and frame bucketing but, per section 5.1, MUST
-  NOT be replayed as a delay by a posh-rec consumer.
+  NOT be replayed as a delay by a poshterity consumer.
 - `code` (string): the event type. This specification assigns `o`, `i`, `r`
   (this section) and `m` (section 4.1).
 - `data` (string): the event payload, interpreted per `code`.
@@ -136,7 +136,7 @@ The standard `.cast` v2 event codes:
   is already present as `o` events; `i` is retained for fidelity and for
   asciinema playback.
 
-### 4. posh-rec extensions
+### 4. poshterity extensions
 
 The extensions in this section are the only differences between `.castx` and
 `.cast` v2. Both are designed to be invisible to a conforming asciinema player
@@ -159,16 +159,16 @@ The extensions in this section are the only differences between `.castx` and
   with that name at or after the current position.
 - Markers are the stable anchor for golden frames (section 5.4).
 
-#### 4.2 The `posh_rec` header block
+#### 4.2 The `poshterity` header block
 
 ```json
-"posh_rec":{"v":1,"emu_rev":"0.1.0"}
+"poshterity":{"v":1,"emu_rev":"0.1.0"}
 ```
 
-- `v` (number): the posh-rec extension version. This specification defines
+- `v` (number): the poshterity extension version. This specification defines
   `v: 1`. A producer conforming to this specification MUST emit `"v":1`. A
   reader that does not understand a given `v` MUST still replay the standard
-  events (the `posh_rec` block never changes how `o`/`i`/`r` are interpreted);
+  events (the `poshterity` block never changes how `o`/`i`/`r` are interpreted);
   it MAY ignore extension semantics it does not understand.
 - `emu_rev` (string): the emulator revision the recording was produced
   against — `posh_term`'s `version+git-sha` (the version flowed from the
@@ -176,7 +176,7 @@ The extensions in this section are the only differences between `.castx` and
   and `posh_term::emu_rev()`). Earlier producers emitted the bare version with
   no `+git-sha` suffix; readers MUST treat `emu_rev` as an opaque string (it is
   compared, never parsed — see section 5.4). Its semantics are advisory.
-- A `.castx` produced by posh-rec MUST include the `posh_rec` block. A reader
+- A `.castx` produced by poshterity MUST include the `poshterity` block. A reader
   MUST treat its absence as "this is a plain `.cast`" and replay normally
   (section 5.3).
 
@@ -184,7 +184,7 @@ The extensions in this section are the only differences between `.castx` and
 
 #### 5.1 Timing is never a delay
 
-A posh-rec replay consumer MUST NOT sleep, block, or otherwise delay between
+A poshterity replay consumer MUST NOT sleep, block, or otherwise delay between
 events on account of their `time` values. The emulated screen after consuming
 a prefix of the event stream is a pure function of the `o`/`r` events in that
 prefix. This determinism is the property the format exists to provide; a
@@ -211,21 +211,21 @@ nondeterminism the format removes.
 - A `.castx` document MUST be a valid asciinema `.cast` v2 document under
   asciinema's own tolerance rules: its header carries the required v2 fields,
   its events use numeric `time` and string `code`/`data`, and its extensions
-  (`m` events, the `posh_rec` header key) are an extra event code and an extra
+  (`m` events, the `poshterity` header key) are an extra event code and an extra
   header key respectively — both of which a conforming asciinema player
   ignores. Therefore any `.castx` MUST play in asciinema.
-- A posh-rec reader MUST accept any conforming `.cast` v2 document. It MUST
+- A poshterity reader MUST accept any conforming `.cast` v2 document. It MUST
   ignore events whose `code` it does not recognize (forward/foreign
-  extensions) rather than erroring, and MUST treat a missing `posh_rec` block
-  as a plain recording. Therefore any `.cast` v2 MUST replay through posh-rec.
+  extensions) rather than erroring, and MUST treat a missing `poshterity` block
+  as a plain recording. Therefore any `.cast` v2 MUST replay through poshterity.
 - There is no version flag day: the extension version `v` (section 4.2)
-  distinguishes posh-rec revisions, and unknown event codes degrade to
+  distinguishes poshterity revisions, and unknown event codes degrade to
   "ignored" on both sides.
 
 #### 5.4 Golden-frame stability and `emu_rev`
 
 A golden frame is a snapshot of the emulated screen at a chosen position,
-written by `posh-rec bless` and checked by `posh-rec assert`.
+written by `poshterity bless` and checked by `poshterity assert`.
 
 - A golden MUST be anchored on a **named marker** (section 4.1) or a byte
   offset — a producer-controlled, stream-stable position. A golden MUST NOT be
@@ -246,7 +246,7 @@ A minimal `.castx` recording 80x24, clearing the screen, printing bold red
 `\u001b` escape):
 
 ```
-{"version":2,"width":80,"height":24,"posh_rec":{"v":1,"emu_rev":"0.1.0"}}
+{"version":2,"width":80,"height":24,"poshterity":{"v":1,"emu_rev":"0.1.0"}}
 [0.000000,"o","\u001b[H\u001b[J\u001b[1;31mhi\u001b[0m"]
 [0.010000,"m","greeting-shown"]
 [0.500000,"r","100x40"]
@@ -256,7 +256,7 @@ A minimal `.castx` recording 80x24, clearing the screen, printing bold red
 
 - A `.castx` is passive data: replaying it feeds recorded bytes to an
   in-process terminal emulator and inspects the resulting screen. It conveys
-  no capability to the consumer beyond what those bytes render. A posh-rec
+  no capability to the consumer beyond what those bytes render. A poshterity
   replay consumer MUST NOT execute, fetch, or otherwise act on `.castx`
   content other than feeding `o`/`r` events to the emulator and resolving
   markers.
@@ -276,16 +276,16 @@ A minimal `.castx` recording 80x24, clearing the screen, printing bold red
 
 ## Conformance Testing
 
-Conformance tests for this specification live in the `crates/posh-rec` cargo
+Conformance tests for this specification live in the `crates/poshterity` cargo
 suite (the normative home until a cross-implementation `zz-tests_bats/` CLI
 suite exists, consistent with RFC 0001's Conformance Testing). The unit tests
 in `castx.rs`, `player.rs`, and `golden.rs`, and the integration tests under
-`crates/posh-rec/tests/`, exercise the requirements below; they drive the
-`posh-rec` binary via Cargo's `CARGO_BIN_EXE_posh-rec` for CLI-level
+`crates/poshterity/tests/`, exercise the requirements below; they drive the
+`poshterity` binary via Cargo's `CARGO_BIN_EXE_poshterity` for CLI-level
 requirements.
 
 A future cross-implementation suite SHOULD use `bats-emo` binary injection
-(`require_bin POSH_REC posh-rec`) so a non-Rust producer/consumer can run the
+(`require_bin POSHTERITY poshterity`) so a non-Rust producer/consumer can run the
 same tests.
 
 ### Covered Requirements
@@ -293,7 +293,7 @@ same tests.
 | Requirement | Test | Description |
 |---|---|---|
 | §1, line-based parsing; escaped interior newline | `castx::tests` (write/read round-trip) | An `o` payload containing a newline stays one line and round-trips. |
-| §2, header fields + width/height default | `castx::tests` (header read) | Headers with and without `posh_rec`; defaults applied when size absent. |
+| §2, header fields + width/height default | `castx::tests` (header read) | Headers with and without `poshterity`; defaults applied when size absent. |
 | §3, `o`/`r` interpretation; `r` is COLSxROWS | `player::tests`, `cli::tests` | Output renders; a `"40x10"` resize sets 40 columns and 10 rows. |
 | §3, `i` not fed on replay | `tests/replay.rs` | A plain `.cast` with an `i` event replays without the input reaching the screen. |
 | §4.1, marker resolves to the next at/after position | `player::tests`, `tests/step.rs` | `step_to_marker` lands exactly at the named marker. |
@@ -305,17 +305,17 @@ same tests.
 
 - **No flag day.** `.castx` is gated by no version negotiation. A reader that
   predates an extension ignores it (unknown event code, unknown header key);
-  the `posh_rec.v` field distinguishes extension revisions when semantics
-  matter. All four skew combinations (asciinema/posh-rec × producer/consumer)
+  the `poshterity.v` field distinguishes extension revisions when semantics
+  matter. All four skew combinations (asciinema/poshterity × producer/consumer)
   degrade to standard `.cast` v2 behavior, never to corruption.
-- **Extension versioning.** Future posh-rec extensions MUST either be a new
+- **Extension versioning.** Future poshterity extensions MUST either be a new
   ignorable event code / header key (no `v` bump) or, when they change the
-  meaning of existing fields, a `posh_rec.v` increment with this RFC
+  meaning of existing fields, a `poshterity.v` increment with this RFC
   superseded or amended. New event codes MUST remain single characters that a
   conforming asciinema player ignores, preserving the superset contract.
 - **asciinema upstream.** Should asciinema define a `.cast` v3 or assign a new
   event code that collides with `m`, this RFC MUST be revised to preserve the
-  superset relationship (e.g. by re-mapping the marker code); the `posh_rec.v`
+  superset relationship (e.g. by re-mapping the marker code); the `poshterity.v`
   field is the signal for such a revision.
 
 ## References
@@ -333,10 +333,10 @@ same tests.
   (`docs/rfcs/0001-target-grammar-and-capability-table.md`) — the Conformance
   Testing convention (cargo suite as normative home until a `zz-tests_bats`
   CLI suite exists) followed here.
-- posh-rec epic (github #56) and phase issues #57–#61 — the recorder/replayer
+- poshterity epic (github #56) and phase issues #57–#61 — the recorder/replayer
   this format serves; #61 (adoption) records a real mosh emulation byte stream
   as a `.castx` and asserts it deterministically.
-- `crates/posh-rec` — reference implementation: `castx.rs` (reader, writer,
+- `crates/poshterity` — reference implementation: `castx.rs` (reader, writer,
   streaming `Recorder`), `player.rs` (step-ratchet replayer + markers),
-  `golden.rs` (grid/vt golden render), and the `posh-rec` binary subcommands
+  `golden.rs` (grid/vt golden render), and the `poshterity` binary subcommands
   `record`/`replay`/`step`/`bless`/`assert` plus `posh --record`.

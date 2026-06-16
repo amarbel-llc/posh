@@ -1,5 +1,5 @@
 [package]
-name = "posh-rec"
+name = "poshterity"
 version.workspace = true # inert placeholder; real version flows from version.env (see root Cargo.toml)
 description = "Deterministic, step-ratcheted terminal recorder/replayer built on posh-term"
 edition.workspace = true

@@ -7,7 +7,7 @@
 #
 # --deploy builds posht and scp's it to host:DEST, then prints DEST and exits
 # WITHOUT launching — for callers that drive the launch themselves (e.g. the
-# debug-record-posht recipe, which records the launch through posh-rec). The
+# debug-record-posht recipe, which records the launch through poshterity). The
 # remote file persists at DEST.
 #
 # --via selects how posht is launched on the host:
@@ -110,7 +110,7 @@ fi
 echo ">> copying to $host:$dest" >&2
 scp -q "$bin" "$host:$dest"
 
-# --deploy: the caller drives the launch (e.g. records it through posh-rec).
+# --deploy: the caller drives the launch (e.g. records it through poshterity).
 # Report the remote path on stdout and stop here.
 if [ -n "$deploy_dest" ]; then
   echo "$dest"

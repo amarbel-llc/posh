@@ -268,7 +268,7 @@ debug-cargo *ARGS:
 debug-perf-compose:
     nix develop --command cargo test -p posh --release remote::perf_probe -- --ignored --nocapture
 
-# Prove posh-rec replay determinism (posh-rec phase 5, #61): `posh-rec assert`
+# Prove poshterity replay determinism (poshterity phase 5, #61): `poshterity assert`
 # the committed VT100 emulation fixture against its golden N times (default 50)
 # and fail loudly on the first mismatch. Zero flakes is the headline of the
 # deterministic replacement for the mosh tests' tmux capture-pane + sleep race.
@@ -276,10 +276,10 @@ debug-perf-compose:
 debug-replay-loop n="50":
     nix develop --command bash -c ' \
       set -euo pipefail; \
-      cargo build -q -p posh-rec; \
-      f=crates/posh-rec/tests/fixtures/emulation-attributes-vt100; \
+      cargo build -q -p poshterity; \
+      f=crates/poshterity/tests/fixtures/emulation-attributes-vt100; \
       for i in $(seq 1 {{ n }}); do \
-        ./target/debug/posh-rec assert "$f.castx" --golden "$f.grid" \
+        ./target/debug/poshterity assert "$f.castx" --golden "$f.grid" \
           || { echo "FLAKE at iteration $i"; exit 1; }; \
       done; \
       echo "{{ n }}/{{ n }} deterministic, zero flakes"'
@@ -340,12 +340,12 @@ debug-verify-term:
 # chasing drawing bugs. TRANSPORT is `posh` (posht inside a persistent posh
 # roaming session) or `ssh` (plain `ssh -t`, no posh in the loop — the
 # reference render). HOST is the remote ([user@]host); extra ARGS go to posht.
-# posht is cross-built and scp'd to /tmp/posht-rec on HOST each run; posh-rec
-# records its launch over the transport (`posh-rec record --via`).
+# posht is cross-built and scp'd to /tmp/posht-rec on HOST each run; poshterity
+# records its launch over the transport (`poshterity record --via`).
 # Run it in the terminal you want to test (e.g. kitty); the session is teed
-# live AND recorded by posh-rec. Quit posht normally to finalize the file.
+# live AND recorded by poshterity. Quit posht normally to finalize the file.
 # Usage: just debug-record-posht posh box   /   just debug-record-posht ssh box
-# Then diff the two .castx (e.g. `posh-rec` replay/dump). Debug-only; the
+# Then diff the two .castx (e.g. `poshterity` replay/dump). Debug-only; the
 # hermetic gate is build-rust/build-go.
 [group("debug")]
 debug-record-posht transport host *ARGS:
@@ -364,11 +364,11 @@ debug-record-posht transport host *ARGS:
         ;;
     esac
     # Build the client tools: posh (the roaming transport, used by --via posh)
-    # and posh-rec (the recorder). target/debug supplies both on PATH.
-    nix develop --command cargo build -p posh -p posh-rec
+    # and poshterity (the recorder). target/debug supplies both on PATH.
+    nix develop --command cargo build -p posh -p poshterity
     export PATH="$PWD/target/debug:$PATH"
     # Deploy posht to a stable remote path (static Go binary, cross-built for the
-    # host's arch). posh-rec then records its launch over the transport, so the
+    # host's arch). poshterity then records its launch over the transport, so the
     # recorder stays pure — it never touches go/scp itself.
     remote=/tmp/posht-rec
     nix shell nixpkgs#go --command \
@@ -379,7 +379,7 @@ debug-record-posht transport host *ARGS:
     # NOT fail the recipe — the recording is the artifact. Only a missing/empty
     # output file is a real failure.
     set +e
-    posh-rec record --out "$out" --via "$via" --host "$target" -- "$remote" {{ ARGS }}
+    poshterity record --out "$out" --via "$via" --host "$target" -- "$remote" {{ ARGS }}
     rc=$?
     set -e
     if [ ! -s "$out" ]; then

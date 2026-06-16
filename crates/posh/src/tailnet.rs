@@ -10,7 +10,7 @@
 use std::net::IpAddr;
 use std::process::Command;
 
-use posh_rec::json::{self, Value};
+use poshterity::json::{self, Value};
 
 /// A tailnet node (self or a peer): the names it answers to and its tailnet IPs.
 #[derive(Debug, Clone, PartialEq)]

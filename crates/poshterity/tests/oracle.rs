@@ -1,13 +1,13 @@
 //! The test-oracle scenario the phase exists for: step to a named marker, then
 //! assert content and color at that frame via the helpers — no live terminal.
 
-use posh_rec::assert::{cells_have_fg, cells_have_bg, find_line};
-use posh_rec::player::Player;
-use posh_rec::Color;
+use poshterity::assert::{cells_have_fg, cells_have_bg, find_line};
+use poshterity::player::Player;
+use poshterity::Color;
 
 // "ready " (cols 0-5) then green "GO" (cols 6-7) in SGR 32 = indexed 2, a
 // marker, then " done" which must NOT be on screen at the marker.
-const DOC: &str = "{\"version\":2,\"width\":20,\"height\":3,\"posh_rec\":{\"v\":1,\"emu_rev\":\"0.1.0\"}}\n\
+const DOC: &str = "{\"version\":2,\"width\":20,\"height\":3,\"poshterity\":{\"v\":1,\"emu_rev\":\"0.1.0\"}}\n\
                    [0.0,\"o\",\"ready \"]\n\
                    [0.1,\"o\",\"\\u001b[32mGO\\u001b[0m\"]\n\
                    [0.2,\"m\",\"go-shown\"]\n\

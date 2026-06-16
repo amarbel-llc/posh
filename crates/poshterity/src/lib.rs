@@ -1,10 +1,10 @@
-//! posh-rec: a deterministic, step-ratcheted terminal recorder/replayer
+//! poshterity: a deterministic, step-ratcheted terminal recorder/replayer
 //! built on the [`posh_term`] emulator.
 //!
 //! The problem it solves: terminal-emulation tests are flaky when they
 //! drive a *live* terminal and race a screen capture against
 //! non-deterministic redraw (the classic `tmux capture-pane` + `sleep`
-//! pattern). posh-rec replays a recorded output byte stream through an
+//! pattern). poshterity replays a recorded output byte stream through an
 //! *in-process* [`posh_term::Terminal`] and lets callers inspect exact
 //! screen state — the screen is a pure function of the bytes fed, so there
 //! is no timing to race.
@@ -13,7 +13,7 @@
 //! deterministic test proving the core in CI. The recording file format
 //! (`.castx`, an asciinema `.cast` v2 superset), the step-ratchet `Player`
 //! with its multiple granularities, the assertion/golden surface, and the
-//! `posh-rec` CLI all build on this seam in later phases. See
+//! `poshterity` CLI all build on this seam in later phases. See
 //! `docs/features/` for the feature record once it lands.
 #![forbid(unsafe_code)]
 

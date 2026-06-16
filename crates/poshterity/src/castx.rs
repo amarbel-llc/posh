@@ -1,10 +1,10 @@
 //! The `.castx` recording format: a strict superset of asciinema `.cast` v2.
 //!
 //! Line-delimited JSON. The first non-blank line is a header object; each
-//! subsequent line is an event array `[time, code, data]`. posh-rec adds two
-//! extensions that stock asciinema players ignore: a `posh_rec` header key and
+//! subsequent line is an event array `[time, code, data]`. poshterity adds two
+//! extensions that stock asciinema players ignore: a `poshterity` header key and
 //! an `m` (named step marker) event letter. Any plain `.cast` v2 therefore
-//! replays through posh-rec, and any `.castx` plays in `asciinema`.
+//! replays through poshterity, and any `.castx` plays in `asciinema`.
 //!
 //! Line-based reading is safe because the writer escapes every interior
 //! newline as `\n` (via [`json_string`]): the only raw `0x0a` in a recording
@@ -13,7 +13,7 @@
 use crate::json::{self, Value};
 
 /// A parsed recording header. `env` and any other asciinema metadata are
-/// parsed-and-ignored in phase 1; only the fields posh-rec acts on are kept.
+/// parsed-and-ignored in phase 1; only the fields poshterity acts on are kept.
 #[derive(Debug, Clone, PartialEq)]
 pub struct Header {
     pub version: u16,
@@ -21,14 +21,14 @@ pub struct Header {
     pub width: u16,
     /// Terminal height in rows.
     pub height: u16,
-    /// The posh-rec extension block, or `None` for a plain asciinema `.cast`.
-    pub posh_rec: Option<PoshRec>,
+    /// The poshterity extension block, or `None` for a plain asciinema `.cast`.
+    pub poshterity: Option<Poshterity>,
 }
 
-/// The posh-rec header extension: format version and the emulator revision the
+/// The poshterity header extension: format version and the emulator revision the
 /// recording was produced against (for golden-frame auditing).
 #[derive(Debug, Clone, PartialEq)]
-pub struct PoshRec {
+pub struct Poshterity {
     pub v: u16,
     pub emu_rev: String,
 }
@@ -43,7 +43,7 @@ pub enum EventCode {
     Input,
     /// `r` — resize, with `"COLSxROWS"` data.
     Resize,
-    /// `m` — posh-rec named step marker (becomes meaningful in phase 3).
+    /// `m` — poshterity named step marker (becomes meaningful in phase 3).
     Marker,
     /// Any other letter (read-compat; ignored on replay).
     Unknown(char),
@@ -146,17 +146,17 @@ fn parse_header(v: &Value) -> Result<Header, String> {
     // them; the header is the authoritative size source for replay.
     let width = v.get("width").and_then(Value::as_u16).unwrap_or(80);
     let height = v.get("height").and_then(Value::as_u16).unwrap_or(24);
-    let posh_rec = v.get("posh_rec").and_then(parse_posh_rec);
+    let poshterity = v.get("poshterity").and_then(parse_poshterity);
     Ok(Header {
         version,
         width,
         height,
-        posh_rec,
+        poshterity,
     })
 }
 
-fn parse_posh_rec(v: &Value) -> Option<PoshRec> {
-    Some(PoshRec {
+fn parse_poshterity(v: &Value) -> Option<Poshterity> {
+    Some(Poshterity {
         v: v.get("v").and_then(Value::as_u16)?,
         emu_rev: v.get("emu_rev").and_then(Value::as_str)?.to_string(),
     })
@@ -179,8 +179,8 @@ pub fn write_header(h: &Header) -> String {
         "{{\"version\":{},\"width\":{},\"height\":{}",
         h.version, h.width, h.height
     );
-    if let Some(pr) = &h.posh_rec {
-        s.push_str(&format!(",\"posh_rec\":{{\"v\":{},\"emu_rev\":", pr.v));
+    if let Some(pr) = &h.poshterity {
+        s.push_str(&format!(",\"poshterity\":{{\"v\":{},\"emu_rev\":", pr.v));
         s.push_str(&json_string(&pr.emu_rev));
         s.push('}');
     }
@@ -209,7 +209,7 @@ pub fn format_time(t: f64) -> String {
 
 /// JSON-escape a string. A byte-for-byte clone of posh's `json_string`
 /// (crates/posh/src/session/mod.rs); its `json_string_escaping` test is the
-/// conformance oracle. Duplicated, not shared, because posh-rec must not depend
+/// conformance oracle. Duplicated, not shared, because poshterity must not depend
 /// on the posh binary crate (per ADR-0003 — small reassemblers stay separate).
 pub fn json_string(s: &str) -> String {
     let mut out = String::with_capacity(s.len() + 2);
@@ -361,25 +361,25 @@ mod tests {
     use super::*;
 
     #[test]
-    fn reads_minimal_header_without_posh_rec() {
+    fn reads_minimal_header_without_poshterity() {
         let mut r = Reader::new(r#"{"version":2,"width":80,"height":24}"#);
         let h = r.header().unwrap();
         assert_eq!(h.version, 2);
         assert_eq!(h.width, 80);
         assert_eq!(h.height, 24);
-        assert_eq!(h.posh_rec, None);
+        assert_eq!(h.poshterity, None);
         assert!(r.next_event().is_none());
     }
 
     #[test]
-    fn reads_header_with_posh_rec_block() {
+    fn reads_header_with_poshterity_block() {
         let mut r = Reader::new(
-            r#"{"version":2,"width":100,"height":40,"posh_rec":{"v":1,"emu_rev":"0.1.0"}}"#,
+            r#"{"version":2,"width":100,"height":40,"poshterity":{"v":1,"emu_rev":"0.1.0"}}"#,
         );
         let h = r.header().unwrap();
         assert_eq!(
-            h.posh_rec,
-            Some(PoshRec {
+            h.poshterity,
+            Some(Poshterity {
                 v: 1,
                 emu_rev: "0.1.0".to_string()
             })
@@ -441,7 +441,7 @@ mod tests {
             version: 2,
             width: 80,
             height: 24,
-            posh_rec: Some(PoshRec {
+            poshterity: Some(Poshterity {
                 v: 1,
                 emu_rev: "0.1.0".to_string(),
             }),
@@ -498,7 +498,7 @@ mod tests {
             version: 2,
             width: 80,
             height: 24,
-            posh_rec: None,
+            poshterity: None,
         }
     }
 
@@ -542,7 +542,7 @@ mod tests {
             version: 2,
             width: 80,
             height: 24,
-            posh_rec: Some(PoshRec {
+            poshterity: Some(Poshterity {
                 v: 1,
                 emu_rev: "0.1.0".to_string(),
             }),

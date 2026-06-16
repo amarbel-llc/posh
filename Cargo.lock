@@ -141,8 +141,8 @@ dependencies = [
  "aes-gcm",
  "libc",
  "posh-build",
- "posh-rec",
  "posh-term",
+ "poshterity",
 ]
 
 [[package]]
@@ -150,19 +150,19 @@ name = "posh-build"
 version = "0.0.0"
 
 [[package]]
-name = "posh-rec"
+name = "posh-term"
+version = "0.0.0"
+dependencies = [
+ "posh-build",
+]
+
+[[package]]
+name = "poshterity"
 version = "0.0.0"
 dependencies = [
  "libc",
  "posh-build",
  "posh-term",
-]
-
-[[package]]
-name = "posh-term"
-version = "0.0.0"
-dependencies = [
- "posh-build",
 ]
 
 [[package]]

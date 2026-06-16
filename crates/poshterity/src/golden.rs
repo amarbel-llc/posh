@@ -53,7 +53,7 @@ pub fn golden_emu_rev(golden: &str) -> Option<&str> {
 fn render_grid(term: &Terminal, emu_rev: &str) -> String {
     let scr = term.screen();
     let mut s = String::new();
-    s.push_str("# posh-rec grid golden v1\n");
+    s.push_str("# poshterity grid golden v1\n");
     s.push_str(&format!("# emu_rev: {emu_rev}\n"));
     s.push_str(&format!("# size: {}x{}\n", scr.cols(), scr.rows()));
 

@@ -1,18 +1,18 @@
-//! End-to-end test for `posh-rec record`: exec the real binary to record a
+//! End-to-end test for `poshterity record`: exec the real binary to record a
 //! deterministic command under a PTY, then replay the produced `.castx`
 //! (phase 1) and assert it reproduces the expected screen.
 
 use std::process::{Command, Stdio};
 
-use posh_rec::cli::{replay_source, Dump};
+use poshterity::cli::{replay_source, Dump};
 
 #[test]
 fn record_produces_a_castx_that_replays_to_the_screen() {
-    let out = std::env::temp_dir().join(format!("posh-rec-record-{}.castx", std::process::id()));
+    let out = std::env::temp_dir().join(format!("poshterity-record-{}.castx", std::process::id()));
 
     // stdin is /dev/null (not a tty) -> raw mode is skipped, input loop sees
     // EOF; the child's PTY output is still teed and recorded.
-    let status = Command::new(env!("CARGO_BIN_EXE_posh-rec"))
+    let status = Command::new(env!("CARGO_BIN_EXE_poshterity"))
         .args([
             "record",
             "--out",
@@ -25,7 +25,7 @@ fn record_produces_a_castx_that_replays_to_the_screen() {
         .stdout(Stdio::null())
         .stderr(Stdio::null())
         .status()
-        .expect("spawn posh-rec");
+        .expect("spawn poshterity");
     assert!(status.success(), "record exited unsuccessfully: {status:?}");
 
     let doc = std::fs::read_to_string(&out).expect("read recording");

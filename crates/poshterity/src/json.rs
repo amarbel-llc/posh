@@ -360,13 +360,13 @@ mod tests {
     #[test]
     fn parses_nested_header_shape() {
         let v = parse(
-            r#"{"version":2,"width":80,"height":24,"env":{"TERM":"xterm"},"posh_rec":{"v":1,"emu_rev":"0.1.0"}}"#,
+            r#"{"version":2,"width":80,"height":24,"env":{"TERM":"xterm"},"poshterity":{"v":1,"emu_rev":"0.1.0"}}"#,
         )
         .unwrap();
         assert_eq!(v.get("version").and_then(Value::as_u16), Some(2));
         assert_eq!(v.get("width").and_then(Value::as_u16), Some(80));
         assert_eq!(
-            v.get("posh_rec")
+            v.get("poshterity")
                 .and_then(|p| p.get("emu_rev"))
                 .and_then(Value::as_str),
             Some("0.1.0")

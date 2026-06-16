@@ -19,7 +19,7 @@ zmx (Zig) lives in its own repository.
 crates/
   posh-term/   standalone terminal emulation library (no dependencies)
   posh/        the posh binary
-  posh-rec/    deterministic terminal recorder/replayer (lib + posh-rec bin; posh rec)
+  poshterity/    deterministic terminal recorder/replayer (lib + poshterity bin; posh rec)
 doc/           scdoc man-page sources (man posh, posh-server, posh-client, posh(7))
 docs/          ADRs, RFCs, feature records (FDRs), plans, and the manual test plan
 posht/         interactive terminal-capability test (Go; nix build .#posht)
@@ -209,26 +209,26 @@ zlib; no utmp/motd integration. The full parity contract — what is
 mirrored, what is deliberately dropped, and the open gaps — is FDR 0003
 (`docs/features/`), with the living checklist in issue #44.
 
-### crates/posh-rec
+### crates/poshterity
 
 A deterministic terminal recorder/replayer built on `posh-term`: replay a
 recorded output byte stream through the in-process emulator and inspect the
 exact screen, with no live terminal and no timing to race (the
 `tmux capture-pane` + `sleep` flake that motivates it). Depends only on
-`posh-term`; surfaced as the standalone `posh-rec` binary and as `posh rec`.
+`posh-term`; surfaced as the standalone `poshterity` binary and as `posh rec`.
 
 ```
-posh-rec record [--out f.castx] -- <cmd>       # record a command under a PTY
+poshterity record [--out f.castx] -- <cmd>       # record a command under a PTY
 posh --record f.castx <session>                # record a live posh session
-posh-rec replay <file> [--dump text|vt|flat]   # or: posh rec replay ...
-posh-rec step <file> --by change --n 3         # step-debug, dump each screen
-posh-rec bless  <file> --golden g --at K       # write a golden-frame snapshot
-posh-rec assert <file> --golden g --at K       # check it (CI gate)
+poshterity replay <file> [--dump text|vt|flat]   # or: posh rec replay ...
+poshterity step <file> --by change --n 3         # step-debug, dump each screen
+poshterity bless  <file> --golden g --at K       # write a golden-frame snapshot
+poshterity assert <file> --golden g --at K       # check it (CI gate)
 ```
 
 The recording format is `.castx`, a strict superset of asciinema `.cast` v2
-(standard `o`/`i`/`r` events plus an ignorable `m` marker and a `posh_rec`
-header block), so any `.cast` replays through posh-rec and any `.castx` plays
+(standard `o`/`i`/`r` events plus an ignorable `m` marker and a `poshterity`
+header block), so any `.cast` replays through poshterity and any `.castx` plays
 in `asciinema`. `step` advances by an emulator-defined granularity
 (`byte`/`escape`/`write`/`change`/`frame`/`marker`) and dumps the intermediate
 screen — a deterministic VT100 frame debugger. `bless`/`assert` snapshot the

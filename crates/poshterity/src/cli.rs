@@ -1,4 +1,4 @@
-//! The `posh-rec` command-line surface (also reachable as `posh rec`).
+//! The `poshterity` command-line surface (also reachable as `posh rec`).
 //!
 //! `replay` feeds a whole recording through the in-process emulator and dumps
 //! the final screen; `step` advances by discrete emulator-defined steps (the
@@ -36,11 +36,11 @@ impl Dump {
 
 const USAGE: &str = "\
 usage:
-  posh-rec replay <file> [--to-marker NAME] [--dump text|vt|flat]
-  posh-rec step <file> (--by byte|escape|write|change|frame|marker [--n N]
+  poshterity replay <file> [--to-marker NAME] [--dump text|vt|flat]
+  poshterity step <file> (--by byte|escape|write|change|frame|marker [--n N]
                         | --to-marker NAME) [--frame-gap SECS] [--dump ...]
-  posh-rec bless <file> --golden <path> [--at MARKER] [--kind grid|vt|flat]
-  posh-rec assert <file> --golden <path> [--at MARKER] [--kind ...]
+  poshterity bless <file> --golden <path> [--at MARKER] [--kind grid|vt|flat]
+  poshterity assert <file> --golden <path> [--at MARKER] [--kind ...]
                   [--check-emu-rev]
 
 Replay a .castx / asciinema .cast v2 recording through the in-process
@@ -49,8 +49,8 @@ discrete steps; `bless` writes a golden-frame snapshot and `assert` checks
 one (the CI gate). Default --dump text, --kind grid. Timing is never
 replayed as sleeps.";
 
-/// Run the posh-rec CLI over `args` — the arguments after the program name
-/// (for the `posh-rec` bin) or after the `rec` subcommand (for `posh rec`).
+/// Run the poshterity CLI over `args` — the arguments after the program name
+/// (for the `poshterity` bin) or after the `rec` subcommand (for `posh rec`).
 /// Returns a human-readable error string on failure.
 pub fn run(args: &[String]) -> Result<(), String> {
     match args.first().map(String::as_str) {
@@ -63,10 +63,10 @@ pub fn run(args: &[String]) -> Result<(), String> {
             Ok(())
         }
         Some("version" | "-V" | "--version") => {
-            // posh-rec's own provenance (version + git sha), flowed by build.rs
+            // poshterity's own provenance (version + git sha), flowed by build.rs
             // (github #71). Distinct from the emulator's emu_rev stamped into
             // recordings. See eng-versioning(7).
-            println!("posh-rec {} ({})", env!("POSH_VERSION"), env!("POSH_GIT_SHA"));
+            println!("poshterity {} ({})", env!("POSH_VERSION"), env!("POSH_GIT_SHA"));
             Ok(())
         }
         Some(other) => Err(format!("unknown subcommand {other:?}\n\n{USAGE}")),
@@ -189,7 +189,7 @@ fn run_step(args: &[String]) -> Result<(), String> {
     // Report where the step landed on stderr, leaving stdout for the dump.
     let pos = player.position();
     eprintln!(
-        "posh-rec: byte {} · gen {} · marker {} · t {:.3}",
+        "poshterity: byte {} · gen {} · marker {} · t {:.3}",
         pos.byte_offset,
         pos.generation,
         pos.marker.as_deref().unwrap_or("-"),
@@ -286,7 +286,7 @@ fn run_bless(args: &[String]) -> Result<(), String> {
     let emu = player.emu_rev().unwrap_or("unknown");
     let rendered = golden::render(player.terminal(), a.kind, emu);
     std::fs::write(a.golden, rendered).map_err(|e| format!("{}: {e}", a.golden))?;
-    eprintln!("posh-rec: blessed {} ({:?})", a.golden, a.kind);
+    eprintln!("poshterity: blessed {} ({:?})", a.golden, a.kind);
     Ok(())
 }
 
@@ -301,7 +301,7 @@ fn run_assert(args: &[String]) -> Result<(), String> {
         if let Some(golden_emu) = golden::golden_emu_rev(&stored) {
             if golden_emu != emu {
                 eprintln!(
-                    "posh-rec: warning: golden blessed under emu_rev {golden_emu:?}, \
+                    "poshterity: warning: golden blessed under emu_rev {golden_emu:?}, \
                      recording is {emu:?} — regen may be due"
                 );
             }
@@ -312,7 +312,7 @@ fn run_assert(args: &[String]) -> Result<(), String> {
         Ok(())
     } else {
         eprint!(
-            "posh-rec: golden mismatch ({}):\n{}",
+            "poshterity: golden mismatch ({}):\n{}",
             a.golden,
             golden::diff(&stored, &fresh, player.terminal(), a.kind)
         );

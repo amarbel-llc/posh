@@ -68,7 +68,7 @@ fn run() -> Result<()> {
             "--record" => {
                 // Tee the session's PTY output into a .castx recording. Travels
                 // as an env var (like --no-init) so it survives the daemon's
-                // double-fork; daemon_main opens it. posh-rec(1) replays it.
+                // double-fork; daemon_main opens it. poshterity(1) replays it.
                 let file = argv
                     .get(i + 1)
                     .ok_or_else(|| Error::from("--record requires a value"))?
@@ -159,9 +159,9 @@ fn run() -> Result<()> {
         "server" => cmd_server(args),
         "client" => cmd_client(args),
         "ssh" => cmd_ssh(args),
-        // `posh rec ...` == the standalone `posh-rec` binary: deterministic
-        // recording replay (posh-rec owns the logic; this is just an alias).
-        "rec" => posh_rec::cli::run(args).map_err(Error::from),
+        // `posh rec ...` == the standalone `poshterity` binary: deterministic
+        // recording replay (poshterity owns the logic; this is just an alias).
+        "rec" => poshterity::cli::run(args).map_err(Error::from),
         name if !name.starts_with('-') => match target::Target::parse(name) {
             // Bare `posh <name>` attaches (creating the session if needed).
             target::Target::LocalSession { .. } => cmd_attach(&group, rest),
@@ -442,7 +442,7 @@ GLOBAL OPTIONS
     --record FILE
         Tee this session's PTY output into a .castx recording (also
         $POSH_RECORD_FILE). Replay it deterministically with
-        `posh-rec replay FILE` / `posh rec replay FILE`.
+        `poshterity replay FILE` / `posh rec replay FILE`.
 
 SESSION COMMANDS (local persistence)
     attach <name> [command...] [--detach]      (alias: a)
@@ -521,8 +521,8 @@ TOOLS
         replayed as sleeps). `replay` prints the final screen; `step`
         advances by byte/escape/write/change/frame/marker; `bless`/`assert`
         write and check golden-frame snapshots (a deterministic
-        capture-pane). Also the standalone `posh-rec` binary, which
-        additionally records (`posh-rec record -- <cmd>`).
+        capture-pane). Also the standalone `poshterity` binary, which
+        additionally records (`poshterity record -- <cmd>`).
 
 ENVIRONMENT
     POSH_DIR        Socket directory (default: $XDG_RUNTIME_DIR/posh, then

@@ -1,27 +1,27 @@
-//! `posh-rec record [--out f.castx] -- <cmd> [args...]`: spawn a command under
+//! `poshterity record [--out f.castx] -- <cmd> [args...]`: spawn a command under
 //! a PTY, tee its output to the terminal AND to a `.castx` recording.
 //!
-//! This is the only part of posh-rec that needs PTY/libc FFI, so it lives in
+//! This is the only part of poshterity that needs PTY/libc FFI, so it lives in
 //! the **binary** (declared `mod record;` in `main.rs`, never in `lib.rs`),
 //! keeping the `#![forbid(unsafe_code)]` library pure. The unsafe syscall
 //! patterns mirror the posh binary's `crates/posh/src/pty.rs` (a separate
 //! crate, so an own copy — not a shared module — per ADR-0003). Serialization
-//! is the safe library's [`posh_rec::castx::Recorder`].
+//! is the safe library's [`poshterity::castx::Recorder`].
 
 use std::os::fd::RawFd;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::time::Instant;
 
-use posh_rec::castx::{Header, PoshRec, Recorder};
+use poshterity::castx::{Header, Poshterity, Recorder};
 
 const STDIN_FD: RawFd = 0;
 const STDOUT_FD: RawFd = 1;
 
 const USAGE: &str = "\
-usage: posh-rec record [--out FILE] [--via posh|ssh --host HOST] -- <cmd> [args...]
+usage: poshterity record [--out FILE] [--via posh|ssh --host HOST] -- <cmd> [args...]
 
 Spawn <cmd> under a PTY, tee its output to the terminal and to a .castx
-recording (default --out recording.castx). Replay it with `posh-rec replay`.
+recording (default --out recording.castx). Replay it with `poshterity replay`.
 
 With --via/--host the command is run over a remote transport, for capturing a
 remote session's client-side rendering (diff a posh vs ssh recording to localize
@@ -40,7 +40,7 @@ enum Via {
     Ssh,
 }
 
-/// Run `posh-rec record`. Returns the child's exit code on success.
+/// Run `poshterity record`. Returns the child's exit code on success.
 pub fn run(args: &[String]) -> Result<i32, String> {
     let (out_path, command) = parse_args(args)?;
 
@@ -54,7 +54,7 @@ pub fn run(args: &[String]) -> Result<i32, String> {
         version: 2,
         width: cols,
         height: rows,
-        posh_rec: Some(PoshRec {
+        poshterity: Some(Poshterity {
             v: 1,
             emu_rev: posh_term::emu_rev(),
         }),
@@ -76,7 +76,7 @@ pub fn run(args: &[String]) -> Result<i32, String> {
     let _ = rec.finish();
     drop(raw); // restore the terminal before printing
 
-    eprintln!("posh-rec: recorded → {out_path}");
+    eprintln!("poshterity: recorded → {out_path}");
     // Prefer the child's real exit status; fall back to the loop's view.
     Ok(if status >= 0 { status } else { code })
 }

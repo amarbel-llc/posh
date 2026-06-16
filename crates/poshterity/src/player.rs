@@ -1,6 +1,6 @@
 //! The step-ratchet [`Player`]: advance a replay by discrete,
 //! emulator-defined steps and inspect the screen at each. The heart of
-//! posh-rec — a deterministic VT100 frame debugger.
+//! poshterity — a deterministic VT100 frame debugger.
 //!
 //! Each step granularity is derived from a signal `posh_term` already exposes
 //! (`mid_escape()`, `generation()`) or a boundary the recording carries (`o`
@@ -82,7 +82,7 @@ pub struct Player {
     /// Index of the next resize not yet applied.
     next_resize: usize,
     frame_gap: f64,
-    /// The emulator revision the recording was produced against (`posh_rec`
+    /// The emulator revision the recording was produced against (`poshterity`
     /// header), for golden auditing.
     emu_rev: Option<String>,
 }
@@ -92,7 +92,7 @@ impl Player {
     pub fn from_source(src: &str) -> Result<Player, String> {
         let mut reader = Reader::new(src);
         let header = reader.header()?;
-        let emu_rev = header.posh_rec.as_ref().map(|p| p.emu_rev.clone());
+        let emu_rev = header.poshterity.as_ref().map(|p| p.emu_rev.clone());
 
         let mut flat = Vec::new();
         let mut writes = Vec::new();
@@ -137,7 +137,7 @@ impl Player {
         self
     }
 
-    /// The `emu_rev` from the recording's `posh_rec` header, if present.
+    /// The `emu_rev` from the recording's `poshterity` header, if present.
     pub fn emu_rev(&self) -> Option<&str> {
         self.emu_rev.as_deref()
     }

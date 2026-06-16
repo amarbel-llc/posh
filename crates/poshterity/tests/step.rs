@@ -1,4 +1,4 @@
-//! CLI wiring for the step-ratchet Player: exec the real `posh-rec` binary
+//! CLI wiring for the step-ratchet Player: exec the real `poshterity` binary
 //! against a hand-written `.castx` (no PTY needed) and check `step` / `replay
 //! --to-marker` dump the expected intermediate screens.
 
@@ -11,19 +11,19 @@ const FIXTURE: &str = "{\"version\":2,\"width\":20,\"height\":3}\n\
 
 fn write_fixture(tag: &str) -> std::path::PathBuf {
     let path =
-        std::env::temp_dir().join(format!("posh-rec-step-{}-{tag}.castx", std::process::id()));
+        std::env::temp_dir().join(format!("poshterity-step-{}-{tag}.castx", std::process::id()));
     std::fs::write(&path, FIXTURE).unwrap();
     path
 }
 
 fn run(args: &[&str]) -> String {
-    let out = Command::new(env!("CARGO_BIN_EXE_posh-rec"))
+    let out = Command::new(env!("CARGO_BIN_EXE_poshterity"))
         .args(args)
         .output()
-        .expect("run posh-rec");
+        .expect("run poshterity");
     assert!(
         out.status.success(),
-        "posh-rec {args:?} failed; stderr: {}",
+        "poshterity {args:?} failed; stderr: {}",
         String::from_utf8_lossy(&out.stderr)
     );
     String::from_utf8(out.stdout).unwrap()

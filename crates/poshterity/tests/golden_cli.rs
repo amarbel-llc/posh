@@ -4,20 +4,20 @@
 use std::process::Command;
 
 // "red" (cols 0-2) in SGR 31 = indexed 1, then " ok", and a marker.
-const DOC: &str = "{\"version\":2,\"width\":20,\"height\":2,\"posh_rec\":{\"v\":1,\"emu_rev\":\"0.1.0\"}}\n\
+const DOC: &str = "{\"version\":2,\"width\":20,\"height\":2,\"poshterity\":{\"v\":1,\"emu_rev\":\"0.1.0\"}}\n\
                    [0.0,\"o\",\"\\u001b[31mred\\u001b[0m ok\"]\n\
                    [0.1,\"m\",\"shown\"]\n";
 
 fn bin() -> &'static str {
-    env!("CARGO_BIN_EXE_posh-rec")
+    env!("CARGO_BIN_EXE_poshterity")
 }
 
 #[test]
 fn bless_then_assert_round_trips_and_regression_fails() {
     let dir = std::env::temp_dir();
     let pid = std::process::id();
-    let castx = dir.join(format!("posh-rec-golden-{pid}.castx"));
-    let golden = dir.join(format!("posh-rec-golden-{pid}.golden"));
+    let castx = dir.join(format!("poshterity-golden-{pid}.castx"));
+    let golden = dir.join(format!("poshterity-golden-{pid}.golden"));
     std::fs::write(&castx, DOC).unwrap();
     let (c, g) = (castx.to_str().unwrap(), golden.to_str().unwrap());
 
