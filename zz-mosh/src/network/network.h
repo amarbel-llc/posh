@@ -46,15 +46,16 @@
 #include <sys/socket.h>
 
 #include "src/crypto/crypto.h"
+#include "src/network/timing.h"
 
 using namespace Crypto;
 
 namespace Network {
 static const unsigned int MOSH_PROTOCOL_VERSION = 2; /* bumped for echo-ack */
 
-uint64_t timestamp( void );
-uint16_t timestamp16( void );
-uint16_t timestamp_diff( uint16_t tsnew, uint16_t tsold );
+/* timestamp(), timestamp16(), timestamp_diff(): declared in
+   src/network/timing.h (included above) so the predictive-echo overlay can use
+   the clock without the crypto/protobuf transport stack -- posh ADR 0004. */
 
 class NetworkException : public std::exception
 {

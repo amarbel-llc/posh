@@ -33,8 +33,7 @@
 #ifndef TERMINAL_OVERLAY_HPP
 #define TERMINAL_OVERLAY_HPP
 
-#include "src/network/network.h"
-#include "src/network/transportsender.h"
+#include "src/network/timing.h"
 #include "src/terminal/parser.h"
 #include "src/terminal/terminalframebuffer.h"
 
