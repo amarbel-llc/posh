@@ -251,6 +251,27 @@
           };
         };
 
+        # The default output: the full posh toolset in one tree, so a bare
+        # `nix build` yields every posh-* build product rather than just the
+        # posh binary (github #73). `posh` already installs the posh /
+        # posh-server / poshterity binaries and the man pages; this only adds
+        # posht (the Go TUI). posh-term is a library compiled into posh, not a
+        # standalone binary, so it has no entry here. mosh (the upstream C++
+        # reference) deliberately stays its own non-default output.
+        poshToolset = pkgs.symlinkJoin {
+          name = "posh-toolset-${poshVersion}";
+          paths = [
+            posh
+            posht
+          ];
+          meta = {
+            description = "The full posh toolset: posh, posh-server, poshterity, and posht";
+            mainProgram = "posh";
+            license = posh.meta.license;
+            platforms = posh.meta.platforms;
+          };
+        };
+
         # Tree-wide formatter: clang-format (C++) + nixfmt + shfmt under one
         # wrapper. Exposed as `formatter.${system}` (so `nix fmt` works) and
         # dropped into the devShell. See ./treefmt.nix.
@@ -258,9 +279,11 @@
       in
       {
         packages = {
-          # posh is the product; the C++ reference tree stays buildable as
-          # `nix build .#mosh`.
-          default = posh;
+          # Default is the full toolset (github #73) so a bare `nix build`
+          # yields posh + posh-server + poshterity + posht. The individual
+          # products stay addressable; the C++ reference stays buildable as
+          # `nix build .#mosh` but out of the default.
+          default = poshToolset;
           posh = posh;
           mosh = mosh;
           posht = posht;

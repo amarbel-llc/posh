@@ -20,7 +20,7 @@ crates/
   posh-term/   standalone terminal emulation library (no dependencies)
   posh/        the posh binary
   poshterity/    deterministic terminal recorder/replayer (lib + poshterity bin; posh rec)
-doc/           scdoc man-page sources (man posh, posh-server, posh-client, posh(7))
+doc/           scdoc man-page sources (man posh, posh-server, posh-client, poshterity, posh(7))
 docs/          ADRs, RFCs, feature records (FDRs), plans, and the manual test plan
 posht/         interactive terminal-capability test (Go; nix build .#posht)
 zz-mosh/       the C++ mosh reference tree (buildable: nix build .#mosh)
@@ -241,6 +241,7 @@ epic; adoption + the `.castx` RFC land in the final phase.
 ## Building and testing
 
 ```
+nix build                   # the full toolset: posh, posh-server, poshterity, posht (#73)
 nix build .#posh            # hermetic build + cargo test --workspace
 just build-rust             # same, via the justfile lane
 just debug-cargo test --workspace   # fast in-worktree dev-loop

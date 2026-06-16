@@ -59,7 +59,7 @@ lint-doc:
 
 # --- build -----------------------------------------------------------------
 
-build: build-nix build-rust build-go
+build: build-nix build-rust build-go build-toolset
 
 # Hermetic C++ reference build: autogen.sh + configure + make (+ check).
 [group("build")]
@@ -71,9 +71,9 @@ build-nix:
 # Hermetic Rust workspace build (cargo test --workspace in checkPhase).
 [group("build")]
 build-rust:
-    # The Rust CI gate (github #33) and the default package; ./result is
-    # the posh binary (bin/posh + the bin/posh-server alias).
-    nix build -L --show-trace
+    # The Rust CI gate (github #33); result-posh holds bin/posh, the
+    # bin/posh-server alias, and bin/poshterity.
+    nix build -L --show-trace ".#posh" -o result-posh
 
 # Hermetic posht build (Go/Bubble Tea terminal-capability test).
 [group("build")]
@@ -81,6 +81,13 @@ build-go:
     # The static posht binary (docs/posht.md). Sources posht/ only, so
     # non-posht changes don't rebuild it.
     nix build -L --show-trace ".#posht" -o result-posht
+
+# The default output: the full posh toolset (github #73). ./result
+# aggregates posh + posh-server + poshterity + posht so a bare `nix build`
+# yields the whole set. Cheap once build-rust/build-go realized the inputs.
+[group("build")]
+build-toolset:
+    nix build -L --show-trace -o result
 
 
 # --- post-build ------------------------------------------------------------
