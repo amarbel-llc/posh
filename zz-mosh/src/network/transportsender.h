@@ -47,8 +47,8 @@ namespace Network {
 using namespace TransportBuffers;
 
 /* timing parameters */
-const int SEND_INTERVAL_MIN = 20;       /* ms between frames */
-const int SEND_INTERVAL_MAX = 250;      /* ms between frames */
+const int SEND_INTERVAL_MIN = 20;  /* ms between frames */
+const int SEND_INTERVAL_MAX = 250; /* ms between frames */
 /* ACK_INTERVAL: declared in src/network/timing.h (shared with the overlay). */
 const int ACK_DELAY = 100;              /* ms before delayed ack */
 const int SHUTDOWN_RETRIES = 16;        /* number of shutdown packets to send before giving up */
