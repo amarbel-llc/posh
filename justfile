@@ -268,6 +268,14 @@ release new_version:
 debug-cargo *ARGS:
     nix develop --command cargo {{ ARGS }}
 
+# (Re)bless the mosh terminal characterization goldens (task #4). The driver is
+# the mosh-ffi C++ FFI shim, so a fixed VT script always renders the same grid
+# (no clock, no network). Assert with the normal loop: `just debug-cargo test
+# -p mosh-ffi`. Debug-only; the hermetic gate is build-rust.
+[group("debug")]
+debug-mosh-bless:
+    nix develop --command env MOSH_FFI_BLESS=1 cargo test -p mosh-ffi -- --nocapture
+
 # Perf probe (prediction perf followups #13/#15): time the per-frame client
 # apply costs at representative sizes, in release. Runs both probes in
 # perf_probe.rs: the DumpDiff reparse + compose (Snapshot::from_term) baseline,

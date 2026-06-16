@@ -1,0 +1,13 @@
+[package]
+name = "mosh-ffi"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+publish = false
+
+# Tracer bullet (task #6): proves mosh's C++ terminal emulator can be compiled
+# and called from Rust via a C-ABI shim, ahead of the FFI-oracle ADR (#7).
+
+[build-dependencies]
+cc = "1"
