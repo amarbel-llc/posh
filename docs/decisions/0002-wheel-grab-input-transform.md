@@ -46,6 +46,57 @@ A byte-fed machine cannot know whether a trailing `ESC` begins a mouse sequence 
 
 `just build-rust` (hermetic `cargo test --workspace`) plus the `remote::client` tests: `grabbed_wheel_becomes_arrows_and_other_events_drop`, `grabbed_split_sequence_reassembles_at_any_boundary` (loops over every split index), `non_mouse_escape_sequences_round_trip_losslessly` (incl. the held-then-flushed lone ESC), `grab_flip_mid_sequence_hands_back_the_held_partial`, and `grabbed_partial_is_bounded_and_flushed_not_held_forever`. Live-verified over a loopback server+client pair in kitty (`just debug-verify-grab on`): wheel ticks arrive as arrows in every bare-prompt state, with no stray escape bytes.
 
+## Selection coexistence (the grab vs. native text selection tradeoff)
+
+The grab this ADR transforms has a cost the original framing did not record:
+while posh holds the outer terminal in mouse reporting (`?1000h ?1006h`) at a
+bare prompt — to harvest the wheel for client-side scrollback (FDR 0005) — the
+terminal forwards *all* mouse events (clicks, drags) to posh, so the
+terminal's own click-drag text selection stops working. posh only consumes the
+wheel (`out.wheel`) and drops clicks/drags, so it does not *want* those events;
+the grab is simply coarser than the need. This section records what the
+terminal-side options actually are, verified against kitty's documentation, so
+a future reader does not re-derive it.
+
+The verified capability map (kitty):
+
+* **Shift+drag-to-select while grabbed is a kitty default**, and a documented
+  headline feature ("select text with kitty even when a terminal program has
+  grabbed the mouse by holding down the `Shift` key"). So "selection regardless
+  of mouse mode" already works *with* the `Shift` modifier today — posh's grab
+  does not defeat it. This is the no-cost coexistence path.
+* **DECSET 1007 (alternate scroll) is the clean wheel-only-without-grab
+  mechanism, but kitty ignores it** (posh#3/#28) — which is the root reason the
+  `?1000` grab exists at all. Crossed off, not overlooked.
+* **There is no wheel-only mouse-reporting mode.** The wheel arrives as SGR
+  buttons 64/65 *inside* `?1000`+, all-or-nothing with clicks/drags. No DECSET
+  reports the wheel while leaving click/drag to the terminal.
+* **The kitty keyboard protocol does not carry scroll/mouse events** (keys
+  only), so it is not a route to wheel-without-grab either.
+
+Terminal-side mitigations (kitty `kitty.conf`, user-controlled — not posh
+code): adding `grabbed` to the selection `mouse_map` makes plain (un-modified)
+drag select even under the grab —
+`mouse_map left press grabbed,ungrabbed mouse_selection normal` (plus the
+`doublepress`/`triplepress` word/line variants). Tradeoff: a plain left-drag
+then no longer reaches the grabbing app — harmless for posh (it drops drags),
+but it would take left-drag from a different grabbed app, which is why kitty's
+default reserves the grabbed state for `shift+left`. For per-app scoping
+without a global change, launch posh in a separately-configured kitty
+(`kitty -o "mouse_map …" posh …` or `kitty -c posh.conf posh …`, both
+verified). A true in-one-window per-app `mouse_map` via `--when-focus-on` is
+**unverified** (the conditional-mapping mechanism is documented only for the
+keyboard `map` directive) and would additionally need posh to emit an
+`OSC 1337;SetUserVar` in lockstep with its grab predicate.
+
+This stays terminal-configuration guidance rather than a posh decision: the
+recommendation to enable selection-under-grab in kitty is tracked in eng#36.
+A posh-side runtime toggle that *drops* the grab on demand (restoring plain
+native selection at the cost of wheel scrollback) remains a revisitable option
+— it is one gated decision (`wheel_active` in
+`crates/posh/src/remote/client.rs`), not a rearchitecture — but is not adopted
+here.
+
 ## Pros and Cons of the Options
 
 ### Option 1 — Held-partial buffer
@@ -75,3 +126,8 @@ A byte-fed machine cannot know whether a trailing `ESC` begins a mouse sequence 
 * Lineage: mosh `zz-mosh/src/terminal/terminaluserinput.{h,cc}` (byte-fed `UserInput` with persistent `state`); posh-term `crates/posh-term/src/parser.rs` (Williams VT500 machine), the same incremental pattern this filter mirrors.
 * Not chosen, revisitable: if a future need makes the lone-Esc delay perceptible in practice, the standard fix is a timeout flush in the client poll loop (the `ttimeoutlen` approach) — add it then, not pre-emptively.
 * Generalized by ADR-0003 (`0003-stream-reassembly-across-reads.md`): `MouseFilter` is one of five instances of the repo-wide "carry partials across reads" convention; 0003 records the pattern and why the instances are kept separate rather than abstracted.
+* Selection coexistence (above): the kitty capability map and the
+  enable-selection-under-grab recommendation are tracked in eng#36. The grab's
+  effect on native text selection, the dead-end of DECSET 1007 on kitty, and
+  the `mouse_map grabbed,ungrabbed` mitigation were verified against kitty's
+  mouse-protocol/mapping docs.
