@@ -1,0 +1,57 @@
+#!/usr/bin/env bash
+# version-merge — a git merge driver that resolves a version.env conflict by
+# keeping the HIGHER POSH_VERSION semver, regardless of which side it came
+# from. Wired via .gitattributes (`version.env merge=keep-higher-semver`) and
+# registered in git config (`just install-merge-driver`, or posh's sweatfile
+# [hooks].create). See eng-versioning(7).
+#
+# git invokes it as:  version-merge %O %A %B
+#   $1 = %O  ancestor (merge base) version of the file  (unused — we pick the
+#            higher of the two sides, not a 3-way text merge)
+#   $2 = %A  "ours" / current version; the driver MUST write the result here
+#   $3 = %B  "theirs" / other version
+#
+# Exit 0 after writing the winner into $2 = a clean resolution. Any nonzero
+# exit leaves $2 untouched and tells git the merge is unresolved, so it falls
+# back to a normal conflict (with markers) for a human to settle. We exit
+# nonzero whenever either side lacks a parseable `export POSH_VERSION=<semver>`
+# — failing safe rather than silently guessing.
+set -euo pipefail
+
+ours=$2
+theirs=$3
+
+# Extract the semver from `export POSH_VERSION=X.Y.Z` (ignoring surrounding
+# whitespace / trailing content). Prints nothing if absent.
+extract_version() {
+  sed -n -E 's/^[[:space:]]*export[[:space:]]+POSH_VERSION=([0-9]+\.[0-9]+\.[0-9]+).*/\1/p' "$1" | head -n1
+}
+
+ours_ver=$(extract_version "$ours")
+theirs_ver=$(extract_version "$theirs")
+
+if [ -z "$ours_ver" ] || [ -z "$theirs_ver" ]; then
+  echo "version-merge: could not parse POSH_VERSION on both sides" \
+    "(ours='$ours_ver' theirs='$theirs_ver'); leaving conflict for manual resolution" >&2
+  exit 1
+fi
+
+# Identical versions: nothing to choose; $2 already holds it, so accept as-is.
+if [ "$ours_ver" = "$theirs_ver" ]; then
+  exit 0
+fi
+
+# Highest of the two by version sort. `sort -V` orders ascending, so the tail
+# is the greater semver.
+highest=$(printf '%s\n%s\n' "$ours_ver" "$theirs_ver" | sort -V | tail -n1)
+
+if [ "$highest" = "$ours_ver" ]; then
+  # Ours already wins; $2 is left as-is.
+  echo "version-merge: kept ours ($ours_ver) over theirs ($theirs_ver)" >&2
+else
+  # Theirs wins: overwrite $2 with theirs' content.
+  cat "$theirs" >"$ours"
+  echo "version-merge: kept theirs ($theirs_ver) over ours ($ours_ver)" >&2
+fi
+
+exit 0

@@ -1,0 +1,35 @@
+# vim: ft=toml
+#
+# posh's spinclass session config. See spinclass-sweatfile(5).
+
+[hooks]
+# The pre-merge VERIFY gate: `just` = the default recipe (validate lint build
+# test), which is posh's CI-equivalent lane. Made explicit here (it is also the
+# eng default) so the repair phase below has a verify gate to run before.
+pre-merge = "just"
+
+# Per-commit repair: format the index-staged content at authoring time so every
+# commit is conformant in history. `--exit-zero-on-fix` maps the restage's
+# exit-3 signal to 0 so a successful repair lets the commit proceed (a
+# pre-commit hook treats nonzero as "block"); partial-stage files are formatted
+# in isolation rather than refused. Uses the PATH `conformist` (home-manager
+# installed). Installed per-worktree at `sc start`/`sc resume`, so an
+# already-running session must `sc resume` to pick it up. Discovers config by
+# walking up to the committed ./conformist.toml. See conformist(7).
+pre-commit = "conformist --staged --exit-zero-on-fix"
+
+# Pre-merge REPAIR phase (spinclass FDR 0018): before the VERIFY gate above,
+# auto-fold mechanical fixes (formatting) into the commit being merged via
+# `git commit --amend`. `--exit-zero-on-fix` exits 0 whether or not anything
+# changed; spinclass reads the HEAD-sha delta to tell "repaired" from "already
+# clean", and a nonzero exit aborts the merge. Re-signs HEAD, so a locked
+# signing agent fails the merge rather than producing an unsigned commit.
+repair = "conformist --commit --amend --exit-zero-on-fix"
+
+# Register the version.env semver merge driver at worktree creation so
+# .gitattributes' `merge=keep-higher-semver` resolves on the first rebase
+# (the driver name lives in .git/config, not version control). Idempotent;
+# the manual / non-spinclass path is `just install-merge-driver`. cwd is the
+# worktree, and git runs the driver from the repo top-level, so the relative
+# scripts/version-merge path resolves.
+create = "git config merge.keep-higher-semver.name 'keep the higher POSH_VERSION (version.env)' && git config merge.keep-higher-semver.driver 'scripts/version-merge %O %A %B'"

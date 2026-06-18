@@ -1,1 +1,10 @@
 * text=true
+
+# version.env conflicts (a release bumped POSH_VERSION on master while a
+# long-lived branch carried an older value) resolve to the HIGHER semver via a
+# custom merge driver, rather than producing a conflict on every rebase. The
+# `keep-higher-semver` driver is registered in .git/config by
+# `just install-merge-driver` (or posh's sweatfile [hooks].create at sc start);
+# .gitattributes alone does not activate it. Driver: scripts/version-merge.
+# See eng-versioning(7).
+version.env merge=keep-higher-semver

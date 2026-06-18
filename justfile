@@ -20,16 +20,19 @@ validate-devshell:
     system=$(nix eval --raw --impure --expr 'builtins.currentSystem')
     nix build --no-link --show-trace ".#devShells.${system}.default"
 
-lint: lint-fmt lint-doc
+lint: lint-fmt lint-doc lint-impure
 
-# Read-only formatting gate (fails if treefmt would change anything).
+# Read-only formatting + eng-convention gate (fails if conformist would change
+# anything, or an eng linter finds a violation).
 [group("pre-build")]
 lint-fmt:
     #!/usr/bin/env bash
     set -euo pipefail
-    # Builds the checks.formatting derivation, which runs treefmt against a
-    # /nix/store snapshot. Does NOT modify the worktree — the modifying
-    # counterpart is `codemod-fmt-treefmt`. They share ./treefmt.nix.
+    # Builds the checks.formatting derivation, which runs `conformist check`
+    # against a /nix/store snapshot. Does NOT modify the worktree — the
+    # modifying counterpart is `codemod-fmt-conformist`. They share
+    # ./conformist.nix (the committed ./conformist.toml is generated from the
+    # same module via `gen-conformist`).
     system=$(nix eval --raw --impure --expr 'builtins.currentSystem')
     nix build ".#checks.${system}.formatting" --no-link --print-build-logs
 
@@ -56,6 +59,24 @@ lint-doc:
       done
       exit "$fail"
     '
+
+lint-impure: lint-worktree
+
+# Impure eng checks against the WORKING TREE (not the sandbox): the eng-impure
+# preset's git-state linters — agents-md (CLAUDE.md -> AGENTS.md), git-remotes
+# (SSH-only), git-default-branch (master, no main), and sweatfile (`spinclass
+# validate`). These need a live .git + profile tools, so they can't run in the
+# sandboxed checks.formatting / `lint-fmt`. Builds the impure config in
+# /nix/store, then runs `conformist check` rooted at the worktree. See
+# conformist-nix(7) and the eng-impure preset.
+[group("pre-build")]
+lint-worktree:
+    #!/usr/bin/env bash
+    set -euo pipefail
+    cd '{{ justfile_directory() }}'
+    system=$(nix eval --raw --impure --expr 'builtins.currentSystem')
+    cfg=$(nix build --no-link --print-out-paths ".#packages.${system}.conformist-impure-config")
+    conformist check --config-file "$cfg" --tree-root .
 
 # --- build -----------------------------------------------------------------
 
@@ -131,6 +152,7 @@ test-mosh-ffi:
 
 # --- operational -----------------------------------------------------------
 
+# Run the default posh toolset via the flake (nix run . -- <args>).
 run-nix *ARGS:
     nix run . -- {{ ARGS }}
 
@@ -165,26 +187,58 @@ run-posht-session host session="posht" *ARGS:
 
 # --- codemod ---------------------------------------------------------------
 
-codemod-fmt: codemod-fmt-treefmt
+codemod-fmt: codemod-fmt-conformist
 
-# Rewrite the worktree in place via treefmt (clang-format + nixfmt + shfmt).
+# Rewrite the worktree in place via conformist (clang-format + nixfmt + shfmt).
 [group("codemod")]
-codemod-fmt-treefmt:
-    # Read-only counterpart is `lint-fmt`. They share ./treefmt.nix.
+codemod-fmt-conformist:
+    # Read-only counterpart is `lint-fmt`. They share ./conformist.nix.
     nix fmt
 
 # --- maintenance -----------------------------------------------------------
 
 clean: clean-build
 
+# Remove nix build symlinks (result, result-*) from the worktree.
 [group("maintenance")]
 clean-build:
     # The C++ tree's distclean is `just zz-mosh/clean-build`.
     rm -rf result result-*
 
+# Update every flake input to its latest revision (rewrites flake.lock).
 [group("maintenance")]
 update-nix:
     nix flake update
+
+# Regenerate the committed conformist.toml from ./conformist.nix (the nix
+# module is the source of truth). The bare `conformist --staged` pre-commit
+# hook and `conformist --commit` repair hook discover this committed file by
+# walking up the tree — they take no --config-file — so it must be kept in
+# sync with the module. Run after editing conformist.nix.
+[group("maintenance")]
+update-conformist-config:
+    #!/usr/bin/env bash
+    set -euo pipefail
+    cd '{{ justfile_directory() }}'
+    system=$(nix eval --raw --impure --expr 'builtins.currentSystem')
+    out=$(nix build --no-link --print-out-paths ".#packages.${system}.conformist-config")
+    install -m 644 "$out" conformist.toml
+    echo "regenerated conformist.toml from ./conformist.nix"
+
+# Register the version.env merge driver in this clone's git config so
+# .gitattributes' `merge=keep-higher-semver` resolves. Required once per clone
+# (the driver name lives in .git/config, which is not version-controlled and
+# is shared across worktrees via $GIT_COMMON_DIR). posh's sweatfile [hooks]
+# create also runs this at `sc start`, so a fresh spinclass worktree is wired
+# automatically; this recipe is the manual / non-spinclass path. Idempotent.
+[group("maintenance")]
+install-merge-driver:
+    #!/usr/bin/env bash
+    set -euo pipefail
+    cd '{{ justfile_directory() }}'
+    git config merge.keep-higher-semver.name 'keep the higher POSH_VERSION (version.env)'
+    git config merge.keep-higher-semver.driver 'scripts/version-merge %O %A %B'
+    echo "registered merge.keep-higher-semver driver"
 
 # Version bump + tag + release, per eng-versioning(7). version.env
 # (POSH_VERSION) is posh's single source of truth, read by flake.nix at
@@ -273,6 +327,94 @@ release new_version:
     gh release create "v{{ new_version }}" --title "$header" --notes "$notes"
 
 # --- debug -----------------------------------------------------------------
+
+# Exercise scripts/version-merge (the version.env semver merge driver) on
+# synthetic %O/%A/%B blobs and assert the higher POSH_VERSION wins, in both
+# orderings, plus the fail-safe (non-zero exit when a side lacks a parseable
+# version). Debug-only; the driver's real exercise is a rebase conflict.
+[group("debug")]
+debug-version-merge:
+    #!/usr/bin/env bash
+    set -euo pipefail
+    cd '{{ justfile_directory() }}'
+    tmp=$(mktemp -d); trap 'rm -rf "$tmp"' EXIT
+    fail=0
+    assert_eq() { # <label> <expected> <actual>
+      if [ "$2" = "$3" ]; then echo "  PASS $1"; else echo "  FAIL $1: expected '$2' got '$3'"; fail=1; fi
+    }
+    mk() { printf 'export POSH_VERSION=%s\n' "$1"; }
+
+    # theirs higher: ours=0.1.8, theirs=0.2.0 -> 0.2.0 wins, exit 0
+    o="$tmp/o" a="$tmp/a" b="$tmp/b"
+    mk 0.1.0 >"$o"; mk 0.1.8 >"$a"; mk 0.2.0 >"$b"
+    scripts/version-merge "$o" "$a" "$b"; rc=$?
+    assert_eq "theirs-higher exit" 0 "$rc"
+    assert_eq "theirs-higher value" "export POSH_VERSION=0.2.0" "$(cat "$a")"
+
+    # ours higher: ours=0.3.0, theirs=0.2.5 -> ours kept, exit 0
+    mk 0.1.0 >"$o"; mk 0.3.0 >"$a"; mk 0.2.5 >"$b"
+    scripts/version-merge "$o" "$a" "$b"; rc=$?
+    assert_eq "ours-higher exit" 0 "$rc"
+    assert_eq "ours-higher value" "export POSH_VERSION=0.3.0" "$(cat "$a")"
+
+    # double-digit ordering (lexical trap): 0.9.0 vs 0.10.0 -> 0.10.0 wins
+    mk 0.1.0 >"$o"; mk 0.9.0 >"$a"; mk 0.10.0 >"$b"
+    scripts/version-merge "$o" "$a" "$b"
+    assert_eq "semver-not-lexical" "export POSH_VERSION=0.10.0" "$(cat "$a")"
+
+    # fail-safe: theirs unparseable -> non-zero exit, ours untouched
+    mk 0.1.0 >"$o"; mk 0.1.8 >"$a"; printf 'garbage\n' >"$b"
+    if scripts/version-merge "$o" "$a" "$b" 2>/dev/null; then
+      echo "  FAIL fail-safe: expected non-zero exit"; fail=1
+    else
+      echo "  PASS fail-safe exit"
+    fi
+    assert_eq "fail-safe untouched" "export POSH_VERSION=0.1.8" "$(cat "$a")"
+
+    [ "$fail" -eq 0 ] && echo "version-merge: all checks passed" || { echo "version-merge: FAILURES"; exit 1; }
+
+# End-to-end proof that git actually invokes the keep-higher-semver driver via
+# .gitattributes: build a throwaway repo under .tmp/, wire the driver + a
+# `version.env merge=keep-higher-semver` attribute, create a real divergent
+# version.env conflict, merge, and assert the higher semver landed with NO
+# conflict markers. Exercises the git plumbing the unit test (debug-version-
+# merge) cannot. Debug-only.
+[group("debug")]
+debug-merge-driver-e2e:
+    #!/usr/bin/env bash
+    set -euo pipefail
+    cd '{{ justfile_directory() }}'
+    driver="$PWD/scripts/version-merge"
+    repo=$(mktemp -d "$PWD/.tmp/merge-e2e.XXXXXX"); trap 'rm -rf "$repo"' EXIT
+    cd "$repo"
+    git init -q
+    git config user.email e2e@posh.test
+    git config user.name "posh e2e"
+    git config commit.gpgsign false
+    git config merge.keep-higher-semver.name "keep higher POSH_VERSION"
+    git config merge.keep-higher-semver.driver "$driver %O %A %B"
+    printf 'version.env merge=keep-higher-semver\n' >.gitattributes
+    printf 'export POSH_VERSION=0.1.0\n' >version.env
+    git add -A; git commit -qm base
+    # branch bumps to 0.1.8
+    git switch -qc feature
+    printf 'export POSH_VERSION=0.1.8\n' >version.env
+    git commit -qam "feature: bump 0.1.8"
+    # master races ahead to 0.2.0 (a release)
+    git switch -q master
+    printf 'export POSH_VERSION=0.2.0\n' >version.env
+    git commit -qam "release: 0.2.0"
+    # merge feature into master: without the driver this conflicts on version.env
+    git merge -q --no-edit feature
+    got=$(cat version.env)
+    if grep -q '^<<<<<<<' version.env; then
+      echo "FAIL: conflict markers present — driver did not fire"; exit 1
+    fi
+    if [ "$got" = "export POSH_VERSION=0.2.0" ]; then
+      echo "PASS: merge kept higher semver (0.2.0), no conflict markers"
+    else
+      echo "FAIL: expected 0.2.0, got '$got'"; exit 1
+    fi
 
 # Run cargo against the Rust workspace in the devShell — the fast dev-loop
 # (incremental, in-worktree). The hermetic gate is build-rust/test-rust.

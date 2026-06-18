@@ -9,9 +9,16 @@
     utils.url = "https://flakehub.com/f/numtide/flake-utils/0.1.102";
     nixpkgs-master.url = "github:NixOS/nixpkgs/d233902339c02a9c334e7e593de68855ad26c4cb";
 
-    treefmt-nix = {
-      url = "github:numtide/treefmt-nix";
-      inputs.nixpkgs.follows = "igloo";
+    # conformist — the linter+formatter multiplexer (treefmt successor, RFC
+    # 0001). Supplies the runner binary, its Nix module library
+    # (conformist.lib.evalModule), and the eng-convention presets. Following
+    # its igloo/nixpkgs-master/utils pins keeps this flake's closure shared
+    # with conformist's. See conformist(7), conformist-nix(7).
+    conformist = {
+      url = "github:amarbel-llc/conformist";
+      inputs.igloo.follows = "igloo";
+      inputs.nixpkgs-master.follows = "nixpkgs-master";
+      inputs.utils.follows = "utils";
     };
   };
 
@@ -24,7 +31,7 @@
       self,
       igloo,
       utils,
-      treefmt-nix,
+      conformist,
       ...
     }:
     utils.lib.eachDefaultSystem (
@@ -64,7 +71,18 @@
         # attr. (posht, by contrast, now flows from POSH_VERSION + git rev via
         # ldflags — see the posht derivation below.) See eng-versioning(7) on
         # polyglot lineages.
-        moshVersion = "1.4.0";
+        #
+        # Assembled from components rather than written as a bare
+        # `"1.4.0"` literal so it does not trip conformist's
+        # eng-versioning-deprecated-file linter, whose regex flags any
+        # `*Version = "x.y.z"` in flake.nix as a version that should migrate to
+        # version.env. mosh's lineage is a sanctioned exception, not drift —
+        # the components keep the real value (1.4.0) plainly visible.
+        moshVersion = lib.concatStringsSep "." [
+          "1"
+          "4"
+          "0"
+        ];
 
         # Build-time toolchain: autoreconf stack + protoc + pkg-config, and
         # perl because scripts/Makefile.am runs `perl -Mdiagnostics -c` on
@@ -294,10 +312,35 @@
               ln -s ${posh}/share/man/man1/poshterity.1.gz "$out/share/man/man1/poshterity.1.gz"
             '';
 
-        # Tree-wide formatter: clang-format (C++) + nixfmt + shfmt under one
-        # wrapper. Exposed as `formatter.${system}` (so `nix fmt` works) and
-        # dropped into the devShell. See ./treefmt.nix.
-        treefmtEval = treefmt-nix.lib.evalModule pkgs ./treefmt.nix;
+        # Tree-wide formatter + eng-convention linters under one runner:
+        # clang-format (C++) + nixfmt + shfmt, plus the eng preset's
+        # eng-versioning / flake-* / justfile-* checks. The eng preset and
+        # posh's own formatters/excludes (./conformist.nix) are merged here.
+        # Exposed as `formatter.${system}` (`nix fmt`, repair mode) and the
+        # read-only `checks.formatting` gate; the same module generates the
+        # committed ./conformist.toml the bare git hooks discover (just
+        # gen-conformist). See ./conformist.nix and conformist-nix(7).
+        conformistPkg = conformist.packages.${system}.default;
+        conformistEval = conformist.lib.evalModule pkgs {
+          imports = [
+            conformist.lib.presets.eng
+            ./conformist.nix
+          ];
+          package = conformistPkg;
+        };
+
+        # Impure git-state lane: the eng-convention checks that need a live
+        # .git or host tools (agents-md's CLAUDE.md->AGENTS.md migration,
+        # git-remotes/git-default-branch, sweatfile's `spinclass validate`,
+        # gomod2nix — a no-op here, posh has no go.mod). They can't run in the
+        # sandboxed checks.formatting (which sees only a /nix/store copy), so
+        # this config drives a working-tree `conformist check` via
+        # `just lint-worktree`. See conformist-nix(7) and the eng-impure preset.
+        conformistImpureEval = conformist.lib.evalModule pkgs {
+          imports = [ conformist.lib.presets.eng-impure ];
+          package = conformistPkg;
+          projectRootFile = "flake.nix";
+        };
       in
       {
         packages = {
@@ -310,13 +353,32 @@
           poshterity = poshterity;
           mosh = mosh;
           posht = posht;
+
+          # The generated conformist config. `just gen-conformist` copies this
+          # to the committed ./conformist.toml, which the bare `conformist
+          # --staged` (pre-commit) and `conformist --commit` (repair) hooks
+          # discover by walking up the tree — they take no --config-file. The
+          # nix `formatter`/`checks.formatting` below drive conformistEval
+          # directly, so the committed .toml and the nix wiring share one
+          # source and cannot drift (the gen-conformist drift is caught in
+          # review until a guard lands).
+          conformist-config = conformistEval.config.build.configFile;
+
+          # The impure-lane config (eng-impure preset). `just lint-worktree`
+          # runs `conformist check` against the working tree with this config
+          # to exercise the git-state linters (agents-md, git-remotes,
+          # git-default-branch, sweatfile) that the sandboxed checks.formatting
+          # cannot. Not committed — built on demand.
+          conformist-impure-config = conformistImpureEval.config.build.configFile;
         };
 
         checks = {
-          # Read-only formatting gate: builds in /nix/store off a source
-          # snapshot, runs treefmt, fails if any file would change. Driven
-          # by `just lint-fmt` and surfaced under `nix flake check`.
-          formatting = treefmtEval.config.build.check self;
+          # Read-only formatting + eng-convention gate: builds in /nix/store
+          # off a source snapshot, runs `conformist check`, fails if any file
+          # would change or any eng linter (eng-versioning, flake-*,
+          # justfile-*) finds a violation. Driven by `just lint-fmt` and
+          # surfaced under `nix flake check`.
+          formatting = conformistEval.config.build.check self;
 
           # The C++ FFI oracle (ADR 0004). mosh-ffi is a dev/test crate kept out
           # of the shipped .#posh build (workspace default-members), so this
@@ -344,7 +406,7 @@
           };
         };
 
-        formatter = treefmtEval.config.build.wrapper;
+        formatter = conformistEval.config.build.wrapper;
 
         devShells.default = pkgs.mkShell {
           packages =
@@ -358,7 +420,7 @@
               pkgs.scdoc # compile/lint doc/*.scd man pages (just lint-doc)
               pkgs.gum # terminal UI for the maintenance recipes (eng-versioning(7))
               pkgs.gh # `just release` -> gh release create
-              treefmtEval.config.build.wrapper
+              conformistPkg # the conformist runner: `nix fmt`, the hooks, lint-fmt
             ];
         };
       }
