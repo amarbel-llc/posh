@@ -12,11 +12,19 @@ pre-merge = "just"
 # commit is conformant in history. `--exit-zero-on-fix` maps the restage's
 # exit-3 signal to 0 so a successful repair lets the commit proceed (a
 # pre-commit hook treats nonzero as "block"); partial-stage files are formatted
-# in isolation rather than refused. Uses the PATH `conformist` (home-manager
-# installed). Installed per-worktree at `sc start`/`sc resume`, so an
-# already-running session must `sc resume` to pick it up. Discovers config by
-# walking up to the committed ./conformist.toml. See conformist(7).
-pre-commit = "conformist --staged --exit-zero-on-fix"
+# in isolation rather than refused. Installed per-worktree at `sc start`/`sc
+# resume`, so an already-running session must `sc resume` to pick it up.
+#
+# Names `conformist-pre-commit` — the CONFIG-SPECIFIC, TOOLCHAIN-HERMETIC hook
+# posh's flake.nix exposes from `conformistEval.config.build.preCommit`, placed
+# on the devShell PATH under that name. It wraps `conformist --staged
+# --exit-zero-on-fix` with this repo's generated store-path config, so the
+# staged repair formats *.nix/*.sh/zz-mosh *.cc with the SAME pinned formatters
+# as `nix fmt`. Do NOT revert to a bare `conformist --staged`: that resolves
+# formatters from PATH and SILENTLY SKIPS file types the shell lacks
+# (conformist#51). Requires the devShell active (direnv) so the wrapper is on
+# PATH. See conformist(7), conformist-nix(7).
+pre-commit = "conformist-pre-commit"
 
 # Pre-merge REPAIR phase (spinclass FDR 0018): before the VERIFY gate above,
 # auto-fold mechanical fixes (formatting) into the commit being merged via
@@ -24,7 +32,14 @@ pre-commit = "conformist --staged --exit-zero-on-fix"
 # changed; spinclass reads the HEAD-sha delta to tell "repaired" from "already
 # clean", and a nonzero exit aborts the merge. Re-signs HEAD, so a locked
 # signing agent fails the merge rather than producing an unsigned commit.
-repair = "conformist --commit --amend --exit-zero-on-fix"
+#
+# Names `conformist-repair` — the store-pinned `--commit --amend` counterpart of
+# conformist-pre-commit, exposed from posh's flake.nix on the devShell PATH (the
+# conformist module ships only a --staged wrapper; conformist-repair hand-rolls
+# the repair variant with the same baked config). Toolchain-hermetic for the
+# same reason as the pre-commit hook. Tracked upstream: teach the module to emit
+# a repair wrapper so this can name a blessed output instead (conformist#54).
+repair = "conformist-repair"
 
 # Register the version.env semver merge driver at worktree creation so
 # .gitattributes' `merge=keep-higher-semver` resolves on the first rebase

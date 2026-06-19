@@ -55,7 +55,7 @@ options = []
 command = "/nix/store/cbdgj2ml8hvs4pzrms38n2s76hbksrp4-shfmt-3.13.1/bin/shfmt"
 excludes = []
 includes = ["*.sh", "*.bash", "*.envrc", "*.envrc.*"]
-options = ["-w", "-i", "2", "-s"]
+options = ["-w", "-i", "2", "-s", "-ci"]
 
 [linter.eng-versioning]
 command = "/nix/store/7l3h1x7183r44r2129i5w9aap303fqn5-conformist-eng-versioning/bin/conformist-eng-versioning"
@@ -100,7 +100,7 @@ options = []
 passes-files = false
 
 [linter.justfile-default]
-command = "/nix/store/lnaxij7b9bq7dair5w9hmn3zr7nr9n7d-conformist-justfile-default/bin/conformist-justfile-default"
+command = "/nix/store/r2sp6i5fpjf2zv1n04ysn3xibbl17lgl-conformist-justfile-default/bin/conformist-justfile-default"
 excludes = []
 includes = ["justfile"]
 options = []

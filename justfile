@@ -211,10 +211,11 @@ update-nix:
     nix flake update
 
 # Regenerate the committed conformist.toml from ./conformist.nix (the nix
-# module is the source of truth). The bare `conformist --staged` pre-commit
-# hook and `conformist --commit` repair hook discover this committed file by
-# walking up the tree — they take no --config-file — so it must be kept in
-# sync with the module. Run after editing conformist.nix.
+# module is the source of truth). The git hooks are now the store-pinned
+# `conformist-pre-commit` / `conformist-repair` wrappers (flake.nix), which bake
+# their own config — so the committed .toml is no longer load-bearing for them.
+# It is kept in sync here pending its removal (the two-phase migration: prove
+# the wrappers, then drop the .toml). Run after editing conformist.nix.
 [group("maintenance")]
 update-conformist-config:
     #!/usr/bin/env bash

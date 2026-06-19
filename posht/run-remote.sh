@@ -31,45 +31,45 @@ via=ssh
 session=posht
 deploy_dest=
 case ${1:-} in
---via)
-  # ${2:-} not $2: a bare trailing `--via` must reach the clean usage error
-  # below, not abort with a raw `set -u` unbound-variable message.
-  via=${2:-}
-  shift
-  shift || true
-  ;;
---via=*)
-  via=${1#--via=}
-  shift
-  ;;
---deploy)
-  deploy_dest=${2:-}
-  if [ -z "$deploy_dest" ]; then
-    echo "$0: --deploy requires a DEST path" >&2
-    exit 64
-  fi
-  shift
-  shift || true
-  ;;
---deploy=*)
-  deploy_dest=${1#--deploy=}
-  if [ -z "$deploy_dest" ]; then
-    echo "$0: --deploy= requires a DEST path" >&2
-    exit 64
-  fi
-  shift
-  ;;
+  --via)
+    # ${2:-} not $2: a bare trailing `--via` must reach the clean usage error
+    # below, not abort with a raw `set -u` unbound-variable message.
+    via=${2:-}
+    shift
+    shift || true
+    ;;
+  --via=*)
+    via=${1#--via=}
+    shift
+    ;;
+  --deploy)
+    deploy_dest=${2:-}
+    if [ -z "$deploy_dest" ]; then
+      echo "$0: --deploy requires a DEST path" >&2
+      exit 64
+    fi
+    shift
+    shift || true
+    ;;
+  --deploy=*)
+    deploy_dest=${1#--deploy=}
+    if [ -z "$deploy_dest" ]; then
+      echo "$0: --deploy= requires a DEST path" >&2
+      exit 64
+    fi
+    shift
+    ;;
 esac
 case $via in
-session=*)
-  session=${via#session=}
-  via=session
-  ;;
-ssh | session | plain) ;;
-*)
-  echo "$0: --via must be ssh, session[=NAME], or plain, got: $via" >&2
-  exit 64
-  ;;
+  session=*)
+    session=${via#session=}
+    via=session
+    ;;
+  ssh | session | plain) ;;
+  *)
+    echo "$0: --via must be ssh, session[=NAME], or plain, got: $via" >&2
+    exit 64
+    ;;
 esac
 
 if [ $# -lt 1 ]; then
@@ -83,12 +83,12 @@ shift
 read -r kernel machine < <(ssh "$host" uname -sm)
 kernel=$(tr '[:upper:]' '[:lower:]' <<<"$kernel")
 case $machine in
-x86_64) arch=amd64 ;;
-aarch64 | arm64) arch=arm64 ;;
-*)
-  echo "$0: unmapped remote arch: $machine" >&2
-  exit 1
-  ;;
+  x86_64) arch=amd64 ;;
+  aarch64 | arm64) arch=arm64 ;;
+  *)
+    echo "$0: unmapped remote arch: $machine" >&2
+    exit 1
+    ;;
 esac
 
 src=$(cd "$(dirname "$0")" && pwd)
@@ -127,8 +127,8 @@ if [ "$via" = plain ]; then
 fi
 if command -v posh >/dev/null 2>&1; then
   case $via in
-  session) exec posh "$host:$session" -- "$dest" "$@" ;;
-  ssh) exec posh ssh "$host" -- "$dest" "$@" ;;
+    session) exec posh "$host:$session" -- "$dest" "$@" ;;
+    ssh) exec posh ssh "$host" -- "$dest" "$@" ;;
   esac
 else
   echo ">> posh not on PATH; falling back to plain ssh -t (no posh in the loop)" >&2
