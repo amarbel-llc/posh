@@ -87,12 +87,11 @@ the `eng-*(7)` manpages — read them with `man eng-versioning`,
   (`just lint-fmt`, read-only) drive it. `conformist.nix` is the single config
   source — there is **no** committed `conformist.toml`; the git hooks are
   store-pinned wrappers (`conformist-pre-commit` / `conformist-repair`,
-  conformist#47/#51) that the flake exposes from
-  `conformistEval.config.build.preCommit` + a hand-rolled `--commit --amend`
-  sibling (conformist#54 tracks folding the repair wrapper into the module),
-  each baking its own `/nix/store` config — so they format with the same pinned
-  toolchain as `nix fmt`, never silent-skipping a file type the ambient PATH
-  lacks. The impure git-state lane (agents-md, git-remotes, sweatfile, …) runs
+  conformist#47/#51/#54) that the flake exposes from
+  `conformistEval.config.build.{preCommit,repair}` (the module derives both from
+  one `mkHookWrapper` body), each baking its own `/nix/store` config — so they
+  format with the same pinned toolchain as `nix fmt`, never silent-skipping a
+  file type the ambient PATH lacks. The impure git-state lane (agents-md, git-remotes, sweatfile, …) runs
   via `just lint-worktree`. The sweatfile wires the spinclass hooks: `pre-commit`
   (`conformist-pre-commit`, format at authoring time) and `repair`
   (`conformist-repair`, fold fixes in before the pre-merge verify gate); both

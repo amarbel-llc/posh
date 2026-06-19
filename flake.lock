@@ -46,11 +46,11 @@
         ]
       },
       "locked": {
-        "lastModified": 1781813718,
-        "narHash": "sha256-QuvPkNJ9PFV83RoCA0cpYagrNpZEZzTB0FUn97Ie/Sk=",
+        "lastModified": 1781885815,
+        "narHash": "sha256-Fn+3z0jtefqi9mgYm6UIl6dvgshKZdF4GXKqzCAZZh0=",
         "owner": "amarbel-llc",
         "repo": "conformist",
-        "rev": "1b8e32db0ee450601b0e70bb84b3b784e5f7cc3d",
+        "rev": "fc7ae619f8ad8d4c27eefcc5e6511df46bd7a1fb",
         "type": "github"
       },
       "original": {

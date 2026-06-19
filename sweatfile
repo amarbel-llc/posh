@@ -34,11 +34,9 @@ pre-commit = "conformist-pre-commit"
 # signing agent fails the merge rather than producing an unsigned commit.
 #
 # Names `conformist-repair` — the store-pinned `--commit --amend` counterpart of
-# conformist-pre-commit, exposed from posh's flake.nix on the devShell PATH (the
-# conformist module ships only a --staged wrapper; conformist-repair hand-rolls
-# the repair variant with the same baked config). Toolchain-hermetic for the
-# same reason as the pre-commit hook. Tracked upstream: teach the module to emit
-# a repair wrapper so this can name a blessed output instead (conformist#54).
+# conformist-pre-commit, the module's `build.repair` output (conformist#54; both
+# hooks share one mkHookWrapper body). Exposed from posh's flake.nix on the
+# devShell PATH. Toolchain-hermetic for the same reason as the pre-commit hook.
 repair = "conformist-repair"
 
 # Register the version.env semver merge driver at worktree creation so

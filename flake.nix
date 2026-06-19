@@ -342,29 +342,6 @@
           package = conformistPkg;
           projectRootFile = "flake.nix";
         };
-
-        # The repair counterpart of conformist-pre-commit (build.preCommit): the
-        # SAME store-pinned pure-lane config, run as `conformist --commit --amend
-        # --exit-zero-on-fix` for the spinclass pre-merge REPAIR phase. The
-        # conformist module ships only a --staged wrapper (build.preCommit), so
-        # this hand-rolls the repair variant, mirroring that derivation
-        # (conformist's nix/module-options.nix) with repair flags — drop this
-        # once the module emits a blessed repair output (conformist#54). `unset
-        # PRJ_ROOT` matches build.preCommit: direnv sets it, and conformist would
-        # otherwise prefer it over the baked --tree-root-file. Exposed as
-        # packages.conformist-repair and on the devShell PATH; the sweatfile's
-        # repair hook names it.
-        conformistRepair = pkgs.writeShellScriptBin "conformist-repair" ''
-          set -euo pipefail
-          unset PRJ_ROOT
-          exec ${conformistPkg}/bin/conformist \
-            --commit \
-            --amend \
-            --exit-zero-on-fix \
-            --config-file=${conformistEval.config.build.configFile} \
-            --tree-root-file=${conformistEval.config.projectRootFile} \
-            "$@"
-        '';
       in
       {
         packages = {
@@ -378,22 +355,17 @@
           mosh = mosh;
           posht = posht;
 
-          # The store-pinned `conformist --staged --exit-zero-on-fix` hook from
-          # this repo's pure-lane config (conformist#47/#51). On the devShell
-          # PATH as `conformist-pre-commit`; the sweatfile's pre-commit hook
-          # names it. Unlike a bare `conformist --staged`, every formatter's
-          # `command` is store-pinned in the baked config, so it CANNOT
-          # silent-skip file types the ambient PATH happens to lack (the
-          # silent-skip trap of conformist#51). `nix build .#conformist-pre-commit`
-          # forces it.
+          # The store-pinned git hooks from this repo's pure-lane config
+          # (conformist#47/#51/#54): conformist-pre-commit runs `conformist
+          # --staged --exit-zero-on-fix`, conformist-repair runs `conformist
+          # --commit --amend --exit-zero-on-fix` (the build.repair sibling, both
+          # from the module's shared mkHookWrapper). On the devShell PATH under
+          # those names; the sweatfile's pre-commit / repair hooks name them.
+          # Unlike a bare `conformist`, every formatter's `command` is
+          # store-pinned in the baked config, so they CANNOT silent-skip file
+          # types the ambient PATH happens to lack (the conformist#51 trap).
           conformist-pre-commit = conformistEval.config.build.preCommit;
-
-          # The repair counterpart (see the conformistRepair let-binding above):
-          # the same store-pinned config run as `conformist --commit --amend
-          # --exit-zero-on-fix` for the spinclass pre-merge REPAIR phase. On the
-          # devShell PATH as `conformist-repair`; the sweatfile's repair hook
-          # names it.
-          conformist-repair = conformistRepair;
+          conformist-repair = conformistEval.config.build.repair;
 
           # The impure-lane config (eng-impure preset). `just lint-worktree`
           # runs `conformist check` against the working tree with this config
@@ -453,9 +425,9 @@
               pkgs.gh # `just release` -> gh release create
               conformistPkg # the raw conformist runner: `nix fmt`, lint-worktree
               # The config-specific, toolchain-hermetic git hooks on PATH under
-              # the names the sweatfile references (conformist#47/#51).
+              # the names the sweatfile references (conformist#47/#51/#54).
               conformistEval.config.build.preCommit # `conformist-pre-commit`
-              conformistRepair # `conformist-repair`
+              conformistEval.config.build.repair # `conformist-repair`
             ];
         };
       }
