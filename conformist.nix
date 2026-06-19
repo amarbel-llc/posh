@@ -5,11 +5,10 @@
 # the formatter set below mirrors it. See conformist(7), conformist-nix(7),
 # eng-versioning(7).
 #
-# The generated config is committed as ./conformist.toml (just gen-conformist)
-# so the bare `conformist --staged` pre-commit hook and `conformist --commit`
-# repair hook — which take no --config-file and discover config by walking up
-# the tree — find it. flake.nix's `nix fmt` / checks.formatting drive the same
-# module directly, so the committed .toml and the nix wiring share one source.
+# This module is the single source: flake.nix's `nix fmt` / checks.formatting
+# and the store-pinned conformist-pre-commit / conformist-repair git hooks all
+# eval it directly (each hook bakes its own /nix/store config), so there is no
+# committed conformist.toml to keep in sync.
 { ... }:
 {
   # C++ reference tree (zz-mosh/src/**/*.cc, *.h). clang-format auto-discovers
@@ -58,10 +57,8 @@
     ".direnv/**"
     ".tmp/**"
     "*.lock"
-    # Prose and generated config are out of scope for code formatters.
+    # Prose is out of scope for code formatters.
     "*.md"
     "flake.lock"
-    # The committed, generated config itself (just gen-conformist owns it).
-    "conformist.toml"
   ];
 }

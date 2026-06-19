@@ -31,8 +31,8 @@ lint-fmt:
     # Builds the checks.formatting derivation, which runs `conformist check`
     # against a /nix/store snapshot. Does NOT modify the worktree — the
     # modifying counterpart is `codemod-fmt-conformist`. They share
-    # ./conformist.nix (the committed ./conformist.toml is generated from the
-    # same module via `gen-conformist`).
+    # ./conformist.nix, the single config source (the store-pinned git hooks
+    # eval it too — there is no committed conformist.toml).
     system=$(nix eval --raw --impure --expr 'builtins.currentSystem')
     nix build ".#checks.${system}.formatting" --no-link --print-build-logs
 
@@ -209,22 +209,6 @@ clean-build:
 [group("maintenance")]
 update-nix:
     nix flake update
-
-# Regenerate the committed conformist.toml from ./conformist.nix (the nix
-# module is the source of truth). The git hooks are now the store-pinned
-# `conformist-pre-commit` / `conformist-repair` wrappers (flake.nix), which bake
-# their own config — so the committed .toml is no longer load-bearing for them.
-# It is kept in sync here pending its removal (the two-phase migration: prove
-# the wrappers, then drop the .toml). Run after editing conformist.nix.
-[group("maintenance")]
-update-conformist-config:
-    #!/usr/bin/env bash
-    set -euo pipefail
-    cd '{{ justfile_directory() }}'
-    system=$(nix eval --raw --impure --expr 'builtins.currentSystem')
-    out=$(nix build --no-link --print-out-paths ".#packages.${system}.conformist-config")
-    install -m 644 "$out" conformist.toml
-    echo "regenerated conformist.toml from ./conformist.nix"
 
 # Register the version.env merge driver in this clone's git config so
 # .gitattributes' `merge=keep-higher-semver` resolves. Required once per clone

@@ -316,10 +316,11 @@
         # clang-format (C++) + nixfmt + shfmt, plus the eng preset's
         # eng-versioning / flake-* / justfile-* checks. The eng preset and
         # posh's own formatters/excludes (./conformist.nix) are merged here.
-        # Exposed as `formatter.${system}` (`nix fmt`, repair mode) and the
-        # read-only `checks.formatting` gate; the same module generates the
-        # committed ./conformist.toml the bare git hooks discover (just
-        # gen-conformist). See ./conformist.nix and conformist-nix(7).
+        # Exposed as `formatter.${system}` (`nix fmt`, repair mode), the
+        # read-only `checks.formatting` gate, and the store-pinned
+        # conformist-pre-commit / conformist-repair git hooks (each bakes this
+        # module's generated /nix/store config — there is no committed
+        # conformist.toml). See ./conformist.nix and conformist-nix(7).
         conformistPkg = conformist.packages.${system}.default;
         conformistEval = conformist.lib.evalModule pkgs {
           imports = [
@@ -393,16 +394,6 @@
           # devShell PATH as `conformist-repair`; the sweatfile's repair hook
           # names it.
           conformist-repair = conformistRepair;
-
-          # The generated conformist config. `just update-conformist-config`
-          # copies this to the committed ./conformist.toml. With the hooks now
-          # store-pinned (conformist-pre-commit / conformist-repair above), the
-          # committed .toml is no longer load-bearing for them — it is kept as a
-          # fallback/discovery path pending its removal (the two-phase migration:
-          # prove the wrappers, then drop the .toml). The nix
-          # `formatter`/`checks.formatting` below drive conformistEval directly,
-          # so the committed .toml and the nix wiring share one source.
-          conformist-config = conformistEval.config.build.configFile;
 
           # The impure-lane config (eng-impure preset). `just lint-worktree`
           # runs `conformist check` against the working tree with this config

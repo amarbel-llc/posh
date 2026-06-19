@@ -84,15 +84,20 @@ the `eng-*(7)` manpages — read them with `man eng-versioning`,
   successor) is the formatter+linter gate. `conformist.nix` (eng preset +
   clang-format/nixfmt/shfmt) is the source of truth; the flake's `formatter`
   (`nix fmt` / `just codemod-fmt`, repair mode) and `checks.formatting`
-  (`just lint-fmt`, read-only) drive it. The generated `conformist.toml` is
-  **committed** at the root so the bare `conformist --staged`/`--commit` git
-  hooks discover it — regenerate it with `just update-conformist-config`
-  after editing `conformist.nix`. The impure git-state lane (agents-md,
-  git-remotes, sweatfile, …) runs via `just lint-worktree`. The sweatfile
-  wires the spinclass hooks: `pre-commit` (`conformist --staged`, format at
-  authoring time) and `repair` (`conformist --commit --amend`, fold fixes in
-  before the pre-merge verify gate); a fresh `sc start`/`sc resume` installs
-  the pre-commit hook.
+  (`just lint-fmt`, read-only) drive it. `conformist.nix` is the single config
+  source — there is **no** committed `conformist.toml`; the git hooks are
+  store-pinned wrappers (`conformist-pre-commit` / `conformist-repair`,
+  conformist#47/#51) that the flake exposes from
+  `conformistEval.config.build.preCommit` + a hand-rolled `--commit --amend`
+  sibling (conformist#54 tracks folding the repair wrapper into the module),
+  each baking its own `/nix/store` config — so they format with the same pinned
+  toolchain as `nix fmt`, never silent-skipping a file type the ambient PATH
+  lacks. The impure git-state lane (agents-md, git-remotes, sweatfile, …) runs
+  via `just lint-worktree`. The sweatfile wires the spinclass hooks: `pre-commit`
+  (`conformist-pre-commit`, format at authoring time) and `repair`
+  (`conformist-repair`, fold fixes in before the pre-merge verify gate); both
+  live on the devShell PATH, and a fresh `sc start`/`sc resume` installs the
+  pre-commit hook.
 - **Justfile (eng-design_patterns-justfile(7)):** verb-noun leaf recipes
   under bare aggregates; `[group(...)]` attributes; `default` is the first
   recipe. Add release/maintenance recipes to the `maintenance` group.
