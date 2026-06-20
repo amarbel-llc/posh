@@ -200,8 +200,26 @@ _POSH_DEBUG_LOG_
 	timing), rotated at 5 MB.
 	For the bare _host:session_ form it is forwarded to the remote, so the
 	server logs to that path on the remote host (failing closed if it is
-	not writable there). Unset disables logging. See *posh-client*(1) and
+	not writable there). The on-demand *SIGUSR2* dump (*SIGNALS*) shares
+	this sink. Unset disables logging. See *posh-client*(1) and
 	*posh-server*(1).
+
+# SIGNALS
+
+The roaming transport responds to two diagnostic signals, sent to the
+*posh server* or *posh client* process (find server pids with *posh
+list* on the host, or _ps_):
+
+*SIGUSR1*
+	Asks an idle server to wind down, gated by
+	_$POSH_SERVER_SIGNAL_TMOUT_. See *posh-server*(1).
+
+*SIGUSR2*
+	Dumps a one-line snapshot of live transport state — peer address,
+	last-heard and last-send ages, acked-vs-current frame, RTT — to the
+	_$POSH_DEBUG_LOG_ sink or a per-pid default file. The on-demand way
+	to introspect a wedged, already-running server or client without
+	restarting it. See *posh-server*(1) and *posh-client*(1).
 
 # EXAMPLES
 

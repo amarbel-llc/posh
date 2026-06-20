@@ -7,6 +7,7 @@ use posh_term::Terminal;
 use crate::pty;
 use crate::remote::caps;
 use crate::remote::crypto::Key;
+use crate::remote::diag;
 use crate::remote::display::Snapshot;
 use crate::remote::framesync::{Baseline, CurrentFrame, DumpDiff, FrameEncoder, MorphDelta};
 use crate::remote::datagram::{Connection, Family, DEFAULT_PORT_RANGE, SEND_INTERVAL_MIN};
@@ -70,6 +71,9 @@ pub fn run(
     }
     util::redirect_stdio_devnull();
     util::install_sigusr1_handler();
+    // SIGUSR2 dumps live transport state on demand (remote::diag) — the only
+    // way to introspect a wedged, already-running server without restarting it.
+    util::install_sigusr2_handler();
 
     let (rows, cols) = (24u16, 80u16);
     // posh#51: the ssh bootstrap allocates no remote pty, so sshd set no TERM;
@@ -202,6 +206,29 @@ fn server_loop(mut conn: Connection, child: pty::PtyChild, rows: u16, cols: u16)
             && now.saturating_sub(last_heard) >= signal_tmout
         {
             break; // signaled and idle long enough
+        }
+        // SIGUSR2: snapshot live transport state to the diagnostic sink. The
+        // peer address + last-heard/last-send ages + acked-vs-current here are
+        // what distinguish a roam we haven't re-pinned from one-way packet loss.
+        if util::take_flag(&util::SIGUSR2_RECEIVED) {
+            diag::ServerState {
+                peer_active,
+                has_remote: conn.has_remote(),
+                remote: conn.remote(),
+                last_heard_age_ms: now.saturating_sub(last_heard),
+                last_send_age_ms: (last_send != 0).then(|| now.saturating_sub(last_send)),
+                current_num: current.num,
+                acked_num,
+                outstanding: outstanding.len(),
+                srtt: conn.srtt(),
+                rto: conn.rto(),
+                send_interval: conn.send_interval(),
+                bytes_rx: conn.bytes_rx(),
+                bytes_tx: conn.bytes_tx(),
+                term_gen: term.generation(),
+                pty_open,
+            }
+            .dump();
         }
 
         let timeout = if peer_active {

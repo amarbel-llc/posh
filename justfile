@@ -548,3 +548,159 @@ debug-record-posht transport host *ARGS:
     fi
     echo ">> wrote recording: $out" >&2
     echo ">> diff a posh vs ssh capture to localize the drawing bug" >&2
+
+# --- debug: live-session triage (a wedged roaming session) -----------------
+# Read-only diagnostics for a posh session that has stopped updating on a
+# remote client. The roaming server (remote/server.rs) owns the PTY directly
+# (mosh-server style) and syncs dump_vt frames over encrypted UDP; it has NO
+# local session-daemon socket, so triage works from the process table, the
+# kernel UDP table, and /proc. None of these recipes mutate anything.
+
+# Snapshot every posh/posh-server process for the current user with its state
+# flags (STAT: R/S/D/T, + for foreground), elapsed seconds, CPU%, and kernel
+# wait channel (WCHAN). A wedged server reads as one of: D (stuck in an
+# uninterruptible syscall), high pcpu (spinning), or S with a poll/recv wchan
+# (idle — waiting on a client whose acks never arrive). Pair with
+# debug-posh-sockets to map pid<->UDP port, then debug-posh-proc-state <pid>.
+[group("debug")]
+debug-posh-procs:
+    #!/usr/bin/env bash
+    set -euo pipefail
+    out="$(nix shell nixpkgs#procps --command \
+      ps -o pid,ppid,stat,etimes,pcpu,wchan:24,args -u "$(id -u)")"
+    echo "$out" | head -n1
+    # Filter ps output captured BEFORE this grep ran, so the grep/nix helpers
+    # aren't in the snapshot. Drop our own recipe line defensively.
+    echo "$out" | grep -i posh | grep -v -e 'debug-posh' -e 'grep -i' \
+      || echo "(no posh processes for uid $(id -u))"
+
+# Map posh sockets to pids: the mosh-style UDP transport listeners (one live
+# server per remote client) and any local session-daemon unix sockets. Then
+# list the socket-dir candidates (POSH_DIR | XDG_RUNTIME_DIR/posh/<group> |
+# {TMPDIR,/tmp}/posh-<uid>) with the daemon .log files. The ss view is
+# env-independent (it reads the kernel); the dir listing reflects THIS shell's
+# env, which may differ from the daemons'. Read-only; pair with debug-posh-procs.
+[group("debug")]
+debug-posh-sockets:
+    #!/usr/bin/env bash
+    set -euo pipefail
+    echo "== ss -nap (udp + unix, posh only) =="
+    nix shell nixpkgs#iproute2 --command ss -nap 2>/dev/null \
+      | grep -i posh || echo "(no posh sockets)"
+    echo
+    echo "== socket-dir candidates =="
+    uid="$(id -u)"
+    for base in \
+      "${POSH_DIR:-}" \
+      "${XDG_RUNTIME_DIR:-/run/user/$uid}/posh" \
+      "${TMPDIR:-}/posh-$uid" \
+      "/tmp/posh-$uid"; do
+      [ -n "$base" ] && [ -d "$base" ] || continue
+      echo "-- $base"
+      find "$base" -maxdepth 2 \
+        -printf '%M %u %TY-%Tm-%Td %TH:%TM %s %p\n' 2>/dev/null | sort -k6
+    done
+
+# Deep read-only kernel state for ONE posh pid (from debug-posh-procs): its
+# wait channel + stack (blocked in which syscall?), state, voluntary vs
+# nonvoluntary context-switch counters (parked vs spinning), and fd table
+# (which UDP socket + which PTY master it holds). This is how you localize
+# *where* a wedged roaming server is stuck. Pure /proc reads — the stack may be
+# empty if kptr/yama restricts it, but wchan/status/fd are always readable for
+# your own process. Usage: just debug-posh-proc-state 12345
+[group("debug")]
+debug-posh-proc-state pid:
+    #!/usr/bin/env bash
+    set -euo pipefail
+    p='{{ pid }}'
+    [ -d "/proc/$p" ] || { echo "no such pid: $p" >&2; exit 1; }
+    echo "== cmdline =="; tr '\0' ' ' < "/proc/$p/cmdline" 2>/dev/null; echo
+    echo "== wchan =="; cat "/proc/$p/wchan" 2>/dev/null; echo
+    echo "== stack =="; cat "/proc/$p/stack" 2>/dev/null || echo "(stack unreadable)"
+    echo "== status =="
+    grep -E '^(State|Threads|VmRSS|voluntary_ctxt_switches|nonvoluntary_ctxt_switches|SigQ|SigPnd|SigBlk):' \
+      "/proc/$p/status" 2>/dev/null || true
+    echo "== fds (sockets, ptys, pipes) =="
+    ls -l "/proc/$p/fd" 2>/dev/null || echo "(fd dir unreadable)"
+
+# Liveness probe for ONE posh pid: is its poll loop still cycling, or frozen?
+# Samples the context-switch counters and WCHAN/State twice across SECS (default
+# 3s) and prints the delta. A live-but-idle roaming server still wakes on its
+# heartbeat/poll timeout, so dvol > 0 means the event loop is alive (the wedge
+# is then on the network/peer side — acks not arriving, peer forgotten, sends
+# stopped); dvol == 0 with State S means genuinely parked (nothing to do — no
+# PTY output, no datagrams). Also lists child processes (the session shell): a
+# live shell child confirms the session itself is intact. Read-only.
+# Usage: just debug-posh-proc-sample 12345 [secs]
+[group("debug")]
+debug-posh-proc-sample pid secs="3":
+    #!/usr/bin/env bash
+    set -euo pipefail
+    p='{{ pid }}'
+    [ -d "/proc/$p" ] || { echo "no such pid: $p" >&2; exit 1; }
+    read_vol() { awk -F'\t' '/^voluntary_ctxt_switches:/{print $2}' "/proc/$p/status"; }
+    read_nonvol() { awk -F'\t' '/^nonvoluntary_ctxt_switches:/{print $2}' "/proc/$p/status"; }
+    v0="$(read_vol)"; n0="$(read_nonvol)"; w0="$(cat /proc/$p/wchan)"
+    sleep '{{ secs }}'
+    v1="$(read_vol)"; n1="$(read_nonvol)"; w1="$(cat /proc/$p/wchan)"
+    st="$(awk -F'\t' '/^State:/{print $2}' /proc/$p/status)"
+    echo "pid $p  State=$st"
+    echo "  voluntary_ctxt_switches:    $v0 -> $v1   (delta $((v1 - v0)) over {{ secs }}s)"
+    echo "  nonvoluntary_ctxt_switches: $n0 -> $n1   (delta $((n1 - n0)))"
+    echo "  wchan: $w0 -> $w1"
+    if [ "$((v1 - v0))" -gt 0 ]; then
+      echo "  => event loop ALIVE (waking on heartbeat/poll); wedge is peer/network-side"
+    else
+      echo "  => parked: no wakeups in {{ secs }}s (idle, or genuinely stuck)"
+    fi
+    echo "== child processes (session shell) =="
+    nix shell nixpkgs#procps --command ps --ppid "$p" -o pid,stat,etimes,wchan:20,args \
+      || echo "(no children — shell may have exited)"
+
+# Trigger a one-shot SIGUSR2 transport-state dump from a running roaming posh
+# server OR client (pid from debug-posh-procs) and print the new line. The
+# process appends a snapshot of its live transport state — peer address,
+# last-heard/last-send ages, acked-vs-current frame — to $POSH_DEBUG_LOG if it
+# was set, else <runtime>/posh/posh-<role>-<pid>.log. Own process, no sudo. This
+# is the on-demand introspection a wedged session needs (remote/diag.rs; see the
+# SIGNALS section of posh-server(1)/posh-client(1)). Usage: just debug-posh-dump 12345
+[group("debug")]
+debug-posh-dump pid:
+    #!/usr/bin/env bash
+    set -euo pipefail
+    pid='{{ pid }}'
+    [ -d "/proc/$pid" ] || { echo "no such pid: $pid" >&2; exit 1; }
+    kill -USR2 "$pid"
+    sleep 0.3
+    uid="$(id -u)"
+    base="${POSH_DIR:-${XDG_RUNTIME_DIR:-/run/user/$uid}/posh}"
+    # Prefer the deterministic per-pid default file (only present when the
+    # process had no POSH_DEBUG_LOG); fall back to this shell's POSH_DEBUG_LOG
+    # when the process reused that pre-armed sink instead.
+    f="$(ls -t "$base"/posh-*-"$pid".log 2>/dev/null | head -n1 || true)"
+    if [ -z "${f:-}" ] && [ -n "${POSH_DEBUG_LOG:-}" ] && [ -f "${POSH_DEBUG_LOG}" ]; then
+      f="${POSH_DEBUG_LOG}"
+    fi
+    if [ -z "${f:-}" ] || [ ! -f "$f" ]; then
+      echo "no dump file for pid $pid under $base (POSH_DEBUG_LOG=${POSH_DEBUG_LOG:-unset})" >&2
+      exit 1
+    fi
+    echo ">> $f"
+    tail -n1 "$f"
+
+# Start a detached loopback roaming server (worktree debug binary) running a
+# long `sleep`, for HEADLESS transport debugging — e.g. exercising
+# debug-posh-dump without a tty. Prints the server's CONNECT line, then the
+# server double-forks and detaches; find its pid with debug-posh-procs and tear
+# it down with `kill`. Debug-only; the hermetic gate is build-rust.
+[group("debug")]
+debug-posh-server-smoke secs="600":
+    #!/usr/bin/env bash
+    set -euo pipefail
+    cd '{{ justfile_directory() }}'
+    nix develop --command cargo build -q -p posh
+    # Foreground returns once the daemon has double-forked away (prints CONNECT +
+    # "[posh-server detached]"); the detached server runs `sleep {{ secs }}`.
+    # POSH_DEBUG_LOG is cleared so the SIGUSR2 dump exercises its own default
+    # per-pid sink (<runtime>/posh/posh-server-<pid>.log), not a pre-armed file.
+    env -u POSH_DEBUG_LOG target/debug/posh server new -4 -- sleep '{{ secs }}'

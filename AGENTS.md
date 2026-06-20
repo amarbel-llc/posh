@@ -121,6 +121,34 @@ the `eng-*(7)` manpages — read them with `man eng-versioning`,
   framed records) MUST be reassembled across read boundaries via a byte-fed
   state machine — never assume a `read()` delivers a whole sequence.
 
+## Debugging a live / wedged roaming session
+
+The roaming server (`remote/server.rs`) owns the PTY directly (mosh-server
+style) and syncs frames over encrypted UDP — it has NO local session-daemon
+socket, so a wedged *remote* session is triaged from the process table, the
+kernel UDP table, and `/proc`, not from `posh list`. Paved-path recipes (all
+read-only, `debug` group):
+
+- `just debug-posh-procs` / `debug-posh-sockets` — find the `posh-server` /
+  `posh` (client) pids, their UDP ports, and state. A wedge is `S` in
+  `do_sys_poll`, not `D` or spinning; both the server and its shell child
+  stay alive (the transport is what's stuck, not the process).
+- `just debug-posh-proc-state <pid>` / `debug-posh-proc-sample <pid>` —
+  per-pid kernel state + a liveness probe (is the event loop still cycling?).
+- `just debug-posh-dump <pid>` — send `SIGUSR2` and print the one-line
+  transport-state snapshot: peer address, last-heard/last-send ages,
+  acked-vs-current frame, RTT. This is the on-demand introspection a wedged
+  session needs — it works on an already-running process, unlike
+  `POSH_DEBUG_LOG` (start-up-gated). The dump lands in `$POSH_DEBUG_LOG` if
+  set, else a per-pid default `$XDG_RUNTIME_DIR/posh/posh-<role>-<pid>.log`.
+  Implementation: `remote/diag.rs`; documented under SIGNALS in
+  `posh-server`(1) / `posh-client`(1) and recorded in FDR 0007.
+- `just debug-posh-server-smoke` — start a detached loopback server for
+  headless transport debugging (e.g. exercising the dump without a tty).
+- `POSH_DEBUG_LOG=<path>` (set before connecting) turns on *continuous*
+  periodic transport summaries to that file — the complement to the on-demand
+  `SIGUSR2` dump.
+
 ## When working here
 
 - You are almost always in a spinclass worktree (`.worktrees/<name>`).

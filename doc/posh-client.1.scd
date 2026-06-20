@@ -93,8 +93,35 @@ _POSH_DEBUG_LOG_
 	frame counts (full/diff/empty), download bandwidth, prediction
 	state, render activity (writes, bytes, idle skips), and per-frame
 	compute timing (full-dump re-parse and render compose, in
-	microseconds) — plus a final line on exit. Rotated at 5 MB. Unset
-	disables logging.
+	microseconds) — plus a final line on exit. Rotated at 5 MB. The
+	on-demand *SIGUSR2* state dump (*SIGNALS*) is written to this same
+	sink. Unset disables logging.
+
+# SIGNALS
+
+*SIGUSR2*
+	Append a one-line snapshot of live transport state to the diagnostic
+	sink: peer (server) address, last-send age, applied frame number,
+	input-outbox base and pending bytes, accumulated scrollback depth,
+	smoothed RTT/RTO and send interval, byte counters, prediction gauges,
+	terminal size, and the remote echo state. Written to _$POSH_DEBUG_LOG_
+	when set, otherwise to a per-pid default file
+	_<rundir>/posh-client-<pid>.log_ (the same _<rundir>_ resolution as
+	*posh-server*(1)). The dump always goes to a file, never the terminal,
+	so it never disturbs the live display; like the server's it needs no
+	startup flag, so it introspects an already-running client when a
+	session has wedged.
+
+*SIGWINCH*
+	Re-read the terminal size and repaint at the new geometry.
+
+*SIGTERM*, *SIGINT*, *SIGHUP*
+	Wind the session down through the normal shutdown handshake,
+	restoring the tty.
+
+*SIGCONT*
+	Repaint from scratch after the client is resumed; the outer terminal
+	state is unknown after *SIGSTOP* or fg.
 
 # SEE ALSO
 

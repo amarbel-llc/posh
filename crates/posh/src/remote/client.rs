@@ -12,6 +12,7 @@ use crate::pty::{self, RawMode};
 use crate::remote::caps;
 use crate::remote::crypto::Key;
 use crate::remote::datagram::{Connection, Family};
+use crate::remote::diag;
 use crate::remote::display::{self, NotificationEngine, Snapshot};
 use crate::remote::framesync::{self, ApplyOutcome, FrameApplier};
 use crate::remote::predict::{
@@ -93,6 +94,10 @@ pub fn run(host: &str, port: u16, family: Family) -> Result<()> {
     // SIGTERM racing it must find the handler installed, not the default
     // disposition (github #48).
     util::install_client_signal_handlers();
+    // SIGUSR2 dumps live transport state on demand (remote::diag); installed
+    // here (not in the shared client bundle) so only the roaming client, which
+    // consumes the flag in drive_client, arms it.
+    util::install_sigusr2_handler();
     let raw = RawMode::enable(STDIN)?;
     // Take over the alternate screen (mosh smcup); close() below restores
     // the user's pre-connect shell screen on the way out.
@@ -364,6 +369,34 @@ fn drive_client(st: &mut ClientState, raw: &RawMode, port: u16) -> Result<i32> {
         if util::take_flag(&util::SIGCONT_RECEIVED) {
             // Resumed after SIGSTOP/fg: the outer terminal state is unknown.
             st.initialized = false;
+        }
+
+        // SIGUSR2: snapshot live transport state to the diagnostic sink. Goes to
+        // a file, never the tty — stdout is the alternate-screen TUI and stderr
+        // is the user's outer shell, so writing either would corrupt the display.
+        if util::take_flag(&util::SIGUSR2_RECEIVED) {
+            let ps = predict_sample(&st.predict.stats());
+            diag::ClientState {
+                remote: st.conn.remote(),
+                last_send_age_ms: (st.last_send != 0).then(|| now.saturating_sub(st.last_send)),
+                applied_num: st.applied_num,
+                outbox_base: st.outbox.base(),
+                outbox_pending: st.outbox.pending().len(),
+                scrollback_len: st.scrollback.len(),
+                srtt: st.conn.srtt(),
+                rto: st.conn.rto(),
+                send_interval: st.conn.send_interval(),
+                bytes_rx: st.conn.bytes_rx(),
+                bytes_tx: st.conn.bytes_tx(),
+                predict_active: ps.active,
+                predict_shown: ps.shown,
+                predict_epoch_lag: ps.epoch_lag,
+                term_gen: st.server_term.generation(),
+                rows: st.rows,
+                cols: st.cols,
+                echo_on: st.echo_on,
+            }
+            .dump();
         }
 
         // Keystrokes -> quit sequence / prediction / reliable input stream.

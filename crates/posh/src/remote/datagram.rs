@@ -242,6 +242,14 @@ impl Connection {
         self.remote.is_some()
     }
 
+    /// The peer socket address datagrams are currently sent to (the address the
+    /// last authenticated datagram was learned from). Surfaced for the SIGUSR2
+    /// state dump: a stale value here vs. where the peer is really sending from
+    /// is the signature of a roam the server hasn't re-pinned to.
+    pub fn remote(&self) -> Option<SocketAddr> {
+        self.remote
+    }
+
     pub fn rto(&self) -> u64 {
         self.rtt.rto()
     }

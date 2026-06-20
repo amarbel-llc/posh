@@ -423,6 +423,7 @@
               pkgs.scdoc # compile/lint doc/*.scd man pages (just lint-doc)
               pkgs.gum # terminal UI for the maintenance recipes (eng-versioning(7))
               pkgs.gh # `just release` -> gh release create
+              pkgs.tcpdump # live-session transport triage (debug-posh-* recipes)
               conformistPkg # the raw conformist runner: `nix fmt`, lint-worktree
               # The config-specific, toolchain-hermetic git hooks on PATH under
               # the names the sweatfile references (conformist#47/#51/#54).

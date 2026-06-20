@@ -5,6 +5,7 @@ pub mod caps;
 pub mod client;
 pub mod crypto;
 pub mod datagram;
+pub mod diag;
 pub mod display;
 pub mod framesync;
 #[cfg(test)]

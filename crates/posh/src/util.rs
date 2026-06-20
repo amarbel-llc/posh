@@ -300,6 +300,7 @@ pub fn set_nonblocking(fd: RawFd) -> std::io::Result<()> {
 pub static SIGWINCH_RECEIVED: AtomicBool = AtomicBool::new(false);
 pub static SIGTERM_RECEIVED: AtomicBool = AtomicBool::new(false);
 pub static SIGUSR1_RECEIVED: AtomicBool = AtomicBool::new(false);
+pub static SIGUSR2_RECEIVED: AtomicBool = AtomicBool::new(false);
 pub static SIGCONT_RECEIVED: AtomicBool = AtomicBool::new(false);
 
 extern "C" fn on_sigwinch(_: libc::c_int) {
@@ -312,6 +313,10 @@ extern "C" fn on_sigterm(_: libc::c_int) {
 
 extern "C" fn on_sigusr1(_: libc::c_int) {
     SIGUSR1_RECEIVED.store(true, Ordering::Release);
+}
+
+extern "C" fn on_sigusr2(_: libc::c_int) {
+    SIGUSR2_RECEIVED.store(true, Ordering::Release);
 }
 
 extern "C" fn on_sigcont(_: libc::c_int) {
@@ -342,6 +347,19 @@ pub fn install_sigusr1_handler() {
     install_handler(
         libc::SIGUSR1,
         on_sigusr1 as extern "C" fn(libc::c_int) as usize,
+    );
+}
+
+/// SIGUSR2 flags a one-shot transport-state dump (remote/diag.rs): the roaming
+/// server and client each snapshot their live transport state to the
+/// POSH_DEBUG_LOG sink (or a default per-pid file) on the next loop iteration.
+/// Installed individually by the roaming server and roaming client — NOT in the
+/// shared client bundle, since the local session-attach client never consumes
+/// the flag.
+pub fn install_sigusr2_handler() {
+    install_handler(
+        libc::SIGUSR2,
+        on_sigusr2 as extern "C" fn(libc::c_int) as usize,
     );
 }
 
@@ -444,6 +462,13 @@ pub fn log_init(path: &Path) -> Result<()> {
         size,
     });
     Ok(())
+}
+
+/// Whether a log sink has been initialized (POSH_DEBUG_LOG armed it, or a prior
+/// `log_init`). The SIGUSR2 state dump uses this to decide whether to reuse the
+/// existing sink or lazily open its own default per-pid file.
+pub fn log_active() -> bool {
+    LOGGER.lock().unwrap().is_some()
 }
 
 /// Logs a line if a log file has been initialized; silently drops otherwise

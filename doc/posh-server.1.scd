@@ -79,7 +79,33 @@ _POSH_DEBUG_LOG_
 	the server has detached and redirected its standard streams to
 	_/dev/null_, this file is its only diagnostic sink. For the bare
 	*posh* _host:session_ form the path is forwarded from the client, so
-	it is interpreted on the remote host. Unset disables logging.
+	it is interpreted on the remote host. The on-demand *SIGUSR2* state
+	dump (*SIGNALS*) is written to this same sink. Unset disables logging.
+
+# SIGNALS
+
+*SIGUSR1*
+	Idle-exit trigger. With _$POSH_SERVER_SIGNAL_TMOUT_ set the server
+	exits if the client has been silent that long (mosh-server parity);
+	otherwise it is taken and ignored.
+
+*SIGUSR2*
+	Append a one-line snapshot of live transport state to the diagnostic
+	sink: peer address, has-remote and peer-active, last-heard and last-
+	send ages, current vs. acked frame, outstanding frames, smoothed
+	RTT/RTO and send interval, byte counters, terminal generation, and
+	whether the PTY is still open. Written to _$POSH_DEBUG_LOG_ when set,
+	otherwise to a per-pid default file _<rundir>/posh-server-<pid>.log_,
+	where _<rundir>_ is _$POSH_DIR_, else _$XDG_RUNTIME_DIR/posh_, else a
+	_/tmp_ fallback. Unlike the periodic _$POSH_DEBUG_LOG_ summary it
+	needs no startup flag, so it introspects an already-running server
+	when a session has wedged: the peer address and last-heard age
+	distinguish a roam the server has not re-pinned from one-way packet
+	loss or a dead client.
+
+*SIGHUP*
+	Ignored, so a hangup on the bootstrap ssh channel never reaps the
+	detached session.
 
 # SEE ALSO
 
