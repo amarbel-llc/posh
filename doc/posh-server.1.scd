@@ -76,8 +76,12 @@ _POSH_ESCAPE_CMD_
 	Whitespace-split into argv (so _sc exec_ works); unset or blank runs
 	_$SHELL_ as a login shell, the same default as the session. In an
 	eng/spinclass environment this is set to _sc exec_, which resolves the
-	worktree session from the cwd and loads its devshell. The trigger
-	sub-key is the client's _POSH_ESCAPE_KEY_ — see *posh-client*(1).
+	worktree session from the cwd and loads its devshell. For the bare
+	*posh* _host:session_ form it is forwarded from the client (like
+	_POSH_DEBUG_LOG_), so to turn the feature on you set it once locally —
+	_export POSH_ESCAPE_CMD='sc exec'_ — and it takes effect on the remote
+	server. The trigger sub-key is the client's _POSH_ESCAPE_KEY_ — see
+	*posh-client*(1).
 
 _POSH_DEBUG_LOG_
 	When set to a writable path, the server appends periodic one-line

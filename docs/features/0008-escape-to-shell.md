@@ -25,11 +25,14 @@ lives on the server, so a client-local shell would land on the wrong machine.
 - **Trigger:** `Ctrl-^` then the escape key (default `s`, `$POSH_ESCAPE_KEY` on
   the client). Raw-mode-proof: the client reads raw stdin and decides what to
   forward, so the inner app's `-isig` is irrelevant.
-- **Command:** `$POSH_ESCAPE_CMD` on the server, whitespace-split into argv;
-  unset/blank runs `$SHELL` as a login shell (the session default). In an
-  eng/spinclass environment it is set to `sc exec`, which resolves the worktree
-  session from the cwd, loads its devshell, and sets the `SPINCLASS_*` identity
-  env — so posh stays generic with no hardcoded spinclass dependency.
+- **Command:** `$POSH_ESCAPE_CMD` (read by the server), whitespace-split into
+  argv; unset/blank runs `$SHELL` as a login shell (the session default). For the
+  bare `posh host:session` form it is forwarded from the client over the ssh
+  bootstrap (like `POSH_DEBUG_LOG`), so you set it **once on the client**
+  (`export POSH_ESCAPE_CMD='sc exec'`) and it takes effect on the remote server.
+  In an eng/spinclass environment it is set to `sc exec`, which resolves the
+  worktree session from the cwd, loads its devshell, and sets the `SPINCLASS_*`
+  identity env — so posh stays generic with no hardcoded spinclass dependency.
 - **Working directory:** the session's OSC-7 cwd (`posh_term::Terminal::pwd()`),
   with a fallback to the server's own cwd then `$HOME` when the shell reported
   none.

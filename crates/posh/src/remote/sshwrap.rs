@@ -101,7 +101,9 @@ fn is_shell_safe_name(name: &str) -> bool {
 /// isn't left with an empty TERM, which strands color-by-$TERM tools like git
 /// and Charmbracelet TUIs); and POSH_DEBUG_LOG, so a single locally-set perf-log
 /// path lights up both ends (the server logs to that path on the *remote* host,
-/// failing closed if it isn't writable there). TERM rides as a *candidate*: the
+/// failing closed if it isn't writable there); and POSH_ESCAPE_CMD, so the
+/// escape-to-shell command (FDR 0008) is set once on the client and runs on the
+/// *remote* server. TERM rides as a *candidate*: the
 /// server resolves it against its own terminfo DB (terminfo::resolve_term).
 /// Restricted to names safe to emit as shell assignments.
 ///
@@ -118,7 +120,8 @@ fn forwarded_env_vars() -> Vec<(String, String)> {
                 || k.starts_with("LC_")
                 || k == "TERM"
                 || k == "COLORTERM"
-                || k == "POSH_DEBUG_LOG")
+                || k == "POSH_DEBUG_LOG"
+                || k == "POSH_ESCAPE_CMD")
                 && is_shell_safe_name(k)
         })
         .collect()
@@ -321,7 +324,7 @@ mod tests {
     }
 
     #[test]
-    fn forwarded_var_filter_admits_locale_term_and_debug_log_only() {
+    fn forwarded_var_filter_admits_locale_term_debug_log_and_escape_cmd() {
         // The membership predicate forwarded_env_vars applies, tested directly
         // (not via process env, which is global and racy under parallel tests).
         let admit = |k: &str| {
@@ -329,7 +332,8 @@ mod tests {
                 || k.starts_with("LC_")
                 || k == "TERM"
                 || k == "COLORTERM"
-                || k == "POSH_DEBUG_LOG")
+                || k == "POSH_DEBUG_LOG"
+                || k == "POSH_ESCAPE_CMD")
                 && is_shell_safe_name(k)
         };
         assert!(admit("TERM"));
@@ -337,7 +341,11 @@ mod tests {
         assert!(admit("LANG"));
         assert!(admit("LC_ALL"));
         assert!(admit("POSH_DEBUG_LOG"));
+        // The escape-to-shell command rides to the remote server (FDR 0008).
+        assert!(admit("POSH_ESCAPE_CMD"));
         assert!(!admit("PATH"));
+        // The trigger KEY is client-side only — it must not be forwarded.
+        assert!(!admit("POSH_ESCAPE_KEY"));
         // The session key must never ride the cleartext remote command.
         assert!(!admit("POSH_KEY"));
     }
