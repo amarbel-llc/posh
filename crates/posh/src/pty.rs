@@ -49,12 +49,16 @@ pub struct PtyChild {
 /// Opens a PTY and forks; the child becomes session leader on the slave side
 /// and execs `command` (or, when None, `$SHELL` as a login shell with a
 /// "-"-prefixed argv[0], the traditional signal). `extra_env` entries are
-/// exported into the child environment.
+/// exported into the child environment. When `cwd` is set the child `chdir`s
+/// into it before exec (a failure is non-fatal — the child keeps the inherited
+/// cwd — so a stale OSC-7 path can't strand the shell). Used by the escape-to-
+/// shell overlay (FDR 0008) to land the shell in the session's working dir.
 pub fn spawn_shell(
     command: Option<&[String]>,
     rows: u16,
     cols: u16,
     extra_env: &[(String, String)],
+    cwd: Option<&str>,
 ) -> Result<PtyChild> {
     // Everything the child needs is allocated before fork(): allocating in
     // the forked child of a (potentially multi-threaded) process is unsafe.
@@ -65,6 +69,14 @@ pub fn spawn_shell(
         .iter()
         .map(|(k, v)| CString::new(format!("{k}={v}")).map_err(|e| Error(e.to_string())))
         .collect::<Result<_>>()?;
+    // Pre-allocate the cwd CString before fork(); the child only dereferences
+    // the raw pointer (chdir is async-signal-safe).
+    let cwd_owned: Option<CString> = match cwd {
+        Some(d) => Some(CString::new(d).map_err(|e| Error(e.to_string()))?),
+        None => None,
+    };
+    let cwd_ptr: *const libc::c_char =
+        cwd_owned.as_ref().map_or(std::ptr::null(), |c| c.as_ptr());
 
     let ws = libc::winsize {
         ws_row: rows,
@@ -104,6 +116,12 @@ pub fn spawn_shell(
             // ioctl request is c_int-width on Linux, c_ulong on macOS; cast
             // the constant to match.
             libc::ioctl(slave, libc::TIOCSCTTY as _, 0);
+            // Land in the requested working directory (the session's OSC-7 cwd
+            // for the escape-to-shell overlay). Non-fatal: on failure the child
+            // keeps the inherited cwd rather than refusing to start.
+            if !cwd_ptr.is_null() {
+                libc::chdir(cwd_ptr);
+            }
             libc::dup2(slave, 0);
             libc::dup2(slave, 1);
             libc::dup2(slave, 2);
@@ -203,5 +221,33 @@ impl Drop for RawMode {
         unsafe {
             libc::tcsetattr(self.fd, libc::TCSAFLUSH, &self.orig);
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::io::Read;
+    use std::os::fd::FromRawFd;
+
+    /// `spawn_shell(cwd=...)` lands the child in that directory: run `pwd -P`
+    /// (physical, getcwd-based, so it reflects the chdir rather than an inherited
+    /// $PWD) and confirm it prints the requested dir. /bin/sh is guaranteed in
+    /// the nix build sandbox.
+    #[test]
+    fn spawn_shell_honors_cwd() {
+        let dir = std::fs::canonicalize(std::env::temp_dir()).unwrap();
+        let dir_str = dir.to_str().unwrap().to_string();
+        let cmd = vec!["/bin/sh".to_string(), "-c".to_string(), "pwd -P".to_string()];
+        let child = spawn_shell(Some(&cmd), 24, 80, &[], Some(&dir_str)).unwrap();
+        // Blocking read to EOF: the child prints once and exits, closing the
+        // slave, so the master sees EOF. from_raw_fd owns + closes the master.
+        let mut f = unsafe { std::fs::File::from_raw_fd(child.master) };
+        let mut out = String::new();
+        let _ = f.read_to_string(&mut out);
+        assert!(
+            out.contains(&dir_str),
+            "pwd -P output {out:?} should contain the spawn cwd {dir_str:?}"
+        );
     }
 }

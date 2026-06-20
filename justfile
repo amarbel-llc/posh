@@ -492,6 +492,31 @@ debug-verify-term:
     echo ">> connecting client to 127.0.0.1:$port — in the session, run: echo \$TERM" >&2
     POSH_KEY="$key" exec "$posh" client -4 127.0.0.1 "$port"
 
+# Verify the escape-to-shell overlay (FDR 0008) over a LOCAL loopback
+# server+client pair with freshly-built worktree binaries. Runs your $SHELL in
+# the session; cd somewhere, then press Ctrl-^ then the escape key (default 's')
+# to drop into a transient shell overlay in that dir — `pwd` should match, and
+# `exit` returns you to the live session. CMD overrides the escape command
+# (e.g. CMD='sc exec', or CMD=env to dump the overlay's environment); ESCKEY
+# remaps the trigger sub-key. The server reads POSH_ESCAPE_CMD and the client
+# reads POSH_ESCAPE_KEY; on a loopback pair both inherit this recipe's env.
+# Run it in the terminal you want to test; detach with Ctrl-^ then "." .
+# Debug-only; the hermetic gate is build-rust.
+[group("debug")]
+debug-verify-escape cmd="" esckey="":
+    #!/usr/bin/env bash
+    set -euo pipefail
+    cd '{{ justfile_directory() }}'
+    nix develop --command cargo build -p posh
+    posh=target/debug/posh
+    fifo=$(mktemp -u); mkfifo "$fifo"; trap 'rm -f "$fifo"' EXIT
+    export POSH_ESCAPE_CMD='{{ cmd }}'
+    export POSH_ESCAPE_KEY='{{ esckey }}'
+    "$posh" server new -4 >"$fifo" &
+    read -r _ _ port key < <(grep -m1 '^POSH CONNECT ' "$fifo")
+    echo ">> connecting client to 127.0.0.1:$port — cd somewhere, then press Ctrl-^ '${POSH_ESCAPE_KEY:-s}'" >&2
+    POSH_KEY="$key" exec "$posh" client -4 127.0.0.1 "$port"
+
 # Record an interactive posht session over a chosen transport to a .castx, to
 # capture and diff posh's client-side rendering against the ground truth when
 # chasing drawing bugs. TRANSPORT is `posh` (posht inside a persistent posh

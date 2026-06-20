@@ -80,7 +80,13 @@ pub fn run(
     // terminfo::session_env gives the session shell a resolved TERM (+ the
     // client's COLORTERM) so color-by-$TERM tools (git, Charmbracelet TUIs)
     // aren't left colorless.
-    let child = pty::spawn_shell(command.as_deref(), rows, cols, &crate::terminfo::session_env())?;
+    let child = pty::spawn_shell(
+        command.as_deref(),
+        rows,
+        cols,
+        &crate::terminfo::session_env(),
+        None,
+    )?;
     util::set_nonblocking(child.master)?;
 
     server_loop(conn, child, rows, cols);
@@ -114,6 +120,36 @@ struct FrameState {
     sb_total: u64,
 }
 
+/// A transient escape-to-shell overlay (FDR 0008): a second PTY running the
+/// configured escape command in the session's cwd, with its own terminal model.
+/// While present it is the broadcast source and the input sink; the live session
+/// keeps running underneath (read into the main `term`, just not broadcast), and
+/// is repainted when the overlay's shell exits.
+struct Overlay {
+    child: pty::PtyChild,
+    term: Terminal,
+}
+
+/// `$POSH_ESCAPE_CMD` parsed into argv (whitespace-split; `sc exec` and most
+/// commands need nothing fancier). `None` (unset/blank) means spawn `$SHELL` as
+/// a login shell — the same default as the session shell.
+fn escape_command() -> Option<Vec<String>> {
+    std::env::var("POSH_ESCAPE_CMD")
+        .ok()
+        .filter(|s| !s.trim().is_empty())
+        .map(|s| s.split_whitespace().map(str::to_string).collect())
+}
+
+/// Tear down an active escape overlay: hang up its shell's process group, reap
+/// it, and close the master fd. No-op when there is no overlay.
+fn close_overlay(overlay: &mut Option<Overlay>) {
+    if let Some(o) = overlay.take() {
+        util::kill_pgroup(o.child.pid, libc::SIGHUP);
+        let _ = util::try_reap(o.child.pid);
+        util::close_fd(o.child.master);
+    }
+}
+
 fn server_loop(mut conn: Connection, child: pty::PtyChild, rows: u16, cols: u16) {
     // Optional perf instrumentation (POSH_DEBUG_LOG). run() has already
     // double-forked and redirected stdio to /dev/null, so this file fd is the
@@ -124,6 +160,16 @@ fn server_loop(mut conn: Connection, child: pty::PtyChild, rows: u16, cols: u16)
     let mut assembly = FragmentAssembly::new();
     let mut inbox = InputInbox::new();
     let mut echo = EchoAck::new();
+
+    // Escape-to-shell overlay (FDR 0008): the command to spawn, a cwd fallback
+    // for when the session never reported an OSC-7 pwd, and the live overlay.
+    let escape_cmd = escape_command();
+    let fallback_cwd: String = std::env::current_dir()
+        .ok()
+        .and_then(|p| p.to_str().map(str::to_string))
+        .or_else(|| std::env::var("HOME").ok())
+        .unwrap_or_else(|| "/".to_string());
+    let mut overlay: Option<Overlay> = None;
 
     // Idle timeouts (seconds; 0 = never). NETWORK fires on its own; SIGNAL
     // only fires when SIGUSR1 has been received.
@@ -261,17 +307,28 @@ fn server_loop(mut conn: Connection, child: pty::PtyChild, rows: u16, cols: u16)
         };
 
         let mut fds = vec![util::pollfd(conn.raw_fd(), libc::POLLIN)];
-        if pty_open {
+        let pty_idx = if pty_open {
             fds.push(util::pollfd(child.master, libc::POLLIN));
-        }
+            fds.len() - 1
+        } else {
+            usize::MAX
+        };
+        let overlay_idx = if let Some(o) = &overlay {
+            fds.push(util::pollfd(o.child.master, libc::POLLIN));
+            fds.len() - 1
+        } else {
+            usize::MAX
+        };
         match util::poll(&mut fds, timeout) {
             Ok(_) => {}
             Err(e) if e.kind() == std::io::ErrorKind::Interrupted => continue,
             Err(_) => break,
         }
 
-        // Shell output -> terminal model.
-        if pty_open && fds[1].revents & (libc::POLLIN | libc::POLLHUP | libc::POLLERR) != 0 {
+        // Session shell output -> the main terminal model. Read even while an
+        // overlay is up so the live session stays current underneath; it just
+        // isn't broadcast until the overlay closes.
+        if pty_open && fds[pty_idx].revents & (libc::POLLIN | libc::POLLHUP | libc::POLLERR) != 0 {
             let mut buf = [0u8; 4096];
             match util::read_fd(child.master, &mut buf) {
                 Ok(0) => {
@@ -296,6 +353,38 @@ fn server_loop(mut conn: Connection, child: pty::PtyChild, rows: u16, cols: u16)
                 shutdown_at = now_ms();
                 force_frame = true;
                 exit_status = util::try_reap(child.pid).map(util::exit_code);
+                // The whole session is ending: tear down any escape overlay.
+                close_overlay(&mut overlay);
+            }
+        }
+
+        // Escape-overlay shell output -> the overlay terminal model (the active
+        // broadcast source). On EOF/EIO the shell exited: drop the overlay and
+        // force a frame so the live session repaints.
+        if overlay_idx != usize::MAX
+            && fds[overlay_idx].revents & (libc::POLLIN | libc::POLLHUP | libc::POLLERR) != 0
+        {
+            let mut closed = false;
+            if let Some(o) = overlay.as_mut() {
+                let mut buf = [0u8; 4096];
+                match util::read_fd(o.child.master, &mut buf) {
+                    Ok(0) => closed = true,
+                    Ok(n) => {
+                        o.term.process(&buf[..n]);
+                        let responses = o.term.take_responses();
+                        if !responses.is_empty() {
+                            let _ = util::write_all_retry(o.child.master, &responses, 100);
+                        }
+                    }
+                    Err(e)
+                        if e.kind() == std::io::ErrorKind::WouldBlock
+                            || e.kind() == std::io::ErrorKind::Interrupted => {}
+                    Err(_) => closed = true,
+                }
+            }
+            if closed {
+                close_overlay(&mut overlay);
+                force_frame = true; // repaint the restored session
             }
         }
 
@@ -329,6 +418,7 @@ fn server_loop(mut conn: Connection, child: pty::PtyChild, rows: u16, cols: u16)
                             &mut term,
                             &child,
                             pty_open,
+                            overlay.as_mut(),
                             &mut inbox,
                             &mut echo,
                             &mut client_size,
@@ -342,6 +432,40 @@ fn server_loop(mut conn: Connection, child: pty::PtyChild, rows: u16, cols: u16)
                             force_frame = true;
                             if pty_open {
                                 util::kill_pgroup(child.pid, libc::SIGHUP);
+                            }
+                        }
+                        // Escape-to-shell (FDR 0008): spawn the overlay once per
+                        // request. Sticky flag + the is_none() guard make
+                        // retransmits idempotent; the client stops once it sees
+                        // FLAG_OVERLAY echoed back.
+                        if msg.flags & sync::CLIENT_FLAG_ESCAPE != 0
+                            && overlay.is_none()
+                            && !shutdown
+                        {
+                            let cwd = if term.pwd().is_empty() {
+                                fallback_cwd.clone()
+                            } else {
+                                term.pwd().to_string()
+                            };
+                            match pty::spawn_shell(
+                                escape_cmd.as_deref(),
+                                client_size.0,
+                                client_size.1,
+                                &crate::terminfo::session_env(),
+                                Some(&cwd),
+                            ) {
+                                Ok(oc) => {
+                                    let _ = util::set_nonblocking(oc.master);
+                                    overlay = Some(Overlay {
+                                        child: oc,
+                                        term: Terminal::new(client_size.0, client_size.1),
+                                    });
+                                    force_frame = true;
+                                }
+                                Err(e) => util::log_write(
+                                    "error",
+                                    &format!("escape-to-shell spawn failed: {e}"),
+                                ),
                             }
                         }
                         update_acks(
@@ -379,7 +503,11 @@ fn server_loop(mut conn: Connection, child: pty::PtyChild, rows: u16, cols: u16)
         }
         let peer_active = conn.has_remote() && now.saturating_sub(last_heard) < PEER_TIMEOUT;
         if peer_active {
-            let dirty = term.generation() != last_gen;
+            // Broadcast source: the overlay terminal while an escape shell is up
+            // (FDR 0008), else the live session. The session still updates `term`
+            // underneath either way; only what we frame here changes.
+            let src: &Terminal = overlay.as_ref().map(|o| &o.term).unwrap_or(&term);
+            let dirty = src.generation() != last_gen;
             let cur_sb_total = term.primary_scrollback_total();
             let mut send_frame = false;
             let mut send_empty = false;
@@ -397,6 +525,7 @@ fn server_loop(mut conn: Connection, child: pty::PtyChild, rows: u16, cols: u16)
             // what the latest frame already covers. Suppressed during the
             // shutdown handshake so the final visible frame is not deferred.
             let want_scrollback = peer_wants_scrollback
+                && overlay.is_none() // the transient overlay carries no scrollback
                 && !term.is_alt_screen()
                 && !force_frame
                 && !shutdown
@@ -410,7 +539,7 @@ fn server_loop(mut conn: Connection, child: pty::PtyChild, rows: u16, cols: u16)
             let make_visible = want_visible && !make_scrollback;
 
             if make_visible {
-                last_gen = term.generation();
+                last_gen = src.generation();
                 force_frame = false;
                 outstanding.push(FrameState {
                     num: current.num,
@@ -425,12 +554,13 @@ fn server_loop(mut conn: Connection, child: pty::PtyChild, rows: u16, cols: u16)
                 }
                 current = FrameState {
                     num: current.num + 1,
-                    data: stats.time_dump_vt(|| term.dump_vt()),
+                    data: stats.time_dump_vt(|| src.dump_vt()),
                     // The morph base for this frame (#15): the rendered state +
-                    // the off-Snapshot fields the keyframe rule reads.
-                    snapshot: Snapshot::from_term(&term),
-                    alt_screen: term.is_alt_screen(),
-                    dims: (term.rows(), term.cols()),
+                    // the off-Snapshot fields the keyframe rule reads. `src` is
+                    // the overlay terminal while an escape shell is active.
+                    snapshot: Snapshot::from_term(src),
+                    alt_screen: src.is_alt_screen(),
+                    dims: (src.rows(), src.cols()),
                     // A visible frame carries no scrollback rows, so applying it
                     // leaves the client at whatever scrollback it held at the
                     // diff base (the acked frame): acked_sb_total, NOT sb_high.
@@ -620,13 +750,29 @@ fn server_loop(mut conn: Connection, child: pty::PtyChild, rows: u16, cols: u16)
                 // Report the remote PTY's ECHO state so an optimistic-echo
                 // client knows when local echo is safe (FDR 0006). Off once the
                 // pty is gone, and at password prompts / raw-mode apps.
-                let echo_flag = if pty_open && pty::echo_on(child.master) {
+                // Echo state of the ACTIVE pty — the overlay shell while it is up
+                // (FDR 0008), else the session — so optimistic echo tracks
+                // whichever the client is typing into.
+                let active_master = overlay
+                    .as_ref()
+                    .map(|o| o.child.master)
+                    .unwrap_or(child.master);
+                let echo_flag = if (overlay.is_some() || pty_open) && pty::echo_on(active_master) {
                     sync::FLAG_ECHO
                 } else {
                     0
                 };
+                // Tell the client an escape overlay is active so it stops
+                // retransmitting CLIENT_FLAG_ESCAPE (the request was honored).
+                let overlay_flag = if overlay.is_some() {
+                    sync::FLAG_OVERLAY
+                } else {
+                    0
+                };
                 let frame = ServerFrame {
-                    flags: (if shutdown { sync::FLAG_SHUTDOWN } else { 0 }) | echo_flag,
+                    flags: (if shutdown { sync::FLAG_SHUTDOWN } else { 0 })
+                        | echo_flag
+                        | overlay_flag,
                     caps: frame_caps,
                     frame_num: current.num,
                     input_ack: inbox.next_offset(),
@@ -670,26 +816,50 @@ fn server_loop(mut conn: Connection, child: pty::PtyChild, rows: u16, cols: u16)
     }
     let _ = util::try_reap(child.pid);
     util::close_fd(child.master);
+    close_overlay(&mut overlay);
 }
 
+#[allow(clippy::too_many_arguments)]
 fn handle_client_message(
     msg: &ClientMessage,
     term: &mut Terminal,
     child: &pty::PtyChild,
     pty_open: bool,
+    overlay: Option<&mut Overlay>,
     inbox: &mut InputInbox,
     echo: &mut EchoAck,
     client_size: &mut (u16, u16),
     force_ack: &mut bool,
 ) {
+    // Split the overlay borrow into its fd (Copy) and its terminal (&mut) so
+    // resize can touch both and input can be routed without a second borrow.
+    let (ov_master, ov_term) = match overlay {
+        Some(o) => (Some(o.child.master), Some(&mut o.term)),
+        None => (None, None),
+    };
     if msg.rows > 0 && msg.cols > 0 && (msg.rows, msg.cols) != *client_size {
         *client_size = (msg.rows, msg.cols);
         pty::set_term_size(child.master, msg.rows, msg.cols);
         term.resize(msg.rows, msg.cols);
+        // Keep the overlay sized to the client too (FDR 0008).
+        if let Some(m) = ov_master {
+            pty::set_term_size(m, msg.rows, msg.cols);
+        }
+        if let Some(t) = ov_term {
+            t.resize(msg.rows, msg.cols);
+        }
     }
     if let Some(new_input) = inbox.accept(msg.input_base, &msg.input) {
-        if pty_open {
-            let _ = util::write_all_retry(child.master, new_input, 500);
+        // Input goes to the active pty: the overlay shell while it is up, else
+        // the session.
+        match ov_master {
+            Some(m) => {
+                let _ = util::write_all_retry(m, new_input, 500);
+            }
+            None if pty_open => {
+                let _ = util::write_all_retry(child.master, new_input, 500);
+            }
+            None => {}
         }
         echo.record(inbox.next_offset(), now_ms());
         *force_ack = true;
@@ -772,7 +942,7 @@ mod tests {
         let key = Key::random();
         let (server_conn, port) = Connection::server((62100, 62199), &key, Family::Inet).unwrap();
         let cmd: Vec<String> = vec!["/bin/sh".into(), "-c".into(), "read x; exit 0".into()];
-        let child = crate::pty::spawn_shell(Some(&cmd), 24, 80, &[]).unwrap();
+        let child = crate::pty::spawn_shell(Some(&cmd), 24, 80, &[], None).unwrap();
         util::set_nonblocking(child.master).unwrap();
         let server = std::thread::spawn(move || server_loop(server_conn, child, 24, 80));
 
@@ -843,7 +1013,7 @@ mod tests {
         let (server_conn, port) = Connection::server((62200, 62299), &key, Family::Inet).unwrap();
         // A shell that would run forever without the client's quit request.
         let cmd: Vec<String> = vec!["/bin/sh".into(), "-c".into(), "sleep 600".into()];
-        let child = crate::pty::spawn_shell(Some(&cmd), 24, 80, &[]).unwrap();
+        let child = crate::pty::spawn_shell(Some(&cmd), 24, 80, &[], None).unwrap();
         util::set_nonblocking(child.master).unwrap();
         let server = std::thread::spawn(move || server_loop(server_conn, child, 24, 80));
 
@@ -901,6 +1071,102 @@ mod tests {
     }
 
     #[test]
+    fn escape_flag_spawns_and_tears_down_a_shell_overlay() {
+        // FDR 0008: CLIENT_FLAG_ESCAPE makes the server spawn a shell overlay
+        // whose frames carry FLAG_OVERLAY; sending that shell `exit\n` closes it
+        // (FLAG_OVERLAY clears); then a shutdown winds the session down. Covers
+        // the spawn, the broadcast-source swap, input routing to the overlay,
+        // and teardown — the parts no unit test reaches.
+        let key = Key::random();
+        let (server_conn, port) = Connection::server((62300, 62399), &key, Family::Inet).unwrap();
+        // The session shell just idles; the overlay is the unit under test.
+        let cmd: Vec<String> = vec!["/bin/sh".into(), "-c".into(), "sleep 600".into()];
+        let child = crate::pty::spawn_shell(Some(&cmd), 24, 80, &[], None).unwrap();
+        util::set_nonblocking(child.master).unwrap();
+        let server = std::thread::spawn(move || server_loop(server_conn, child, 24, 80));
+
+        let addr = format!("127.0.0.1:{port}").parse().unwrap();
+        let mut conn = Connection::client(addr, &key).unwrap();
+        let mut fragmenter = Fragmenter::new();
+        let mut assembly = FragmentAssembly::new();
+        let mut outbox = InputOutbox::new();
+
+        let mut acked_frame = 0u64;
+        let mut saw_overlay = false;
+        let mut overlay_cleared = false;
+        let mut sent_exit = false;
+        let mut shutting_down = false;
+        let mut saw_shutdown = false;
+        let deadline = now_ms() + 15_000;
+        while now_ms() < deadline {
+            let flags = if shutting_down {
+                sync::CLIENT_FLAG_SHUTDOWN
+            } else if !saw_overlay {
+                sync::CLIENT_FLAG_ESCAPE // request until the overlay appears
+            } else {
+                0
+            };
+            let msg = ClientMessage {
+                flags,
+                caps: vec![],
+                acked_frame,
+                rows: 24,
+                cols: 80,
+                input_base: outbox.base(),
+                input: outbox.pending().to_vec(),
+            };
+            for frag in fragmenter.make_fragments(&msg.encode(), sync::FRAGMENT_CONTENTS_MAX) {
+                conn.send(&frag.to_bytes()).unwrap();
+            }
+            if saw_shutdown && acked_frame > 0 {
+                break;
+            }
+            std::thread::sleep(std::time::Duration::from_millis(50));
+            loop {
+                match conn.recv() {
+                    Ok(Some(payload)) => {
+                        let Ok(frag) = sync::Fragment::from_bytes(&payload) else {
+                            continue;
+                        };
+                        let Some(assembled) = assembly.add(frag) else {
+                            continue;
+                        };
+                        let Ok(frame) = ServerFrame::decode(&assembled) else {
+                            continue;
+                        };
+                        acked_frame = acked_frame.max(frame.frame_num);
+                        if frame.flags & sync::FLAG_OVERLAY != 0 {
+                            saw_overlay = true;
+                        } else if saw_overlay {
+                            overlay_cleared = true; // overlay shell exited
+                        }
+                        if frame.flags & sync::FLAG_SHUTDOWN != 0 {
+                            saw_shutdown = true;
+                        }
+                    }
+                    Ok(None) => continue,
+                    Err(e) if e.kind() == std::io::ErrorKind::WouldBlock => break,
+                    Err(_) => break,
+                }
+            }
+            // Once the overlay is up, send its shell `exit`; once it has closed,
+            // wind the whole session down.
+            if saw_overlay && !sent_exit {
+                outbox.push(b"exit\n");
+                sent_exit = true;
+            }
+            if overlay_cleared {
+                shutting_down = true;
+            }
+        }
+
+        assert!(saw_overlay, "never saw FLAG_OVERLAY after CLIENT_FLAG_ESCAPE");
+        assert!(overlay_cleared, "overlay never closed after `exit`");
+        assert!(saw_shutdown, "server never wound down");
+        server.join().unwrap();
+    }
+
+    #[test]
     fn fresh_frames_paced_by_send_interval() {
         // A client that never supplies timestamps gives the server no RTT
         // samples, so its send_interval stays at the 250ms initial-SRTT
@@ -914,7 +1180,7 @@ mod tests {
             "-c".into(),
             "while :; do echo spam; done".into(),
         ];
-        let child = crate::pty::spawn_shell(Some(&cmd), 24, 80, &[]).unwrap();
+        let child = crate::pty::spawn_shell(Some(&cmd), 24, 80, &[], None).unwrap();
         util::set_nonblocking(child.master).unwrap();
         let server = std::thread::spawn(move || server_loop(server_conn, child, 24, 80));
 
@@ -1076,7 +1342,7 @@ mod tests {
         let (server_conn, port) = Connection::server(ports, &key, Family::Inet).unwrap();
         let cmd: Vec<String> =
             vec!["/bin/sh".into(), "-c".into(), "stty -echo; exec cat".into()];
-        let child = crate::pty::spawn_shell(Some(&cmd), 24, 80, &[]).unwrap();
+        let child = crate::pty::spawn_shell(Some(&cmd), 24, 80, &[], None).unwrap();
         util::set_nonblocking(child.master).unwrap();
         let server = std::thread::spawn(move || server_loop(server_conn, child, 24, 80));
 

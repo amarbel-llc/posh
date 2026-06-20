@@ -265,7 +265,7 @@ fn daemon_main(
         ("POSH_SESSION".to_string(), name.to_string()),
         ("POSH_GROUP".to_string(), cfg.group.clone()),
     ];
-    let child = match pty::spawn_shell(command.as_deref(), rows, cols, &envs) {
+    let child = match pty::spawn_shell(command.as_deref(), rows, cols, &envs, None) {
         Ok(c) => c,
         Err(e) => {
             util::log_write("error", &format!("failed to spawn pty: {e}"));

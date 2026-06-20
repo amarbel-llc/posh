@@ -37,6 +37,14 @@ the host and then launches this client against the reported address.
 	Suspend the client (background it); resume with the shell's job
 	control. The remote session keeps running.
 
+*Ctrl-^* then *s*
+	Open a transient shell on the *server* in the session's working
+	directory (FDR 0008), overlaying the live session until that shell
+	exits — handy for a quick command alongside a full-screen session
+	app. The sub-key is _POSH_ESCAPE_KEY_ (default _s_); the command is
+	the server's _POSH_ESCAPE_CMD_ (default the login shell). See
+	*posh-server*(1).
+
 # ENVIRONMENT
 
 _POSH_KEY_
@@ -86,6 +94,12 @@ _POSH_GRAB_MOUSE_
 _POSH_NO_TERM_INIT_
 	Suppress the alternate-screen takeover (set by *posh*(1)'s
 	*--no-init*).
+
+_POSH_ESCAPE_KEY_
+	The single sub-key, pressed after *Ctrl-^*, that opens an
+	escape-to-shell overlay (FDR 0008); default _s_. The command it runs
+	is chosen on the server by _POSH_ESCAPE_CMD_ — see *posh-server*(1).
+	Avoid _._ and _^_, which the *Ctrl-^* menu already uses.
 
 _POSH_DEBUG_LOG_
 	When set to a writable path, the client appends periodic one-line

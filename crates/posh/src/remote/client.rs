@@ -37,7 +37,20 @@ const SCROLLBACK_RING_DEPTH: usize = 10_000;
 /// The escape (quit-sequence) key: Ctrl-^ (0x1E), as in mosh.
 const ESCAPE_KEY: u8 = 0x1e;
 const ESCAPE_PASS_KEY: u8 = b'^';
-const ESCAPE_KEY_HELP: &str = "Commands: Ctrl-Z suspends, \".\" quits, \"^\" gives literal Ctrl-^";
+
+/// The Ctrl-^ command help line, naming the configured escape-to-shell key.
+fn escape_help(key: u8) -> String {
+    format!(
+        "Commands: Ctrl-Z suspends, \".\" quits, \"{}\" shells out, \"^\" gives literal Ctrl-^",
+        key as char
+    )
+}
+
+/// Parse `$POSH_ESCAPE_KEY` into the single sub-key byte that follows Ctrl-^ to
+/// open a shell (FDR 0008); default `s`. Avoid `.`/`^` (they are taken).
+fn parse_escape_key(value: Option<&str>) -> u8 {
+    value.and_then(|s| s.bytes().next()).unwrap_or(b's')
+}
 
 /// $POSH_GRAB_MOUSE: whether to grab the wheel on the outer terminal when the
 /// session app has no mouse mode of its own, translating wheel-up/down into
@@ -153,6 +166,9 @@ fn resolve(host: &str, port: u16, family: Family) -> Result<SocketAddr> {
 
 struct ClientState {
     conn: Connection,
+    /// Escape-to-shell trigger: the sub-key after Ctrl-^ that opens a shell
+    /// (FDR 0008, `$POSH_ESCAPE_KEY`, default `s`).
+    escape_key: u8,
     fragmenter: Fragmenter,
     outbox: InputOutbox,
     rows: u16,
@@ -241,8 +257,11 @@ fn client_loop(
     // unset/empty/other stays on DumpDiff (today's behavior, default-off).
     let framesync = framesync::FrameSync::parse(std::env::var("POSH_FRAMESYNC").ok().as_deref());
     let applier = framesync.applier();
+    // Escape-to-shell trigger key (FDR 0008): the sub-key after Ctrl-^, default 's'.
+    let escape_key = parse_escape_key(std::env::var("POSH_ESCAPE_KEY").ok().as_deref());
     let mut st = ClientState {
         conn,
+        escape_key,
         fragmenter: Fragmenter::new(),
         outbox: InputOutbox::new(),
         rows,
@@ -806,6 +825,7 @@ fn process_user_input(st: &mut ClientState, buf: &[u8], raw: &RawMode) -> bool {
         st.outbox.push(&[byte]);
     };
 
+    let escape_key = st.escape_key;
     for &byte in buf {
         if st.quit_pending {
             st.quit_pending = false;
@@ -824,13 +844,23 @@ fn process_user_input(st: &mut ClientState, buf: &[u8], raw: &RawMode) -> bool {
                     // Ctrl-^ twice (or Ctrl-^ ^) sends a literal Ctrl-^.
                     push(st, ESCAPE_KEY);
                 }
+                b if b == escape_key => {
+                    // Ctrl-^ <escape_key>: open a shell on the server (FDR 0008).
+                    // One-shot sticky flag (send_message clears it after one
+                    // transmission); the server spawns the overlay and echoes
+                    // FLAG_OVERLAY, which clears the notice below.
+                    st.flags |= sync::CLIENT_FLAG_ESCAPE;
+                    st.notify.set_message("opening shell\u{2026}", true, now);
+                    dirty = true;
+                    continue;
+                }
                 other => {
                     // Anything else is sent literally, escape key included.
                     push(st, ESCAPE_KEY);
                     push(st, other);
                 }
             }
-            if st.notify.message() == ESCAPE_KEY_HELP {
+            if st.notify.message() == escape_help(escape_key) {
                 st.notify.set_message("", false, now);
             }
             dirty = true;
@@ -839,7 +869,7 @@ fn process_user_input(st: &mut ClientState, buf: &[u8], raw: &RawMode) -> bool {
 
         if byte == ESCAPE_KEY {
             st.quit_pending = true;
-            st.notify.set_message(ESCAPE_KEY_HELP, true, now);
+            st.notify.set_message(&escape_help(st.escape_key), true, now);
             continue;
         }
 
@@ -876,6 +906,11 @@ fn process_frame(st: &mut ClientState, frame: &ServerFrame) -> bool {
         .on_server_frame(frame.input_ack, frame.echo_ack, st.conn.send_interval());
     // Remote PTY echo state for the optimistic-echo gate (FDR 0006).
     st.echo_on = frame.flags & sync::FLAG_ECHO != 0;
+    // The escape-to-shell overlay is up (FDR 0008): the request was honored, so
+    // drop the "opening shell…" notice (the request flag is already one-shot).
+    if frame.flags & sync::FLAG_OVERLAY != 0 && st.notify.message() == "opening shell\u{2026}" {
+        st.notify.set_message("", false, now);
+    }
     if frame.flags & sync::FLAG_SHUTDOWN != 0 {
         st.shutdown_seen = true;
         // EXIT_STATUS rides the shutdown frame's capability table; the
@@ -1144,6 +1179,10 @@ fn send_message(st: &mut ClientState) {
         input_base: st.outbox.base(),
         input: st.outbox.pending().to_vec(),
     };
+    // CLIENT_FLAG_ESCAPE is one-shot: it rode this message, so clear it now (the
+    // server's overlay spawn is idempotent on repeats, and the user can retry
+    // Ctrl-^ s if this datagram is lost). SHUTDOWN stays sticky until acked.
+    st.flags &= !sync::CLIENT_FLAG_ESCAPE;
     for frag in st
         .fragmenter
         .make_fragments(&msg.encode(), sync::FRAGMENT_CONTENTS_MAX)
@@ -1315,6 +1354,55 @@ mod tests {
         }
     }
 
+    /// A real RawMode over a throwaway pty slave. `process_user_input` needs a
+    /// `&RawMode` even on the paths (Ctrl-^ s, literal keys) that never use it.
+    fn pty_raw_mode() -> RawMode {
+        // SAFETY: openpty fills m/s with valid fds; the slave is a tty, which is
+        // all RawMode::enable needs. The fds intentionally leak for the test.
+        unsafe {
+            let (mut m, mut s) = (0, 0);
+            assert_eq!(
+                libc::openpty(
+                    &mut m,
+                    &mut s,
+                    std::ptr::null_mut(),
+                    std::ptr::null::<libc::termios>() as *mut _,
+                    std::ptr::null_mut(),
+                ),
+                0,
+                "openpty"
+            );
+            let _ = m; // keep the pty pair alive for the test
+            RawMode::enable(s).unwrap()
+        }
+    }
+
+    #[test]
+    fn parse_escape_key_defaults_to_s() {
+        assert_eq!(parse_escape_key(None), b's');
+        assert_eq!(parse_escape_key(Some("")), b's');
+        assert_eq!(parse_escape_key(Some("x")), b'x');
+        assert_eq!(parse_escape_key(Some("!")), b'!');
+    }
+
+    #[test]
+    fn ctrl_caret_escape_key_requests_shell_overlay() {
+        // FDR 0008: Ctrl-^ then the escape key sets CLIENT_FLAG_ESCAPE and
+        // forwards nothing; any other follow-up key does not.
+        let raw = pty_raw_mode();
+
+        let mut st = test_state(24, 80);
+        assert_eq!(st.escape_key, b's');
+        process_user_input(&mut st, &[ESCAPE_KEY, b's'], &raw);
+        assert_ne!(st.flags & sync::CLIENT_FLAG_ESCAPE, 0, "escape flag set");
+        assert!(st.outbox.is_empty(), "Ctrl-^ s forwards no input bytes");
+
+        let mut other = test_state(24, 80);
+        process_user_input(&mut other, &[ESCAPE_KEY, b'z'], &raw);
+        assert_eq!(other.flags & sync::CLIENT_FLAG_ESCAPE, 0, "non-escape key");
+        assert!(!other.outbox.is_empty(), "a literal key is forwarded");
+    }
+
     /// ClientState over a throwaway loopback connection, for unit tests
     /// of frame application and composition.
     fn test_state(rows: u16, cols: u16) -> ClientState {
@@ -1338,6 +1426,7 @@ mod tests {
             predict: predict::build(PredictionModel::Never, RenderStyle::Replace, false).0,
             renderer: predict::build(PredictionModel::Never, RenderStyle::Replace, false).1,
             notify: NotificationEngine::new(0),
+            escape_key: b's',
             grab_mouse: GrabMouse::Off,
             mouse_filter: MouseFilter::default(),
             quit_pending: false,

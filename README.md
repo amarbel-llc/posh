@@ -187,7 +187,8 @@ the render style are independent, swappable axes: `POSH_PREDICTION_RENDER` selec
 how predicted cells are painted (`replace`, the default, or `dim`). `POSH_PREDICTION`
 is a deprecated alias for `POSH_PREDICTION_MODEL`. A reverse-video
 "Last contact N seconds ago" banner appears after 6.5s of silence; the quit
-sequence is Ctrl-^ then `.` (Ctrl-^ Ctrl-Z suspends the client). Servers
+sequence is Ctrl-^ then `.` (Ctrl-^ Ctrl-Z suspends the client, Ctrl-^ s drops
+to a shell on the server in the session's directory). Servers
 bind dual-stack IPv6 when possible,
 report `POSH IP` from `$SSH_CONNECTION` for the ssh wrapper, require UTF-8
 locales on both ends (forwarding LANG/LC_* over ssh), forward TERM and

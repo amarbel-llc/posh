@@ -210,6 +210,12 @@ pub const FLAG_SHUTDOWN: u8 = 1;
 /// apps so their input is not shown. `0x02` is the reserved caps EXTENSION bit,
 /// so this is the next free runtime bit.
 pub const FLAG_ECHO: u8 = 4;
+/// An escape-to-shell overlay is active (FDR 0008): the frames carry the
+/// transient shell's screen, not the live session. Echoed back to the client so
+/// it knows its `CLIENT_FLAG_ESCAPE` request was honored (and can stop
+/// retransmitting it). `0x08` is the next free runtime bit after FLAG_ECHO (0x02
+/// is the reserved caps EXTENSION bit).
+pub const FLAG_OVERLAY: u8 = 8;
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum FrameBody {
@@ -466,6 +472,13 @@ impl EchoAck {
 /// Client requests a clean shutdown (Ctrl-^ . quit sequence): the server
 /// hangs up the shell and acknowledges with `FLAG_SHUTDOWN` frames.
 pub const CLIENT_FLAG_SHUTDOWN: u8 = 1;
+
+/// Client requests an escape-to-shell overlay (Ctrl-^ s, FDR 0008): the server
+/// spawns the configured escape command in the session cwd and broadcasts it
+/// until it exits. Sticky until the client sees `FLAG_OVERLAY` (so it survives
+/// UDP loss); the server's "already in overlay" guard makes repeats idempotent.
+/// `0x04` is the next free runtime bit (0x01 = SHUTDOWN, 0x02 = caps EXTENSION).
+pub const CLIENT_FLAG_ESCAPE: u8 = 4;
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct ClientMessage {
@@ -1055,6 +1068,41 @@ mod tests {
         };
         assert_eq!(ClientMessage::decode(&msg.encode()).unwrap(), msg);
         assert!(ClientMessage::decode(b"nope").is_err());
+    }
+
+    #[test]
+    fn escape_overlay_flags_roundtrip_clear_of_extension() {
+        // FDR 0008: the new runtime bits must not collide with the reserved
+        // caps EXTENSION bit (0x02), and must survive encode/decode even when a
+        // caps table is present (which sets EXTENSION on the wire).
+        assert_eq!(CLIENT_FLAG_ESCAPE & caps::FLAG_EXTENSION, 0);
+        assert_eq!(FLAG_OVERLAY & caps::FLAG_EXTENSION, 0);
+
+        let table = caps::own_table(&[]); // non-empty (leads with protocol version)
+        let cmsg = ClientMessage {
+            flags: CLIENT_FLAG_ESCAPE | CLIENT_FLAG_SHUTDOWN,
+            caps: table.clone(),
+            acked_frame: 7,
+            rows: 24,
+            cols: 80,
+            input_base: 3,
+            input: b"hi".to_vec(),
+        };
+        let cback = ClientMessage::decode(&cmsg.encode()).unwrap();
+        assert_eq!(cback.flags, CLIENT_FLAG_ESCAPE | CLIENT_FLAG_SHUTDOWN);
+        assert_eq!(cback, cmsg);
+
+        let frame = ServerFrame {
+            flags: FLAG_OVERLAY | FLAG_ECHO,
+            caps: table,
+            frame_num: 9,
+            input_ack: 2,
+            echo_ack: 1,
+            body: FrameBody::Empty,
+        };
+        let fback = ServerFrame::decode(&frame.encode()).unwrap();
+        assert_eq!(fback.flags, FLAG_OVERLAY | FLAG_ECHO);
+        assert_eq!(fback, frame);
     }
 
     #[test]

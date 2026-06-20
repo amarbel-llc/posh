@@ -70,6 +70,15 @@ _POSH_SERVER_SIGNAL_TMOUT_
 	_MOSH_SERVER_SIGNAL_TMOUT_ analog: a supervisor sends SIGUSR1 to
 	ask idle servers to wind down.
 
+_POSH_ESCAPE_CMD_
+	The command the escape-to-shell overlay runs (FDR 0008), spawned in
+	the session's working directory when the client sends *Ctrl-^* _s_.
+	Whitespace-split into argv (so _sc exec_ works); unset or blank runs
+	_$SHELL_ as a login shell, the same default as the session. In an
+	eng/spinclass environment this is set to _sc exec_, which resolves the
+	worktree session from the cwd and loads its devshell. The trigger
+	sub-key is the client's _POSH_ESCAPE_KEY_ — see *posh-client*(1).
+
 _POSH_DEBUG_LOG_
 	When set to a writable path, the server appends periodic one-line
 	performance summaries — smoothed RTT, RTO, transmitted frame counts

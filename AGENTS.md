@@ -103,8 +103,9 @@ the `eng-*(7)` manpages — read them with `man eng-versioning`,
 - **Docs:** significant designs get a record under `docs/` — ADR for
   architecture decisions, RFC for wire/file-format contracts, FDR for
   user-facing features. The target grammar + capability table is RFC 0001;
-  the FDRs (0001-0005) cover the namespace, takeover, mosh-parity, ssh agent
-  forwarding, and scrollback sync.
+  the FDRs (0001-0008) cover the namespace, takeover, mosh-parity, ssh agent
+  forwarding, scrollback sync, optimistic echo, the SIGUSR2 transport-state
+  dump, and escape-to-shell.
 
 ## Key design facts (load-bearing, verified)
 
@@ -120,6 +121,12 @@ the `eng-*(7)` manpages — read them with `man eng-versioning`,
 - **Stream parsing (ADR-0003):** multi-byte structures (escape sequences,
   framed records) MUST be reassembled across read boundaries via a byte-fed
   state machine — never assume a `read()` delivers a whole sequence.
+- **Escape-to-shell overlay (FDR 0008):** `Ctrl-^ s` makes the *server*
+  spawn a transient second PTY + `posh_term::Terminal` in the session cwd;
+  while it is up the broadcast source and input sink swap to that overlay
+  (the live session keeps running underneath, just unbroadcast) and frames
+  carry `FLAG_OVERLAY`. `remote/server.rs:server_loop`. Server-side because
+  the worktree lives on the server for cross-host roaming.
 
 ## Debugging a live / wedged roaming session
 
