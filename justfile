@@ -737,3 +737,29 @@ debug-posh-server-smoke secs="600":
     # POSH_DEBUG_LOG is cleared so the SIGUSR2 dump exercises its own default
     # per-pid sink (<runtime>/posh/posh-server-<pid>.log), not a pre-armed file.
     env -u POSH_DEBUG_LOG target/debug/posh server new -4 -- sleep '{{ secs }}'
+
+# Spin up ONE fresh roaming server for hand-testing the command palette, with NO
+# ambient paths. Kills any lingering posh servers, builds the hermetic toolset
+# (absolute /nix/store paths; posh + posh-palette co-installed so Ctrl-^ finds the
+# renderer next to itself), starts the server running $SHELL (fish) detached, and
+# prints the exact client command to paste — eliminating the stale-binary and
+# port-race confusion of leaning on target/debug or ./result. Tear down later
+# with: pkill -f '[p]osh server new'. Debug-only; the hermetic gate is build-rust.
+[group("debug")]
+debug-posh-palette-demo:
+    #!/usr/bin/env bash
+    set -euo pipefail
+    cd '{{ justfile_directory() }}'
+    # The [p] character class stops pkill from matching its own command line
+    # (the classic self-kill footgun).
+    pkill -f '[p]osh server new' || true
+    sleep 0.5
+    posh="$(nix build .#default --no-link --print-out-paths)/bin/posh"
+    fish="$(command -v fish || echo /bin/sh)"
+    out=$(SHELL="$fish" env -u POSH_DEBUG_LOG POSH_SERVER_NETWORK_TMOUT=3600 \
+        setsid "$posh" server new -4)
+    echo "$out"
+    read -r port key < <(awk '/POSH CONNECT/ {print $3, $4}' <<<"$out")
+    echo
+    echo "=== paste this to connect (absolute store path, no env juggling): ==="
+    echo "POSH_KEY=$key $posh client -4 127.0.0.1 $port"
