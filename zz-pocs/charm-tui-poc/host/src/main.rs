@@ -1,33 +1,30 @@
-//! charm-tui-host: spawn the bubbletea POC binary (`tui/tui-bin`, now a v2
-//! command palette modeled on trapeze's "/" Commands dialog) on a PTY and host
-//! it on a `posh_term::Terminal`, popped up as a chord-summoned overlay —
-//! proving posh's client-side emulator can summon and render an arbitrary
-//! charmbracelet TUI. Throwaway POC: hardcoded constants, no flags, no config.
-//! All libc/PTY FFI is confined here so posh-term stays 100% safe.
+//! charm-tui-host: host the bubbletea POC command bar (`tui/tui-bin`) as a
+//! centered popup composited over a retained session screen — proving posh's
+//! client-side emulator can run an arbitrary charmbracelet TUI as a mux-style
+//! popup. Throwaway POC: hardcoded constants, no flags. All libc/PTY FFI is
+//! confined here so posh-term stays 100% safe.
 //!
-//! This mirrors the server-side escape-to-shell overlay (FDR 0008) but
-//! client-side and local: a base "session" screen runs underneath, a chord (or
-//! a bare "/", trapeze's native trigger) swaps the input sink + render source to
-//! the command bar. Esc (or running a command) dismisses it back to the base;
-//! the bar's "Quit" command (or ctrl+c) exits the whole driver, signalled by the
-//! bar exiting with a sentinel status the host reaps.
+//! Rendering uses posh-term as a compositor rather than a separate-PTY blit:
+//!   * `session`: a posh_term::Terminal holding the background ("live session").
+//!   * `bar`: a posh_term::Terminal fed the command bar's PTY output.
+//!   * compose(): copy the session cells, then overlay the bar's drawn region
+//!     (its non-blank bounding box) centered on top — like `tmux display-popup`.
+//!   * a per-cell diff renderer writes only the cells that changed since the
+//!     last frame (reusing posh_term::sgr_params for styling), wrapped in
+//!     synchronized-output. So the popup is centered, and when it shrinks or
+//!     closes the vacated cells revert to the session underneath — no
+//!     full-screen clear, no stale rectangle.
 //!
-//! When the Ctrl-^ prefix is armed (awaiting its second key), a reverse-video
-//! status line is shown so the chord state is legible — the prior demo gave no
-//! hint, which made it hard to discover how to act/exit.
-//!
-//! One binary, two behaviours chosen by whether stdout is a tty (an OS fact,
-//! not a flag):
-//!   * stdout IS a tty  -> interactive: base screen + chord/"/" -> command bar.
-//!   * stdout is NOT a tty -> self-test: assert (a) posh_term renders the hosted
-//!     command bar and filtering/selection work, (b) selecting "Quit" exits with
-//!     the sentinel code, and (c) the chord state machine maps correctly. Print
-//!     PASS/FAIL, exit 0/1.
+//! Two behaviours chosen by whether stdout is a tty (an OS fact, not a flag):
+//!   * stdout IS a tty  -> interactive: session screen + chord/"/" -> popup.
+//!   * stdout is NOT a tty -> self-test: assert the hosted bar renders, filters,
+//!     and runs/quits; that compose() centers the popup over the background; and
+//!     that the chord state machine maps correctly. Print PASS/FAIL, exit 0/1.
 
 use std::ffi::CString;
 use std::time::Duration;
 
-use posh_term::Terminal;
+use posh_term::{sgr_params, Cell, Screen, Style, Terminal};
 
 /// Path to the bubbletea binary, anchored at compile time to this crate's
 /// manifest dir so it resolves regardless of the runtime CWD.
@@ -52,13 +49,15 @@ const CHORD_OPEN: u8 = b'.'; // Ctrl-^ .  -> summon the command bar
 const CHORD_QUIT: u8 = b'q'; // Ctrl-^ q  -> quit the driver
 const SLASH: u8 = b'/'; // bare "/" also summons (trapeze's native trigger)
 
+/// The retained "live session" background screen the popup composites over.
+const BASE_SCREEN: &[u8] = b"\x1b[2J\x1b[H  posh client \xe2\x80\x94 live session (POC base screen)\r\n\r\n  \x1b[1m/\x1b[0m  or  \x1b[1mCtrl-^ .\x1b[0m   command palette\r\n  \x1b[1mCtrl-^ q\x1b[0m            quit\r\n";
+
 fn main() {
     // Make the child's color/term detection deterministic and non-blocking.
     std::env::set_var("TERM", "xterm-256color");
     std::env::set_var("COLORTERM", "truecolor");
 
-    let bin = std::fs::canonicalize(TUI_BIN)
-        .unwrap_or_else(|e| panic!("cannot find {TUI_BIN}: {e}"));
+    let bin = std::fs::canonicalize(TUI_BIN).unwrap_or_else(|e| panic!("cannot find {TUI_BIN}: {e}"));
     let bin = CString::new(bin.into_os_string().into_encoded_bytes()).unwrap();
 
     if isatty(STDOUT) {
@@ -113,18 +112,188 @@ impl Chord {
 }
 
 // ---------------------------------------------------------------------------
+// Compositor: session background + centered popup -> presentation grid, then a
+// per-cell diff to the real terminal.
+// ---------------------------------------------------------------------------
+
+/// Tracks the cells currently on the real screen so each frame only writes the
+/// cells that changed (a minimal diff, like the live client's display path).
+struct Presenter {
+    rows: u16,
+    cols: u16,
+    prev: Vec<Cell>,
+}
+
+impl Presenter {
+    /// Starts assuming a freshly cleared (all-blank) screen.
+    fn new(rows: u16, cols: u16) -> Presenter {
+        let blank = Cell::blank(Style::default());
+        Presenter {
+            rows,
+            cols,
+            prev: vec![blank; rows as usize * cols as usize],
+        }
+    }
+
+    fn flush(&mut self, session: &Terminal, overlay: Option<&Terminal>, armed: bool) {
+        let cur = compose(self.rows, self.cols, session, overlay, armed);
+        let mut body = Vec::new();
+        diff(&self.prev, &cur, self.rows, self.cols, &mut body);
+        if !body.is_empty() {
+            let mut frame = Vec::with_capacity(body.len() + 16);
+            frame.extend_from_slice(b"\x1b[?2026h"); // begin synchronized update
+            frame.extend_from_slice(&body);
+            frame.extend_from_slice(b"\x1b[?2026l"); // end synchronized update
+            write_all(STDOUT, &frame);
+        }
+        self.prev = cur;
+    }
+}
+
+/// Build the presentation grid: the session background with `overlay` (if any)
+/// composited as a centered popup, or the armed status line on the bottom row.
+fn compose(rows: u16, cols: u16, session: &Terminal, overlay: Option<&Terminal>, armed: bool) -> Vec<Cell> {
+    let w = cols as usize;
+    let mut cur = vec![Cell::blank(Style::default()); rows as usize * w];
+
+    let sscr = session.screen();
+    for r in 0..rows {
+        for c in 0..cols {
+            if let Some(cell) = sscr.cell(r, c) {
+                cur[r as usize * w + c as usize] = cell.clone();
+            }
+        }
+    }
+
+    if let Some(bar) = overlay {
+        if let Some((r0, c0, r1, c1)) = bbox(bar.screen()) {
+            let h = r1 - r0 + 1;
+            let bw = c1 - c0 + 1;
+            // Center the popup's bounding box over the screen.
+            let dr = rows.saturating_sub(h) / 2;
+            let dc = cols.saturating_sub(bw) / 2;
+            let bscr = bar.screen();
+            for r in 0..h {
+                for c in 0..bw {
+                    let (pr, pc) = (dr + r, dc + c);
+                    if pr < rows && pc < cols {
+                        if let Some(cell) = bscr.cell(r0 + r, c0 + c) {
+                            cur[pr as usize * w + pc as usize] = cell.clone();
+                        }
+                    }
+                }
+            }
+        }
+    } else if armed {
+        overlay_status_line(&mut cur, rows, cols);
+    }
+
+    cur
+}
+
+/// The non-blank bounding box of a screen: (top, left, bottom, right), or None
+/// if the screen is entirely blank. This is the popup's drawn region.
+fn bbox(scr: &Screen) -> Option<(u16, u16, u16, u16)> {
+    let mut found = false;
+    let (mut r0, mut c0, mut r1, mut c1) = (0u16, 0u16, 0u16, 0u16);
+    for r in 0..scr.rows() {
+        for c in 0..scr.cols() {
+            if scr.cell(r, c).map(|cell| !cell.is_blank()).unwrap_or(false) {
+                if !found {
+                    found = true;
+                    (r0, c0, r1, c1) = (r, c, r, c);
+                } else {
+                    r0 = r0.min(r);
+                    c0 = c0.min(c);
+                    r1 = r1.max(r);
+                    c1 = c1.max(c);
+                }
+            }
+        }
+    }
+    found.then_some((r0, c0, r1, c1))
+}
+
+/// Paint a reverse-video chord-armed hint onto the bottom row of the grid.
+fn overlay_status_line(cur: &mut [Cell], rows: u16, cols: u16) {
+    let text = " PREFIX  Ctrl-^  —  .  palette   ·   q  quit   (any other key cancels) ";
+    let mut style = Style::default();
+    style.inverse = true;
+    let w = cols as usize;
+    let base = (rows - 1) as usize * w;
+    for (i, ch) in text.chars().enumerate() {
+        if i >= w {
+            break;
+        }
+        cur[base + i] = Cell {
+            ch,
+            style,
+            width: 1,
+            extra: Vec::new(),
+            hyperlink: 0,
+        };
+    }
+}
+
+/// Emit the minimal escape stream to turn `prev` into `cur`: per row, repaint
+/// from the first changed column to the last, reusing posh_term::sgr_params for
+/// styling. Cursor-positions absolutely, so it does not disturb other rows.
+fn diff(prev: &[Cell], cur: &[Cell], rows: u16, cols: u16, out: &mut Vec<u8>) {
+    let w = cols as usize;
+    for r in 0..rows as usize {
+        let base = r * w;
+        let mut first = None;
+        let mut last = 0;
+        for c in 0..w {
+            if !cells_eq(&prev[base + c], &cur[base + c]) {
+                if first.is_none() {
+                    first = Some(c);
+                }
+                last = c;
+            }
+        }
+        let Some(first) = first else { continue };
+
+        out.extend_from_slice(format!("\x1b[{};{}H\x1b[0m", r + 1, first + 1).as_bytes());
+        let mut style = Style::default();
+        for c in first..=last {
+            let cell = &cur[base + c];
+            if cell.width == 0 {
+                continue; // trailing column of a wide char
+            }
+            if cell.style != style {
+                out.extend_from_slice(format!("\x1b[{}m", sgr_params(&cell.style)).as_bytes());
+                style = cell.style;
+            }
+            let mut b = [0u8; 4];
+            let ch = if cell.ch == '\0' { ' ' } else { cell.ch };
+            out.extend_from_slice(ch.encode_utf8(&mut b).as_bytes());
+            for &e in &cell.extra {
+                out.extend_from_slice(e.encode_utf8(&mut b).as_bytes());
+            }
+        }
+        out.extend_from_slice(b"\x1b[0m");
+    }
+}
+
+fn cells_eq(a: &Cell, b: &Cell) -> bool {
+    a.ch == b.ch && a.style == b.style && a.width == b.width && a.extra == b.extra && a.hyperlink == b.hyperlink
+}
+
+// ---------------------------------------------------------------------------
 // Self-test: the deterministic, headless PASS/FAIL path.
 // ---------------------------------------------------------------------------
 
 fn selftest(bin: &CString) -> i32 {
     let hosting_ok = test_command_bar(bin);
     let quit_ok = test_quit_command(bin);
+    let composite_ok = test_composite(bin);
     let chord_ok = test_chord();
-    if hosting_ok && quit_ok && chord_ok {
-        println!("PASS: posh_term hosted the command bar, the Quit command exits the driver, and the chord state machine maps correctly");
+    if hosting_ok && quit_ok && composite_ok && chord_ok {
+        println!("PASS: posh_term hosted the command bar, Quit exits the driver, the popup composites centered over the session, and the chord state machine maps correctly");
         0
     } else {
-        println!("FAIL: hosting_ok={hosting_ok} quit_ok={quit_ok} chord_ok={chord_ok}");
+        println!("FAIL: hosting_ok={hosting_ok} quit_ok={quit_ok} composite_ok={composite_ok} chord_ok={chord_ok}");
         1
     }
 }
@@ -177,6 +346,33 @@ fn test_quit_command(bin: &CString) -> bool {
     ok
 }
 
+/// Compose the bar over the session background and assert the popup is centered
+/// (doesn't start at column 0) and the background shows above it.
+fn test_composite(bin: &CString) -> bool {
+    let (master, pid) = spawn_on_pty(bin, DEFAULT_ROWS, DEFAULT_COLS);
+    let mut bar = Terminal::new(DEFAULT_ROWS, DEFAULT_COLS);
+    drain_until_idle(master, &mut bar, IDLE);
+    wait_for(pid, true);
+
+    let mut session = Terminal::new(DEFAULT_ROWS, DEFAULT_COLS);
+    session.process(BASE_SCREEN);
+
+    let cur = compose(DEFAULT_ROWS, DEFAULT_COLS, &session, Some(&bar), false);
+    let joined: Vec<String> = (0..DEFAULT_ROWS).map(|r| row_text(&cur, r, DEFAULT_COLS)).collect();
+
+    // Background preserved above the centered popup: the top row is the session.
+    let bg_ok = joined[0].contains("posh client");
+    // The composed grid carries the palette.
+    let popup_ok = joined.join("\n").contains("Commands") && joined.join("\n").contains("New Session");
+    // Horizontally centered: the popup's bbox does not start at column 0.
+    let centered = match bbox(bar.screen()) {
+        Some((_, c0, _, c1)) => DEFAULT_COLS.saturating_sub(c1 - c0 + 1) / 2 > 0,
+        None => false,
+    };
+    eprintln!("--- composite ---\nbg_ok={bg_ok} popup_ok={popup_ok} centered={centered}\ntop=\"{}\"\n-----------------", joined[0]);
+    bg_ok && popup_ok && centered
+}
+
 /// Assert the chord parser: ordinary bytes pass through, `Ctrl-^ .` opens,
 /// `Ctrl-^ q` quits, `Ctrl-^ Ctrl-^` forwards a literal Ctrl-^.
 fn test_chord() -> bool {
@@ -197,6 +393,17 @@ fn test_chord() -> bool {
         && literal == (Action::Pending, Action::Forward(vec![CHORD_PREFIX]));
     eprintln!("--- chord ---\nordinary={ordinary:?}\nopen={open:?}\nquit={quit:?}\nliteral={literal:?}\n-------------");
     pass
+}
+
+fn row_text(cur: &[Cell], r: u16, cols: u16) -> String {
+    let w = cols as usize;
+    let base = r as usize * w;
+    let mut s = String::new();
+    for c in 0..w {
+        let ch = cur[base + c].ch;
+        s.push(if ch == '\0' { ' ' } else { ch });
+    }
+    s.trim_end().to_string()
 }
 
 /// Read from `master` into `term` until no bytes arrive for `idle`, or the
@@ -221,19 +428,24 @@ fn drain_until_idle(master: libc::c_int, term: &mut Terminal, idle: Duration) {
 }
 
 // ---------------------------------------------------------------------------
-// Interactive: base screen + chord-summoned command bar (for a human to drive).
+// Interactive: session screen + chord-summoned popup (for a human to drive).
 // ---------------------------------------------------------------------------
 
 fn interactive(bin: &CString) {
     let (rows, cols) = term_size(STDOUT).unwrap_or((DEFAULT_ROWS, DEFAULT_COLS));
     let _raw = RawGuard::enable(STDIN);
-    write_all(STDOUT, b"\x1b[?1049h"); // alt screen: restore the user's view on exit
+    // Alt screen, clear, hide cursor (the popup carries its own visible state).
+    write_all(STDOUT, b"\x1b[?1049h\x1b[2J\x1b[?25l");
 
-    draw_base();
+    let mut session = Terminal::new(rows, cols);
+    session.process(BASE_SCREEN);
+
+    let mut pres = Presenter::new(rows, cols);
     let mut chord = Chord::new();
     let mut armed = false;
-    let mut buf = [0u8; 8192];
+    pres.flush(&session, None, armed);
 
+    let mut buf = [0u8; 8192];
     'session: loop {
         if !poll_readable(STDIN, Duration::from_millis(250)) {
             continue;
@@ -251,63 +463,33 @@ fn interactive(bin: &CString) {
                     if bytes == [SLASH] {
                         open = true;
                     }
-                    // Other forwarded bytes would reach the session; the POC
-                    // base screen has nothing underneath, so they are dropped.
                 }
                 Action::Pending => {}
             }
         }
-        // Reflect the chord-armed state in the status line.
         if chord.armed != armed {
             armed = chord.armed;
-            render_armed(rows, armed);
+            pres.flush(&session, None, armed);
         }
         if open {
-            if host_overlay(bin, rows, cols) {
-                break 'session; // the bar's Quit command
-            }
-            draw_base();
+            let quit = run_overlay(bin, rows, cols, &session, &mut pres);
+            chord = Chord::new();
             armed = false;
+            if quit {
+                break 'session;
+            }
+            pres.flush(&session, None, false); // remove the popup -> reveal session
         }
     }
 
-    write_all(STDOUT, b"\x1b[?1049l");
+    write_all(STDOUT, b"\x1b[?25h\x1b[?1049l");
 }
 
-/// Draw the stand-in "live session" base screen.
-fn draw_base() {
-    let mut s = Vec::new();
-    s.extend_from_slice(b"\x1b[2J\x1b[H");
-    s.extend_from_slice(b"  posh client \xe2\x80\x94 live session (POC base screen)\r\n\r\n");
-    s.extend_from_slice(b"  \x1b[1m/\x1b[0m  or  \x1b[1mCtrl-^ .\x1b[0m   command palette\r\n");
-    s.extend_from_slice(b"  \x1b[1mCtrl-^ q\x1b[0m            quit\r\n");
-    write_all(STDOUT, &s);
-}
-
-/// Show or clear a reverse-video status line on the bottom row indicating that
-/// the Ctrl-^ prefix is armed and awaiting its second key. Cursor is saved and
-/// restored so the base screen is undisturbed.
-fn render_armed(rows: u16, armed: bool) {
-    let mut s = Vec::new();
-    s.extend_from_slice(b"\x1b7"); // DECSC: save cursor
-    s.extend_from_slice(format!("\x1b[{rows};1H\x1b[2K").as_bytes());
-    if armed {
-        s.extend_from_slice(
-            "\x1b[7m PREFIX  Ctrl-^  —  press  .  palette   ·   q  quit   (any other key cancels) \x1b[0m"
-                .as_bytes(),
-        );
-    }
-    s.extend_from_slice(b"\x1b8"); // DECRC: restore cursor
-    write_all(STDOUT, &s);
-}
-
-/// Spawn the TUI on a PTY and host it on a posh_term::Terminal, rendering to
-/// the real terminal and forwarding keystrokes, until the overlay exits.
-/// Returns true if the overlay asked the driver to quit (its "Quit" command,
-/// signalled by the child exiting with QUIT_SENTINEL).
-fn host_overlay(bin: &CString, rows: u16, cols: u16) -> bool {
+/// Spawn the bar on a PTY and composite it as a popup over `session` until it
+/// exits. Returns true if the bar asked the driver to quit (QUIT_SENTINEL).
+fn run_overlay(bin: &CString, rows: u16, cols: u16, session: &Terminal, pres: &mut Presenter) -> bool {
     let (master, pid) = spawn_on_pty(bin, rows, cols);
-    let mut term = Terminal::new(rows, cols);
+    let mut bar = Terminal::new(rows, cols);
 
     let mut fds = [
         libc::pollfd { fd: master, events: libc::POLLIN, revents: 0 },
@@ -326,10 +508,10 @@ fn host_overlay(bin: &CString, rows: u16, cols: u16) -> bool {
             let n = read_fd(master, &mut buf);
             if n <= 0 {
                 exited = true;
-                break; // overlay process exited
+                break;
             }
-            term.process(&buf[..n as usize]);
-            let replies = term.take_responses();
+            bar.process(&buf[..n as usize]);
+            let replies = bar.take_responses();
             if !replies.is_empty() {
                 write_all(master, &replies);
             }
@@ -337,21 +519,17 @@ fn host_overlay(bin: &CString, rows: u16, cols: u16) -> bool {
         if fds[1].revents & libc::POLLIN != 0 {
             let n = read_fd(STDIN, &mut buf);
             if n > 0 {
-                write_all(master, &buf[..n as usize]); // input sink -> overlay
+                write_all(master, &buf[..n as usize]); // input sink -> bar
             }
         }
-        if term.generation() != last_gen {
-            last_gen = term.generation();
-            let mut frame = Vec::with_capacity(4096);
-            frame.extend_from_slice(b"\x1b[H");
-            frame.extend_from_slice(&term.dump_vt());
-            write_all(STDOUT, &frame);
+        if bar.generation() != last_gen {
+            last_gen = bar.generation();
+            pres.flush(session, Some(&bar), false);
         }
         fds[0].revents = 0;
         fds[1].revents = 0;
     }
 
-    // Natural exit -> read the true exit code; otherwise (poll error) terminate.
     let code = wait_for(pid, !exited);
     code == Some(QUIT_SENTINEL)
 }

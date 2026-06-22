@@ -14,10 +14,13 @@ server-side escape-to-shell overlay (FDR 0008).
   `charm.land/bubbletea/v2` + `bubbles/v2` + `lipgloss/v2` stack (the versions
   trapeze uses). Built to `tui/tui-bin`.
 - `host/`  — a standalone Rust driver (`charm-tui-host`) depending only on the
-  in-repo `posh-term` crate plus `libc`. It `forkpty`-spawns the command bar,
-  pumps its PTY output through a `posh_term::Terminal`, renders to the real
-  terminal, and forwards keystrokes. All unsafe/PTY FFI lives here; `posh-term`
-  stays 100% safe.
+  in-repo `posh-term` crate plus `libc`. It `forkpty`-spawns the command bar
+  into one `posh_term::Terminal`, keeps a second `posh_term::Terminal` for the
+  retained session background, **composites** the bar's drawn region centered
+  over the session, and paints the real terminal with a **per-cell diff**
+  (reusing `posh_term::sgr_params`) so only changed cells are written — like
+  `tmux display-popup`. All unsafe/PTY FFI lives here; `posh-term` stays 100%
+  safe.
 - `flake.nix` — isolated devShell providing Go 1.26 (the repo devShell has none).
 
 ## Run
@@ -46,9 +49,13 @@ In `just run`:
 ## What it proves
 
 - `posh_term` faithfully emulates a bubbletea **v2** TUI: the rendered palette
-  is recoverable via `dump_text()`/`dump_vt()`, filtering narrows the list, and
-  selecting a command dispatches it.
-- A chord can intercept client-side input to summon/dismiss the overlay, with a
+  is recoverable cell-by-cell, filtering narrows the list, and selecting a
+  command dispatches it.
+- The bar can be composited as a **centered popup over a retained session**
+  using posh-term's own cell state + SGR emitter and a per-cell diff — so it
+  centers, and shrinking/closing it reveals the session underneath (no
+  full-screen clear, no stale rectangle).
+- A chord can intercept client-side input to summon/dismiss the popup, with a
   visible armed-prefix indicator.
 
 ## Known limits / out of scope (deliberate POC shortcuts)
@@ -60,8 +67,10 @@ In `just run`:
   app state on its custom `ultraviolet` cell-renderer; this POC reproduces the
   slash-palette behavior, key bindings, command labels, and styling as a vanilla
   bubbletea v2 `Model`.
-- **The host full-repaints** `dump_vt()` on every change (no frame diffing) and
-  there is **no SIGWINCH/resize handling.**
+- **The popup re-centers vertically as it grows/shrinks** (width is fixed), and
+  the real cursor is **hidden** while a popup is up (the filter text shows, but
+  there's no blinking input caret — cursor mapping is a follow-up). There is
+  **no SIGWINCH/resize handling.**
 - **Local-only, no server.** The real roaming client (`remote/client.rs`)
   requires a server; this POC hosts the overlay standalone to prove the
   emulator-hosting mechanic without that machinery.
