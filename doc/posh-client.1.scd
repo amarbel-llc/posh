@@ -29,40 +29,18 @@ the host and then launches this client against the reported address.
 
 # KEYS
 
-*Ctrl-^* then *.*
-	Quit the client and close the connection. Press *Ctrl-^* twice to
-	send a literal *Ctrl-^* to the remote.
+*Ctrl-^*
+	Open the command palette — the escape menu. It lists every client-local
+	escape command: the predictive-echo models (_adaptive_, _optimistic_,
+	_always_, _never_), the debug-logging toggle (_POSH_DEBUG_LOG_), shell-out
+	on the server (FDR 0008, the _POSH_ESCAPE_CMD_ command), suspend the
+	client, and quit. Type to filter, arrows to choose, Enter to run, Esc to
+	dismiss. Rendered by the *posh-palette* helper over a JSON-RPC control
+	channel; the session greys behind it.
 
-*Ctrl-^* then *Ctrl-Z*
-	Suspend the client (background it); resume with the shell's job
-	control. The remote session keeps running.
-
-*Ctrl-^* then *s*
-	Open a transient shell on the *server* in the session's working
-	directory (FDR 0008), overlaying the live session until that shell
-	exits — handy for a quick command alongside a full-screen session
-	app. The sub-key is _POSH_ESCAPE_KEY_ (default _s_); the command is
-	the server's _POSH_ESCAPE_CMD_ (default the login shell). See
-	*posh-server*(1).
-
-*Ctrl-^* then *e*
-	Cycle the local predictive-echo model live (_adaptive_, _optimistic_,
-	_always_, _never_) without reconnecting; a banner shows the new model.
-	Overrides _POSH_PREDICTION_MODEL_ for the rest of the session.
-
-*Ctrl-^* then *d*
-	Toggle client-side debug logging at runtime (the _POSH_DEBUG_LOG_
-	stream). When turned on without _POSH_DEBUG_LOG_ set, periodic transport
-	summaries are written to a per-pid file under the posh runtime dir; a
-	banner shows the state and path.
-
-*Ctrl-^* then *p*
-	Open the command palette: a filterable overlay listing the client-local
-	controls (the echo models and logging toggle above, plus quit). Type to
-	filter, arrows to choose, Enter to run, Esc to dismiss. Rendered by the
-	*posh-palette* helper over a JSON-RPC control channel; if that binary is
-	not found the palette is unavailable and a banner says so. The direct
-	chords keep working regardless.
+	If that helper cannot be launched, *Ctrl-^* instead arms a one-shot
+	fallback: *Ctrl-^* then *.* quits, and *Ctrl-^* then *Ctrl-^* (or *^*)
+	sends a literal *Ctrl-^* to the remote.
 
 # ENVIRONMENT
 
@@ -113,12 +91,6 @@ _POSH_GRAB_MOUSE_
 _POSH_NO_TERM_INIT_
 	Suppress the alternate-screen takeover (set by *posh*(1)'s
 	*--no-init*).
-
-_POSH_ESCAPE_KEY_
-	The single sub-key, pressed after *Ctrl-^*, that opens an
-	escape-to-shell overlay (FDR 0008); default _s_. The command it runs
-	is chosen on the server by _POSH_ESCAPE_CMD_ — see *posh-server*(1).
-	Avoid _._ and _^_, which the *Ctrl-^* menu already uses.
 
 _POSH_DEBUG_LOG_
 	When set to a writable path, the client appends periodic one-line

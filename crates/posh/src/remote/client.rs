@@ -40,17 +40,14 @@ const SCROLLBACK_RING_DEPTH: usize = 10_000;
 const ESCAPE_KEY: u8 = 0x1e;
 const ESCAPE_PASS_KEY: u8 = b'^';
 
-/// The Ctrl-^ command help line, naming the configured escape-to-shell key.
-fn escape_help(key: u8) -> String {
-    format!(
-        "Commands: Ctrl-Z suspends, \".\" quits, \"{}\" shells out, \"e\" cycles echo, \"d\" toggles logging, \"p\" opens palette, \"^\" gives literal Ctrl-^",
-        key as char
-    )
-}
+/// Banner shown only when Ctrl-^ can't open the palette (renderer missing or
+/// wedged): the degraded escape prefix, where Ctrl-^ . still quits.
+const PALETTE_FALLBACK_HELP: &str =
+    "command palette unavailable — \".\" quits, \"^\" gives literal Ctrl-^";
 
 /// Rebuild the predictor/renderer for `next` in place and force a clean repaint
-/// so stale predicted cells clear; banners the new model. The settable core
-/// shared by the `Ctrl-^ e` cycle and the palette's `echo.set` action.
+/// so stale predicted cells clear; banners the new model. Backs the palette's
+/// `echo.set` action.
 fn apply_echo_model(st: &mut ClientState, next: PredictionModel, now: u64) {
     let (predict, renderer) = predict::build(next, st.predict_render, st.predict_overwrite);
     st.predict = predict;
@@ -58,20 +55,6 @@ fn apply_echo_model(st: &mut ClientState, next: PredictionModel, now: u64) {
     st.predict_model = next;
     st.initialized = false;
     st.notify.set_message(&format!("echo: {next:?}"), false, now);
-}
-
-/// Cycle the predictive-echo model live (Ctrl-^ e): Adaptive -> Optimistic ->
-/// Always -> Never -> ... Experimental (legacy) is skipped; if the session
-/// started on it, the cycle re-enters at Optimistic.
-fn cycle_echo(st: &mut ClientState, now: u64) {
-    const CYCLE: [PredictionModel; 4] = [
-        PredictionModel::Adaptive,
-        PredictionModel::Optimistic,
-        PredictionModel::Always,
-        PredictionModel::Never,
-    ];
-    let i = CYCLE.iter().position(|&m| m == st.predict_model).unwrap_or(0);
-    apply_echo_model(st, CYCLE[(i + 1) % CYCLE.len()], now);
 }
 
 /// Set client-local debug logging to `enabled`: open the default per-pid sink
@@ -94,13 +77,9 @@ fn set_logging(st: &mut ClientState, enabled: bool, now: u64) {
     }
 }
 
-/// Toggle client-local debug logging (Ctrl-^ d).
-fn toggle_logging(st: &mut ClientState, now: u64) {
-    set_logging(st, !util::log_active(), now);
-}
-
 /// The palette's command list (RFC 0005 §5): the discoverable surface for the
-/// client-local controls. The logging entry reflects the current state.
+/// escape commands. Ctrl-^ opens this in lieu of a key-prefix menu, so every
+/// escape action lives here. The logging entry reflects the current state.
 fn palette_commands() -> Value {
     let (log_name, log_enabled): (&str, bool) = if util::log_active() {
         ("Debug logging: off", false)
@@ -113,29 +92,37 @@ fn palette_commands() -> Value {
         { "name": "Echo: always", "action": { "method": "echo.set", "params": { "model": "always" } } },
         { "name": "Echo: never", "action": { "method": "echo.set", "params": { "model": "never" } } },
         { "name": log_name, "action": { "method": "logging.set", "params": { "enabled": log_enabled } } },
+        { "name": "Shell out (server)", "action": { "method": "shell.open" } },
+        { "name": "Suspend client", "action": { "method": "client.suspend" } },
         { "name": "Quit session", "action": { "method": "app.quit" } },
     ])
 }
 
-/// Summon the command palette (Ctrl-^ p): spawn the renderer on first use, then
-/// show it. Returns whether the screen needs a repaint. A missing/unspawnable
-/// renderer degrades to a banner (the palette is optional).
-fn open_palette(st: &mut ClientState, now: u64) {
+/// Summon the command palette: spawn the renderer on first use, then show it.
+/// Returns whether it opened (false if the renderer can't be spawned, leaving
+/// the caller to fall back to the emergency-quit prefix).
+fn open_palette(st: &mut ClientState) -> bool {
     if st.palette.is_none() {
         st.palette = Palette::spawn(st.rows, st.cols);
     }
     if let Some(p) = st.palette.as_mut() {
         p.open("Commands", palette_commands());
         st.initialized = false; // repaint to show the overlay
+        true
     } else {
-        st.notify
-            .set_message("command palette unavailable (posh-palette not found)", false, now);
+        false
     }
 }
 
 /// Dispatch a palette-selected command action (RFC 0005 §7). Returns whether the
-/// client should send to the server promptly (true for a quit).
-fn dispatch_palette_action(st: &mut ClientState, method: &str, params: &Value, now: u64) -> bool {
+/// client should send to the server promptly (the escape-to-shell flag or quit).
+fn dispatch_palette_action(
+    st: &mut ClientState,
+    raw: &RawMode,
+    method: &str,
+    params: &Value,
+    now: u64,
+) -> bool {
     match method {
         "echo.set" => {
             if let Some(model) = params
@@ -153,18 +140,23 @@ fn dispatch_palette_action(st: &mut ClientState, method: &str, params: &Value, n
             }
             false
         }
+        "shell.open" => {
+            // FDR 0008 escape-to-shell: a one-shot sticky flag the next message
+            // carries; the server spawns the overlay shell in the session cwd.
+            st.flags |= sync::CLIENT_FLAG_ESCAPE;
+            st.notify.set_message("opening shell\u{2026}", true, now);
+            true
+        }
+        "client.suspend" => {
+            suspend(st, raw);
+            false
+        }
         "app.quit" => {
             request_shutdown(st);
             true
         }
         _ => false, // unknown method: the renderer already closed; ignore
     }
-}
-
-/// Parse `$POSH_ESCAPE_KEY` into the single sub-key byte that follows Ctrl-^ to
-/// open a shell (FDR 0008); default `s`. Avoid `.`/`^` (they are taken).
-fn parse_escape_key(value: Option<&str>) -> u8 {
-    value.and_then(|s| s.bytes().next()).unwrap_or(b's')
 }
 
 /// $POSH_GRAB_MOUSE: whether to grab the wheel on the outer terminal when the
@@ -281,9 +273,6 @@ fn resolve(host: &str, port: u16, family: Family) -> Result<SocketAddr> {
 
 struct ClientState {
     conn: Connection,
-    /// Escape-to-shell trigger: the sub-key after Ctrl-^ that opens a shell
-    /// (FDR 0008, `$POSH_ESCAPE_KEY`, default `s`).
-    escape_key: u8,
     fragmenter: Fragmenter,
     outbox: InputOutbox,
     rows: u16,
@@ -381,11 +370,8 @@ fn client_loop(
     // unset/empty/other stays on DumpDiff (today's behavior, default-off).
     let framesync = framesync::FrameSync::parse(std::env::var("POSH_FRAMESYNC").ok().as_deref());
     let applier = framesync.applier();
-    // Escape-to-shell trigger key (FDR 0008): the sub-key after Ctrl-^, default 's'.
-    let escape_key = parse_escape_key(std::env::var("POSH_ESCAPE_KEY").ok().as_deref());
     let mut st = ClientState {
         conn,
-        escape_key,
         fragmenter: Fragmenter::new(),
         outbox: InputOutbox::new(),
         rows,
@@ -571,7 +557,7 @@ fn drive_client(st: &mut ClientState, raw: &RawMode, port: u16) -> Result<i32> {
                     send_now = true;
                 }
                 Ok(n) => {
-                    if process_user_input(st, &buf[..n], raw) {
+                    if process_user_input(st, &buf[..n]) {
                         send_now = true;
                     }
                 }
@@ -623,7 +609,7 @@ fn drive_client(st: &mut ClientState, raw: &RawMode, port: u16) -> Result<i32> {
             if fds[base + 1].revents & libc::POLLIN != 0 {
                 match st.palette.as_mut().map(Palette::poll_events) {
                     Some(PaletteEvent::Action { method, params }) => {
-                        if dispatch_palette_action(st, &method, &params, now_ms()) {
+                        if dispatch_palette_action(st, raw, &method, &params, now_ms()) {
                             send_now = true;
                         }
                         st.initialized = false; // palette closed -> repaint session
@@ -930,7 +916,7 @@ fn arrow_down(app_cursor_keys: bool) -> &'static [u8] {
 /// Feeds user bytes through the Ctrl-^ quit-sequence state machine, the
 /// prediction engine, and into the reliable input stream. Returns true when
 /// anything needs sending.
-fn process_user_input(st: &mut ClientState, buf: &[u8], raw: &RawMode) -> bool {
+fn process_user_input(st: &mut ClientState, buf: &[u8]) -> bool {
     let now = now_ms();
     let mut dirty = false;
 
@@ -1000,9 +986,10 @@ fn process_user_input(st: &mut ClientState, buf: &[u8], raw: &RawMode) -> bool {
         st.outbox.push(&[byte]);
     };
 
-    let escape_key = st.escape_key;
     for &byte in buf {
         if st.quit_pending {
+            // Degraded escape prefix: only entered when the palette could not
+            // open, so Ctrl-^ . still quits (the rest pass through literally).
             st.quit_pending = false;
             match byte {
                 b'.' => {
@@ -1010,42 +997,9 @@ fn process_user_input(st: &mut ClientState, buf: &[u8], raw: &RawMode) -> bool {
                     dirty = true;
                     continue;
                 }
-                0x1a => {
-                    // Ctrl-^ Ctrl-Z: suspend the client (mosh suspend
-                    // sequence), not the remote foreground job.
-                    suspend(st, raw);
-                }
                 ESCAPE_KEY | ESCAPE_PASS_KEY => {
                     // Ctrl-^ twice (or Ctrl-^ ^) sends a literal Ctrl-^.
                     push(st, ESCAPE_KEY);
-                }
-                b if b == escape_key => {
-                    // Ctrl-^ <escape_key>: open a shell on the server (FDR 0008).
-                    // One-shot sticky flag (send_message clears it after one
-                    // transmission); the server spawns the overlay and echoes
-                    // FLAG_OVERLAY, which clears the notice below.
-                    st.flags |= sync::CLIENT_FLAG_ESCAPE;
-                    st.notify.set_message("opening shell\u{2026}", true, now);
-                    dirty = true;
-                    continue;
-                }
-                b'e' => {
-                    // Ctrl-^ e: cycle the predictive-echo model (client-local).
-                    cycle_echo(st, now);
-                    dirty = true;
-                    continue;
-                }
-                b'd' => {
-                    // Ctrl-^ d: toggle client-local debug logging.
-                    toggle_logging(st, now);
-                    dirty = true;
-                    continue;
-                }
-                b'p' => {
-                    // Ctrl-^ p: open the command palette (client-local overlay).
-                    open_palette(st, now);
-                    dirty = true;
-                    continue;
                 }
                 other => {
                     // Anything else is sent literally, escape key included.
@@ -1053,7 +1007,7 @@ fn process_user_input(st: &mut ClientState, buf: &[u8], raw: &RawMode) -> bool {
                     push(st, other);
                 }
             }
-            if st.notify.message() == escape_help(escape_key) {
+            if st.notify.message() == PALETTE_FALLBACK_HELP {
                 st.notify.set_message("", false, now);
             }
             dirty = true;
@@ -1061,8 +1015,15 @@ fn process_user_input(st: &mut ClientState, buf: &[u8], raw: &RawMode) -> bool {
         }
 
         if byte == ESCAPE_KEY {
-            st.quit_pending = true;
-            st.notify.set_message(&escape_help(st.escape_key), true, now);
+            // Ctrl-^ opens the command palette directly (it is the escape menu:
+            // echo, logging, shell-out, suspend, quit all live there). If the
+            // renderer can't be spawned, fall back to the emergency-quit prefix.
+            if open_palette(st) {
+                dirty = true;
+            } else {
+                st.quit_pending = true;
+                st.notify.set_message(PALETTE_FALLBACK_HELP, true, now);
+            }
             continue;
         }
 
@@ -1619,8 +1580,8 @@ mod tests {
         }
     }
 
-    /// A real RawMode over a throwaway pty slave. `process_user_input` needs a
-    /// `&RawMode` even on the paths (Ctrl-^ s, literal keys) that never use it.
+    /// A real RawMode over a throwaway pty slave. `dispatch_palette_action`
+    /// needs a `&RawMode` (the suspend command restores/re-enters raw mode).
     fn pty_raw_mode() -> RawMode {
         // SAFETY: openpty fills m/s with valid fds; the slave is a tty, which is
         // all RawMode::enable needs. The fds intentionally leak for the test.
@@ -1643,29 +1604,23 @@ mod tests {
     }
 
     #[test]
-    fn parse_escape_key_defaults_to_s() {
-        assert_eq!(parse_escape_key(None), b's');
-        assert_eq!(parse_escape_key(Some("")), b's');
-        assert_eq!(parse_escape_key(Some("x")), b'x');
-        assert_eq!(parse_escape_key(Some("!")), b'!');
+    fn dispatch_shell_open_sets_escape_flag() {
+        // The palette's "Shell out" command sets CLIENT_FLAG_ESCAPE (FDR 0008)
+        // and asks to send promptly.
+        let raw = pty_raw_mode();
+        let mut st = test_state(24, 80);
+        let send = dispatch_palette_action(&mut st, &raw, "shell.open", &json!({}), 0);
+        assert!(send, "shell-out asks to send promptly");
+        assert_ne!(st.flags & sync::CLIENT_FLAG_ESCAPE, 0, "escape flag set");
     }
 
     #[test]
-    fn ctrl_caret_escape_key_requests_shell_overlay() {
-        // FDR 0008: Ctrl-^ then the escape key sets CLIENT_FLAG_ESCAPE and
-        // forwards nothing; any other follow-up key does not.
+    fn dispatch_quit_requests_shutdown() {
         let raw = pty_raw_mode();
-
         let mut st = test_state(24, 80);
-        assert_eq!(st.escape_key, b's');
-        process_user_input(&mut st, &[ESCAPE_KEY, b's'], &raw);
-        assert_ne!(st.flags & sync::CLIENT_FLAG_ESCAPE, 0, "escape flag set");
-        assert!(st.outbox.is_empty(), "Ctrl-^ s forwards no input bytes");
-
-        let mut other = test_state(24, 80);
-        process_user_input(&mut other, &[ESCAPE_KEY, b'z'], &raw);
-        assert_eq!(other.flags & sync::CLIENT_FLAG_ESCAPE, 0, "non-escape key");
-        assert!(!other.outbox.is_empty(), "a literal key is forwarded");
+        let send = dispatch_palette_action(&mut st, &raw, "app.quit", &json!({}), 0);
+        assert!(send, "quit asks to send promptly");
+        assert!(st.shutdown_requested, "quit requests shutdown");
     }
 
     /// ClientState over a throwaway loopback connection, for unit tests
@@ -1694,7 +1649,6 @@ mod tests {
             predict_render: RenderStyle::Replace,
             predict_overwrite: false,
             notify: NotificationEngine::new(0),
-            escape_key: b's',
             grab_mouse: GrabMouse::Off,
             mouse_filter: MouseFilter::default(),
             quit_pending: false,
@@ -1715,22 +1669,17 @@ mod tests {
     }
 
     #[test]
-    fn cycle_echo_advances_model_swaps_predictor_and_banners() {
+    fn dispatch_echo_set_swaps_predictor_and_banners() {
+        let raw = pty_raw_mode();
         let mut st = test_state(3, 30);
-        st.predict_model = PredictionModel::Adaptive;
+        st.predict_model = PredictionModel::Never;
         st.initialized = true;
 
-        cycle_echo(&mut st, 0);
+        let send = dispatch_palette_action(&mut st, &raw, "echo.set", &json!({ "model": "optimistic" }), 0);
+        assert!(!send, "echo.set is client-local, no prompt send");
         assert_eq!(st.predict_model, PredictionModel::Optimistic);
         assert!(st.notify.message().contains("Optimistic"), "banner names the new model");
         assert!(!st.initialized, "swapping the predictor forces a clean repaint");
-
-        cycle_echo(&mut st, 0);
-        assert_eq!(st.predict_model, PredictionModel::Always);
-        cycle_echo(&mut st, 0);
-        assert_eq!(st.predict_model, PredictionModel::Never);
-        cycle_echo(&mut st, 0);
-        assert_eq!(st.predict_model, PredictionModel::Adaptive, "wraps around");
     }
 
     #[test]

@@ -225,6 +225,8 @@ methods it does not implement.
 |------------------|-----------------------------------------|----------------------------------------------|
 | `echo.set`       | `{"model": <string>}`                   | Set predictive-echo model. `model` ∈ `adaptive`, `optimistic`, `always`, `never`. Invalid → `-32602`. On a client without prediction (local attach), `-32601`. |
 | `logging.set`    | `{"enabled": <bool>}`                   | Enable/disable client debug logging. `result` MAY carry `{"path": <string>}`. |
+| `shell.open`     | `{}`                                    | Open the server-side escape-to-shell overlay (FDR 0008) in the session cwd. On a client without a server-side overlay, `-32601`. |
+| `client.suspend` | `{}`                                    | Suspend the client process (job-control `SIGSTOP`); the remote session keeps running. |
 | `app.quit`       | `{}`                                    | Quit the client (close the connection / detach per client semantics). |
 
 Per posh#87, these methods are the client's shared control surface: a converged
