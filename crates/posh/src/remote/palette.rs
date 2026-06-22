@@ -452,6 +452,44 @@ mod tests {
         p.shutdown();
     }
 
+    // Selecting a command must round-trip its action's NESTED params intact
+    // (#3: the server-logging command carries {scope, enabled}; the existing
+    // round-trip only covered a param-less app.quit). Skipped without the binary.
+    #[test]
+    fn real_binary_selection_preserves_nested_params() {
+        if palette_binary().is_none() {
+            eprintln!("skip: posh-palette not found (set POSH_PALETTE to run)");
+            return;
+        }
+        let mut p = Palette::spawn(24, 80).expect("spawn + handshake");
+        p.open(
+            "Commands",
+            json!([{
+                "name": "Server debug logging: on",
+                "action": { "method": "logging.set", "params": { "scope": "server", "enabled": true } }
+            }]),
+        );
+        let deadline = Instant::now() + Duration::from_secs(3);
+        while Instant::now() < deadline && !p.rterm.dump_text().contains("Server") {
+            poll_readable(p.master, Duration::from_millis(100));
+            p.pump();
+        }
+        p.forward_input(b"\r"); // select the only command
+        let mut got = None;
+        let deadline = Instant::now() + Duration::from_secs(3);
+        while Instant::now() < deadline && got.is_none() {
+            poll_readable(p.ctrl, Duration::from_millis(100));
+            if let PaletteEvent::Action { method, params } = p.poll_events() {
+                got = Some((method, params));
+            }
+        }
+        let (method, params) = got.expect("an action came back");
+        assert_eq!(method, "logging.set");
+        assert_eq!(params["scope"], "server", "nested scope param lost: {params}");
+        assert_eq!(params["enabled"], true, "nested enabled param lost: {params}");
+        p.shutdown();
+    }
+
     // A long command list (a 9-entry palette like the real one) must reach the
     // renderer intact — the wire write and the renderer's parse must not truncate
     // it. Reproduces the #3 report of a missing "Server debug logging". Skipped
