@@ -99,7 +99,7 @@ Point at an explicit renderer build:
 |---|---|---|---|
 | handshake timeout | 2s | ample for a local spawn + bubbletea start | spawns time out on slow hosts |
 | shutdown grace | 300ms | renderer exits promptly on `ui.shutdown`; SIGKILL backstop after | renderers routinely need longer to exit cleanly |
-| anchor / width | 1/3 down, centered, width 46 | matches the POC; fits 80 columns | users want it elsewhere or width-responsive |
+| anchor / width | ≤1/3 down (clamped up so a tall panel never clips the bottom), centered, width 46 | matches the POC while keeping the whole list on screen | the list grows past a short screen even clamped (needs in-panel scrolling) |
 
 ## More Information
 

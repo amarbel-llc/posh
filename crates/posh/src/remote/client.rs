@@ -1294,7 +1294,10 @@ fn composite_palette(next: &mut Snapshot, rterm: &Terminal, rows: u16, cols: u16
     };
     let bh = r1 - r0 + 1;
     let bw = c1 - c0 + 1;
-    let dr = rows / 3;
+    // Anchor a third of the way down, but shift up so a panel taller than the
+    // remaining space doesn't clip off the bottom (#3: the longer command list
+    // pushed "Server debug logging" and below past the screen edge).
+    let dr = (rows / 3).min(rows.saturating_sub(bh));
     let dc = cols.saturating_sub(bw) / 2;
     for r in 0..bh {
         for c in 0..bw {
@@ -1658,6 +1661,22 @@ mod tests {
     }
 
     #[test]
+    fn palette_commands_includes_both_logging_scopes() {
+        let cmds = palette_commands(false);
+        let arr = cmds.as_array().expect("commands is an array");
+        let names: Vec<&str> = arr.iter().filter_map(|c| c["name"].as_str()).collect();
+        assert!(
+            names.iter().any(|n| n.contains("Client debug logging")),
+            "client logging missing: {names:?}"
+        );
+        assert!(
+            names.iter().any(|n| n.contains("Server debug logging")),
+            "server logging missing: {names:?}"
+        );
+        assert_eq!(arr.len(), 9, "expected 9 commands, got {names:?}");
+    }
+
+    #[test]
     fn dispatch_server_logging_sets_one_shot_wire_flag() {
         // logging.set scope=server requests the toggle over the wire (#3): an
         // idempotent one-shot flag, not a client-local change.
@@ -1745,6 +1764,26 @@ mod tests {
         assert_eq!(st.predict_model, PredictionModel::Optimistic);
         assert!(st.notify.message().contains("Optimistic"), "banner names the new model");
         assert!(!st.initialized, "swapping the predictor forces a clean repaint");
+    }
+
+    #[test]
+    fn composite_palette_keeps_a_tall_panel_on_screen() {
+        // #3: a panel nearly as tall as the screen must not have its bottom
+        // commands clipped off by the 1/3-down anchor. Renderer marks its top
+        // and near-bottom rows; both must survive compositing onto a short screen.
+        let rows = 16u16;
+        let mut snap = Snapshot::blank(rows, 80);
+        let mut rterm = Terminal::new(rows, 80);
+        rterm.process(b"TOPMARK");
+        rterm.process(b"\x1b[14;1HBOTMARK"); // row 14 (1-indexed) => screen row 13
+        composite_palette(&mut snap, &rterm, rows, 80);
+
+        let text: String = snap.cells.iter().flatten().map(|c| c.ch).collect();
+        assert!(text.contains("TOPMARK"), "top of the panel present");
+        assert!(
+            text.contains("BOTMARK"),
+            "bottom of the panel must stay on screen, not clip off the edge"
+        );
     }
 
     #[test]

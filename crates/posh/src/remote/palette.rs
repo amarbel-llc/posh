@@ -451,4 +451,46 @@ mod tests {
         assert_eq!(action.as_deref(), Some("app.quit"));
         p.shutdown();
     }
+
+    // A long command list (a 9-entry palette like the real one) must reach the
+    // renderer intact — the wire write and the renderer's parse must not truncate
+    // it. Reproduces the #3 report of a missing "Server debug logging". Skipped
+    // without the binary; a tall PTY avoids the renderer clipping the panel.
+    #[test]
+    fn real_binary_lists_a_long_command_set() {
+        if palette_binary().is_none() {
+            eprintln!("skip: posh-palette not found (set POSH_PALETTE to run)");
+            return;
+        }
+        let mut p = Palette::spawn(40, 100).expect("spawn + handshake");
+        p.open(
+            "Commands",
+            json!([
+                { "name": "Echo: adaptive", "action": { "method": "echo.set" } },
+                { "name": "Echo: optimistic", "action": { "method": "echo.set" } },
+                { "name": "Echo: always", "action": { "method": "echo.set" } },
+                { "name": "Echo: never", "action": { "method": "echo.set" } },
+                { "name": "Client debug logging: on", "action": { "method": "logging.set" } },
+                { "name": "Server debug logging: on", "action": { "method": "logging.set", "params": { "scope": "server" } } },
+                { "name": "Shell out (server)", "action": { "method": "shell.open" } },
+                { "name": "Suspend client", "action": { "method": "client.suspend" } },
+                { "name": "Quit session", "action": { "method": "app.quit" } },
+            ]),
+        );
+        let deadline = Instant::now() + Duration::from_secs(3);
+        while Instant::now() < deadline && !p.rterm.dump_text().contains("Quit session") {
+            poll_readable(p.master, Duration::from_millis(100));
+            p.pump();
+        }
+        let text = p.rterm.dump_text();
+        assert!(
+            text.contains("Server debug logging"),
+            "a later command was dropped:\n{text}"
+        );
+        assert!(
+            text.contains("Quit session"),
+            "the last command was dropped:\n{text}"
+        );
+        p.shutdown();
+    }
 }
