@@ -1187,6 +1187,102 @@ mod tests {
     }
 
     #[test]
+    fn server_logging_toggle_reports_state() {
+        // #3: CLIENT_FLAG_LOG_ON makes the server enable its debug logging and
+        // report FLAG_SERVER_LOG on its frames; CLIENT_FLAG_LOG_OFF clears it.
+        // Uses the process-global log sink, so it restores the prior state on exit.
+        let restore = util::log_active();
+        let key = Key::random();
+        let (server_conn, port) = Connection::server((62600, 62699), &key, Family::Inet).unwrap();
+        let cmd: Vec<String> = vec!["/bin/sh".into(), "-c".into(), "sleep 600".into()];
+        let child = crate::pty::spawn_shell(Some(&cmd), 24, 80, &[], None).unwrap();
+        util::set_nonblocking(child.master).unwrap();
+        let server = std::thread::spawn(move || server_loop(server_conn, child, 24, 80));
+
+        let addr = format!("127.0.0.1:{port}").parse().unwrap();
+        let mut conn = Connection::client(addr, &key).unwrap();
+        let mut fragmenter = Fragmenter::new();
+        let mut assembly = FragmentAssembly::new();
+
+        let mut acked = 0u64;
+        let mut saw_log_on = false;
+        let mut saw_log_off = false;
+        let mut shutting = false;
+        let mut saw_shutdown = false;
+        let deadline = now_ms() + 15_000;
+        while now_ms() < deadline {
+            let flags = if shutting {
+                sync::CLIENT_FLAG_SHUTDOWN
+            } else if !saw_log_on {
+                sync::CLIENT_FLAG_LOG_ON
+            } else if !saw_log_off {
+                sync::CLIENT_FLAG_LOG_OFF
+            } else {
+                0
+            };
+            let msg = ClientMessage {
+                flags,
+                caps: vec![],
+                acked_frame: acked,
+                rows: 24,
+                cols: 80,
+                input_base: 0,
+                input: vec![],
+            };
+            for frag in fragmenter.make_fragments(&msg.encode(), sync::FRAGMENT_CONTENTS_MAX) {
+                conn.send(&frag.to_bytes()).unwrap();
+            }
+            if saw_shutdown && acked > 0 {
+                break;
+            }
+            std::thread::sleep(std::time::Duration::from_millis(50));
+            loop {
+                match conn.recv() {
+                    Ok(Some(payload)) => {
+                        let Ok(frag) = sync::Fragment::from_bytes(&payload) else {
+                            continue;
+                        };
+                        let Some(assembled) = assembly.add(frag) else {
+                            continue;
+                        };
+                        let Ok(frame) = ServerFrame::decode(&assembled) else {
+                            continue;
+                        };
+                        acked = acked.max(frame.frame_num);
+                        if frame.flags & sync::FLAG_SERVER_LOG != 0 {
+                            saw_log_on = true;
+                        } else if saw_log_on {
+                            saw_log_off = true; // cleared after having been on
+                        }
+                        if frame.flags & sync::FLAG_SHUTDOWN != 0 {
+                            saw_shutdown = true;
+                        }
+                    }
+                    Ok(None) => continue,
+                    Err(e) if e.kind() == std::io::ErrorKind::WouldBlock => break,
+                    Err(_) => break,
+                }
+            }
+            if saw_log_off {
+                shutting = true;
+            }
+        }
+        if !restore {
+            util::log_disable(); // restore the global log state for other tests
+        }
+        assert!(
+            saw_log_on,
+            "server never reported FLAG_SERVER_LOG after CLIENT_FLAG_LOG_ON"
+        );
+        assert!(
+            saw_log_off,
+            "server never cleared FLAG_SERVER_LOG after CLIENT_FLAG_LOG_OFF"
+        );
+        assert!(saw_shutdown, "server never wound down");
+        server.join().unwrap();
+    }
+
+    #[test]
     fn fresh_frames_paced_by_send_interval() {
         // A client that never supplies timestamps gives the server no RTT
         // samples, so its send_interval stays at the 250ms initial-SRTT
