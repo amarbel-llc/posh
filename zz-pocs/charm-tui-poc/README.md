@@ -36,8 +36,12 @@ In `just run`:
   state is legible (the earlier OK-button demo gave no hint, which made exit
   hard to discover).
 - In the command bar: type to filter, `↑`/`↓` choose, `Enter` runs the
-  selection (echoes `ran: <command>`), **`Esc` cancels** back to the base.
-- `Ctrl-^ q` quits the driver.
+  selection (a non-`Quit` selection echoes `ran: <command>` and closes the bar),
+  **`Esc` cancels** back to the base.
+- Selecting **`Quit`** (or pressing `ctrl+c`) in the bar exits the whole driver:
+  the bar exits with a sentinel status (42) that the host reaps and treats as
+  "quit the session" rather than "dismiss the overlay".
+- `Ctrl-^ q` also quits the driver from the base screen.
 
 ## What it proves
 

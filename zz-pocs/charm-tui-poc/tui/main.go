@@ -1,8 +1,10 @@
 // charm-tui-poc command bar: a bubbletea v2 command palette modeled on
 // trapeze's "/" Commands dialog (the charm.land/bubbletea/v2 stack). Throwaway
 // POC content for the posh client-side TUI host. The command list is a
-// hardcoded subset of trapeze's defaults; selecting a command just echoes it
-// and exits (the POC has no real actions). Esc cancels.
+// hardcoded subset of trapeze's defaults; selecting a command echoes it and
+// exits, except "Quit" (or ctrl+c), which exits with quitExitCode so the host
+// driver can tell "quit the session" apart from "dismiss the overlay". Esc
+// cancels.
 package main
 
 import (
@@ -15,6 +17,11 @@ import (
 	tea "charm.land/bubbletea/v2"
 	"charm.land/lipgloss/v2"
 )
+
+// quitExitCode is the process exit status the bar uses to tell the host driver
+// to quit the whole session. The Rust host reaps it in host_overlay; any other
+// exit (0) means "the overlay closed, return to the base screen".
+const quitExitCode = 42
 
 type command struct {
 	name     string
@@ -53,7 +60,7 @@ var (
 )
 
 type keymap struct {
-	up, down, sel, cancel key.Binding
+	up, down, sel, cancel, quit key.Binding
 }
 
 type model struct {
@@ -62,6 +69,7 @@ type model struct {
 	filtered []command
 	selected int
 	chosen   string
+	quit     bool
 }
 
 func newModel() model {
@@ -76,6 +84,7 @@ func newModel() model {
 			down:   key.NewBinding(key.WithKeys("down")),
 			sel:    key.NewBinding(key.WithKeys("enter")),
 			cancel: key.NewBinding(key.WithKeys("esc")),
+			quit:   key.NewBinding(key.WithKeys("ctrl+c")),
 		},
 	}
 	m.recompute()
@@ -103,11 +112,17 @@ func (m model) Init() tea.Cmd { return nil }
 func (m model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 	if key, ok := msg.(tea.KeyPressMsg); ok {
 		switch {
+		case keyMatches(key, m.keys.quit):
+			m.quit = true
+			return m, tea.Quit
 		case keyMatches(key, m.keys.cancel):
 			return m, tea.Quit
 		case keyMatches(key, m.keys.sel):
 			if len(m.filtered) > 0 {
 				m.chosen = m.filtered[m.selected].name
+				if m.chosen == "Quit" {
+					m.quit = true
+				}
 			}
 			return m, tea.Quit
 		case keyMatches(key, m.keys.up):
@@ -165,7 +180,11 @@ func main() {
 		fmt.Fprintln(os.Stderr, "command-bar:", err)
 		os.Exit(1)
 	}
-	if m, ok := final.(model); ok && m.chosen != "" {
+	m, _ := final.(model)
+	if m.quit {
+		os.Exit(quitExitCode)
+	}
+	if m.chosen != "" {
 		fmt.Println("ran:", m.chosen)
 	}
 }

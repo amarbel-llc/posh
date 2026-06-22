@@ -8,7 +8,9 @@
 //! This mirrors the server-side escape-to-shell overlay (FDR 0008) but
 //! client-side and local: a base "session" screen runs underneath, a chord (or
 //! a bare "/", trapeze's native trigger) swaps the input sink + render source to
-//! the command bar, and dismissing it (Esc) restores the base.
+//! the command bar. Esc (or running a command) dismisses it back to the base;
+//! the bar's "Quit" command (or ctrl+c) exits the whole driver, signalled by the
+//! bar exiting with a sentinel status the host reaps.
 //!
 //! When the Ctrl-^ prefix is armed (awaiting its second key), a reverse-video
 //! status line is shown so the chord state is legible — the prior demo gave no
@@ -18,8 +20,9 @@
 //! not a flag):
 //!   * stdout IS a tty  -> interactive: base screen + chord/"/" -> command bar.
 //!   * stdout is NOT a tty -> self-test: assert (a) posh_term renders the hosted
-//!     command bar (title + commands, filtering, selection) and (b) the chord
-//!     state machine maps correctly. Print PASS/FAIL, exit 0/1.
+//!     command bar and filtering/selection work, (b) selecting "Quit" exits with
+//!     the sentinel code, and (c) the chord state machine maps correctly. Print
+//!     PASS/FAIL, exit 0/1.
 
 use std::ffi::CString;
 use std::time::Duration;
@@ -35,6 +38,10 @@ const STDIN: libc::c_int = 0;
 const STDOUT: libc::c_int = 1;
 /// Quiet period with no PTY output that counts as "the TUI finished drawing".
 const IDLE: Duration = Duration::from_millis(400);
+/// Exit status the command bar uses to request that the whole driver quit (vs.
+/// exit 0 = "overlay closed, return to base"). Mirrors quitExitCode in
+/// tui/main.go.
+const QUIT_SENTINEL: i32 = 42;
 
 // Chord: Ctrl-^ (0x1e) prefix + a key, matching posh's existing escape chord
 // (remote/client.rs ESCAPE_KEY). `Ctrl-^ .` is the reachable stand-in for the
@@ -111,18 +118,20 @@ impl Chord {
 
 fn selftest(bin: &CString) -> i32 {
     let hosting_ok = test_command_bar(bin);
+    let quit_ok = test_quit_command(bin);
     let chord_ok = test_chord();
-    if hosting_ok && chord_ok {
-        println!("PASS: posh_term hosted the bubbletea command bar and the chord state machine maps correctly");
+    if hosting_ok && quit_ok && chord_ok {
+        println!("PASS: posh_term hosted the command bar, the Quit command exits the driver, and the chord state machine maps correctly");
         0
     } else {
-        println!("FAIL: hosting_ok={hosting_ok} chord_ok={chord_ok}");
+        println!("FAIL: hosting_ok={hosting_ok} quit_ok={quit_ok} chord_ok={chord_ok}");
         1
     }
 }
 
-/// Spawn the command bar on a PTY, then assert through the emulated screen:
-/// it renders the palette, typing filters it, and Enter runs the selection.
+/// Spawn the command bar on a PTY, then assert through the emulated screen: it
+/// renders the palette, typing filters it, and Enter runs a (non-Quit)
+/// selection, which echoes `ran: <name>` and closes the overlay.
 fn test_command_bar(bin: &CString) -> bool {
     let (master, pid) = spawn_on_pty(bin, DEFAULT_ROWS, DEFAULT_COLS);
     let mut term = Terminal::new(DEFAULT_ROWS, DEFAULT_COLS);
@@ -132,22 +141,40 @@ fn test_command_bar(bin: &CString) -> bool {
     let shows_bar = initial.contains("Commands") && initial.contains("New Session");
     eprintln!("--- command bar (initial) ---\n{initial}\n-----------------------------");
 
-    // Type "quit" to filter the list down to the Quit command.
-    write_all(master, b"quit");
+    // Type "model" to filter the list down to "Switch Model".
+    write_all(master, b"model");
     drain_until_idle(master, &mut term, IDLE);
     let filtered = term.dump_text();
-    let filtered_ok = filtered.contains("Quit") && !filtered.contains("New Session");
-    eprintln!("--- after filter \"quit\" ---\n{filtered}\n---------------------------");
+    let filtered_ok = filtered.contains("Switch Model") && !filtered.contains("New Session");
+    eprintln!("--- after filter \"model\" ---\n{filtered}\n----------------------------");
 
-    // Enter runs the selected command; the program echoes "ran: Quit" and exits.
+    // Enter runs the selection; the program echoes "ran: Switch Model".
     write_all(master, b"\r");
     drain_until_idle(master, &mut term, IDLE);
     let ran = term.dump_text();
-    let ran_ok = ran.contains("ran: Quit");
+    let ran_ok = ran.contains("ran: Switch Model");
     eprintln!("--- after Enter ---\n{ran}\n-------------------");
 
-    reap(pid);
+    wait_for(pid, true);
     shows_bar && filtered_ok && ran_ok
+}
+
+/// Spawn the command bar, filter to "Quit", press Enter, and assert the bar
+/// exits with the sentinel status that tells the host to quit the driver.
+fn test_quit_command(bin: &CString) -> bool {
+    let (master, pid) = spawn_on_pty(bin, DEFAULT_ROWS, DEFAULT_COLS);
+    let mut term = Terminal::new(DEFAULT_ROWS, DEFAULT_COLS);
+
+    drain_until_idle(master, &mut term, IDLE);
+    write_all(master, b"quit");
+    drain_until_idle(master, &mut term, IDLE);
+    write_all(master, b"\r");
+    drain_until_idle(master, &mut term, IDLE);
+
+    let code = wait_for(pid, false);
+    let ok = code == Some(QUIT_SENTINEL);
+    eprintln!("--- quit command ---\nexit code = {code:?} (want {QUIT_SENTINEL})\n--------------------");
+    ok
 }
 
 /// Assert the chord parser: ordinary bytes pass through, `Ctrl-^ .` opens,
@@ -236,7 +263,9 @@ fn interactive(bin: &CString) {
             render_armed(rows, armed);
         }
         if open {
-            host_overlay(bin, rows, cols);
+            if host_overlay(bin, rows, cols) {
+                break 'session; // the bar's Quit command
+            }
             draw_base();
             armed = false;
         }
@@ -274,7 +303,9 @@ fn render_armed(rows: u16, armed: bool) {
 
 /// Spawn the TUI on a PTY and host it on a posh_term::Terminal, rendering to
 /// the real terminal and forwarding keystrokes, until the overlay exits.
-fn host_overlay(bin: &CString, rows: u16, cols: u16) {
+/// Returns true if the overlay asked the driver to quit (its "Quit" command,
+/// signalled by the child exiting with QUIT_SENTINEL).
+fn host_overlay(bin: &CString, rows: u16, cols: u16) -> bool {
     let (master, pid) = spawn_on_pty(bin, rows, cols);
     let mut term = Terminal::new(rows, cols);
 
@@ -284,6 +315,7 @@ fn host_overlay(bin: &CString, rows: u16, cols: u16) {
     ];
     let mut buf = [0u8; 8192];
     let mut last_gen = u64::MAX;
+    let mut exited = false;
 
     loop {
         let r = unsafe { libc::poll(fds.as_mut_ptr(), 2, 50) };
@@ -293,6 +325,7 @@ fn host_overlay(bin: &CString, rows: u16, cols: u16) {
         if fds[0].revents != 0 {
             let n = read_fd(master, &mut buf);
             if n <= 0 {
+                exited = true;
                 break; // overlay process exited
             }
             term.process(&buf[..n as usize]);
@@ -318,7 +351,9 @@ fn host_overlay(bin: &CString, rows: u16, cols: u16) {
         fds[1].revents = 0;
     }
 
-    reap(pid);
+    // Natural exit -> read the true exit code; otherwise (poll error) terminate.
+    let code = wait_for(pid, !exited);
+    code == Some(QUIT_SENTINEL)
 }
 
 // ---------------------------------------------------------------------------
@@ -355,11 +390,24 @@ fn spawn_on_pty(bin: &CString, rows: u16, cols: u16) -> (libc::c_int, libc::pid_
     }
 }
 
-fn reap(pid: libc::pid_t) {
+/// Wait for the child to terminate and return its exit code (None if it was
+/// killed by a signal). With `terminate`, SIGTERM is sent first — cleanup for a
+/// child that may still be running; without it, the natural exit code is read
+/// (the child is expected to have already exited on its own).
+fn wait_for(pid: libc::pid_t, terminate: bool) -> Option<i32> {
     unsafe {
-        libc::kill(pid, libc::SIGTERM);
+        if terminate {
+            libc::kill(pid, libc::SIGTERM);
+        }
         let mut status: libc::c_int = 0;
-        libc::waitpid(pid, &mut status, 0);
+        if libc::waitpid(pid, &mut status as *mut libc::c_int, 0) != pid {
+            return None;
+        }
+        if libc::WIFEXITED(status) {
+            Some(libc::WEXITSTATUS(status))
+        } else {
+            None
+        }
     }
 }
 
