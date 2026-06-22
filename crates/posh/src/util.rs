@@ -471,6 +471,12 @@ pub fn log_active() -> bool {
     LOGGER.lock().unwrap().is_some()
 }
 
+/// Close the log sink (runtime disable, e.g. the `Ctrl-^ d` toggle). `log_write`
+/// silently drops afterward and `log_active` reports false until re-enabled.
+pub fn log_disable() {
+    *LOGGER.lock().unwrap() = None;
+}
+
 /// Logs a line if a log file has been initialized; silently drops otherwise
 /// (CLI invocations do not log, only daemons do).
 pub fn log_write(level: &str, msg: &str) {

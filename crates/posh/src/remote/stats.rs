@@ -89,6 +89,12 @@ impl Stats {
         }
     }
 
+    /// Flip the collector on/off at runtime (the `Ctrl-^ d` debug-logging
+    /// toggle). When off, the periodic flush is skipped even if a sink is open.
+    pub fn set_enabled(&mut self, on: bool) {
+        self.enabled = on;
+    }
+
     // --- recording -----------------------------------------------------------
 
     pub fn record_frame_full(&mut self) {

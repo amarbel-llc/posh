@@ -165,6 +165,17 @@ fn default_dump_path(role: &str) -> PathBuf {
     base.join(format!("posh-{role}-{}.log", std::process::id()))
 }
 
+/// Enable debug logging at runtime to the default per-pid sink (if not already
+/// active), returning the sink path. The runtime counterpart of `POSH_DEBUG_LOG`
+/// for the `Ctrl-^ d` toggle; mirrors `dump`'s lazy-open + path scheme.
+pub fn enable_logging(role: &str) -> PathBuf {
+    let path = default_dump_path(role);
+    if !util::log_active() {
+        let _ = util::log_init(&path);
+    }
+    path
+}
+
 /// Append `body` to the diagnostic sink under the `dump` level. Reuses the
 /// `POSH_DEBUG_LOG` sink when armed; otherwise lazily opens the per-pid default
 /// so SIGUSR2 works even when periodic logging was never enabled — the whole

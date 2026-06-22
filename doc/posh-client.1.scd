@@ -45,6 +45,17 @@ the host and then launches this client against the reported address.
 	the server's _POSH_ESCAPE_CMD_ (default the login shell). See
 	*posh-server*(1).
 
+*Ctrl-^* then *e*
+	Cycle the local predictive-echo model live (_adaptive_, _optimistic_,
+	_always_, _never_) without reconnecting; a banner shows the new model.
+	Overrides _POSH_PREDICTION_MODEL_ for the rest of the session.
+
+*Ctrl-^* then *d*
+	Toggle client-side debug logging at runtime (the _POSH_DEBUG_LOG_
+	stream). When turned on without _POSH_DEBUG_LOG_ set, periodic transport
+	summaries are written to a per-pid file under the posh runtime dir; a
+	banner shows the state and path.
+
 # ENVIRONMENT
 
 _POSH_KEY_

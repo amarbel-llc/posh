@@ -41,9 +41,46 @@ const ESCAPE_PASS_KEY: u8 = b'^';
 /// The Ctrl-^ command help line, naming the configured escape-to-shell key.
 fn escape_help(key: u8) -> String {
     format!(
-        "Commands: Ctrl-Z suspends, \".\" quits, \"{}\" shells out, \"^\" gives literal Ctrl-^",
+        "Commands: Ctrl-Z suspends, \".\" quits, \"{}\" shells out, \"e\" cycles echo, \"d\" toggles logging, \"^\" gives literal Ctrl-^",
         key as char
     )
+}
+
+/// Cycle the predictive-echo model live (Ctrl-^ e): Adaptive -> Optimistic ->
+/// Always -> Never -> ... Rebuilds the predictor/renderer in place and forces a
+/// clean repaint so stale predicted cells clear. Experimental (legacy) is
+/// skipped; if the session started on it, the cycle re-enters at Optimistic.
+fn cycle_echo(st: &mut ClientState, now: u64) {
+    const CYCLE: [PredictionModel; 4] = [
+        PredictionModel::Adaptive,
+        PredictionModel::Optimistic,
+        PredictionModel::Always,
+        PredictionModel::Never,
+    ];
+    let i = CYCLE.iter().position(|&m| m == st.predict_model).unwrap_or(0);
+    let next = CYCLE[(i + 1) % CYCLE.len()];
+    let (predict, renderer) = predict::build(next, st.predict_render, st.predict_overwrite);
+    st.predict = predict;
+    st.renderer = renderer;
+    st.predict_model = next;
+    st.initialized = false;
+    st.notify.set_message(&format!("echo: {next:?}"), false, now);
+}
+
+/// Toggle client-local debug logging (Ctrl-^ d): open the default per-pid sink
+/// (reusing the SIGUSR2-dump path scheme) or close it, and flip the stats
+/// collector so the periodic transport summaries flow while it is on.
+fn toggle_logging(st: &mut ClientState, now: u64) {
+    if util::log_active() {
+        util::log_disable();
+        st.stats.set_enabled(false);
+        st.notify.set_message("debug logging: off", false, now);
+    } else {
+        let path = diag::enable_logging("client");
+        st.stats.set_enabled(true);
+        st.notify
+            .set_message(&format!("debug logging: on ({})", path.display()), false, now);
+    }
 }
 
 /// Parse `$POSH_ESCAPE_KEY` into the single sub-key byte that follows Ctrl-^ to
@@ -197,6 +234,12 @@ struct ClientState {
     initialized: bool,
     predict: Box<dyn Predictor>,
     renderer: Box<dyn PredictionRenderer>,
+    /// Cached prediction config so the model can be rebuilt live (Ctrl-^ e
+    /// cycles it). The trait objects above are swapped; these record what to
+    /// rebuild from.
+    predict_model: PredictionModel,
+    predict_render: RenderStyle,
+    predict_overwrite: bool,
     notify: NotificationEngine,
     /// $POSH_GRAB_MOUSE policy; on, intercepted wheel events become arrow keys
     /// instead of driving the scrollback scroll-view (the legacy posh#50 grab).
@@ -277,6 +320,9 @@ fn client_loop(
         initialized: false,
         predict,
         renderer,
+        predict_model: model,
+        predict_render: render,
+        predict_overwrite,
         notify: NotificationEngine::new(now),
         grab_mouse,
         mouse_filter: MouseFilter::default(),
@@ -854,6 +900,18 @@ fn process_user_input(st: &mut ClientState, buf: &[u8], raw: &RawMode) -> bool {
                     dirty = true;
                     continue;
                 }
+                b'e' => {
+                    // Ctrl-^ e: cycle the predictive-echo model (client-local).
+                    cycle_echo(st, now);
+                    dirty = true;
+                    continue;
+                }
+                b'd' => {
+                    // Ctrl-^ d: toggle client-local debug logging.
+                    toggle_logging(st, now);
+                    dirty = true;
+                    continue;
+                }
                 other => {
                     // Anything else is sent literally, escape key included.
                     push(st, ESCAPE_KEY);
@@ -1425,6 +1483,9 @@ mod tests {
             initialized: false,
             predict: predict::build(PredictionModel::Never, RenderStyle::Replace, false).0,
             renderer: predict::build(PredictionModel::Never, RenderStyle::Replace, false).1,
+            predict_model: PredictionModel::Never,
+            predict_render: RenderStyle::Replace,
+            predict_overwrite: false,
             notify: NotificationEngine::new(0),
             escape_key: b's',
             grab_mouse: GrabMouse::Off,
@@ -1443,6 +1504,25 @@ mod tests {
             applier: Box::new(framesync::DumpDiff),
             stats: Stats::new(),
         }
+    }
+
+    #[test]
+    fn cycle_echo_advances_model_swaps_predictor_and_banners() {
+        let mut st = test_state(3, 30);
+        st.predict_model = PredictionModel::Adaptive;
+        st.initialized = true;
+
+        cycle_echo(&mut st, 0);
+        assert_eq!(st.predict_model, PredictionModel::Optimistic);
+        assert!(st.notify.message().contains("Optimistic"), "banner names the new model");
+        assert!(!st.initialized, "swapping the predictor forces a clean repaint");
+
+        cycle_echo(&mut st, 0);
+        assert_eq!(st.predict_model, PredictionModel::Always);
+        cycle_echo(&mut st, 0);
+        assert_eq!(st.predict_model, PredictionModel::Never);
+        cycle_echo(&mut st, 0);
+        assert_eq!(st.predict_model, PredictionModel::Adaptive, "wraps around");
     }
 
     #[test]
