@@ -106,9 +106,9 @@ the `eng-*(7)` manpages — read them with `man eng-versioning`,
 - **Docs:** significant designs get a record under `docs/` — ADR for
   architecture decisions, RFC for wire/file-format contracts, FDR for
   user-facing features. The target grammar + capability table is RFC 0001;
-  the FDRs (0001-0008) cover the namespace, takeover, mosh-parity, ssh agent
+  the FDRs (0001-0009) cover the namespace, takeover, mosh-parity, ssh agent
   forwarding, scrollback sync, optimistic echo, the SIGUSR2 transport-state
-  dump, and escape-to-shell.
+  dump, escape-to-shell, and the command palette.
 
 ## Key design facts (load-bearing, verified)
 
@@ -124,12 +124,18 @@ the `eng-*(7)` manpages — read them with `man eng-versioning`,
 - **Stream parsing (ADR-0003):** multi-byte structures (escape sequences,
   framed records) MUST be reassembled across read boundaries via a byte-fed
   state machine — never assume a `read()` delivers a whole sequence.
-- **Escape-to-shell overlay (FDR 0008):** `Ctrl-^ s` makes the *server*
-  spawn a transient second PTY + `posh_term::Terminal` in the session cwd;
-  while it is up the broadcast source and input sink swap to that overlay
-  (the live session keeps running underneath, just unbroadcast) and frames
-  carry `FLAG_OVERLAY`. `remote/server.rs:server_loop`. Server-side because
-  the worktree lives on the server for cross-host roaming.
+- **Escape-to-shell overlay (FDR 0008):** the palette's *Shell out* command
+  (FDR 0009; originally `Ctrl-^ s`) makes the *server* spawn a transient second
+  PTY + `posh_term::Terminal` in the session cwd; while it is up the broadcast
+  source and input sink swap to that overlay (the live session keeps running
+  underneath, just unbroadcast) and frames carry `FLAG_OVERLAY`.
+  `remote/server.rs:server_loop`. Server-side because the worktree lives on the
+  server for cross-host roaming.
+- **Command palette (FDR 0009):** `Ctrl-^` opens the `posh-palette` renderer
+  subprocess (its own Go module) driven over the RFC 0005 JSON-RPC channel on
+  fd 3, composited onto the session `Snapshot`. It is the escape menu (echo,
+  logging, shell-out, suspend, quit); `Ctrl-^ .` survives only as the
+  renderer-unavailable emergency quit. `remote/client.rs` + `remote/palette.rs`.
 
 ## Debugging a live / wedged roaming session
 

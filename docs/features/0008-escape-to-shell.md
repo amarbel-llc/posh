@@ -5,6 +5,11 @@ date: 2026-06-20
 
 # Escape to shell (Ctrl-^ s)
 
+> **Trigger moved (2026-06-22):** the overlay is now summoned by the command
+> palette's *Shell out* command (FDR 0009), not the `Ctrl-^ s` chord. The
+> server-side mechanism, wire bits, and `$POSH_ESCAPE_CMD` below are unchanged;
+> only the client-side trigger and `$POSH_ESCAPE_KEY` are superseded.
+
 ## Problem Statement
 
 A user working inside a full-screen session app — notably a clown/claude TUI —
@@ -22,9 +27,10 @@ lives on the server, so a client-local shell would land on the wrong machine.
 
 ## Interface
 
-- **Trigger:** `Ctrl-^` then the escape key (default `s`, `$POSH_ESCAPE_KEY` on
-  the client). Raw-mode-proof: the client reads raw stdin and decides what to
-  forward, so the inner app's `-isig` is irrelevant.
+- **Trigger:** the command palette's *Shell out* command (`Ctrl-^`, then select
+  it — FDR 0009). Raw-mode-proof: the client reads raw stdin and decides what to
+  forward, so the inner app's `-isig` is irrelevant. (Originally the `Ctrl-^ s`
+  sub-key chord, `$POSH_ESCAPE_KEY`; that chord is superseded by the palette.)
 - **Command:** `$POSH_ESCAPE_CMD` (read by the server), whitespace-split into
   argv; unset/blank runs `$SHELL` as a login shell (the session default). For the
   bare `posh host:session` form it is forwarded from the client over the ssh
@@ -66,9 +72,9 @@ Remap the trigger to the vi/less convention:
   emitting OSC 7. Without it the overlay lands in the fallback cwd, and `sc exec`
   then degrades to a plain shell (its own graceful-degradation path).
 - **Ctrl-^ still governs the session, not the overlay.** While the overlay is up,
-  `Ctrl-^ .` quits the whole session, not just the shell; exit the overlay with
-  the shell's own `exit`. A second `Ctrl-^ s` is ignored (the server's
-  already-in-overlay guard).
+  the client's `Ctrl-^` palette (and its Quit) act on the whole session, not just
+  the shell; exit the overlay with the shell's own `exit`. Selecting *Shell out*
+  again is ignored (the server's already-in-overlay guard).
 - **Request loss.** `CLIENT_FLAG_ESCAPE` is one-shot (cleared after one send), so
   a dropped request datagram just means the user presses `Ctrl-^ s` again.
 - **Roaming only (for now).** The session-attach client (`session/client.rs`),
