@@ -8,7 +8,7 @@
 //! The renderer is spawned once on a PTY (visual channel) plus a control socket
 //! on its fd 3. The host sends `show {view:"palette", commands}` / `hide`; the
 //! renderer reports palette `selected`/`cancel` events back on the same socket.
-//! `Ctrl-^` (or a bare `/`) opens the palette directly. The host owns input
+//! `Ctrl-^` opens the palette directly. The host owns input
 //! routing (the open trigger handled here; keystrokes forwarded to the renderer
 //! while the palette is up) and compositing: the palette is a popup anchored a
 //! third of the way down over a greyed-out (dimmed) session background, painted
@@ -36,13 +36,13 @@ const STDOUT: libc::c_int = 1;
 /// Quiet period with no PTY output that counts as "the renderer finished drawing".
 const IDLE: Duration = Duration::from_millis(400);
 
-// Open triggers: Ctrl-^ (0x1e, matches remote/client.rs ESCAPE_KEY) or a bare
-// "/" opens the command palette directly. Quit is the palette's own command.
+// Open trigger: Ctrl-^ (0x1e, matches remote/client.rs ESCAPE_KEY) opens the
+// command palette. A bare "/" is deliberately NOT a trigger — it is far too
+// common a character to serve as an escape hatch. Quit is the palette's command.
 const CTRL_CARET: u8 = 0x1e;
-const SLASH: u8 = b'/';
 
 fn is_open_trigger(b: u8) -> bool {
-    b == CTRL_CARET || b == SLASH
+    b == CTRL_CARET
 }
 
 /// The only host-supported commands. Sent to the renderer when the palette
@@ -267,7 +267,7 @@ fn cells_eq(a: &Cell, b: &Cell) -> bool {
 fn selftest(bin: &CString) -> i32 {
     let palette_ok = test_palette_rpc(bin);
     let compose_ok = test_compose(bin);
-    let trigger_ok = is_open_trigger(CTRL_CARET) && is_open_trigger(SLASH) && !is_open_trigger(b'a');
+    let trigger_ok = is_open_trigger(CTRL_CARET) && !is_open_trigger(b'/') && !is_open_trigger(b'a');
     if palette_ok && compose_ok && trigger_ok {
         println!("PASS: RPC palette+selection, compositor (greyed anchored palette over the session), and open triggers all hold");
         0

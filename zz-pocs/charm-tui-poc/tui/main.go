@@ -1,7 +1,7 @@
 // charm-tui-poc renderer: a long-running bubbletea v2 renderer driven by the
 // host over a JSON-RPC-style control channel (newline-delimited JSON on fd 3),
 // rendering to its PTY. The host tells it to show the command palette (modeled
-// on trapeze's "/" Commands dialog, opened by Ctrl-^ or "/"); the renderer
+// on trapeze's "/" Commands dialog, opened by Ctrl-^); the renderer
 // reports palette selections/cancels back as events. Throwaway POC content for
 // the posh client-side TUI host.
 //
@@ -70,10 +70,11 @@ var (
 			Width(46)
 
 	titleStyle = lipgloss.NewStyle().Bold(true).Foreground(lipgloss.Color("214"))
-	selStyle   = lipgloss.NewStyle().
+	// Selection highlight keeps its original purple (63), not the yellow border.
+	selStyle = lipgloss.NewStyle().
 			Bold(true).
 			Foreground(lipgloss.Color("231")).
-			Background(lipgloss.Color("214"))
+			Background(lipgloss.Color("63"))
 	dimStyle  = lipgloss.NewStyle().Faint(true)
 	helpStyle = lipgloss.NewStyle().Faint(true)
 )

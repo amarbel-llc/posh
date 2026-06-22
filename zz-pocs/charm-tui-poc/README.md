@@ -10,7 +10,7 @@ escape-to-shell overlay (FDR 0008).
 
 The renderer shows a **command palette** on demand — a `/`-style filter list
 modeled on [trapeze](https://github.com/amarbel-llc/trapeze)'s Commands dialog,
-opened directly by `Ctrl-^` (or a bare `/`).
+opened by `Ctrl-^`.
 
 ## Layout
 
@@ -48,11 +48,12 @@ just run     # interactive: drive it in your own terminal
 In `just run`:
 
 - A base "live session" screen is shown (stand-in for the real session).
-- Press **`Ctrl-^`** (or a bare **`/`**): the session **greys out** and the
-  **command palette** opens directly — a yellow-bordered box anchored a third of
-  the way down (it expands downward / collapses upward as you filter). The host
-  sends `show {view:"palette", commands:[…]}` and forwards keystrokes to the
-  renderer while it's up.
+- Press **`Ctrl-^`**: the session **greys out** and the **command palette**
+  opens directly — a yellow-bordered box anchored a third of the way down (it
+  expands downward / collapses upward as you filter). The host sends
+  `show {view:"palette", commands:[…]}` and forwards keystrokes to the renderer
+  while it's up. (A bare `/` is intentionally *not* a trigger — too common a
+  character to hijack.)
 - Type to filter, `↑`/`↓` choose, `Enter` runs, **`Esc` cancels**.
 - Selecting a command sends a `selected` event back; the host performs it:
   **`Quit`** exits, **`Clear session`** blanks the background, **`Redraw session`**
@@ -82,6 +83,6 @@ In `just run`:
   bottom (list scrolling is a follow-up). The real cursor is **hidden** while an
   overlay is up (cursor mapping is a follow-up). There is **no SIGWINCH/resize
   handling.**
-- **Local-only, no server**, and **bare `/` is intercepted globally** in the base
-  screen for convenience (a real client would route `/` to the session).
+- **Local-only, no server** — this POC hosts the overlay standalone; the real
+  roaming client (`remote/client.rs`) requires a server.
 - **Rust↔Go is a spawned binary over a PTY + control socket** (no FFI).
