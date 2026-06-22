@@ -18,6 +18,9 @@ aes-gcm = { version = "0.10", default-features = false, features = [
     "aes",
     "alloc",
 ] }
+# The command-palette control channel speaks JSON-RPC 2.0 (RFC 0005); serde_json
+# parses the renderer's selected-command actions (arbitrary params) robustly.
+serde_json = "1"
 
 [build-dependencies]
 # Shared version + git-sha flow-out (github #71). See eng-versioning(7).

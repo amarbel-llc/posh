@@ -8,6 +8,7 @@ pub mod datagram;
 pub mod diag;
 pub mod display;
 pub mod framesync;
+pub mod palette;
 #[cfg(test)]
 mod perf_probe;
 pub mod predict;

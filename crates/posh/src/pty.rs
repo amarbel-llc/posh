@@ -141,6 +141,95 @@ pub fn spawn_shell(
     }
 }
 
+pub struct PtyControlChild {
+    pub master: RawFd,
+    /// Host end of the control socket; the child sees its peer as fd 3.
+    pub control: RawFd,
+    pub pid: libc::pid_t,
+}
+
+/// Like `spawn_shell` but for a co-process that needs a private control channel
+/// alongside its terminal: opens a PTY *and* a `socketpair`, forks, and in the
+/// child dup2's the child socket end onto fd 3 before exec'ing `bin` (no login
+/// shell, no env/cwd massaging). Used to host the command-palette renderer
+/// (RFC 0005): the renderer draws to the PTY and speaks JSON-RPC on fd 3.
+pub fn spawn_with_control(bin: &CString, rows: u16, cols: u16) -> Result<PtyControlChild> {
+    let argv: [*const libc::c_char; 2] = [bin.as_ptr(), std::ptr::null()];
+    let ws = libc::winsize {
+        ws_row: rows,
+        ws_col: cols,
+        ws_xpixel: 0,
+        ws_ypixel: 0,
+    };
+    let mut master: libc::c_int = -1;
+    let mut slave: libc::c_int = -1;
+    let mut sp: [libc::c_int; 2] = [-1, -1];
+    // SAFETY: all pointers passed to the libc calls are valid for the call;
+    // the forked child touches only async-signal-safe functions
+    // (setsid/ioctl/dup2/close/execv/_exit) with no allocation between fork and
+    // exec (argv/bin were built before the fork).
+    unsafe {
+        if libc::socketpair(libc::AF_UNIX, libc::SOCK_STREAM, 0, sp.as_mut_ptr()) != 0 {
+            return Err(std::io::Error::last_os_error().into());
+        }
+        let (host_ctrl, child_ctrl) = (sp[0], sp[1]);
+        // openpty's termios/winsize params are *const on Linux, *mut on
+        // macOS/BSD; cast so each platform's signature resolves (see spawn_shell).
+        if libc::openpty(
+            &mut master,
+            &mut slave,
+            std::ptr::null_mut(),
+            std::ptr::null::<libc::termios>() as *mut _,
+            &ws as *const _ as *mut _,
+        ) < 0
+        {
+            let e = std::io::Error::last_os_error();
+            libc::close(host_ctrl);
+            libc::close(child_ctrl);
+            return Err(e.into());
+        }
+        let pid = libc::fork();
+        if pid < 0 {
+            let e = std::io::Error::last_os_error();
+            libc::close(master);
+            libc::close(slave);
+            libc::close(host_ctrl);
+            libc::close(child_ctrl);
+            return Err(e.into());
+        }
+        if pid == 0 {
+            // Child: slave PTY becomes the controlling terminal on stdio, and
+            // the child's socket end is moved to fd 3 (where the renderer reads
+            // JSON-RPC). dup2 atomically closes any fd already at 3.
+            libc::setsid();
+            libc::ioctl(slave, libc::TIOCSCTTY as _, 0);
+            libc::dup2(slave, 0);
+            libc::dup2(slave, 1);
+            libc::dup2(slave, 2);
+            libc::close(master);
+            libc::close(host_ctrl);
+            if child_ctrl != 3 {
+                libc::dup2(child_ctrl, 3);
+                libc::close(child_ctrl);
+            }
+            // Close the redundant slave ref unless it is now stdio or the
+            // control fd (slave == 3 means dup2 above already repurposed it).
+            if slave > 2 && slave != 3 {
+                libc::close(slave);
+            }
+            libc::execv(bin.as_ptr(), argv.as_ptr());
+            libc::_exit(127);
+        }
+        libc::close(slave);
+        libc::close(child_ctrl);
+        Ok(PtyControlChild {
+            master,
+            control: host_ctrl,
+            pid,
+        })
+    }
+}
+
 fn build_argv(command: Option<&[String]>) -> Result<(CString, Vec<CString>)> {
     match command {
         Some(args) if !args.is_empty() => {
