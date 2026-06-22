@@ -485,6 +485,7 @@ fn drive_client(st: &mut ClientState, raw: &RawMode, port: u16) -> Result<i32> {
     send_message(st);
 
     let result: Result<i32> = 'client: loop {
+        let iter_start = st.stats.enabled().then(Instant::now);
         let now = now_ms();
         let mut deadline = st.last_send + HEARTBEAT_INTERVAL;
         if !st.outbox.is_empty() || st.flags != 0 {
@@ -514,11 +515,13 @@ fn drive_client(st: &mut ClientState, raw: &RawMode, port: u16) -> Result<i32> {
             base
         });
         let mut send_now = false;
+        let poll_start = st.stats.enabled().then(Instant::now);
         match util::poll(&mut fds, timeout) {
             Ok(_) => {}
             Err(e) if e.kind() == std::io::ErrorKind::Interrupted => {}
             Err(e) => break 'client Err(e.into()),
         }
+        let idle_us = poll_start.map_or(0, |t| t.elapsed().as_micros() as u64);
 
         if util::take_flag(&util::SIGWINCH_RECEIVED) {
             let size = pty::term_size(STDOUT);
@@ -700,6 +703,13 @@ fn drive_client(st: &mut ClientState, raw: &RawMode, port: u16) -> Result<i32> {
         }
         if st.shutdown_requested && now.saturating_sub(st.shutdown_requested_at) >= SHUTDOWN_GRACE {
             break 'client Ok(0); // server unreachable; leave anyway
+        }
+
+        // Per-iteration loop timing (perf instrumentation): busy = the whole
+        // iteration minus the poll wait.
+        if let Some(start) = iter_start {
+            let total = start.elapsed().as_micros() as u64;
+            st.stats.record_loop_iter(total.saturating_sub(idle_us), idle_us);
         }
     };
     result

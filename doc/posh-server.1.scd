@@ -85,9 +85,13 @@ _POSH_ESCAPE_CMD_
 _POSH_DEBUG_LOG_
 	When set to a writable path, the server appends periodic one-line
 	performance summaries — smoothed RTT, RTO, transmitted frame counts
-	(full/diff/empty), diff-saved percentage, average _dump_vt_ time in
-	microseconds, upload bandwidth, outstanding-frame count, and
-	retransmissions — plus a final line on exit. Rotated at 5 MB. Since
+	(full/diff/empty), diff-saved percentage, _dump_vt_ time as
+	_avg/max_ microseconds (the max is the worst single serialization in
+	that interval), upload bandwidth, outstanding-frame count,
+	retransmissions, and event-loop timing (_loop iters=… busy=…us
+	idle=…us busy_pct=…% max_iter_us=…_, the busy/idle/stall view) — plus a
+	final line on exit. All timings are windowed per interval, so a spike
+	shows up in the second it happened. Rotated at 5 MB. Since
 	the server has detached and redirected its standard streams to
 	_/dev/null_, this file is its only diagnostic sink. For the bare
 	*posh* _host:session_ form the path is forwarded from the client, so

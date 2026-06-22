@@ -2,6 +2,8 @@
 //! and a posh_term::Terminal, and syncs screen state to the client as
 //! dump_vt frames (full or diffed against the last client-acked frame).
 
+use std::time::Instant;
+
 use posh_term::Terminal;
 
 use crate::pty;
@@ -240,6 +242,7 @@ fn server_loop(mut conn: Connection, child: pty::PtyChild, rows: u16, cols: u16)
     let mut force_frame = false;
 
     loop {
+        let iter_start = stats.enabled().then(Instant::now);
         let now = now_ms();
         // A silent peer is forgotten after a minute: sending stops (the
         // session stays alive) until an authentic datagram arrives again.
@@ -319,11 +322,13 @@ fn server_loop(mut conn: Connection, child: pty::PtyChild, rows: u16, cols: u16)
         } else {
             usize::MAX
         };
+        let poll_start = stats.enabled().then(Instant::now);
         match util::poll(&mut fds, timeout) {
             Ok(_) => {}
             Err(e) if e.kind() == std::io::ErrorKind::Interrupted => continue,
             Err(_) => break,
         }
+        let idle_us = poll_start.map_or(0, |t| t.elapsed().as_micros() as u64);
 
         // Session shell output -> the main terminal model. Read even while an
         // overlay is up so the live session stays current underneath; it just
@@ -820,6 +825,13 @@ fn server_loop(mut conn: Connection, child: pty::PtyChild, rows: u16, cols: u16)
             if now_ms().saturating_sub(shutdown_at) >= SHUTDOWN_GRACE {
                 break;
             }
+        }
+
+        // Per-iteration loop timing (perf instrumentation): busy = the whole
+        // iteration minus the poll wait.
+        if let Some(start) = iter_start {
+            let total = start.elapsed().as_micros() as u64;
+            stats.record_loop_iter(total.saturating_sub(idle_us), idle_us);
         }
     }
 

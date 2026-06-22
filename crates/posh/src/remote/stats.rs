@@ -42,11 +42,23 @@ pub struct Stats {
 
     // Client compute timing — the mirror of the server's dump_vt_us. `apply` is
     // the full-dump re-parse (apply_frame), `compose` is the snapshot + diff
-    // render (compose_frame). Both reported as cumulative averages.
+    // render (compose_frame). Reported as windowed avg + max (worst single
+    // frame in the window), reset each flush, so a latency spike is visible in
+    // the second it happened rather than smeared into a session average.
     apply_us_total: u64,
     apply_count: u64,
+    apply_us_max: u64,
     compose_us_total: u64,
     compose_count: u64,
+    compose_us_max: u64,
+
+    // Event-loop timing (windowed): per iteration, time blocked in poll (idle)
+    // vs doing work (busy), the longest single busy stretch, and the iteration
+    // count. Drives the busy% / stall / jitter view. Reset each flush.
+    loop_iters: u64,
+    loop_busy_us: u64,
+    loop_idle_us: u64,
+    loop_busy_us_max: u64,
 
     // Server framing economics.
     /// Sum of full-dump bytes over frames that had a diff option (whether or
@@ -57,6 +69,7 @@ pub struct Stats {
     retransmits: u64,
     dump_vt_us_total: u64,
     dump_vt_count: u64,
+    dump_vt_us_max: u64,
 }
 
 /// Client prediction gauges sampled at flush time (POSH_DEBUG_LOG). Bundled so
@@ -132,11 +145,24 @@ impl Stats {
     pub fn record_apply_us(&mut self, us: u64) {
         self.apply_us_total += us;
         self.apply_count += 1;
+        self.apply_us_max = self.apply_us_max.max(us);
     }
     /// Client: accumulate one compose_frame render (snapshot + `new_frame` diff).
     pub fn record_compose_us(&mut self, us: u64) {
         self.compose_us_total += us;
         self.compose_count += 1;
+        self.compose_us_max = self.compose_us_max.max(us);
+    }
+
+    /// One event-loop iteration: `idle_us` blocked in poll, `busy_us` doing
+    /// work. Cheap accumulation; the caller gates the `Instant`s on `enabled()`.
+    /// Does not mark `dirty` — the loop spins constantly, so loop stats ride out
+    /// on whatever frame activity triggers a flush rather than forcing one.
+    pub fn record_loop_iter(&mut self, busy_us: u64, idle_us: u64) {
+        self.loop_iters += 1;
+        self.loop_busy_us += busy_us;
+        self.loop_idle_us += idle_us;
+        self.loop_busy_us_max = self.loop_busy_us_max.max(busy_us);
     }
 
     /// A frame the server sent as a diff: record the full-dump size it would
@@ -164,8 +190,10 @@ impl Stats {
         }
         let t = Instant::now();
         let out = f();
-        self.dump_vt_us_total += t.elapsed().as_micros() as u64;
+        let us = t.elapsed().as_micros() as u64;
+        self.dump_vt_us_total += us;
         self.dump_vt_count += 1;
+        self.dump_vt_us_max = self.dump_vt_us_max.max(us);
         out
     }
 
@@ -221,6 +249,33 @@ impl Stats {
         self.last_flush = now;
         self.last_bytes_rx = bytes_rx;
         self.last_bytes_tx = bytes_tx;
+        // Windowed timing resets so each line reflects only its own interval
+        // (a spike shows up in the second it happened, not the running average).
+        self.apply_us_total = 0;
+        self.apply_count = 0;
+        self.apply_us_max = 0;
+        self.compose_us_total = 0;
+        self.compose_count = 0;
+        self.compose_us_max = 0;
+        self.dump_vt_us_total = 0;
+        self.dump_vt_count = 0;
+        self.dump_vt_us_max = 0;
+        self.loop_iters = 0;
+        self.loop_busy_us = 0;
+        self.loop_idle_us = 0;
+        self.loop_busy_us_max = 0;
+    }
+
+    /// Share of the window spent doing work vs blocked in poll, as a whole
+    /// percent. The high-CPU / stall signal: ~0% is a healthy idle loop, a high
+    /// value with a large `max_iter_us` is a stall or a hot path.
+    fn loop_busy_pct(&self) -> u64 {
+        let total = self.loop_busy_us + self.loop_idle_us;
+        if total == 0 {
+            0
+        } else {
+            self.loop_busy_us * 100 / total
+        }
     }
 
     /// Periodic client summary; no-op unless a flush is due.
@@ -286,7 +341,8 @@ impl Stats {
                  predict active={} shown={} epoch_lag={} resets={} \
                  correct={} nocredit={} incorrect={} srtt_trig={} \
                  render writes={} bytes_out={} skipped_idle={} \
-                 apply_us={} compose_us={}",
+                 apply_us={}/{} compose_us={}/{} \
+                 loop iters={} busy={}us idle={}us busy_pct={}% max_iter_us={}",
                 self.frames_total,
                 self.frames_full,
                 self.frames_diff,
@@ -304,7 +360,14 @@ impl Stats {
                 self.render_bytes_out,
                 self.render_skipped_idle,
                 self.avg_apply_us(),
+                self.apply_us_max,
                 self.avg_compose_us(),
+                self.compose_us_max,
+                self.loop_iters,
+                self.loop_busy_us,
+                self.loop_idle_us,
+                self.loop_busy_pct(),
+                self.loop_busy_us_max,
             ),
         );
         self.mark_flushed(now, bytes_rx, bytes_tx);
@@ -338,16 +401,23 @@ impl Stats {
             "stats",
             &format!(
                 "{label} srtt={srtt:.0}ms rto={rto}ms frames tx={} (full={} diff={} empty={}) \
-                 diff_saved={}% dump_vt_us={} bytes_tx={bytes_tx} bw_up={} outstanding={outstanding} \
-                 retransmit={}",
+                 diff_saved={}% dump_vt_us={}/{} bytes_tx={bytes_tx} bw_up={} outstanding={outstanding} \
+                 retransmit={} \
+                 loop iters={} busy={}us idle={}us busy_pct={}% max_iter_us={}",
                 self.frames_total,
                 self.frames_full,
                 self.frames_diff,
                 self.frames_empty,
                 self.diff_saved_pct(),
                 self.avg_dump_vt_us(),
+                self.dump_vt_us_max,
                 human_rate(bw_up),
                 self.retransmits,
+                self.loop_iters,
+                self.loop_busy_us,
+                self.loop_idle_us,
+                self.loop_busy_pct(),
+                self.loop_busy_us_max,
             ),
         );
         // bytes_rx is unused server-side; reuse the rx slot to track tx deltas.
@@ -485,7 +555,9 @@ mod tests {
         let mut c = enabled_stats();
         c.record_frame_diff();
         c.record_apply_us(40);
+        c.record_apply_us(80); // a slower frame: windowed avg 60, max 80
         c.record_compose_us(60);
+        c.record_loop_iter(100, 900); // 100us busy, 900us idle => 10% busy
         c.emit_client(
             "client",
             1000,
@@ -505,6 +577,7 @@ mod tests {
         let mut s = enabled_stats();
         s.record_frame_full();
         s.record_diff_frame(100, 20);
+        s.record_loop_iter(50, 950); // 5% busy
         s.emit_server("server", 2000, 42.0, 200, 3, 4096);
 
         let body = std::fs::read_to_string(&path).unwrap();
@@ -515,12 +588,19 @@ mod tests {
             "frames rx=1 (full=0 diff=1",
             "bw_down=",
             "predict active=1 shown=1 epoch_lag=0 resets=0 correct=0 nocredit=0 incorrect=0 srtt_trig=0",
-            "apply_us=40",
-            "compose_us=60",
+            "apply_us=60/80", // windowed avg / max
+            "compose_us=60/60",
+            "loop iters=1 busy=100us idle=900us busy_pct=10% max_iter_us=100",
         ] {
             assert!(body.contains(key), "missing client key {key:?} in:\n{body}");
         }
-        for key in ["server srtt=42ms", "diff_saved=80%", "dump_vt_us=", "bw_up="] {
+        for key in [
+            "server srtt=42ms",
+            "diff_saved=80%",
+            "dump_vt_us=",
+            "bw_up=",
+            "loop iters=1 busy=50us idle=950us busy_pct=5% max_iter_us=50",
+        ] {
             assert!(body.contains(key), "missing server key {key:?} in:\n{body}");
         }
     }
