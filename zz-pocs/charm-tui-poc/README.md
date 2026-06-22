@@ -67,10 +67,12 @@ In `just run`:
   app state on its custom `ultraviolet` cell-renderer; this POC reproduces the
   slash-palette behavior, key bindings, command labels, and styling as a vanilla
   bubbletea v2 `Model`.
-- **The popup re-centers vertically as it grows/shrinks** (width is fixed), and
-  the real cursor is **hidden** while a popup is up (the filter text shows, but
-  there's no blinking input caret — cursor mapping is a follow-up). There is
-  **no SIGWINCH/resize handling.**
+- **The popup is anchored a third of the way down** (horizontally centered) and
+  expands downward / collapses upward as the list filters; a long list in a
+  short terminal clips at the bottom (list scrolling is a follow-up). The real
+  cursor is **hidden** while a popup is up (the filter text shows, but there's
+  no blinking input caret — cursor mapping is a follow-up). There is **no
+  SIGWINCH/resize handling.**
 - **Local-only, no server.** The real roaming client (`remote/client.rs`)
   requires a server; this POC hosts the overlay standalone to prove the
   emulator-hosting mechanic without that machinery.

@@ -169,8 +169,11 @@ fn compose(rows: u16, cols: u16, session: &Terminal, overlay: Option<&Terminal>,
         if let Some((r0, c0, r1, c1)) = bbox(bar.screen()) {
             let h = r1 - r0 + 1;
             let bw = c1 - c0 + 1;
-            // Center the popup's bounding box over the screen.
-            let dr = rows.saturating_sub(h) / 2;
+            // Anchor the popup's top a third of the way down and center it
+            // horizontally. The top stays put as the list grows/shrinks, so it
+            // expands downward and collapses upward (a long list in a short
+            // terminal clips at the bottom — list scrolling is a follow-up).
+            let dr = rows / 3;
             let dc = cols.saturating_sub(bw) / 2;
             let bscr = bar.screen();
             for r in 0..h {
@@ -360,7 +363,7 @@ fn test_composite(bin: &CString) -> bool {
     let cur = compose(DEFAULT_ROWS, DEFAULT_COLS, &session, Some(&bar), false);
     let joined: Vec<String> = (0..DEFAULT_ROWS).map(|r| row_text(&cur, r, DEFAULT_COLS)).collect();
 
-    // Background preserved above the centered popup: the top row is the session.
+    // Background preserved above the popup: the top row is the session.
     let bg_ok = joined[0].contains("posh client");
     // The composed grid carries the palette.
     let popup_ok = joined.join("\n").contains("Commands") && joined.join("\n").contains("New Session");
@@ -369,8 +372,15 @@ fn test_composite(bin: &CString) -> bool {
         Some((_, c0, _, c1)) => DEFAULT_COLS.saturating_sub(c1 - c0 + 1) / 2 > 0,
         None => false,
     };
-    eprintln!("--- composite ---\nbg_ok={bg_ok} popup_ok={popup_ok} centered={centered}\ntop=\"{}\"\n-----------------", joined[0]);
-    bg_ok && popup_ok && centered
+    // Top anchored a third of the way down: the popup's top border sits on that
+    // row and the row above it is still background.
+    let anchor = (DEFAULT_ROWS / 3) as usize;
+    let anchored = joined[anchor].contains('╭') && !joined[anchor - 1].contains('╭');
+    eprintln!(
+        "--- composite ---\nbg_ok={bg_ok} popup_ok={popup_ok} centered={centered} anchored={anchored}\ntop=\"{}\"  anchor[{anchor}]=\"{}\"\n-----------------",
+        joined[0], joined[anchor]
+    );
+    bg_ok && popup_ok && centered && anchored
 }
 
 /// Assert the chord parser: ordinary bytes pass through, `Ctrl-^ .` opens,
