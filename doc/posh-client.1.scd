@@ -56,6 +56,14 @@ the host and then launches this client against the reported address.
 	summaries are written to a per-pid file under the posh runtime dir; a
 	banner shows the state and path.
 
+*Ctrl-^* then *p*
+	Open the command palette: a filterable overlay listing the client-local
+	controls (the echo models and logging toggle above, plus quit). Type to
+	filter, arrows to choose, Enter to run, Esc to dismiss. Rendered by the
+	*posh-palette* helper over a JSON-RPC control channel; if that binary is
+	not found the palette is unavailable and a banner says so. The direct
+	chords keep working regardless.
+
 # ENVIRONMENT
 
 _POSH_KEY_

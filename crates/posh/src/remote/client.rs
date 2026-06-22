@@ -6,7 +6,8 @@
 use std::net::{SocketAddr, ToSocketAddrs};
 use std::time::Instant;
 
-use posh_term::Terminal;
+use posh_term::{Color, Screen, Style, Terminal};
+use serde_json::{json, Value};
 
 use crate::pty::{self, RawMode};
 use crate::remote::caps;
@@ -15,6 +16,7 @@ use crate::remote::datagram::{Connection, Family};
 use crate::remote::diag;
 use crate::remote::display::{self, NotificationEngine, Snapshot};
 use crate::remote::framesync::{self, ApplyOutcome, FrameApplier};
+use crate::remote::palette::{Palette, PaletteEvent};
 use crate::remote::predict::{
     self, PredictionModel, PredictionRenderer, Predictor, RenderStyle,
 };
@@ -41,24 +43,15 @@ const ESCAPE_PASS_KEY: u8 = b'^';
 /// The Ctrl-^ command help line, naming the configured escape-to-shell key.
 fn escape_help(key: u8) -> String {
     format!(
-        "Commands: Ctrl-Z suspends, \".\" quits, \"{}\" shells out, \"e\" cycles echo, \"d\" toggles logging, \"^\" gives literal Ctrl-^",
+        "Commands: Ctrl-Z suspends, \".\" quits, \"{}\" shells out, \"e\" cycles echo, \"d\" toggles logging, \"p\" opens palette, \"^\" gives literal Ctrl-^",
         key as char
     )
 }
 
-/// Cycle the predictive-echo model live (Ctrl-^ e): Adaptive -> Optimistic ->
-/// Always -> Never -> ... Rebuilds the predictor/renderer in place and forces a
-/// clean repaint so stale predicted cells clear. Experimental (legacy) is
-/// skipped; if the session started on it, the cycle re-enters at Optimistic.
-fn cycle_echo(st: &mut ClientState, now: u64) {
-    const CYCLE: [PredictionModel; 4] = [
-        PredictionModel::Adaptive,
-        PredictionModel::Optimistic,
-        PredictionModel::Always,
-        PredictionModel::Never,
-    ];
-    let i = CYCLE.iter().position(|&m| m == st.predict_model).unwrap_or(0);
-    let next = CYCLE[(i + 1) % CYCLE.len()];
+/// Rebuild the predictor/renderer for `next` in place and force a clean repaint
+/// so stale predicted cells clear; banners the new model. The settable core
+/// shared by the `Ctrl-^ e` cycle and the palette's `echo.set` action.
+fn apply_echo_model(st: &mut ClientState, next: PredictionModel, now: u64) {
     let (predict, renderer) = predict::build(next, st.predict_render, st.predict_overwrite);
     st.predict = predict;
     st.renderer = renderer;
@@ -67,19 +60,104 @@ fn cycle_echo(st: &mut ClientState, now: u64) {
     st.notify.set_message(&format!("echo: {next:?}"), false, now);
 }
 
-/// Toggle client-local debug logging (Ctrl-^ d): open the default per-pid sink
+/// Cycle the predictive-echo model live (Ctrl-^ e): Adaptive -> Optimistic ->
+/// Always -> Never -> ... Experimental (legacy) is skipped; if the session
+/// started on it, the cycle re-enters at Optimistic.
+fn cycle_echo(st: &mut ClientState, now: u64) {
+    const CYCLE: [PredictionModel; 4] = [
+        PredictionModel::Adaptive,
+        PredictionModel::Optimistic,
+        PredictionModel::Always,
+        PredictionModel::Never,
+    ];
+    let i = CYCLE.iter().position(|&m| m == st.predict_model).unwrap_or(0);
+    apply_echo_model(st, CYCLE[(i + 1) % CYCLE.len()], now);
+}
+
+/// Set client-local debug logging to `enabled`: open the default per-pid sink
 /// (reusing the SIGUSR2-dump path scheme) or close it, and flip the stats
-/// collector so the periodic transport summaries flow while it is on.
-fn toggle_logging(st: &mut ClientState, now: u64) {
-    if util::log_active() {
-        util::log_disable();
-        st.stats.set_enabled(false);
-        st.notify.set_message("debug logging: off", false, now);
-    } else {
+/// collector so the periodic transport summaries flow while it is on. A no-op
+/// (no banner) when already in the requested state.
+fn set_logging(st: &mut ClientState, enabled: bool, now: u64) {
+    if enabled == util::log_active() {
+        return;
+    }
+    if enabled {
         let path = diag::enable_logging("client");
         st.stats.set_enabled(true);
         st.notify
             .set_message(&format!("debug logging: on ({})", path.display()), false, now);
+    } else {
+        util::log_disable();
+        st.stats.set_enabled(false);
+        st.notify.set_message("debug logging: off", false, now);
+    }
+}
+
+/// Toggle client-local debug logging (Ctrl-^ d).
+fn toggle_logging(st: &mut ClientState, now: u64) {
+    set_logging(st, !util::log_active(), now);
+}
+
+/// The palette's command list (RFC 0005 §5): the discoverable surface for the
+/// client-local controls. The logging entry reflects the current state.
+fn palette_commands() -> Value {
+    let (log_name, log_enabled): (&str, bool) = if util::log_active() {
+        ("Debug logging: off", false)
+    } else {
+        ("Debug logging: on", true)
+    };
+    json!([
+        { "name": "Echo: adaptive", "action": { "method": "echo.set", "params": { "model": "adaptive" } } },
+        { "name": "Echo: optimistic", "action": { "method": "echo.set", "params": { "model": "optimistic" } } },
+        { "name": "Echo: always", "action": { "method": "echo.set", "params": { "model": "always" } } },
+        { "name": "Echo: never", "action": { "method": "echo.set", "params": { "model": "never" } } },
+        { "name": log_name, "action": { "method": "logging.set", "params": { "enabled": log_enabled } } },
+        { "name": "Quit session", "action": { "method": "app.quit" } },
+    ])
+}
+
+/// Summon the command palette (Ctrl-^ p): spawn the renderer on first use, then
+/// show it. Returns whether the screen needs a repaint. A missing/unspawnable
+/// renderer degrades to a banner (the palette is optional).
+fn open_palette(st: &mut ClientState, now: u64) {
+    if st.palette.is_none() {
+        st.palette = Palette::spawn(st.rows, st.cols);
+    }
+    if let Some(p) = st.palette.as_mut() {
+        p.open("Commands", palette_commands());
+        st.initialized = false; // repaint to show the overlay
+    } else {
+        st.notify
+            .set_message("command palette unavailable (posh-palette not found)", false, now);
+    }
+}
+
+/// Dispatch a palette-selected command action (RFC 0005 §7). Returns whether the
+/// client should send to the server promptly (true for a quit).
+fn dispatch_palette_action(st: &mut ClientState, method: &str, params: &Value, now: u64) -> bool {
+    match method {
+        "echo.set" => {
+            if let Some(model) = params
+                .get("model")
+                .and_then(Value::as_str)
+                .and_then(|m| PredictionModel::parse(Some(m)).ok())
+            {
+                apply_echo_model(st, model, now);
+            }
+            false
+        }
+        "logging.set" => {
+            if let Some(enabled) = params.get("enabled").and_then(Value::as_bool) {
+                set_logging(st, enabled, now);
+            }
+            false
+        }
+        "app.quit" => {
+            request_shutdown(st);
+            true
+        }
+        _ => false, // unknown method: the renderer already closed; ignore
     }
 }
 
@@ -279,6 +357,9 @@ struct ClientState {
     applier: Box<dyn FrameApplier>,
     /// Optional performance instrumentation (POSH_DEBUG_LOG); inert when unset.
     stats: Stats,
+    /// The command-palette overlay renderer (Ctrl-^ p), spawned lazily on first
+    /// summon and kept resident; `None` until then or if it can't be launched.
+    palette: Option<Palette>,
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -339,8 +420,13 @@ fn client_loop(
         framesync,
         applier,
         stats: Stats::new(),
+        palette: None,
     };
     let result = drive_client(&mut st, raw, port);
+    // Tear down the palette renderer (if any) before the final stats flush.
+    if let Some(p) = st.palette.take() {
+        p.shutdown();
+    }
     // One final summary regardless of how the loop exited (graceful, timeout,
     // or error), so the log always ends with the last-observed transport state.
     let now = now_ms();
@@ -395,10 +481,18 @@ fn drive_client(st: &mut ClientState, raw: &RawMode, port: u16) -> Result<i32> {
         }
         let timeout = deadline.saturating_sub(now).min(1000) as i32;
 
-        let mut fds = [
+        let mut fds = vec![
             util::pollfd(STDIN, libc::POLLIN),
             util::pollfd(st.conn.raw_fd(), libc::POLLIN),
         ];
+        // Poll the palette renderer's fds (its PTY + control socket) while it is
+        // resident, so its output drains and selections are seen promptly.
+        let palette_base = st.palette.as_ref().map(|p| {
+            let base = fds.len();
+            fds.push(util::pollfd(p.master_fd(), libc::POLLIN));
+            fds.push(util::pollfd(p.ctrl_fd(), libc::POLLIN));
+            base
+        });
         let mut send_now = false;
         match util::poll(&mut fds, timeout) {
             Ok(_) => {}
@@ -410,6 +504,9 @@ fn drive_client(st: &mut ClientState, raw: &RawMode, port: u16) -> Result<i32> {
             let size = pty::term_size(STDOUT);
             st.rows = size.0;
             st.cols = size.1;
+            if let Some(p) = st.palette.as_mut() {
+                p.resize(st.rows, st.cols);
+            }
             st.predict.reset();
             st.initialized = false; // full repaint at the new size
             // RFC 0002 §4: a width change rewraps the server's ring, so
@@ -511,6 +608,30 @@ fn drive_client(st: &mut ClientState, raw: &RawMode, port: u16) -> Result<i32> {
                     Ok(None) => continue,
                     Err(e) if e.kind() == std::io::ErrorKind::WouldBlock => break,
                     Err(_) => break,
+                }
+            }
+        }
+
+        // Palette overlay: drain the renderer's screen so the next compose
+        // reflects it, and act on any selection/cancel it reported.
+        if let Some(base) = palette_base {
+            if fds[base].revents & libc::POLLIN != 0 {
+                if let Some(p) = st.palette.as_mut() {
+                    p.pump();
+                }
+            }
+            if fds[base + 1].revents & libc::POLLIN != 0 {
+                match st.palette.as_mut().map(Palette::poll_events) {
+                    Some(PaletteEvent::Action { method, params }) => {
+                        if dispatch_palette_action(st, &method, &params, now_ms()) {
+                            send_now = true;
+                        }
+                        st.initialized = false; // palette closed -> repaint session
+                    }
+                    Some(PaletteEvent::Cancelled) => {
+                        st.initialized = false; // palette closed -> repaint session
+                    }
+                    _ => {}
                 }
             }
         }
@@ -813,6 +934,14 @@ fn process_user_input(st: &mut ClientState, buf: &[u8], raw: &RawMode) -> bool {
     let now = now_ms();
     let mut dirty = false;
 
+    // While the palette overlay is up, the renderer owns the keyboard: forward
+    // raw keystrokes to it and send nothing to the session. It reports the
+    // selection/cancel over the control channel (handled in the poll loop).
+    if let Some(p) = st.palette.as_ref().filter(|p| p.is_open()) {
+        p.forward_input(buf);
+        return false;
+    }
+
     // When we are intercepting the wheel (bare prompt, primary screen), run
     // input through the mouse filter before the byte loop. The wheel drives the
     // scrollback scroll-view by default, or the legacy wheel→arrow grab when
@@ -909,6 +1038,12 @@ fn process_user_input(st: &mut ClientState, buf: &[u8], raw: &RawMode) -> bool {
                 b'd' => {
                     // Ctrl-^ d: toggle client-local debug logging.
                     toggle_logging(st, now);
+                    dirty = true;
+                    continue;
+                }
+                b'p' => {
+                    // Ctrl-^ p: open the command palette (client-local overlay).
+                    open_palette(st, now);
                     dirty = true;
                     continue;
                 }
@@ -1095,8 +1230,11 @@ fn render(st: &mut ClientState, now: u64) {
 /// last_render_overlays. github #35.
 fn compose_frame(st: &mut ClientState, now: u64) -> Vec<u8> {
     let model_state = (st.applied_num, st.server_term.generation());
-    let overlays_live =
-        st.predict.active() || !st.notify.message().is_empty() || st.notify.server_late(now);
+    let palette_open = st.palette.as_ref().is_some_and(Palette::is_open);
+    let overlays_live = st.predict.active()
+        || !st.notify.message().is_empty()
+        || st.notify.server_late(now)
+        || palette_open;
     if st.initialized
         && model_state == st.last_render_state
         && !overlays_live
@@ -1119,6 +1257,12 @@ fn compose_frame(st: &mut ClientState, now: u64) -> Vec<u8> {
     st.predict.cull(&base, now);
     let mut next = base;
     st.predict.render(&mut next, &*st.renderer);
+    // The palette overlay sits above the session (greyed) but below the banner.
+    if palette_open {
+        if let Some(rterm) = st.palette.as_ref().and_then(Palette::screen) {
+            composite_palette(&mut next, rterm, st.rows, st.cols);
+        }
+    }
     st.notify.adjust(now);
     st.notify.apply(&mut next, now);
 
@@ -1130,6 +1274,69 @@ fn compose_frame(st: &mut ClientState, now: u64) -> Vec<u8> {
         st.stats.record_compose_us(t.elapsed().as_micros() as u64);
     }
     bytes
+}
+
+/// Composite the open palette over the session snapshot: grey the session
+/// behind it, then paint the renderer's non-blank bounding box anchored a third
+/// of the way down, centered, and map the renderer's cursor into that box.
+fn composite_palette(next: &mut Snapshot, rterm: &Terminal, rows: u16, cols: u16) {
+    // Grey the session background: keep the glyphs, flatten the style.
+    let dim = Style {
+        fg: Color::Rgb(0x70, 0x70, 0x70),
+        dim: true,
+        ..Style::default()
+    };
+    for row in next.cells.iter_mut() {
+        for cell in row.iter_mut() {
+            cell.style = dim;
+        }
+    }
+
+    let screen = rterm.screen();
+    let Some((r0, c0, r1, c1)) = bbox(screen) else {
+        next.cursor_visible = false;
+        return;
+    };
+    let bh = r1 - r0 + 1;
+    let bw = c1 - c0 + 1;
+    let dr = rows / 3;
+    let dc = cols.saturating_sub(bw) / 2;
+    for r in 0..bh {
+        for c in 0..bw {
+            if let (Some(src), Some(dst)) =
+                (screen.cell(r0 + r, c0 + c), next.cell_mut(dr + r, dc + c))
+            {
+                *dst = src.clone();
+            }
+        }
+    }
+
+    // Put the real cursor in the palette's input field (mapped from the
+    // renderer's cursor); hide it when that cursor falls outside the box.
+    let cur = rterm.cursor();
+    if cur.visible && cur.row >= r0 && cur.row <= r1 && cur.col >= c0 && cur.col <= c1 {
+        next.cursor_row = dr + (cur.row - r0);
+        next.cursor_col = dc + (cur.col - c0);
+        next.cursor_visible = true;
+    } else {
+        next.cursor_visible = false;
+    }
+}
+
+/// Non-blank bounding box of a screen: (top, left, bottom, right), or None.
+fn bbox(scr: &Screen) -> Option<(u16, u16, u16, u16)> {
+    let mut found: Option<(u16, u16, u16, u16)> = None;
+    for r in 0..scr.rows() {
+        for c in 0..scr.cols() {
+            if scr.cell(r, c).is_some_and(|cell| !cell.is_blank()) {
+                found = Some(match found {
+                    None => (r, c, r, c),
+                    Some((r0, c0, r1, c1)) => (r0.min(r), c0.min(c), r1.max(r), c1.max(c)),
+                });
+            }
+        }
+    }
+    found
 }
 
 /// Builds the scroll-view escape stream (FDR 0005): a window of the accumulated
@@ -1503,6 +1710,7 @@ mod tests {
             framesync: framesync::FrameSync::DumpDiff,
             applier: Box::new(framesync::DumpDiff),
             stats: Stats::new(),
+            palette: None,
         }
     }
 
@@ -1523,6 +1731,27 @@ mod tests {
         assert_eq!(st.predict_model, PredictionModel::Never);
         cycle_echo(&mut st, 0);
         assert_eq!(st.predict_model, PredictionModel::Adaptive, "wraps around");
+    }
+
+    #[test]
+    fn composite_palette_dims_session_and_anchors_renderer() {
+        let mut snap = Snapshot::blank(24, 80);
+        snap.cell_mut(0, 0).unwrap().ch = 'X'; // a session glyph to check greying
+
+        let mut rterm = Terminal::new(24, 80);
+        rterm.process(b"HI"); // renderer screen: "HI" at row 0, cols 0-1
+
+        composite_palette(&mut snap, &rterm, 24, 80);
+
+        // Session is greyed (glyph kept, style flattened to dim).
+        let bg = snap.cell_mut(0, 0).unwrap();
+        assert_eq!(bg.ch, 'X');
+        assert!(bg.style.dim, "session cell is dimmed behind the palette");
+
+        // bbox("HI") = rows 0, cols 0..1 (bw=2); anchored at row 24/3=8,
+        // col (80-2)/2=39.
+        assert_eq!(snap.cells[8][39].ch, 'H');
+        assert_eq!(snap.cells[8][40].ch, 'I');
     }
 
     #[test]

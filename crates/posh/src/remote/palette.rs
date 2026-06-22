@@ -10,10 +10,6 @@
 //! the `initialize` handshake; [`Palette::open`] summons the palette;
 //! `pump`/`forward_input`/`poll_events` drive it while up; [`Palette::shutdown`]
 //! tears it down (`ui.shutdown` + a `SIGKILL` backstop).
-//!
-//! The poll-loop / compositing wiring into `client.rs` lands in a follow-up
-//! commit, so several accessors are not yet called outside tests.
-#![allow(dead_code)]
 
 use std::ffi::CString;
 use std::os::fd::RawFd;
@@ -139,12 +135,6 @@ impl Palette {
             json!({ "view": "palette", "title": title, "commands": commands }),
         );
         self.open = true;
-    }
-
-    /// Dismiss the palette (`ui.hide`).
-    pub fn hide(&mut self) {
-        self.send_request("ui.hide", json!({}));
-        self.open = false;
     }
 
     /// Drain the renderer PTY into the emulated screen. Returns whether the
