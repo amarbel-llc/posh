@@ -12,6 +12,8 @@ publish = false
 # The one in-repo crate the POC leans on: the client-side terminal emulator.
 posh-term = { path = "../../../crates/posh-term" }
 libc = "0.2"
+# The JSON-RPC-style control channel to the Go renderer.
+serde_json = "1"
 
 [[bin]]
 name = "charm-tui-host"

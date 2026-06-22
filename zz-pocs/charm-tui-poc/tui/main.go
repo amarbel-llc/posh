@@ -1,13 +1,23 @@
-// charm-tui-poc command bar: a bubbletea v2 command palette modeled on
-// trapeze's "/" Commands dialog (the charm.land/bubbletea/v2 stack). Throwaway
-// POC content for the posh client-side TUI host. The command list is a
-// hardcoded subset of trapeze's defaults; selecting a command echoes it and
-// exits, except "Quit" (or ctrl+c), which exits with quitExitCode so the host
-// driver can tell "quit the session" apart from "dismiss the overlay". Esc
-// cancels.
+// charm-tui-poc renderer: a long-running bubbletea v2 renderer driven by the
+// host over a JSON-RPC-style control channel (newline-delimited JSON on fd 3),
+// rendering to its PTY. The host tells it which view to show — the command
+// palette (modeled on trapeze's "/" Commands dialog) or the chord-armed
+// indicator — and the renderer reports palette selections/cancels back as
+// events. Throwaway POC content for the posh client-side TUI host.
+//
+// Protocol (one JSON object per line on fd 3):
+//   host  -> renderer:  {"method":"show","params":{"view":"palette",
+//                          "commands":[{"name":"Quit","shortcut":""}]}}
+//                       {"method":"show","params":{"view":"chord"}}
+//                       {"method":"hide","params":{}}
+//   renderer -> host:   {"method":"event","params":{"kind":"selected",
+//                          "command":"Quit"}}
+//                       {"method":"event","params":{"kind":"cancel"}}
 package main
 
 import (
+	"bufio"
+	"encoding/json"
 	"fmt"
 	"os"
 	"strings"
@@ -18,30 +28,38 @@ import (
 	"charm.land/lipgloss/v2"
 )
 
-// quitExitCode is the process exit status the bar uses to tell the host driver
-// to quit the whole session. The Rust host reaps it in host_overlay; any other
-// exit (0) means "the overlay closed, return to the base screen".
-const quitExitCode = 42
+// --- control protocol ---
+
+type rpcIn struct {
+	Method string          `json:"method"`
+	Params json.RawMessage `json:"params"`
+}
 
 type command struct {
-	name     string
-	shortcut string
+	Name     string `json:"name"`
+	Shortcut string `json:"shortcut"`
 }
 
-// A representative subset of trapeze's default system commands
-// (internal/ui/dialog/commands.go defaultCommands).
-var allCommands = []command{
-	{"New Session", "ctrl+n"},
-	{"Sessions", "ctrl+s"},
-	{"Switch Model", "ctrl+l"},
-	{"Toggle Thinking Mode", ""},
-	{"Open File Picker", "ctrl+f"},
-	{"Open External Editor", "ctrl+o"},
-	{"Toggle Help", "ctrl+g"},
-	{"Initialize Project", ""},
-	{"Toggle Yolo Mode", "ctrl+y"},
-	{"Quit", "ctrl+c"},
+type showParams struct {
+	View     string    `json:"view"`
+	Commands []command `json:"commands,omitempty"`
 }
+
+type eventOut struct {
+	Method string      `json:"method"`
+	Params eventParams `json:"params"`
+}
+
+type eventParams struct {
+	Kind    string `json:"kind"`
+	Command string `json:"command,omitempty"`
+}
+
+// bubbletea messages produced from control input.
+type showMsg showParams
+type hideMsg struct{}
+
+// --- styling ---
 
 var (
 	panelStyle = lipgloss.NewStyle().
@@ -57,45 +75,120 @@ var (
 			Background(lipgloss.Color("63"))
 	dimStyle  = lipgloss.NewStyle().Faint(true)
 	helpStyle = lipgloss.NewStyle().Faint(true)
+
+	chordStyle = lipgloss.NewStyle().
+			Border(lipgloss.DoubleBorder()).
+			BorderForeground(lipgloss.Color("214")).
+			Padding(1, 4)
+	chordKey = lipgloss.NewStyle().Bold(true).Foreground(lipgloss.Color("214"))
+)
+
+// --- model ---
+
+type viewKind int
+
+const (
+	viewNone viewKind = iota
+	viewPalette
+	viewChord
 )
 
 type keymap struct {
-	up, down, sel, cancel, quit key.Binding
+	up, down, sel, cancel key.Binding
 }
 
 type model struct {
+	view     viewKind
+	ctrl     *os.File
 	input    textinput.Model
 	keys     keymap
+	commands []command
 	filtered []command
 	selected int
-	chosen   string
-	quit     bool
 }
 
-func newModel() model {
+func newModel(ctrl *os.File) model {
 	in := textinput.New()
 	in.Placeholder = "Type to filter"
 	in.Prompt = "/ "
-	in.Focus()
-	m := model{
+	return model{
+		view:  viewNone,
+		ctrl:  ctrl,
 		input: in,
 		keys: keymap{
 			up:     key.NewBinding(key.WithKeys("up")),
 			down:   key.NewBinding(key.WithKeys("down")),
 			sel:    key.NewBinding(key.WithKeys("enter")),
 			cancel: key.NewBinding(key.WithKeys("esc")),
-			quit:   key.NewBinding(key.WithKeys("ctrl+c")),
 		},
 	}
-	m.recompute()
-	return m
+}
+
+func (m model) Init() tea.Cmd { return nil }
+
+func (m model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
+	switch msg := msg.(type) {
+	case showMsg:
+		switch msg.View {
+		case "palette":
+			m.view = viewPalette
+			m.commands = msg.Commands
+			m.input.SetValue("")
+			m.input.Focus()
+			m.selected = 0
+			m.recompute()
+		case "chord":
+			m.view = viewChord
+		default:
+			m.view = viewNone
+		}
+		return m, nil
+	case hideMsg:
+		m.view = viewNone
+		return m, nil
+	case tea.KeyPressMsg:
+		if m.view != viewPalette {
+			return m, nil // host owns chord keys; ignore otherwise
+		}
+		switch {
+		case keyMatches(msg, m.keys.cancel):
+			m.sendEvent("cancel", "")
+			m.view = viewNone
+			return m, nil
+		case keyMatches(msg, m.keys.sel):
+			if len(m.filtered) > 0 {
+				m.sendEvent("selected", m.filtered[m.selected].Name)
+			}
+			m.view = viewNone
+			return m, nil
+		case keyMatches(msg, m.keys.up):
+			if m.selected > 0 {
+				m.selected--
+			}
+			return m, nil
+		case keyMatches(msg, m.keys.down):
+			if m.selected < len(m.filtered)-1 {
+				m.selected++
+			}
+			return m, nil
+		}
+		var cmd tea.Cmd
+		m.input, cmd = m.input.Update(msg)
+		m.recompute()
+		return m, cmd
+	}
+	return m, nil
+}
+
+func keyMatches(k tea.KeyPressMsg, b key.Binding) bool {
+	return key.Matches(k, b)
 }
 
 func (m *model) recompute() {
 	q := strings.ToLower(strings.TrimSpace(m.input.Value()))
 	m.filtered = nil
-	for _, c := range allCommands {
-		if q == "" || strings.Contains(strings.ToLower(c.name), q) {
+	for _, c := range m.commands {
+		if q == "" || strings.Contains(strings.ToLower(c.Name), q) {
 			m.filtered = append(m.filtered, c)
 		}
 	}
@@ -107,47 +200,26 @@ func (m *model) recompute() {
 	}
 }
 
-func (m model) Init() tea.Cmd { return nil }
-
-func (m model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
-	if key, ok := msg.(tea.KeyPressMsg); ok {
-		switch {
-		case keyMatches(key, m.keys.quit):
-			m.quit = true
-			return m, tea.Quit
-		case keyMatches(key, m.keys.cancel):
-			return m, tea.Quit
-		case keyMatches(key, m.keys.sel):
-			if len(m.filtered) > 0 {
-				m.chosen = m.filtered[m.selected].name
-				if m.chosen == "Quit" {
-					m.quit = true
-				}
-			}
-			return m, tea.Quit
-		case keyMatches(key, m.keys.up):
-			if m.selected > 0 {
-				m.selected--
-			}
-			return m, nil
-		case keyMatches(key, m.keys.down):
-			if m.selected < len(m.filtered)-1 {
-				m.selected++
-			}
-			return m, nil
-		}
+func (m model) sendEvent(kind, cmd string) {
+	if m.ctrl == nil {
+		return
 	}
-	var cmd tea.Cmd
-	m.input, cmd = m.input.Update(msg)
-	m.recompute()
-	return m, cmd
-}
-
-func keyMatches(k tea.KeyPressMsg, b key.Binding) bool {
-	return key.Matches(k, b)
+	b, _ := json.Marshal(eventOut{Method: "event", Params: eventParams{Kind: kind, Command: cmd}})
+	m.ctrl.Write(append(b, '\n'))
 }
 
 func (m model) View() tea.View {
+	switch m.view {
+	case viewPalette:
+		return tea.NewView(m.paletteView())
+	case viewChord:
+		return tea.NewView(m.chordView())
+	default:
+		return tea.NewView("")
+	}
+}
+
+func (m model) paletteView() string {
 	var b strings.Builder
 	b.WriteString(titleStyle.Render("Commands"))
 	b.WriteByte('\n')
@@ -158,9 +230,9 @@ func (m model) View() tea.View {
 		b.WriteByte('\n')
 	}
 	for i, c := range m.filtered {
-		row := c.name
-		if c.shortcut != "" {
-			row = fmt.Sprintf("%-22s %s", c.name, c.shortcut)
+		row := c.Name
+		if c.Shortcut != "" {
+			row = fmt.Sprintf("%-22s %s", c.Name, c.Shortcut)
 		}
 		if i == m.selected {
 			b.WriteString(selStyle.Render("› " + row))
@@ -171,20 +243,53 @@ func (m model) View() tea.View {
 	}
 	b.WriteByte('\n')
 	b.WriteString(helpStyle.Render("↑/↓ choose · enter run · esc cancel"))
-	return tea.NewView(panelStyle.Render(b.String()))
+	return panelStyle.Render(b.String())
 }
 
+func (m model) chordView() string {
+	body := lipgloss.JoinVertical(
+		lipgloss.Center,
+		chordKey.Render("Ctrl-^"),
+		"",
+		"prefix armed — choose:",
+		"",
+		chordKey.Render(".")+"  command palette",
+		chordKey.Render("q")+"  quit",
+		"",
+		dimStyle.Render("any other key cancels"),
+	)
+	return chordStyle.Render(body)
+}
+
+// --- main + control reader ---
+
 func main() {
-	final, err := tea.NewProgram(newModel()).Run()
-	if err != nil {
-		fmt.Fprintln(os.Stderr, "command-bar:", err)
+	ctrl := os.NewFile(3, "control")
+	p := tea.NewProgram(newModel(ctrl))
+	if ctrl != nil {
+		go readControl(ctrl, p)
+	}
+	if _, err := p.Run(); err != nil {
+		fmt.Fprintln(os.Stderr, "renderer:", err)
 		os.Exit(1)
 	}
-	m, _ := final.(model)
-	if m.quit {
-		os.Exit(quitExitCode)
+}
+
+func readControl(ctrl *os.File, p *tea.Program) {
+	sc := bufio.NewScanner(ctrl)
+	for sc.Scan() {
+		var in rpcIn
+		if json.Unmarshal(sc.Bytes(), &in) != nil {
+			continue
+		}
+		switch in.Method {
+		case "show":
+			var sp showParams
+			_ = json.Unmarshal(in.Params, &sp)
+			p.Send(showMsg(sp))
+		case "hide":
+			p.Send(hideMsg{})
+		}
 	}
-	if m.chosen != "" {
-		fmt.Println("ran:", m.chosen)
-	}
+	p.Quit() // control channel closed -> shut down
 }
