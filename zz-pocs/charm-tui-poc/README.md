@@ -8,10 +8,9 @@ full terminal emulator, it can run an arbitrary charmbracelet renderer as a
 host-driven, mux-style overlay — a local analogue of the server-side
 escape-to-shell overlay (FDR 0008).
 
-The renderer shows one of two views on demand:
-- a **command palette** (a `/`-style filter list modeled on
-  [trapeze](https://github.com/amarbel-llc/trapeze)'s Commands dialog), and
-- a **chord-armed indicator** (shown while the `Ctrl-^` prefix is pending).
+The renderer shows a **command palette** on demand — a `/`-style filter list
+modeled on [trapeze](https://github.com/amarbel-llc/trapeze)'s Commands dialog,
+opened directly by `Ctrl-^` (or a bare `/`).
 
 ## Layout
 
@@ -34,7 +33,6 @@ The renderer shows one of two views on demand:
 
 ```
 host -> renderer:  {"method":"show","params":{"view":"palette","commands":[{"name":"Quit","shortcut":""}]}}
-                   {"method":"show","params":{"view":"chord"}}
                    {"method":"hide","params":{}}
 renderer -> host:  {"method":"event","params":{"kind":"selected","command":"Quit"}}
                    {"method":"event","params":{"kind":"cancel"}}
@@ -50,33 +48,31 @@ just run     # interactive: drive it in your own terminal
 In `just run`:
 
 - A base "live session" screen is shown (stand-in for the real session).
-- Press **`Ctrl-^`**: the whole session **greys out** and a centered
-  charmbracelet **chord indicator** appears (`.` palette, `q` quit, any other key
-  cancels). The host sends `show {view:"chord"}`; the grey-out is a host-side
-  compositor pass.
-- Then `.` (or a bare `/` from the base) opens the **command palette** — a popup
-  anchored a third of the way down. Type to filter, `↑`/`↓` choose, `Enter` runs,
-  **`Esc` cancels**. The host sends `show {view:"palette", commands:[…]}` and
-  forwards keystrokes to the renderer while it's up.
+- Press **`Ctrl-^`** (or a bare **`/`**): the session **greys out** and the
+  **command palette** opens directly — a yellow-bordered box anchored a third of
+  the way down (it expands downward / collapses upward as you filter). The host
+  sends `show {view:"palette", commands:[…]}` and forwards keystrokes to the
+  renderer while it's up.
+- Type to filter, `↑`/`↓` choose, `Enter` runs, **`Esc` cancels**.
 - Selecting a command sends a `selected` event back; the host performs it:
   **`Quit`** exits, **`Clear session`** blanks the background, **`Redraw session`**
   restores it. Only host-supported commands are listed.
-- `Ctrl-^ q` quits the driver directly.
 
 ## What it proves
 
 - A single charmbracelet renderer can be **driven by the host over JSON-RPC**
-  (host → `show`/`hide`, renderer → `selected`/`cancel`) to present different
-  views, with the PTY as the visual channel and a separate control socket.
-- `posh_term` composites that renderer over a retained session: the palette as an
-  anchored popup, and the chord indicator over a **greyed-out** background — all
-  via posh-term's own cell state + SGR emitter and a per-cell diff (only changed
-  cells written; closing an overlay reveals the session underneath).
+  (host → `show`/`hide`, renderer → `selected`/`cancel`), with the PTY as the
+  visual channel and a separate control socket.
+- `posh_term` composites that renderer over a retained session: the palette as a
+  yellow-bordered popup anchored a third down, over a **greyed-out** session
+  background — all via posh-term's own cell state + SGR emitter and a per-cell
+  diff (only changed cells written; closing the palette reveals the session
+  underneath).
 
 ## Known limits / out of scope (deliberate POC shortcuts)
 
-- **Chord is `Ctrl-^ .`, not a bare `Ctrl-.`** A bare `Ctrl-.` is not a control
-  byte; reporting it needs the kitty / CSI-u keyboard protocol. Deferred.
+- **`Ctrl-^` opens the palette, not a bare `Ctrl-.`** A bare `Ctrl-.` is not a
+  control byte; reporting it needs the kitty / CSI-u keyboard protocol. Deferred.
 - **The palette is a faithful *reproduction* of trapeze's UX, not its literal
   code** (trapeze's `Commands` dialog is a 568-line modal coupled to its custom
   `ultraviolet` cell-renderer). The command set is trimmed to what the host

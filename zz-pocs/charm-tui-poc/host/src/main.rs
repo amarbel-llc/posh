@@ -6,14 +6,14 @@
 //! 100% safe.
 //!
 //! The renderer is spawned once on a PTY (visual channel) plus a control socket
-//! on its fd 3. The host sends `show {view:"palette"|"chord", …}` / `hide`; the
+//! on its fd 3. The host sends `show {view:"palette", commands}` / `hide`; the
 //! renderer reports palette `selected`/`cancel` events back on the same socket.
-//! The host owns input routing (chord keys handled here; keystrokes forwarded to
-//! the renderer only while the palette is up) and compositing:
-//!   * palette -> a centered popup anchored a third of the way down.
-//!   * chord   -> the session background is greyed out and a centered
-//!                charmbracelet indicator is composited on top (fullscreen dim).
-//! A per-cell diff (reusing posh_term::sgr_params) writes only changed cells.
+//! `Ctrl-^` (or a bare `/`) opens the palette directly. The host owns input
+//! routing (the open trigger handled here; keystrokes forwarded to the renderer
+//! while the palette is up) and compositing: the palette is a popup anchored a
+//! third of the way down over a greyed-out (dimmed) session background, painted
+//! with a per-cell diff (reusing posh_term::sgr_params) that writes only the
+//! cells that changed.
 //!
 //! Two behaviours chosen by whether stdout is a tty (an OS fact, not a flag):
 //!   * stdout IS a tty  -> interactive.
@@ -36,11 +36,14 @@ const STDOUT: libc::c_int = 1;
 /// Quiet period with no PTY output that counts as "the renderer finished drawing".
 const IDLE: Duration = Duration::from_millis(400);
 
-// Chord: Ctrl-^ (0x1e) prefix + a key (matches remote/client.rs ESCAPE_KEY).
-const CHORD_PREFIX: u8 = 0x1e; // Ctrl-^
-const CHORD_OPEN: u8 = b'.'; // Ctrl-^ .  -> command palette
-const CHORD_QUIT: u8 = b'q'; // Ctrl-^ q  -> quit the driver
-const SLASH: u8 = b'/'; // bare "/" also opens the palette
+// Open triggers: Ctrl-^ (0x1e, matches remote/client.rs ESCAPE_KEY) or a bare
+// "/" opens the command palette directly. Quit is the palette's own command.
+const CTRL_CARET: u8 = 0x1e;
+const SLASH: u8 = b'/';
+
+fn is_open_trigger(b: u8) -> bool {
+    b == CTRL_CARET || b == SLASH
+}
 
 /// The only host-supported commands. Sent to the renderer when the palette
 /// opens; selecting one is handled below. (Unsupported demo commands removed.)
@@ -64,45 +67,6 @@ fn main() {
 }
 
 // ---------------------------------------------------------------------------
-// Chord state machine — the input-intercept logic, unit-testable in isolation.
-// ---------------------------------------------------------------------------
-
-#[derive(Debug, PartialEq, Eq)]
-enum Action {
-    Forward(Vec<u8>),
-    OpenOverlay,
-    Quit,
-    Pending,
-}
-
-struct Chord {
-    armed: bool,
-}
-
-impl Chord {
-    fn new() -> Chord {
-        Chord { armed: false }
-    }
-
-    fn feed(&mut self, b: u8) -> Action {
-        if self.armed {
-            self.armed = false;
-            match b {
-                CHORD_OPEN => Action::OpenOverlay,
-                CHORD_QUIT => Action::Quit,
-                CHORD_PREFIX => Action::Forward(vec![CHORD_PREFIX]),
-                other => Action::Forward(vec![other]),
-            }
-        } else if b == CHORD_PREFIX {
-            self.armed = true;
-            Action::Pending
-        } else {
-            Action::Forward(vec![b])
-        }
-    }
-}
-
-// ---------------------------------------------------------------------------
 // Control channel: JSON-RPC-style messages to/from the renderer.
 // ---------------------------------------------------------------------------
 
@@ -118,10 +82,6 @@ fn send_show_palette(ctrl: libc::c_int) {
         .map(|n| serde_json::json!({ "name": n, "shortcut": "" }))
         .collect();
     send_rpc(ctrl, &serde_json::json!({"method":"show","params":{"view":"palette","commands": cmds}}));
-}
-
-fn send_show_chord(ctrl: libc::c_int) {
-    send_rpc(ctrl, &serde_json::json!({"method":"show","params":{"view":"chord"}}));
 }
 
 fn send_hide(ctrl: libc::c_int) {
@@ -148,7 +108,6 @@ fn parse_event(line: &str) -> Option<(String, String)> {
 #[derive(Clone, Copy, PartialEq, Eq)]
 enum Mode {
     None,
-    Chord,
     Palette,
 }
 
@@ -198,7 +157,7 @@ fn compose(rows: u16, cols: u16, session: &Terminal, overlay: Option<&Terminal>,
     let w = cols as usize;
     let mut cur = vec![Cell::blank(Style::default()); rows as usize * w];
 
-    let grey = mode == Mode::Chord;
+    let grey = mode == Mode::Palette;
     let sscr = session.screen();
     for r in 0..rows {
         for c in 0..cols {
@@ -213,12 +172,9 @@ fn compose(rows: u16, cols: u16, session: &Terminal, overlay: Option<&Terminal>,
             if let Some((r0, c0, r1, c1)) = bbox(rend.screen()) {
                 let h = r1 - r0 + 1;
                 let bw = c1 - c0 + 1;
-                // Palette anchors a third down (expands down / collapses up);
-                // the chord indicator is centered.
-                let dr = match mode {
-                    Mode::Palette => rows / 3,
-                    _ => rows.saturating_sub(h) / 2,
-                };
+                // Anchor a third of the way down (expands down / collapses up),
+                // centered horizontally.
+                let dr = rows / 3;
                 let dc = cols.saturating_sub(bw) / 2;
                 let rscr = rend.screen();
                 for r in 0..h {
@@ -310,14 +266,13 @@ fn cells_eq(a: &Cell, b: &Cell) -> bool {
 
 fn selftest(bin: &CString) -> i32 {
     let palette_ok = test_palette_rpc(bin);
-    let chord_ok = test_chord_view(bin);
     let compose_ok = test_compose(bin);
-    let parser_ok = test_chord_parser();
-    if palette_ok && chord_ok && compose_ok && parser_ok {
-        println!("PASS: RPC palette+selection, chord view, compositor (anchored popup / greyed chord), and chord parser all hold");
+    let trigger_ok = is_open_trigger(CTRL_CARET) && is_open_trigger(SLASH) && !is_open_trigger(b'a');
+    if palette_ok && compose_ok && trigger_ok {
+        println!("PASS: RPC palette+selection, compositor (greyed anchored palette over the session), and open triggers all hold");
         0
     } else {
-        println!("FAIL: palette_ok={palette_ok} chord_ok={chord_ok} compose_ok={compose_ok} parser_ok={parser_ok}");
+        println!("FAIL: palette_ok={palette_ok} compose_ok={compose_ok} trigger_ok={trigger_ok}");
         1
     }
 }
@@ -347,26 +302,9 @@ fn test_palette_rpc(bin: &CString) -> bool {
     shows && ev_ok
 }
 
-/// show the chord view over RPC and assert the charmbracelet indicator renders.
-fn test_chord_view(bin: &CString) -> bool {
-    let (master, ctrl, pid) = spawn_renderer(bin, DEFAULT_ROWS, DEFAULT_COLS);
-    let mut term = Terminal::new(DEFAULT_ROWS, DEFAULT_COLS);
-    drain_until_idle(master, &mut term, IDLE);
-
-    send_show_chord(ctrl);
-    drain_until_idle(master, &mut term, IDLE);
-    let shown = term.dump_text();
-    let ok = shown.contains("prefix armed") && shown.contains("command palette");
-    eprintln!("--- chord view ---\n{shown}\n------------------");
-
-    wait_for(pid, true);
-    unsafe { libc::close(ctrl) };
-    ok
-}
-
-/// Compose both modes over a session background and assert: palette is an
-/// anchored popup with the background ungreyed above it; chord greys the
-/// background and centers the indicator.
+/// Compose the palette over a session background and assert: the background is
+/// greyed, the palette is present and anchored a third down with the yellow
+/// (double) border, and the greyed session text still shows above it.
 fn test_compose(bin: &CString) -> bool {
     let (master, ctrl, pid) = spawn_renderer(bin, DEFAULT_ROWS, DEFAULT_COLS);
     let mut renderer = Terminal::new(DEFAULT_ROWS, DEFAULT_COLS);
@@ -378,36 +316,19 @@ fn test_compose(bin: &CString) -> bool {
     send_show_palette(ctrl);
     drain_until_idle(master, &mut renderer, IDLE);
     let pal = compose(DEFAULT_ROWS, DEFAULT_COLS, &session, Some(&renderer), Mode::Palette);
-    let pal_rows: Vec<String> = (0..DEFAULT_ROWS).map(|r| row_text(&pal, r, DEFAULT_COLS)).collect();
+    let rows: Vec<String> = (0..DEFAULT_ROWS).map(|r| row_text(&pal, r, DEFAULT_COLS)).collect();
     let anchor = (DEFAULT_ROWS / 3) as usize;
-    let palette_ok = pal_rows[0].contains("posh client")
-        && pal_rows.join("\n").contains("Commands")
-        && pal_rows[anchor].contains('╭')
-        && !is_dimmed(&pal, 0, DEFAULT_COLS, 'p');
 
-    send_show_chord(ctrl);
-    drain_until_idle(master, &mut renderer, IDLE);
-    let chd = compose(DEFAULT_ROWS, DEFAULT_COLS, &session, Some(&renderer), Mode::Chord);
-    let chd_rows: Vec<String> = (0..DEFAULT_ROWS).map(|r| row_text(&chd, r, DEFAULT_COLS)).collect();
-    let chord_ok = chd_rows.join("\n").contains("prefix armed") && is_dimmed(&chd, 0, DEFAULT_COLS, 'p');
+    let greyed = is_dimmed(&pal, 0, DEFAULT_COLS, 'p');
+    let bg_above = rows[0].contains("posh client");
+    let popup = rows.join("\n").contains("Commands") && rows.join("\n").contains("Quit");
+    let anchored = rows[anchor].contains('╔'); // double (yellow) border top-left
 
-    eprintln!("--- compose ---\npalette_ok={palette_ok} chord_ok={chord_ok}\n---------------");
+    let ok = greyed && bg_above && popup && anchored;
+    eprintln!("--- compose ---\ngreyed={greyed} bg_above={bg_above} popup={popup} anchored={anchored}\n---------------");
     wait_for(pid, true);
     unsafe { libc::close(ctrl) };
-    palette_ok && chord_ok
-}
-
-fn test_chord_parser() -> bool {
-    let ordinary = Chord::new().feed(b'a');
-    let mut c = Chord::new();
-    let open = (c.feed(CHORD_PREFIX), c.feed(CHORD_OPEN));
-    let mut c = Chord::new();
-    let quit = (c.feed(CHORD_PREFIX), c.feed(CHORD_QUIT));
-    let pass = ordinary == Action::Forward(vec![b'a'])
-        && open == (Action::Pending, Action::OpenOverlay)
-        && quit == (Action::Pending, Action::Quit);
-    eprintln!("--- chord parser ---\nordinary={ordinary:?} open={open:?} quit={quit:?}\n--------------------");
-    pass
+    ok
 }
 
 /// True if the first cell in `row` whose char is `ch` carries the dim style.
@@ -476,7 +397,6 @@ fn interactive(bin: &CString) {
     let (master, ctrl, pid) = spawn_renderer(bin, rows, cols);
     let mut renderer = Terminal::new(rows, cols);
     let mut pres = Presenter::new(rows, cols);
-    let mut chord = Chord::new();
     let mut mode = Mode::None;
     pres.flush(&session, None, mode);
 
@@ -544,32 +464,11 @@ fn interactive(bin: &CString) {
                 break;
             }
             if mode == Mode::Palette {
-                write_all(master, &buf[..n as usize]);
-            } else {
-                for &b in &buf[..n as usize] {
-                    match chord.feed(b) {
-                        Action::Pending => {
-                            mode = Mode::Chord;
-                            send_show_chord(ctrl);
-                            pres.flush(&session, Some(&renderer), mode);
-                        }
-                        Action::OpenOverlay => {
-                            mode = Mode::Palette;
-                            send_show_palette(ctrl);
-                        }
-                        Action::Quit => break 'session,
-                        Action::Forward(bytes) => {
-                            if bytes == [SLASH] {
-                                mode = Mode::Palette;
-                                send_show_palette(ctrl);
-                            } else if mode == Mode::Chord {
-                                mode = Mode::None;
-                                send_hide(ctrl);
-                                pres.flush(&session, None, mode);
-                            }
-                        }
-                    }
-                }
+                write_all(master, &buf[..n as usize]); // forward keystrokes to the palette
+            } else if buf[..n as usize].iter().any(|&b| is_open_trigger(b)) {
+                mode = Mode::Palette;
+                send_show_palette(ctrl);
+                pres.flush(&session, Some(&renderer), mode); // grey the session immediately
             }
         }
 

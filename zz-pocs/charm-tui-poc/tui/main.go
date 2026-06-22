@@ -1,18 +1,18 @@
 // charm-tui-poc renderer: a long-running bubbletea v2 renderer driven by the
 // host over a JSON-RPC-style control channel (newline-delimited JSON on fd 3),
-// rendering to its PTY. The host tells it which view to show — the command
-// palette (modeled on trapeze's "/" Commands dialog) or the chord-armed
-// indicator — and the renderer reports palette selections/cancels back as
-// events. Throwaway POC content for the posh client-side TUI host.
+// rendering to its PTY. The host tells it to show the command palette (modeled
+// on trapeze's "/" Commands dialog, opened by Ctrl-^ or "/"); the renderer
+// reports palette selections/cancels back as events. Throwaway POC content for
+// the posh client-side TUI host.
 //
 // Protocol (one JSON object per line on fd 3):
-//   host  -> renderer:  {"method":"show","params":{"view":"palette",
-//                          "commands":[{"name":"Quit","shortcut":""}]}}
-//                       {"method":"show","params":{"view":"chord"}}
-//                       {"method":"hide","params":{}}
-//   renderer -> host:   {"method":"event","params":{"kind":"selected",
-//                          "command":"Quit"}}
-//                       {"method":"event","params":{"kind":"cancel"}}
+//
+//	host  -> renderer:  {"method":"show","params":{"view":"palette",
+//	                       "commands":[{"name":"Quit","shortcut":""}]}}
+//	                    {"method":"hide","params":{}}
+//	renderer -> host:   {"method":"event","params":{"kind":"selected",
+//	                       "command":"Quit"}}
+//	                    {"method":"event","params":{"kind":"cancel"}}
 package main
 
 import (
@@ -62,25 +62,20 @@ type hideMsg struct{}
 // --- styling ---
 
 var (
+	// The palette wears the yellow double-border the chord indicator used to.
 	panelStyle = lipgloss.NewStyle().
-			Border(lipgloss.RoundedBorder()).
-			BorderForeground(lipgloss.Color("63")).
+			Border(lipgloss.DoubleBorder()).
+			BorderForeground(lipgloss.Color("214")).
 			Padding(1, 2).
 			Width(46)
 
-	titleStyle = lipgloss.NewStyle().Bold(true).Foreground(lipgloss.Color("63"))
+	titleStyle = lipgloss.NewStyle().Bold(true).Foreground(lipgloss.Color("214"))
 	selStyle   = lipgloss.NewStyle().
 			Bold(true).
 			Foreground(lipgloss.Color("231")).
-			Background(lipgloss.Color("63"))
+			Background(lipgloss.Color("214"))
 	dimStyle  = lipgloss.NewStyle().Faint(true)
 	helpStyle = lipgloss.NewStyle().Faint(true)
-
-	chordStyle = lipgloss.NewStyle().
-			Border(lipgloss.DoubleBorder()).
-			BorderForeground(lipgloss.Color("214")).
-			Padding(1, 4)
-	chordKey = lipgloss.NewStyle().Bold(true).Foreground(lipgloss.Color("214"))
 )
 
 // --- model ---
@@ -90,7 +85,6 @@ type viewKind int
 const (
 	viewNone viewKind = iota
 	viewPalette
-	viewChord
 )
 
 type keymap struct {
@@ -137,8 +131,6 @@ func (m model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 			m.input.Focus()
 			m.selected = 0
 			m.recompute()
-		case "chord":
-			m.view = viewChord
 		default:
 			m.view = viewNone
 		}
@@ -212,8 +204,6 @@ func (m model) View() tea.View {
 	switch m.view {
 	case viewPalette:
 		return tea.NewView(m.paletteView())
-	case viewChord:
-		return tea.NewView(m.chordView())
 	default:
 		return tea.NewView("")
 	}
@@ -244,21 +234,6 @@ func (m model) paletteView() string {
 	b.WriteByte('\n')
 	b.WriteString(helpStyle.Render("↑/↓ choose · enter run · esc cancel"))
 	return panelStyle.Render(b.String())
-}
-
-func (m model) chordView() string {
-	body := lipgloss.JoinVertical(
-		lipgloss.Center,
-		chordKey.Render("Ctrl-^"),
-		"",
-		"prefix armed — choose:",
-		"",
-		chordKey.Render(".")+"  command palette",
-		chordKey.Render("q")+"  quit",
-		"",
-		dimStyle.Render("any other key cancels"),
-	)
-	return chordStyle.Render(body)
 }
 
 // --- main + control reader ---
