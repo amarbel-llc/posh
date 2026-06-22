@@ -6,9 +6,10 @@
 //! 100% safe.
 //!
 //! The renderer is spawned once on a PTY (visual channel) plus a control socket
-//! on its fd 3. The host sends `show {view:"palette", commands}` / `hide`; the
-//! renderer reports palette `selected`/`cancel` events back on the same socket.
-//! `Ctrl-^` opens the palette directly. The host owns input
+//! on its fd 3. The host sends `show {view:"palette", commands}` / `hide`, where
+//! each command carries a JSON-RPC `action`; the renderer echoes the chosen
+//! command's action back (or a `ui.cancel`), and the host dispatches it as a
+//! small options API. `Ctrl-^` opens the palette directly. The host owns input
 //! routing (the open trigger handled here; keystrokes forwarded to the renderer
 //! while the palette is up) and compositing: the palette is a popup anchored a
 //! third of the way down over a greyed-out (dimmed) session background, painted
@@ -18,8 +19,8 @@
 //! Two behaviours chosen by whether stdout is a tty (an OS fact, not a flag):
 //!   * stdout IS a tty  -> interactive.
 //!   * stdout is NOT a tty -> self-test: exercise the RPC round-trip (palette
-//!     show + selection event, chord view) and the compositor (anchored popup,
-//!     greyed chord background), plus the chord parser. Print PASS/FAIL.
+//!     show + an echo.set action), the JSON-RPC command dispatch, the compositor
+//!     (greyed anchored palette), and the open trigger. Print PASS/FAIL.
 
 use std::ffi::CString;
 use std::time::Duration;
@@ -45,12 +46,93 @@ fn is_open_trigger(b: u8) -> bool {
     b == CTRL_CARET
 }
 
-/// The only host-supported commands. Sent to the renderer when the palette
-/// opens; selecting one is handled below. (Unsupported demo commands removed.)
-const COMMANDS: &[&str] = &["Quit", "Clear session", "Redraw session"];
+/// The host-supported palette commands. Each carries a JSON-RPC `action` — the
+/// request the renderer echoes back when the command is chosen — so selections
+/// flow as a small JSON-RPC API (dispatched in `dispatch_rpc`) rather than by
+/// matching display names. The same method surface (logging.toggle, echo.set, …)
+/// is what a remote peer could service over the wire (#3). The logging/echo
+/// entries are POC stand-ins (see PocState); real posh wiring is the #2/#3 work.
+fn palette_commands() -> Vec<serde_json::Value> {
+    let echo = |m: &str| {
+        serde_json::json!({
+            "name": format!("Predictive echo: {m}"),
+            "action": {"method": "echo.set", "params": {"model": m}},
+        })
+    };
+    vec![
+        serde_json::json!({"name":"Toggle debug logging","action":{"method":"logging.toggle"}}),
+        echo("Adaptive"),
+        echo("Optimistic"),
+        echo("Always"),
+        echo("Never"),
+        serde_json::json!({"name":"Clear session","action":{"method":"session.clear"}}),
+        serde_json::json!({"name":"Redraw session","action":{"method":"session.redraw"}}),
+        serde_json::json!({"name":"Quit","action":{"method":"app.quit"}}),
+    ]
+}
 
-/// The retained "live session" background screen the overlays composite over.
-const BASE_SCREEN: &[u8] = b"\x1b[2J\x1b[H  posh client \xe2\x80\x94 live session (POC base screen)\r\n\r\n  \x1b[1m/\x1b[0m  or  \x1b[1mCtrl-^ .\x1b[0m   command palette\r\n  \x1b[1mCtrl-^ q\x1b[0m            quit\r\n";
+/// The POC's local stand-in state, surfaced on the session background. In the
+/// real client these would drive posh's debug logging and predictive echo —
+/// both of which need runtime toggles (logging is launch-env-gated; the echo
+/// model is frozen at launch) and, for remote logging, a protocol change. Those
+/// are the #2/#3 follow-ups; here they are display-only mocks.
+struct PocState {
+    logging: bool,
+    echo: String,
+}
+
+impl Default for PocState {
+    fn default() -> PocState {
+        PocState {
+            logging: false,
+            echo: "Adaptive".to_string(),
+        }
+    }
+}
+
+/// Draw the "live session" background, showing the current stand-in state.
+fn render_base(session: &mut Terminal, state: &PocState) {
+    let logging = if state.logging { "on" } else { "off" };
+    let mut s = Vec::new();
+    s.extend_from_slice(b"\x1b[2J\x1b[H");
+    s.extend_from_slice(b"  posh client \xe2\x80\x94 live session (POC base screen)\r\n\r\n");
+    s.extend_from_slice(format!("  debug logging:    \x1b[1m{logging}\x1b[0m\r\n").as_bytes());
+    s.extend_from_slice(format!("  predictive echo:  \x1b[1m{}\x1b[0m\r\n\r\n", state.echo).as_bytes());
+    s.extend_from_slice(b"  \x1b[1mCtrl-^\x1b[0m   command palette\r\n");
+    session.process(&s);
+}
+
+/// Dispatch a JSON-RPC request from the palette against the POC state + session
+/// screen. Returns true if the driver should quit. This is the local handler for
+/// the options API; a remote peer would handle the same methods over the wire.
+fn dispatch_rpc(method: &str, params: &serde_json::Value, state: &mut PocState, session: &mut Terminal) -> bool {
+    match method {
+        "app.quit" => return true,
+        "session.clear" => {
+            session.process(b"\x1b[2J");
+            return false;
+        }
+        "session.redraw" => {}
+        "logging.toggle" => state.logging = !state.logging,
+        "echo.set" => {
+            if let Some(m) = params.get("model").and_then(|v| v.as_str()) {
+                state.echo = m.to_string();
+            }
+        }
+        // "ui.cancel" and unknowns: just re-render and close.
+        _ => {}
+    }
+    render_base(session, state);
+    false
+}
+
+/// Parse one JSON-RPC request line from the renderer: (method, params).
+fn parse_request(line: &str) -> Option<(String, serde_json::Value)> {
+    let v: serde_json::Value = serde_json::from_str(line).ok()?;
+    let method = v.get("method")?.as_str()?.to_string();
+    let params = v.get("params").cloned().unwrap_or(serde_json::Value::Null);
+    Some((method, params))
+}
 
 fn main() {
     std::env::set_var("TERM", "xterm-256color");
@@ -77,27 +159,11 @@ fn send_rpc(ctrl: libc::c_int, msg: &serde_json::Value) {
 }
 
 fn send_show_palette(ctrl: libc::c_int) {
-    let cmds: Vec<serde_json::Value> = COMMANDS
-        .iter()
-        .map(|n| serde_json::json!({ "name": n, "shortcut": "" }))
-        .collect();
-    send_rpc(ctrl, &serde_json::json!({"method":"show","params":{"view":"palette","commands": cmds}}));
+    send_rpc(ctrl, &serde_json::json!({"method":"show","params":{"view":"palette","commands": palette_commands()}}));
 }
 
 fn send_hide(ctrl: libc::c_int) {
     send_rpc(ctrl, &serde_json::json!({"method":"hide","params":{}}));
-}
-
-/// Parse one renderer event line: returns (kind, command).
-fn parse_event(line: &str) -> Option<(String, String)> {
-    let v: serde_json::Value = serde_json::from_str(line).ok()?;
-    if v.get("method")?.as_str()? != "event" {
-        return None;
-    }
-    let p = v.get("params")?;
-    let kind = p.get("kind")?.as_str()?.to_string();
-    let command = p.get("command").and_then(|c| c.as_str()).unwrap_or("").to_string();
-    Some((kind, command))
 }
 
 // ---------------------------------------------------------------------------
@@ -267,14 +333,33 @@ fn cells_eq(a: &Cell, b: &Cell) -> bool {
 fn selftest(bin: &CString) -> i32 {
     let palette_ok = test_palette_rpc(bin);
     let compose_ok = test_compose(bin);
+    let commands_ok = test_commands();
     let trigger_ok = is_open_trigger(CTRL_CARET) && !is_open_trigger(b'/') && !is_open_trigger(b'a');
-    if palette_ok && compose_ok && trigger_ok {
-        println!("PASS: RPC palette+selection, compositor (greyed anchored palette over the session), and open triggers all hold");
+    if palette_ok && compose_ok && commands_ok && trigger_ok {
+        println!("PASS: RPC palette+selection, compositor (greyed anchored palette), command dispatch, and open trigger all hold");
         0
     } else {
-        println!("FAIL: palette_ok={palette_ok} compose_ok={compose_ok} trigger_ok={trigger_ok}");
+        println!("FAIL: palette_ok={palette_ok} compose_ok={compose_ok} commands_ok={commands_ok} trigger_ok={trigger_ok}");
         1
     }
+}
+
+/// Dispatch a few palette selections and assert the POC state updates, the new
+/// state renders on the session background, and Quit signals exit.
+fn test_commands() -> bool {
+    let mut state = PocState::default();
+    let mut session = Terminal::new(DEFAULT_ROWS, DEFAULT_COLS);
+    render_base(&mut session, &state);
+
+    dispatch_rpc("logging.toggle", &serde_json::Value::Null, &mut state, &mut session);
+    dispatch_rpc("echo.set", &serde_json::json!({"model":"Optimistic"}), &mut state, &mut session);
+    let shown = session.dump_text();
+    let state_ok = state.logging && state.echo == "Optimistic";
+    let shown_ok = shown.contains("predictive echo:") && shown.contains("Optimistic");
+    let quit = dispatch_rpc("app.quit", &serde_json::Value::Null, &mut state, &mut session);
+
+    eprintln!("--- commands ---\nlogging={} echo={} shown_ok={shown_ok} quit={quit}\n----------------", state.logging, state.echo);
+    state_ok && shown_ok && quit
 }
 
 /// show palette over RPC, assert it renders the supported commands, then filter
@@ -290,12 +375,13 @@ fn test_palette_rpc(bin: &CString) -> bool {
     let shows = shown.contains("Commands") && shown.contains("Quit") && shown.contains("Clear session");
     eprintln!("--- palette (rpc) ---\n{shown}\n---------------------");
 
-    write_all(master, b"clear"); // filter to "Clear session"
+    write_all(master, b"optimistic"); // filter to "Predictive echo: Optimistic"
     drain_until_idle(master, &mut term, IDLE);
     write_all(master, b"\r");
-    let ev = read_event(ctrl, Duration::from_millis(800));
-    let ev_ok = ev == Some(("selected".to_string(), "Clear session".to_string()));
-    eprintln!("--- palette event ---\n{ev:?} (want selected/Clear session)\n---------------------");
+    let req = read_request(ctrl, Duration::from_millis(800));
+    let ev_ok = matches!(&req, Some((m, p))
+        if m == "echo.set" && p.get("model").and_then(|v| v.as_str()) == Some("Optimistic"));
+    eprintln!("--- palette request ---\n{req:?} (want echo.set / Optimistic)\n-----------------------");
 
     wait_for(pid, true);
     unsafe { libc::close(ctrl) };
@@ -311,7 +397,7 @@ fn test_compose(bin: &CString) -> bool {
     drain_until_idle(master, &mut renderer, IDLE);
 
     let mut session = Terminal::new(DEFAULT_ROWS, DEFAULT_COLS);
-    session.process(BASE_SCREEN);
+    render_base(&mut session, &PocState::default());
 
     send_show_palette(ctrl);
     drain_until_idle(master, &mut renderer, IDLE);
@@ -349,8 +435,8 @@ fn row_text(grid: &[Cell], r: u16, cols: u16) -> String {
     s.trim_end().to_string()
 }
 
-/// Read one event line from the control socket within `timeout`.
-fn read_event(ctrl: libc::c_int, timeout: Duration) -> Option<(String, String)> {
+/// Read one JSON-RPC request line from the control socket within `timeout`.
+fn read_request(ctrl: libc::c_int, timeout: Duration) -> Option<(String, serde_json::Value)> {
     if !poll_readable(ctrl, timeout) {
         return None;
     }
@@ -360,7 +446,7 @@ fn read_event(ctrl: libc::c_int, timeout: Duration) -> Option<(String, String)> 
         return None;
     }
     let s = std::str::from_utf8(&buf[..n as usize]).ok()?;
-    s.lines().find_map(|line| parse_event(line.trim()))
+    s.lines().find_map(|line| parse_request(line.trim()))
 }
 
 /// Read PTY output into `term` until idle or EOF, echoing query replies.
@@ -391,8 +477,9 @@ fn interactive(bin: &CString) {
     let _raw = RawGuard::enable(STDIN);
     write_all(STDOUT, b"\x1b[?1049h\x1b[2J\x1b[?25l");
 
+    let mut state = PocState::default();
     let mut session = Terminal::new(rows, cols);
-    session.process(BASE_SCREEN);
+    render_base(&mut session, &state);
 
     let (master, ctrl, pid) = spawn_renderer(bin, rows, cols);
     let mut renderer = Terminal::new(rows, cols);
@@ -437,20 +524,11 @@ fn interactive(bin: &CString) {
             ctrl_buf.extend_from_slice(&buf[..n as usize]);
             while let Some(pos) = ctrl_buf.iter().position(|&b| b == b'\n') {
                 let line: Vec<u8> = ctrl_buf.drain(..=pos).collect();
-                let Some((kind, command)) = std::str::from_utf8(&line).ok().and_then(|s| parse_event(s.trim())) else {
+                let Some((method, params)) = std::str::from_utf8(&line).ok().and_then(|s| parse_request(s.trim())) else {
                     continue;
                 };
-                match kind.as_str() {
-                    "selected" => match command.as_str() {
-                        "Quit" => break 'session,
-                        "Clear session" => session.process(b"\x1b[2J"),
-                        "Redraw session" => {
-                            session = Terminal::new(rows, cols);
-                            session.process(BASE_SCREEN);
-                        }
-                        _ => {}
-                    },
-                    _ => {}
+                if dispatch_rpc(&method, &params, &mut state, &mut session) {
+                    break 'session;
                 }
                 mode = Mode::None;
                 pres.flush(&session, None, mode);

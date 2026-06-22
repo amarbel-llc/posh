@@ -17,8 +17,8 @@ opened by `Ctrl-^`.
 - `tui/`   — the Go bubbletea **v2** renderer (`main.go`), on the
   `charm.land/bubbletea/v2` + `bubbles/v2` + `lipgloss/v2` stack (the versions
   trapeze uses). Long-running: it reads newline-delimited JSON-RPC on **fd 3**
-  (`show {view}` / `hide`), renders the requested view to its PTY, and reports
-  palette `selected`/`cancel` **events** back on the same socket. Built to
+  (`show {view, commands}` / `hide`), renders the palette to its PTY, and echoes
+  the chosen command's JSON-RPC **action** back on the same socket. Built to
   `tui/tui-bin`.
 - `host/`  — a standalone Rust driver (`charm-tui-host`) depending on the in-repo
   `posh-term` crate, `libc`, and `serde_json`. It spawns the renderer once on a
@@ -32,10 +32,14 @@ opened by `Ctrl-^`.
 ### Control protocol (one JSON object per line on fd 3)
 
 ```
-host -> renderer:  {"method":"show","params":{"view":"palette","commands":[{"name":"Quit","shortcut":""}]}}
+host -> renderer:  {"method":"show","params":{"view":"palette","commands":[
+                     {"name":"Quit","action":{"method":"app.quit"}},
+                     {"name":"Predictive echo: Optimistic",
+                      "action":{"method":"echo.set","params":{"model":"Optimistic"}}}]}}
                    {"method":"hide","params":{}}
-renderer -> host:  {"method":"event","params":{"kind":"selected","command":"Quit"}}
-                   {"method":"event","params":{"kind":"cancel"}}
+renderer -> host:  the chosen command's action verbatim, e.g.
+                     {"method":"echo.set","params":{"model":"Optimistic"}}
+                   {"method":"ui.cancel"}
 ```
 
 ## Run
@@ -47,7 +51,8 @@ just run     # interactive: drive it in your own terminal
 
 In `just run`:
 
-- A base "live session" screen is shown (stand-in for the real session).
+- A base "live session" screen shows the current stand-in state (debug logging
+  on/off, predictive echo model).
 - Press **`Ctrl-^`**: the session **greys out** and the **command palette**
   opens directly — a yellow-bordered box anchored a third of the way down (it
   expands downward / collapses upward as you filter). The host sends
@@ -55,15 +60,21 @@ In `just run`:
   while it's up. (A bare `/` is intentionally *not* a trigger — too common a
   character to hijack.)
 - Type to filter, `↑`/`↓` choose, `Enter` runs, **`Esc` cancels**.
-- Selecting a command sends a `selected` event back; the host performs it:
-  **`Quit`** exits, **`Clear session`** blanks the background, **`Redraw session`**
-  restores it. Only host-supported commands are listed.
+- Selecting a command echoes its JSON-RPC **action** back, which the host
+  dispatches: **`Toggle debug logging`** (`logging.toggle`) and **`Predictive
+  echo: <model>`** (`echo.set`) flip stand-in state shown on the base screen;
+  **`Quit`** (`app.quit`) exits; **`Clear`/`Redraw session`** blank/restore the
+  background. The logging + echo entries are **mocks** — posh's real logging and
+  predictive echo need runtime toggles / a protocol change that don't exist yet
+  (the #2/#3 follow-ups); the same `method` surface is what could ride the wire.
 
 ## What it proves
 
 - A single charmbracelet renderer can be **driven by the host over JSON-RPC**
-  (host → `show`/`hide`, renderer → `selected`/`cancel`), with the PTY as the
-  visual channel and a separate control socket.
+  (host → `show`/`hide`; renderer → the chosen command's `action`), with the PTY
+  as the visual channel and a separate control socket. Commands and their option
+  actions form a small JSON-RPC API — the same surface a remote peer could
+  service over the wire.
 - `posh_term` composites that renderer over a retained session: the palette as a
   yellow-bordered popup anchored a third down, over a **greyed-out** session
   background — all via posh-term's own cell state + SGR emitter and a per-cell

@@ -1,18 +1,18 @@
 // charm-tui-poc renderer: a long-running bubbletea v2 renderer driven by the
 // host over a JSON-RPC-style control channel (newline-delimited JSON on fd 3),
 // rendering to its PTY. The host tells it to show the command palette (modeled
-// on trapeze's "/" Commands dialog, opened by Ctrl-^); the renderer
-// reports palette selections/cancels back as events. Throwaway POC content for
-// the posh client-side TUI host.
+// on trapeze's "/" Commands dialog, opened by Ctrl-^); each command carries a
+// JSON-RPC "action" the renderer echoes back to the host when chosen. Throwaway
+// POC content for the posh client-side TUI host.
 //
 // Protocol (one JSON object per line on fd 3):
 //
 //	host  -> renderer:  {"method":"show","params":{"view":"palette",
-//	                       "commands":[{"name":"Quit","shortcut":""}]}}
+//	                       "commands":[{"name":"Quit","action":{"method":"app.quit"}}]}}
 //	                    {"method":"hide","params":{}}
-//	renderer -> host:   {"method":"event","params":{"kind":"selected",
-//	                       "command":"Quit"}}
-//	                    {"method":"event","params":{"kind":"cancel"}}
+//	renderer -> host:   the chosen command's action verbatim, e.g.
+//	                       {"method":"echo.set","params":{"model":"Optimistic"}}
+//	                    {"method":"ui.cancel"}   (palette dismissed)
 package main
 
 import (
@@ -36,23 +36,15 @@ type rpcIn struct {
 }
 
 type command struct {
-	Name     string `json:"name"`
-	Shortcut string `json:"shortcut"`
+	Name string `json:"name"`
+	// Action is the JSON-RPC request ({method, params}) the host gets back when
+	// this command is chosen. Opaque to the renderer — it just echoes it.
+	Action json.RawMessage `json:"action,omitempty"`
 }
 
 type showParams struct {
 	View     string    `json:"view"`
 	Commands []command `json:"commands,omitempty"`
-}
-
-type eventOut struct {
-	Method string      `json:"method"`
-	Params eventParams `json:"params"`
-}
-
-type eventParams struct {
-	Kind    string `json:"kind"`
-	Command string `json:"command,omitempty"`
 }
 
 // bubbletea messages produced from control input.
@@ -145,12 +137,14 @@ func (m model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 		}
 		switch {
 		case keyMatches(msg, m.keys.cancel):
-			m.sendEvent("cancel", "")
+			m.sendCancel()
 			m.view = viewNone
 			return m, nil
 		case keyMatches(msg, m.keys.sel):
 			if len(m.filtered) > 0 {
-				m.sendEvent("selected", m.filtered[m.selected].Name)
+				m.sendAction(m.filtered[m.selected].Action)
+			} else {
+				m.sendCancel()
 			}
 			m.view = viewNone
 			return m, nil
@@ -193,12 +187,17 @@ func (m *model) recompute() {
 	}
 }
 
-func (m model) sendEvent(kind, cmd string) {
-	if m.ctrl == nil {
+// sendAction writes the chosen command's JSON-RPC action back to the host
+// verbatim; sendCancel reports a dismissed palette.
+func (m model) sendAction(action json.RawMessage) {
+	if m.ctrl == nil || len(action) == 0 {
 		return
 	}
-	b, _ := json.Marshal(eventOut{Method: "event", Params: eventParams{Kind: kind, Command: cmd}})
-	m.ctrl.Write(append(b, '\n'))
+	m.ctrl.Write(append([]byte(action), '\n'))
+}
+
+func (m model) sendCancel() {
+	m.sendAction(json.RawMessage(`{"method":"ui.cancel"}`))
 }
 
 func (m model) View() tea.View {
@@ -221,14 +220,10 @@ func (m model) paletteView() string {
 		b.WriteByte('\n')
 	}
 	for i, c := range m.filtered {
-		row := c.Name
-		if c.Shortcut != "" {
-			row = fmt.Sprintf("%-22s %s", c.Name, c.Shortcut)
-		}
 		if i == m.selected {
-			b.WriteString(selStyle.Render("› " + row))
+			b.WriteString(selStyle.Render("› " + c.Name))
 		} else {
-			b.WriteString("  " + row)
+			b.WriteString("  " + c.Name)
 		}
 		b.WriteByte('\n')
 	}
