@@ -83,15 +83,17 @@ fn set_logging(st: &mut ClientState, enabled: bool, now: u64) {
 /// client logging from this process, server logging from the last frame's
 /// FLAG_SERVER_LOG (`server_log_on`).
 fn palette_commands(server_log_on: bool) -> Value {
+    // Imperative labels (the verb is the action): "on"/"off" read ambiguously as
+    // status, so a user who saw "…: on" assumed it was already enabled.
     let (client_log_name, client_log_enabled): (&str, bool) = if util::log_active() {
-        ("Client debug logging: off", false)
+        ("Disable client debug logging", false)
     } else {
-        ("Client debug logging: on", true)
+        ("Enable client debug logging", true)
     };
     let (server_log_name, server_log_enabled): (&str, bool) = if server_log_on {
-        ("Server debug logging: off", false)
+        ("Disable server debug logging", false)
     } else {
-        ("Server debug logging: on", true)
+        ("Enable server debug logging", true)
     };
     json!([
         { "name": "Echo: adaptive", "action": { "method": "echo.set", "params": { "model": "adaptive" } } },
@@ -1666,11 +1668,11 @@ mod tests {
         let arr = cmds.as_array().expect("commands is an array");
         let names: Vec<&str> = arr.iter().filter_map(|c| c["name"].as_str()).collect();
         assert!(
-            names.iter().any(|n| n.contains("Client debug logging")),
+            names.iter().any(|n| n.to_lowercase().contains("client debug logging")),
             "client logging missing: {names:?}"
         );
         assert!(
-            names.iter().any(|n| n.contains("Server debug logging")),
+            names.iter().any(|n| n.to_lowercase().contains("server debug logging")),
             "server logging missing: {names:?}"
         );
         assert_eq!(arr.len(), 9, "expected 9 commands, got {names:?}");

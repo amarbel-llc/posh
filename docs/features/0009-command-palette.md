@@ -29,11 +29,11 @@ client's behavior (backend) and reusing mature TUI prior art.
 - **Commands:** the palette *is* the escape menu. Version 1 lists:
   - **Echo: adaptive / optimistic / always / never** — set the predictive-echo
     model live (`echo.set`), overriding `$POSH_PREDICTION_MODEL` for the session.
-  - **Client debug logging: on/off** — toggle this client's debug logging
-    (`logging.set`); the label reflects the live state and the banner shows the
-    log path.
-  - **Server debug logging: on/off** — toggle the *server's* debug logging over
-    the transport (`logging.set` `scope=server`, #3). The request rides a
+  - **Enable / Disable client debug logging** — toggle this client's debug
+    logging (`logging.set`); the imperative label reflects the live state and the
+    banner shows the log path.
+  - **Enable / Disable server debug logging** — toggle the *server's* debug
+    logging over the transport (`logging.set` `scope=server`, #3). The request rides a
     one-shot wire flag (`CLIENT_FLAG_LOG_ON`/`_OFF`); the server applies it
     idempotently and reports its state back per frame (`FLAG_SERVER_LOG`), so the
     label reflects the real server state, not just intent.
