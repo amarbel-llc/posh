@@ -60,6 +60,14 @@ pub struct Stats {
     loop_idle_us: u64,
     loop_busy_us_max: u64,
 
+    // Client input latency (windowed, ms): keystroke -> the frame whose
+    // input_ack confirms the server consumed it. Captures send-pacing + network
+    // + server processing — the keystroke-lag the user feels, which srtt alone
+    // (pure network RTT) misses. Reset each flush.
+    input_ms_total: u64,
+    input_count: u64,
+    input_ms_max: u64,
+
     // Server framing economics.
     /// Sum of full-dump bytes over frames that had a diff option (whether or
     /// not the diff was chosen) — the denominator for `diff_saved_pct`.
@@ -154,6 +162,14 @@ impl Stats {
         self.compose_us_max = self.compose_us_max.max(us);
     }
 
+    /// Client: one keystroke→consumed round-trip, in milliseconds (the input
+    /// byte's outbox-queue time to the frame whose `input_ack` covered it).
+    pub fn record_input_ms(&mut self, ms: u64) {
+        self.input_ms_total += ms;
+        self.input_count += 1;
+        self.input_ms_max = self.input_ms_max.max(ms);
+    }
+
     /// One event-loop iteration: `idle_us` blocked in poll, `busy_us` doing
     /// work. Cheap accumulation; the caller gates the `Instant`s on `enabled()`.
     /// Does not mark `dirty` — the loop spins constantly, so loop stats ride out
@@ -223,6 +239,14 @@ impl Stats {
         }
     }
 
+    fn avg_input_ms(&self) -> u64 {
+        if self.input_count == 0 {
+            0
+        } else {
+            self.input_ms_total / self.input_count
+        }
+    }
+
     fn avg_compose_us(&self) -> u64 {
         if self.compose_count == 0 {
             0
@@ -264,6 +288,9 @@ impl Stats {
         self.loop_busy_us = 0;
         self.loop_idle_us = 0;
         self.loop_busy_us_max = 0;
+        self.input_ms_total = 0;
+        self.input_count = 0;
+        self.input_ms_max = 0;
     }
 
     /// Share of the window spent doing work vs blocked in poll, as a whole
@@ -341,7 +368,7 @@ impl Stats {
                  predict active={} shown={} epoch_lag={} resets={} \
                  correct={} nocredit={} incorrect={} srtt_trig={} \
                  render writes={} bytes_out={} skipped_idle={} \
-                 apply_us={}/{} compose_us={}/{} \
+                 apply_us={}/{} compose_us={}/{} input_ms={}/{} \
                  loop iters={} busy={}us idle={}us busy_pct={}% max_iter_us={}",
                 self.frames_total,
                 self.frames_full,
@@ -363,6 +390,8 @@ impl Stats {
                 self.apply_us_max,
                 self.avg_compose_us(),
                 self.compose_us_max,
+                self.avg_input_ms(),
+                self.input_ms_max,
                 self.loop_iters,
                 self.loop_busy_us,
                 self.loop_idle_us,
@@ -557,6 +586,8 @@ mod tests {
         c.record_apply_us(40);
         c.record_apply_us(80); // a slower frame: windowed avg 60, max 80
         c.record_compose_us(60);
+        c.record_input_ms(12);
+        c.record_input_ms(34); // keystroke latency: avg 23, max 34
         c.record_loop_iter(100, 900); // 100us busy, 900us idle => 10% busy
         c.emit_client(
             "client",
@@ -590,6 +621,7 @@ mod tests {
             "predict active=1 shown=1 epoch_lag=0 resets=0 correct=0 nocredit=0 incorrect=0 srtt_trig=0",
             "apply_us=60/80", // windowed avg / max
             "compose_us=60/60",
+            "input_ms=23/34",
             "loop iters=1 busy=100us idle=900us busy_pct=10% max_iter_us=100",
         ] {
             assert!(body.contains(key), "missing client key {key:?} in:\n{body}");

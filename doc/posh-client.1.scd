@@ -98,8 +98,12 @@ _POSH_DEBUG_LOG_
 	performance summaries — smoothed RTT, RTO, send interval, received
 	frame counts (full/diff/empty), download bandwidth, prediction
 	state, render activity (writes, bytes, idle skips), and per-frame
-	compute timing (full-dump re-parse and render compose, in
-	microseconds) — plus a final line on exit. Rotated at 5 MB. The
+	compute timing as _avg/max_ microseconds (full-dump re-parse
+	_apply_us_ and render _compose_us_; the max is the worst single frame
+	in the interval), keystroke→consumed input latency (_input_ms_, the
+	lag you feel), and event-loop timing (_loop iters=… busy=…us idle=…us
+	busy_pct=…% max_iter_us=…_, the stall / busy-CPU view) — plus a final
+	line on exit. All timings are windowed per interval. Rotated at 5 MB. The
 	on-demand *SIGUSR2* state dump (*SIGNALS*) is written to this same
 	sink. Unset disables logging.
 

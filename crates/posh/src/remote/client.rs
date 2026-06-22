@@ -3,6 +3,7 @@
 //! server frames, speculative local echo (predict.rs), and a minimal-diff
 //! renderer (display.rs) so frames morph the screen without flicker.
 
+use std::collections::VecDeque;
 use std::net::{SocketAddr, ToSocketAddrs};
 use std::time::Instant;
 
@@ -369,6 +370,10 @@ struct ClientState {
     /// Latest server-reported debug-logging state (FLAG_SERVER_LOG, #3); drives
     /// the palette's "Server debug logging" command label. Off until reported.
     server_log_on: bool,
+    /// Pending keystroke timestamps for the input-latency gauge: (outbox
+    /// end-offset after a stdin read, queue time ms). Drained as the server's
+    /// `input_ack` covers each offset. Capped so a stalled link can't grow it.
+    input_sent: VecDeque<(u64, u64)>,
     /// Frame-sync codec selection (`POSH_FRAMESYNC`, #15). Drives whether we
     /// advertise `CAP_MORPH` and which `applier` we route visible-frame bodies
     /// through. Defaults to DumpDiff (today's behavior) when the env is unset.
@@ -437,6 +442,7 @@ fn client_loop(
         last_scroll_state: None,
         echo_on: false,
         server_log_on: false,
+        input_sent: VecDeque::new(),
         framesync,
         applier,
         stats: Stats::new(),
@@ -972,6 +978,11 @@ fn process_user_input(st: &mut ClientState, buf: &[u8]) -> bool {
         return false;
     }
 
+    // Input-latency baseline (perf): the outbox offset before this read's
+    // keystrokes, so the bytes queued below can be timestamped and their
+    // keystroke→consumed round-trip measured when the server acks them.
+    let outbox_start = st.outbox.end_offset();
+
     // When we are intercepting the wheel (bare prompt, primary screen), run
     // input through the mouse filter before the byte loop. The wheel drives the
     // scrollback scroll-view by default, or the legacy wheel→arrow grab when
@@ -1079,6 +1090,17 @@ fn process_user_input(st: &mut ClientState, buf: &[u8]) -> bool {
         push(st, byte);
         dirty = true;
     }
+    // If this read queued input, timestamp the resulting outbox offset for the
+    // input-latency gauge (drained in process_frame when input_ack covers it).
+    if st.stats.enabled() {
+        let end = st.outbox.end_offset();
+        if end > outbox_start {
+            st.input_sent.push_back((end, now));
+            if st.input_sent.len() > 256 {
+                st.input_sent.pop_front(); // bound a stalled link's backlog
+            }
+        }
+    }
     dirty
 }
 
@@ -1100,6 +1122,16 @@ fn process_frame(st: &mut ClientState, frame: &ServerFrame) -> bool {
     }
     st.notify.server_heard(now);
     st.outbox.ack(frame.input_ack);
+    // Input latency (perf): the server has now consumed input up to input_ack,
+    // so record the keystroke→consumed round-trip for any pending entries it
+    // covers (the deque is offset-ordered, so drain from the front).
+    while let Some(&(offset, queued)) = st.input_sent.front() {
+        if offset > frame.input_ack {
+            break;
+        }
+        st.input_sent.pop_front();
+        st.stats.record_input_ms(now.saturating_sub(queued));
+    }
     st.predict
         .on_server_frame(frame.input_ack, frame.echo_ack, st.conn.send_interval());
     // Remote PTY echo state for the optimistic-echo gate (FDR 0006).
@@ -1757,6 +1789,7 @@ mod tests {
             last_scroll_state: None,
             echo_on: false,
             server_log_on: false,
+            input_sent: VecDeque::new(),
             framesync: framesync::FrameSync::DumpDiff,
             applier: Box::new(framesync::DumpDiff),
             stats: Stats::new(),
