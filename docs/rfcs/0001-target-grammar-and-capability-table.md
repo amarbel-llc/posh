@@ -175,9 +175,12 @@ each direction (e.g. `0x04`). Currently assigned:
 | `0x01` | client | `SHUTDOWN` | Client requests a clean shutdown (`Ctrl-^ .`); the server hangs up the shell and replies with shutdown-flagged frames. |
 | `0x01` | server | `SHUTDOWN` | The session shell has exited; the frame carries the final state (and `EXIT_STATUS` if advertised). |
 | `0x02` | both | `EXTENSION` | Reserved (above): a capability table follows the flags byte. |
-| `0x04` | client | `ESCAPE` | Client requests an escape-to-shell overlay (`Ctrl-^ s`, FDR 0008). One-shot; the server's already-in-overlay guard makes repeats idempotent. |
+| `0x04` | client | `ESCAPE` | Client requests an escape-to-shell overlay (the palette's *Shell out*, FDR 0008/0009). One-shot; the server's already-in-overlay guard makes repeats idempotent. |
 | `0x04` | server | `ECHO` | The remote PTY's line-discipline ECHO is on (FDR 0006), reported per frame. |
+| `0x08` | client | `LOG_ON` | Client requests the server enable its debug logging (FDR 0009, #3). One-shot; idempotent on the server. |
 | `0x08` | server | `OVERLAY` | An escape-to-shell overlay is active (FDR 0008); echoed so the client stops re-requesting. |
+| `0x10` | client | `LOG_OFF` | Client requests the server disable its debug logging (FDR 0009, #3). One-shot; idempotent. |
+| `0x10` | server | `SERVER_LOG` | The server's debug logging is on (FDR 0009, #3), reported per frame so the client's palette shows the true state and confirms a toggle. |
 
 The capability table is:
 

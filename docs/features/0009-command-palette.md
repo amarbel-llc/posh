@@ -29,8 +29,14 @@ client's behavior (backend) and reusing mature TUI prior art.
 - **Commands:** the palette *is* the escape menu. Version 1 lists:
   - **Echo: adaptive / optimistic / always / never** — set the predictive-echo
     model live (`echo.set`), overriding `$POSH_PREDICTION_MODEL` for the session.
-  - **Debug logging: on/off** — toggle client debug logging (`logging.set`); the
-    label reflects the current state and the banner shows the log path.
+  - **Client debug logging: on/off** — toggle this client's debug logging
+    (`logging.set`); the label reflects the live state and the banner shows the
+    log path.
+  - **Server debug logging: on/off** — toggle the *server's* debug logging over
+    the transport (`logging.set` `scope=server`, #3). The request rides a
+    one-shot wire flag (`CLIENT_FLAG_LOG_ON`/`_OFF`); the server applies it
+    idempotently and reports its state back per frame (`FLAG_SERVER_LOG`), so the
+    label reflects the real server state, not just intent.
   - **Shell out (server)** — open the server-side escape-to-shell overlay in the
     session cwd (`shell.open`; FDR 0008's `CLIENT_FLAG_ESCAPE`).
   - **Suspend client** — job-control `SIGSTOP` the client (`client.suspend`); the

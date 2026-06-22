@@ -434,6 +434,18 @@ fn server_loop(mut conn: Connection, child: pty::PtyChild, rows: u16, cols: u16)
                                 util::kill_pgroup(child.pid, libc::SIGHUP);
                             }
                         }
+                        // Server-side debug logging toggle (#3): the palette's
+                        // "Server debug logging" command. Idempotent set bits open
+                        // / close the per-pid sink and flip the stats collector;
+                        // the resulting state rides back as FLAG_SERVER_LOG.
+                        if msg.flags & sync::CLIENT_FLAG_LOG_ON != 0 && !util::log_active() {
+                            diag::enable_logging("server");
+                            stats.set_enabled(true);
+                        }
+                        if msg.flags & sync::CLIENT_FLAG_LOG_OFF != 0 && util::log_active() {
+                            util::log_disable();
+                            stats.set_enabled(false);
+                        }
                         // Escape-to-shell (FDR 0008): spawn the overlay once per
                         // request. Sticky flag + the is_none() guard make
                         // retransmits idempotent; the client stops once it sees
@@ -769,10 +781,18 @@ fn server_loop(mut conn: Connection, child: pty::PtyChild, rows: u16, cols: u16)
                 } else {
                     0
                 };
+                // Report the server's debug-logging state so the client's "Server
+                // debug logging" palette command shows the truth (#3).
+                let server_log_flag = if util::log_active() {
+                    sync::FLAG_SERVER_LOG
+                } else {
+                    0
+                };
                 let frame = ServerFrame {
                     flags: (if shutdown { sync::FLAG_SHUTDOWN } else { 0 })
                         | echo_flag
-                        | overlay_flag,
+                        | overlay_flag
+                        | server_log_flag,
                     caps: frame_caps,
                     frame_num: current.num,
                     input_ack: inbox.next_offset(),

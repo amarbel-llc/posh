@@ -224,7 +224,7 @@ methods it does not implement.
 | method           | params                                  | effect                                       |
 |------------------|-----------------------------------------|----------------------------------------------|
 | `echo.set`       | `{"model": <string>}`                   | Set predictive-echo model. `model` ∈ `adaptive`, `optimistic`, `always`, `never`. Invalid → `-32602`. On a client without prediction (local attach), `-32601`. |
-| `logging.set`    | `{"enabled": <bool>}`                   | Enable/disable client debug logging. `result` MAY carry `{"path": <string>}`. |
+| `logging.set`    | `{"enabled": <bool>, "scope"?: <string>}` | Enable/disable debug logging. `scope` ∈ `client` (default) or `server`. `client` is applied in-process; `server` requests the toggle over the transport (the client reports the resulting state from the next frame). `result` MAY carry `{"path": <string>}`. |
 | `shell.open`     | `{}`                                    | Open the server-side escape-to-shell overlay (FDR 0008) in the session cwd. On a client without a server-side overlay, `-32601`. |
 | `client.suspend` | `{}`                                    | Suspend the client process (job-control `SIGSTOP`); the remote session keeps running. |
 | `app.quit`       | `{}`                                    | Quit the client (close the connection / detach per client semantics). |

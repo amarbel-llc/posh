@@ -79,19 +79,27 @@ fn set_logging(st: &mut ClientState, enabled: bool, now: u64) {
 
 /// The palette's command list (RFC 0005 §5): the discoverable surface for the
 /// escape commands. Ctrl-^ opens this in lieu of a key-prefix menu, so every
-/// escape action lives here. The logging entry reflects the current state.
-fn palette_commands() -> Value {
-    let (log_name, log_enabled): (&str, bool) = if util::log_active() {
-        ("Debug logging: off", false)
+/// escape action lives here. The logging entries reflect the current state —
+/// client logging from this process, server logging from the last frame's
+/// FLAG_SERVER_LOG (`server_log_on`).
+fn palette_commands(server_log_on: bool) -> Value {
+    let (client_log_name, client_log_enabled): (&str, bool) = if util::log_active() {
+        ("Client debug logging: off", false)
     } else {
-        ("Debug logging: on", true)
+        ("Client debug logging: on", true)
+    };
+    let (server_log_name, server_log_enabled): (&str, bool) = if server_log_on {
+        ("Server debug logging: off", false)
+    } else {
+        ("Server debug logging: on", true)
     };
     json!([
         { "name": "Echo: adaptive", "action": { "method": "echo.set", "params": { "model": "adaptive" } } },
         { "name": "Echo: optimistic", "action": { "method": "echo.set", "params": { "model": "optimistic" } } },
         { "name": "Echo: always", "action": { "method": "echo.set", "params": { "model": "always" } } },
         { "name": "Echo: never", "action": { "method": "echo.set", "params": { "model": "never" } } },
-        { "name": log_name, "action": { "method": "logging.set", "params": { "enabled": log_enabled } } },
+        { "name": client_log_name, "action": { "method": "logging.set", "params": { "enabled": client_log_enabled } } },
+        { "name": server_log_name, "action": { "method": "logging.set", "params": { "scope": "server", "enabled": server_log_enabled } } },
         { "name": "Shell out (server)", "action": { "method": "shell.open" } },
         { "name": "Suspend client", "action": { "method": "client.suspend" } },
         { "name": "Quit session", "action": { "method": "app.quit" } },
@@ -105,8 +113,9 @@ fn open_palette(st: &mut ClientState) -> bool {
     if st.palette.is_none() {
         st.palette = Palette::spawn(st.rows, st.cols);
     }
+    let commands = palette_commands(st.server_log_on);
     if let Some(p) = st.palette.as_mut() {
-        p.open("Commands", palette_commands());
+        p.open("Commands", commands);
         st.initialized = false; // repaint to show the overlay
         true
     } else {
@@ -135,8 +144,27 @@ fn dispatch_palette_action(
             false
         }
         "logging.set" => {
-            if let Some(enabled) = params.get("enabled").and_then(Value::as_bool) {
-                set_logging(st, enabled, now);
+            let enabled = params.get("enabled").and_then(Value::as_bool);
+            if params.get("scope").and_then(Value::as_str) == Some("server") {
+                // Server-side toggle (#3): request the state change over the wire;
+                // the server applies it and reports back via FLAG_SERVER_LOG.
+                if let Some(en) = enabled {
+                    st.flags |= if en {
+                        sync::CLIENT_FLAG_LOG_ON
+                    } else {
+                        sync::CLIENT_FLAG_LOG_OFF
+                    };
+                    let msg = if en {
+                        "server debug logging: on (requested)"
+                    } else {
+                        "server debug logging: off (requested)"
+                    };
+                    st.notify.set_message(msg, false, now);
+                }
+                return true; // send the request flag promptly
+            }
+            if let Some(en) = enabled {
+                set_logging(st, en, now); // client-local (default scope)
             }
             false
         }
@@ -336,6 +364,9 @@ struct ClientState {
     /// Latest server-reported remote-PTY ECHO state (FLAG_ECHO). Gates
     /// optimistic local echo (FDR 0006); defaults off until the first frame.
     echo_on: bool,
+    /// Latest server-reported debug-logging state (FLAG_SERVER_LOG, #3); drives
+    /// the palette's "Server debug logging" command label. Off until reported.
+    server_log_on: bool,
     /// Frame-sync codec selection (`POSH_FRAMESYNC`, #15). Drives whether we
     /// advertise `CAP_MORPH` and which `applier` we route visible-frame bodies
     /// through. Defaults to DumpDiff (today's behavior) when the env is unset.
@@ -403,6 +434,7 @@ fn client_loop(
         scroll_offset: 0,
         last_scroll_state: None,
         echo_on: false,
+        server_log_on: false,
         framesync,
         applier,
         stats: Stats::new(),
@@ -1060,6 +1092,8 @@ fn process_frame(st: &mut ClientState, frame: &ServerFrame) -> bool {
         .on_server_frame(frame.input_ack, frame.echo_ack, st.conn.send_interval());
     // Remote PTY echo state for the optimistic-echo gate (FDR 0006).
     st.echo_on = frame.flags & sync::FLAG_ECHO != 0;
+    // Server debug-logging state for the palette's "Server debug logging" label (#3).
+    st.server_log_on = frame.flags & sync::FLAG_SERVER_LOG != 0;
     // The escape-to-shell overlay is up (FDR 0008): the request was honored, so
     // drop the "opening shell…" notice (the request flag is already one-shot).
     if frame.flags & sync::FLAG_OVERLAY != 0 && st.notify.message() == "opening shell\u{2026}" {
@@ -1405,10 +1439,10 @@ fn send_message(st: &mut ClientState) {
         input_base: st.outbox.base(),
         input: st.outbox.pending().to_vec(),
     };
-    // CLIENT_FLAG_ESCAPE is one-shot: it rode this message, so clear it now (the
-    // server's overlay spawn is idempotent on repeats, and the user can retry
-    // Ctrl-^ s if this datagram is lost). SHUTDOWN stays sticky until acked.
-    st.flags &= !sync::CLIENT_FLAG_ESCAPE;
+    // CLIENT_FLAG_ESCAPE and the server-logging toggles are one-shot: they rode
+    // this message, so clear them now (the server acts idempotently on repeats,
+    // and the user can retry if this datagram is lost). SHUTDOWN stays sticky.
+    st.flags &= !(sync::CLIENT_FLAG_ESCAPE | sync::CLIENT_FLAG_LOG_ON | sync::CLIENT_FLAG_LOG_OFF);
     for frag in st
         .fragmenter
         .make_fragments(&msg.encode(), sync::FRAGMENT_CONTENTS_MAX)
@@ -1623,6 +1657,36 @@ mod tests {
         assert!(st.shutdown_requested, "quit requests shutdown");
     }
 
+    #[test]
+    fn dispatch_server_logging_sets_one_shot_wire_flag() {
+        // logging.set scope=server requests the toggle over the wire (#3): an
+        // idempotent one-shot flag, not a client-local change.
+        let raw = pty_raw_mode();
+
+        let mut on = test_state(24, 80);
+        let send = dispatch_palette_action(
+            &mut on,
+            &raw,
+            "logging.set",
+            &json!({ "scope": "server", "enabled": true }),
+            0,
+        );
+        assert!(send, "server-logging toggle sends promptly");
+        assert_ne!(on.flags & sync::CLIENT_FLAG_LOG_ON, 0, "LOG_ON set");
+        assert_eq!(on.flags & sync::CLIENT_FLAG_LOG_OFF, 0);
+
+        let mut off = test_state(24, 80);
+        dispatch_palette_action(
+            &mut off,
+            &raw,
+            "logging.set",
+            &json!({ "scope": "server", "enabled": false }),
+            0,
+        );
+        assert_ne!(off.flags & sync::CLIENT_FLAG_LOG_OFF, 0, "LOG_OFF set");
+        assert_eq!(off.flags & sync::CLIENT_FLAG_LOG_ON, 0);
+    }
+
     /// ClientState over a throwaway loopback connection, for unit tests
     /// of frame application and composition.
     fn test_state(rows: u16, cols: u16) -> ClientState {
@@ -1661,6 +1725,7 @@ mod tests {
             scroll_offset: 0,
             last_scroll_state: None,
             echo_on: false,
+            server_log_on: false,
             framesync: framesync::FrameSync::DumpDiff,
             applier: Box::new(framesync::DumpDiff),
             stats: Stats::new(),

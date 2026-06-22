@@ -92,7 +92,11 @@ _POSH_DEBUG_LOG_
 	_/dev/null_, this file is its only diagnostic sink. For the bare
 	*posh* _host:session_ form the path is forwarded from the client, so
 	it is interpreted on the remote host. The on-demand *SIGUSR2* state
-	dump (*SIGNALS*) is written to this same sink. Unset disables logging.
+	dump (*SIGNALS*) is written to this same sink. Unset disables logging
+	at startup, but a connected client can turn the summaries on or off at
+	runtime from its *Ctrl-^* command palette (*Server debug logging*); when
+	enabled that way without _POSH_DEBUG_LOG_ set, the sink is the same
+	per-pid default file the *SIGUSR2* dump uses. See *posh-client*(1).
 
 # SIGNALS
 

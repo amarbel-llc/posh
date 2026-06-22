@@ -216,6 +216,11 @@ pub const FLAG_ECHO: u8 = 4;
 /// retransmitting it). `0x08` is the next free runtime bit after FLAG_ECHO (0x02
 /// is the reserved caps EXTENSION bit).
 pub const FLAG_OVERLAY: u8 = 8;
+/// The server's debug logging (the `POSH_DEBUG_LOG` sink) is currently on,
+/// reported per frame so the client's "Server debug logging" palette command can
+/// show the true state and confirm a toggle (#3). `0x10` is the next free
+/// runtime bit after FLAG_OVERLAY.
+pub const FLAG_SERVER_LOG: u8 = 16;
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum FrameBody {
@@ -479,6 +484,15 @@ pub const CLIENT_FLAG_SHUTDOWN: u8 = 1;
 /// UDP loss); the server's "already in overlay" guard makes repeats idempotent.
 /// `0x04` is the next free runtime bit (0x01 = SHUTDOWN, 0x02 = caps EXTENSION).
 pub const CLIENT_FLAG_ESCAPE: u8 = 4;
+
+/// Toggle the *server's* debug logging at runtime (#3): the palette's "Server
+/// debug logging" command sets one of these for a single message. Idempotent on
+/// the server (setting ON when already on is a no-op), so they need not be
+/// sticky — a lost request just means the user re-toggles. The server reports
+/// the resulting state back via `FLAG_SERVER_LOG`. `0x08`/`0x10` are the next
+/// free client runtime bits.
+pub const CLIENT_FLAG_LOG_ON: u8 = 8;
+pub const CLIENT_FLAG_LOG_OFF: u8 = 16;
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct ClientMessage {

@@ -32,9 +32,10 @@ the host and then launches this client against the reported address.
 *Ctrl-^*
 	Open the command palette — the escape menu. It lists every client-local
 	escape command: the predictive-echo models (_adaptive_, _optimistic_,
-	_always_, _never_), the debug-logging toggle (_POSH_DEBUG_LOG_), shell-out
-	on the server (FDR 0008, the _POSH_ESCAPE_CMD_ command), suspend the
-	client, and quit. Type to filter, arrows to choose, Enter to run, Esc to
+	_always_, _never_), the client *and* server debug-logging toggles
+	(_POSH_DEBUG_LOG_; the server toggle rides the transport), shell-out on the
+	server (FDR 0008, the _POSH_ESCAPE_CMD_ command), suspend the client, and
+	quit. Type to filter, arrows to choose, Enter to run, Esc to
 	dismiss. Rendered by the *posh-palette* helper over a JSON-RPC control
 	channel; the session greys behind it.
 
