@@ -1,28 +1,26 @@
-//! charm-tui-host: drive a long-running bubbletea renderer (`tui/tui-bin`) over
-//! a JSON-RPC-style control channel and composite its output over a retained
-//! session screen — proving posh's client-side emulator can run a charmbracelet
-//! renderer as a host-driven, mux-style overlay. Throwaway POC: hardcoded
-//! constants, no flags. All libc/PTY FFI is confined here so posh-term stays
-//! 100% safe.
+//! charm-tui-host: a chord-summoned command-palette overlay composited over a
+//! REAL local shell running in a `posh_term::Terminal` — the same client-side
+//! emulator the posh roaming client drives (`server_term`, fed by the remote
+//! shell). The chord+overlay is factored into an `Overlay` component whose
+//! interface matches what `remote/client.rs` provides, so lifting it into the
+//! real client is a swap (local shell -> `server_term`), not a rewrite.
+//! Throwaway POC: hardcoded constants, no flags. All libc/PTY FFI is confined
+//! here so posh-term stays 100% safe.
 //!
-//! The renderer is spawned once on a PTY (visual channel) plus a control socket
-//! on its fd 3. The host sends `show {view:"palette", commands}` / `hide`, where
-//! each command carries a JSON-RPC `action`; the renderer echoes the chosen
-//! command's action back (or a `ui.cancel`), and the host dispatches it as a
-//! small options API. `Ctrl-^` opens the palette directly. The host owns input
-//! routing (the open trigger handled here; keystrokes forwarded to the renderer
-//! while the palette is up) and compositing: the palette is a popup anchored a
-//! third of the way down over a greyed-out (dimmed) session background, painted
-//! with a per-cell diff (reusing posh_term::sgr_params) that writes only the
-//! cells that changed.
+//! Session: `$SHELL` on a PTY feeds `session: Terminal`; the host renders it to
+//! the real terminal with a per-cell diff and routes stdin to it. `Ctrl-^` opens
+//! the palette (a bubbletea renderer on a PTY + a JSON-RPC control socket on its
+//! fd 3); while open the session greys and stdin goes to the palette. Each
+//! command carries a JSON-RPC `action` the renderer echoes back; the host
+//! dispatches it. Logging/echo are mocks surfaced via a transient banner (the
+//! POC stand-in for the client's `NotificationEngine`) until lifted into posh,
+//! where `echo.set` -> `predict::build` swap and `logging.toggle` ->
+//! `util::log_enable/disable`. SIGWINCH resizes the shell + session live.
 //!
-//! Two behaviours chosen by whether stdout is a tty (an OS fact, not a flag):
-//!   * stdout IS a tty  -> interactive.
-//!   * stdout is NOT a tty -> self-test: exercise the RPC round-trip (palette
-//!     show + an echo.set action), the JSON-RPC command dispatch, the compositor
-//!     (greyed anchored palette), and the open trigger. Print PASS/FAIL.
+//! stdout a tty -> interactive; not a tty -> headless self-test (PASS/FAIL).
 
 use std::ffi::CString;
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::time::{Duration, Instant};
 
 use posh_term::{sgr_params, Cell, Color, Screen, Style, Terminal};
@@ -36,102 +34,12 @@ const STDIN: libc::c_int = 0;
 const STDOUT: libc::c_int = 1;
 /// Quiet period with no PTY output that counts as "the renderer finished drawing".
 const IDLE: Duration = Duration::from_millis(400);
-
-// Open trigger: Ctrl-^ (0x1e, matches remote/client.rs ESCAPE_KEY) opens the
-// command palette. A bare "/" is deliberately NOT a trigger — it is far too
-// common a character to serve as an escape hatch. Quit is the palette's command.
+/// Ctrl-^ opens the palette (matches remote/client.rs ESCAPE_KEY). A bare "/" is
+/// deliberately not a trigger — too common a character for an escape hatch.
 const CTRL_CARET: u8 = 0x1e;
 
 fn is_open_trigger(b: u8) -> bool {
     b == CTRL_CARET
-}
-
-/// The host-supported palette commands. Each carries a JSON-RPC `action` — the
-/// request the renderer echoes back when the command is chosen — so selections
-/// flow as a small JSON-RPC API (dispatched in `dispatch_rpc`) rather than by
-/// matching display names. The same method surface (logging.toggle, echo.set, …)
-/// is what a remote peer could service over the wire (#3). The logging/echo
-/// entries are POC stand-ins (see PocState); real posh wiring is the #2/#3 work.
-fn palette_commands() -> Vec<serde_json::Value> {
-    let echo = |m: &str| {
-        serde_json::json!({
-            "name": format!("Predictive echo: {m}"),
-            "action": {"method": "echo.set", "params": {"model": m}},
-        })
-    };
-    vec![
-        serde_json::json!({"name":"Toggle debug logging","action":{"method":"logging.toggle"}}),
-        echo("Adaptive"),
-        echo("Optimistic"),
-        echo("Always"),
-        echo("Never"),
-        serde_json::json!({"name":"Clear session","action":{"method":"session.clear"}}),
-        serde_json::json!({"name":"Redraw session","action":{"method":"session.redraw"}}),
-        serde_json::json!({"name":"Quit","action":{"method":"app.quit"}}),
-    ]
-}
-
-/// The POC's local stand-in state, surfaced on the session background. In the
-/// real client these would drive posh's debug logging and predictive echo —
-/// both of which need runtime toggles (logging is launch-env-gated; the echo
-/// model is frozen at launch) and, for remote logging, a protocol change. Those
-/// are the #2/#3 follow-ups; here they are display-only mocks.
-struct PocState {
-    logging: bool,
-    echo: String,
-}
-
-impl Default for PocState {
-    fn default() -> PocState {
-        PocState {
-            logging: false,
-            echo: "Adaptive".to_string(),
-        }
-    }
-}
-
-/// Draw the "live session" background, showing the current stand-in state.
-fn render_base(session: &mut Terminal, state: &PocState) {
-    let logging = if state.logging { "on" } else { "off" };
-    let mut s = Vec::new();
-    s.extend_from_slice(b"\x1b[2J\x1b[H");
-    s.extend_from_slice(b"  posh client \xe2\x80\x94 live session (POC base screen)\r\n\r\n");
-    s.extend_from_slice(format!("  debug logging:    \x1b[1m{logging}\x1b[0m\r\n").as_bytes());
-    s.extend_from_slice(format!("  predictive echo:  \x1b[1m{}\x1b[0m\r\n\r\n", state.echo).as_bytes());
-    s.extend_from_slice(b"  \x1b[1mCtrl-^\x1b[0m   command palette\r\n");
-    session.process(&s);
-}
-
-/// Dispatch a JSON-RPC request from the palette against the POC state + session
-/// screen. Returns true if the driver should quit. This is the local handler for
-/// the options API; a remote peer would handle the same methods over the wire.
-fn dispatch_rpc(method: &str, params: &serde_json::Value, state: &mut PocState, session: &mut Terminal) -> bool {
-    match method {
-        "app.quit" => return true,
-        "session.clear" => {
-            session.process(b"\x1b[2J");
-            return false;
-        }
-        "session.redraw" => {}
-        "logging.toggle" => state.logging = !state.logging,
-        "echo.set" => {
-            if let Some(m) = params.get("model").and_then(|v| v.as_str()) {
-                state.echo = m.to_string();
-            }
-        }
-        // "ui.cancel" and unknowns: just re-render and close.
-        _ => {}
-    }
-    render_base(session, state);
-    false
-}
-
-/// Parse one JSON-RPC request line from the renderer: (method, params).
-fn parse_request(line: &str) -> Option<(String, serde_json::Value)> {
-    let v: serde_json::Value = serde_json::from_str(line).ok()?;
-    let method = v.get("method")?.as_str()?.to_string();
-    let params = v.get("params").cloned().unwrap_or(serde_json::Value::Null);
-    Some((method, params))
 }
 
 fn main() {
@@ -149,8 +57,113 @@ fn main() {
 }
 
 // ---------------------------------------------------------------------------
-// Control channel: JSON-RPC-style messages to/from the renderer.
+// Mock client state + transient banner (POC stand-ins for the real client).
 // ---------------------------------------------------------------------------
+
+/// POC-local stand-in for the client settings the palette would drive. The real
+/// client swaps this for `predict::build()` / `util::log_enable` on lift.
+struct MockState {
+    logging: bool,
+    echo: String,
+}
+
+impl Default for MockState {
+    fn default() -> MockState {
+        MockState {
+            logging: false,
+            echo: "Adaptive".to_string(),
+        }
+    }
+}
+
+/// A transient top-row status message — the POC stand-in for the client's
+/// `NotificationEngine` (remote/display.rs). Auto-clears after a short window.
+struct Banner {
+    text: String,
+    expires_at: Option<Instant>,
+}
+
+impl Banner {
+    fn new() -> Banner {
+        Banner {
+            text: String::new(),
+            expires_at: None,
+        }
+    }
+
+    fn set(&mut self, text: &str) {
+        self.text = text.to_string();
+        self.expires_at = Some(Instant::now() + Duration::from_millis(1500));
+    }
+
+    /// Clear if expired; returns true if it changed (so the host recomposites).
+    fn tick(&mut self) -> bool {
+        if matches!(self.expires_at, Some(t) if Instant::now() >= t) {
+            self.text.clear();
+            self.expires_at = None;
+            return true;
+        }
+        false
+    }
+
+    fn active(&self) -> bool {
+        !self.text.is_empty()
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Palette commands + JSON-RPC control protocol.
+// ---------------------------------------------------------------------------
+
+/// The host-supported palette commands. Each carries a JSON-RPC `action` — the
+/// request the renderer echoes back when chosen — so selections flow as a small
+/// JSON-RPC API (dispatched in `dispatch_rpc`), the same method surface a remote
+/// peer could service over the wire (#3). Logging/echo are POC mocks.
+fn palette_commands() -> Vec<serde_json::Value> {
+    let echo = |m: &str| {
+        serde_json::json!({
+            "name": format!("Predictive echo: {m}"),
+            "action": {"method": "echo.set", "params": {"model": m}},
+        })
+    };
+    vec![
+        serde_json::json!({"name":"Toggle debug logging","action":{"method":"logging.toggle"}}),
+        echo("Adaptive"),
+        echo("Optimistic"),
+        echo("Always"),
+        echo("Never"),
+        serde_json::json!({"name":"Quit","action":{"method":"app.quit"}}),
+    ]
+}
+
+/// Dispatch a JSON-RPC request from the palette against the mock state, raising a
+/// banner. Returns true if the driver should quit. The real client handles these
+/// same methods for real (echo.set -> predict::build swap; logging.toggle ->
+/// util::log_enable/disable).
+fn dispatch_rpc(method: &str, params: &serde_json::Value, state: &mut MockState, banner: &mut Banner) -> bool {
+    match method {
+        "app.quit" => return true,
+        "logging.toggle" => {
+            state.logging = !state.logging;
+            banner.set(&format!("debug logging: {}", if state.logging { "on" } else { "off" }));
+        }
+        "echo.set" => {
+            if let Some(m) = params.get("model").and_then(|v| v.as_str()) {
+                state.echo = m.to_string();
+                banner.set(&format!("predictive echo: {m}"));
+            }
+        }
+        _ => {} // ui.cancel and unknowns: just close
+    }
+    false
+}
+
+fn parse_request(line: &str) -> Option<(String, serde_json::Value)> {
+    let v: serde_json::Value = serde_json::from_str(line).ok()?;
+    let method = v.get("method")?.as_str()?.to_string();
+    let params = v.get("params").cloned().unwrap_or(serde_json::Value::Null);
+    Some((method, params))
+}
 
 fn send_rpc(ctrl: libc::c_int, msg: &serde_json::Value) {
     let mut s = msg.to_string();
@@ -163,15 +176,114 @@ fn send_show_palette(ctrl: libc::c_int) {
 }
 
 // ---------------------------------------------------------------------------
-// Compositor: session background + a centered/anchored overlay, with optional
-// grey-out, diffed to the real terminal.
+// Overlay: the chord-summoned palette, factored for a clean lift into the real
+// client. It owns the renderer process + the overlay emulator, but NOT the
+// session emulator — the host (and, on lift, the client) owns that and asks the
+// overlay to composite over it.
 // ---------------------------------------------------------------------------
 
-#[derive(Clone, Copy, PartialEq, Eq)]
-enum Mode {
+/// Outcome of pumping the control socket.
+enum Event {
+    Quit,
+    Closed, // the palette was dismissed (a selection ran, or cancel)
     None,
-    Palette,
 }
+
+struct Overlay {
+    master: libc::c_int, // renderer PTY
+    ctrl: libc::c_int,   // JSON-RPC control socket
+    pid: libc::pid_t,
+    rterm: Terminal, // the renderer's emulated screen (palette pixels)
+    open: bool,
+    ctrl_buf: Vec<u8>,
+    state: MockState,
+}
+
+impl Overlay {
+    fn spawn(bin: &CString, rows: u16, cols: u16) -> Overlay {
+        let (master, ctrl, pid) = spawn_renderer(bin, rows, cols);
+        Overlay {
+            master,
+            ctrl,
+            pid,
+            rterm: Terminal::new(rows, cols),
+            open: false,
+            ctrl_buf: Vec::new(),
+            state: MockState::default(),
+        }
+    }
+
+    fn is_open(&self) -> bool {
+        self.open
+    }
+
+    /// The overlay screen to composite, or None when the palette is closed.
+    fn screen(&self) -> Option<&Terminal> {
+        self.open.then_some(&self.rterm)
+    }
+
+    fn open(&mut self) {
+        self.open = true;
+        send_show_palette(self.ctrl);
+    }
+
+    /// Drain the renderer PTY into `rterm`. Returns true if it drew (recomposite).
+    fn pump(&mut self) -> bool {
+        let mut buf = [0u8; 8192];
+        let n = read_fd(self.master, &mut buf);
+        if n <= 0 {
+            return false;
+        }
+        let before = self.rterm.generation();
+        self.rterm.process(&buf[..n as usize]);
+        let replies = self.rterm.take_responses();
+        if !replies.is_empty() {
+            write_all(self.master, &replies);
+        }
+        self.rterm.generation() != before
+    }
+
+    fn forward_input(&self, bytes: &[u8]) {
+        write_all(self.master, bytes);
+    }
+
+    /// Drain control-socket events, dispatch them, update the banner.
+    fn poll_events(&mut self, banner: &mut Banner) -> Event {
+        let mut buf = [0u8; 4096];
+        let n = read_fd(self.ctrl, &mut buf);
+        if n <= 0 {
+            return Event::None;
+        }
+        self.ctrl_buf.extend_from_slice(&buf[..n as usize]);
+        let mut outcome = Event::None;
+        while let Some(pos) = self.ctrl_buf.iter().position(|&b| b == b'\n') {
+            let line: Vec<u8> = self.ctrl_buf.drain(..=pos).collect();
+            let Some((method, params)) = std::str::from_utf8(&line).ok().and_then(|s| parse_request(s.trim())) else {
+                continue;
+            };
+            if dispatch_rpc(&method, &params, &mut self.state, banner) {
+                return Event::Quit;
+            }
+            self.open = false; // any action (or ui.cancel) closes the palette
+            outcome = Event::Closed;
+        }
+        outcome
+    }
+
+    fn resize(&mut self, rows: u16, cols: u16) {
+        set_winsize(self.master, rows, cols);
+        self.rterm.resize(rows, cols);
+    }
+
+    fn shutdown(self) {
+        shutdown_renderer(self.pid, self.ctrl);
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Compositor: session background (greyed when the palette is open) + the
+// anchored palette + a top-row banner, diffed to the real terminal.
+// ---------------------------------------------------------------------------
 
 struct Presenter {
     rows: u16,
@@ -188,8 +300,8 @@ impl Presenter {
         }
     }
 
-    fn flush(&mut self, session: &Terminal, overlay: Option<&Terminal>, mode: Mode) {
-        let cur = compose(self.rows, self.cols, session, overlay, mode);
+    fn flush(&mut self, session: &Terminal, overlay: Option<&Terminal>, banner: &Banner) {
+        let cur = compose(self.rows, self.cols, session, overlay, banner);
         let mut body = Vec::new();
         diff(&self.prev, &cur, self.rows, self.cols, &mut body);
         if !body.is_empty() {
@@ -215,11 +327,12 @@ fn dim_cell(cell: &Cell) -> Cell {
     }
 }
 
-fn compose(rows: u16, cols: u16, session: &Terminal, overlay: Option<&Terminal>, mode: Mode) -> Vec<Cell> {
+fn compose(rows: u16, cols: u16, session: &Terminal, overlay: Option<&Terminal>, banner: &Banner) -> Vec<Cell> {
     let w = cols as usize;
     let mut cur = vec![Cell::blank(Style::default()); rows as usize * w];
 
-    let grey = mode == Mode::Palette;
+    // Session background, greyed while the palette is open.
+    let grey = overlay.is_some();
     let sscr = session.screen();
     for r in 0..rows {
         for c in 0..cols {
@@ -229,23 +342,20 @@ fn compose(rows: u16, cols: u16, session: &Terminal, overlay: Option<&Terminal>,
         }
     }
 
-    if mode != Mode::None {
-        if let Some(rend) = overlay {
-            if let Some((r0, c0, r1, c1)) = bbox(rend.screen()) {
-                let h = r1 - r0 + 1;
-                let bw = c1 - c0 + 1;
-                // Anchor a third of the way down (expands down / collapses up),
-                // centered horizontally.
-                let dr = rows / 3;
-                let dc = cols.saturating_sub(bw) / 2;
-                let rscr = rend.screen();
-                for r in 0..h {
-                    for c in 0..bw {
-                        let (pr, pc) = (dr + r, dc + c);
-                        if pr < rows && pc < cols {
-                            if let Some(cell) = rscr.cell(r0 + r, c0 + c) {
-                                cur[pr as usize * w + pc as usize] = cell.clone();
-                            }
+    // The palette, anchored a third of the way down, centered horizontally.
+    if let Some(rend) = overlay {
+        if let Some((r0, c0, r1, c1)) = bbox(rend.screen()) {
+            let h = r1 - r0 + 1;
+            let bw = c1 - c0 + 1;
+            let dr = rows / 3;
+            let dc = cols.saturating_sub(bw) / 2;
+            let rscr = rend.screen();
+            for r in 0..h {
+                for c in 0..bw {
+                    let (pr, pc) = (dr + r, dc + c);
+                    if pr < rows && pc < cols {
+                        if let Some(cell) = rscr.cell(r0 + r, c0 + c) {
+                            cur[pr as usize * w + pc as usize] = cell.clone();
                         }
                     }
                 }
@@ -253,7 +363,31 @@ fn compose(rows: u16, cols: u16, session: &Terminal, overlay: Option<&Terminal>,
         }
     }
 
+    // Transient banner on the top row, on top of everything.
+    if banner.active() {
+        draw_banner(&mut cur, cols, &banner.text);
+    }
+
     cur
+}
+
+/// Paint a reverse-video `posh: <text>` banner across the top row.
+fn draw_banner(cur: &mut [Cell], cols: u16, text: &str) {
+    let label: Vec<char> = format!(" posh: {text} ").chars().collect();
+    let style = Style {
+        inverse: true,
+        bold: true,
+        ..Style::default()
+    };
+    for c in 0..cols as usize {
+        cur[c] = Cell {
+            ch: label.get(c).copied().unwrap_or(' '),
+            style,
+            width: 1,
+            extra: Vec::new(),
+            hyperlink: 0,
+        };
+    }
 }
 
 /// Non-blank bounding box of a screen: (top, left, bottom, right), or None.
@@ -322,6 +456,122 @@ fn cells_eq(a: &Cell, b: &Cell) -> bool {
     a.ch == b.ch && a.style == b.style && a.width == b.width && a.extra == b.extra && a.hyperlink == b.hyperlink
 }
 
+/// Place the real cursor at the session's cursor when no overlay is up; hide it
+/// while the palette is open (the palette has no mapped cursor — a follow-up).
+fn update_cursor(session: &Terminal, overlay_open: bool) {
+    if overlay_open {
+        write_all(STDOUT, b"\x1b[?25l");
+        return;
+    }
+    let c = session.cursor();
+    let mut s = format!("\x1b[{};{}H", c.row + 1, c.col + 1).into_bytes();
+    s.extend_from_slice(if c.visible { b"\x1b[?25h" } else { b"\x1b[?25l" });
+    write_all(STDOUT, &s);
+}
+
+// ---------------------------------------------------------------------------
+// Interactive: a real shell session + the chord-summoned palette overlay.
+// ---------------------------------------------------------------------------
+
+fn interactive(bin: &CString) {
+    let (mut rows, mut cols) = term_size(STDOUT).unwrap_or((DEFAULT_ROWS, DEFAULT_COLS));
+    let _raw = RawGuard::enable(STDIN);
+    install_sigwinch();
+    write_all(STDOUT, b"\x1b[?1049h\x1b[2J");
+
+    let (shell_master, shell_pid) = spawn_shell(rows, cols);
+    let mut session = Terminal::new(rows, cols);
+    let mut overlay = Overlay::spawn(bin, rows, cols);
+    let mut banner = Banner::new();
+    let mut pres = Presenter::new(rows, cols);
+    pres.flush(&session, None, &banner);
+    update_cursor(&session, false);
+
+    let mut buf = [0u8; 8192];
+    'session: loop {
+        let mut fds = [
+            libc::pollfd { fd: shell_master, events: libc::POLLIN, revents: 0 },
+            libc::pollfd { fd: overlay.master, events: libc::POLLIN, revents: 0 },
+            libc::pollfd { fd: overlay.ctrl, events: libc::POLLIN, revents: 0 },
+            libc::pollfd { fd: STDIN, events: libc::POLLIN, revents: 0 },
+        ];
+        // EINTR (e.g. SIGWINCH) returns < 0 with revents untouched (all 0); fall
+        // through to the resize check rather than breaking.
+        unsafe { libc::poll(fds.as_mut_ptr(), 4, 50) };
+        let mut dirty = false;
+
+        if SIGWINCH.swap(false, Ordering::AcqRel) {
+            if let Some((nr, nc)) = term_size(STDOUT) {
+                rows = nr;
+                cols = nc;
+                set_winsize(shell_master, rows, cols);
+                session.resize(rows, cols);
+                overlay.resize(rows, cols);
+                pres = Presenter::new(rows, cols);
+                write_all(STDOUT, b"\x1b[2J");
+                dirty = true;
+            }
+        }
+
+        // Shell output -> session emulator.
+        if fds[0].revents != 0 {
+            let n = read_fd(shell_master, &mut buf);
+            if n <= 0 {
+                break 'session; // shell exited -> end the POC, back to the parent shell
+            }
+            session.process(&buf[..n as usize]);
+            let replies = session.take_responses();
+            if !replies.is_empty() {
+                write_all(shell_master, &replies);
+            }
+            dirty = true;
+        }
+
+        // Renderer output -> overlay emulator.
+        if fds[1].revents != 0 && overlay.pump() && overlay.is_open() {
+            dirty = true;
+        }
+
+        // Control-socket events from the palette.
+        if fds[2].revents & libc::POLLIN != 0 {
+            match overlay.poll_events(&mut banner) {
+                Event::Quit => break 'session,
+                Event::Closed => dirty = true,
+                Event::None => {}
+            }
+        }
+
+        // Stdin: to the palette when open; chord opens it; otherwise to the shell.
+        if fds[3].revents & libc::POLLIN != 0 {
+            let n = read_fd(STDIN, &mut buf);
+            if n <= 0 {
+                break 'session;
+            }
+            if overlay.is_open() {
+                overlay.forward_input(&buf[..n as usize]);
+            } else if buf[..n as usize].iter().any(|&b| is_open_trigger(b)) {
+                overlay.open();
+                dirty = true; // grey the session immediately
+            } else {
+                write_all(shell_master, &buf[..n as usize]);
+            }
+        }
+
+        if banner.tick() {
+            dirty = true;
+        }
+
+        if dirty {
+            pres.flush(&session, overlay.screen(), &banner);
+            update_cursor(&session, overlay.is_open());
+        }
+    }
+
+    write_all(STDOUT, b"\x1b[?25h\x1b[?1049l");
+    overlay.shutdown();
+    wait_for(shell_pid, true); // SIGKILL + reap the shell
+}
+
 // ---------------------------------------------------------------------------
 // Self-test: the deterministic, headless PASS/FAIL path.
 // ---------------------------------------------------------------------------
@@ -333,7 +583,7 @@ fn selftest(bin: &CString) -> i32 {
     let shutdown_ok = test_shutdown(bin);
     let trigger_ok = is_open_trigger(CTRL_CARET) && !is_open_trigger(b'/') && !is_open_trigger(b'a');
     if palette_ok && compose_ok && commands_ok && shutdown_ok && trigger_ok {
-        println!("PASS: RPC palette+selection, compositor, command dispatch, graceful shutdown, and open trigger all hold");
+        println!("PASS: RPC palette+selection, compositor over a session (greyed/anchored + banner), command dispatch, graceful shutdown, and open trigger all hold");
         0
     } else {
         println!("FAIL: palette_ok={palette_ok} compose_ok={compose_ok} commands_ok={commands_ok} shutdown_ok={shutdown_ok} trigger_ok={trigger_ok}");
@@ -341,52 +591,8 @@ fn selftest(bin: &CString) -> i32 {
     }
 }
 
-/// Send a `shutdown` request and assert the renderer exits on its own within the
-/// grace window (the graceful path — `p.Kill` cancels its context, no SIGKILL).
-fn test_shutdown(bin: &CString) -> bool {
-    let (master, ctrl, pid) = spawn_renderer(bin, DEFAULT_ROWS, DEFAULT_COLS);
-    let mut term = Terminal::new(DEFAULT_ROWS, DEFAULT_COLS);
-    drain_until_idle(master, &mut term, IDLE); // let it boot
-
-    send_rpc(ctrl, &serde_json::json!({"method":"shutdown"}));
-    let deadline = Instant::now() + Duration::from_millis(800);
-    let mut graceful = false;
-    while Instant::now() < deadline {
-        let mut status: libc::c_int = 0;
-        if unsafe { libc::waitpid(pid, &mut status as *mut libc::c_int, libc::WNOHANG) } == pid {
-            graceful = true;
-            break;
-        }
-        std::thread::sleep(Duration::from_millis(10));
-    }
-    if !graceful {
-        wait_for(pid, true); // SIGKILL cleanup so a failed test never leaks the child
-    }
-    unsafe { libc::close(ctrl) };
-    eprintln!("--- shutdown ---\ngraceful_exit={graceful}\n----------------");
-    graceful
-}
-
-/// Dispatch a few palette selections and assert the POC state updates, the new
-/// state renders on the session background, and Quit signals exit.
-fn test_commands() -> bool {
-    let mut state = PocState::default();
-    let mut session = Terminal::new(DEFAULT_ROWS, DEFAULT_COLS);
-    render_base(&mut session, &state);
-
-    dispatch_rpc("logging.toggle", &serde_json::Value::Null, &mut state, &mut session);
-    dispatch_rpc("echo.set", &serde_json::json!({"model":"Optimistic"}), &mut state, &mut session);
-    let shown = session.dump_text();
-    let state_ok = state.logging && state.echo == "Optimistic";
-    let shown_ok = shown.contains("predictive echo:") && shown.contains("Optimistic");
-    let quit = dispatch_rpc("app.quit", &serde_json::Value::Null, &mut state, &mut session);
-
-    eprintln!("--- commands ---\nlogging={} echo={} shown_ok={shown_ok} quit={quit}\n----------------", state.logging, state.echo);
-    state_ok && shown_ok && quit
-}
-
 /// show palette over RPC, assert it renders the supported commands, then filter
-/// + Enter and assert the renderer reports the right `selected` event.
+/// + Enter and assert the renderer echoes back the right JSON-RPC action.
 fn test_palette_rpc(bin: &CString) -> bool {
     let (master, ctrl, pid) = spawn_renderer(bin, DEFAULT_ROWS, DEFAULT_COLS);
     let mut term = Terminal::new(DEFAULT_ROWS, DEFAULT_COLS);
@@ -395,7 +601,7 @@ fn test_palette_rpc(bin: &CString) -> bool {
     send_show_palette(ctrl);
     drain_until_idle(master, &mut term, IDLE);
     let shown = term.dump_text();
-    let shows = shown.contains("Commands") && shown.contains("Quit") && shown.contains("Clear session");
+    let shows = shown.contains("Commands") && shown.contains("Quit") && shown.contains("Toggle debug logging");
     eprintln!("--- palette (rpc) ---\n{shown}\n---------------------");
 
     write_all(master, b"optimistic"); // filter to "Predictive echo: Optimistic"
@@ -411,33 +617,83 @@ fn test_palette_rpc(bin: &CString) -> bool {
     shows && ev_ok
 }
 
-/// Compose the palette over a session background and assert: the background is
-/// greyed, the palette is present and anchored a third down with the yellow
-/// (double) border, and the greyed session text still shows above it.
+/// Compose the palette over a (canned) session and assert: the session is greyed,
+/// the palette is anchored a third down with the yellow border, and a banner
+/// paints on the top row.
 fn test_compose(bin: &CString) -> bool {
     let (master, ctrl, pid) = spawn_renderer(bin, DEFAULT_ROWS, DEFAULT_COLS);
-    let mut renderer = Terminal::new(DEFAULT_ROWS, DEFAULT_COLS);
-    drain_until_idle(master, &mut renderer, IDLE);
+    let mut rterm = Terminal::new(DEFAULT_ROWS, DEFAULT_COLS);
+    drain_until_idle(master, &mut rterm, IDLE);
 
     let mut session = Terminal::new(DEFAULT_ROWS, DEFAULT_COLS);
-    render_base(&mut session, &PocState::default());
+    session.process(b"\x1b[2J\x1b[Hhello from the shell");
 
     send_show_palette(ctrl);
-    drain_until_idle(master, &mut renderer, IDLE);
-    let pal = compose(DEFAULT_ROWS, DEFAULT_COLS, &session, Some(&renderer), Mode::Palette);
-    let rows: Vec<String> = (0..DEFAULT_ROWS).map(|r| row_text(&pal, r, DEFAULT_COLS)).collect();
+    drain_until_idle(master, &mut rterm, IDLE);
+
+    // No banner: row 0 is the greyed session; the palette is anchored a third
+    // down with its yellow double border.
+    let plain = compose(DEFAULT_ROWS, DEFAULT_COLS, &session, Some(&rterm), &Banner::new());
+    let rows: Vec<String> = (0..DEFAULT_ROWS).map(|r| row_text(&plain, r, DEFAULT_COLS)).collect();
     let anchor = (DEFAULT_ROWS / 3) as usize;
+    let greyed = is_dimmed(&plain, 0, DEFAULT_COLS, 'h');
+    let bg_above = rows[0].contains("hello from the shell");
+    let popup = rows.join("\n").contains("Toggle debug logging") && rows.join("\n").contains("Quit");
+    let anchored = rows[anchor].contains('╔');
 
-    let greyed = is_dimmed(&pal, 0, DEFAULT_COLS, 'p');
-    let bg_above = rows[0].contains("posh client");
-    let popup = rows.join("\n").contains("Commands") && rows.join("\n").contains("Quit");
-    let anchored = rows[anchor].contains('╔'); // double (yellow) border top-left
+    // With a banner active: the top row carries the reverse-video status.
+    let mut banner = Banner::new();
+    banner.set("predictive echo: Optimistic");
+    let withbar = compose(DEFAULT_ROWS, DEFAULT_COLS, &session, Some(&rterm), &banner);
+    let banner_ok = row_text(&withbar, 0, DEFAULT_COLS).contains("posh: predictive echo: Optimistic");
 
-    let ok = greyed && bg_above && popup && anchored;
-    eprintln!("--- compose ---\ngreyed={greyed} bg_above={bg_above} popup={popup} anchored={anchored}\n---------------");
+    let ok = greyed && bg_above && popup && anchored && banner_ok;
+    eprintln!("--- compose ---\ngreyed={greyed} bg_above={bg_above} popup={popup} anchored={anchored} banner_ok={banner_ok}\n---------------");
     wait_for(pid, true);
     unsafe { libc::close(ctrl) };
     ok
+}
+
+/// Dispatch a few palette actions and assert the mock state updates and the
+/// banner reflects the change, and that `app.quit` signals exit.
+fn test_commands() -> bool {
+    let mut state = MockState::default();
+    let mut banner = Banner::new();
+
+    dispatch_rpc("logging.toggle", &serde_json::Value::Null, &mut state, &mut banner);
+    let logging_ok = state.logging && banner.text.contains("debug logging: on");
+    dispatch_rpc("echo.set", &serde_json::json!({"model":"Optimistic"}), &mut state, &mut banner);
+    let echo_ok = state.echo == "Optimistic" && banner.text.contains("Optimistic");
+    let quit = dispatch_rpc("app.quit", &serde_json::Value::Null, &mut state, &mut banner);
+
+    eprintln!("--- commands ---\nlogging_ok={logging_ok} echo_ok={echo_ok} quit={quit}\n----------------");
+    logging_ok && echo_ok && quit
+}
+
+/// Send a `shutdown` request and assert the renderer exits on its own within the
+/// grace window (the graceful path — `p.Kill` cancels its context, no SIGKILL).
+fn test_shutdown(bin: &CString) -> bool {
+    let (master, ctrl, pid) = spawn_renderer(bin, DEFAULT_ROWS, DEFAULT_COLS);
+    let mut term = Terminal::new(DEFAULT_ROWS, DEFAULT_COLS);
+    drain_until_idle(master, &mut term, IDLE);
+
+    send_rpc(ctrl, &serde_json::json!({"method":"shutdown"}));
+    let deadline = Instant::now() + Duration::from_millis(800);
+    let mut graceful = false;
+    while Instant::now() < deadline {
+        let mut status: libc::c_int = 0;
+        if unsafe { libc::waitpid(pid, &mut status as *mut libc::c_int, libc::WNOHANG) } == pid {
+            graceful = true;
+            break;
+        }
+        std::thread::sleep(Duration::from_millis(10));
+    }
+    if !graceful {
+        wait_for(pid, true);
+    }
+    unsafe { libc::close(ctrl) };
+    eprintln!("--- shutdown ---\ngraceful_exit={graceful}\n----------------");
+    graceful
 }
 
 /// True if the first cell in `row` whose char is `ch` carries the dim style.
@@ -492,107 +748,64 @@ fn drain_until_idle(master: libc::c_int, term: &mut Terminal, idle: Duration) {
 }
 
 // ---------------------------------------------------------------------------
-// Interactive: drive the renderer + composite (for a human).
-// ---------------------------------------------------------------------------
-
-fn interactive(bin: &CString) {
-    let (rows, cols) = term_size(STDOUT).unwrap_or((DEFAULT_ROWS, DEFAULT_COLS));
-    let _raw = RawGuard::enable(STDIN);
-    write_all(STDOUT, b"\x1b[?1049h\x1b[2J\x1b[?25l");
-
-    let mut state = PocState::default();
-    let mut session = Terminal::new(rows, cols);
-    render_base(&mut session, &state);
-
-    let (master, ctrl, pid) = spawn_renderer(bin, rows, cols);
-    let mut renderer = Terminal::new(rows, cols);
-    let mut pres = Presenter::new(rows, cols);
-    let mut mode = Mode::None;
-    pres.flush(&session, None, mode);
-
-    let mut fds = [
-        libc::pollfd { fd: master, events: libc::POLLIN, revents: 0 },
-        libc::pollfd { fd: ctrl, events: libc::POLLIN, revents: 0 },
-        libc::pollfd { fd: STDIN, events: libc::POLLIN, revents: 0 },
-    ];
-    let mut buf = [0u8; 8192];
-    let mut ctrl_buf: Vec<u8> = Vec::new();
-    let mut last_gen = u64::MAX;
-
-    'session: loop {
-        let r = unsafe { libc::poll(fds.as_mut_ptr(), 3, 50) };
-        if r < 0 {
-            break;
-        }
-
-        // renderer PTY -> renderer emulator
-        if fds[0].revents != 0 {
-            let n = read_fd(master, &mut buf);
-            if n <= 0 {
-                break;
-            }
-            renderer.process(&buf[..n as usize]);
-            let replies = renderer.take_responses();
-            if !replies.is_empty() {
-                write_all(master, &replies);
-            }
-        }
-
-        // control socket -> renderer events
-        if fds[1].revents & libc::POLLIN != 0 {
-            let n = read_fd(ctrl, &mut buf);
-            if n <= 0 {
-                break;
-            }
-            ctrl_buf.extend_from_slice(&buf[..n as usize]);
-            while let Some(pos) = ctrl_buf.iter().position(|&b| b == b'\n') {
-                let line: Vec<u8> = ctrl_buf.drain(..=pos).collect();
-                let Some((method, params)) = std::str::from_utf8(&line).ok().and_then(|s| parse_request(s.trim())) else {
-                    continue;
-                };
-                if dispatch_rpc(&method, &params, &mut state, &mut session) {
-                    break 'session;
-                }
-                mode = Mode::None;
-                pres.flush(&session, None, mode);
-            }
-        }
-
-        // stdin -> chord (or forwarded to the palette)
-        if fds[2].revents & libc::POLLIN != 0 {
-            let n = read_fd(STDIN, &mut buf);
-            if n <= 0 {
-                break;
-            }
-            if mode == Mode::Palette {
-                write_all(master, &buf[..n as usize]); // forward keystrokes to the palette
-            } else if buf[..n as usize].iter().any(|&b| is_open_trigger(b)) {
-                mode = Mode::Palette;
-                send_show_palette(ctrl);
-                pres.flush(&session, Some(&renderer), mode); // grey the session immediately
-            }
-        }
-
-        // re-composite when the renderer redraws an active overlay
-        if renderer.generation() != last_gen {
-            last_gen = renderer.generation();
-            if mode != Mode::None {
-                pres.flush(&session, Some(&renderer), mode);
-            }
-        }
-
-        for f in &mut fds {
-            f.revents = 0;
-        }
-    }
-
-    write_all(STDOUT, b"\x1b[?25h\x1b[?1049l");
-    shutdown_renderer(pid, ctrl);
-}
-
-// ---------------------------------------------------------------------------
 // libc/PTY glue — the only unsafe code in the POC.
 // ---------------------------------------------------------------------------
+
+static SIGWINCH: AtomicBool = AtomicBool::new(false);
+
+extern "C" fn on_sigwinch(_: libc::c_int) {
+    SIGWINCH.store(true, Ordering::Release);
+}
+
+fn install_sigwinch() {
+    unsafe {
+        let mut sa: libc::sigaction = std::mem::zeroed();
+        sa.sa_sigaction = on_sigwinch as *const () as usize;
+        libc::sigemptyset(&mut sa.sa_mask as *mut libc::sigset_t);
+        sa.sa_flags = 0; // no SA_RESTART: poll returns EINTR promptly on resize
+        libc::sigaction(libc::SIGWINCH, &sa as *const libc::sigaction, std::ptr::null_mut());
+    }
+}
+
+fn set_winsize(fd: libc::c_int, rows: u16, cols: u16) {
+    let ws = libc::winsize {
+        ws_row: rows,
+        ws_col: cols,
+        ws_xpixel: 0,
+        ws_ypixel: 0,
+    };
+    unsafe { libc::ioctl(fd, libc::TIOCSWINSZ, &ws as *const libc::winsize) };
+}
+
+/// Spawn `$SHELL` (fallback `/bin/sh`) on a fresh PTY. Returns (master, pid).
+fn spawn_shell(rows: u16, cols: u16) -> (libc::c_int, libc::pid_t) {
+    let shell = std::env::var("SHELL").unwrap_or_else(|_| "/bin/sh".to_string());
+    let shell_c = CString::new(shell).unwrap_or_else(|_| CString::new("/bin/sh").unwrap());
+    let mut master: libc::c_int = -1;
+    let ws = libc::winsize {
+        ws_row: rows,
+        ws_col: cols,
+        ws_xpixel: 0,
+        ws_ypixel: 0,
+    };
+    let pid = unsafe {
+        libc::forkpty(
+            &mut master as *mut libc::c_int,
+            std::ptr::null_mut(),
+            std::ptr::null(),
+            &ws as *const libc::winsize,
+        )
+    };
+    match pid {
+        -1 => panic!("forkpty (shell) failed: {}", std::io::Error::last_os_error()),
+        0 => unsafe {
+            let argv = [shell_c.as_ptr(), std::ptr::null()];
+            libc::execv(shell_c.as_ptr(), argv.as_ptr());
+            libc::_exit(127);
+        },
+        _ => (master, pid),
+    }
+}
 
 /// Spawn `bin` on a fresh PTY plus a control socket routed to its fd 3.
 /// Returns (pty_master, host_control_fd, pid).
@@ -638,7 +851,7 @@ fn spawn_renderer(bin: &CString, rows: u16, cols: u16) -> (libc::c_int, libc::c_
 }
 
 /// Wait for the child and return its exit code (None if killed by a signal).
-/// With `terminate`, SIGKILL is sent first — bulletproof teardown for tests.
+/// With `terminate`, SIGKILL is sent first — bulletproof teardown.
 fn wait_for(pid: libc::pid_t, terminate: bool) -> Option<i32> {
     unsafe {
         if terminate {
@@ -657,20 +870,16 @@ fn wait_for(pid: libc::pid_t, terminate: bool) -> Option<i32> {
 }
 
 /// Shut the renderer down: ask it to quit over the control channel (coordinated
-/// via JSON-RPC), give it a grace period to exit on its own, then SIGKILL if it
-/// has not. Guarantees the driver returns to the shell even if the renderer's
-/// event loop is wedged — a bare `p.Quit`/SIGTERM routes a quit through that
-/// loop and can hang; `shutdown` -> `p.Kill` cancels its context, and SIGKILL is
-/// the backstop.
+/// via JSON-RPC), give it a grace period, then SIGKILL if it hasn't exited.
 fn shutdown_renderer(pid: libc::pid_t, ctrl: libc::c_int) {
     send_rpc(ctrl, &serde_json::json!({"method":"shutdown"}));
-    unsafe { libc::close(ctrl) }; // also EOFs the renderer's control fd
+    unsafe { libc::close(ctrl) };
 
     let deadline = Instant::now() + Duration::from_millis(300);
     loop {
         let mut status: libc::c_int = 0;
         if unsafe { libc::waitpid(pid, &mut status as *mut libc::c_int, libc::WNOHANG) } == pid {
-            return; // exited within the grace period
+            return;
         }
         if Instant::now() >= deadline {
             break;
