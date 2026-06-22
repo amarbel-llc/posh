@@ -18,6 +18,7 @@ package main
 import (
 	"bufio"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"os"
 	"strings"
@@ -240,7 +241,7 @@ func main() {
 	if ctrl != nil {
 		go readControl(ctrl, p)
 	}
-	if _, err := p.Run(); err != nil {
+	if _, err := p.Run(); err != nil && !errors.Is(err, tea.ErrProgramKilled) {
 		fmt.Fprintln(os.Stderr, "renderer:", err)
 		os.Exit(1)
 	}
@@ -260,7 +261,10 @@ func readControl(ctrl *os.File, p *tea.Program) {
 			p.Send(showMsg(sp))
 		case "hide":
 			p.Send(hideMsg{})
+		case "shutdown":
+			p.Kill() // forceful: cancels the program context even if the loop is wedged
+			return
 		}
 	}
-	p.Quit() // control channel closed -> shut down
+	p.Kill() // control channel closed -> stop
 }

@@ -23,7 +23,7 @@
 //!     (greyed anchored palette), and the open trigger. Print PASS/FAIL.
 
 use std::ffi::CString;
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 use posh_term::{sgr_params, Cell, Color, Screen, Style, Terminal};
 
@@ -160,10 +160,6 @@ fn send_rpc(ctrl: libc::c_int, msg: &serde_json::Value) {
 
 fn send_show_palette(ctrl: libc::c_int) {
     send_rpc(ctrl, &serde_json::json!({"method":"show","params":{"view":"palette","commands": palette_commands()}}));
-}
-
-fn send_hide(ctrl: libc::c_int) {
-    send_rpc(ctrl, &serde_json::json!({"method":"hide","params":{}}));
 }
 
 // ---------------------------------------------------------------------------
@@ -334,14 +330,41 @@ fn selftest(bin: &CString) -> i32 {
     let palette_ok = test_palette_rpc(bin);
     let compose_ok = test_compose(bin);
     let commands_ok = test_commands();
+    let shutdown_ok = test_shutdown(bin);
     let trigger_ok = is_open_trigger(CTRL_CARET) && !is_open_trigger(b'/') && !is_open_trigger(b'a');
-    if palette_ok && compose_ok && commands_ok && trigger_ok {
-        println!("PASS: RPC palette+selection, compositor (greyed anchored palette), command dispatch, and open trigger all hold");
+    if palette_ok && compose_ok && commands_ok && shutdown_ok && trigger_ok {
+        println!("PASS: RPC palette+selection, compositor, command dispatch, graceful shutdown, and open trigger all hold");
         0
     } else {
-        println!("FAIL: palette_ok={palette_ok} compose_ok={compose_ok} commands_ok={commands_ok} trigger_ok={trigger_ok}");
+        println!("FAIL: palette_ok={palette_ok} compose_ok={compose_ok} commands_ok={commands_ok} shutdown_ok={shutdown_ok} trigger_ok={trigger_ok}");
         1
     }
+}
+
+/// Send a `shutdown` request and assert the renderer exits on its own within the
+/// grace window (the graceful path — `p.Kill` cancels its context, no SIGKILL).
+fn test_shutdown(bin: &CString) -> bool {
+    let (master, ctrl, pid) = spawn_renderer(bin, DEFAULT_ROWS, DEFAULT_COLS);
+    let mut term = Terminal::new(DEFAULT_ROWS, DEFAULT_COLS);
+    drain_until_idle(master, &mut term, IDLE); // let it boot
+
+    send_rpc(ctrl, &serde_json::json!({"method":"shutdown"}));
+    let deadline = Instant::now() + Duration::from_millis(800);
+    let mut graceful = false;
+    while Instant::now() < deadline {
+        let mut status: libc::c_int = 0;
+        if unsafe { libc::waitpid(pid, &mut status as *mut libc::c_int, libc::WNOHANG) } == pid {
+            graceful = true;
+            break;
+        }
+        std::thread::sleep(Duration::from_millis(10));
+    }
+    if !graceful {
+        wait_for(pid, true); // SIGKILL cleanup so a failed test never leaks the child
+    }
+    unsafe { libc::close(ctrl) };
+    eprintln!("--- shutdown ---\ngraceful_exit={graceful}\n----------------");
+    graceful
 }
 
 /// Dispatch a few palette selections and assert the POC state updates, the new
@@ -563,10 +586,8 @@ fn interactive(bin: &CString) {
         }
     }
 
-    send_hide(ctrl);
-    unsafe { libc::close(ctrl) };
     write_all(STDOUT, b"\x1b[?25h\x1b[?1049l");
-    wait_for(pid, true);
+    shutdown_renderer(pid, ctrl);
 }
 
 // ---------------------------------------------------------------------------
@@ -616,10 +637,12 @@ fn spawn_renderer(bin: &CString, rows: u16, cols: u16) -> (libc::c_int, libc::c_
     }
 }
 
+/// Wait for the child and return its exit code (None if killed by a signal).
+/// With `terminate`, SIGKILL is sent first — bulletproof teardown for tests.
 fn wait_for(pid: libc::pid_t, terminate: bool) -> Option<i32> {
     unsafe {
         if terminate {
-            libc::kill(pid, libc::SIGTERM);
+            libc::kill(pid, libc::SIGKILL);
         }
         let mut status: libc::c_int = 0;
         if libc::waitpid(pid, &mut status as *mut libc::c_int, 0) != pid {
@@ -630,6 +653,35 @@ fn wait_for(pid: libc::pid_t, terminate: bool) -> Option<i32> {
         } else {
             None
         }
+    }
+}
+
+/// Shut the renderer down: ask it to quit over the control channel (coordinated
+/// via JSON-RPC), give it a grace period to exit on its own, then SIGKILL if it
+/// has not. Guarantees the driver returns to the shell even if the renderer's
+/// event loop is wedged — a bare `p.Quit`/SIGTERM routes a quit through that
+/// loop and can hang; `shutdown` -> `p.Kill` cancels its context, and SIGKILL is
+/// the backstop.
+fn shutdown_renderer(pid: libc::pid_t, ctrl: libc::c_int) {
+    send_rpc(ctrl, &serde_json::json!({"method":"shutdown"}));
+    unsafe { libc::close(ctrl) }; // also EOFs the renderer's control fd
+
+    let deadline = Instant::now() + Duration::from_millis(300);
+    loop {
+        let mut status: libc::c_int = 0;
+        if unsafe { libc::waitpid(pid, &mut status as *mut libc::c_int, libc::WNOHANG) } == pid {
+            return; // exited within the grace period
+        }
+        if Instant::now() >= deadline {
+            break;
+        }
+        std::thread::sleep(Duration::from_millis(5));
+    }
+
+    unsafe {
+        libc::kill(pid, libc::SIGKILL);
+        let mut status: libc::c_int = 0;
+        libc::waitpid(pid, &mut status as *mut libc::c_int, 0);
     }
 }
 

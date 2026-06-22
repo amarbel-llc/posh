@@ -37,6 +37,7 @@ host -> renderer:  {"method":"show","params":{"view":"palette","commands":[
                      {"name":"Predictive echo: Optimistic",
                       "action":{"method":"echo.set","params":{"model":"Optimistic"}}}]}}
                    {"method":"hide","params":{}}
+                   {"method":"shutdown"}    # quit: renderer p.Kill()s; host SIGKILLs if it lingers
 renderer -> host:  the chosen command's action verbatim, e.g.
                      {"method":"echo.set","params":{"model":"Optimistic"}}
                    {"method":"ui.cancel"}
