@@ -10,3 +10,6 @@
 
 # debug-record-posht output (posh-rec captures written to the repo root)
 /posht-*.castx
+
+# `go build` in the module dir drops the binary beside its source
+/posh-palette/posh-palette

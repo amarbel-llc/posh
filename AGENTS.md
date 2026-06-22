@@ -23,6 +23,9 @@ doc/           scdoc man-page SOURCES — posh(1), posh-server(1),
 docs/          ADRs (docs/decisions/), RFCs (docs/rfcs/), feature records
                (docs/features/, the FDRs), plans (docs/plans/), manual tests
 posht/         standalone interactive terminal-capability test (Go/Bubble Tea)
+posh-palette/  the command-palette renderer (Go/Bubble Tea v2): a subprocess
+               the client drives over a JSON-RPC control channel (RFC 0005) and
+               composites onto the session view. Its own Go module, like posht.
 zz-mosh/       the vendored C++ mosh reference tree (the porting reference);
                has its OWN justfile for host-lane recipes: `just zz-mosh/<r>`
 ```

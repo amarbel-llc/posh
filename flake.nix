@@ -269,21 +269,53 @@
           };
         };
 
+        # posh-palette: the command-palette renderer for the posh client — a
+        # bubbletea (v2) subprocess the client drives over the RFC 0005 JSON-RPC
+        # control channel (fd 3) and composites onto the session view. Its own
+        # Go module under posh-palette/, independent of the Rust workspace, so
+        # sourcing the subtree keeps non-palette changes from rebuilding it.
+        # Built exactly like posht: buildGoModule + version/rev flowed in via
+        # -ldflags -X main.version / main.gitSHA (github #71); buildGoModule's
+        # checkPhase runs `go test ./...`, gating the version-format and
+        # protocol tests. The client locates the binary next to itself, so
+        # poshToolset co-installs it in the same bin/. See eng-versioning(7).
+        posh-palette = pkgs.buildGoModule {
+          pname = "posh-palette";
+          version = poshVersion;
+
+          src = ./posh-palette;
+          vendorHash = "sha256-DwMz9dJy844NmDb9d711z4JnqwZtqociP/LZXBC2WJw=";
+
+          ldflags = [
+            "-X main.version=${poshVersion}"
+            "-X main.gitSHA=${poshGitSha}"
+          ];
+
+          meta = with lib; {
+            description = "Command-palette renderer for the posh client (RFC 0005 control protocol)";
+            license = licenses.gpl3Plus;
+            mainProgram = "posh-palette";
+            platforms = platforms.linux ++ platforms.darwin;
+          };
+        };
+
         # The default output: the full posh toolset in one tree, so a bare
         # `nix build` yields every posh-* build product rather than just the
         # posh binary (github #73). `posh` already installs the posh /
-        # posh-server / poshterity binaries and the man pages; this only adds
-        # posht (the Go TUI). posh-term is a library compiled into posh, not a
-        # standalone binary, so it has no entry here. mosh (the upstream C++
-        # reference) deliberately stays its own non-default output.
+        # posh-server / poshterity binaries and the man pages; this adds posht
+        # (the Go TUI) and posh-palette (the command-palette renderer).
+        # posh-term is a library compiled into posh, not a standalone binary, so
+        # it has no entry here. mosh (the upstream C++ reference) deliberately
+        # stays its own non-default output.
         poshToolset = pkgs.symlinkJoin {
           name = "posh-toolset-${poshVersion}";
           paths = [
             posh
             posht
+            posh-palette
           ];
           meta = {
-            description = "The full posh toolset: posh, posh-server, poshterity, and posht";
+            description = "The full posh toolset: posh, posh-server, poshterity, posht, and posh-palette";
             mainProgram = "posh";
             license = posh.meta.license;
             platforms = posh.meta.platforms;
@@ -354,6 +386,7 @@
           poshterity = poshterity;
           mosh = mosh;
           posht = posht;
+          posh-palette = posh-palette;
 
           # The store-pinned git hooks from this repo's pure-lane config
           # (conformist#47/#51/#54): conformist-pre-commit runs `conformist

@@ -80,7 +80,7 @@ lint-worktree:
 
 # --- build -----------------------------------------------------------------
 
-build: build-nix build-rust build-go build-toolset
+build: build-nix build-rust build-go build-palette build-toolset
 
 # Hermetic C++ reference build: autogen.sh + configure + make (+ check).
 [group("build")]
@@ -103,10 +103,18 @@ build-go:
     # non-posht changes don't rebuild it.
     nix build -L --show-trace ".#posht" -o result-posht
 
+# Hermetic posh-palette build (the command-palette renderer, RFC 0005).
+[group("build")]
+build-palette:
+    # The static posh-palette binary. Sources posh-palette/ only; buildGoModule's
+    # checkPhase runs `go test ./...` (version + protocol tests). Also realized
+    # by build-toolset via poshToolset; this is the focused dev-loop signal.
+    nix build -L --show-trace ".#posh-palette" -o result-posh-palette
+
 # The default output: the full posh toolset (github #73). ./result
-# aggregates posh + posh-server + poshterity + posht so a bare `nix build`
-# yields the whole set. Also realizes the standalone .#poshterity output
-# (`nix run .#poshterity`) so the merge gate exercises it. Cheap once
+# aggregates posh + posh-server + poshterity + posht + posh-palette so a bare
+# `nix build` yields the whole set. Also realizes the standalone .#poshterity
+# output (`nix run .#poshterity`) so the merge gate exercises it. Cheap once
 # build-rust/build-go realized the inputs.
 [group("build")]
 build-toolset:
