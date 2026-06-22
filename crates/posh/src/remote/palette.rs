@@ -55,8 +55,14 @@ pub struct Palette {
 }
 
 /// Locate the `posh-palette` binary: `$POSH_PALETTE` override, else next to the
-/// running executable (poshToolset co-installs them), else the first match on
-/// `$PATH`.
+/// running executable, else the first match on `$PATH`.
+///
+/// "Next to the executable" tries both `current_exe()` and `argv[0]`: under a
+/// nix `symlinkJoin` toolset, posh and posh-palette are symlinked side by side,
+/// but `current_exe()` resolves through the symlink to posh's *own* store path,
+/// whose sibling dir lacks posh-palette — while `argv[0]`, when invoked by path,
+/// still points into the join dir that has it. A profile install finds it on
+/// `$PATH` regardless.
 fn palette_binary() -> Option<PathBuf> {
     if let Some(p) = std::env::var_os("POSH_PALETTE") {
         let p = PathBuf::from(p);
@@ -64,11 +70,17 @@ fn palette_binary() -> Option<PathBuf> {
             return Some(p);
         }
     }
-    if let Ok(exe) = std::env::current_exe() {
-        if let Some(cand) = exe.parent().map(|d| d.join(BINARY_NAME)) {
-            if cand.is_file() {
-                return Some(cand);
-            }
+    let exe_paths = [
+        std::env::current_exe().ok(),
+        std::env::args_os().next().map(PathBuf::from),
+    ];
+    for dir in exe_paths.iter().flatten().filter_map(|p| p.parent()) {
+        if dir.as_os_str().is_empty() {
+            continue; // a bare argv[0] like "posh" has no useful directory
+        }
+        let cand = dir.join(BINARY_NAME);
+        if cand.is_file() {
+            return Some(cand);
         }
     }
     if let Some(path) = std::env::var_os("PATH") {
