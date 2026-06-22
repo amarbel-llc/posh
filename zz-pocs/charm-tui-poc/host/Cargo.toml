@@ -1,0 +1,18 @@
+# Own workspace root: this throwaway crate lives under the posh repo tree but
+# must not be treated as a member of the posh workspace.
+[workspace]
+
+[package]
+name = "charm-tui-host"
+version = "0.0.0"
+edition = "2021"
+publish = false
+
+[dependencies]
+# The one in-repo crate the POC leans on: the client-side terminal emulator.
+posh-term = { path = "../../../crates/posh-term" }
+libc = "0.2"
+
+[[bin]]
+name = "charm-tui-host"
+path = "src/main.rs"

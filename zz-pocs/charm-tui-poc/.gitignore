@@ -1,0 +1,3 @@
+# Build artifacts (host binary + cargo/go outputs); the source is committed.
+/host/target/
+/tui/tui-bin

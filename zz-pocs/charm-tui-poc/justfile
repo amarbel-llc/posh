@@ -1,0 +1,31 @@
+# charm-tui-poc: a Go bubbletea v2 command bar (modeled on trapeze's "/"
+# Commands dialog) hosted on posh's client-side posh_term emulator, summoned by
+# a chord. Throwaway POC. All recipes are in the `explore` group.
+
+poc := justfile_directory()
+repo := `git rev-parse --show-toplevel`
+
+# Default: build everything and run the headless self-test.
+[group('explore')]
+default: test
+
+# Build the Go bubbletea command bar (isolated flake brings its own Go 1.26).
+[group('explore')]
+build-tui:
+    nix develop path:{{ poc }} -c bash -c 'cd {{ poc }}/tui && GOTOOLCHAIN=local go build -o tui-bin .'
+
+# Build the Rust host driver with the repo's cargo toolchain.
+[group('explore')]
+build-host:
+    cd {{ repo }} && nix develop -c cargo build --manifest-path {{ poc }}/host/Cargo.toml
+
+# Headless self-test: asserts command-bar hosting + chord parser; prints PASS/FAIL.
+[group('explore')]
+test: build-tui build-host
+    cd {{ repo }} && nix develop -c cargo run --manifest-path {{ poc }}/host/Cargo.toml | cat
+
+# Interactive: run in YOUR terminal to drive the base screen + command bar.
+#   / or Ctrl-^ .  command palette    Ctrl-^ q  quit
+[group('explore')]
+run: build-tui build-host
+    {{ poc }}/host/target/debug/charm-tui-host
