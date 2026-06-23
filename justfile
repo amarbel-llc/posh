@@ -763,3 +763,134 @@ debug-posh-palette-demo:
     echo
     echo "=== paste this to connect (absolute store path, no env juggling): ==="
     echo "POSH_KEY=$key $posh client -4 127.0.0.1 $port"
+
+# Scan a posh server/client debug log for STALLS: consecutive records whose
+# leading [epoch-ms] timestamps jump by more than THRESH ms (default 5000). The
+# periodic [stats] flush fires every 1-3s while the loop is alive, so one large
+# gap == the event loop was parked (a roaming wedge / no-paint freeze) for that
+# long. Pass a pid (resolves the default per-pid sink under <runtime>/posh) or an
+# explicit log path. Prints each gap with its two boundary records (last srtt /
+# outstanding / retransmit before the freeze are right there). Read-only.
+# Usage: just debug-posh-log-gaps 12345 [thresh_ms]   or   ... /path/to.log [thresh_ms]
+[group("debug")]
+debug-posh-log-gaps target thresh="5000":
+    #!/usr/bin/env bash
+    set -euo pipefail
+    t='{{ target }}'
+    if [ -f "$t" ]; then
+      f="$t"
+    else
+      uid="$(id -u)"
+      base="${POSH_DIR:-${XDG_RUNTIME_DIR:-/run/user/$uid}/posh}"
+      f="$base/posh-server-$t.log"
+      [ -f "$f" ] || f="$base/posh-client-$t.log"
+    fi
+    [ -f "$f" ] || { echo "no log for '$t' (tried it as a path, then posh-{server,client}-$t.log under $base)" >&2; exit 1; }
+    echo ">> $f"
+    awk -v thresh='{{ thresh }}' '
+      substr($0,1,1) == "[" {
+        rb = index($0, "]")
+        if (rb < 3) next
+        ts = substr($0, 2, rb-2) + 0
+        if (have && ts - prev > thresh) {
+          dt = ts - prev
+          ngaps++
+          printf "GAP %d ms (%.1fs, ~%.1f min) ending at line %d:\n", dt, dt/1000, dt/60000, NR
+          printf "  before: %s\n", prevline
+          printf "  after:  %s\n", $0
+        }
+        prev = ts; prevline = $0; have = 1
+      }
+      END {
+        if (have) printf "(scanned %d records, last ts %d; %d gap(s) over %d ms)\n", NR, prev, ngaps+0, thresh
+      }
+    ' "$f"
+
+# Pinpoint a posh transport BLACKOUT in a server log when the event loop never
+# stalled (debug-posh-log-gaps finds nothing) but the user still saw a no-paint
+# freeze: the client became unreachable, so the server kept tx-ing frames that
+# were never acked. That shows up as a burst in the cumulative `retransmit`
+# counter + `outstanding` (unacked frames) climbing while srtt/rto inflate, then
+# a collapse on recovery. Reports every record whose retransmit grew by >RT
+# (default 40) since the prior record, or whose outstanding is >=OUT (default 8),
+# and the single worst retransmit jump. Read-only.
+# Usage: just debug-posh-log-loss 12345 [retransmit_delta] [outstanding_min]
+[group("debug")]
+debug-posh-log-loss target rt="40" out="8":
+    #!/usr/bin/env bash
+    set -euo pipefail
+    t='{{ target }}'
+    if [ -f "$t" ]; then
+      f="$t"
+    else
+      uid="$(id -u)"
+      base="${POSH_DIR:-${XDG_RUNTIME_DIR:-/run/user/$uid}/posh}"
+      f="$base/posh-server-$t.log"
+      [ -f "$f" ] || f="$base/posh-client-$t.log"
+    fi
+    [ -f "$f" ] || { echo "no log for '$t' (tried it as a path, then posh-{server,client}-$t.log under $base)" >&2; exit 1; }
+    echo ">> $f"
+    awk -v rt='{{ rt }}' -v outmin='{{ out }}' '
+      substr($0,1,1) == "[" {
+        rb = index($0, "]"); ts = substr($0, 2, rb-2) + 0
+        r=""; o=""; s="";
+        for (i=1;i<=NF;i++) {
+          if ($i ~ /^retransmit=/) r = substr($i,12)+0
+          else if ($i ~ /^outstanding=/) o = substr($i,13)+0
+          else if ($i ~ /^srtt=/) s = $i
+        }
+        if (r == "") next
+        dr = (haveR ? r - prevR : 0)
+        flag = ""
+        if (haveR && dr > rt) flag = flag sprintf(" retransmit+%d", dr)
+        if (o != "" && o+0 >= outmin) flag = flag sprintf(" outstanding=%d", o)
+        if (flag != "") printf "L%d ts=%d %s%s  (retransmit=%d)\n", NR, ts, s, flag, r
+        if (haveR && dr > maxdr) { maxdr=dr; maxln=NR; maxts=ts }
+        prevR=r; haveR=1
+      }
+      END { printf "(max retransmit jump = +%d at line %d, ts %d)\n", maxdr+0, maxln+0, maxts+0 }
+    ' "$f"
+
+# Explain a high posh retransmit rate by probing the underlying network path: is
+# the Tailscale link to a roaming peer DIRECT or DERP-relayed, and what's its real
+# latency/loss? `tailscale ping` reports `via DERP(region)` vs `via <ip>:<port>`
+# (direct) — a relayed path adds a WAN hop and is the usual cause of 100ms+ srtt
+# and steady UDP loss. Also prints the peer's `tailscale status` line (endpoint /
+# relay) and the host's UDP error counters + the posh socket's own drop count, so
+# socket-level receive drops (RcvbufErrors) are distinguished from path loss.
+# Read-only. PEER is the roaming client's 100.x address (from debug-posh-dump's
+# `remote=`); PORT defaults to the server's 60001. Usage: just debug-posh-net 100.x.y.z
+[group("debug")]
+debug-posh-net peer port="60001":
+    #!/usr/bin/env bash
+    set -euo pipefail
+    peer='{{ peer }}'
+    echo "== tailscale status (peer line) =="
+    tailscale status | grep -F "$peer" || echo "(peer $peer not listed in tailscale status)"
+    echo
+    echo "== tailscale ping $peer (stops at first DIRECT, else shows DERP) =="
+    timeout 20 tailscale ping "$peer" || true
+    echo
+    echo "== posh UDP socket (drops/backlog, port {{ port }}) =="
+    ss -uapmi "sport = :{{ port }}" || true
+    echo
+    echo "== host UDP error counters =="
+    nstat -a -s -z 2>/dev/null | grep -i udp || true
+
+# Quantify the real loss+latency on the direct Tailscale path to a roaming peer
+# (the wireguard tunnel that carries posh's UDP) with ICMP, and report THIS host's
+# NAT/firewall posture via `tailscale netcheck`: UDP reachability, hard-NAT
+# (MappingVariesByDestIP), and whether any port-mapping protocol (UPnP/NAT-PMP/PCP)
+# is available. Hard NAT + no port-mapping == fragile, loss-prone direct paths —
+# the usual root cause of a high posh retransmit rate even when the link reports
+# "direct". Read-only. Usage: just debug-posh-pathloss 100.x.y.z [count]
+[group("debug")]
+debug-posh-pathloss peer count="20":
+    #!/usr/bin/env bash
+    set -euo pipefail
+    peer='{{ peer }}'
+    echo "== ping (loss/rtt on the tailscale path, {{ count }} probes) =="
+    ping -c '{{ count }}' -i 0.25 -w 25 "$peer" || true
+    echo
+    echo "== tailscale netcheck (NAT / firewall / port-mapping posture) =="
+    timeout 25 tailscale netcheck || true

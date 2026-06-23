@@ -164,6 +164,17 @@ read-only, `debug` group):
 - `POSH_DEBUG_LOG=<path>` (set before connecting) turns on *continuous*
   periodic transport summaries to that file — the complement to the on-demand
   `SIGUSR2` dump.
+- `just debug-posh-log-gaps <pid|log>` / `debug-posh-log-loss <pid|log>` —
+  offline scans of a `[stats]` log: `-gaps` finds event-loop STALLS (timestamp
+  jumps between records = a wedge/no-paint freeze); `-loss` finds transport
+  BLACKOUTS (bursts in the cumulative `retransmit` counter + `outstanding`
+  pile-up). Use these to triage a freeze AFTER the fact from the log alone.
+- `just debug-posh-net <peer-100.x>` / `debug-posh-pathloss <peer-100.x>` —
+  explain a high `retransmit` rate by probing the network path: direct vs
+  DERP-relayed Tailscale link, real ICMP loss/latency, socket drop counters,
+  and the host's NAT/firewall posture (`tailscale netcheck`). A steady
+  retransmit climb with ~0% measured loss points at the RTO margin
+  (`RttEstimator::rto`, `remote/datagram.rs`), not the path.
 
 ## When working here
 
