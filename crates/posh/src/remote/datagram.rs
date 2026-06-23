@@ -12,6 +12,17 @@ use crate::util::{now_ms, Error, Result};
 pub const DEFAULT_PORT_RANGE: (u16, u16) = (60001, 60999);
 const MIN_RTO: u64 = 50; // ms
 const MAX_RTO: u64 = 1000; // ms
+// Floor RTTVAR at this fraction of SRTT when deriving the RTO. On a very stable
+// link the measured RTTVAR collapses toward zero, leaving an RTO only a few ms
+// above SRTT — tighter than the peer's own ack-generation jitter, so acks
+// routinely land just after the RTO fires and trigger spurious retransmits
+// (observed: srtt=102ms, rttvar≈1.25ms => rto=107ms, ~2ms over peak RTT). A
+// proportional floor keeps the margin sensible relative to the round-trip time
+// (≈4·frac·SRTT, e.g. 20ms on a 100ms link) instead of a flat constant that is
+// too loose on a LAN and too tight across a continent. Read-time only — the
+// stored RTTVAR keeps tracking true variance, so a link that turns jittery
+// widens the RTO immediately. MIN_RTO still guards the low-SRTT (LAN) end.
+const RTTVAR_FLOOR_FRAC: f64 = 0.05;
 const TS_NONE: u16 = 0xffff;
 // mosh transportsender SEND_INTERVAL_MIN/MAX: pacing derived from SRTT.
 // MIN is also the server's floor between fresh frames.
@@ -157,7 +168,8 @@ impl RttEstimator {
     }
 
     pub fn rto(&self) -> u64 {
-        let rto = (self.srtt + 4.0 * self.rttvar).ceil() as u64;
+        let rttvar = self.rttvar.max(self.srtt * RTTVAR_FLOOR_FRAC);
+        let rto = (self.srtt + 4.0 * rttvar).ceil() as u64;
         rto.clamp(MIN_RTO, MAX_RTO)
     }
 
@@ -409,6 +421,25 @@ mod tests {
         est.sample(100.0);
         est.sample(10_000.0);
         assert_eq!(est.srtt, 100.0);
+    }
+
+    #[test]
+    fn rto_keeps_proportional_margin_on_stable_high_rtt_link() {
+        // A perfectly stable ~100ms link drives RTTVAR toward zero. Without the
+        // floor the RTO would sit ~1ms above SRTT and spuriously retransmit on
+        // the peer's ordinary ack jitter (the transatlantic-Tailscale case that
+        // motivated the floor). The proportional RTTVAR floor keeps the margin
+        // tied to the round-trip time: srtt + 4·(srtt·0.05) = srtt·1.2 ≈ 120ms.
+        let mut est = RttEstimator::new();
+        for _ in 0..200 {
+            est.sample(100.0);
+        }
+        assert!((est.srtt() - 100.0).abs() < 1.0, "srtt should converge to ~100ms");
+        let rto = est.rto();
+        assert!(
+            (118..=125).contains(&rto),
+            "expected ~120ms RTO (≥2x the bare srtt+ε), got {rto}ms"
+        );
     }
 
     #[test]
