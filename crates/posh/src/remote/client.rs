@@ -21,7 +21,7 @@ use crate::remote::palette::{Palette, PaletteEvent};
 use crate::remote::predict::{
     self, PredictionModel, PredictionRenderer, Predictor, RenderStyle,
 };
-use crate::remote::stats::{PredictSample, Stats};
+use crate::remote::stats::{FrameKind, PredictSample, Stats};
 use crate::remote::sync::{
     self, ClientMessage, FragmentAssembly, Fragmenter, FrameBody, InputOutbox, ScrollbackRing,
     ServerFrame, HEARTBEAT_INTERVAL,
@@ -104,6 +104,7 @@ fn palette_commands(server_log_on: bool) -> Value {
         { "name": client_log_name, "action": { "method": "logging.set", "params": { "enabled": client_log_enabled } } },
         { "name": server_log_name, "action": { "method": "logging.set", "params": { "scope": "server", "enabled": server_log_enabled } } },
         { "name": "Shell out (server)", "action": { "method": "shell.open" } },
+        { "name": "Reset & resync (force redraw)", "action": { "method": "session.resync" } },
         { "name": "Suspend client", "action": { "method": "client.suspend" } },
         { "name": "Quit session", "action": { "method": "app.quit" } },
     ])
@@ -176,6 +177,16 @@ fn dispatch_palette_action(
             // carries; the server spawns the overlay shell in the session cwd.
             st.flags |= sync::CLIENT_FLAG_ESCAPE;
             st.notify.set_message("opening shell\u{2026}", true, now);
+            true
+        }
+        "session.resync" => {
+            // Force the server to send a Full keyframe (#wedge): the client is
+            // wedged rejecting diffs against a base it isn't at and the automatic
+            // stale-ack -> Full recovery didn't fire. One-shot flag like
+            // CLIENT_FLAG_ESCAPE; the server drops its acked baseline so the next
+            // frame is a Full this client applies unconditionally.
+            st.flags |= sync::CLIENT_FLAG_RESYNC;
+            st.notify.set_message("resyncing\u{2026}", true, now);
             true
         }
         "client.suspend" => {
@@ -586,6 +597,8 @@ fn drive_client(st: &mut ClientState, raw: &RawMode, port: u16) -> Result<i32> {
                 rows: st.rows,
                 cols: st.cols,
                 echo_on: st.echo_on,
+                codec: st.framesync.label(),
+                apply: st.stats.apply_snapshot(),
             }
             .dump();
         }
@@ -682,6 +695,15 @@ fn drive_client(st: &mut ClientState, raw: &RawMode, port: u16) -> Result<i32> {
             }
         }
         render(st, now);
+        // Self-logging apply-stall detector (#wedge): a visible model frozen
+        // past the threshold while diff frames keep arriving emits one diagnostic
+        // line. Cheap no-op when POSH_DEBUG_LOG is unset.
+        st.stats.check_wedge(
+            now,
+            st.server_term.generation(),
+            st.applied_num,
+            st.framesync.label(),
+        );
         let predict_stats = st.predict.stats();
         st.stats.flush_client(
             now,
@@ -1116,9 +1138,10 @@ fn process_frame(st: &mut ClientState, frame: &ServerFrame) -> bool {
         // acked base), so it shares the Diff economics counter (#15).
         FrameBody::Diff { .. } | FrameBody::Morph { .. } => st.stats.record_frame_diff(),
         FrameBody::Empty => st.stats.record_frame_empty(),
-        // Scrollback bodies carry no visible-screen change; they are not
-        // part of the Full/Diff/Empty economics the stats track.
-        FrameBody::Scrollback { .. } => {}
+        // Scrollback bodies carry no visible-screen change, so they stay out of
+        // the Full/Diff/Empty economics — but are counted separately (#wedge) so
+        // a scrollback storm/reset is not invisible.
+        FrameBody::Scrollback { .. } => st.stats.record_frame_scrollback(),
     }
     st.notify.server_heard(now);
     st.outbox.ack(frame.input_ack);
@@ -1161,7 +1184,29 @@ fn process_frame(st: &mut ClientState, frame: &ServerFrame) -> bool {
 /// stream. Returns true when the frame advanced (or repeated) server state
 /// and an ack should go out.
 fn apply_frame(st: &mut ClientState, frame: &ServerFrame) -> bool {
+    // Apply-path instrumentation (#wedge): record the visible/scrollback frame
+    // at the gate so a frozen client self-reports which frame it is rejecting.
+    // Empty heartbeats carry no visible body and are skipped to keep the signal
+    // clean (and to keep `last_rx` pointing at the last real frame).
+    match &frame.body {
+        FrameBody::Empty => {}
+        FrameBody::Full(_) => {
+            st.stats
+                .record_apply_rx(frame.frame_num, frame.frame_num, FrameKind::Full)
+        }
+        FrameBody::Diff { base, .. } => {
+            st.stats.record_apply_rx(frame.frame_num, *base, FrameKind::Diff)
+        }
+        FrameBody::Morph { base, .. } => {
+            st.stats.record_apply_rx(frame.frame_num, *base, FrameKind::Morph)
+        }
+        FrameBody::Scrollback { base, .. } => {
+            st.stats
+                .record_apply_rx(frame.frame_num, *base, FrameKind::Scrollback)
+        }
+    }
     if frame.frame_num < st.applied_num {
+        st.stats.record_apply_stale();
         return true; // stale retransmission: re-ack our newer state
     }
     // Scrollback growth (RFC 0002 §3): append rows to the local ring without
@@ -1172,9 +1217,11 @@ fn apply_frame(st: &mut ClientState, frame: &ServerFrame) -> bool {
     // the base for a later `Diff` that builds on this frame number.
     if let FrameBody::Scrollback { base, rows } = &frame.body {
         if frame.frame_num == st.applied_num {
+            st.stats.record_apply_dup();
             return true; // duplicate retransmission: re-ack, don't reapply
         }
         if *base != st.applied_num {
+            st.stats.record_apply_basemis();
             return true; // growth against a state we are not at; re-ack
         }
         let grew = rows.len();
@@ -1185,6 +1232,7 @@ fn apply_frame(st: &mut ClientState, frame: &ServerFrame) -> bool {
             set_scroll(st, st.scroll_offset + grew);
         }
         st.applied_num = frame.frame_num;
+        st.stats.record_apply_advanced();
         return true;
     }
     // Base-anchored bodies (Diff, Morph) apply only when we are exactly at
@@ -1196,6 +1244,7 @@ fn apply_frame(st: &mut ClientState, frame: &ServerFrame) -> bool {
         FrameBody::Empty => return false,
         FrameBody::Diff { base, .. } | FrameBody::Morph { base, .. } => {
             if *base != st.applied_num {
+                st.stats.record_apply_basemis();
                 return true;
             }
         }
@@ -1204,6 +1253,7 @@ fn apply_frame(st: &mut ClientState, frame: &ServerFrame) -> bool {
         FrameBody::Scrollback { .. } => unreachable!("scrollback handled above"),
     }
     if frame.frame_num == st.applied_num {
+        st.stats.record_apply_dup();
         return true; // duplicate retransmission: re-ack, don't reapply
     }
     // Route the body through the selected codec's applier. Time the apply —
@@ -1225,6 +1275,7 @@ fn apply_frame(st: &mut ClientState, frame: &ServerFrame) -> bool {
         ApplyOutcome::Advanced { dump } => {
             st.applied_num = frame.frame_num;
             st.applied_data = dump;
+            st.stats.record_apply_advanced();
             true
         }
         // MorphDelta advanced the model in place without re-dumping it (#15).
@@ -1232,14 +1283,21 @@ fn apply_frame(st: &mut ClientState, frame: &ServerFrame) -> bool {
         // never sends a Diff body that would read it.
         ApplyOutcome::AdvancedNoDump => {
             st.applied_num = frame.frame_num;
+            st.stats.record_apply_advanced();
             true
         }
         // Undecodable diff / base mismatch the applier surfaced: re-ack and
         // wait for a Full keyframe, leaving the model untouched.
-        ApplyOutcome::ReackAndWait => true,
+        ApplyOutcome::ReackAndWait => {
+            st.stats.record_apply_reack();
+            true
+        }
         // Empty is returned early above; an applier should not produce this
         // for a visible body, but if it does, treat it as no advance.
-        ApplyOutcome::NoChange => false,
+        ApplyOutcome::NoChange => {
+            st.stats.record_apply_nochange();
+            false
+        }
     }
 }
 
@@ -1435,6 +1493,7 @@ fn compose_scroll_frame(st: &mut ClientState) -> Vec<u8> {
 /// Snapshots the prediction engine's display gauges for the stats log.
 fn predict_sample(stats: &predict::PredictorStats) -> PredictSample {
     let (correct, nocredit, incorrect) = stats.outcomes;
+    let (nocredit_unknown, nocredit_blank, nocredit_matched) = stats.nocredit_reasons;
     PredictSample {
         active: stats.active,
         shown: stats.shown_cells,
@@ -1443,6 +1502,9 @@ fn predict_sample(stats: &predict::PredictorStats) -> PredictSample {
         correct,
         nocredit,
         incorrect,
+        nocredit_unknown,
+        nocredit_blank,
+        nocredit_matched,
     }
 }
 
@@ -1486,10 +1548,14 @@ fn send_message(st: &mut ClientState) {
         input_base: st.outbox.base(),
         input: st.outbox.pending().to_vec(),
     };
-    // CLIENT_FLAG_ESCAPE and the server-logging toggles are one-shot: they rode
-    // this message, so clear them now (the server acts idempotently on repeats,
-    // and the user can retry if this datagram is lost). SHUTDOWN stays sticky.
-    st.flags &= !(sync::CLIENT_FLAG_ESCAPE | sync::CLIENT_FLAG_LOG_ON | sync::CLIENT_FLAG_LOG_OFF);
+    // CLIENT_FLAG_ESCAPE, the server-logging toggles, and the resync request are
+    // one-shot: they rode this message, so clear them now (the server acts
+    // idempotently on repeats, and the user can retry if this datagram is lost).
+    // SHUTDOWN stays sticky.
+    st.flags &= !(sync::CLIENT_FLAG_ESCAPE
+        | sync::CLIENT_FLAG_LOG_ON
+        | sync::CLIENT_FLAG_LOG_OFF
+        | sync::CLIENT_FLAG_RESYNC);
     for frag in st
         .fragmenter
         .make_fragments(&msg.encode(), sync::FRAGMENT_CONTENTS_MAX)
@@ -1705,6 +1771,17 @@ mod tests {
     }
 
     #[test]
+    fn dispatch_resync_sets_one_shot_resync_flag() {
+        // The palette's "Reset & resync" command sets CLIENT_FLAG_RESYNC and asks
+        // to send promptly so the server forces a Full keyframe (#wedge).
+        let raw = pty_raw_mode();
+        let mut st = test_state(24, 80);
+        let send = dispatch_palette_action(&mut st, &raw, "session.resync", &json!({}), 0);
+        assert!(send, "resync asks to send promptly");
+        assert_ne!(st.flags & sync::CLIENT_FLAG_RESYNC, 0, "resync flag set");
+    }
+
+    #[test]
     fn palette_commands_includes_both_logging_scopes() {
         let cmds = palette_commands(false);
         let arr = cmds.as_array().expect("commands is an array");
@@ -1717,7 +1794,11 @@ mod tests {
             names.iter().any(|n| n.to_lowercase().contains("server debug logging")),
             "server logging missing: {names:?}"
         );
-        assert_eq!(arr.len(), 9, "expected 9 commands, got {names:?}");
+        assert!(
+            names.iter().any(|n| n.to_lowercase().contains("resync")),
+            "resync command missing: {names:?}"
+        );
+        assert_eq!(arr.len(), 10, "expected 10 commands, got {names:?}");
     }
 
     #[test]

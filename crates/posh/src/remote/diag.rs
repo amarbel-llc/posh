@@ -95,6 +95,11 @@ pub struct ClientState {
     pub rows: u16,
     pub cols: u16,
     pub echo_on: bool,
+    /// Negotiated frame-sync codec label (#wedge): "dumpdiff" | "morph".
+    pub codec: &'static str,
+    /// Client apply-path histogram + last received frame (#wedge): a climbing
+    /// `basemis` with a frozen `term_gen` is the apply-stall fingerprint.
+    pub apply: crate::remote::stats::ApplySnapshot,
 }
 
 impl ClientState {
@@ -103,7 +108,9 @@ impl ClientState {
             "role=client pid={} remote={} last_send_age_ms={} applied_num={} \
              outbox_base={} outbox_pending={} scrollback_len={} srtt={:.0}ms rto={}ms \
              send_interval={}ms bytes_rx={} bytes_tx={} predict(active={} shown={} epoch_lag={}) \
-             term_gen={} rows={} cols={} echo_on={}",
+             term_gen={} rows={} cols={} echo_on={} codec={} \
+             apply(adv={} stale={} dup={} basemis={} reack={} nochange={} sb_rx={}) \
+             last_rx(num={} base={} body={})",
             std::process::id(),
             fmt_addr(self.remote),
             fmt_age(self.last_send_age_ms),
@@ -123,6 +130,17 @@ impl ClientState {
             self.rows,
             self.cols,
             self.echo_on as u8,
+            self.codec,
+            self.apply.advanced,
+            self.apply.stale,
+            self.apply.dup,
+            self.apply.basemis,
+            self.apply.reack,
+            self.apply.nochange,
+            self.apply.scrollback_rx,
+            self.apply.last_rx_num,
+            self.apply.last_rx_base,
+            self.apply.last_rx_body.as_str(),
         )
     }
 
@@ -269,6 +287,14 @@ mod tests {
             rows: 40,
             cols: 120,
             echo_on: true,
+            codec: "morph",
+            apply: crate::remote::stats::ApplySnapshot {
+                basemis: 7,
+                last_rx_num: 41,
+                last_rx_base: 40,
+                last_rx_body: crate::remote::stats::FrameKind::Diff,
+                ..Default::default()
+            },
         }
         .format();
         for key in [
@@ -283,6 +309,9 @@ mod tests {
             "rows=40",
             "cols=120",
             "echo_on=1",
+            "codec=morph",
+            "apply(adv=0 stale=0 dup=0 basemis=7 reack=0 nochange=0 sb_rx=0)",
+            "last_rx(num=41 base=40 body=diff)",
         ] {
             assert!(line.contains(key), "missing {key:?} in:\n{line}");
         }

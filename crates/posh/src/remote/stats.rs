@@ -18,6 +18,10 @@ use crate::util::{self, now_ms};
 /// Minimum gap between emitted summary lines: idle ticks don't spam the log.
 const FLUSH_INTERVAL_MS: u64 = 1000;
 
+/// A visible model frozen for at least this long WHILE diff frames keep
+/// arriving is the apply-stall wedge signature the detector self-logs (#wedge).
+const WEDGE_FROZEN_MS: u64 = 3000;
+
 #[derive(Default)]
 pub struct Stats {
     enabled: bool,
@@ -78,6 +82,33 @@ pub struct Stats {
     dump_vt_us_total: u64,
     dump_vt_count: u64,
     dump_vt_us_max: u64,
+
+    // Client apply-path outcome histogram (#wedge debuggability): how received
+    // visible/scrollback bodies resolved in `apply_frame`. A climbing `basemis`
+    // while the visible model is frozen is the apply-stall fingerprint, distinct
+    // from an idle session where no frames arrive at all.
+    apply_advanced: u64,
+    apply_stale: u64,
+    apply_dup: u64,
+    apply_basemis: u64,
+    apply_reack: u64,
+    apply_nochange: u64,
+    /// Received Scrollback bodies (RFC 0002) — excluded from the full/diff/empty
+    /// frame counters, surfaced separately so a scrollback storm/reset is visible.
+    frames_scrollback: u64,
+    /// The visible/scrollback frame last seen at the apply gate: (num, base,
+    /// kind). Reported in the dump + wedge line so a stall names what it rejects.
+    last_rx_num: u64,
+    last_rx_base: u64,
+    last_rx_body: FrameKind,
+
+    // Wedge auto-detector: the visible-model generation and the diff-rx count
+    // when the model last advanced, so a model frozen past WEDGE_FROZEN_MS WHILE
+    // diff frames keep arriving (the apply-stall signature) self-logs once.
+    wedge_last_term_gen: u64,
+    wedge_term_gen_since: u64,
+    wedge_diff_at_change: u64,
+    wedge_warned: bool,
 }
 
 /// Client prediction gauges sampled at flush time (POSH_DEBUG_LOG). Bundled so
@@ -93,6 +124,53 @@ pub struct PredictSample {
     pub correct: u64,
     pub nocredit: u64,
     pub incorrect: u64,
+    /// `nocredit` split by cause (#predict-echo): (unknown, blank,
+    /// matched_original). `matched` dominating is the credit-starvation signature.
+    pub nocredit_unknown: u64,
+    pub nocredit_blank: u64,
+    pub nocredit_matched: u64,
+}
+
+/// Wire-body kind of a received frame, recorded at the apply gate so the dump
+/// and the wedge detector can name exactly which frame a frozen client is
+/// rejecting (#wedge debuggability).
+#[derive(Clone, Copy, Default, PartialEq, Eq)]
+pub enum FrameKind {
+    #[default]
+    None,
+    Full,
+    Diff,
+    Morph,
+    Scrollback,
+}
+
+impl FrameKind {
+    pub fn as_str(self) -> &'static str {
+        match self {
+            FrameKind::None => "none",
+            FrameKind::Full => "full",
+            FrameKind::Diff => "diff",
+            FrameKind::Morph => "morph",
+            FrameKind::Scrollback => "scrollback",
+        }
+    }
+}
+
+/// Snapshot of the client apply-path histogram + last received frame, for the
+/// SIGUSR2 dump (#wedge debuggability). A climbing `basemis` together with a
+/// frozen visible model (`term_gen`) is the apply-stall fingerprint.
+#[derive(Clone, Copy, Default)]
+pub struct ApplySnapshot {
+    pub advanced: u64,
+    pub stale: u64,
+    pub dup: u64,
+    pub basemis: u64,
+    pub reack: u64,
+    pub nochange: u64,
+    pub scrollback_rx: u64,
+    pub last_rx_num: u64,
+    pub last_rx_base: u64,
+    pub last_rx_body: FrameKind,
 }
 
 impl Stats {
@@ -103,9 +181,11 @@ impl Stats {
             Some(p) if !p.is_empty() => util::log_init(Path::new(&p)).is_ok(),
             _ => false,
         };
+        let now = now_ms();
         Stats {
             enabled,
-            last_flush: now_ms(),
+            last_flush: now,
+            wedge_term_gen_since: now,
             ..Default::default()
         }
     }
@@ -132,6 +212,111 @@ impl Stats {
         self.frames_total += 1;
         self.frames_empty += 1;
         self.dirty = true;
+    }
+    /// A received Scrollback body (RFC 0002). Tracked apart from the
+    /// full/diff/empty `frames_total` economics, which it is deliberately not
+    /// part of, so a scrollback storm/reset stays visible (#wedge).
+    pub fn record_frame_scrollback(&mut self) {
+        self.frames_scrollback += 1;
+        self.dirty = true;
+    }
+
+    // --- client apply-path histogram (#wedge debuggability) ------------------
+
+    /// Record the visible/scrollback frame seen at the apply gate. `base` is the
+    /// body's diff/morph/scrollback base, or `num` for a self-contained `Full`.
+    pub fn record_apply_rx(&mut self, num: u64, base: u64, kind: FrameKind) {
+        self.last_rx_num = num;
+        self.last_rx_base = base;
+        self.last_rx_body = kind;
+    }
+    /// The body advanced the client's applied state (or appended scrollback).
+    pub fn record_apply_advanced(&mut self) {
+        self.apply_advanced += 1;
+    }
+    /// `frame_num < applied_num`: a stale retransmission, re-acked not applied.
+    pub fn record_apply_stale(&mut self) {
+        self.apply_stale += 1;
+    }
+    /// `frame_num == applied_num`: a duplicate retransmission, re-acked.
+    pub fn record_apply_dup(&mut self) {
+        self.apply_dup += 1;
+    }
+    /// Base != applied_num: the body anchors on a state we are not at, so it is
+    /// re-acked and dropped. A climbing `basemis` with a frozen model IS the
+    /// apply-stall wedge.
+    pub fn record_apply_basemis(&mut self) {
+        self.apply_basemis += 1;
+    }
+    /// The applier surfaced an undecodable body (re-ack and wait for a keyframe).
+    pub fn record_apply_reack(&mut self) {
+        self.apply_reack += 1;
+    }
+    /// The applier reported no visible change.
+    pub fn record_apply_nochange(&mut self) {
+        self.apply_nochange += 1;
+    }
+
+    /// Snapshot the apply-path histogram + last-received frame for the dump.
+    pub fn apply_snapshot(&self) -> ApplySnapshot {
+        ApplySnapshot {
+            advanced: self.apply_advanced,
+            stale: self.apply_stale,
+            dup: self.apply_dup,
+            basemis: self.apply_basemis,
+            reack: self.apply_reack,
+            nochange: self.apply_nochange,
+            scrollback_rx: self.frames_scrollback,
+            last_rx_num: self.last_rx_num,
+            last_rx_base: self.last_rx_base,
+            last_rx_body: self.last_rx_body,
+        }
+    }
+
+    /// Wedge auto-detector: when the visible model (`term_gen`) has not advanced
+    /// for `WEDGE_FROZEN_MS` WHILE diff frames keep arriving — the apply-stall
+    /// signature, distinct from an idle session where no frames arrive — emit one
+    /// `wedge` line carrying the apply histogram and the rejected frame, then
+    /// latch until the model advances. Returns whether it emitted (for tests).
+    pub fn check_wedge(&mut self, now: u64, term_gen: u64, applied_num: u64, codec: &str) -> bool {
+        if !self.enabled {
+            return false;
+        }
+        if term_gen != self.wedge_last_term_gen {
+            self.wedge_last_term_gen = term_gen;
+            self.wedge_term_gen_since = now;
+            self.wedge_diff_at_change = self.frames_diff;
+            self.wedge_warned = false;
+            return false;
+        }
+        if self.wedge_warned {
+            return false;
+        }
+        let frozen_ms = now.saturating_sub(self.wedge_term_gen_since);
+        let diffs_since = self.frames_diff.saturating_sub(self.wedge_diff_at_change);
+        if frozen_ms < WEDGE_FROZEN_MS || diffs_since == 0 {
+            return false;
+        }
+        util::log_write(
+            "wedge",
+            &format!(
+                "visible model frozen {frozen_ms}ms while {diffs_since} diff frames arrived \
+                 (apply-stall) applied_num={applied_num} codec={codec} \
+                 last_rx(num={} base={} body={}) \
+                 apply(adv={} stale={} dup={} basemis={} reack={} nochange={})",
+                self.last_rx_num,
+                self.last_rx_base,
+                self.last_rx_body.as_str(),
+                self.apply_advanced,
+                self.apply_stale,
+                self.apply_dup,
+                self.apply_basemis,
+                self.apply_reack,
+                self.apply_nochange,
+            ),
+        );
+        self.wedge_warned = true;
+        true
     }
 
     pub fn record_render(&mut self, bytes_out: usize) {
@@ -367,9 +552,11 @@ impl Stats {
                  frames rx={} (full={} diff={} empty={}) bytes_rx={bytes_rx} bw_down={} \
                  predict active={} shown={} epoch_lag={} resets={} \
                  correct={} nocredit={} incorrect={} srtt_trig={} \
+                 nocredit_by(unk={} blank={} matched={}) \
                  render writes={} bytes_out={} skipped_idle={} \
                  apply_us={}/{} compose_us={}/{} input_ms={}/{} \
-                 loop iters={} busy={}us idle={}us busy_pct={}% max_iter_us={}",
+                 loop iters={} busy={}us idle={}us busy_pct={}% max_iter_us={} \
+                 apply(adv={} stale={} dup={} basemis={} reack={} nochange={}) sb_rx={}",
                 self.frames_total,
                 self.frames_full,
                 self.frames_diff,
@@ -383,6 +570,9 @@ impl Stats {
                 predict.nocredit,
                 predict.incorrect,
                 srtt_trig as u8,
+                predict.nocredit_unknown,
+                predict.nocredit_blank,
+                predict.nocredit_matched,
                 self.render_writes,
                 self.render_bytes_out,
                 self.render_skipped_idle,
@@ -397,6 +587,13 @@ impl Stats {
                 self.loop_idle_us,
                 self.loop_busy_pct(),
                 self.loop_busy_us_max,
+                self.apply_advanced,
+                self.apply_stale,
+                self.apply_dup,
+                self.apply_basemis,
+                self.apply_reack,
+                self.apply_nochange,
+                self.frames_scrollback,
             ),
         );
         self.mark_flushed(now, bytes_rx, bytes_tx);
@@ -488,10 +685,47 @@ mod tests {
         s.record_frame_diff();
         s.record_frame_diff();
         s.record_frame_empty();
-        assert_eq!(s.frames_total, 4);
+        s.record_frame_scrollback();
+        assert_eq!(s.frames_total, 4, "scrollback stays out of the full/diff/empty total");
         assert_eq!(s.frames_full, 1);
         assert_eq!(s.frames_diff, 2);
         assert_eq!(s.frames_empty, 1);
+        assert_eq!(s.frames_scrollback, 1);
+    }
+
+    #[test]
+    fn wedge_detector_fires_on_frozen_model_with_arriving_diffs() {
+        let mut s = enabled_stats();
+        // Model advances to gen 5 at t=0: arms the freeze baseline.
+        assert!(!s.check_wedge(0, 5, 100, "morph"));
+        // Diffs keep arriving while the visible model stays at gen 5...
+        s.record_frame_diff();
+        s.record_frame_diff();
+        // ...not yet past the freeze threshold.
+        assert!(!s.check_wedge(WEDGE_FROZEN_MS - 1, 5, 100, "morph"));
+        // Past the threshold with diffs since the freeze began: fires once.
+        assert!(s.check_wedge(WEDGE_FROZEN_MS, 5, 100, "morph"));
+        // Latched: does not re-fire while the model stays frozen.
+        assert!(!s.check_wedge(WEDGE_FROZEN_MS + 5000, 5, 100, "morph"));
+        // The model advances: re-arms (no immediate re-fire).
+        assert!(!s.check_wedge(WEDGE_FROZEN_MS + 5000, 6, 100, "morph"));
+    }
+
+    #[test]
+    fn wedge_detector_ignores_idle_model_with_no_diffs() {
+        let mut s = enabled_stats();
+        assert!(!s.check_wedge(0, 5, 100, "morph"));
+        // No diffs arrive: a long-frozen model is just an idle session, not a
+        // wedge — must not warn no matter how long it sits.
+        assert!(!s.check_wedge(WEDGE_FROZEN_MS * 100, 5, 100, "morph"));
+    }
+
+    #[test]
+    fn wedge_detector_silent_when_disabled() {
+        let mut s = Stats::default(); // enabled = false
+        s.frames_diff = 50;
+        assert!(!s.check_wedge(0, 5, 100, "morph"));
+        assert!(!s.check_wedge(WEDGE_FROZEN_MS * 10, 5, 100, "morph"));
     }
 
     #[test]
@@ -619,10 +853,12 @@ mod tests {
             "frames rx=1 (full=0 diff=1",
             "bw_down=",
             "predict active=1 shown=1 epoch_lag=0 resets=0 correct=0 nocredit=0 incorrect=0 srtt_trig=0",
+            "nocredit_by(unk=0 blank=0 matched=0)",
             "apply_us=60/80", // windowed avg / max
             "compose_us=60/60",
             "input_ms=23/34",
             "loop iters=1 busy=100us idle=900us busy_pct=10% max_iter_us=100",
+            "apply(adv=0 stale=0 dup=0 basemis=0 reack=0 nochange=0) sb_rx=0",
         ] {
             assert!(body.contains(key), "missing client key {key:?} in:\n{body}");
         }

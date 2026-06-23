@@ -96,6 +96,10 @@ pub struct PredictorStats {
     pub epoch_lag: u64,
     pub mispredict_resets: u64,
     pub outcomes: (u64, u64, u64),
+    /// `outcomes.1` (nocredit) split by cause: (unknown, blank, matched_original).
+    /// `matched_original` dominating is the field credit-starvation signature
+    /// (#predict-echo).
+    pub nocredit_reasons: (u64, u64, u64),
     pub srtt_trigger: bool,
 }
 

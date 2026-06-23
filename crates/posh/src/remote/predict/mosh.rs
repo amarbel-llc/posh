@@ -6,7 +6,7 @@
 
 use crate::remote::display::Snapshot;
 
-use super::overlay::{OverlayBuffer, Validity};
+use super::overlay::{NoCreditReason, OverlayBuffer, Validity};
 use super::{
     PredictionModel, PredictionRenderer, Predictor, PredictorStats, FLAG_TRIGGER_HIGH,
     FLAG_TRIGGER_LOW, GLITCH_FLAG_THRESHOLD, GLITCH_REPAIR_COUNT, GLITCH_REPAIR_MININTERVAL,
@@ -39,6 +39,13 @@ pub struct MoshPredictor {
     pred_correct: u64,
     pred_nocredit: u64,
     pred_incorrect: u64,
+    /// `pred_nocredit` split by cause (#predict-echo): which branch of
+    /// `get_validity` denied credit. `matched` dominating points at typing along
+    /// content already on screen (autosuggestions / a TUI's own echo); `unknown`
+    /// at cursor-cell churn; `blank` at blank predictions.
+    pred_nocredit_unknown: u64,
+    pred_nocredit_blank: u64,
+    pred_nocredit_matched: u64,
 }
 
 impl MoshPredictor {
@@ -62,6 +69,9 @@ impl MoshPredictor {
             pred_correct: 0,
             pred_nocredit: 0,
             pred_incorrect: 0,
+            pred_nocredit_unknown: 0,
+            pred_nocredit_blank: 0,
+            pred_nocredit_matched: 0,
         }
     }
 
@@ -134,6 +144,9 @@ impl MoshPredictor {
         let mut n_correct = 0u64;
         let mut n_nocredit = 0u64;
         let mut n_incorrect = 0u64;
+        let mut n_nocredit_unknown = 0u64;
+        let mut n_nocredit_blank = 0u64;
+        let mut n_nocredit_matched = 0u64;
         let experimental = self.display_preference == PredictionModel::Experimental;
 
         self.buf.overlays.retain(|row| row.row_num < fb.rows);
@@ -180,8 +193,13 @@ impl MoshPredictor {
                         }
                         row.cells[j].reset();
                     }
-                    Validity::CorrectNoCredit => {
+                    Validity::CorrectNoCredit(reason) => {
                         n_nocredit += 1;
+                        match reason {
+                            NoCreditReason::Unknown => n_nocredit_unknown += 1,
+                            NoCreditReason::Blank => n_nocredit_blank += 1,
+                            NoCreditReason::MatchedOriginal => n_nocredit_matched += 1,
+                        }
                         row.cells[j].reset();
                     }
                     Validity::Pending => {
@@ -205,6 +223,9 @@ impl MoshPredictor {
         self.pred_correct += n_correct;
         self.pred_nocredit += n_nocredit;
         self.pred_incorrect += n_incorrect;
+        self.pred_nocredit_unknown += n_nocredit_unknown;
+        self.pred_nocredit_blank += n_nocredit_blank;
+        self.pred_nocredit_matched += n_nocredit_matched;
 
         if do_reset {
             self.mispredict_resets += 1;
@@ -304,6 +325,11 @@ impl Predictor for MoshPredictor {
                 .saturating_sub(self.buf.confirmed_epoch),
             mispredict_resets: self.mispredict_resets,
             outcomes: (self.pred_correct, self.pred_nocredit, self.pred_incorrect),
+            nocredit_reasons: (
+                self.pred_nocredit_unknown,
+                self.pred_nocredit_blank,
+                self.pred_nocredit_matched,
+            ),
             srtt_trigger: self.srtt_trigger,
         }
     }

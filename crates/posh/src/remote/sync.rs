@@ -494,6 +494,15 @@ pub const CLIENT_FLAG_ESCAPE: u8 = 4;
 pub const CLIENT_FLAG_LOG_ON: u8 = 8;
 pub const CLIENT_FLAG_LOG_OFF: u8 = 16;
 
+/// Client asks the server to send a fresh `Full` keyframe (the palette "Reset &
+/// resync" command): the client's apply state is wedged on a base it cannot
+/// apply and the automatic stale-ack -> `Full` recovery did not fire. One-shot
+/// like `CLIENT_FLAG_ESCAPE` — cleared after one send (a lost request just means
+/// the user retries). On receipt the server drops its acked baseline so the next
+/// frame must be a `Full`, which the client applies unconditionally. `0x20` is
+/// the next free client runtime bit after `CLIENT_FLAG_LOG_OFF`.
+pub const CLIENT_FLAG_RESYNC: u8 = 32;
+
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct ClientMessage {
     /// Runtime signal bits only (CLIENT_FLAG_SHUTDOWN); the EXTENSION bit

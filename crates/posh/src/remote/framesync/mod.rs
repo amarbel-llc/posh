@@ -64,6 +64,14 @@ impl FrameSync {
         matches!(self, FrameSync::Morph)
     }
 
+    /// A short stable label for logs and the SIGUSR2 dump (#wedge).
+    pub fn label(self) -> &'static str {
+        match self {
+            FrameSync::DumpDiff => "dumpdiff",
+            FrameSync::Morph => "morph",
+        }
+    }
+
     /// The client-side applier for this selection. Both impls handle
     /// `Full`/`Diff` identically; the Morph applier additionally applies a
     /// `Morph` body to the existing model.

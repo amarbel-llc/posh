@@ -494,6 +494,21 @@ fn server_loop(mut conn: Connection, child: pty::PtyChild, rows: u16, cols: u16)
                             &mut acked_baseline,
                             &mut acked_sb_total,
                         );
+                        // Force-resync (palette "Reset & resync"): the client is
+                        // wedged rejecting diffs against a base it isn't at and the
+                        // stale-ack -> Full auto-recovery did not fire. Applied
+                        // AFTER update_acks — which would otherwise repopulate the
+                        // baseline from this very ack — so the drop sticks: with no
+                        // diff base the encoder must emit a Full keyframe, and
+                        // force_frame ships it even if the screen is static. The
+                        // client applies a Full unconditionally, breaking the
+                        // apply-stall; its ack then repopulates the baseline and
+                        // incremental diffing resumes.
+                        if msg.flags & sync::CLIENT_FLAG_RESYNC != 0 {
+                            acked_data = None;
+                            acked_baseline = None;
+                            force_frame = true;
+                        }
                         let now_wants = caps::find(&msg.caps, caps::CAP_SCROLLBACK).is_some();
                         if now_wants && !peer_wants_scrollback {
                             // (Re)activation: accumulate forward from here.
@@ -1289,6 +1304,102 @@ mod tests {
         assert!(
             saw_log_off,
             "server never cleared FLAG_SERVER_LOG after CLIENT_FLAG_LOG_OFF"
+        );
+        assert!(saw_shutdown, "server never wound down");
+        server.join().unwrap();
+    }
+
+    #[test]
+    fn resync_flag_forces_a_full_keyframe() {
+        // #wedge: CLIENT_FLAG_RESYNC (the palette "Reset & resync" command) makes
+        // the server drop its acked baseline and emit a fresh Full keyframe even
+        // when the screen is static — the manual unwedge for an apply-stall. We
+        // ack the handshake frame, send RESYNC, then require a LATER Full (a
+        // frame_num beyond the one acked when we asked), proving it is a freshly
+        // forced keyframe and not the initial handshake Full retransmitted.
+        let key = Key::random();
+        let (server_conn, port) = Connection::server((62700, 62799), &key, Family::Inet).unwrap();
+        // Emit one line so a visible frame is actually produced (a blank screen
+        // never changes generation, so the server would only send heartbeats and
+        // `acked` would never advance to trigger the resync), then idle.
+        let cmd: Vec<String> = vec!["/bin/sh".into(), "-c".into(), "echo resync; sleep 600".into()];
+        let child = crate::pty::spawn_shell(Some(&cmd), 24, 80, &[], None).unwrap();
+        util::set_nonblocking(child.master).unwrap();
+        let server = std::thread::spawn(move || server_loop(server_conn, child, 24, 80));
+
+        let addr = format!("127.0.0.1:{port}").parse().unwrap();
+        let mut conn = Connection::client(addr, &key).unwrap();
+        let mut fragmenter = Fragmenter::new();
+        let mut assembly = FragmentAssembly::new();
+
+        let mut acked = 0u64;
+        let mut resync_at: Option<u64> = None;
+        let mut saw_resync_full = false;
+        let mut shutting = false;
+        let mut saw_shutdown = false;
+        let deadline = now_ms() + 15_000;
+        while now_ms() < deadline {
+            // Once we've acked the handshake frame, ask for a resync; once the
+            // forced Full comes back, wind the session down.
+            let want_resync = resync_at.is_none() && acked >= 1 && !saw_resync_full;
+            if want_resync {
+                resync_at = Some(acked);
+            }
+            let flags = if shutting || saw_resync_full {
+                shutting = true;
+                sync::CLIENT_FLAG_SHUTDOWN
+            } else if want_resync {
+                sync::CLIENT_FLAG_RESYNC
+            } else {
+                0
+            };
+            let msg = ClientMessage {
+                flags,
+                caps: vec![],
+                acked_frame: acked,
+                rows: 24,
+                cols: 80,
+                input_base: 0,
+                input: vec![],
+            };
+            for frag in fragmenter.make_fragments(&msg.encode(), sync::FRAGMENT_CONTENTS_MAX) {
+                conn.send(&frag.to_bytes()).unwrap();
+            }
+            if saw_shutdown {
+                break;
+            }
+            std::thread::sleep(std::time::Duration::from_millis(50));
+            loop {
+                match conn.recv() {
+                    Ok(Some(payload)) => {
+                        let Ok(frag) = sync::Fragment::from_bytes(&payload) else {
+                            continue;
+                        };
+                        let Some(assembled) = assembly.add(frag) else {
+                            continue;
+                        };
+                        let Ok(frame) = ServerFrame::decode(&assembled) else {
+                            continue;
+                        };
+                        acked = acked.max(frame.frame_num);
+                        if let Some(at) = resync_at {
+                            if frame.frame_num > at && matches!(frame.body, FrameBody::Full(_)) {
+                                saw_resync_full = true;
+                            }
+                        }
+                        if frame.flags & sync::FLAG_SHUTDOWN != 0 {
+                            saw_shutdown = true;
+                        }
+                    }
+                    Ok(None) => continue,
+                    Err(e) if e.kind() == std::io::ErrorKind::WouldBlock => break,
+                    Err(_) => break,
+                }
+            }
+        }
+        assert!(
+            saw_resync_full,
+            "server never sent a fresh Full keyframe after CLIENT_FLAG_RESYNC"
         );
         assert!(saw_shutdown, "server never wound down");
         server.join().unwrap();

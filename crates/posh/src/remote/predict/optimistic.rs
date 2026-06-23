@@ -130,6 +130,7 @@ impl Predictor for OptimisticPredictor {
                 .saturating_sub(self.buf.confirmed_epoch),
             mispredict_resets: 0,
             outcomes: (0, 0, 0),
+            nocredit_reasons: (0, 0, 0),
             srtt_trigger: false,
         }
     }

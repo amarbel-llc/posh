@@ -17,9 +17,25 @@ use super::{CellHint, PredictionRenderer};
 pub(super) enum Validity {
     Pending,
     Correct,
-    CorrectNoCredit,
+    CorrectNoCredit(NoCreditReason),
     IncorrectOrExpired,
     Inactive,
+}
+
+/// Why a `CorrectNoCredit` prediction earned no credit, so the field
+/// "nocredit-dominant" credit starvation can be attributed to a specific branch
+/// instead of an opaque aggregate (#predict-echo debuggability).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(super) enum NoCreditReason {
+    /// The cell is still `unknown` — the last cell of a print (the cursor
+    /// cell), whose final glyph the server has not pinned down yet.
+    Unknown,
+    /// The prediction replaces the cell with blank — too weak to credit
+    /// ("too easy to trigger falsely").
+    Blank,
+    /// The predicted glyph AND rendition were already on screen: a genuine no-op
+    /// prediction (e.g. typing along a byte-identical autosuggestion).
+    MatchedOriginal,
 }
 
 /// mosh Cell::contents_match: glyphs match, ignoring renditions.
@@ -94,11 +110,11 @@ impl OverlayCell {
             return Validity::Pending;
         }
         if self.unknown {
-            return Validity::CorrectNoCredit;
+            return Validity::CorrectNoCredit(NoCreditReason::Unknown);
         }
         if self.replacement.is_blank() {
             // Too easy for this to trigger falsely.
-            return Validity::CorrectNoCredit;
+            return Validity::CorrectNoCredit(NoCreditReason::Blank);
         }
         let current = fb.cell(row, self.col).expect("cell in range");
         if contents_match(current, &self.replacement) {
@@ -110,7 +126,7 @@ impl OverlayCell {
             // CorrectNoCredit, starving confirmed_epoch and hiding all local
             // echo (shown=0, nocredit-dominant).
             if self.original_contents.iter().any(|c| c == &self.replacement) {
-                return Validity::CorrectNoCredit;
+                return Validity::CorrectNoCredit(NoCreditReason::MatchedOriginal);
             }
             return Validity::Correct;
         }
@@ -719,5 +735,45 @@ impl OverlayBuffer {
         } else {
             self.cursor().row += 1;
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// An active prediction past its expiration frame, so `late_ack = 0` makes
+    /// it eligible for crediting (not `Pending`).
+    fn ready_cell(col: u16) -> OverlayCell {
+        let mut c = OverlayCell::new(col, 1);
+        c.active = true;
+        c.expiration_frame = 0;
+        c
+    }
+
+    #[test]
+    fn nocredit_attributes_unknown_cell() {
+        // The cursor cell (last cell of a print) is `unknown` => no credit,
+        // attributed to the Unknown branch (#predict-echo).
+        let fb = Snapshot::blank(24, 80);
+        let mut c = ready_cell(2);
+        c.unknown = true;
+        assert_eq!(
+            c.get_validity(&fb, 0, 0),
+            Validity::CorrectNoCredit(NoCreditReason::Unknown)
+        );
+    }
+
+    #[test]
+    fn nocredit_attributes_blank_replacement() {
+        // A blank prediction is too weak to credit => Blank branch.
+        let fb = Snapshot::blank(24, 80);
+        let mut c = ready_cell(2);
+        c.unknown = false;
+        c.replacement = blank_cell();
+        assert_eq!(
+            c.get_validity(&fb, 0, 0),
+            Validity::CorrectNoCredit(NoCreditReason::Blank)
+        );
     }
 }
