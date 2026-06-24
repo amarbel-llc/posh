@@ -1276,6 +1276,16 @@ fn apply_frame(st: &mut ClientState, frame: &ServerFrame) -> bool {
             st.applied_num = frame.frame_num;
             st.applied_data = dump;
             st.stats.record_apply_advanced();
+            // The manual "Reset & resync" (CLIENT_FLAG_RESYNC) forces a Full
+            // keyframe; once that Full applies and advances us, the recovery is
+            // complete, so drop the sticky "resyncing…" notice (#93). Mirrors
+            // the one-shot "opening shell…" drop above. Only a Full resolves a
+            // resync — a Diff/Morph advancing does not.
+            if matches!(frame.body, FrameBody::Full(_))
+                && st.notify.message() == "resyncing\u{2026}"
+            {
+                st.notify.set_message("", false, now_ms());
+            }
             true
         }
         // MorphDelta advanced the model in place without re-dumping it (#15).
@@ -1779,6 +1789,66 @@ mod tests {
         let send = dispatch_palette_action(&mut st, &raw, "session.resync", &json!({}), 0);
         assert!(send, "resync asks to send promptly");
         assert_ne!(st.flags & sync::CLIENT_FLAG_RESYNC, 0, "resync flag set");
+    }
+
+    #[test]
+    fn resync_banner_clears_once_full_applies() {
+        // #93: "Reset & resync" sets a sticky "resyncing…" banner; the forced
+        // Full keyframe applying must drop it, otherwise it persists forever.
+        let raw = pty_raw_mode();
+        let mut st = test_state(3, 20);
+        let _ = dispatch_palette_action(&mut st, &raw, "session.resync", &json!({}), 0);
+        assert_eq!(
+            st.notify.message(),
+            "resyncing\u{2026}",
+            "resync sets the sticky banner"
+        );
+        let full = ServerFrame {
+            flags: 0,
+            caps: vec![],
+            frame_num: 1,
+            input_ack: 0,
+            echo_ack: 0,
+            body: FrameBody::Full(b"recovered".to_vec()),
+        };
+        assert!(apply_frame(&mut st, &full));
+        assert_eq!(
+            st.notify.message(),
+            "",
+            "the applied Full clears the resync banner"
+        );
+    }
+
+    #[test]
+    fn resync_banner_survives_an_unrelated_diff() {
+        // A Diff advancing the model is not the resync result, so the banner
+        // must stay up until the forced Full lands (#93).
+        let raw = pty_raw_mode();
+        let mut st = test_state(3, 20);
+        let base = ServerFrame {
+            flags: 0,
+            caps: vec![],
+            frame_num: 1,
+            input_ack: 0,
+            echo_ack: 0,
+            body: FrameBody::Full(b"a".to_vec()),
+        };
+        assert!(apply_frame(&mut st, &base));
+        let _ = dispatch_palette_action(&mut st, &raw, "session.resync", &json!({}), 0);
+        let diff = ServerFrame {
+            frame_num: 2,
+            body: FrameBody::Diff {
+                base: 1,
+                diff: sync::make_diff(b"a", b"ab"),
+            },
+            ..base
+        };
+        assert!(apply_frame(&mut st, &diff));
+        assert_eq!(
+            st.notify.message(),
+            "resyncing\u{2026}",
+            "a Diff must not clear the resync banner"
+        );
     }
 
     #[test]
