@@ -66,6 +66,17 @@ pub const CAP_AGENT_ACK: u8 = 8;
 #[allow(dead_code)]
 pub const AGENT_DATA_MAX: usize = u8::MAX as usize - 8; // 247
 
+/// Max [`CAP_AGENT_DATA`] entries one message carries. The table length is a
+/// `count: u8`, so the whole table (agent data + protocol version + scrollback
+/// + any other caps) must stay under 256 entries; emitting the entire unacked
+/// agent tail unbounded would overflow that count and silently corrupt the
+/// frame. We cap agent data well below 255 to leave headroom for the handful
+/// of non-agent caps, bounding one message at ~`MAX_AGENT_DATA_CAPS *
+/// AGENT_DATA_MAX` ≈ 59 KB of agent bytes; the unsent tail rides the next
+/// message (the stream is cumulative, so a prefix is always valid).
+#[allow(dead_code)]
+pub const MAX_AGENT_DATA_CAPS: usize = 239;
+
 /// The post-table format version we implement (payload of
 /// [`CAP_PROTOCOL_VERSION`]).
 pub const PROTOCOL_VERSION: u8 = 1;
@@ -151,13 +162,17 @@ pub fn find_all(caps: &[Cap], id: u8) -> impl Iterator<Item = &Cap> {
 
 /// Splits a contiguous agent-stream run starting at `base` into AGENT_DATA
 /// caps of at most [`AGENT_DATA_MAX`] bytes each, with contiguous offsets. An
-/// empty `data` produces no entries (nothing to (re)transmit). The number of
-/// entries one message can hold is bounded by the table's `count: u8`.
+/// empty `data` produces no entries (nothing to (re)transmit). At most
+/// [`MAX_AGENT_DATA_CAPS`] entries are emitted: the table count is a `u8`, so a
+/// large unacked tail is sent as a prefix here and the rest rides the next
+/// message (the stream is cumulative — a prefix is always a valid send, and
+/// retransmission carries the remainder). Without this cap a >~59 KB pending
+/// buffer would produce >255 entries and overflow the table's count byte.
 #[allow(dead_code)]
 pub fn encode_agent_data(base: u64, data: &[u8]) -> Vec<Cap> {
     let mut out = Vec::new();
     let mut offset = base;
-    for chunk in data.chunks(AGENT_DATA_MAX) {
+    for chunk in data.chunks(AGENT_DATA_MAX).take(MAX_AGENT_DATA_CAPS) {
         let mut payload = Vec::with_capacity(8 + chunk.len());
         payload.extend_from_slice(&offset.to_be_bytes());
         payload.extend_from_slice(chunk);
@@ -306,6 +321,26 @@ mod tests {
     #[test]
     fn agent_data_empty_run_emits_nothing() {
         assert!(encode_agent_data(7, b"").is_empty());
+    }
+
+    #[test]
+    fn agent_data_caps_bounded_so_table_count_cannot_overflow() {
+        // A pending tail far larger than one message can carry must NOT produce
+        // more than MAX_AGENT_DATA_CAPS entries — otherwise the table's count:u8
+        // overflows and silently corrupts the frame. The emitted prefix stays
+        // contiguous from the base; the remainder rides a later message.
+        let huge = vec![0u8; AGENT_DATA_MAX * (MAX_AGENT_DATA_CAPS + 50)];
+        let caps = encode_agent_data(0, &huge);
+        assert_eq!(caps.len(), MAX_AGENT_DATA_CAPS);
+        // Whole table (agent data + a generous slack for other caps) fits a u8.
+        assert!(caps.len() + 16 <= u8::MAX as usize);
+        // The emitted entries are still a contiguous prefix from offset 0.
+        let mut expected = 0u64;
+        for cap in &caps {
+            let (offset, bytes) = decode_agent_data(&cap.payload).unwrap();
+            assert_eq!(offset, expected);
+            expected += bytes.len() as u64;
+        }
     }
 
     #[test]

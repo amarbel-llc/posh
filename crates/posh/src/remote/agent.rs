@@ -31,9 +31,13 @@ use crate::util::{self, Result};
 // the change signals on each.
 /// Max concurrent agent channels per connection: bounds clients and memory.
 const MAX_AGENT_CHANNELS: usize = 8;
-/// Per-channel buffered-bytes cap (OpenSSH's max agent message). A read that
-/// would exceed it is split across `Data` records, never grown unboundedly.
-const CHANNEL_READ_CHUNK: usize = 256 * 1024;
+/// Read-syscall buffer for draining a channel socket. The drain loop reads
+/// repeatedly until `WouldBlock`, so this only bounds bytes-per-`read()`, not
+/// per-channel throughput; kept modest (16 KiB) so the stack buffer stays small
+/// even with `MAX_AGENT_CHANNELS` channels read in one pass. Agent messages are
+/// typically well under 1 KiB, and `AGENT_DATA` chunks the stream to ≤247 bytes
+/// regardless, so a larger read buffer buys nothing.
+const CHANNEL_READ_BUF: usize = 16 * 1024;
 /// Cadence for the symlink-liveness / takeover check and dead-`srv-*.sock` GC.
 const AGENT_SLOW_TICK_MS: u64 = 5_000;
 /// Peer-silence window after which the endpoint fast-fails outstanding agent
@@ -400,20 +404,23 @@ impl AgentClient {
     }
 }
 
-fn close_record(channel: u32) -> AgentRecord {
+/// An empty-payload control record. `close_record`/`fail_record` are the named
+/// call sites — `Close` (orderly end) and `Fail` (the client end couldn't reach
+/// the local agent) carry no bytes, only the channel and kind.
+fn control_record(channel: u32, kind: RecordKind) -> AgentRecord {
     AgentRecord {
         channel,
-        kind: RecordKind::Close,
+        kind,
         payload: Vec::new(),
     }
 }
 
+fn close_record(channel: u32) -> AgentRecord {
+    control_record(channel, RecordKind::Close)
+}
+
 fn fail_record(channel: u32) -> AgentRecord {
-    AgentRecord {
-        channel,
-        kind: RecordKind::Fail,
-        payload: Vec::new(),
-    }
+    control_record(channel, RecordKind::Fail)
 }
 
 // ---------------------------------------------------------------------------
@@ -438,7 +445,7 @@ fn read_channel_data(channels: &mut Vec<Channel>) -> Vec<AgentRecord> {
         if ch.closed {
             continue;
         }
-        let mut buf = [0u8; CHANNEL_READ_CHUNK];
+        let mut buf = [0u8; CHANNEL_READ_BUF];
         loop {
             match ch.stream.read(&mut buf) {
                 Ok(0) => {

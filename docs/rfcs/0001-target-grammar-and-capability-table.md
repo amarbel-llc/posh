@@ -207,13 +207,20 @@ entries: count × ( id: u8, len: u8, payload: len bytes )
 |---|---|---|---|---|
 | 0 | `PROTOCOL_VERSION` | both | 1 byte | Meta escape hatch: the version of the post-table format. Currently 1. A future value > 1 MAY redefine everything after the table; receivers seeing a higher version than they implement MUST fall back to baseline interpretation of the body. |
 | 1 | `EXIT_STATUS` | both | client: 0 bytes; server: 1 byte | Client entry (empty payload) advertises understanding. A server MUST NOT send the entry unless the client advertised it; when sent, it MUST appear on shutdown-flagged frames and its payload is the session command's shell-style exit code (`WEXITSTATUS`, or 128+signal). A client receiving it MUST exit with that code after the shutdown handshake. |
-| 2–223 | — | — | — | Unassigned; allocate sequentially via this registry. |
+| 2 | — | — | — | Reserved for `TERM_FEATURES` (see below); not yet allocated. |
+| 3 | `SCROLLBACK` | both | client: 1 byte; server: 0 bytes | Scrollback sync (RFC 0002 §1). Client entry's byte requests a ring depth in units of 256 rows (`0` = server default) and advertises understanding of the `BODY_SCROLLBACK` frame body; the server entry (empty) acknowledges it will emit them. |
+| 4 | `MORPH` | both | empty | Incremental frame sync (#15). Client entry advertises understanding of the `BODY_MORPH` forward-escape-delta body (sent only behind the `POSH_FRAMESYNC=morph` opt-in); the server emits Morph bodies only when the peer advertised this, with a `Full` keyframe always the fallback. |
+| 5 | `BASE_SUM` | both | empty | Base-integrity checksums (RFC 0006). Client entry advertises that it verifies a `BODY_DIFF_SUM`/`BODY_MORPH_SUM` body's diff base against its own held dump before applying, re-acking + requesting a resync on a mismatch; the server emits the checksummed variants only when the peer advertised this. |
+| 6 | `AGENT_FORWARD` | both | empty | SSH agent forwarding (FDR 0004). Sender participates in agent forwarding on this connection. Neither side sends `AGENT_DATA`/`AGENT_ACK` until it has seen this from the peer. |
+| 7 | `AGENT_DATA` | both | `u64` offset + ≤247 bytes | One contiguous chunk of the sender's agent byte stream (FDR 0004): a big-endian `u64` stream offset followed by up to 247 payload bytes. Multiple entries MAY appear per message; their offsets MUST be contiguous within the message. |
+| 8 | `AGENT_ACK` | both | `u64` | Cumulative ack of the peer's agent stream (FDR 0004): a big-endian `u64`, one past the last contiguous byte received. |
+| 9–223 | — | — | — | Unassigned; allocate sequentially via this registry. |
 | 224–255 | — | — | — | Reserved for experiments; MUST NOT appear in released builds. |
 
 `TERM_FEATURES` (outer-terminal facts such as color depth and kitty
 protocol support, advertised client → server so the server-side terminal
-model can answer queries honestly) is anticipated as the next allocation
-but is NOT specified by this document.
+model can answer queries honestly) is anticipated for id 2 but is NOT
+specified by this document.
 
 ## Security Considerations
 
