@@ -218,6 +218,12 @@ _POSH_FORWARD_AGENT_
 	value is a socket path to forward instead of _$SSH_AUTH_SOCK_. Unset
 	means the best-effort default (forward _$SSH_AUTH_SOCK_ when set).
 
+_POSH_AGENT_NOTICE_
+	When agent forwarding is active, a rate-limited banner (at most one
+	per minute) reports when the remote host opens a connection to your
+	forwarded agent — the ambient signal that it is being used. Enabled
+	by default; set to *no* or *0* to silence it.
+
 _POSH_SERVER_NETWORK_TMOUT_
 	Server exits after N seconds without client contact (0 = never,
 	the default). See *posh-server*(1).

@@ -483,6 +483,76 @@ pub fn resolve_forward_policy(
     }
 }
 
+// ---------------------------------------------------------------------------
+// Per-request agent-use notice (FDR 0004 §Limitations; github #96). With
+// default-on forwarding, a one-line client banner — "agent forwarding
+// requested by <host>" — is the only ambient signal that the remote host is
+// exercising the local agent. Rate-limited to one line per minute so heavy
+// `git` use doesn't flood the notify line, silenced entirely by
+// POSH_AGENT_NOTICE=no. The rate-limit + silence logic is pure here so it is
+// unit-tested without the loop or the NotificationEngine.
+
+/// Minimum gap between notices (FDR 0004: "one line per host per minute"). The
+/// roaming client has a single peer, so this is effectively one timestamp gate.
+const AGENT_NOTICE_INTERVAL_MS: u64 = 60_000;
+
+/// Client-side rate limiter for the agent-use notice. Owns the silence flag,
+/// the last-fired timestamp, and the host it names — the host is only
+/// meaningful together with the notice, so they live and die as one (the
+/// notice exists only while forwarding is active). `on_channel_open` is the
+/// gate.
+pub struct AgentNotice {
+    silenced: bool,
+    last_shown: Option<u64>,
+    host: String,
+}
+
+impl AgentNotice {
+    /// Builds the limiter for `host` from the environment: `POSH_AGENT_NOTICE=no`
+    /// (or `0`) silences it; anything else (including unset) leaves it enabled —
+    /// the FDR ships it on in v1.
+    #[allow(dead_code)] // wired into the client loop alongside this type
+    pub fn from_env(host: &str) -> AgentNotice {
+        let silenced = matches!(
+            std::env::var("POSH_AGENT_NOTICE").ok().as_deref(),
+            Some("no") | Some("0")
+        );
+        AgentNotice {
+            silenced,
+            last_shown: None,
+            host: host.to_string(),
+        }
+    }
+
+    /// Builds a limiter with an explicit silence flag (the seam the tests use).
+    #[cfg(test)]
+    pub fn new(silenced: bool, host: &str) -> AgentNotice {
+        AgentNotice {
+            silenced,
+            last_shown: None,
+            host: host.to_string(),
+        }
+    }
+
+    /// Called when a forwarded-agent channel opens. Returns the banner text to
+    /// show, or `None` when silenced or still inside the rate-limit window.
+    /// Advances the rate-limit clock only when it actually returns a message.
+    pub fn on_channel_open(&mut self, now: u64) -> Option<String> {
+        if self.silenced {
+            return None;
+        }
+        let due = match self.last_shown {
+            Some(t) => now.saturating_sub(t) >= AGENT_NOTICE_INTERVAL_MS,
+            None => true,
+        };
+        if !due {
+            return None;
+        }
+        self.last_shown = Some(now);
+        Some(format!("agent forwarding requested by {}", self.host))
+    }
+}
+
 /// An empty-payload control record. `close_record`/`fail_record` are the named
 /// call sites — `Close` (orderly end) and `Fail` (the client end couldn't reach
 /// the local agent) carry no bytes, only the channel and kind.
@@ -1044,5 +1114,50 @@ mod tests {
         let (p, warn) = resolve_forward_policy(&ForwardFlag::ExplicitOn, None, Some(""));
         assert_eq!(p, ForwardPolicy::Off);
         assert!(warn.is_some());
+    }
+
+    // --- AgentNotice (per-request agent-use banner, github #96) -------------
+
+    #[test]
+    fn notice_fires_on_first_open_with_host() {
+        let mut n = AgentNotice::new(false, "box");
+        let msg = n.on_channel_open(1_000).expect("first open notifies");
+        assert!(msg.contains("box"), "names the host: {msg}");
+        assert!(msg.contains("agent"), "mentions the agent: {msg}");
+    }
+
+    #[test]
+    fn notice_rate_limited_to_one_per_minute() {
+        let mut n = AgentNotice::new(false, "box");
+        assert!(n.on_channel_open(0).is_some(), "first fires");
+        // Within the window: suppressed.
+        assert!(n.on_channel_open(30_000).is_none(), "30s later suppressed");
+        assert!(
+            n.on_channel_open(59_999).is_none(),
+            "just under a minute suppressed"
+        );
+        // At/after the window: fires again, and the clock advances from there.
+        assert!(n.on_channel_open(60_000).is_some(), "a minute later fires");
+        assert!(n.on_channel_open(75_000).is_none(), "window restarts");
+    }
+
+    #[test]
+    fn notice_silenced_never_fires() {
+        let mut n = AgentNotice::new(true, "box");
+        assert!(n.on_channel_open(0).is_none());
+        assert!(n.on_channel_open(120_000).is_none(), "still silent past the window");
+    }
+
+    #[test]
+    fn notice_suppressed_open_does_not_advance_the_clock() {
+        // A suppressed in-window call must not consume the rate-limit slot: it
+        // leaves last_shown at the first fire, so the next fire is still exactly
+        // one window later, not pushed out by the calls between.
+        let mut n = AgentNotice::new(false, "box");
+        assert!(n.on_channel_open(0).is_some());
+        assert!(n.on_channel_open(10_000).is_none());
+        assert!(n.on_channel_open(20_000).is_none());
+        // 60s after the FIRST fire (not after the last suppressed call) fires.
+        assert!(n.on_channel_open(60_000).is_some());
     }
 }

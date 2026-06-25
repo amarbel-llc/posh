@@ -294,6 +294,7 @@ pub fn run(
         &raw,
         addr.port(),
         agent_source,
+        host,
     );
     let _ = util::write_all_retry(STDOUT, &display::close(), 1000);
     drop(raw);
@@ -443,6 +444,10 @@ struct ClientState {
     agent: Option<crate::remote::agent::AgentClient>,
     agent_stream: sync::AgentStream,
     agent_seen: bool,
+    /// Per-request agent-use notice (FDR 0004; #96): the rate-limited banner
+    /// shown when a forwarded-agent channel opens. `Some` only when forwarding
+    /// is active (it rides on the proxy and owns the host name it reports).
+    agent_notice: Option<crate::remote::agent::AgentNotice>,
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -455,6 +460,7 @@ fn client_loop(
     raw: &RawMode,
     port: u16,
     agent_source: Option<std::path::PathBuf>,
+    host: &str,
 ) -> Result<i32> {
     util::set_nonblocking(STDIN)?;
 
@@ -507,7 +513,13 @@ fn client_loop(
         last_reack: None,
         forensic_captured: false,
         // Agent forwarding (FDR 0004): the proxy forwards the resolved source
-        // socket; `None` source == forwarding off this connection.
+        // socket; `None` source == forwarding off this connection. The notice
+        // (FDR 0004; #96) rides with the proxy — armed only when forwarding is
+        // on, reading POSH_AGENT_NOTICE for its silence default and owning the
+        // host name it reports.
+        agent_notice: agent_source
+            .as_ref()
+            .map(|_| crate::remote::agent::AgentNotice::from_env(host)),
         agent: agent_source.map(crate::remote::agent::AgentClient::new),
         agent_stream: sync::AgentStream::new(),
         agent_seen: false,
@@ -1217,13 +1229,16 @@ fn process_user_input(st: &mut ClientState, buf: &[u8]) -> bool {
 /// — go back onto our outbound stream), and drain our outbox on AGENT_ACK. A
 /// decoder error means the authenticated stream is corrupt; drop the proxy.
 fn consume_agent_caps(st: &mut ClientState, frame: &ServerFrame) {
-    let Some(agent) = st.agent.as_mut() else {
+    if st.agent.is_none() {
         return;
-    };
+    }
     if caps::find(&frame.caps, caps::CAP_AGENT_FORWARD).is_some() {
         st.agent_seen = true;
     }
     let mut decode_failed = false;
+    // A channel OPEN from the server means a remote process started using the
+    // forwarded agent — the event the notice (#96) reports.
+    let mut saw_open = false;
     for cap in caps::find_all(&frame.caps, caps::CAP_AGENT_DATA) {
         let Ok((offset, bytes)) = caps::decode_agent_data(&cap.payload) else {
             decode_failed = true;
@@ -1231,7 +1246,13 @@ fn consume_agent_caps(st: &mut ClientState, frame: &ServerFrame) {
         };
         match st.agent_stream.recv(offset, bytes) {
             Ok(records) => {
-                for reply in agent.apply_records(&records) {
+                saw_open |= records
+                    .iter()
+                    .any(|r| r.kind == crate::remote::sync::RecordKind::Open);
+                // The proxy borrow is scoped tight so the notice below can
+                // touch other ClientState fields.
+                let replies = st.agent.as_mut().unwrap().apply_records(&records);
+                for reply in replies {
                     st.agent_stream.send(&reply);
                 }
             }
@@ -1244,6 +1265,15 @@ fn consume_agent_caps(st: &mut ClientState, frame: &ServerFrame) {
     if let Some(cap) = caps::find(&frame.caps, caps::CAP_AGENT_ACK) {
         if let Ok(upto) = caps::decode_agent_ack(&cap.payload) {
             st.agent_stream.ack(upto);
+        }
+    }
+    // Surface the rate-limited agent-use notice (FDR 0004; #96) on a new
+    // channel — but not when the stream just went corrupt (we're tearing down).
+    if saw_open && !decode_failed {
+        if let Some(notice) = st.agent_notice.as_mut() {
+            if let Some(msg) = notice.on_channel_open(now_ms()) {
+                st.notify.set_message(&msg, false, now_ms());
+            }
         }
     }
     if decode_failed {
@@ -2245,6 +2275,61 @@ mod tests {
         assert_eq!(off.flags & sync::CLIENT_FLAG_LOG_ON, 0);
     }
 
+    // Integration of the agent-use notice (#96) with consume_agent_caps: a
+    // server frame carrying an OPEN record must surface the rate-limited
+    // banner via the NotificationEngine. Exercises the real hook, not just the
+    // AgentNotice unit.
+    #[test]
+    fn consume_agent_caps_shows_notice_on_channel_open() {
+        use crate::remote::agent::{AgentClient, AgentNotice};
+        use crate::remote::sync::{AgentRecord, AgentStream, RecordKind};
+        use std::os::unix::net::UnixListener;
+        use std::path::PathBuf;
+
+        // A fake local agent so the proxy's OPEN connect succeeds.
+        let sock = PathBuf::from(format!("/tmp/posh-notice-test-{}.sock", std::process::id()));
+        std::fs::remove_file(&sock).ok();
+        let _listener = UnixListener::bind(&sock).unwrap();
+
+        let mut st = test_state(24, 80);
+        st.agent = Some(AgentClient::new(sock.clone()));
+        st.agent_notice = Some(AgentNotice::new(false, "box"));
+
+        // Build the server's agent caps the way the server would: frame an OPEN
+        // record onto an AgentStream and encode its pending bytes as AGENT_DATA.
+        let mut server_stream = AgentStream::new();
+        server_stream.send(&AgentRecord {
+            channel: 1,
+            kind: RecordKind::Open,
+            payload: Vec::new(),
+        });
+        let mut server_caps = vec![caps::Cap {
+            id: caps::CAP_AGENT_FORWARD,
+            payload: vec![],
+        }];
+        server_caps.extend(caps::encode_agent_data(
+            server_stream.send_base(),
+            server_stream.pending(),
+        ));
+
+        let frame = ServerFrame {
+            flags: 0,
+            caps: caps::own_table(&server_caps),
+            frame_num: 0,
+            input_ack: 0,
+            echo_ack: 0,
+            body: FrameBody::Empty,
+        };
+        consume_agent_caps(&mut st, &frame);
+
+        let msg = st.notify.message();
+        assert!(
+            msg.contains("box") && msg.contains("agent"),
+            "expected an agent-use notice naming the host, got {msg:?}"
+        );
+        std::fs::remove_file(&sock).ok();
+    }
+
     /// ClientState over a throwaway loopback connection, for unit tests
     /// of frame application and composition.
     fn test_state(rows: u16, cols: u16) -> ClientState {
@@ -2294,6 +2379,7 @@ mod tests {
             agent: None,
             agent_stream: sync::AgentStream::new(),
             agent_seen: false,
+            agent_notice: None,
         }
     }
 
