@@ -563,6 +563,12 @@ pub(crate) fn server_loop(mut conn: Connection, child: pty::PtyChild, rows: u16,
                 && !shutdown
                 && cur_sb_total > sb_high
                 && cur_sb_total > acked_sb_total.max(sb_floor)
+                // #95: never emit scrollback before a visible baseline is
+                // confirmed. A scrollback frame carries the acked visible dump
+                // forward as its diff base; with no acked baseline it would leap
+                // applied_num from the empty initial state past the (unapplied)
+                // first Full, staling the client's visible baseline -> apply-stall.
+                && acked_data.is_some()
                 && paced;
             // At most one fresh body per opportunity; when both are ready
             // (heavy output scrolling the screen) alternate so neither kind
@@ -607,15 +613,30 @@ pub(crate) fn server_loop(mut conn: Connection, child: pty::PtyChild, rows: u16,
                 send_frame = true;
                 fresh_frame = true;
             } else if make_scrollback {
-                // The visible screen is unchanged, so the scrollback frame
-                // inherits the standing visible dump as its diff base — the
-                // diff-base chain is unbroken across interleaved frames. The
-                // morph base (snapshot/alt/dims) is inherited for the same
-                // reason (#15).
-                let visible = current.data.clone();
-                let visible_snapshot = current.snapshot.clone();
-                let visible_alt = current.alt_screen;
-                let visible_dims = current.dims;
+                // The scrollback frame inherits a visible dump as its diff base
+                // (the diff-base chain is unbroken across interleaved frames; the
+                // morph base snapshot/alt/dims is inherited for the same reason,
+                // #15). #95: it MUST inherit the CONFIRMED baseline (acked_data /
+                // acked_baseline), NOT the latest `current.data`. Under loss the
+                // latest visible dump can be ahead of what the client holds, so
+                // acking this scrollback frame (which advances applied_num but not
+                // the client's visible content) would push the server's visible
+                // diff base past a visible frame the client never applied, leaving
+                // its baseline stale -> every later visible Diff short-bases ->
+                // permanent apply-stall. Anchoring to acked_data pins the diff
+                // base to the last visible state the client actually confirmed.
+                // want_scrollback gates on acked_data.is_some(); the fallback is
+                // defensive and preserves the old behavior if that ever changes.
+                let (visible, visible_snapshot, visible_alt, visible_dims) =
+                    match (acked_data.clone(), acked_baseline.clone()) {
+                        (Some(d), Some((s, a, dim))) => (d, s, a, dim),
+                        _ => (
+                            current.data.clone(),
+                            current.snapshot.clone(),
+                            current.alt_screen,
+                            current.dims,
+                        ),
+                    };
                 outstanding.push(FrameState {
                     num: current.num,
                     data: std::mem::take(&mut current.data),
