@@ -107,6 +107,16 @@ _POSH_DEBUG_LOG_
 	on-demand *SIGUSR2* state dump (*SIGNALS*) is written to this same
 	sink. Unset disables logging.
 
+_POSH_WEDGE_WATCHDOG_
+	When set, arms an opt-in apply-stall watchdog (off by default). If the
+	visible model stays frozen past a threshold while diff frames keep
+	arriving — the apply-stall signature — the client auto-captures a wedge
+	forensic bundle, arms the diagnostic sink, and forces a resync to break
+	the stall. The RFC 0006 base-integrity check and the auto-escalate on an
+	undecodable diff already recover the common cases; this is a
+	belt-and-suspenders catch-all for a freeze those paths miss (e.g. a
+	transport-side stall). Independent of _POSH_DEBUG_LOG_.
+
 # SIGNALS
 
 *SIGUSR2*

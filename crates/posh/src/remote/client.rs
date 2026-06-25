@@ -804,12 +804,24 @@ fn drive_client(st: &mut ClientState, raw: &RawMode, port: u16) -> Result<i32> {
         // Self-logging apply-stall detector (#wedge): a visible model frozen
         // past the threshold while diff frames keep arriving emits one diagnostic
         // line. Cheap no-op when POSH_DEBUG_LOG is unset.
-        st.stats.check_wedge(
+        let wedged = st.stats.check_wedge(
             now,
             st.server_term.generation(),
             st.applied_num,
             st.framesync.label(),
         );
+        if wedged && st.stats.wedge_watchdog() {
+            // #8 opt-in auto-recovery: a visible model frozen past the threshold
+            // while diff frames keep arriving is an apply-stall the reack/base_sum
+            // paths did not catch (repeated dup/nochange, or a transport-side
+            // stall). Capture forensics if a body is pending, arm the diagnostic
+            // sink, and force a resync to break it.
+            if let Some(reack) = st.last_reack.as_ref() {
+                let _ = diag::capture_forensics(st.applied_num, &st.applied_data, reack);
+            }
+            let _ = diag::enable_logging("client");
+            st.flags |= sync::CLIENT_FLAG_RESYNC;
+        }
         let predict_stats = st.predict.stats();
         st.stats.flush_client(
             now,

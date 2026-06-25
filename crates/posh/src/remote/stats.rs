@@ -25,6 +25,10 @@ const WEDGE_FROZEN_MS: u64 = 3000;
 #[derive(Default)]
 pub struct Stats {
     enabled: bool,
+    /// #8 watchdog: opt-in (POSH_WEDGE_WATCHDOG) auto-recovery. Independent of
+    /// `enabled` so the apply-stall fingerprint runs and triggers recovery even
+    /// when periodic logging (POSH_DEBUG_LOG) is off.
+    wedge_watchdog: bool,
     last_flush: u64,
     /// A meaningful counter advanced since the last emit. Idle-only activity
     /// (skipped renders) deliberately does not set this, so a quiescent session
@@ -191,6 +195,8 @@ impl Stats {
         let now = now_ms();
         Stats {
             enabled,
+            wedge_watchdog: std::env::var_os("POSH_WEDGE_WATCHDOG")
+                .is_some_and(|v| !v.is_empty()),
             last_flush: now,
             wedge_term_gen_since: now,
             ..Default::default()
@@ -292,7 +298,9 @@ impl Stats {
     /// `wedge` line carrying the apply histogram and the rejected frame, then
     /// latch until the model advances. Returns whether it emitted (for tests).
     pub fn check_wedge(&mut self, now: u64, term_gen: u64, applied_num: u64, codec: &str) -> bool {
-        if !self.enabled {
+        // Detection runs when logging is armed OR the #8 watchdog is on; only the
+        // wedge log line below is gated on `enabled`.
+        if !self.enabled && !self.wedge_watchdog {
             return false;
         }
         if term_gen != self.wedge_last_term_gen {
@@ -310,24 +318,26 @@ impl Stats {
         if frozen_ms < WEDGE_FROZEN_MS || diffs_since == 0 {
             return false;
         }
-        util::log_write(
-            "wedge",
-            &format!(
-                "visible model frozen {frozen_ms}ms while {diffs_since} diff frames arrived \
-                 (apply-stall) applied_num={applied_num} codec={codec} \
-                 last_rx(num={} base={} body={}) \
-                 apply(adv={} stale={} dup={} basemis={} reack={} nochange={})",
-                self.last_rx_num,
-                self.last_rx_base,
-                self.last_rx_body.as_str(),
-                self.apply_advanced,
-                self.apply_stale,
-                self.apply_dup,
-                self.apply_basemis,
-                self.apply_reack,
-                self.apply_nochange,
-            ),
-        );
+        if self.enabled {
+            util::log_write(
+                "wedge",
+                &format!(
+                    "visible model frozen {frozen_ms}ms while {diffs_since} diff frames arrived \
+                     (apply-stall) applied_num={applied_num} codec={codec} \
+                     last_rx(num={} base={} body={}) \
+                     apply(adv={} stale={} dup={} basemis={} reack={} nochange={})",
+                    self.last_rx_num,
+                    self.last_rx_base,
+                    self.last_rx_body.as_str(),
+                    self.apply_advanced,
+                    self.apply_stale,
+                    self.apply_dup,
+                    self.apply_basemis,
+                    self.apply_reack,
+                    self.apply_nochange,
+                ),
+            );
+        }
         self.wedge_warned = true;
         true
     }
@@ -345,6 +355,12 @@ impl Stats {
     /// path when instrumentation is off (the `let t = enabled().then(...)` idiom).
     pub fn enabled(&self) -> bool {
         self.enabled
+    }
+
+    /// Whether the #8 wedge watchdog (POSH_WEDGE_WATCHDOG) is armed, so the
+    /// client acts (forensics + resync) on a `check_wedge` fire.
+    pub fn wedge_watchdog(&self) -> bool {
+        self.wedge_watchdog
     }
 
     /// Client: accumulate one apply_frame re-parse (full-dump `term.process`).
@@ -735,10 +751,28 @@ mod tests {
 
     #[test]
     fn wedge_detector_silent_when_disabled() {
-        let mut s = Stats::default(); // enabled = false
+        let mut s = Stats::default(); // enabled = false, watchdog = false
         s.frames_diff = 50;
         assert!(!s.check_wedge(0, 5, 100, "morph"));
         assert!(!s.check_wedge(WEDGE_FROZEN_MS * 10, 5, 100, "morph"));
+    }
+
+    #[test]
+    fn wedge_watchdog_detects_even_without_logging() {
+        // #8: with the watchdog armed but POSH_DEBUG_LOG off, the apply-stall
+        // fingerprint still fires (so the client can auto-recover) -- unlike the
+        // plain disabled case above, which stays silent.
+        let mut s = Stats {
+            wedge_watchdog: true,
+            ..Default::default()
+        };
+        assert!(!s.check_wedge(0, 5, 100, "dumpdiff"));
+        s.record_frame_diff();
+        assert!(s.check_wedge(WEDGE_FROZEN_MS, 5, 100, "dumpdiff"), "watchdog fires");
+        assert!(
+            !s.check_wedge(WEDGE_FROZEN_MS + 1000, 5, 100, "dumpdiff"),
+            "latched until the model advances",
+        );
     }
 
     #[test]
