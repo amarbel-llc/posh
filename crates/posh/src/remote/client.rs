@@ -2210,8 +2210,9 @@ mod tests {
         let cmd: Vec<String> = vec!["/bin/sh".into(), "-c".into(), script.into()];
         let child = crate::pty::spawn_shell(Some(&cmd), 24, 80, &[], None).unwrap();
         util::set_nonblocking(child.master).unwrap();
-        let server =
-            std::thread::spawn(move || crate::remote::server::server_loop(server_conn, child, 24, 80));
+        let server = std::thread::spawn(move || {
+            crate::remote::server::server_loop(server_conn, child, 24, 80, None)
+        });
 
         let addr = format!("127.0.0.1:{port}").parse().unwrap();
         let mut conn = Connection::client(addr, &key).unwrap();

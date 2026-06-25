@@ -148,8 +148,9 @@ fn wait_for_frame(mut stream: &UnixStream, tag: Tag, what: &str) -> Result<ipc::
 /// Validates an existing session directory: it must be a real directory (not
 /// a symlink) owned by `uid`. With `require_private`, it must additionally
 /// have no group/other access (0700). A path that does not exist yet is fine
-/// (the caller creates it). github #7.
-fn validate_session_dir(path: &Path, uid: u32, require_private: bool) -> Result<()> {
+/// (the caller creates it). github #7. `pub(crate)` so the agent-forwarding
+/// endpoint (`remote::agent`) hardens `<base>/agent/` with the same check.
+pub(crate) fn validate_session_dir(path: &Path, uid: u32, require_private: bool) -> Result<()> {
     let meta = match std::fs::symlink_metadata(path) {
         Ok(m) => m,
         Err(_) => return Ok(()),
@@ -185,7 +186,9 @@ fn validate_session_dir(path: &Path, uid: u32, require_private: bool) -> Result<
 
 /// True only when the socket is genuinely dead — connect is refused or the
 /// path is gone — as opposed to a live daemon that was merely slow to reply.
-fn socket_is_dead(path: &Path) -> bool {
+/// `pub(crate)` so `remote::agent` reuses the same liveness probe for symlink
+/// takeover and dead-`srv-*.sock` GC (github #15 distinction).
+pub(crate) fn socket_is_dead(path: &Path) -> bool {
     match UnixStream::connect(path) {
         Ok(_) => false,
         Err(e) => matches!(

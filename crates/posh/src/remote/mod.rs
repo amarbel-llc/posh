@@ -1,6 +1,7 @@
 //! Roaming remote terminal over encrypted UDP (mosh port, simplified state
 //! sync: frames are complete dump_vt screen states, optionally diffed).
 
+pub mod agent;
 pub mod caps;
 pub mod client;
 pub mod crypto;

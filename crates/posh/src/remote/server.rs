@@ -48,6 +48,7 @@ pub fn run(
     port_range: Option<(u16, u16)>,
     family: Family,
     command: Option<Vec<String>>,
+    agent_forward: bool,
 ) -> Result<()> {
     util::check_utf8_locale("posh-server")?;
 
@@ -77,21 +78,41 @@ pub fn run(
     // way to introspect a wedged, already-running server without restarting it.
     util::install_sigusr2_handler();
 
+    // Agent forwarding (FDR 0004): when active, stand up the remote endpoint
+    // (the agent/sock the session shell will use as SSH_AUTH_SOCK) before the
+    // shell is spawned, so its env carries the right value from birth (C5). A
+    // best-effort failure here (e.g. a hardened-dir rejection) just leaves the
+    // session without forwarding rather than refusing to start it.
+    let agent_endpoint = if agent_forward {
+        match crate::remote::agent::AgentEndpoint::from_env() {
+            Ok(ep) => Some(ep),
+            Err(e) => {
+                util::log_write("warn", &format!("agent forwarding disabled: {e}"));
+                None
+            }
+        }
+    } else {
+        None
+    };
+
     let (rows, cols) = (24u16, 80u16);
     // posh#51: the ssh bootstrap allocates no remote pty, so sshd set no TERM;
     // terminfo::session_env gives the session shell a resolved TERM (+ the
     // client's COLORTERM) so color-by-$TERM tools (git, Charmbracelet TUIs)
     // aren't left colorless.
-    let child = pty::spawn_shell(
-        command.as_deref(),
-        rows,
-        cols,
-        &crate::terminfo::session_env(),
-        None,
-    )?;
+    let mut shell_env = crate::terminfo::session_env();
+    if let Some(ep) = &agent_endpoint {
+        // C5: a session created through a forwarding connection inherits
+        // SSH_AUTH_SOCK pointing at the stable agent/sock.
+        shell_env.push((
+            "SSH_AUTH_SOCK".to_string(),
+            ep.sock_path().to_string_lossy().into_owned(),
+        ));
+    }
+    let child = pty::spawn_shell(command.as_deref(), rows, cols, &shell_env, None)?;
     util::set_nonblocking(child.master)?;
 
-    server_loop(conn, child, rows, cols);
+    server_loop(conn, child, rows, cols, agent_endpoint);
     std::process::exit(0);
 }
 
@@ -152,7 +173,13 @@ fn close_overlay(overlay: &mut Option<Overlay>) {
     }
 }
 
-pub(crate) fn server_loop(mut conn: Connection, child: pty::PtyChild, rows: u16, cols: u16) {
+pub(crate) fn server_loop(
+    mut conn: Connection,
+    child: pty::PtyChild,
+    rows: u16,
+    cols: u16,
+    mut agent_endpoint: Option<crate::remote::agent::AgentEndpoint>,
+) {
     // Optional perf instrumentation (POSH_DEBUG_LOG). run() has already
     // double-forked and redirected stdio to /dev/null, so this file fd is the
     // server's only viable diagnostic sink; inert when the env var is unset.
@@ -229,6 +256,14 @@ pub(crate) fn server_loop(mut conn: Connection, child: pty::PtyChild, rows: u16,
     let mut current_is_sb = false;
     let mut last_was_sb = false;
 
+    // Agent forwarding (FDR 0004). The bidirectional agent byte stream and the
+    // peer's per-message AGENT_FORWARD advertisement. `agent_seen` latches once
+    // the peer has advertised, so we may emit AGENT_DATA/AGENT_ACK (RFC 0001:
+    // never before seeing the peer's AGENT_FORWARD). The stream + endpoint are
+    // inert unless `agent_endpoint` is Some.
+    let mut agent_stream = sync::AgentStream::new();
+    let mut agent_seen = false;
+
     let mut last_gen = term.generation();
     let mut last_send: u64 = 0;
     let mut last_heard: u64 = now_ms();
@@ -253,6 +288,19 @@ pub(crate) fn server_loop(mut conn: Connection, child: pty::PtyChild, rows: u16,
         let peer_active = conn.has_remote() && now.saturating_sub(last_heard) < PEER_TIMEOUT;
         if network_tmout > 0 && now.saturating_sub(last_heard) >= network_tmout {
             break; // POSH_SERVER_NETWORK_TMOUT expired: give up the session
+        }
+        // Agent-forwarding maintenance (FDR 0004): symlink takeover, dead-sock
+        // GC, and a stricter peer-liveness gate (AGENT_PEER_ACTIVE, 15 s — vs
+        // the loop's 60 s PEER_TIMEOUT) so a roamed-away peer fast-fails a
+        // blocked `git push` rather than hanging it. Any channels the tick
+        // closes are framed back to the client.
+        if let Some(ep) = agent_endpoint.as_mut() {
+            let agent_peer_active = conn.has_remote()
+                && now.saturating_sub(last_heard) < crate::remote::agent::AGENT_PEER_ACTIVE;
+            for rec in ep.tick(agent_peer_active, now) {
+                agent_stream.send(&rec);
+                force_ack = true;
+            }
         }
         if util::take_flag(&util::SIGUSR1_RECEIVED)
             && signal_tmout > 0
@@ -326,6 +374,18 @@ pub(crate) fn server_loop(mut conn: Connection, child: pty::PtyChild, rows: u16,
         } else {
             usize::MAX
         };
+        // Agent-forwarding fds (FDR 0004): the listener then each open channel,
+        // in the order `AgentEndpoint::pollfds` returns. `agent_fd_base` is the
+        // index of the first; `usize::MAX` when forwarding is inactive.
+        let (agent_fd_base, agent_fd_count) = match &agent_endpoint {
+            Some(ep) => {
+                let agent_fds = ep.pollfds();
+                let base = fds.len();
+                fds.extend_from_slice(&agent_fds);
+                (base, agent_fds.len())
+            }
+            None => (usize::MAX, 0),
+        };
         let poll_start = stats.enabled().then(Instant::now);
         match util::poll(&mut fds, timeout) {
             Ok(_) => {}
@@ -397,6 +457,26 @@ pub(crate) fn server_loop(mut conn: Connection, child: pty::PtyChild, rows: u16,
             }
         }
 
+        // Agent-forwarding sockets (FDR 0004): accept new connections and read
+        // agent-client bytes, framing both as records onto the outbound stream.
+        // `read_channels` already scans every channel, so a single signalled
+        // agent fd suffices to drive it; the listener is the base index.
+        if agent_fd_base != usize::MAX {
+            if let Some(ep) = agent_endpoint.as_mut() {
+                let agent_revents = (agent_fd_base..agent_fd_base + agent_fd_count)
+                    .any(|i| fds[i].revents & (libc::POLLIN | libc::POLLHUP | libc::POLLERR) != 0);
+                if agent_revents {
+                    for rec in ep.accept_pending() {
+                        agent_stream.send(&rec);
+                    }
+                    for rec in ep.read_channels() {
+                        agent_stream.send(&rec);
+                        force_ack = true; // pace agent chunks promptly (design §2)
+                    }
+                }
+            }
+        }
+
         // Client datagrams.
         if fds[0].revents & libc::POLLIN != 0 {
             loop {
@@ -414,6 +494,42 @@ pub(crate) fn server_loop(mut conn: Connection, child: pty::PtyChild, rows: u16,
                         last_heard = now_ms();
                         if caps::find(&msg.caps, caps::CAP_EXIT_STATUS).is_some() {
                             peer_wants_exit = true;
+                        }
+                        // Agent forwarding (FDR 0004): consume the peer's agent
+                        // caps into the stream + endpoint. AGENT_FORWARD latches
+                        // `agent_seen` (gates our own AGENT_DATA/ACK); AGENT_DATA
+                        // chunks feed the inbox -> decoder -> channel writes;
+                        // AGENT_ACK drains our outbox. Only meaningful when the
+                        // endpoint exists; a decoder error tears it down (a
+                        // corrupt authenticated stream is unrecoverable).
+                        if let Some(ep) = agent_endpoint.as_mut() {
+                            if caps::find(&msg.caps, caps::CAP_AGENT_FORWARD).is_some() {
+                                agent_seen = true;
+                            }
+                            let mut decode_failed = false;
+                            for cap in caps::find_all(&msg.caps, caps::CAP_AGENT_DATA) {
+                                let Ok((offset, bytes)) = caps::decode_agent_data(&cap.payload)
+                                else {
+                                    decode_failed = true;
+                                    break;
+                                };
+                                match agent_stream.recv(offset, bytes) {
+                                    Ok(records) => ep.apply_records(&records),
+                                    Err(_) => {
+                                        decode_failed = true;
+                                        break;
+                                    }
+                                }
+                            }
+                            if let Some(cap) = caps::find(&msg.caps, caps::CAP_AGENT_ACK) {
+                                if let Ok(upto) = caps::decode_agent_ack(&cap.payload) {
+                                    agent_stream.ack(upto);
+                                }
+                            }
+                            if decode_failed {
+                                agent_endpoint = None; // drop the endpoint + channels
+                                agent_seen = false;
+                            }
                         }
                         // Per-message (caps do not persist): does the client
                         // still want scrollback? A fresh advertisement after
@@ -817,6 +933,23 @@ pub(crate) fn server_loop(mut conn: Connection, child: pty::PtyChild, rows: u16,
                         });
                     }
                 }
+                // Agent forwarding (FDR 0004): advertise AGENT_FORWARD whenever
+                // the endpoint is up so the peer may begin; emit AGENT_DATA
+                // chunks + AGENT_ACK only once the peer has advertised back
+                // (RFC 0001: not before seeing the peer's AGENT_FORWARD).
+                if agent_endpoint.is_some() {
+                    extras.push(caps::Cap {
+                        id: caps::CAP_AGENT_FORWARD,
+                        payload: vec![],
+                    });
+                    if agent_seen {
+                        extras.extend(caps::encode_agent_data(
+                            agent_stream.send_base(),
+                            agent_stream.pending(),
+                        ));
+                        extras.push(caps::encode_agent_ack(agent_stream.recv_ack()));
+                    }
+                }
                 let frame_caps = if extras.is_empty() {
                     Vec::new()
                 } else {
@@ -1034,7 +1167,7 @@ mod tests {
         let cmd: Vec<String> = vec!["/bin/sh".into(), "-c".into(), "read x; exit 0".into()];
         let child = crate::pty::spawn_shell(Some(&cmd), 24, 80, &[], None).unwrap();
         util::set_nonblocking(child.master).unwrap();
-        let server = std::thread::spawn(move || server_loop(server_conn, child, 24, 80));
+        let server = std::thread::spawn(move || server_loop(server_conn, child, 24, 80, None));
 
         let addr = format!("127.0.0.1:{port}").parse().unwrap();
         let mut conn = Connection::client(addr, &key).unwrap();
@@ -1105,7 +1238,7 @@ mod tests {
         let cmd: Vec<String> = vec!["/bin/sh".into(), "-c".into(), "sleep 600".into()];
         let child = crate::pty::spawn_shell(Some(&cmd), 24, 80, &[], None).unwrap();
         util::set_nonblocking(child.master).unwrap();
-        let server = std::thread::spawn(move || server_loop(server_conn, child, 24, 80));
+        let server = std::thread::spawn(move || server_loop(server_conn, child, 24, 80, None));
 
         let addr = format!("127.0.0.1:{port}").parse().unwrap();
         let mut conn = Connection::client(addr, &key).unwrap();
@@ -1173,7 +1306,7 @@ mod tests {
         let cmd: Vec<String> = vec!["/bin/sh".into(), "-c".into(), "sleep 600".into()];
         let child = crate::pty::spawn_shell(Some(&cmd), 24, 80, &[], None).unwrap();
         util::set_nonblocking(child.master).unwrap();
-        let server = std::thread::spawn(move || server_loop(server_conn, child, 24, 80));
+        let server = std::thread::spawn(move || server_loop(server_conn, child, 24, 80, None));
 
         let addr = format!("127.0.0.1:{port}").parse().unwrap();
         let mut conn = Connection::client(addr, &key).unwrap();
@@ -1267,7 +1400,7 @@ mod tests {
         let cmd: Vec<String> = vec!["/bin/sh".into(), "-c".into(), "sleep 600".into()];
         let child = crate::pty::spawn_shell(Some(&cmd), 24, 80, &[], None).unwrap();
         util::set_nonblocking(child.master).unwrap();
-        let server = std::thread::spawn(move || server_loop(server_conn, child, 24, 80));
+        let server = std::thread::spawn(move || server_loop(server_conn, child, 24, 80, None));
 
         let addr = format!("127.0.0.1:{port}").parse().unwrap();
         let mut conn = Connection::client(addr, &key).unwrap();
@@ -1368,7 +1501,7 @@ mod tests {
         let cmd: Vec<String> = vec!["/bin/sh".into(), "-c".into(), "echo resync; sleep 600".into()];
         let child = crate::pty::spawn_shell(Some(&cmd), 24, 80, &[], None).unwrap();
         util::set_nonblocking(child.master).unwrap();
-        let server = std::thread::spawn(move || server_loop(server_conn, child, 24, 80));
+        let server = std::thread::spawn(move || server_loop(server_conn, child, 24, 80, None));
 
         let addr = format!("127.0.0.1:{port}").parse().unwrap();
         let mut conn = Connection::client(addr, &key).unwrap();
@@ -1464,7 +1597,7 @@ mod tests {
         ];
         let child = crate::pty::spawn_shell(Some(&cmd), 24, 80, &[], None).unwrap();
         util::set_nonblocking(child.master).unwrap();
-        let server = std::thread::spawn(move || server_loop(server_conn, child, 24, 80));
+        let server = std::thread::spawn(move || server_loop(server_conn, child, 24, 80, None));
 
         let addr = format!("127.0.0.1:{port}").parse().unwrap();
         let mut conn = Connection::client(addr, &key).unwrap();
@@ -1626,7 +1759,7 @@ mod tests {
             vec!["/bin/sh".into(), "-c".into(), "stty -echo; exec cat".into()];
         let child = crate::pty::spawn_shell(Some(&cmd), 24, 80, &[], None).unwrap();
         util::set_nonblocking(child.master).unwrap();
-        let server = std::thread::spawn(move || server_loop(server_conn, child, 24, 80));
+        let server = std::thread::spawn(move || server_loop(server_conn, child, 24, 80, None));
 
         let addr = format!("127.0.0.1:{port}").parse().unwrap();
         let mut conn = Connection::client(addr, &key).unwrap();

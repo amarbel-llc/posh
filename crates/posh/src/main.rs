@@ -250,7 +250,10 @@ fn cmd_server(args: &[String]) -> Result<()> {
             other => return Err(Error(format!("unknown server option {other}"))),
         }
     }
-    remote::server::run(port_range, family, command)
+    // Agent forwarding (FDR 0004) is off until item 5 resolves the -A flag /
+    // bootstrap argv into this call. The endpoint machinery is built and
+    // tested but dormant.
+    remote::server::run(port_range, family, command, false)
 }
 
 fn parse_port_range(s: &str) -> Result<(u16, u16)> {
