@@ -159,6 +159,13 @@ read-only, `debug` group):
   set, else a per-pid default `$XDG_RUNTIME_DIR/posh/posh-<role>-<pid>.log`.
   Implementation: `remote/diag.rs`; documented under SIGNALS in
   `posh-server`(1) / `posh-client`(1) and recorded in FDR 0007.
+- `just debug-posh-forensics <pid>` — print the most recent apply-stall
+  forensic bundle for a CLIENT pid: a verdict (`SHORT_BASE prefix+suffix>applied`
+  = the #90 wedge; `LEN_OK` = the #94 content divergence) plus the raw
+  `.applied` base dump and `.diff` body bytes for an offline `apply_diff`
+  re-run. Written automatically on the first `ReackAndWait` per wedge episode
+  (no pre-arming needed), and on demand via `SIGUSR2` or the "Dump wedge
+  forensics" palette command. Implementation: `remote/diag.rs::capture_forensics`.
 - `just debug-posh-server-smoke` — start a detached loopback server for
   headless transport debugging (e.g. exercising the dump without a tty).
 - `POSH_DEBUG_LOG=<path>` (set before connecting) turns on *continuous*

@@ -34,7 +34,7 @@ the host and then launches this client against the reported address.
 	escape command: the predictive-echo models (_adaptive_, _optimistic_,
 	_always_, _never_), the client *and* server debug-logging toggles
 	(_POSH_DEBUG_LOG_; the server toggle rides the transport), shell-out on the
-	server (FDR 0008, the _POSH_ESCAPE_CMD_ command), suspend the client, and
+	server (FDR 0008, the _POSH_ESCAPE_CMD_ command), reset & resync, dump wedge forensics, suspend the client, and
 	quit. Type to filter, arrows to choose, Enter to run, Esc to
 	dismiss. Rendered by the *posh-palette* helper over a JSON-RPC control
 	channel; the session greys behind it.
@@ -121,6 +121,15 @@ _POSH_DEBUG_LOG_
 	so it never disturbs the live display; like the server's it needs no
 	startup flag, so it introspects an already-running client when a
 	session has wedged.
+
+	When a visible-frame body is currently being rejected by the apply path
+	(an apply-stall: the diff's base matches the applied frame but cannot be
+	reconstructed, so the screen freezes), the dump also writes a byte-level
+	_forensic bundle_ beside the log — _posh-forensic-client-<pid>-<num>.txt_
+	carrying a verdict line, plus _.applied_ and _.diff_ raw bytes for an
+	offline diff re-run. The bundle is also written automatically on the first
+	such rejection per episode, and on demand via the *Dump wedge forensics*
+	palette command.
 
 *SIGWINCH*
 	Re-read the terminal size and repaint at the new geometry.

@@ -827,6 +827,50 @@ mod tests {
         assert_eq!(apply_diff(b"tiny", &d), None);
     }
 
+    // A title change is a length-varying edit to the middle of a dump (the OSC
+    // title sits between unchanged prefix/suffix screen state). On a matching
+    // base it round-trips fine — the normal path.
+    #[test]
+    fn apply_diff_title_change_round_trips_on_matching_base() {
+        let base = b"\x1b[2J\x1b[H\x1b]2;old title\x07cursor-state".to_vec();
+        let new = b"\x1b[2J\x1b[H\x1b]2;a noticeably longer new title\x07cursor-state".to_vec();
+        let d = make_diff(&base, &new);
+        assert_eq!(apply_diff(&base, &d).as_deref(), Some(new.as_slice()));
+    }
+
+    // The #90 apply-stall, at the byte level: a diff built against a base the
+    // client does not hold (here a SHORTER base than prefix+suffix) returns
+    // None -> the DumpDiff applier surfaces ReackAndWait -> the screen wedges.
+    // This is the exact condition observed live (prefix+suffix > applied_len).
+    #[test]
+    fn apply_diff_short_base_returns_none_the_wedge() {
+        let server_base = b"PREFIX_oldmiddle_SUFFIX";
+        let new = b"PREFIX_newmiddle_SUFFIX";
+        let d = make_diff(server_base, new);
+        // prefix("PREFIX_") + suffix("_SUFFIX") = 14 > 6.
+        let client_base_short = b"PREFIX";
+        assert_eq!(apply_diff(client_base_short, &d), None);
+    }
+
+    // The #94 hazard: apply_diff is content-blind — it validates only
+    // prefix+suffix <= base.len(), never that the base matches what make_diff
+    // saw. An EQUAL-length base that differs in content yields Some(garbage)
+    // with no error: silent screen corruption (term_gen advances, no wedge).
+    #[test]
+    fn apply_diff_equal_len_divergence_corrupts_silently() {
+        let server_base = b"PREFIX_old_SUFFIX"; // len 17
+        let new = b"PREFIX_new_SUFFIX";
+        let d = make_diff(server_base, new);
+        let client_base_wrong = b"PREFXX_old_SUFFIX"; // len 17, byte 4 I->X
+        let got = apply_diff(client_base_wrong, &d).expect("equal-len base never returns None");
+        assert_ne!(
+            got.as_slice(),
+            new.as_slice(),
+            "content-blind splice must mis-reconstruct on a divergent base (#94)",
+        );
+        assert_eq!(got, b"PREFXX_new_SUFFIX", "splices new middle between wrong prefix/suffix");
+    }
+
     #[test]
     fn server_frame_roundtrip() {
         let cases = vec![

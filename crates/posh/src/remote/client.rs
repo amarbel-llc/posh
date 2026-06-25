@@ -105,6 +105,7 @@ fn palette_commands(server_log_on: bool) -> Value {
         { "name": server_log_name, "action": { "method": "logging.set", "params": { "scope": "server", "enabled": server_log_enabled } } },
         { "name": "Shell out (server)", "action": { "method": "shell.open" } },
         { "name": "Reset & resync (force redraw)", "action": { "method": "session.resync" } },
+        { "name": "Dump wedge forensics", "action": { "method": "session.forensics" } },
         { "name": "Suspend client", "action": { "method": "client.suspend" } },
         { "name": "Quit session", "action": { "method": "app.quit" } },
     ])
@@ -188,6 +189,21 @@ fn dispatch_palette_action(
             st.flags |= sync::CLIENT_FLAG_RESYNC;
             st.notify.set_message("resyncing\u{2026}", true, now);
             true
+        }
+        "session.forensics" => {
+            // Write a byte-level apply-stall forensic bundle on demand (#90/#94).
+            // Only meaningful while wedged (a reack is pending); otherwise says so.
+            let msg = match st.last_reack.as_ref() {
+                Some(reack) => {
+                    match diag::capture_forensics(st.applied_num, &st.applied_data, reack) {
+                        Some(path) => format!("wedge forensics: {}", path.display()),
+                        None => "wedge forensics: write failed".to_string(),
+                    }
+                }
+                None => "wedge forensics: nothing pending (not wedged)".to_string(),
+            };
+            st.notify.set_message(&msg, false, now);
+            false
         }
         "client.suspend" => {
             suspend(st, raw);
@@ -398,6 +414,14 @@ struct ClientState {
     /// The command-palette overlay renderer (Ctrl-^ p), spawned lazily on first
     /// summon and kept resident; `None` until then or if it can't be launched.
     palette: Option<Palette>,
+    /// The last visible-frame body the applier rejected via `ReackAndWait`
+    /// (#90/#94 forensics): `(rx_num, rx_base, kind, body_bytes)`. Captured to
+    /// disk once per wedge episode so the divergent base can be analysed
+    /// offline (`diag::capture_forensics`).
+    last_reack: Option<(u64, u64, FrameKind, Vec<u8>)>,
+    /// One-shot guard so a wedge writes a single forensic bundle, not one per
+    /// retransmit (the reack loop fires constantly); reset when apply advances.
+    forensic_captured: bool,
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -458,6 +482,8 @@ fn client_loop(
         applier,
         stats: Stats::new(),
         palette: None,
+        last_reack: None,
+        forensic_captured: false,
     };
     let result = drive_client(&mut st, raw, port);
     // Tear down the palette renderer (if any) before the final stats flush.
@@ -601,6 +627,11 @@ fn drive_client(st: &mut ClientState, raw: &RawMode, port: u16) -> Result<i32> {
                 apply: st.stats.apply_snapshot(),
             }
             .dump();
+            // Also drop a byte-level forensic bundle if an apply-stall is
+            // pending, so `just debug-posh-dump` captures the divergent base.
+            if let Some(reack) = st.last_reack.as_ref() {
+                let _ = diag::capture_forensics(st.applied_num, &st.applied_data, reack);
+            }
         }
 
         // Keystrokes -> quit sequence / prediction / reliable input stream.
@@ -1183,6 +1214,14 @@ fn process_frame(st: &mut ClientState, frame: &ServerFrame) -> bool {
 /// screen state, so application is: fresh Terminal, then feed the dump_vt
 /// stream. Returns true when the frame advanced (or repeated) server state
 /// and an ack should go out.
+/// Clear the apply-stall forensic latch once the client makes forward progress,
+/// so a later wedge episode captures a fresh bundle and a manual/SIGUSR2 capture
+/// after recovery does not write a stale one.
+fn clear_reack(st: &mut ClientState) {
+    st.last_reack = None;
+    st.forensic_captured = false;
+}
+
 fn apply_frame(st: &mut ClientState, frame: &ServerFrame) -> bool {
     // Apply-path instrumentation (#wedge): record the visible/scrollback frame
     // at the gate so a frozen client self-reports which frame it is rejecting.
@@ -1233,6 +1272,7 @@ fn apply_frame(st: &mut ClientState, frame: &ServerFrame) -> bool {
         }
         st.applied_num = frame.frame_num;
         st.stats.record_apply_advanced();
+        clear_reack(st);
         return true;
     }
     // Base-anchored bodies (Diff, Morph) apply only when we are exactly at
@@ -1286,6 +1326,7 @@ fn apply_frame(st: &mut ClientState, frame: &ServerFrame) -> bool {
             {
                 st.notify.set_message("", false, now_ms());
             }
+            clear_reack(st);
             true
         }
         // MorphDelta advanced the model in place without re-dumping it (#15).
@@ -1294,12 +1335,40 @@ fn apply_frame(st: &mut ClientState, frame: &ServerFrame) -> bool {
         ApplyOutcome::AdvancedNoDump => {
             st.applied_num = frame.frame_num;
             st.stats.record_apply_advanced();
+            clear_reack(st);
             true
         }
-        // Undecodable diff / base mismatch the applier surfaced: re-ack and
-        // wait for a Full keyframe, leaving the model untouched.
+        // Undecodable diff against a matching-base frame: re-ack and wait for a
+        // Full keyframe, model untouched. This is the #90 apply-stall; stash the
+        // rejected body and capture a forensic bundle once per episode so the
+        // divergent base can be analysed offline (the divergence origin is not
+        // unit-reproducible -- it needs the live bytes).
         ApplyOutcome::ReackAndWait => {
             st.stats.record_apply_reack();
+            let captured = match &frame.body {
+                FrameBody::Diff { base, diff } => Some((*base, FrameKind::Diff, diff.clone())),
+                FrameBody::Morph { base, escapes } => {
+                    Some((*base, FrameKind::Morph, escapes.clone()))
+                }
+                _ => None,
+            };
+            if let Some((base, kind, bytes)) = captured {
+                st.last_reack = Some((frame.frame_num, base, kind, bytes));
+                if !st.forensic_captured {
+                    st.forensic_captured = true;
+                    if let Some(reack) = st.last_reack.as_ref() {
+                        let _ = diag::capture_forensics(st.applied_num, &st.applied_data, reack);
+                    }
+                }
+            }
+            // Auto-escalate (#90): an undecodable diff against a matching-base
+            // frame never self-heals -- the server keeps rebuilding the same
+            // diff against a base the client cannot reconstruct. Actively
+            // request a Full keyframe instead of passively waiting for one that
+            // never comes. One-shot flag (cleared on send); it coalesces across
+            // the retransmit storm and rides the next ack, so the manual "Reset
+            // & resync" command is no longer the only way out of an apply-stall.
+            st.flags |= sync::CLIENT_FLAG_RESYNC;
             true
         }
         // Empty is returned early above; an applier should not produce this
@@ -1852,6 +1921,72 @@ mod tests {
     }
 
     #[test]
+    fn dispatch_forensics_without_wedge_reports_nothing_pending() {
+        // The "Dump wedge forensics" command is local (no wire send) and, with
+        // no apply-stall pending, says so rather than writing a stale bundle.
+        let raw = pty_raw_mode();
+        let mut st = test_state(24, 80);
+        let send = dispatch_palette_action(&mut st, &raw, "session.forensics", &json!({}), 0);
+        assert!(!send, "forensics capture is local, no wire send");
+        assert!(
+            st.notify.message().contains("nothing pending"),
+            "notify: {}",
+            st.notify.message(),
+        );
+    }
+
+    #[test]
+    fn apply_frame_stashes_reack_on_short_base_diff() {
+        // A Diff whose base matches applied_num but whose prefix+suffix exceeds
+        // the client's (shorter) applied_data -> apply_diff None -> ReackAndWait.
+        // The body must be stashed for forensics. (Auto-capture file write is
+        // suppressed here via the one-shot guard so the test does no I/O.)
+        let mut st = test_state(24, 80);
+        st.applied_num = 5;
+        st.applied_data = b"PREFIX".to_vec(); // len 6 < prefix+suffix below
+        st.forensic_captured = true; // suppress the auto-capture write
+        let diff = sync::make_diff(b"PREFIX_oldmiddle_SUFFIX", b"PREFIX_newmiddle_SUFFIX");
+        let frame = ServerFrame {
+            flags: 0,
+            caps: vec![],
+            frame_num: 6,
+            input_ack: 0,
+            echo_ack: 0,
+            body: FrameBody::Diff { base: 5, diff },
+        };
+        assert!(apply_frame(&mut st, &frame), "reack re-acks (returns true)");
+        assert_eq!(st.applied_num, 5, "model untouched on reack");
+        let (num, base, kind, _) = st.last_reack.as_ref().expect("reack body stashed");
+        assert_eq!((*num, *base), (6, 5));
+        assert_eq!(*kind, FrameKind::Diff);
+        assert_ne!(
+            st.flags & sync::CLIENT_FLAG_RESYNC,
+            0,
+            "an apply-stall auto-escalates: request a Full keyframe (#90)",
+        );
+    }
+
+    #[test]
+    fn apply_frame_advance_clears_reack_latch() {
+        let mut st = test_state(24, 80);
+        st.last_reack = Some((9, 8, FrameKind::Diff, vec![1, 2, 3]));
+        st.forensic_captured = true;
+        // A Full keyframe advances and must clear the forensic latch so a later
+        // wedge episode captures afresh.
+        let frame = ServerFrame {
+            flags: 0,
+            caps: vec![],
+            frame_num: 1,
+            input_ack: 0,
+            echo_ack: 0,
+            body: FrameBody::Full(b"\x1b[2J\x1b[Hhi".to_vec()),
+        };
+        assert!(apply_frame(&mut st, &frame));
+        assert!(st.last_reack.is_none(), "advance clears stale reack");
+        assert!(!st.forensic_captured, "advance resets the one-shot guard");
+    }
+
+    #[test]
     fn palette_commands_includes_both_logging_scopes() {
         let cmds = palette_commands(false);
         let arr = cmds.as_array().expect("commands is an array");
@@ -1868,7 +2003,11 @@ mod tests {
             names.iter().any(|n| n.to_lowercase().contains("resync")),
             "resync command missing: {names:?}"
         );
-        assert_eq!(arr.len(), 10, "expected 10 commands, got {names:?}");
+        assert!(
+            names.iter().any(|n| n.to_lowercase().contains("wedge forensics")),
+            "forensics command missing: {names:?}"
+        );
+        assert_eq!(arr.len(), 11, "expected 11 commands, got {names:?}");
     }
 
     #[test]
@@ -1945,6 +2084,8 @@ mod tests {
             applier: Box::new(framesync::DumpDiff),
             stats: Stats::new(),
             palette: None,
+            last_reack: None,
+            forensic_captured: false,
         }
     }
 

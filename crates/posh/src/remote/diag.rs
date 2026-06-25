@@ -160,10 +160,10 @@ fn fmt_age(age: Option<u64>) -> String {
         .unwrap_or_else(|| "never".to_string())
 }
 
-/// The default per-pid sink when `POSH_DEBUG_LOG` is unset: the same socket-dir
-/// scheme the sessions (and `just debug-posh-sockets`) already use, so the dump
-/// file is discoverable beside them.
-fn default_dump_path(role: &str) -> PathBuf {
+/// The session socket dir, lazily created private (0700) like the session dirs.
+/// Per-pid dump and forensic files live here beside the sockets, so they are
+/// discoverable by `just debug-posh-sockets` / `debug-posh-forensics`.
+fn sink_base() -> PathBuf {
     let posh_dir = std::env::var("POSH_DIR").ok();
     let xdg = std::env::var("XDG_RUNTIME_DIR").ok();
     let tmpdir = std::env::var("TMPDIR").ok();
@@ -174,13 +174,19 @@ fn default_dump_path(role: &str) -> PathBuf {
         util::uid(),
     );
     // The base may not exist for a bare roaming server (no local session ever
-    // created it); make it private (0700) like the session dirs. Best-effort —
-    // log_init reports any real open failure.
+    // created it). Best-effort — the caller's open reports any real failure.
     let _ = std::fs::DirBuilder::new()
         .recursive(true)
         .mode(0o700)
         .create(&base);
-    base.join(format!("posh-{role}-{}.log", std::process::id()))
+    base
+}
+
+/// The default per-pid sink when `POSH_DEBUG_LOG` is unset: the same socket-dir
+/// scheme the sessions (and `just debug-posh-sockets`) already use, so the dump
+/// file is discoverable beside them.
+fn default_dump_path(role: &str) -> PathBuf {
+    sink_base().join(format!("posh-{role}-{}.log", std::process::id()))
 }
 
 /// Enable debug logging at runtime to the default per-pid sink (if not already
@@ -203,6 +209,110 @@ pub fn dump(role: &str, body: &str) {
         let _ = util::log_init(&default_dump_path(role));
     }
     util::log_write("dump", body);
+}
+
+/// Byte-level forensics for an apply-stall (#90/#94), captured when the client
+/// hits `ReackAndWait`. The transport-layer origin of a base divergence is not
+/// reproducible at unit level (the per-frame byte invariant holds in isolation),
+/// so the bytes from a live wedge are the only way to root-cause it.
+pub struct ForensicReport {
+    pub pid: u32,
+    pub applied_num: u64,
+    pub rx_num: u64,
+    pub rx_base: u64,
+    pub body: crate::remote::stats::FrameKind,
+    pub applied_len: usize,
+    pub body_len: usize,
+    /// Decoded prefix/suffix from a `Diff` body header; None for other bodies
+    /// or a body too short to carry the 8-byte header.
+    pub prefix_suffix: Option<(u32, u32)>,
+}
+
+impl ForensicReport {
+    /// One-line classification of why apply_diff failed (or would mis-apply).
+    pub fn verdict(&self) -> String {
+        use crate::remote::stats::FrameKind;
+        if self.body != FrameKind::Diff {
+            return format!(
+                "{} body (base={}) -- no prefix/suffix diff to decode",
+                self.body.as_str(),
+                self.rx_base,
+            );
+        }
+        let Some((p, s)) = self.prefix_suffix else {
+            return format!("DIFF_TRUNCATED (diff_len={} < 8 header bytes)", self.body_len);
+        };
+        let ps = p as usize + s as usize;
+        if ps > self.applied_len {
+            format!(
+                "SHORT_BASE: prefix+suffix={ps} > applied_len={} -- apply_diff returns None, \
+                 the #90 apply-stall wedge",
+                self.applied_len,
+            )
+        } else {
+            format!(
+                "LEN_OK: prefix+suffix={ps} <= applied_len={} -- apply_diff returns Some; if the \
+                 base content diverged this is silent corruption (#94)",
+                self.applied_len,
+            )
+        }
+    }
+
+    pub fn format(&self) -> String {
+        let (p, s) = match self.prefix_suffix {
+            Some((p, s)) => (p.to_string(), s.to_string()),
+            None => ("-".to_string(), "-".to_string()),
+        };
+        format!(
+            "role=client pid={} applied_num={} last_rx(num={} base={} body={}) \
+             applied_len={} body_len={} prefix={p} suffix={s}\nverdict: {}\n",
+            self.pid,
+            self.applied_num,
+            self.rx_num,
+            self.rx_base,
+            self.body.as_str(),
+            self.applied_len,
+            self.body_len,
+            self.verdict(),
+        )
+    }
+}
+
+/// Write a forensic bundle for a pending apply-stall reack to the sink dir:
+/// `posh-forensic-client-<pid>-<rx_num>.{txt,applied,diff}`, returning the
+/// `.txt` path. `reack` is `(rx_num, rx_base, body_kind, body_bytes)` as stashed
+/// by the client's `ReackAndWait` arm. Lazily creates the sink dir like `dump`,
+/// so it works even when periodic logging was never armed -- the whole point,
+/// since past wedges happened with no logging in place.
+pub fn capture_forensics(
+    applied_num: u64,
+    applied_data: &[u8],
+    reack: &(u64, u64, crate::remote::stats::FrameKind, Vec<u8>),
+) -> Option<PathBuf> {
+    use crate::remote::stats::FrameKind;
+    let (rx_num, rx_base, body, body_bytes) = (reack.0, reack.1, reack.2, &reack.3);
+    let prefix_suffix = (body == FrameKind::Diff && body_bytes.len() >= 8).then(|| {
+        let p = u32::from_le_bytes(body_bytes[0..4].try_into().unwrap());
+        let s = u32::from_le_bytes(body_bytes[4..8].try_into().unwrap());
+        (p, s)
+    });
+    let report = ForensicReport {
+        pid: std::process::id(),
+        applied_num,
+        rx_num,
+        rx_base,
+        body,
+        applied_len: applied_data.len(),
+        body_len: body_bytes.len(),
+        prefix_suffix,
+    };
+    let base = sink_base();
+    let stem = format!("posh-forensic-client-{}-{}", report.pid, rx_num);
+    let txt = base.join(format!("{stem}.txt"));
+    std::fs::write(&txt, report.format()).ok()?;
+    let _ = std::fs::write(base.join(format!("{stem}.applied")), applied_data);
+    let _ = std::fs::write(base.join(format!("{stem}.diff")), body_bytes);
+    Some(txt)
 }
 
 #[cfg(test)]
@@ -315,5 +425,57 @@ mod tests {
         ] {
             assert!(line.contains(key), "missing {key:?} in:\n{line}");
         }
+    }
+
+    use crate::remote::stats::FrameKind;
+
+    fn forensic(
+        body: FrameKind,
+        applied_len: usize,
+        prefix_suffix: Option<(u32, u32)>,
+        body_len: usize,
+    ) -> ForensicReport {
+        ForensicReport {
+            pid: 123,
+            applied_num: 5272,
+            rx_num: 5276,
+            rx_base: 5272,
+            body,
+            applied_len,
+            body_len,
+            prefix_suffix,
+        }
+    }
+
+    #[test]
+    fn forensic_verdict_short_base_is_the_wedge() {
+        // prefix+suffix (120) > applied_len (100): the #90 apply-stall.
+        let r = forensic(FrameKind::Diff, 100, Some((80, 40)), 200);
+        assert!(r.verdict().starts_with("SHORT_BASE"), "{}", r.verdict());
+        let line = r.format();
+        assert!(line.contains("verdict: SHORT_BASE"), "{line}");
+        assert!(line.contains("prefix=80 suffix=40"), "{line}");
+        assert!(line.contains("last_rx(num=5276 base=5272 body=diff)"), "{line}");
+    }
+
+    #[test]
+    fn forensic_verdict_len_ok_flags_content_divergence() {
+        // prefix+suffix (80) <= applied_len (100): apply_diff returns Some;
+        // a divergent base is then silent corruption (#94).
+        let r = forensic(FrameKind::Diff, 100, Some((40, 40)), 90);
+        assert!(r.verdict().starts_with("LEN_OK"), "{}", r.verdict());
+        assert!(r.verdict().contains("#94"), "{}", r.verdict());
+    }
+
+    #[test]
+    fn forensic_verdict_truncated_and_non_diff() {
+        let trunc = forensic(FrameKind::Diff, 100, None, 4);
+        assert!(
+            trunc.verdict().starts_with("DIFF_TRUNCATED"),
+            "{}",
+            trunc.verdict(),
+        );
+        let morph = forensic(FrameKind::Morph, 100, None, 50);
+        assert!(morph.verdict().contains("morph"), "{}", morph.verdict());
     }
 }

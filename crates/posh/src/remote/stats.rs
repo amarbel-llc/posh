@@ -134,7 +134,7 @@ pub struct PredictSample {
 /// Wire-body kind of a received frame, recorded at the apply gate so the dump
 /// and the wedge detector can name exactly which frame a frozen client is
 /// rejecting (#wedge debuggability).
-#[derive(Clone, Copy, Default, PartialEq, Eq)]
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
 pub enum FrameKind {
     #[default]
     None,

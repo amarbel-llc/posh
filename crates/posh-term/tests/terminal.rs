@@ -1031,6 +1031,88 @@ fn dump_vt_roundtrip_alt_screen() {
     assert_eq!(pos(&t3), pos(&t4));
 }
 
+// --- title (OSC 0/1/2) dump round-trip ---------------------------------------
+// The roaming wedge (#90) correlates strongly with window-title / frontmost-
+// process changes (OSC 0/2). The transport diffs successive `dump_vt` outputs;
+// if a title makes `dump_vt` non-idempotent (re-parsing a dump and re-dumping
+// changes the bytes), the client's reconstructed base length can diverge from
+// the server's — exactly the `apply_diff` short-base condition that wedges.
+
+/// `dump_vt` must be idempotent: parsing a dump into a fresh terminal and
+/// re-dumping yields byte-identical output. A length change here is the
+/// apply-stall origin we are hunting.
+fn assert_dump_vt_idempotent(t: &Terminal) {
+    let once = t.dump_vt();
+    let mut t2 = Terminal::new(t.rows(), t.cols());
+    t2.process(&once);
+    let twice = t2.dump_vt();
+    assert_eq!(
+        once,
+        twice,
+        "dump_vt not idempotent:\n once={:?}\n twice={:?}",
+        String::from_utf8_lossy(&once),
+        String::from_utf8_lossy(&twice),
+    );
+}
+
+#[test]
+fn dump_vt_title_variants_round_trip() {
+    let cases: &[&[u8]] = &[
+        b"\x1b]2;short\x07",
+        b"\x1b]0;both window and icon\x07",
+        b"\x1b]1;icon only\x07",
+        b"\x1b]2;\x07",                             // explicit empty title
+        b"\x1b]2;with;semicolons;in;it\x07",        // semicolons are title content
+        b"\x1b]2;unicode \xc3\xa9\xe2\x9c\x94\x07", // "é ✔" (valid UTF-8)
+        b"\x1b]2;tab\there\x07",                    // embedded C0 (tab) is content
+        b"\x1b]2;latin1-\xff-byte\x07",             // invalid UTF-8 -> from_utf8_lossy
+    ];
+    for raw in cases {
+        let mut t = term();
+        t.process(raw);
+        let t2 = roundtrip(&t);
+        assert_eq!(
+            t.title(),
+            t2.title(),
+            "title mismatch for {:?}",
+            String::from_utf8_lossy(raw),
+        );
+        assert_dump_vt_idempotent(&t);
+    }
+}
+
+#[test]
+fn dump_vt_idempotent_across_title_changes() {
+    // Rapid OSC title updates (the frontmost-process-change scenario): every
+    // intermediate state must leave dump_vt idempotent.
+    let mut t = term();
+    for title in ["one", "second longer title", "x", "", "back to normal"] {
+        t.process(format!("\x1b]2;{title}\x07").as_bytes());
+        assert_dump_vt_idempotent(&t);
+    }
+}
+
+#[test]
+fn process_title_split_byte_by_byte_matches_whole() {
+    // ADR-0003: a title OSC split across read boundaries must reassemble to the
+    // same state as delivered whole (a frontmost-process change landing
+    // mid-read). dump_vt of the two must be byte-identical.
+    let stream: &[u8] = b"prompt$ \x1b]0;user@host: ~/work\x07ready\r\nmore \xc3\xa9 text";
+    let mut whole = term();
+    whole.process(stream);
+
+    let mut split = term();
+    for b in stream {
+        split.process(&[*b]);
+    }
+    assert_eq!(whole.title(), split.title(), "title differs whole vs split");
+    assert_eq!(
+        whole.dump_vt(),
+        split.dump_vt(),
+        "dump_vt differs whole vs split",
+    );
+}
+
 #[test]
 fn dump_vt_roundtrip_scrollback() {
     let mut t = term();

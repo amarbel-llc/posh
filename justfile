@@ -721,6 +721,30 @@ debug-posh-dump pid:
     echo ">> $f"
     tail -n1 "$f"
 
+# Print the most recent wedge-forensics bundle for a roaming posh CLIENT pid.
+# A bundle is written on an apply-stall (ReackAndWait), and on demand via the
+# SIGUSR2 dump or the "Dump wedge forensics" palette command. The .txt carries
+# the verdict (SHORT_BASE prefix+suffix>applied = the #90 wedge; LEN_OK = #94
+# content divergence); the sibling .applied/.diff hold the raw bytes for an
+# offline apply_diff re-run. See remote/diag.rs::capture_forensics.
+# Usage: just debug-posh-forensics 12345
+[group("debug")]
+debug-posh-forensics pid:
+    #!/usr/bin/env bash
+    set -euo pipefail
+    pid='{{ pid }}'
+    uid="$(id -u)"
+    base="${POSH_DIR:-${XDG_RUNTIME_DIR:-/run/user/$uid}/posh}"
+    txt="$(ls -t "$base"/posh-forensic-client-"$pid"-*.txt 2>/dev/null | head -n1 || true)"
+    if [ -z "${txt:-}" ] || [ ! -f "$txt" ]; then
+      echo "no forensic bundle for pid $pid under $base (none captured -- not wedged?)" >&2
+      exit 1
+    fi
+    echo ">> $txt"
+    cat "$txt"
+    echo "== raw byte siblings (for an offline apply_diff re-run) =="
+    ls -l "${txt%.txt}.applied" "${txt%.txt}.diff" 2>/dev/null || true
+
 # Start a detached loopback roaming server (worktree debug binary) running a
 # long `sleep`, for HEADLESS transport debugging — e.g. exercising
 # debug-posh-dump without a tty. Prints the server's CONNECT line, then the
