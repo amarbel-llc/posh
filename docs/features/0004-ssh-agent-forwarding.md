@@ -60,9 +60,9 @@ channels generate zero wire traffic. Direct connection to a specific
 `srv-<pid>.sock` keeps working for anyone who wants a *particular*
 attach's agent.
 
-**On the wire**, three new RFC 0001 capability ids (allocated
-sequentially: `2 = AGENT_FORWARD`, `3 = AGENT_DATA`, `4 = AGENT_ACK`)
-carry a second reliable cumulative byte stream in each direction —
+**On the wire**, three new RFC 0001 capability ids
+(`6 = AGENT_FORWARD`, `7 = AGENT_DATA`, `8 = AGENT_ACK`) carry a second
+reliable cumulative byte stream in each direction —
 mirroring the existing input-stream machinery — whose payload is framed
 channel records (`channel:u32 kind:u8 len:u32 payload`) with kinds
 `OPEN` / `DATA` / `CLOSE` / `FAIL`. Channels map 1:1 to unix
@@ -70,6 +70,13 @@ connections accepted on the remote agent socket; the posh client opens
 one connection to the local `$SSH_AUTH_SOCK` per channel and proxies
 opaque bytes — no agent-message parsing on the wire path. Baseline peers
 skip the unknown ids and are untouched.
+
+The ids are `6`/`7`/`8`, not the `2`/`3`/`4` the original design
+proposed: ids `3`/`4`/`5` were taken by `SCROLLBACK`/`MORPH`/`BASE_SUM`
+between that design and this implementation, and `2` is held for the
+long-anticipated `TERM_FEATURES`. The exact numbers were never
+load-bearing — the agent caps just need their own contiguous block; the
+registry in RFC 0001 is the source of truth.
 
 ## Examples
 

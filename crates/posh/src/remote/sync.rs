@@ -767,6 +767,224 @@ impl InputInbox {
     }
 }
 
+// ---------------------------------------------------------------------------
+// Agent-channel record codec (FDR 0004 phase 1). The reliable agent byte
+// stream — carried in both directions by a mirror of the input-stream
+// machinery (InputOutbox/InputInbox above) — frames its content as channel
+// records:
+//
+//     channel: u32   kind: u8   len: u32   payload: len bytes   (all BE)
+//
+// Channels map 1:1 to unix connections accepted on the remote agent socket;
+// records are protocol-agnostic byte pipes (no agent-message parsing here).
+// Per ADR-0003 a record header or payload may straddle a stream-accept
+// boundary, so decoding is a byte-fed state machine that buffers a partial
+// record across `push` calls — never "one accept == one record".
+//
+// This is FDR 0004 work item 1: the pure codec + stream mirror, landed and
+// tested ahead of its non-test callers (the caps wiring is item 2, the remote
+// endpoint item 3, the client proxy item 4). Until those land the public
+// surface here has only test callers, hence the `#[allow(dead_code)]` on each
+// item — the same pattern `ScrollbackRing` uses for its conformance-tested but
+// not-yet-wired read side.
+
+/// Fixed record header: channel:u32 + kind:u8 + len:u32, big-endian to match
+/// the fragment header's framing precedent.
+#[allow(dead_code)]
+pub const AGENT_RECORD_HEADER_LEN: usize = 9;
+
+/// Upper bound on a single record's payload, matching the per-channel buffer
+/// cap (FDR 0004: OpenSSH's max agent message, 256 KB). A header advertising
+/// more than this from an authenticated-but-buggy/hostile peer is rejected
+/// rather than allowed to drive a multi-megabyte allocation.
+#[allow(dead_code)]
+pub const AGENT_RECORD_PAYLOAD_MAX: usize = 256 * 1024;
+
+#[allow(dead_code)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum RecordKind {
+    /// Remote: a new unix client connected to the agent socket. Opens `channel`.
+    Open,
+    /// One opaque chunk of `channel`'s byte pipe, either direction.
+    Data,
+    /// Either side closing `channel`; half-close collapses to full close (the
+    /// agent protocol is strict request/response).
+    Close,
+    /// Client: the local agent is unreachable. The remote end answers the unix
+    /// client with `SSH_AGENT_FAILURE` and closes `channel`.
+    Fail,
+}
+
+#[allow(dead_code)]
+impl RecordKind {
+    fn to_byte(self) -> u8 {
+        match self {
+            RecordKind::Open => 0,
+            RecordKind::Data => 1,
+            RecordKind::Close => 2,
+            RecordKind::Fail => 3,
+        }
+    }
+
+    fn from_byte(b: u8) -> Result<RecordKind> {
+        match b {
+            0 => Ok(RecordKind::Open),
+            1 => Ok(RecordKind::Data),
+            2 => Ok(RecordKind::Close),
+            3 => Ok(RecordKind::Fail),
+            other => Err(Error::from(format!("agent record: unknown kind {other}"))),
+        }
+    }
+}
+
+#[allow(dead_code)]
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct AgentRecord {
+    pub channel: u32,
+    pub kind: RecordKind,
+    pub payload: Vec<u8>,
+}
+
+#[allow(dead_code)]
+impl AgentRecord {
+    /// Appends this record's framed bytes to `out` (the agent outbox buffer).
+    pub fn encode_into(&self, out: &mut Vec<u8>) {
+        debug_assert!(self.payload.len() <= AGENT_RECORD_PAYLOAD_MAX);
+        out.extend_from_slice(&self.channel.to_be_bytes());
+        out.push(self.kind.to_byte());
+        out.extend_from_slice(&(self.payload.len() as u32).to_be_bytes());
+        out.extend_from_slice(&self.payload);
+    }
+
+    pub fn to_bytes(&self) -> Vec<u8> {
+        let mut out = Vec::with_capacity(AGENT_RECORD_HEADER_LEN + self.payload.len());
+        self.encode_into(&mut out);
+        out
+    }
+}
+
+/// Streaming reassembler for the agent record stream (ADR-0003). Bytes drained
+/// from the agent inbox are fed in via `push`; whole records come back out as
+/// they complete. A partial header or payload is held until the rest arrives,
+/// so callers never have to align stream-accept boundaries to record edges.
+///
+/// On a malformed header (unknown kind, or a `len` past
+/// [`AGENT_RECORD_PAYLOAD_MAX`]) `push` returns `Err` and the decoder is left
+/// poisoned: the cumulative byte stream is authenticated and in-order, so a
+/// bad header means the stream is corrupt, not recoverable by resync. The
+/// caller drops the connection.
+#[allow(dead_code)]
+#[derive(Default)]
+pub struct RecordDecoder {
+    buf: Vec<u8>,
+}
+
+#[allow(dead_code)]
+impl RecordDecoder {
+    pub fn new() -> RecordDecoder {
+        RecordDecoder::default()
+    }
+
+    /// Feeds freshly-applied stream bytes and returns every record that became
+    /// complete. Records may span multiple `push` calls; multiple records may
+    /// complete in one call.
+    pub fn push(&mut self, bytes: &[u8]) -> Result<Vec<AgentRecord>> {
+        self.buf.extend_from_slice(bytes);
+        let mut out = Vec::new();
+        loop {
+            if self.buf.len() < AGENT_RECORD_HEADER_LEN {
+                break;
+            }
+            let channel = u32::from_be_bytes(self.buf[0..4].try_into().unwrap());
+            let kind = RecordKind::from_byte(self.buf[4])?;
+            let len = u32::from_be_bytes(self.buf[5..9].try_into().unwrap()) as usize;
+            if len > AGENT_RECORD_PAYLOAD_MAX {
+                return Err(Error::from(format!(
+                    "agent record: payload len {len} exceeds cap {AGENT_RECORD_PAYLOAD_MAX}"
+                )));
+            }
+            let total = AGENT_RECORD_HEADER_LEN + len;
+            if self.buf.len() < total {
+                break; // header parsed, payload not yet fully arrived
+            }
+            let payload = self.buf[AGENT_RECORD_HEADER_LEN..total].to_vec();
+            self.buf.drain(..total);
+            out.push(AgentRecord {
+                channel,
+                kind,
+                payload,
+            });
+        }
+        Ok(out)
+    }
+}
+
+/// One end's view of the bidirectional agent byte stream (FDR 0004 phase 1).
+/// Both client and server hold one of these per connection: records are
+/// encoded into the outbox (the unacked tail rides every `AGENT_DATA` send
+/// and drops on `AGENT_ACK`, exactly like keystrokes), and the peer's stream
+/// is fed through the inbox into the decoder so only fresh, in-order bytes
+/// reach the record reassembler. Reliability and roaming are inherited whole
+/// from the input-stream machinery (constraint C3) — this type adds no new
+/// retransmission logic, only the record framing on top.
+#[allow(dead_code)]
+#[derive(Default)]
+pub struct AgentStream {
+    outbox: InputOutbox,
+    inbox: InputInbox,
+    decoder: RecordDecoder,
+}
+
+#[allow(dead_code)]
+impl AgentStream {
+    pub fn new() -> AgentStream {
+        AgentStream::default()
+    }
+
+    /// Frames a record onto the send side. It becomes part of the unacked
+    /// tail until the peer's `AGENT_ACK` reaches past it.
+    pub fn send(&mut self, record: &AgentRecord) {
+        self.outbox.push(&record.to_bytes());
+    }
+
+    /// The outbound stream's acked base — emit as the `AGENT_DATA` offset.
+    pub fn send_base(&self) -> u64 {
+        self.outbox.base()
+    }
+
+    /// Bytes not yet known-acked by the peer — the `AGENT_DATA` payload to
+    /// (re)send. Empty when the peer is caught up.
+    pub fn pending(&self) -> &[u8] {
+        self.outbox.pending()
+    }
+
+    pub fn has_pending(&self) -> bool {
+        !self.outbox.is_empty()
+    }
+
+    /// Offset to advertise in `AGENT_ACK`: one past the last byte handed to
+    /// the decoder, i.e. everything received in order so far.
+    pub fn recv_ack(&self) -> u64 {
+        self.inbox.next_offset()
+    }
+
+    /// Drops the acked prefix of the send side on the peer's `AGENT_ACK`.
+    pub fn ack(&mut self, upto: u64) {
+        self.outbox.ack(upto);
+    }
+
+    /// Accepts a peer `AGENT_DATA` chunk `(base, data)`: dedupes against what
+    /// the inbox has already seen, then feeds the fresh suffix to the record
+    /// decoder. Returns the records that completed. A malformed record stream
+    /// surfaces the decoder's `Err` (the caller drops the connection).
+    pub fn recv(&mut self, base: u64, data: &[u8]) -> Result<Vec<AgentRecord>> {
+        match self.inbox.accept(base, data) {
+            Some(fresh) => self.decoder.push(fresh),
+            None => Ok(Vec::new()),
+        }
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -1447,5 +1665,187 @@ mod tests {
         ob.ack(ib.next_offset());
         assert!(ob.is_empty());
         assert_eq!(applied, b"first second");
+    }
+
+    fn rec(channel: u32, kind: RecordKind, payload: &[u8]) -> AgentRecord {
+        AgentRecord {
+            channel,
+            kind,
+            payload: payload.to_vec(),
+        }
+    }
+
+    #[test]
+    fn agent_record_roundtrip_each_kind() {
+        for kind in [
+            RecordKind::Open,
+            RecordKind::Data,
+            RecordKind::Close,
+            RecordKind::Fail,
+        ] {
+            let r = rec(0xdead_beef, kind, b"payload");
+            let mut dec = RecordDecoder::new();
+            let got = dec.push(&r.to_bytes()).unwrap();
+            assert_eq!(got, vec![r]);
+        }
+    }
+
+    #[test]
+    fn agent_record_empty_payload_roundtrips() {
+        let r = rec(7, RecordKind::Close, b"");
+        assert_eq!(r.to_bytes().len(), AGENT_RECORD_HEADER_LEN);
+        let mut dec = RecordDecoder::new();
+        assert_eq!(dec.push(&r.to_bytes()).unwrap(), vec![r]);
+    }
+
+    #[test]
+    fn agent_record_multiple_in_one_push() {
+        let a = rec(1, RecordKind::Open, b"");
+        let b = rec(1, RecordKind::Data, b"hello");
+        let c = rec(2, RecordKind::Data, b"world!!");
+        let mut wire = a.to_bytes();
+        wire.extend(b.to_bytes());
+        wire.extend(c.to_bytes());
+        let mut dec = RecordDecoder::new();
+        assert_eq!(dec.push(&wire).unwrap(), vec![a, b, c]);
+    }
+
+    // ADR-0003: a read() boundary can fall anywhere — inside the header,
+    // inside the payload, between records. The decoder must hold the partial
+    // record until the rest arrives and never mis-frame.
+    #[test]
+    fn agent_record_reassembles_across_split_reads() {
+        let r = rec(0x0102_0304, RecordKind::Data, b"a longer agent message body");
+        let wire = r.to_bytes();
+        for split in 1..wire.len() {
+            let mut dec = RecordDecoder::new();
+            let first = dec.push(&wire[..split]).unwrap();
+            assert!(first.is_empty(), "premature record at split {split}");
+            let second = dec.push(&wire[split..]).unwrap();
+            assert_eq!(second, vec![r.clone()], "bad reassembly at split {split}");
+        }
+    }
+
+    #[test]
+    fn agent_record_reassembles_byte_at_a_time() {
+        let a = rec(5, RecordKind::Data, b"chunk-one");
+        let b = rec(5, RecordKind::Close, b"");
+        let mut wire = a.to_bytes();
+        wire.extend(b.to_bytes());
+        let mut dec = RecordDecoder::new();
+        let mut got = Vec::new();
+        for &byte in &wire {
+            got.extend(dec.push(&[byte]).unwrap());
+        }
+        assert_eq!(got, vec![a, b]);
+    }
+
+    // The codec rides the same cumulative byte stream as keystrokes: prove a
+    // record survives outbox retransmission + inbox dedupe and decodes once.
+    #[test]
+    fn agent_record_through_outbox_inbox_stream() {
+        let a = rec(1, RecordKind::Open, b"");
+        let b = rec(1, RecordKind::Data, b"sign-request-bytes");
+        let mut ob = InputOutbox::new();
+        let mut ib = InputInbox::new();
+        let mut dec = RecordDecoder::new();
+        let mut got = Vec::new();
+
+        ob.push(&a.to_bytes());
+        if let Some(fresh) = ib.accept(ob.base(), ob.pending()) {
+            got.extend(dec.push(fresh).unwrap());
+        }
+        // Ack for the first record is lost: the outbox retransmits it ahead of
+        // the new bytes; the inbox must hand the decoder only the fresh suffix,
+        // so the first record is not decoded twice.
+        ob.push(&b.to_bytes());
+        if let Some(fresh) = ib.accept(ob.base(), ob.pending()) {
+            got.extend(dec.push(fresh).unwrap());
+        }
+        ob.ack(ib.next_offset());
+        assert!(ob.is_empty());
+        assert_eq!(got, vec![a, b]);
+    }
+
+    #[test]
+    fn agent_record_unknown_kind_is_rejected() {
+        // channel 0, kind 9 (undefined), len 0.
+        let mut wire = 0u32.to_be_bytes().to_vec();
+        wire.push(9);
+        wire.extend(0u32.to_be_bytes());
+        let mut dec = RecordDecoder::new();
+        assert!(dec.push(&wire).is_err());
+    }
+
+    #[test]
+    fn agent_record_oversized_len_is_rejected_not_allocated() {
+        // A header claiming a payload past the cap must be refused before any
+        // attempt to buffer toward it — never trust an authenticated peer's len.
+        let mut wire = 0u32.to_be_bytes().to_vec();
+        wire.push(RecordKind::Data.to_byte());
+        wire.extend(((AGENT_RECORD_PAYLOAD_MAX + 1) as u32).to_be_bytes());
+        let mut dec = RecordDecoder::new();
+        assert!(dec.push(&wire).is_err());
+    }
+
+    #[test]
+    fn agent_record_payload_at_cap_is_accepted() {
+        let r = rec(3, RecordKind::Data, &vec![0xab; AGENT_RECORD_PAYLOAD_MAX]);
+        let mut dec = RecordDecoder::new();
+        assert_eq!(dec.push(&r.to_bytes()).unwrap(), vec![r]);
+    }
+
+    // The wrapper bundles outbox+inbox+decoder; drive a full request/response
+    // round-trip across the pair (client opens a channel and sends a request;
+    // server replies; acks lag a step) and confirm each side decodes the
+    // other's records exactly once despite the retransmitted unacked tail.
+    #[test]
+    fn agent_stream_bidirectional_request_response() {
+        let mut client = AgentStream::new();
+        let mut server = AgentStream::new();
+
+        // Client -> server: OPEN then a request, both still unacked.
+        client.send(&rec(1, RecordKind::Open, b""));
+        client.send(&rec(1, RecordKind::Data, b"sign please"));
+        let got = server
+            .recv(client.send_base(), client.pending())
+            .unwrap();
+        assert_eq!(
+            got,
+            vec![rec(1, RecordKind::Open, b""), rec(1, RecordKind::Data, b"sign please")]
+        );
+        // Server acks what it consumed; client's outbox drains.
+        client.ack(server.recv_ack());
+        assert!(!client.has_pending());
+
+        // Server -> client: the signature, plus close.
+        server.send(&rec(1, RecordKind::Data, b"signature"));
+        server.send(&rec(1, RecordKind::Close, b""));
+        // First delivery lost: the client never acks, so the server's next
+        // send retransmits the whole unacked tail. The client must still
+        // surface each record once, not twice.
+        let _dropped = server.pending().to_vec();
+        let got = client
+            .recv(server.send_base(), server.pending())
+            .unwrap();
+        assert_eq!(
+            got,
+            vec![rec(1, RecordKind::Data, b"signature"), rec(1, RecordKind::Close, b"")]
+        );
+        // A pure retransmission of the same tail yields nothing new.
+        assert!(client.recv(server.send_base(), server.pending()).unwrap().is_empty());
+        client.ack(server.recv_ack());
+        server.ack(client.recv_ack());
+        assert!(!server.has_pending());
+    }
+
+    #[test]
+    fn agent_stream_surfaces_decoder_error() {
+        let mut s = AgentStream::new();
+        // A record with an undefined kind byte reaches the decoder and errors.
+        let mut wire = 0u32.to_be_bytes().to_vec();
+        wire.push(9);
+        wire.extend(0u32.to_be_bytes());
+        assert!(s.recv(0, &wire).is_err());
     }
 }
