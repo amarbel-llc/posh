@@ -91,6 +91,12 @@ pub struct Stats {
     apply_stale: u64,
     apply_dup: u64,
     apply_basemis: u64,
+    /// RFC 0006 base-checksum mismatches: the diff base NUMBER matched but its
+    /// CONTENT checksum did not, so the client refused the body and resynced.
+    /// Distinct from `apply_basemis` (a frame-number mismatch); a nonzero count
+    /// means a base divergence was caught before it could short-base wedge or
+    /// silently corrupt (#94).
+    apply_base_sum_mismatch: u64,
     apply_reack: u64,
     apply_nochange: u64,
     /// Received Scrollback bodies (RFC 0002) — excluded from the full/diff/empty
@@ -165,6 +171,7 @@ pub struct ApplySnapshot {
     pub stale: u64,
     pub dup: u64,
     pub basemis: u64,
+    pub base_sum_mismatch: u64,
     pub reack: u64,
     pub nochange: u64,
     pub scrollback_rx: u64,
@@ -248,6 +255,11 @@ impl Stats {
     pub fn record_apply_basemis(&mut self) {
         self.apply_basemis += 1;
     }
+    /// RFC 0006: a base-checksum mismatch caught a divergent diff base (the base
+    /// number matched but the content did not). Counted separately from basemis.
+    pub fn record_apply_base_sum_mismatch(&mut self) {
+        self.apply_base_sum_mismatch += 1;
+    }
     /// The applier surfaced an undecodable body (re-ack and wait for a keyframe).
     pub fn record_apply_reack(&mut self) {
         self.apply_reack += 1;
@@ -264,6 +276,7 @@ impl Stats {
             stale: self.apply_stale,
             dup: self.apply_dup,
             basemis: self.apply_basemis,
+            base_sum_mismatch: self.apply_base_sum_mismatch,
             reack: self.apply_reack,
             nochange: self.apply_nochange,
             scrollback_rx: self.frames_scrollback,

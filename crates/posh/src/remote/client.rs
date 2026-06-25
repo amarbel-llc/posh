@@ -1421,7 +1421,7 @@ fn apply_frame(st: &mut ClientState, frame: &ServerFrame) -> bool {
             // always None, so this is inert there.)
             if let Some(sum) = base_sum {
                 if sync::base_checksum(&st.applied_data) != *sum {
-                    st.stats.record_apply_basemis();
+                    st.stats.record_apply_base_sum_mismatch();
                     st.flags |= sync::CLIENT_FLAG_RESYNC;
                     return true;
                 }
@@ -2195,7 +2195,7 @@ mod tests {
 
         // Divergent base checksum: must NOT apply; re-ack + resync.
         let wrong = sync::base_checksum(&st.applied_data).wrapping_add(1);
-        let before_basemis = st.stats.apply_snapshot().basemis;
+        let before_mismatch = st.stats.apply_snapshot().base_sum_mismatch;
         let bad = ServerFrame {
             flags: 0,
             caps: vec![],
@@ -2216,8 +2216,8 @@ mod tests {
             "divergent base requests a resync",
         );
         assert!(
-            st.stats.apply_snapshot().basemis > before_basemis,
-            "divergent base records a base mismatch",
+            st.stats.apply_snapshot().base_sum_mismatch > before_mismatch,
+            "divergent base records a base-checksum mismatch",
         );
     }
 
@@ -2554,7 +2554,21 @@ mod tests {
         }
 
         assert!(frames_applied > 0, "transport never connected (0 frames applied)");
-        eprintln!("harness CLEAN: {frames_applied} frames applied, reack=0 (no SHORT_BASE stall)");
+        // RFC 0006 corruption detector (#94): with #95 + #7 the diff base never
+        // diverges, so the base checksum never mismatches. A nonzero count means a
+        // base divergence was caught -- the exact condition that, unchecked,
+        // short-base wedges (#90) or silently corrupts the screen (#94). This
+        // catches a divergence even when apply_diff would have returned Some
+        // (garbage), which the reack assertion alone cannot.
+        let bsm = st.stats.apply_snapshot().base_sum_mismatch;
+        assert_eq!(
+            bsm, 0,
+            "base divergence detected ({bsm}x): the client's diff base diverged \
+             from the server's (would corrupt or wedge without the RFC 0006 checksum)"
+        );
+        eprintln!(
+            "harness CLEAN: {frames_applied} frames applied, reack=0, base_sum_mismatch=0"
+        );
     }
 
     #[test]
