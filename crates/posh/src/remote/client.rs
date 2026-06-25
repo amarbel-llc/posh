@@ -352,6 +352,11 @@ struct ClientState {
     cols: u16,
     flags: u8,
     last_send: u64,
+    /// Wall-clock ms when we last decoded a frame from the server. Its age
+    /// (now - last_heard) distinguishes a transport-dead freeze (server silent /
+    /// path down) from an apply-stall (frames arriving, none applied) -- the
+    /// first thing to check on a wedge. Mirrors the server's own last_heard.
+    last_heard: u64,
     // Frame 0 is the implicit empty initial state.
     applied_num: u64,
     applied_data: Vec<u8>,
@@ -479,6 +484,7 @@ fn client_loop(
         cols,
         flags: 0,
         last_send: 0,
+        last_heard: now,
         applied_num: 0,
         applied_data: Vec::new(),
         server_term: Terminal::with_scrollback(rows, cols, 0),
@@ -657,6 +663,7 @@ fn drive_client(st: &mut ClientState, raw: &RawMode, port: u16) -> Result<i32> {
             diag::ClientState {
                 remote: st.conn.remote(),
                 last_send_age_ms: (st.last_send != 0).then(|| now.saturating_sub(st.last_send)),
+                last_heard_age_ms: now.saturating_sub(st.last_heard),
                 applied_num: st.applied_num,
                 outbox_base: st.outbox.base(),
                 outbox_pending: st.outbox.pending().len(),
@@ -674,6 +681,7 @@ fn drive_client(st: &mut ClientState, raw: &RawMode, port: u16) -> Result<i32> {
                 cols: st.cols,
                 echo_on: st.echo_on,
                 codec: st.framesync.label(),
+                title: st.server_term.title().to_string(),
                 apply: st.stats.apply_snapshot(),
             }
             .dump();
@@ -718,6 +726,7 @@ fn drive_client(st: &mut ClientState, raw: &RawMode, port: u16) -> Result<i32> {
                         let Ok(frame) = ServerFrame::decode(&assembled) else {
                             continue;
                         };
+                        st.last_heard = now_ms();
                         if !heard {
                             heard = true;
                             if st.notify.message().starts_with("Nothing received") {
@@ -2343,6 +2352,7 @@ mod tests {
             cols,
             flags: 0,
             last_send: 0,
+            last_heard: 0,
             applied_num: 0,
             applied_data: Vec::new(),
             server_term: Terminal::with_scrollback(rows, cols, 0),

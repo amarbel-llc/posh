@@ -79,6 +79,10 @@ pub struct ClientState {
     pub remote: Option<SocketAddr>,
     /// None until the first message is sent (`last_send == 0`).
     pub last_send_age_ms: Option<u64>,
+    /// ms since we last decoded a frame from the server -- transport liveness. A
+    /// large value with `bytes_rx` flat means the server went silent / the path
+    /// is down, distinct from an apply-stall where frames keep arriving.
+    pub last_heard_age_ms: u64,
     pub applied_num: u64,
     pub outbox_base: u64,
     pub outbox_pending: usize,
@@ -97,6 +101,9 @@ pub struct ClientState {
     pub echo_on: bool,
     /// Negotiated frame-sync codec label (#wedge): "dumpdiff" | "morph".
     pub codec: &'static str,
+    /// The server's window/icon title (OSC 0/2), mirrored from the client model,
+    /// so a debugger can map a pid/socket back to its session by hand.
+    pub title: String,
     /// Client apply-path histogram + last received frame (#wedge): a climbing
     /// `basemis` with a frozen `term_gen` is the apply-stall fingerprint.
     pub apply: crate::remote::stats::ApplySnapshot,
@@ -105,15 +112,16 @@ pub struct ClientState {
 impl ClientState {
     pub fn format(&self) -> String {
         format!(
-            "role=client pid={} remote={} last_send_age_ms={} applied_num={} \
+            "role=client pid={} remote={} last_send_age_ms={} last_heard_age_ms={} applied_num={} \
              outbox_base={} outbox_pending={} scrollback_len={} srtt={:.0}ms rto={}ms \
              send_interval={}ms bytes_rx={} bytes_tx={} predict(active={} shown={} epoch_lag={}) \
-             term_gen={} rows={} cols={} echo_on={} codec={} \
+             term_gen={} rows={} cols={} echo_on={} codec={} title={:?} \
              apply(adv={} stale={} dup={} basemis={} bsum_mis={} reack={} nochange={} sb_rx={}) \
              last_rx(num={} base={} body={})",
             std::process::id(),
             fmt_addr(self.remote),
             fmt_age(self.last_send_age_ms),
+            self.last_heard_age_ms,
             self.applied_num,
             self.outbox_base,
             self.outbox_pending,
@@ -131,6 +139,7 @@ impl ClientState {
             self.cols,
             self.echo_on as u8,
             self.codec,
+            &self.title,
             self.apply.advanced,
             self.apply.stale,
             self.apply.dup,
@@ -382,6 +391,7 @@ mod tests {
         let line = ClientState {
             remote: Some("100.85.205.39:60006".parse().unwrap()),
             last_send_age_ms: Some(20),
+            last_heard_age_ms: 1234,
             applied_num: 41,
             outbox_base: 7,
             outbox_pending: 3,
@@ -399,6 +409,7 @@ mod tests {
             cols: 120,
             echo_on: true,
             codec: "morph",
+            title: "user@host: ~/work".to_string(),
             apply: crate::remote::stats::ApplySnapshot {
                 basemis: 7,
                 last_rx_num: 41,
@@ -421,6 +432,8 @@ mod tests {
             "cols=120",
             "echo_on=1",
             "codec=morph",
+            "last_heard_age_ms=1234",
+            "title=\"user@host: ~/work\"",
             "apply(adv=0 stale=0 dup=0 basemis=7 bsum_mis=0 reack=0 nochange=0 sb_rx=0)",
             "last_rx(num=41 base=40 body=diff)",
         ] {
