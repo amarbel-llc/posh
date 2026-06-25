@@ -25,6 +25,14 @@ pub const CAP_SCROLLBACK: u8 = 3;
 /// this; a `Full` keyframe is always the fallback (first frame, base
 /// mismatch, alt-screen/resize transitions).
 pub const CAP_MORPH: u8 = 4;
+/// Base-integrity checksums (RFC 0006). Client entry (empty payload): "I verify
+/// the diff base of a `BODY_DIFF_SUM`/`BODY_MORPH_SUM` body against my own held
+/// dump before applying, and re-ack + request a resync on a mismatch instead of
+/// reconstructing against a divergent base". The server emits the checksummed
+/// body variants only when the peer advertised this; a baseline peer keeps
+/// receiving plain `BODY_DIFF`/`BODY_MORPH`. Catches a base divergence that the
+/// content-blind prefix/suffix diff would otherwise mis-apply (#94) or wedge on.
+pub const CAP_BASE_SUM: u8 = 5;
 
 /// The post-table format version we implement (payload of
 /// [`CAP_PROTOCOL_VERSION`]).

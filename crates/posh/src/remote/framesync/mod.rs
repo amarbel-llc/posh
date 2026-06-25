@@ -412,6 +412,7 @@ mod tests {
         bad_diff.extend_from_slice(&100u32.to_le_bytes());
         let body = FrameBody::Diff {
             base: 0,
+            base_sum: None,
             diff: bad_diff,
         };
         let outcome = applier.apply(ROWS, COLS, b"", &mut term, &body);

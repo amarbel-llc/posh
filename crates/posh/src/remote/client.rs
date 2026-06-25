@@ -1282,10 +1282,23 @@ fn apply_frame(st: &mut ClientState, frame: &ServerFrame) -> bool {
     // use (#15).
     match &frame.body {
         FrameBody::Empty => return false,
-        FrameBody::Diff { base, .. } | FrameBody::Morph { base, .. } => {
+        FrameBody::Diff { base, base_sum, .. } | FrameBody::Morph { base, base_sum, .. } => {
             if *base != st.applied_num {
                 st.stats.record_apply_basemis();
                 return true;
+            }
+            // RFC 0006: the base NUMBER matches; when the server stamped a base
+            // checksum (CAP_BASE_SUM, Diff only) verify the base CONTENT too. A
+            // mismatch means our applied_data diverged from the server's diff
+            // base -- applying would short-base wedge or silently corrupt (#94) --
+            // so re-ack and request a Full keyframe instead. (Morph base_sum is
+            // always None, so this is inert there.)
+            if let Some(sum) = base_sum {
+                if sync::base_checksum(&st.applied_data) != *sum {
+                    st.stats.record_apply_basemis();
+                    st.flags |= sync::CLIENT_FLAG_RESYNC;
+                    return true;
+                }
             }
         }
         FrameBody::Full(_) => {}
@@ -1346,8 +1359,8 @@ fn apply_frame(st: &mut ClientState, frame: &ServerFrame) -> bool {
         ApplyOutcome::ReackAndWait => {
             st.stats.record_apply_reack();
             let captured = match &frame.body {
-                FrameBody::Diff { base, diff } => Some((*base, FrameKind::Diff, diff.clone())),
-                FrameBody::Morph { base, escapes } => {
+                FrameBody::Diff { base, diff, .. } => Some((*base, FrameKind::Diff, diff.clone())),
+                FrameBody::Morph { base, escapes, .. } => {
                     Some((*base, FrameKind::Morph, escapes.clone()))
                 }
                 _ => None,
@@ -1594,10 +1607,19 @@ fn predict_sample(stats: &predict::PredictorStats) -> PredictSample {
 /// BODY_SCROLLBACK" with payload 0 requesting the server's default ring
 /// depth (RFC 0002 §1). Consumes the one-shot resize suppression.
 fn outgoing_caps(st: &mut ClientState) -> Vec<caps::Cap> {
-    let mut extra = vec![caps::Cap {
-        id: caps::CAP_EXIT_STATUS,
-        payload: vec![],
-    }];
+    let mut extra = vec![
+        caps::Cap {
+            id: caps::CAP_EXIT_STATUS,
+            payload: vec![],
+        },
+        // Base-integrity (RFC 0006): always advertised. It's a pure safety check
+        // -- verify the diff base before applying -- at a negligible cost (4
+        // bytes per Diff), so there is no opt-in gate like CAP_MORPH.
+        caps::Cap {
+            id: caps::CAP_BASE_SUM,
+            payload: vec![],
+        },
+    ];
     if st.suppress_scrollback_once {
         st.suppress_scrollback_once = false;
     } else {
@@ -1908,6 +1930,7 @@ mod tests {
             frame_num: 2,
             body: FrameBody::Diff {
                 base: 1,
+                base_sum: None,
                 diff: sync::make_diff(b"a", b"ab"),
             },
             ..base
@@ -1952,7 +1975,7 @@ mod tests {
             frame_num: 6,
             input_ack: 0,
             echo_ack: 0,
-            body: FrameBody::Diff { base: 5, diff },
+            body: FrameBody::Diff { base: 5, base_sum: None, diff },
         };
         assert!(apply_frame(&mut st, &frame), "reack re-acks (returns true)");
         assert_eq!(st.applied_num, 5, "model untouched on reack");
@@ -1984,6 +2007,75 @@ mod tests {
         assert!(apply_frame(&mut st, &frame));
         assert!(st.last_reack.is_none(), "advance clears stale reack");
         assert!(!st.forensic_captured, "advance resets the one-shot guard");
+    }
+
+    #[test]
+    fn apply_frame_base_sum_mismatch_resyncs_instead_of_applying() {
+        // RFC 0006: a Diff whose base NUMBER matches applied_num but whose base
+        // CHECKSUM does not (our applied_data diverged from the server's diff
+        // base) must NOT be applied -- it would short-base wedge or silently
+        // corrupt (#94). The client re-acks and requests a resync.
+        let mut st = test_state(24, 80);
+        let full = ServerFrame {
+            flags: 0,
+            caps: vec![],
+            frame_num: 1,
+            input_ack: 0,
+            echo_ack: 0,
+            body: FrameBody::Full(b"\x1b[2J\x1b[Hhello".to_vec()),
+        };
+        assert!(apply_frame(&mut st, &full));
+        assert_eq!(st.applied_num, 1);
+        let baseline = st.applied_data.clone();
+        let diff = sync::make_diff(&baseline, b"\x1b[2J\x1b[Hhello world");
+
+        // Matching base checksum: applies and advances, no resync.
+        let good = ServerFrame {
+            flags: 0,
+            caps: vec![],
+            frame_num: 2,
+            input_ack: 0,
+            echo_ack: 0,
+            body: FrameBody::Diff {
+                base: 1,
+                base_sum: Some(sync::base_checksum(&baseline)),
+                diff: diff.clone(),
+            },
+        };
+        assert!(apply_frame(&mut st, &good));
+        assert_eq!(st.applied_num, 2, "matching checksum applies");
+        assert_eq!(
+            st.flags & sync::CLIENT_FLAG_RESYNC,
+            0,
+            "no resync on a matching base",
+        );
+
+        // Divergent base checksum: must NOT apply; re-ack + resync.
+        let wrong = sync::base_checksum(&st.applied_data).wrapping_add(1);
+        let before_basemis = st.stats.apply_snapshot().basemis;
+        let bad = ServerFrame {
+            flags: 0,
+            caps: vec![],
+            frame_num: 3,
+            input_ack: 0,
+            echo_ack: 0,
+            body: FrameBody::Diff {
+                base: 2,
+                base_sum: Some(wrong),
+                diff: diff.clone(),
+            },
+        };
+        assert!(apply_frame(&mut st, &bad), "re-acks (returns true)");
+        assert_eq!(st.applied_num, 2, "divergent base is not applied");
+        assert_ne!(
+            st.flags & sync::CLIENT_FLAG_RESYNC,
+            0,
+            "divergent base requests a resync",
+        );
+        assert!(
+            st.stats.apply_snapshot().basemis > before_basemis,
+            "divergent base records a base mismatch",
+        );
     }
 
     #[test]
@@ -2183,10 +2275,10 @@ mod tests {
                         let pre_len = st.applied_data.len();
                         let desc = match &frame.body {
                             FrameBody::Full(b) => format!("Full(len={})", b.len()),
-                            FrameBody::Diff { base, diff } => {
+                            FrameBody::Diff { base, diff, .. } => {
                                 format!("Diff(base={base}, difflen={})", diff.len())
                             }
-                            FrameBody::Morph { base, escapes } => {
+                            FrameBody::Morph { base, escapes, .. } => {
                                 format!("Morph(base={base}, len={})", escapes.len())
                             }
                             FrameBody::Scrollback { base, rows } => {

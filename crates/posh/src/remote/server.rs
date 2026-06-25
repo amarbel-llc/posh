@@ -206,6 +206,10 @@ pub(crate) fn server_loop(mut conn: Connection, child: pty::PtyChild, rows: u16,
     // frames with MorphDelta, else DumpDiff (today's behavior). Both encoders
     // are held so selection is a per-frame choice, not a reallocation.
     let mut peer_wants_morph = false;
+    // Base-integrity (RFC 0006): when the peer advertises CAP_BASE_SUM we stamp
+    // each visible Diff/Morph with a checksum of its diff base, so the client can
+    // detect a divergent base and resync instead of mis-applying it (#94).
+    let mut peer_wants_base_sum = false;
     let mut dumpdiff_enc = DumpDiff;
     let mut morph_enc = MorphDelta::default();
 
@@ -518,6 +522,8 @@ pub(crate) fn server_loop(mut conn: Connection, child: pty::PtyChild, rows: u16,
                         peer_wants_scrollback = now_wants;
                         // CAP_MORPH (#15): per-message, like scrollback.
                         peer_wants_morph = caps::find(&msg.caps, caps::CAP_MORPH).is_some();
+                        peer_wants_base_sum =
+                            caps::find(&msg.caps, caps::CAP_BASE_SUM).is_some();
                     }
                     Ok(None) => continue,
                     Err(e) if e.kind() == std::io::ErrorKind::WouldBlock => break,
@@ -735,11 +741,27 @@ pub(crate) fn server_loop(mut conn: Connection, child: pty::PtyChild, rows: u16,
                         rows: current.dims.0,
                         cols: current.dims.1,
                     };
-                    let body = if peer_wants_morph {
+                    let mut body = if peer_wants_morph {
                         morph_enc.encode(baseline.as_ref(), &cur)
                     } else {
                         dumpdiff_enc.encode(baseline.as_ref(), &cur)
                     };
+                    // RFC 0006: stamp the diff base's checksum so the client can
+                    // confirm it holds the same base before applying. The base is
+                    // the acked dump the diff was computed against (acked_data).
+                    if peer_wants_base_sum {
+                        if let Some(acked) = acked_data.as_deref() {
+                            // Diff only: the client's applied_data IS the DumpDiff
+                            // base, so a byte checksum verifies it. A Morph base is
+                            // a snapshot, not the client's held dump bytes, so the
+                            // byte checksum does not apply (Morph base_sum stays
+                            // None -- the field is reserved for a future snapshot
+                            // checksum).
+                            if let FrameBody::Diff { base_sum, .. } = &mut body {
+                                *base_sum = Some(sync::base_checksum(acked));
+                            }
+                        }
+                    }
                     // Diff economics sampling, preserved from the inline path:
                     // a diff-shaped body (Diff/Morph) is the incremental case;
                     // Full is the keyframe. The fresh_frame gate keeps

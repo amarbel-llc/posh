@@ -198,6 +198,20 @@ pub fn apply_diff(old: &[u8], diff: &[u8]) -> Option<Vec<u8>> {
     Some(out)
 }
 
+/// FNV-1a 32-bit over a diff base's bytes (RFC 0006, `CAP_BASE_SUM`). A cheap,
+/// dependency-free integrity tag so the client can confirm it holds the same
+/// diff base the server diffed against before applying a content-blind
+/// prefix/suffix diff. Not cryptographic — the datagram is already AEAD-sealed;
+/// this only needs to catch an accidental base divergence.
+pub fn base_checksum(bytes: &[u8]) -> u32 {
+    let mut h: u32 = 0x811c_9dc5;
+    for &b in bytes {
+        h ^= u32::from(b);
+        h = h.wrapping_mul(0x0100_0193);
+    }
+    h
+}
+
 // ---------------------------------------------------------------------------
 // Server->client frames. A frame is the unit of screen-state sync: either a
 // full dump_vt stream, a diff against the client-acked frame, or an empty
@@ -225,7 +239,16 @@ pub const FLAG_SERVER_LOG: u8 = 16;
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum FrameBody {
     Full(Vec<u8>),
-    Diff { base: u64, diff: Vec<u8> },
+    /// `base_sum` (RFC 0006, `CAP_BASE_SUM`): when `Some`, `base_checksum` of the
+    /// server's diff base. The client verifies it against its own held dump
+    /// before applying and re-acks + resyncs on a mismatch, turning a silent
+    /// base divergence (#94) or a short-base wedge into a clean recovery. `None`
+    /// for a baseline peer (plain `BODY_DIFF`).
+    Diff {
+        base: u64,
+        base_sum: Option<u32>,
+        diff: Vec<u8>,
+    },
     Empty,
     /// Incremental visible-frame sync (#15, `CAP_MORPH`): a minimal forward
     /// escape-delta (`display::new_frame`) that morphs the client's existing
@@ -235,7 +258,11 @@ pub enum FrameBody {
     /// `base` (`base == applied_num`), so a retransmitted or superseding body
     /// is anchored exactly like `Diff`. On a base mismatch the client re-acks
     /// and the server falls back to a `Full` keyframe.
-    Morph { base: u64, escapes: Vec<u8> },
+    Morph {
+        base: u64,
+        base_sum: Option<u32>,
+        escapes: Vec<u8>,
+    },
     /// Scrollback growth (RFC 0002 §2): the rows that newly entered the
     /// server's primary-screen scrollback since the frame the client last
     /// acknowledged. `base` is that acked frame number — the client appends
@@ -270,6 +297,12 @@ const BODY_DIFF: u8 = 1;
 const BODY_EMPTY: u8 = 2;
 const BODY_SCROLLBACK: u8 = 3;
 const BODY_MORPH: u8 = 4;
+/// Checksummed visible-body variants (RFC 0006, `CAP_BASE_SUM`): a `BODY_DIFF` /
+/// `BODY_MORPH` whose `base` u64 is immediately followed by a u32
+/// `base_checksum` of the server's diff base, letting the client detect a
+/// divergent base before applying.
+const BODY_DIFF_SUM: u8 = 5;
+const BODY_MORPH_SUM: u8 = 6;
 
 /// Upper bound on rows in one `BODY_SCROLLBACK` body. A single frame's
 /// payload is already bounded by the fragmentation layer, but `appended` is
@@ -293,14 +326,32 @@ impl ServerFrame {
                 out.push(BODY_FULL);
                 out.extend_from_slice(bytes);
             }
-            FrameBody::Diff { base, diff } => {
-                out.push(BODY_DIFF);
+            FrameBody::Diff {
+                base,
+                base_sum,
+                diff,
+            } => {
+                out.push(if base_sum.is_some() { BODY_DIFF_SUM } else { BODY_DIFF });
                 out.extend_from_slice(&base.to_le_bytes());
+                if let Some(sum) = base_sum {
+                    out.extend_from_slice(&sum.to_le_bytes());
+                }
                 out.extend_from_slice(diff);
             }
-            FrameBody::Morph { base, escapes } => {
-                out.push(BODY_MORPH);
+            FrameBody::Morph {
+                base,
+                base_sum,
+                escapes,
+            } => {
+                out.push(if base_sum.is_some() {
+                    BODY_MORPH_SUM
+                } else {
+                    BODY_MORPH
+                });
                 out.extend_from_slice(&base.to_le_bytes());
+                if let Some(sum) = base_sum {
+                    out.extend_from_slice(&sum.to_le_bytes());
+                }
                 out.extend_from_slice(escapes);
             }
             FrameBody::Empty => out.push(BODY_EMPTY),
@@ -335,7 +386,20 @@ impl ServerFrame {
                 let base = u64::from_le_bytes(data[at + 1..at + 9].try_into().unwrap());
                 FrameBody::Diff {
                     base,
+                    base_sum: None,
                     diff: data[at + 9..].to_vec(),
+                }
+            }
+            BODY_DIFF_SUM => {
+                if data.len() < at + 13 {
+                    return Err(Error::from("diff-sum frame too short"));
+                }
+                let base = u64::from_le_bytes(data[at + 1..at + 9].try_into().unwrap());
+                let sum = u32::from_le_bytes(data[at + 9..at + 13].try_into().unwrap());
+                FrameBody::Diff {
+                    base,
+                    base_sum: Some(sum),
+                    diff: data[at + 13..].to_vec(),
                 }
             }
             BODY_MORPH => {
@@ -345,7 +409,20 @@ impl ServerFrame {
                 let base = u64::from_le_bytes(data[at + 1..at + 9].try_into().unwrap());
                 FrameBody::Morph {
                     base,
+                    base_sum: None,
                     escapes: data[at + 9..].to_vec(),
+                }
+            }
+            BODY_MORPH_SUM => {
+                if data.len() < at + 13 {
+                    return Err(Error::from("morph-sum frame too short"));
+                }
+                let base = u64::from_le_bytes(data[at + 1..at + 9].try_into().unwrap());
+                let sum = u32::from_le_bytes(data[at + 9..at + 13].try_into().unwrap());
+                FrameBody::Morph {
+                    base,
+                    base_sum: Some(sum),
+                    escapes: data[at + 13..].to_vec(),
                 }
             }
             BODY_EMPTY => FrameBody::Empty,
@@ -827,6 +904,16 @@ mod tests {
         assert_eq!(apply_diff(b"tiny", &d), None);
     }
 
+    #[test]
+    fn base_checksum_is_deterministic_and_sensitive() {
+        // RFC 0006: same bytes -> same tag; any change (including transposition)
+        // -> different tag, enough to catch an accidental diff-base divergence.
+        assert_eq!(base_checksum(b"hello"), base_checksum(b"hello"));
+        assert_ne!(base_checksum(b"hello"), base_checksum(b"hellp"));
+        assert_ne!(base_checksum(b""), base_checksum(b"x"));
+        assert_ne!(base_checksum(b"ab"), base_checksum(b"ba"));
+    }
+
     // A title change is a length-varying edit to the middle of a dump (the OSC
     // title sits between unchanged prefix/suffix screen state). On a matching
     // base it round-trips fine — the normal path.
@@ -952,6 +1039,7 @@ mod tests {
                 echo_ack: 100,
                 body: FrameBody::Diff {
                     base: 7,
+                    base_sum: None,
                     diff: b"delta".to_vec(),
                 },
             },
@@ -991,6 +1079,7 @@ mod tests {
                 echo_ack: 5,
                 body: FrameBody::Morph {
                     base: 9,
+                    base_sum: None,
                     escapes: b"\x1b[2;3Hx".to_vec(),
                 },
             },
@@ -1004,7 +1093,34 @@ mod tests {
                 echo_ack: 6,
                 body: FrameBody::Morph {
                     base: 11,
+                    base_sum: None,
                     escapes: vec![],
+                },
+            },
+            // RFC 0006: checksummed Diff/Morph (BODY_DIFF_SUM / BODY_MORPH_SUM)
+            // carry a u32 base checksum after the base; it must round-trip.
+            ServerFrame {
+                flags: 0,
+                caps: vec![],
+                frame_num: 13,
+                input_ack: 7,
+                echo_ack: 7,
+                body: FrameBody::Diff {
+                    base: 12,
+                    base_sum: Some(0xdead_beef),
+                    diff: b"sumdelta".to_vec(),
+                },
+            },
+            ServerFrame {
+                flags: 0,
+                caps: vec![],
+                frame_num: 14,
+                input_ack: 8,
+                echo_ack: 8,
+                body: FrameBody::Morph {
+                    base: 13,
+                    base_sum: Some(0x0123_4567),
+                    escapes: b"\x1b[5;5Hy".to_vec(),
                 },
             },
         ];
@@ -1128,6 +1244,7 @@ mod tests {
             FrameBody::Full(b"dump".to_vec()),
             FrameBody::Diff {
                 base: 3,
+                base_sum: None,
                 diff: b"delta".to_vec(),
             },
             FrameBody::Empty,

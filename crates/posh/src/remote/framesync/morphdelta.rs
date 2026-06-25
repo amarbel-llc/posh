@@ -57,6 +57,7 @@ impl FrameEncoder for MorphDelta {
                 let escapes = display::new_frame(true, &base.snapshot, cur.snapshot, false);
                 FrameBody::Morph {
                     base: base.num,
+                    base_sum: None, // server fills it when CAP_BASE_SUM is negotiated
                     escapes,
                 }
             }
@@ -76,7 +77,7 @@ impl FrameApplier for MorphDelta {
         body: &FrameBody,
     ) -> ApplyOutcome {
         match body {
-            FrameBody::Morph { base: _, escapes } => {
+            FrameBody::Morph { base: _, escapes, .. } => {
                 // The caller has already confirmed base == applied_num before
                 // dispatching here. Apply the forward morph to the EXISTING
                 // model — the whole point of the codec. No `dump_vt` refresh and

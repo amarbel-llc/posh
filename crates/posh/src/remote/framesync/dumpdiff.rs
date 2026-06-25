@@ -26,6 +26,9 @@ impl FrameEncoder for DumpDiff {
                 if diff.len() + 8 < cur.dump.len() {
                     FrameBody::Diff {
                         base: base.num,
+                        // The server fills the base_sum in when CAP_BASE_SUM is
+                        // negotiated; the codec is oblivious to it (#94/RFC 0006).
+                        base_sum: None,
                         diff,
                     }
                 } else {
@@ -54,7 +57,7 @@ impl FrameApplier for DumpDiff {
         let bytes: Vec<u8> = match body {
             FrameBody::Empty => return ApplyOutcome::NoChange,
             FrameBody::Full(bytes) => bytes.clone(),
-            FrameBody::Diff { base: _, diff } => {
+            FrameBody::Diff { base: _, diff, .. } => {
                 // The caller has already confirmed base == applied_num before
                 // dispatching here; reconstruct against the held dump.
                 match sync::apply_diff(applied_data, diff) {
