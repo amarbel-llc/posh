@@ -42,9 +42,11 @@ const AGENT_SLOW_TICK_MS: u64 = 5_000;
 /// `server_loop` computes the gate against this and passes it to [`tick`].
 pub(crate) const AGENT_PEER_ACTIVE: u64 = 15_000; // ms
 
-/// One forwarded agent connection accepted on `agent/srv-<pid>.sock`. The
-/// `u32` id matches it to a record-stream channel; the `stream` is the live
-/// unix socket to the agent client (`git`, `ssh`, …).
+/// One forwarded agent connection: the `u32` id matches it to a record-stream
+/// channel, the `stream` is the live unix socket. On the server end the stream
+/// is an accepted connection from an agent client (`git`, `ssh`, …); on the
+/// client end it is an outbound connection to the user's local agent. The
+/// channel machinery is otherwise identical, so both ends share it.
 struct Channel {
     id: u32,
     stream: UnixStream,
@@ -211,64 +213,20 @@ impl AgentEndpoint {
     /// bytes and a `Close` when a channel reaches EOF or errors. The caller
     /// feeds the returned records into the outbound `AgentStream`.
     pub fn read_channels(&mut self) -> Vec<AgentRecord> {
-        let mut out = Vec::new();
-        for ch in &mut self.channels {
-            if ch.closed {
-                continue;
-            }
-            let mut buf = [0u8; CHANNEL_READ_CHUNK];
-            loop {
-                match ch.stream.read(&mut buf) {
-                    Ok(0) => {
-                        ch.closed = true;
-                        out.push(close_record(ch.id));
-                        break;
-                    }
-                    Ok(n) => out.push(AgentRecord {
-                        channel: ch.id,
-                        kind: RecordKind::Data,
-                        payload: buf[..n].to_vec(),
-                    }),
-                    Err(e) if e.kind() == std::io::ErrorKind::WouldBlock => break,
-                    Err(e) if e.kind() == std::io::ErrorKind::Interrupted => continue,
-                    Err(_) => {
-                        ch.closed = true;
-                        out.push(close_record(ch.id));
-                        break;
-                    }
-                }
-            }
-        }
-        self.reap_closed();
-        out
+        read_channel_data(&mut self.channels)
     }
 
     /// Dispatches records decoded from the client's agent stream to their
     /// channel sockets: `Data` writes through; `Close`/`Fail` tear the channel
-    /// down (the agent client's read then sees EOF, i.e. a failed request).
-    /// An unknown channel id is ignored — a `Close` may race ahead of our own.
+    /// down (the agent client's read then sees EOF, i.e. a failed request). An
+    /// `Open` on this (server) end is a peer bug — OPEN only flows
+    /// remote->client — and is ignored.
     pub fn apply_records(&mut self, records: &[AgentRecord]) {
         for rec in records {
-            let Some(ch) = self.channels.iter_mut().find(|c| c.id == rec.channel) else {
-                continue;
-            };
-            match rec.kind {
-                RecordKind::Data => {
-                    // A short/failed write fails just this channel, not the
-                    // session: the agent protocol is strict request/response,
-                    // so a half-written request is a failed request.
-                    if ch.stream.write_all(&rec.payload).is_err() {
-                        ch.closed = true;
-                    }
-                }
-                RecordKind::Open => {
-                    // OPEN only flows remote->client; receiving one back is a
-                    // peer bug. Ignore rather than trust it.
-                }
-                RecordKind::Close | RecordKind::Fail => ch.closed = true,
-            }
+            apply_data_or_close(&mut self.channels, rec);
+            // OPEN reaching the server end is ignored by apply_data_or_close.
         }
-        self.reap_closed();
+        reap_closed(&mut self.channels);
     }
 
     /// Periodic maintenance, gated to `AGENT_SLOW_TICK_MS`. Returns any
@@ -303,11 +261,11 @@ impl AgentEndpoint {
     }
 
     fn live_channel_count(&self) -> usize {
-        self.channels.iter().filter(|c| !c.closed).count()
+        live_count(&self.channels)
     }
 
     fn reap_closed(&mut self) {
-        self.channels.retain(|c| !c.closed);
+        reap_closed(&mut self.channels);
     }
 
     /// Unlinks `srv-*.sock` files in `agent/` whose owning pid is dead. A
@@ -346,11 +304,184 @@ impl Drop for AgentEndpoint {
     }
 }
 
+/// The client side of agent forwarding (FDR 0004 work item 4): the mirror of
+/// [`AgentEndpoint`]. Where the endpoint *accepts* connections on the remote
+/// host and the user's agent lives at the far end, the client *connects* —
+/// each `Open` record from the server opens a fresh connection to the user's
+/// local agent socket (`$SSH_AUTH_SOCK` or a `--forward-agent=PATH` override),
+/// and bytes are proxied back over the same record stream. No symlink, no
+/// listener, no GC: the client owns no shared filesystem endpoint, just the
+/// outbound connections it dials on demand.
+pub struct AgentClient {
+    /// The local agent socket every channel dials. Resolved once at startup;
+    /// a path that dies mid-session degrades to per-`Open` `Fail` (design §1).
+    source: PathBuf,
+    channels: Vec<Channel>,
+}
+
+impl AgentClient {
+    /// Builds a proxy that forwards the agent at `source` (the seam the tests
+    /// and item 5's resolved `--forward-agent=PATH` use).
+    pub fn new(source: PathBuf) -> AgentClient {
+        AgentClient {
+            source,
+            channels: Vec::new(),
+        }
+    }
+
+    /// Builds a proxy forwarding `$SSH_AUTH_SOCK` — the best-effort default
+    /// source. Item 5 replaces this caller with the resolved flag/env path;
+    /// the proxy interface (it forwards *a* socket) is unchanged. `None` when
+    /// no agent socket is set, so the caller can skip forwarding silently.
+    #[allow(dead_code)] // caller lands with the -A flag wiring (FDR 0004 item 5)
+    pub fn from_env() -> Option<AgentClient> {
+        let sock = std::env::var("SSH_AUTH_SOCK").ok().filter(|s| !s.is_empty())?;
+        Some(AgentClient::new(PathBuf::from(sock)))
+    }
+
+    /// Channel fds for `client_loop`'s poll set (no listener — the client only
+    /// has its outbound connections).
+    pub fn pollfds(&self) -> Vec<libc::pollfd> {
+        self.channels
+            .iter()
+            .filter(|c| !c.closed)
+            .map(|c| util::pollfd(c.stream.as_raw_fd(), libc::POLLIN))
+            .collect()
+    }
+
+    /// Reads readable channels into `Data`/`Close` records (shared with the
+    /// endpoint). The caller frames these onto the outbound `AgentStream`.
+    pub fn read_channels(&mut self) -> Vec<AgentRecord> {
+        read_channel_data(&mut self.channels)
+    }
+
+    /// Applies records decoded from the server's agent stream. `Open` dials the
+    /// local agent and opens a channel (or replies `Fail` if it can't connect,
+    /// or the channel cap is hit); `Data` writes through; `Close`/`Fail` tears
+    /// the channel down. Returns any records to send back to the server (the
+    /// `Fail` replies). Connect uses a blocking connect then switches the
+    /// socket to non-blocking — agent sockets are local, so the connect is
+    /// effectively immediate.
+    pub fn apply_records(&mut self, records: &[AgentRecord]) -> Vec<AgentRecord> {
+        let mut out = Vec::new();
+        for rec in records {
+            match rec.kind {
+                RecordKind::Open => {
+                    if live_count(&self.channels) >= MAX_AGENT_CHANNELS {
+                        out.push(fail_record(rec.channel));
+                        continue;
+                    }
+                    match self.connect_channel(rec.channel) {
+                        Ok(()) => {}
+                        Err(_) => out.push(fail_record(rec.channel)),
+                    }
+                }
+                _ => apply_data_or_close(&mut self.channels, rec),
+            }
+        }
+        reap_closed(&mut self.channels);
+        out
+    }
+
+    fn connect_channel(&mut self, id: u32) -> std::io::Result<()> {
+        let stream = UnixStream::connect(&self.source)?;
+        stream.set_nonblocking(true)?;
+        self.channels.push(Channel {
+            id,
+            stream,
+            closed: false,
+        });
+        Ok(())
+    }
+
+    #[cfg(test)]
+    fn live_channel_count(&self) -> usize {
+        live_count(&self.channels)
+    }
+}
+
 fn close_record(channel: u32) -> AgentRecord {
     AgentRecord {
         channel,
         kind: RecordKind::Close,
         payload: Vec::new(),
+    }
+}
+
+fn fail_record(channel: u32) -> AgentRecord {
+    AgentRecord {
+        channel,
+        kind: RecordKind::Fail,
+        payload: Vec::new(),
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Channel-table machinery shared by both ends (AgentEndpoint accepts; the
+// AgentClient connects). The byte pump and teardown are direction-agnostic;
+// only how a channel is *created* (accept vs connect on OPEN) differs.
+
+fn live_count(channels: &[Channel]) -> usize {
+    channels.iter().filter(|c| !c.closed).count()
+}
+
+fn reap_closed(channels: &mut Vec<Channel>) {
+    channels.retain(|c| !c.closed);
+}
+
+/// Reads every readable channel non-blocking, producing `Data` records for
+/// fresh bytes and a `Close` on EOF/error. Reaps closed channels before
+/// returning. Identical on both ends.
+fn read_channel_data(channels: &mut Vec<Channel>) -> Vec<AgentRecord> {
+    let mut out = Vec::new();
+    for ch in channels.iter_mut() {
+        if ch.closed {
+            continue;
+        }
+        let mut buf = [0u8; CHANNEL_READ_CHUNK];
+        loop {
+            match ch.stream.read(&mut buf) {
+                Ok(0) => {
+                    ch.closed = true;
+                    out.push(close_record(ch.id));
+                    break;
+                }
+                Ok(n) => out.push(AgentRecord {
+                    channel: ch.id,
+                    kind: RecordKind::Data,
+                    payload: buf[..n].to_vec(),
+                }),
+                Err(e) if e.kind() == std::io::ErrorKind::WouldBlock => break,
+                Err(e) if e.kind() == std::io::ErrorKind::Interrupted => continue,
+                Err(_) => {
+                    ch.closed = true;
+                    out.push(close_record(ch.id));
+                    break;
+                }
+            }
+        }
+    }
+    reap_closed(channels);
+    out
+}
+
+/// Applies one inbound record's `Data`/`Close`/`Fail` to its channel: `Data`
+/// writes through (a failed write closes just that channel — a half-written
+/// agent request is a failed request), `Close`/`Fail` tear it down. `Open` and
+/// unknown-channel records are no-ops here; the OPEN-creates-a-channel step is
+/// the per-end caller's job. Does not reap — the caller reaps after a batch.
+fn apply_data_or_close(channels: &mut [Channel], rec: &AgentRecord) {
+    let Some(ch) = channels.iter_mut().find(|c| c.id == rec.channel) else {
+        return;
+    };
+    match rec.kind {
+        RecordKind::Data => {
+            if ch.stream.write_all(&rec.payload).is_err() {
+                ch.closed = true;
+            }
+        }
+        RecordKind::Open => {} // handled by the caller, never written through
+        RecordKind::Close | RecordKind::Fail => ch.closed = true,
     }
 }
 
@@ -583,5 +714,136 @@ mod tests {
         assert_eq!(srv_sock_pid(Path::new("/x/sock")), None);
         assert_eq!(srv_sock_pid(Path::new("/x/srv-abc.sock")), None);
         assert_eq!(srv_sock_pid(Path::new("/x/other.sock")), None);
+    }
+
+    // --- AgentClient (the local-agent proxy mirror) -----------------------
+
+    /// A short path under /tmp for a fake-agent listener socket (SUN_LEN again).
+    fn temp_sock() -> PathBuf {
+        use std::sync::atomic::{AtomicU32, Ordering};
+        static COUNTER: AtomicU32 = AtomicU32::new(0);
+        let n = COUNTER.fetch_add(1, Ordering::Relaxed);
+        PathBuf::from(format!("/tmp/posh-fakeagt-{}-{}.sock", own_pid(), n))
+    }
+
+    #[test]
+    fn client_open_connects_to_local_agent() {
+        // Stand up a fake local agent; an OPEN record makes the client dial it.
+        let sock = temp_sock();
+        std::fs::remove_file(&sock).ok();
+        let listener = UnixListener::bind(&sock).unwrap();
+        let mut client = AgentClient::new(sock.clone());
+
+        let fails = client.apply_records(&[AgentRecord {
+            channel: 1,
+            kind: RecordKind::Open,
+            payload: Vec::new(),
+        }]);
+        assert!(fails.is_empty(), "a reachable agent must not FAIL");
+        assert_eq!(client.live_channel_count(), 1);
+        // The fake agent saw the connection.
+        listener.set_nonblocking(true).unwrap();
+        assert!(listener.accept().is_ok());
+
+        std::fs::remove_file(&sock).ok();
+    }
+
+    #[test]
+    fn client_proxies_bytes_both_ways() {
+        let sock = temp_sock();
+        std::fs::remove_file(&sock).ok();
+        let listener = UnixListener::bind(&sock).unwrap();
+        let mut client = AgentClient::new(sock.clone());
+        client.apply_records(&[AgentRecord {
+            channel: 7,
+            kind: RecordKind::Open,
+            payload: Vec::new(),
+        }]);
+        let (mut agent_side, _) = listener.accept().unwrap();
+
+        // Server-relayed request bytes -> written through to the fake agent.
+        client.apply_records(&[AgentRecord {
+            channel: 7,
+            kind: RecordKind::Data,
+            payload: b"request".to_vec(),
+        }]);
+        let mut got = [0u8; 7];
+        agent_side.read_exact(&mut got).unwrap();
+        assert_eq!(&got, b"request");
+
+        // Agent reply -> surfaces as a Data record headed back to the server.
+        agent_side.write_all(b"reply").unwrap();
+        std::thread::sleep(std::time::Duration::from_millis(20));
+        let recs = client.read_channels();
+        let joined: Vec<u8> = recs
+            .iter()
+            .filter(|r| r.kind == RecordKind::Data && r.channel == 7)
+            .flat_map(|r| r.payload.clone())
+            .collect();
+        assert_eq!(joined, b"reply");
+
+        std::fs::remove_file(&sock).ok();
+    }
+
+    #[test]
+    fn client_open_to_dead_agent_replies_fail() {
+        // No listener at the source: the OPEN connect fails and the client
+        // answers FAIL on that channel rather than opening it.
+        let sock = temp_sock();
+        std::fs::remove_file(&sock).ok();
+        let mut client = AgentClient::new(sock);
+        let out = client.apply_records(&[AgentRecord {
+            channel: 3,
+            kind: RecordKind::Open,
+            payload: Vec::new(),
+        }]);
+        assert_eq!(out.len(), 1);
+        assert_eq!(out[0].kind, RecordKind::Fail);
+        assert_eq!(out[0].channel, 3);
+        assert_eq!(client.live_channel_count(), 0);
+    }
+
+    #[test]
+    fn client_close_tears_down_channel() {
+        let sock = temp_sock();
+        std::fs::remove_file(&sock).ok();
+        let _listener = UnixListener::bind(&sock).unwrap();
+        let mut client = AgentClient::new(sock.clone());
+        client.apply_records(&[AgentRecord {
+            channel: 5,
+            kind: RecordKind::Open,
+            payload: Vec::new(),
+        }]);
+        assert_eq!(client.live_channel_count(), 1);
+        client.apply_records(&[close_record(5)]);
+        assert_eq!(client.live_channel_count(), 0);
+        std::fs::remove_file(&sock).ok();
+    }
+
+    #[test]
+    fn client_channel_count_is_capped() {
+        let sock = temp_sock();
+        std::fs::remove_file(&sock).ok();
+        let _listener = UnixListener::bind(&sock).unwrap();
+        let mut client = AgentClient::new(sock.clone());
+        let opens: Vec<AgentRecord> = (0..MAX_AGENT_CHANNELS as u32)
+            .map(|id| AgentRecord {
+                channel: id,
+                kind: RecordKind::Open,
+                payload: Vec::new(),
+            })
+            .collect();
+        assert!(client.apply_records(&opens).is_empty());
+        assert_eq!(client.live_channel_count(), MAX_AGENT_CHANNELS);
+        // One past the cap is refused with FAIL.
+        let over = client.apply_records(&[AgentRecord {
+            channel: 99,
+            kind: RecordKind::Open,
+            payload: Vec::new(),
+        }]);
+        assert_eq!(over.len(), 1);
+        assert_eq!(over[0].kind, RecordKind::Fail);
+        assert_eq!(client.live_channel_count(), MAX_AGENT_CHANNELS);
+        std::fs::remove_file(&sock).ok();
     }
 }

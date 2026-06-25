@@ -280,7 +280,19 @@ pub fn run(host: &str, port: u16, family: Family) -> Result<()> {
     // Take over the alternate screen (mosh smcup); close() below restores
     // the user's pre-connect shell screen on the way out.
     let _ = util::write_all_retry(STDOUT, &display::open(), 1000);
-    let result = client_loop(conn, model, render, predict_overwrite, grab_mouse, &raw, addr.port());
+    // Agent forwarding (FDR 0004) is off until item 5 resolves the -A flag /
+    // POSH_FORWARD_AGENT into this call. The proxy machinery is built and
+    // tested but dormant.
+    let result = client_loop(
+        conn,
+        model,
+        render,
+        predict_overwrite,
+        grab_mouse,
+        &raw,
+        addr.port(),
+        false,
+    );
     let _ = util::write_all_retry(STDOUT, &display::close(), 1000);
     drop(raw);
     eprintln!("\nposh: [client exited]");
@@ -422,8 +434,16 @@ struct ClientState {
     /// One-shot guard so a wedge writes a single forensic bundle, not one per
     /// retransmit (the reack loop fires constantly); reset when apply advances.
     forensic_captured: bool,
+    /// SSH agent forwarding (FDR 0004): the local-agent proxy + the
+    /// bidirectional agent byte stream, and whether the server has advertised
+    /// AGENT_FORWARD yet (gates our own AGENT_DATA/ACK; caps don't persist, so
+    /// this latches once seen). `None` proxy == forwarding off this connection.
+    agent: Option<crate::remote::agent::AgentClient>,
+    agent_stream: sync::AgentStream,
+    agent_seen: bool,
 }
 
+#[allow(clippy::too_many_arguments)]
 #[allow(clippy::too_many_arguments)]
 fn client_loop(
     conn: Connection,
@@ -433,6 +453,7 @@ fn client_loop(
     grab_mouse: GrabMouse,
     raw: &RawMode,
     port: u16,
+    agent_forward: bool,
 ) -> Result<i32> {
     util::set_nonblocking(STDIN)?;
 
@@ -484,6 +505,15 @@ fn client_loop(
         palette: None,
         last_reack: None,
         forensic_captured: false,
+        // Agent forwarding (FDR 0004): the proxy is built only when active and
+        // a local agent is reachable; otherwise forwarding proceeds off.
+        agent: if agent_forward {
+            crate::remote::agent::AgentClient::from_env()
+        } else {
+            None
+        },
+        agent_stream: sync::AgentStream::new(),
+        agent_seen: false,
     };
     let result = drive_client(&mut st, raw, port);
     // Tear down the palette renderer (if any) before the final stats flush.
@@ -557,6 +587,17 @@ fn drive_client(st: &mut ClientState, raw: &RawMode, port: u16) -> Result<i32> {
             fds.push(util::pollfd(p.ctrl_fd(), libc::POLLIN));
             base
         });
+        // Agent-forwarding channel fds (FDR 0004): the local-agent connections
+        // the proxy has open. `agent_base`/count map their `revents` back.
+        let (agent_base, agent_count) = match &st.agent {
+            Some(a) => {
+                let agent_fds = a.pollfds();
+                let base = fds.len();
+                fds.extend_from_slice(&agent_fds);
+                (base, agent_fds.len())
+            }
+            None => (usize::MAX, 0),
+        };
         let mut send_now = false;
         let poll_start = st.stats.enabled().then(Instant::now);
         match util::poll(&mut fds, timeout) {
@@ -681,6 +722,22 @@ fn drive_client(st: &mut ClientState, raw: &RawMode, port: u16) -> Result<i32> {
                     Ok(None) => continue,
                     Err(e) if e.kind() == std::io::ErrorKind::WouldBlock => break,
                     Err(_) => break,
+                }
+            }
+        }
+
+        // Agent-forwarding channels (FDR 0004): read local-agent reply bytes
+        // and frame them onto the outbound agent stream. `read_channels` scans
+        // every channel, so a single signalled agent fd drives it.
+        if agent_base != usize::MAX {
+            if let Some(agent) = st.agent.as_mut() {
+                let readable = (agent_base..agent_base + agent_count)
+                    .any(|i| fds[i].revents & (libc::POLLIN | libc::POLLHUP | libc::POLLERR) != 0);
+                if readable {
+                    for rec in agent.read_channels() {
+                        st.agent_stream.send(&rec);
+                        send_now = true; // flush agent chunks promptly (design §2)
+                    }
                 }
             }
         }
@@ -1157,6 +1214,47 @@ fn process_user_input(st: &mut ClientState, buf: &[u8]) -> bool {
     dirty
 }
 
+/// Consumes the server's agent-forwarding caps from a frame (FDR 0004): latch
+/// AGENT_FORWARD, feed AGENT_DATA chunks through the stream into the local-agent
+/// proxy (any FAIL replies the proxy produces — unreachable agent, channel cap
+/// — go back onto our outbound stream), and drain our outbox on AGENT_ACK. A
+/// decoder error means the authenticated stream is corrupt; drop the proxy.
+fn consume_agent_caps(st: &mut ClientState, frame: &ServerFrame) {
+    let Some(agent) = st.agent.as_mut() else {
+        return;
+    };
+    if caps::find(&frame.caps, caps::CAP_AGENT_FORWARD).is_some() {
+        st.agent_seen = true;
+    }
+    let mut decode_failed = false;
+    for cap in caps::find_all(&frame.caps, caps::CAP_AGENT_DATA) {
+        let Ok((offset, bytes)) = caps::decode_agent_data(&cap.payload) else {
+            decode_failed = true;
+            break;
+        };
+        match st.agent_stream.recv(offset, bytes) {
+            Ok(records) => {
+                for reply in agent.apply_records(&records) {
+                    st.agent_stream.send(&reply);
+                }
+            }
+            Err(_) => {
+                decode_failed = true;
+                break;
+            }
+        }
+    }
+    if let Some(cap) = caps::find(&frame.caps, caps::CAP_AGENT_ACK) {
+        if let Ok(upto) = caps::decode_agent_ack(&cap.payload) {
+            st.agent_stream.ack(upto);
+        }
+    }
+    if decode_failed {
+        st.agent = None;
+        st.agent_seen = false;
+    }
+}
+
 /// Handles one decoded server frame: acks, prediction bookkeeping, and
 /// state application. Returns true when an ack should go out.
 fn process_frame(st: &mut ClientState, frame: &ServerFrame) -> bool {
@@ -1207,6 +1305,7 @@ fn process_frame(st: &mut ClientState, frame: &ServerFrame) -> bool {
             }
         }
     }
+    consume_agent_caps(st, frame);
     apply_frame(st, frame)
 }
 
@@ -1636,6 +1735,23 @@ fn outgoing_caps(st: &mut ClientState) -> Vec<caps::Cap> {
             id: caps::CAP_MORPH,
             payload: vec![],
         });
+    }
+    // Agent forwarding (FDR 0004): advertise AGENT_FORWARD whenever the proxy
+    // is active so the server may begin opening channels; emit AGENT_DATA
+    // chunks + AGENT_ACK only once the server has advertised back (RFC 0001:
+    // not before seeing the peer's AGENT_FORWARD).
+    if st.agent.is_some() {
+        extra.push(caps::Cap {
+            id: caps::CAP_AGENT_FORWARD,
+            payload: vec![],
+        });
+        if st.agent_seen {
+            extra.extend(caps::encode_agent_data(
+                st.agent_stream.send_base(),
+                st.agent_stream.pending(),
+            ));
+            extra.push(caps::encode_agent_ack(st.agent_stream.recv_ack()));
+        }
     }
     caps::own_table(&extra)
 }
@@ -2178,6 +2294,9 @@ mod tests {
             palette: None,
             last_reack: None,
             forensic_captured: false,
+            agent: None,
+            agent_stream: sync::AgentStream::new(),
+            agent_seen: false,
         }
     }
 
