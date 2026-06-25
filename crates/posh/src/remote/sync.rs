@@ -871,6 +871,68 @@ mod tests {
         assert_eq!(got, b"PREFXX_new_SUFFIX", "splices new middle between wrong prefix/suffix");
     }
 
+    // Reproduction attempt for the apply-stall origin (#90/#2): reassembling a
+    // single instruction's fragments must reproduce the payload byte-for-byte
+    // regardless of arrival order or duplicates. A truncated or misordered
+    // reassembly is a prime candidate for the client holding a shorter/wrong
+    // dump than the server sent (FragmentAssembly had a wedge bug in #12).
+    #[test]
+    fn fragment_reassembly_round_trips_under_reorder_and_dup() {
+        let cases: Vec<Vec<u8>> = vec![
+            vec![],
+            vec![42],
+            (0u32..=255).map(|i| i as u8).collect(),
+            (0..FRAGMENT_CONTENTS_MAX).map(|i| i as u8).collect(), // one full chunk
+            (0..FRAGMENT_CONTENTS_MAX + 1).map(|i| i as u8).collect(), // spills to two
+            (0..FRAGMENT_CONTENTS_MAX * 5 + 7).map(|i| i.wrapping_mul(31) as u8).collect(),
+        ];
+        // Deterministic LCG so a failure is reproducible.
+        let mut seed = 0x1234_5678_9abc_def0u64;
+        let mut rng = || {
+            seed = seed
+                .wrapping_mul(6364136223846793005)
+                .wrapping_add(1442695040888963407);
+            (seed >> 33) as usize
+        };
+        for payload in &cases {
+            let mut fr = Fragmenter::new();
+            let frags = fr.make_fragments(payload, FRAGMENT_CONTENTS_MAX);
+            for trial in 0..16 {
+                let mut order = frags.clone();
+                match trial {
+                    0 => {}
+                    1 => order.reverse(),
+                    _ => {
+                        for i in (1..order.len()).rev() {
+                            let j = rng() % (i + 1);
+                            order.swap(i, j);
+                        }
+                        if !order.is_empty() {
+                            let a = rng() % order.len();
+                            let b = rng() % order.len();
+                            order.push(order[a].clone());
+                            order.push(order[b].clone());
+                        }
+                    }
+                }
+                let mut asm = FragmentAssembly::new();
+                let mut got = None;
+                for f in order {
+                    if let Some(p) = asm.add(f) {
+                        got = Some(p);
+                        break;
+                    }
+                }
+                assert_eq!(
+                    got.as_deref(),
+                    Some(payload.as_slice()),
+                    "payload {} bytes, trial {trial}: reassembly mismatch",
+                    payload.len(),
+                );
+            }
+        }
+    }
+
     #[test]
     fn server_frame_roundtrip() {
         let cases = vec![

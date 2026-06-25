@@ -152,7 +152,7 @@ fn close_overlay(overlay: &mut Option<Overlay>) {
     }
 }
 
-fn server_loop(mut conn: Connection, child: pty::PtyChild, rows: u16, cols: u16) {
+pub(crate) fn server_loop(mut conn: Connection, child: pty::PtyChild, rows: u16, cols: u16) {
     // Optional perf instrumentation (POSH_DEBUG_LOG). run() has already
     // double-forked and redirected stdio to /dev/null, so this file fd is the
     // server's only viable diagnostic sink; inert when the env var is unset.

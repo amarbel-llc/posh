@@ -2089,6 +2089,179 @@ mod tests {
         }
     }
 
+    // Faithful reproduction harness for the apply-stall wedge (#2/#90). Drives a
+    // REAL server_loop over loopback UDP with a shell that floods content +
+    // frequent OSC 2 title changes (the suspected trigger), applies frames
+    // through the REAL apply_frame, and induces packet loss at the client app
+    // layer so the server's retransmit + diff-base management is exercised.
+    //
+    // The invariant: in a correct system the server always diffs against the
+    // frame the client acked, so base == applied_num and apply_diff never
+    // returns None. A nonzero `reack` (the SHORT_BASE apply-stall) means the
+    // wedge reproduced -- we panic with the captured forensic fields.
+    //
+    // #[ignore] so it stays OUT of the merge gate (real PTY + threads + UDP +
+    // an 8s run); invoke explicitly: `cargo test -p posh -- --ignored wedge_repro`.
+    #[test]
+    #[ignore = "apply-stall reproduction harness; run with --ignored"]
+    fn wedge_repro_server_loop_with_loss_and_titles() {
+        let key = Key::random();
+        let (server_conn, port) = Connection::server((62300, 62399), &key, Family::Inet).unwrap();
+        // Pace output with a busy inner loop so the screen keeps changing across
+        // the whole run (a raw flood finishes in <1s on loopback and the server
+        // then goes quiet, starving the harness). Frequent OSC 2 title changes
+        // are the suspected trigger.
+        let script = "i=0; while [ $i -lt 100000 ]; do \
+                      printf '\\033]2;ttl-%d\\007line %d: the quick brown fox jumps over\\r\\n' $i $i; \
+                      j=0; while [ $j -lt 250 ]; do j=$((j+1)); done; \
+                      i=$((i+1)); done; sleep 30";
+        let cmd: Vec<String> = vec!["/bin/sh".into(), "-c".into(), script.into()];
+        let child = crate::pty::spawn_shell(Some(&cmd), 24, 80, &[], None).unwrap();
+        util::set_nonblocking(child.master).unwrap();
+        let server =
+            std::thread::spawn(move || crate::remote::server::server_loop(server_conn, child, 24, 80));
+
+        let addr = format!("127.0.0.1:{port}").parse().unwrap();
+        let mut conn = Connection::client(addr, &key).unwrap();
+        let mut fragmenter = Fragmenter::new();
+        let mut assembly = FragmentAssembly::new();
+        let mut st = test_state(24, 80);
+
+        // Deterministic loss PRNG so a reproduction is replayable.
+        let mut seed = 0xdead_beef_cafe_f00du64;
+        let mut roll = || {
+            seed = seed
+                .wrapping_mul(6364136223846793005)
+                .wrapping_add(1442695040888963407);
+            (seed >> 40) % 100
+        };
+        const DROP_PCT: u64 = 35;
+
+        let deadline = now_ms() + 8_000;
+        let mut frames_applied = 0u64;
+        while now_ms() < deadline {
+            // Advertise the real caps (CAP_SCROLLBACK etc.) so the server
+            // interleaves scrollback frames with visible frames. This is the
+            // necessary ingredient: a scrollback frame advances applied_num past
+            // an unapplied visible frame, leaving the visible applied_data stale
+            // -> later visible Diffs fail apply_diff (short base) -> apply-stall.
+            // (Control: swapping this for `Vec::new()` makes the wedge vanish.)
+            let caps = outgoing_caps(&mut st);
+            let msg = ClientMessage {
+                flags: st.flags,
+                caps,
+                acked_frame: st.applied_num,
+                rows: 24,
+                cols: 80,
+                input_base: 0,
+                input: Vec::new(),
+            };
+            st.flags &= !sync::CLIENT_FLAG_RESYNC; // one-shot, like the real client
+            for frag in fragmenter.make_fragments(&msg.encode(), sync::FRAGMENT_CONTENTS_MAX) {
+                conn.send(&frag.to_bytes()).unwrap();
+            }
+            std::thread::sleep(std::time::Duration::from_millis(5));
+            loop {
+                match conn.recv() {
+                    Ok(Some(payload)) => {
+                        let Ok(frag) = sync::Fragment::from_bytes(&payload) else {
+                            continue;
+                        };
+                        let Some(assembled) = assembly.add(frag) else {
+                            continue;
+                        };
+                        let Ok(frame) = ServerFrame::decode(&assembled) else {
+                            continue;
+                        };
+                        if roll() < DROP_PCT {
+                            continue; // induced packet loss: never reaches apply
+                        }
+                        // Capture pre-apply state so the reacking frame is fully
+                        // described (the drain would otherwise clear last_reack).
+                        let before = st.stats.apply_snapshot().reack;
+                        let pre_num = st.applied_num;
+                        let pre_len = st.applied_data.len();
+                        let desc = match &frame.body {
+                            FrameBody::Full(b) => format!("Full(len={})", b.len()),
+                            FrameBody::Diff { base, diff } => {
+                                format!("Diff(base={base}, difflen={})", diff.len())
+                            }
+                            FrameBody::Morph { base, escapes } => {
+                                format!("Morph(base={base}, len={})", escapes.len())
+                            }
+                            FrameBody::Scrollback { base, rows } => {
+                                format!("Scrollback(base={base}, rows={})", rows.len())
+                            }
+                            FrameBody::Empty => "Empty".to_string(),
+                        };
+                        apply_frame(&mut st, &frame);
+                        frames_applied += 1;
+                        if st.stats.apply_snapshot().reack > before {
+                            let ps = if let FrameBody::Diff { diff, .. } = &frame.body {
+                                if diff.len() >= 8 {
+                                    let p = u32::from_le_bytes(diff[0..4].try_into().unwrap());
+                                    let s = u32::from_le_bytes(diff[4..8].try_into().unwrap());
+                                    format!(" prefix={p} suffix={s} (sum={})", p as u64 + s as u64)
+                                } else {
+                                    String::new()
+                                }
+                            } else {
+                                String::new()
+                            };
+                            panic!(
+                                "WEDGE REPRODUCED at frame#{} body={desc}: \
+                                 pre-apply applied_num={pre_num} applied_len={pre_len}{ps} \
+                                 (after {frames_applied} applies)",
+                                frame.frame_num,
+                            );
+                        }
+                    }
+                    Ok(None) => continue,
+                    Err(e) if e.kind() == std::io::ErrorKind::WouldBlock => break,
+                    Err(_) => break,
+                }
+            }
+        }
+
+        // Wind the server down (bounded; detach rather than hang if it resists).
+        let shutdown_deadline = now_ms() + 5_000;
+        let mut server_done = false;
+        while now_ms() < shutdown_deadline && !server_done {
+            let q = ClientMessage {
+                flags: sync::CLIENT_FLAG_SHUTDOWN,
+                caps: vec![],
+                acked_frame: st.applied_num,
+                rows: 24,
+                cols: 80,
+                input_base: 0,
+                input: Vec::new(),
+            };
+            for frag in fragmenter.make_fragments(&q.encode(), sync::FRAGMENT_CONTENTS_MAX) {
+                let _ = conn.send(&frag.to_bytes());
+            }
+            std::thread::sleep(std::time::Duration::from_millis(20));
+            while let Ok(Some(payload)) = conn.recv() {
+                if let Ok(frag) = sync::Fragment::from_bytes(&payload) {
+                    if let Some(asm) = assembly.add(frag) {
+                        if let Ok(frame) = ServerFrame::decode(&asm) {
+                            if frame.flags & sync::FLAG_SHUTDOWN != 0 {
+                                server_done = true;
+                            }
+                        }
+                    }
+                }
+            }
+        }
+        if server_done {
+            let _ = server.join();
+        } else {
+            eprintln!("harness: server did not wind down in time; detaching its thread");
+        }
+
+        assert!(frames_applied > 0, "transport never connected (0 frames applied)");
+        eprintln!("harness CLEAN: {frames_applied} frames applied, reack=0 (no SHORT_BASE stall)");
+    }
+
     #[test]
     fn dispatch_echo_set_swaps_predictor_and_banners() {
         let raw = pty_raw_mode();
