@@ -324,8 +324,9 @@ pub struct AgentClient {
 }
 
 impl AgentClient {
-    /// Builds a proxy that forwards the agent at `source` (the seam the tests
-    /// and item 5's resolved `--forward-agent=PATH` use).
+    /// Builds a proxy that forwards the agent at `source` — the local socket
+    /// resolved by the CLI/env policy (`--forward-agent=PATH`, `$SSH_AUTH_SOCK`,
+    /// …) and dialed afresh on each `Open`.
     pub fn new(source: PathBuf) -> AgentClient {
         AgentClient {
             source,
@@ -437,42 +438,47 @@ pub fn resolve_forward_policy(
         source: PathBuf::from(p),
     };
     let usable_sock = auth_sock.filter(|s| !s.is_empty());
+    // The env var is overloaded: `no`/`0` is the profile opt-out, the empty
+    // string is "unset", and any other value names a custom source socket.
+    // Classify it once; the flag decides how the classification is used.
+    let env_optout = matches!(env, Some("no") | Some("0"));
+    let env_path = env.filter(|p| !p.is_empty() && !env_optout);
+    // The forwarding SOURCE resolves env-path-then-default ($SSH_AUTH_SOCK).
+    // The opt-out only suppresses the source on the default path (no flag); an
+    // explicit `-A` overrides it (flag > env) and falls through to the socket.
+    let source_for_explicit = env_path.or(usable_sock);
+    let source_for_default = if env_optout { None } else { source_for_explicit };
 
     match flag {
         // `-a` always wins.
         ForwardFlag::Disable => (ForwardPolicy::Off, None),
-        // `--forward-agent=PATH`: forward exactly that socket.
+        // `--forward-agent=PATH`: forward exactly that socket, no questions.
         ForwardFlag::Path(p) => (
             ForwardPolicy::On {
                 source: p.clone(),
             },
             None,
         ),
-        // Bare `-A`: explicit enable. Unlike the default, complain loudly when
-        // there is no usable source socket (and stay off) rather than passing
-        // silently.
-        ForwardFlag::ExplicitOn => match usable_sock {
+        // Bare `-A`: explicit enable, overriding an env opt-out. Forward the
+        // resolved source ($POSH_FORWARD_AGENT path, else $SSH_AUTH_SOCK);
+        // unlike the silent default, complain loudly and stay off when none
+        // resolves.
+        ForwardFlag::ExplicitOn => match source_for_explicit {
             Some(s) => (on(s), None),
             None => (
                 ForwardPolicy::Off,
                 Some(
-                    "posh: -A given but no usable agent at $SSH_AUTH_SOCK; forwarding off"
+                    "posh: -A given but no usable agent ($POSH_FORWARD_AGENT / \
+                     $SSH_AUTH_SOCK); forwarding off"
                         .to_string(),
                 ),
             ),
         },
-        // No flag: consult the environment, then the default.
-        ForwardFlag::Unset => match env {
-            // Profile-level opt-out.
-            Some("no") | Some("0") => (ForwardPolicy::Off, None),
-            // A non-yes/no value is a socket path (gpg-agent's ssh socket, …).
-            Some(p) if !p.is_empty() => (on(p), None),
-            // Unset/empty env: default-on best-effort — forward the standard
-            // agent when one exists, else proceed silently without it.
-            _ => match usable_sock {
-                Some(s) => (on(s), None),
-                None => (ForwardPolicy::Off, None),
-            },
+        // No flag: best-effort default — forward the resolved source when one
+        // exists and the env did not opt out, else proceed silently.
+        ForwardFlag::Unset => match source_for_default {
+            Some(s) => (on(s), None),
+            None => (ForwardPolicy::Off, None),
         },
     }
 }
@@ -965,15 +971,41 @@ mod tests {
 
     #[test]
     fn policy_explicit_on_warns_loudly_without_agent() {
-        // Bare -A with no usable agent: stays off AND warns (the distinguishing
-        // behavior vs the silent default).
+        // Bare -A with no usable agent (no env path, no $SSH_AUTH_SOCK): stays
+        // off AND warns (the distinguishing behavior vs the silent default).
         let (p, warn) = resolve_forward_policy(&ForwardFlag::ExplicitOn, None, None);
         assert_eq!(p, ForwardPolicy::Off);
         assert!(warn.unwrap().contains("-A given but no usable agent"));
-        // With an agent, -A just enables it, no warning.
+        // With $SSH_AUTH_SOCK, -A just enables it, no warning.
         let (p, warn) =
             resolve_forward_policy(&ForwardFlag::ExplicitOn, None, Some("/run/agent.sock"));
         assert_eq!(p, on("/run/agent.sock"));
+        assert!(warn.is_none());
+    }
+
+    #[test]
+    fn policy_explicit_on_resolves_source_through_env_then_default() {
+        // -A means "on, loudly"; the SOURCE still resolves env-then-default
+        // (flag > env > default). A POSH_FORWARD_AGENT path satisfies -A even
+        // with no $SSH_AUTH_SOCK — no warning, forward the env path.
+        let (p, warn) =
+            resolve_forward_policy(&ForwardFlag::ExplicitOn, Some("/gpg/agent.ssh"), None);
+        assert_eq!(p, on("/gpg/agent.ssh"));
+        assert!(warn.is_none(), "an env-provided source satisfies -A");
+        // An env opt-out (no/0) with no socket is not a usable source, so -A
+        // warns and stays off rather than treating "no" as a path.
+        let (p, warn) =
+            resolve_forward_policy(&ForwardFlag::ExplicitOn, Some("no"), None);
+        assert_eq!(p, ForwardPolicy::Off);
+        assert!(warn.is_some());
+        // But -A overrides the env opt-out (flag > env): with $SSH_AUTH_SOCK
+        // present, `-A` + POSH_FORWARD_AGENT=no still forwards the socket.
+        let (p, warn) = resolve_forward_policy(
+            &ForwardFlag::ExplicitOn,
+            Some("no"),
+            Some("/run/agent.sock"),
+        );
+        assert_eq!(p, on("/run/agent.sock"), "-A overrides the env opt-out");
         assert!(warn.is_none());
     }
 

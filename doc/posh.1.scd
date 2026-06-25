@@ -73,10 +73,13 @@ _name_
 	taken over. See *posh*(7) and FDR 0002.
 
 *-A*, *--forward-agent*
-	Explicitly enable SSH agent forwarding for a roaming
-	_host_*:*_session_ connection. Unlike the best-effort default, a
-	missing or unconnectable _$SSH_AUTH_SOCK_ warns loudly and forwarding
-	stays off, rather than passing silently. See FDR 0004.
+	Explicitly enable SSH agent forwarding for a roaming connection
+	(both *posh* _host_ and *posh* _host_*:*_session_). The source
+	socket resolves _$POSH_FORWARD_AGENT_ (when it names a path), then
+	_$SSH_AUTH_SOCK_; *-A* overrides a _$POSH_FORWARD_AGENT_=*no*
+	opt-out. Unlike the best-effort default, when neither resolves to a
+	usable agent *-A* warns loudly and forwarding stays off, rather than
+	passing silently. See FDR 0004.
 
 *--forward-agent*=_PATH_
 	Forward _PATH_ instead of _$SSH_AUTH_SOCK_ (a second agent,

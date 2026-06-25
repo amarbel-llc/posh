@@ -177,7 +177,7 @@ fn run() -> Result<()> {
         }
         "server" => cmd_server(args),
         "client" => cmd_client(args),
-        "ssh" => cmd_ssh(args),
+        "ssh" => cmd_ssh(args, None),
         // `posh rec ...` == the standalone `poshterity` binary: deterministic
         // recording replay (poshterity owns the logic; this is just an alias).
         "rec" => poshterity::cli::run(args).map_err(Error::from),
@@ -191,8 +191,9 @@ fn run() -> Result<()> {
                 cmd_attach(&g.unwrap_or(group), &args)
             }
             // mosh parity: `posh [user@]host [-- command...]` connects
-            // remotely over ssh + encrypted UDP.
-            target::Target::Host { .. } => cmd_ssh(rest),
+            // remotely over ssh + encrypted UDP. This roaming path honors
+            // agent forwarding (FDR 0004), like `host:session`.
+            target::Target::Host { .. } => cmd_ssh(rest, Some(&forward_flag)),
             // `posh host:grp/dev` — persistent remote session over the
             // roaming transport (RFC 0001 §2).
             target::Target::RemoteSession {
@@ -355,25 +356,11 @@ fn cmd_ssh_session(
         Some(u) => format!("{u}@{host}"),
         None => host,
     };
-    // Resolve agent forwarding (flag > env > default-on). The warning fires
-    // only for an explicit `-A` with no usable agent; print it and proceed off.
-    let (policy, warning) = remote::agent::resolve_forward_policy(
-        forward_flag,
-        std::env::var("POSH_FORWARD_AGENT").ok().as_deref(),
-        std::env::var("SSH_AUTH_SOCK").ok().as_deref(),
-    );
-    if let Some(w) = warning {
-        eprintln!("{w}");
-    }
-    let agent_source = match policy {
-        remote::agent::ForwardPolicy::On { source } => Some(source),
-        remote::agent::ForwardPolicy::Off => None,
-    };
+    // Resolve agent forwarding (flag > env > default-on).
     let opts = remote::sshwrap::SshOptions {
         family: Family::Auto,
         port_range: None,
-        forward_agent: agent_source.is_some(),
-        agent_source,
+        agent_source: resolve_agent_source(forward_flag),
     };
     remote::sshwrap::run(&dest, &inner, &opts)
 }
@@ -422,7 +409,11 @@ fn cmd_list_remote(user: Option<String>, host: String) -> Result<()> {
     Ok(())
 }
 
-fn cmd_ssh(args: &[String]) -> Result<()> {
+// `forward` is Some for the mosh-parity bare `posh host` roaming path (which
+// honors agent forwarding like `host:session`), and None for the explicit
+// `posh ssh` subcommand, which stays a thin ssh wrapper — a `-A` there is the
+// real ssh flag, not posh forwarding (FDR 0004 §Limitations).
+fn cmd_ssh(args: &[String], forward: Option<&remote::agent::ForwardFlag>) -> Result<()> {
     let usage = "usage: posh ssh [-4|-6] [-p PORT[:PORT2]] [user@]host [-- command...]";
     let mut family = Family::Auto;
     let mut port_range: Option<String> = None;
@@ -456,17 +447,33 @@ fn cmd_ssh(args: &[String]) -> Result<()> {
     if remote_cmd.first().map(|s| s.as_str()) == Some("--") {
         remote_cmd = &remote_cmd[1..];
     }
-    // `posh ssh` stays a thin ssh wrapper (FDR 0004 §Limitations): a `-A` here
-    // is a literal ssh flag, not posh forwarding. The bare `posh host` roaming
-    // path also routes here today; wiring posh forwarding onto it is a
-    // follow-up (the `host:session` path carries forwarding now).
+    // Resolve agent forwarding for the roaming bare-host path; the explicit
+    // `posh ssh` subcommand passes None and stays a thin wrapper.
     let opts = remote::sshwrap::SshOptions {
         family,
         port_range,
-        forward_agent: false,
-        agent_source: None,
+        agent_source: forward.and_then(resolve_agent_source),
     };
     remote::sshwrap::run(target, remote_cmd, &opts)
+}
+
+/// Resolves the local agent socket to forward (FDR 0004) from the CLI flag plus
+/// $POSH_FORWARD_AGENT / $SSH_AUTH_SOCK, printing the explicit-`-A`-no-agent
+/// warning to stderr. Shared by the `host:session` and bare-`host` roaming
+/// paths. Returns the source path when forwarding is on, else None.
+fn resolve_agent_source(flag: &remote::agent::ForwardFlag) -> Option<std::path::PathBuf> {
+    let (policy, warning) = remote::agent::resolve_forward_policy(
+        flag,
+        std::env::var("POSH_FORWARD_AGENT").ok().as_deref(),
+        std::env::var("SSH_AUTH_SOCK").ok().as_deref(),
+    );
+    if let Some(w) = warning {
+        eprintln!("{w}");
+    }
+    match policy {
+        remote::agent::ForwardPolicy::On { source } => Some(source),
+        remote::agent::ForwardPolicy::Off => None,
+    }
 }
 
 const HELP: &str = "\

@@ -1,11 +1,14 @@
 ---
-status: exploring
+status: experimental
 date: 2026-06-12
-promotion-criteria: phase-1 implementation (github #55) lands with the
-  loopback E2E test green; a real `git push` from inside a forwarded
-  session authenticates against the local agent and survives a network
-  roam; the wire ids are allocated in the RFC 0001 registry. Advance to
-  `experimental` once that implementation exists in `crates/posh`.
+promotion-criteria: phase-1 implementation (github #55) landed — the
+  loopback E2E test is green (the in-process round-trip in
+  `remote/server.rs`, `cargo test -- --ignored agent_forward`) and the
+  wire ids are allocated in the RFC 0001 registry (6/7/8). Advanced to
+  `experimental` on that basis. The remaining bar for the next tier
+  (`stable`) is the real-world clause: a real `git push` from inside a
+  forwarded session authenticating against the local agent and surviving
+  a network roam, exercised outside the in-process harness.
 ---
 
 # SSH agent forwarding over the posh transport

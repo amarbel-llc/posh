@@ -12,13 +12,11 @@ pub struct SshOptions {
     pub family: Family,
     /// Server-side UDP port range, already validated ("P" or "P1:P2").
     pub port_range: Option<String>,
-    /// SSH agent forwarding (FDR 0004): when true the bootstrap argv carries
-    /// `-A` to `posh-server new` (C4 — the remote command carries the
-    /// *outcome*, the policy stays client-side), and `agent_source` is the
-    /// local socket the client proxy dials. Off => neither is set.
-    pub forward_agent: bool,
-    /// The resolved local agent socket to forward (only meaningful with
-    /// `forward_agent`); passed through to the client. Never travels the wire.
+    /// SSH agent forwarding (FDR 0004): the resolved local agent socket the
+    /// client proxy dials, or `None` when forwarding is off. `Some` is the
+    /// single source of truth — `remote_command` appends `-A` to
+    /// `posh-server new` exactly when this is set (C4: the bootstrap carries
+    /// the outcome; the path itself stays client-side, never on the wire).
     pub agent_source: Option<std::path::PathBuf>,
 }
 
@@ -74,7 +72,7 @@ pub fn remote_command(
     cmd.push_str("posh-server new");
     // C4: the bootstrap carries only the outcome (forward or not), never the
     // source path — that lives client-side. A bare `-A` to posh-server.
-    if opts.forward_agent {
+    if opts.agent_source.is_some() {
         cmd.push_str(" -A");
     }
     match opts.family {
@@ -280,7 +278,6 @@ mod tests {
         let opts = SshOptions {
             family: Family::Auto,
             port_range: None,
-            forward_agent: false,
             agent_source: None,
         };
         let inner: Vec<String> = ["posh", "-g", "grp", "attach", "my dev"]
@@ -299,7 +296,6 @@ mod tests {
         let opts = SshOptions {
             family: Family::Inet6,
             port_range: Some("60100:60200".to_string()),
-            forward_agent: false,
             agent_source: None,
         };
         let locale = vec![("LANG".to_string(), "en_US.UTF-8".to_string())];
@@ -313,8 +309,7 @@ mod tests {
             &SshOptions {
                 family: Family::Auto,
                 port_range: None,
-                forward_agent: false,
-                agent_source: None,
+                    agent_source: None,
             },
             &[],
             &[],
@@ -330,7 +325,6 @@ mod tests {
         let opts = SshOptions {
             family: Family::Inet,
             port_range: Some("60001:60999".to_string()),
-            forward_agent: true,
             agent_source: Some("/run/user/1000/agent.sock".into()),
         };
         let cmd = remote_command(&opts, &[], &[]);
@@ -341,7 +335,6 @@ mod tests {
         let off = SshOptions {
             family: Family::Auto,
             port_range: None,
-            forward_agent: false,
             agent_source: None,
         };
         assert_eq!(remote_command(&off, &[], &[]), "posh-server new");
@@ -355,7 +348,6 @@ mod tests {
         let opts = SshOptions {
             family: Family::Auto,
             port_range: None,
-            forward_agent: false,
             agent_source: None,
         };
         let env = vec![
