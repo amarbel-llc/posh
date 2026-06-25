@@ -2063,4 +2063,183 @@ mod tests {
         std::env::set_var("POSH_TEST_TMOUT_D", "junk");
         assert_eq!(timeout_env("POSH_TEST_TMOUT_D"), 0);
     }
+
+    // End-to-end agent forwarding over the real transport (FDR 0004 item 7):
+    // a REAL server_loop with a live AgentEndpoint, the REAL AgentClient proxy,
+    // and a fake ssh-agent — the whole byte path the unit tests only cover in
+    // pieces. Topology mirrors production:
+    //
+    //   agent consumer ──connect──▶ <server>/agent/sock   (AgentEndpoint)
+    //         │                            │  AGENT_* caps over UDP frames
+    //         │                            ▼
+    //         │                     test-as-client ──▶ AgentClient ──connect──▶ fake agent
+    //         ▼                                                                      │
+    //   request bytes ───────────── round-trip ─────────────────────────────▶ canned reply
+    //
+    // A request written to the server's agent socket must traverse the endpoint,
+    // the AGENT_DATA stream over real loopback UDP, the client proxy, reach the
+    // fake agent, and the reply must come all the way back. #[ignore] (real PTY
+    // + UDP + threads): run with `cargo test -p posh -- --ignored agent_forward`.
+    #[test]
+    #[ignore = "agent-forwarding E2E harness; run with --ignored"]
+    fn agent_forward_round_trips_request_to_local_agent() {
+        use crate::remote::agent::{AgentClient, AgentEndpoint};
+        use crate::remote::sync::AgentStream;
+        use std::io::{Read, Write};
+        use std::os::unix::net::{UnixListener, UnixStream};
+        use std::path::PathBuf;
+        use std::sync::atomic::{AtomicBool, Ordering};
+        use std::sync::Arc;
+
+        const REQUEST: &[u8] = b"AGENT-REQUEST-PING";
+        const REPLY: &[u8] = b"AGENT-REPLY-PONG-0123456789";
+
+        // Short /tmp paths so the unix sockets stay within SUN_LEN.
+        let pid = std::process::id();
+        let server_base = PathBuf::from(format!("/tmp/posh-e2e-srv-{pid}"));
+        std::fs::remove_dir_all(&server_base).ok();
+        std::os::unix::fs::DirBuilderExt::mode(
+            std::fs::DirBuilder::new().recursive(true),
+            0o700,
+        )
+        .create(&server_base)
+        .unwrap();
+        let fake_agent_sock = PathBuf::from(format!("/tmp/posh-e2e-agent-{pid}.sock"));
+        std::fs::remove_file(&fake_agent_sock).ok();
+        let fake_agent_sock_cleanup = fake_agent_sock.clone();
+
+        // (1) Fake ssh-agent: read the request, write the canned reply, close.
+        let agent_listener = UnixListener::bind(&fake_agent_sock).unwrap();
+        let agent_thread = std::thread::spawn(move || {
+            if let Ok((mut s, _)) = agent_listener.accept() {
+                let mut buf = vec![0u8; REQUEST.len()];
+                if s.read_exact(&mut buf).is_ok() {
+                    assert_eq!(buf, REQUEST, "fake agent saw the forwarded request");
+                    let _ = s.write_all(REPLY);
+                }
+            }
+        });
+
+        // (2) Real server with a live agent endpoint, shell idling.
+        let key = Key::random();
+        let (server_conn, port) = Connection::server((62800, 62899), &key, Family::Inet).unwrap();
+        let endpoint = AgentEndpoint::new(&server_base).unwrap();
+        let agent_sock = endpoint.sock_path().to_path_buf();
+        let cmd: Vec<String> = vec!["/bin/sh".into(), "-c".into(), "sleep 600".into()];
+        let child = crate::pty::spawn_shell(Some(&cmd), 24, 80, &[], None).unwrap();
+        util::set_nonblocking(child.master).unwrap();
+        let server = std::thread::spawn(move || {
+            server_loop(server_conn, child, 24, 80, Some(endpoint));
+        });
+
+        // (3) Test-as-client: pump the transport + the agent proxy until the
+        // round-trip completes or we time out. Runs on its own thread so the
+        // main thread can drive the agent consumer concurrently.
+        let done = Arc::new(AtomicBool::new(false));
+        let client_done = done.clone();
+        let client = std::thread::spawn(move || {
+            let addr = format!("127.0.0.1:{port}").parse().unwrap();
+            let mut conn = Connection::client(addr, &key).unwrap();
+            let mut fragmenter = Fragmenter::new();
+            let mut assembly = FragmentAssembly::new();
+            let mut proxy = AgentClient::new(fake_agent_sock.clone());
+            let mut stream = AgentStream::new();
+            let mut agent_seen = false;
+
+            while !client_done.load(Ordering::Relaxed) {
+                // Advertise AGENT_FORWARD every message; emit DATA/ACK once the
+                // server has advertised back (mirrors outgoing_caps).
+                let mut extras = vec![caps::Cap {
+                    id: caps::CAP_AGENT_FORWARD,
+                    payload: vec![],
+                }];
+                if agent_seen {
+                    extras.extend(caps::encode_agent_data(stream.send_base(), stream.pending()));
+                    extras.push(caps::encode_agent_ack(stream.recv_ack()));
+                }
+                let msg = ClientMessage {
+                    flags: 0,
+                    caps: caps::own_table(&extras),
+                    acked_frame: 0,
+                    rows: 24,
+                    cols: 80,
+                    input_base: 0,
+                    input: Vec::new(),
+                };
+                for frag in fragmenter.make_fragments(&msg.encode(), sync::FRAGMENT_CONTENTS_MAX) {
+                    let _ = conn.send(&frag.to_bytes());
+                }
+                // Drain inbound frames; consume the server's agent caps.
+                while let Ok(Some(payload)) = conn.recv() {
+                    let Ok(frag) = sync::Fragment::from_bytes(&payload) else {
+                        continue;
+                    };
+                    let Some(assembled) = assembly.add(frag) else {
+                        continue;
+                    };
+                    let Ok(frame) = ServerFrame::decode(&assembled) else {
+                        continue;
+                    };
+                    if caps::find(&frame.caps, caps::CAP_AGENT_FORWARD).is_some() {
+                        agent_seen = true;
+                    }
+                    for cap in caps::find_all(&frame.caps, caps::CAP_AGENT_DATA) {
+                        if let Ok((offset, bytes)) = caps::decode_agent_data(&cap.payload) {
+                            if let Ok(records) = stream.recv(offset, bytes) {
+                                for reply in proxy.apply_records(&records) {
+                                    stream.send(&reply);
+                                }
+                            }
+                        }
+                    }
+                    if let Some(cap) = caps::find(&frame.caps, caps::CAP_AGENT_ACK) {
+                        if let Ok(upto) = caps::decode_agent_ack(&cap.payload) {
+                            stream.ack(upto);
+                        }
+                    }
+                }
+                // Pump the proxy's local-agent connections -> outbound stream.
+                for rec in proxy.read_channels() {
+                    stream.send(&rec);
+                }
+                std::thread::sleep(std::time::Duration::from_millis(5));
+            }
+        });
+
+        // (4) The agent consumer: connect to the SERVER's agent/sock (what a
+        // forwarded `git push` would use as SSH_AUTH_SOCK), send the request,
+        // read the reply. The endpoint claims the symlink at construction, so a
+        // working server is connectable almost at once; a few seconds of retry
+        // covers thread startup, and a miss past it fails fast (a broken path
+        // must not hang the suite).
+        let deadline = now_ms() + 5_000;
+        let mut stream = loop {
+            if let Ok(s) = UnixStream::connect(&agent_sock) {
+                break s;
+            }
+            assert!(now_ms() < deadline, "agent/sock never became connectable");
+            std::thread::sleep(std::time::Duration::from_millis(20));
+        };
+        stream.set_read_timeout(Some(std::time::Duration::from_secs(8))).unwrap();
+        stream.write_all(REQUEST).unwrap();
+        let mut got = vec![0u8; REPLY.len()];
+        let read_result = stream.read_exact(&mut got);
+
+        // Tear everything down. The client + fake-agent threads join once the
+        // done flag is set; the server thread runs an idle `sleep 600` shell
+        // and is abandoned (it exits on PEER_TIMEOUT after we stop sending, or
+        // when the test process ends — spawned threads do not block exit).
+        done.store(true, Ordering::Relaxed);
+        let _ = client.join();
+        let _ = agent_thread.join();
+        drop(server);
+        std::fs::remove_dir_all(&server_base).ok();
+        std::fs::remove_file(&fake_agent_sock_cleanup).ok();
+
+        read_result.expect("reply must arrive back through the forwarded path");
+        assert_eq!(
+            got, REPLY,
+            "the fake agent's reply round-tripped server endpoint -> UDP -> client proxy -> back"
+        );
+    }
 }
