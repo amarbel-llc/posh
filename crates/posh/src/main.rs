@@ -47,6 +47,10 @@ fn run() -> Result<()> {
     }
 
     let mut group = std::env::var("POSH_GROUP").unwrap_or_else(|_| "default".to_string());
+    // SSH agent forwarding (FDR 0004): the client-side flag, highest precedence
+    // in `resolve_forward_policy`. Only the roaming `host:session` path acts on
+    // it; `posh ssh` passes a literal `-A` through to real ssh instead.
+    let mut forward_flag = remote::agent::ForwardFlag::Unset;
 
     let mut i = 0;
     while i < argv.len() {
@@ -57,6 +61,21 @@ fn run() -> Result<()> {
                     .ok_or_else(|| Error::from("--group requires a value"))?
                     .clone();
                 i += 2;
+            }
+            "-a" | "--no-forward-agent" => {
+                forward_flag = remote::agent::ForwardFlag::Disable;
+                i += 1;
+            }
+            "-A" | "--forward-agent" => {
+                forward_flag = remote::agent::ForwardFlag::ExplicitOn;
+                i += 1;
+            }
+            // Long-option-with-`=` only, so bare `-A host` never swallows the
+            // target word (FDR 0004 Interface).
+            arg if arg.starts_with("--forward-agent=") => {
+                let path = arg.strip_prefix("--forward-agent=").unwrap();
+                forward_flag = remote::agent::ForwardFlag::Path(path.into());
+                i += 1;
             }
             "--no-init" => {
                 // mosh --no-init parity: travels as an environment variable
@@ -181,7 +200,7 @@ fn run() -> Result<()> {
                 host,
                 group: g,
                 session,
-            } => cmd_ssh_session(user, host, g, session, &rest[1..]),
+            } => cmd_ssh_session(user, host, g, session, &rest[1..], &forward_flag),
         },
         flag => Err(Error(format!("unknown option {flag} (see posh help)"))),
     }
@@ -228,6 +247,11 @@ fn cmd_server(args: &[String]) -> Result<()> {
     let mut port_range: Option<(u16, u16)> = None;
     let mut family = Family::Auto;
     let mut command: Option<Vec<String>> = None;
+    // Agent forwarding (FDR 0004): the ssh bootstrap appends a bare `-A` to
+    // `posh-server new` exactly when the client resolved forwarding on (C4 —
+    // the policy stays client-side; the server only learns the outcome). The
+    // server then stands up the agent endpoint and exports SSH_AUTH_SOCK.
+    let mut agent_forward = false;
     let mut i = 0;
     while i < rest.len() {
         match rest[i].as_str() {
@@ -242,6 +266,10 @@ fn cmd_server(args: &[String]) -> Result<()> {
                 family = Family::from_flag(flag).expect("matched flag");
                 i += 1;
             }
+            "-A" | "--forward-agent" => {
+                agent_forward = true;
+                i += 1;
+            }
             "--" => {
                 let cmd: Vec<String> = rest[i + 1..].to_vec();
                 command = (!cmd.is_empty()).then_some(cmd);
@@ -250,10 +278,7 @@ fn cmd_server(args: &[String]) -> Result<()> {
             other => return Err(Error(format!("unknown server option {other}"))),
         }
     }
-    // Agent forwarding (FDR 0004) is off until item 5 resolves the -A flag /
-    // bootstrap argv into this call. The endpoint machinery is built and
-    // tested but dormant.
-    remote::server::run(port_range, family, command, false)
+    remote::server::run(port_range, family, command, agent_forward)
 }
 
 fn parse_port_range(s: &str) -> Result<(u16, u16)> {
@@ -292,7 +317,10 @@ fn cmd_client(args: &[String]) -> Result<()> {
         ),
         _ => return Err(Error::from("usage: posh client [-4|-6] <host> <port>")),
     };
-    remote::client::run(host, port, family)
+    // The raw `posh client` subcommand carries no forwarding policy (it's the
+    // low-level transport entrypoint); agent forwarding is resolved on the
+    // `posh host:session` path. Off here.
+    remote::client::run(host, port, family, None)
 }
 
 /// `posh [user@]host:[group/]session` (RFC 0001 §2): attach to (creating
@@ -307,6 +335,7 @@ fn cmd_ssh_session(
     group: Option<String>,
     session: String,
     extra: &[String],
+    forward_flag: &remote::agent::ForwardFlag,
 ) -> Result<()> {
     let mut inner: Vec<String> = vec!["posh".into()];
     if let Some(g) = &group {
@@ -326,9 +355,25 @@ fn cmd_ssh_session(
         Some(u) => format!("{u}@{host}"),
         None => host,
     };
+    // Resolve agent forwarding (flag > env > default-on). The warning fires
+    // only for an explicit `-A` with no usable agent; print it and proceed off.
+    let (policy, warning) = remote::agent::resolve_forward_policy(
+        forward_flag,
+        std::env::var("POSH_FORWARD_AGENT").ok().as_deref(),
+        std::env::var("SSH_AUTH_SOCK").ok().as_deref(),
+    );
+    if let Some(w) = warning {
+        eprintln!("{w}");
+    }
+    let agent_source = match policy {
+        remote::agent::ForwardPolicy::On { source } => Some(source),
+        remote::agent::ForwardPolicy::Off => None,
+    };
     let opts = remote::sshwrap::SshOptions {
         family: Family::Auto,
         port_range: None,
+        forward_agent: agent_source.is_some(),
+        agent_source,
     };
     remote::sshwrap::run(&dest, &inner, &opts)
 }
@@ -411,7 +456,16 @@ fn cmd_ssh(args: &[String]) -> Result<()> {
     if remote_cmd.first().map(|s| s.as_str()) == Some("--") {
         remote_cmd = &remote_cmd[1..];
     }
-    let opts = remote::sshwrap::SshOptions { family, port_range };
+    // `posh ssh` stays a thin ssh wrapper (FDR 0004 §Limitations): a `-A` here
+    // is a literal ssh flag, not posh forwarding. The bare `posh host` roaming
+    // path also routes here today; wiring posh forwarding onto it is a
+    // follow-up (the `host:session` path carries forwarding now).
+    let opts = remote::sshwrap::SshOptions {
+        family,
+        port_range,
+        forward_agent: false,
+        agent_source: None,
+    };
     remote::sshwrap::run(target, remote_cmd, &opts)
 }
 

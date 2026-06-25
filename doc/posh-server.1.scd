@@ -6,9 +6,9 @@ posh-server - remote endpoint of a posh roaming session
 
 # SYNOPSIS
 
-*posh-server* *new* [*-p* _PORT_[*:*_PORT2_]] [*-4*|*-6*] [*--* _command_...]
+*posh-server* *new* [*-p* _PORT_[*:*_PORT2_]] [*-4*|*-6*] [*-A*] [*--* _command_...]
 
-*posh server* [*new*] [*-p* _PORT_[*:*_PORT2_]] [*-4*|*-6*] [*--* _command_...]
+*posh server* [*new*] [*-p* _PORT_[*:*_PORT2_]] [*-4*|*-6*] [*-A*] [*--* _command_...]
 
 # DESCRIPTION
 
@@ -38,6 +38,15 @@ non-interactive PATH.
 
 *-4*, *-6*
 	Force IPv4 or IPv6. The default binds dual-stack when possible.
+
+*-A*, *--forward-agent*
+	Enable SSH agent forwarding (FDR 0004). The *posh*(1) ssh bootstrap
+	appends this exactly when the client resolved forwarding on; it is
+	not normally typed by hand. The server then binds a per-pid agent
+	socket, claims the stable _<session-dir>/agent/sock_ symlink, and
+	exports _SSH_AUTH_SOCK_ into the session shell. The forwarding
+	*policy* (which socket, opt-out) lives entirely in the client; the
+	server only learns the outcome.
 
 *--* _command_...
 	Run _command_ in the PTY instead of the default _$SHELL_.

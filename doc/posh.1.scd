@@ -72,6 +72,31 @@ _name_
 	found; a terminal whose entry defines no alternate screen is never
 	taken over. See *posh*(7) and FDR 0002.
 
+*-A*, *--forward-agent*
+	Explicitly enable SSH agent forwarding for a roaming
+	_host_*:*_session_ connection. Unlike the best-effort default, a
+	missing or unconnectable _$SSH_AUTH_SOCK_ warns loudly and forwarding
+	stays off, rather than passing silently. See FDR 0004.
+
+*--forward-agent*=_PATH_
+	Forward _PATH_ instead of _$SSH_AUTH_SOCK_ (a second agent,
+	*gpg-agent*'s ssh socket, etc.). The path lives only in the local
+	client; nothing about it reaches the wire or the remote host.
+
+*-a*, *--no-forward-agent*
+	Disable agent forwarding for this connection (the per-connection
+	opt-out; _$POSH_FORWARD_AGENT_=*no* is the profile-level switch).
+
+Agent forwarding is *on by default* on a roaming connection whenever a
+usable _$SSH_AUTH_SOCK_ exists; with none, posh proceeds without it. On
+the remote host the forwarded agent is reachable at the stable
+_$SSH_AUTH_SOCK_=_<session-dir>/agent/sock_, valid across
+detach/reattach. This diverges from OpenSSH's opt-in default — posh
+targets are overwhelmingly your own hosts; the trust model is otherwise
+identical to *ssh -A*, so prefer confirm-constrained keys (*ssh-add -c*)
+for hosts you do not fully trust. *posh ssh* stays a thin *ssh* wrapper:
+a *-A* there is the real *ssh* flag, not posh forwarding.
+
 # SESSION COMMANDS
 
 Local persistence over Unix sockets.
@@ -183,6 +208,12 @@ _POSH_GRAB_MOUSE_
 
 _POSH_NO_TERM_INIT_
 	Set by *--no-init*; suppresses the alternate-screen takeover.
+
+_POSH_FORWARD_AGENT_
+	Agent-forwarding default for roaming connections (FDR 0004),
+	overridden by *-A*/*-a*. *no* or *0* disables forwarding; any other
+	value is a socket path to forward instead of _$SSH_AUTH_SOCK_. Unset
+	means the best-effort default (forward _$SSH_AUTH_SOCK_ when set).
 
 _POSH_SERVER_NETWORK_TMOUT_
 	Server exits after N seconds without client contact (0 = never,

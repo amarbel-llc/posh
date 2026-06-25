@@ -240,7 +240,12 @@ impl GrabMouse {
     }
 }
 
-pub fn run(host: &str, port: u16, family: Family) -> Result<()> {
+pub fn run(
+    host: &str,
+    port: u16,
+    family: Family,
+    agent_source: Option<std::path::PathBuf>,
+) -> Result<()> {
     util::check_utf8_locale("posh-client")?;
 
     // mosh convention: the key travels in the environment, never on argv
@@ -280,9 +285,6 @@ pub fn run(host: &str, port: u16, family: Family) -> Result<()> {
     // Take over the alternate screen (mosh smcup); close() below restores
     // the user's pre-connect shell screen on the way out.
     let _ = util::write_all_retry(STDOUT, &display::open(), 1000);
-    // Agent forwarding (FDR 0004) is off until item 5 resolves the -A flag /
-    // POSH_FORWARD_AGENT into this call. The proxy machinery is built and
-    // tested but dormant.
     let result = client_loop(
         conn,
         model,
@@ -291,7 +293,7 @@ pub fn run(host: &str, port: u16, family: Family) -> Result<()> {
         grab_mouse,
         &raw,
         addr.port(),
-        false,
+        agent_source,
     );
     let _ = util::write_all_retry(STDOUT, &display::close(), 1000);
     drop(raw);
@@ -444,7 +446,6 @@ struct ClientState {
 }
 
 #[allow(clippy::too_many_arguments)]
-#[allow(clippy::too_many_arguments)]
 fn client_loop(
     conn: Connection,
     model: PredictionModel,
@@ -453,7 +454,7 @@ fn client_loop(
     grab_mouse: GrabMouse,
     raw: &RawMode,
     port: u16,
-    agent_forward: bool,
+    agent_source: Option<std::path::PathBuf>,
 ) -> Result<i32> {
     util::set_nonblocking(STDIN)?;
 
@@ -505,13 +506,9 @@ fn client_loop(
         palette: None,
         last_reack: None,
         forensic_captured: false,
-        // Agent forwarding (FDR 0004): the proxy is built only when active and
-        // a local agent is reachable; otherwise forwarding proceeds off.
-        agent: if agent_forward {
-            crate::remote::agent::AgentClient::from_env()
-        } else {
-            None
-        },
+        // Agent forwarding (FDR 0004): the proxy forwards the resolved source
+        // socket; `None` source == forwarding off this connection.
+        agent: agent_source.map(crate::remote::agent::AgentClient::new),
         agent_stream: sync::AgentStream::new(),
         agent_seen: false,
     };

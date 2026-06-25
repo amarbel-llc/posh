@@ -12,6 +12,14 @@ pub struct SshOptions {
     pub family: Family,
     /// Server-side UDP port range, already validated ("P" or "P1:P2").
     pub port_range: Option<String>,
+    /// SSH agent forwarding (FDR 0004): when true the bootstrap argv carries
+    /// `-A` to `posh-server new` (C4 — the remote command carries the
+    /// *outcome*, the policy stays client-side), and `agent_source` is the
+    /// local socket the client proxy dials. Off => neither is set.
+    pub forward_agent: bool,
+    /// The resolved local agent socket to forward (only meaningful with
+    /// `forward_agent`); passed through to the client. Never travels the wire.
+    pub agent_source: Option<std::path::PathBuf>,
 }
 
 /// What the wrapped server reported on stdout.
@@ -64,6 +72,11 @@ pub fn remote_command(
         cmd.push(' ');
     }
     cmd.push_str("posh-server new");
+    // C4: the bootstrap carries only the outcome (forward or not), never the
+    // source path — that lives client-side. A bare `-A` to posh-server.
+    if opts.forward_agent {
+        cmd.push_str(" -A");
+    }
     match opts.family {
         Family::Inet => cmd.push_str(" -4"),
         Family::Inet6 => cmd.push_str(" -6"),
@@ -177,7 +190,7 @@ pub fn run(target: &str, remote_cmd: &[String], opts: &SshOptions) -> Result<()>
     let fallback = target.rsplit('@').next().unwrap_or(target).to_string();
     let host = report.ip.unwrap_or(fallback);
     std::env::set_var("POSH_KEY", key);
-    crate::remote::client::run(&host, port, opts.family)
+    crate::remote::client::run(&host, port, opts.family, opts.agent_source.clone())
 }
 
 fn parse_connect(rest: &str) -> Option<(u16, String)> {
@@ -267,6 +280,8 @@ mod tests {
         let opts = SshOptions {
             family: Family::Auto,
             port_range: None,
+            forward_agent: false,
+            agent_source: None,
         };
         let inner: Vec<String> = ["posh", "-g", "grp", "attach", "my dev"]
             .iter()
@@ -284,6 +299,8 @@ mod tests {
         let opts = SshOptions {
             family: Family::Inet6,
             port_range: Some("60100:60200".to_string()),
+            forward_agent: false,
+            agent_source: None,
         };
         let locale = vec![("LANG".to_string(), "en_US.UTF-8".to_string())];
         let cmd = remote_command(&opts, &["htop".to_string(), "-d".to_string()], &locale);
@@ -296,11 +313,38 @@ mod tests {
             &SshOptions {
                 family: Family::Auto,
                 port_range: None,
+                forward_agent: false,
+                agent_source: None,
             },
             &[],
             &[],
         );
         assert_eq!(plain, "posh-server new");
+    }
+
+    #[test]
+    fn remote_command_appends_dash_a_when_forwarding() {
+        // FDR 0004 C4: a bare `-A` rides to posh-server exactly when forwarding
+        // resolved on, positioned right after `new` (before -4/-6/-p). The
+        // source path never appears — it stays client-side.
+        let opts = SshOptions {
+            family: Family::Inet,
+            port_range: Some("60001:60999".to_string()),
+            forward_agent: true,
+            agent_source: Some("/run/user/1000/agent.sock".into()),
+        };
+        let cmd = remote_command(&opts, &[], &[]);
+        assert_eq!(cmd, "posh-server new -A -4 -p 60001:60999");
+        assert!(!cmd.contains("agent.sock"), "source path must not hit the wire");
+
+        // Off => no -A.
+        let off = SshOptions {
+            family: Family::Auto,
+            port_range: None,
+            forward_agent: false,
+            agent_source: None,
+        };
+        assert_eq!(remote_command(&off, &[], &[]), "posh-server new");
     }
 
     #[test]
@@ -311,6 +355,8 @@ mod tests {
         let opts = SshOptions {
             family: Family::Auto,
             port_range: None,
+            forward_agent: false,
+            agent_source: None,
         };
         let env = vec![
             ("TERM".to_string(), "xterm-kitty".to_string()),
