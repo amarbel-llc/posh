@@ -1,6 +1,12 @@
 # Rust workspace
 /target
 
+# RFC 0007 evolutionary-predictor pilot: mephisto source bridge. The flake
+# populates vendor/mephisto from the `mephisto` flake input (store path) at
+# build time; locally it is a gitignored symlink to the sibling checkout for
+# the dev-loop. flake.lock is the single rev pin.
+/vendor
+
 # Nix build outputs
 /result
 /result-*

@@ -21,6 +21,12 @@ aes-gcm = { version = "0.10", default-features = false, features = [
 # The command-palette control channel speaks JSON-RPC 2.0 (RFC 0005); serde_json
 # parses the renderer's selected-command actions (arbitrary params) robustly.
 serde_json = "1"
+# Evolutionary predictive-echo pilot (RFC 0007): the mephisto GP engine drives
+# the controller/from-scratch predictor species. A path dep into vendor/, which
+# the flake populates from the `mephisto` flake input (private repo, ssh-fetched
+# at eval; flake.lock is the rev pin) and a gitignored symlink populates for the
+# dev-loop — so no cargo git fetch / outputHashes is needed.
+mephisto = { path = "../../vendor/mephisto/v2-rust" }
 
 [build-dependencies]
 # Shared version + git-sha flow-out (github #71). See eng-versioning(7).

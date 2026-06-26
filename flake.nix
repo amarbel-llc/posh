@@ -20,6 +20,18 @@
       inputs.nixpkgs-master.follows = "nixpkgs-master";
       inputs.utils.follows = "utils";
     };
+
+    # mephisto — the genetic-programming engine for the RFC 0007 evolutionary
+    # predictor pilot. PRIVATE repo, so a flake input (a fixed-output git+ssh
+    # fetch at evaluation time, authenticated by the user's SSH agent) rather
+    # than a cargo git dependency (which the sandboxed hermetic build cannot
+    # authenticate). flake = false: we consume the source tree (a root virtual
+    # workspace; the `mephisto` crate lives under v2-rust/), bridged into the
+    # rust build via a cargo [patch]. See docs/rfcs/0007.
+    mephisto = {
+      url = "git+ssh://git@github.com/amarbel-llc/mephisto?rev=31d496dfd95509b2d48b8fe51179adf1e6f00b84";
+      flake = false;
+    };
   };
 
   # The `...` ellipsis is load-bearing: nix calls `outputs` with `self`

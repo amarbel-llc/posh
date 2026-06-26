@@ -19,6 +19,7 @@ use posh_term::Cell;
 
 use crate::remote::display::Snapshot;
 
+mod evolved;
 mod metric;
 mod mosh;
 mod optimistic;

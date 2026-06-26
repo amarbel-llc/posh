@@ -102,6 +102,23 @@
         "type": "github"
       }
     },
+    "mephisto": {
+      "flake": false,
+      "locked": {
+        "lastModified": 1782481645,
+        "narHash": "sha256-IFvmDwCWEXt4B5xD73ET5ti0JQSmZIjeO9H+49/SDWU=",
+        "ref": "refs/heads/master",
+        "rev": "31d496dfd95509b2d48b8fe51179adf1e6f00b84",
+        "revCount": 235,
+        "type": "git",
+        "url": "ssh://git@github.com/amarbel-llc/mephisto"
+      },
+      "original": {
+        "rev": "31d496dfd95509b2d48b8fe51179adf1e6f00b84",
+        "type": "git",
+        "url": "ssh://git@github.com/amarbel-llc/mephisto"
+      }
+    },
     "nixpkgs-master": {
       "locked": {
         "lastModified": 1781577229,
@@ -138,6 +155,7 @@
       "inputs": {
         "conformist": "conformist",
         "igloo": "igloo",
+        "mephisto": "mephisto",
         "nixpkgs-master": "nixpkgs-master_2",
         "utils": "utils"
       }
