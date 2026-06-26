@@ -106,6 +106,7 @@ fn palette_commands(server_log_on: bool) -> Value {
         { "name": "Shell out (server)", "action": { "method": "shell.open" } },
         { "name": "Reset & resync (force redraw)", "action": { "method": "session.resync" } },
         { "name": "Dump wedge forensics", "action": { "method": "session.forensics" } },
+        { "name": "Show wedge debug info", "action": { "method": "session.debuginfo" } },
         { "name": "Suspend client", "action": { "method": "client.suspend" } },
         { "name": "Quit session", "action": { "method": "app.quit" } },
     ])
@@ -126,6 +127,69 @@ fn open_palette(st: &mut ClientState) -> bool {
     } else {
         false
     }
+}
+
+/// Write the full client transport snapshot — and a byte-level forensic bundle
+/// if an apply-stall is pending — to the diagnostic sink. Shared by the SIGUSR2
+/// handler and the "Show wedge debug info" palette command (#3), so both record
+/// the identical forensic state on disk.
+fn dump_client_state(st: &ClientState, now: u64) {
+    let ps = predict_sample(&st.predict.stats());
+    diag::ClientState {
+        remote: st.conn.remote(),
+        last_send_age_ms: (st.last_send != 0).then(|| now.saturating_sub(st.last_send)),
+        last_heard_age_ms: now.saturating_sub(st.last_heard),
+        applied_num: st.applied_num,
+        outbox_base: st.outbox.base(),
+        outbox_pending: st.outbox.pending().len(),
+        scrollback_len: st.scrollback.len(),
+        srtt: st.conn.srtt(),
+        rto: st.conn.rto(),
+        send_interval: st.conn.send_interval(),
+        bytes_rx: st.conn.bytes_rx(),
+        bytes_tx: st.conn.bytes_tx(),
+        predict_active: ps.active,
+        predict_shown: ps.shown,
+        predict_epoch_lag: ps.epoch_lag,
+        term_gen: st.server_term.generation(),
+        rows: st.rows,
+        cols: st.cols,
+        echo_on: st.echo_on,
+        codec: st.framesync.label(),
+        title: st.server_term.title().to_string(),
+        apply: st.stats.apply_snapshot(),
+        server_diag: st.last_server_diag,
+    }
+    .dump();
+    if let Some(reack) = st.last_reack.as_ref() {
+        let _ = diag::capture_forensics(st.applied_num, &st.applied_data, reack);
+    }
+}
+
+/// The compact on-screen wedge-triage line for the "Show wedge debug info"
+/// palette command (#3): the handful of fields that distinguish a wedge's cause,
+/// readable without a second terminal because the notify banner composites even
+/// while the session content is frozen (the client loop, palette, and renderer
+/// all keep running — only the apply path is stuck). `reack=yes` is the
+/// apply-stall signal; `srv=` shows the far side when the client is in a debug
+/// posture so the server piggyback (CAP_DIAG, #6) was negotiated, else `off`.
+fn wedge_debug_summary(st: &ClientState, now: u64) -> String {
+    let srv = match st.last_server_diag {
+        Some(d) => format!(
+            "(num={} acked={} out={} pty={})",
+            d.current_num, d.acked_num, d.outstanding, d.pty_open as u8
+        ),
+        None => "off".to_string(),
+    };
+    format!(
+        "debug: pid={} applied={} heard={}ms gen={} reack={} srv={}",
+        std::process::id(),
+        st.applied_num,
+        now.saturating_sub(st.last_heard),
+        st.server_term.generation(),
+        if st.last_reack.is_some() { "yes" } else { "no" },
+        srv,
+    )
 }
 
 /// Dispatch a palette-selected command action (RFC 0005 §7). Returns whether the
@@ -203,6 +267,16 @@ fn dispatch_palette_action(
                 None => "wedge forensics: nothing pending (not wedged)".to_string(),
             };
             st.notify.set_message(&msg, false, now);
+            false
+        }
+        "session.debuginfo" => {
+            // Show the wedge-triage line on-screen (visible even while frozen)
+            // and write the full transport snapshot to the diagnostic sink (#3),
+            // so the user can read the cause in-session and keep the forensic
+            // record without a second terminal or knowing the pid.
+            let summary = wedge_debug_summary(st, now);
+            dump_client_state(st, now);
+            st.notify.set_message(&summary, false, now);
             false
         }
         "client.suspend" => {
@@ -675,38 +749,7 @@ fn drive_client(st: &mut ClientState, raw: &RawMode, port: u16) -> Result<i32> {
         // a file, never the tty — stdout is the alternate-screen TUI and stderr
         // is the user's outer shell, so writing either would corrupt the display.
         if util::take_flag(&util::SIGUSR2_RECEIVED) {
-            let ps = predict_sample(&st.predict.stats());
-            diag::ClientState {
-                remote: st.conn.remote(),
-                last_send_age_ms: (st.last_send != 0).then(|| now.saturating_sub(st.last_send)),
-                last_heard_age_ms: now.saturating_sub(st.last_heard),
-                applied_num: st.applied_num,
-                outbox_base: st.outbox.base(),
-                outbox_pending: st.outbox.pending().len(),
-                scrollback_len: st.scrollback.len(),
-                srtt: st.conn.srtt(),
-                rto: st.conn.rto(),
-                send_interval: st.conn.send_interval(),
-                bytes_rx: st.conn.bytes_rx(),
-                bytes_tx: st.conn.bytes_tx(),
-                predict_active: ps.active,
-                predict_shown: ps.shown,
-                predict_epoch_lag: ps.epoch_lag,
-                term_gen: st.server_term.generation(),
-                rows: st.rows,
-                cols: st.cols,
-                echo_on: st.echo_on,
-                codec: st.framesync.label(),
-                title: st.server_term.title().to_string(),
-                apply: st.stats.apply_snapshot(),
-                server_diag: st.last_server_diag,
-            }
-            .dump();
-            // Also drop a byte-level forensic bundle if an apply-stall is
-            // pending, so `just debug-posh-dump` captures the divergent base.
-            if let Some(reack) = st.last_reack.as_ref() {
-                let _ = diag::capture_forensics(st.applied_num, &st.applied_data, reack);
-            }
+            dump_client_state(st, now);
         }
 
         // Keystrokes -> quit sequence / prediction / reliable input stream.
@@ -2156,6 +2199,37 @@ mod tests {
     }
 
     #[test]
+    fn wedge_debug_summary_reports_apply_stall_and_server_state() {
+        // The on-screen line (#3): with an apply-stall pending and a CAP_DIAG
+        // report in hand, it shows reack=yes and the far-side srv state, so the
+        // user reads the wedge's cause without a second terminal.
+        let mut st = test_state(24, 80);
+        st.applied_num = 41;
+        st.last_reack = Some((42, 41, FrameKind::Diff, vec![0u8; 8]));
+        st.last_server_diag = Some(caps::ServerDiag {
+            current_num: 43,
+            acked_num: 41,
+            term_gen: 90,
+            outstanding: 2,
+            pty_open: true,
+        });
+        let line = wedge_debug_summary(&st, 1000);
+        assert!(line.contains("applied=41"), "{line}");
+        assert!(line.contains("reack=yes"), "{line}");
+        assert!(line.contains("srv=(num=43 acked=41 out=2 pty=1)"), "{line}");
+    }
+
+    #[test]
+    fn wedge_debug_summary_server_state_off_without_diag_posture() {
+        // No CAP_DIAG negotiated (default session, not a debug posture): the
+        // far side is unavailable, reported as srv=off, and no apply-stall.
+        let st = test_state(24, 80);
+        let line = wedge_debug_summary(&st, 0);
+        assert!(line.contains("reack=no"), "{line}");
+        assert!(line.contains("srv=off"), "{line}");
+    }
+
+    #[test]
     fn apply_frame_stashes_reack_on_short_base_diff() {
         // A Diff whose base matches applied_num but whose prefix+suffix exceeds
         // the client's (shorter) applied_data -> apply_diff None -> ReackAndWait.
@@ -2296,7 +2370,11 @@ mod tests {
             names.iter().any(|n| n.to_lowercase().contains("wedge forensics")),
             "forensics command missing: {names:?}"
         );
-        assert_eq!(arr.len(), 11, "expected 11 commands, got {names:?}");
+        assert!(
+            names.iter().any(|n| n.to_lowercase().contains("wedge debug info")),
+            "debug-info command missing: {names:?}"
+        );
+        assert_eq!(arr.len(), 12, "expected 12 commands, got {names:?}");
     }
 
     #[test]
