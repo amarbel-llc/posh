@@ -41,6 +41,16 @@ pub fn echo_on(fd: RawFd) -> bool {
     }
 }
 
+/// The pty's foreground process group id (`tcgetpgrp`) — the process group that
+/// owns the terminal, i.e. the app the user is interacting with. Used by the
+/// RFC 0007 metric bus to identify the session's foreground app. `None` when
+/// `fd` is not a tty or has no foreground group.
+pub fn foreground_pgid(fd: RawFd) -> Option<libc::pid_t> {
+    // SAFETY: tcgetpgrp takes only the fd and returns the pgid or -1.
+    let pgid = unsafe { libc::tcgetpgrp(fd) };
+    (pgid > 0).then_some(pgid)
+}
+
 pub struct PtyChild {
     pub master: RawFd,
     pub pid: libc::pid_t,

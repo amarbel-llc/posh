@@ -29,6 +29,11 @@ pub struct Stats {
     /// `enabled` so the apply-stall fingerprint runs and triggers recovery even
     /// when periodic logging (POSH_DEBUG_LOG) is off.
     wedge_watchdog: bool,
+    /// RFC 0007 metric bus: when a GP predictor species is active the client
+    /// needs the compute-timing terminals (apply/compose/loop) even with
+    /// periodic logging off, so timing is collected when `instrument()` — i.e.
+    /// `enabled || gp_active` — not just `enabled`.
+    gp_active: bool,
     last_flush: u64,
     /// A meaningful counter advanced since the last emit. Idle-only activity
     /// (skipped renders) deliberately does not set this, so a quiescent session
@@ -59,6 +64,15 @@ pub struct Stats {
     compose_us_total: u64,
     compose_count: u64,
     compose_us_max: u64,
+
+    // Most-recent (not windowed, not flush-reset) single-frame compute costs,
+    // for the RFC 0007 metric bus. Updated by the same record_* calls; surfaced
+    // via the `last_*` getters so the bus reads a current value regardless of
+    // the flush cycle.
+    last_apply_us: u64,
+    last_compose_us: u64,
+    last_loop_busy_us: u64,
+    last_loop_idle_us: u64,
 
     // Event-loop timing (windowed): per iteration, time blocked in poll (idle)
     // vs doing work (busy), the longest single busy stretch, and the iteration
@@ -207,6 +221,35 @@ impl Stats {
     /// toggle). When off, the periodic flush is skipped even if a sink is open.
     pub fn set_enabled(&mut self, on: bool) {
         self.enabled = on;
+    }
+
+    /// Mark whether a GP predictor species (RFC 0007) is active. When it is, the
+    /// compute timers run even with periodic logging off so the metric bus can
+    /// read the `last_*` costs.
+    pub fn set_gp_active(&mut self, on: bool) {
+        self.gp_active = on;
+    }
+
+    /// Whether per-frame compute timing should be collected: periodic logging is
+    /// on, or a GP species needs the timing terminals.
+    pub fn instrument(&self) -> bool {
+        self.enabled || self.gp_active
+    }
+
+    /// Most-recent single-frame compute costs (µs) for the RFC 0007 metric bus.
+    pub fn last_apply_us(&self) -> u64 {
+        self.last_apply_us
+    }
+    pub fn last_compose_us(&self) -> u64 {
+        self.last_compose_us
+    }
+    /// Busy/idle µs of the most recent event-loop iteration (drives fps +
+    /// busy-fraction in the metric bus).
+    pub fn last_loop_busy_us(&self) -> u64 {
+        self.last_loop_busy_us
+    }
+    pub fn last_loop_idle_us(&self) -> u64 {
+        self.last_loop_idle_us
     }
 
     // --- recording -----------------------------------------------------------
@@ -368,12 +411,14 @@ impl Stats {
         self.apply_us_total += us;
         self.apply_count += 1;
         self.apply_us_max = self.apply_us_max.max(us);
+        self.last_apply_us = us;
     }
     /// Client: accumulate one compose_frame render (snapshot + `new_frame` diff).
     pub fn record_compose_us(&mut self, us: u64) {
         self.compose_us_total += us;
         self.compose_count += 1;
         self.compose_us_max = self.compose_us_max.max(us);
+        self.last_compose_us = us;
     }
 
     /// Client: one keystroke→consumed round-trip, in milliseconds (the input
@@ -393,6 +438,8 @@ impl Stats {
         self.loop_busy_us += busy_us;
         self.loop_idle_us += idle_us;
         self.loop_busy_us_max = self.loop_busy_us_max.max(busy_us);
+        self.last_loop_busy_us = busy_us;
+        self.last_loop_idle_us = idle_us;
     }
 
     /// A frame the server sent as a diff: record the full-dump size it would

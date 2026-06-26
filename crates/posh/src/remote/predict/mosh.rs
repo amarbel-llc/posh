@@ -80,8 +80,12 @@ impl MoshPredictor {
             PredictionModel::Never => false,
             PredictionModel::Always | PredictionModel::Experimental => true,
             PredictionModel::Adaptive => self.srtt_trigger || self.glitch_trigger > 0,
-            // Optimistic never constructs a MoshPredictor.
-            PredictionModel::Optimistic => true,
+            // These never construct a MoshPredictor directly: optimistic is its
+            // own model, and the evolved species (RFC 0007) wrap an *adaptive*
+            // MoshPredictor as their shadow, so display_preference is Adaptive.
+            PredictionModel::Optimistic
+            | PredictionModel::Controller
+            | PredictionModel::FromScratch => true,
         }
     }
 

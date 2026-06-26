@@ -54,8 +54,19 @@ fn apply_echo_model(st: &mut ClientState, next: PredictionModel, now: u64) {
     st.predict = predict;
     st.renderer = renderer;
     st.predict_model = next;
+    st.stats.set_gp_active(is_gp_species(next));
     st.initialized = false;
     st.notify.set_message(&format!("echo: {next:?}"), false, now);
+}
+
+/// Whether a prediction model is one of the evolved GP species (RFC 0007). The
+/// metric bus assembles only for these, and their compute timing is collected
+/// even with periodic logging off.
+fn is_gp_species(model: PredictionModel) -> bool {
+    matches!(
+        model,
+        PredictionModel::Controller | PredictionModel::FromScratch
+    )
 }
 
 /// Set client-local debug logging to `enabled`: open the default per-pid sink
@@ -459,6 +470,13 @@ struct ClientState {
     predict_model: PredictionModel,
     predict_render: RenderStyle,
     predict_overwrite: bool,
+    /// Latest metric vector (RFC 0007), reassembled each compose while a GP
+    /// species is active; the seam the evolved program reads once wired.
+    #[allow(dead_code)] // consumed once the GP program is wired (RFC 0007 §7)
+    last_metrics: predict::MetricVector,
+    /// Latest decoded `CAP_METRICS` remote terminals (RFC 0007 §3), folded into
+    /// `last_metrics` each compose. `NaN` until the server forwards them.
+    remote_metrics: [f64; 5],
     notify: NotificationEngine,
     /// $POSH_GRAB_MOUSE policy; on, intercepted wheel events become arrow keys
     /// instead of driving the scrollback scroll-view (the legacy posh#50 grab).
@@ -585,6 +603,8 @@ fn client_loop(
         predict_model: model,
         predict_render: render,
         predict_overwrite,
+        last_metrics: predict::MetricVector::unavailable(),
+        remote_metrics: [f64::NAN; 5],
         notify: NotificationEngine::new(now),
         grab_mouse,
         mouse_filter: MouseFilter::default(),
@@ -620,6 +640,9 @@ fn client_loop(
         agent_stream: sync::AgentStream::new(),
         agent_seen: false,
     };
+    // RFC 0007: collect the compute-timing terminals when a GP species is the
+    // startup model, independent of POSH_DEBUG_LOG.
+    st.stats.set_gp_active(is_gp_species(model));
     let result = drive_client(&mut st, raw, port);
     // Tear down the palette renderer (if any) before the final stats flush.
     if let Some(p) = st.palette.take() {
@@ -663,7 +686,7 @@ fn drive_client(st: &mut ClientState, raw: &RawMode, port: u16) -> Result<i32> {
     send_message(st);
 
     let result: Result<i32> = 'client: loop {
-        let iter_start = st.stats.enabled().then(Instant::now);
+        let iter_start = st.stats.instrument().then(Instant::now);
         let now = now_ms();
         let mut deadline = st.last_send + HEARTBEAT_INTERVAL;
         if !st.outbox.is_empty() || st.flags != 0 {
@@ -704,7 +727,7 @@ fn drive_client(st: &mut ClientState, raw: &RawMode, port: u16) -> Result<i32> {
             None => (usize::MAX, 0),
         };
         let mut send_now = false;
-        let poll_start = st.stats.enabled().then(Instant::now);
+        let poll_start = st.stats.instrument().then(Instant::now);
         match util::poll(&mut fds, timeout) {
             Ok(_) => {}
             Err(e) if e.kind() == std::io::ErrorKind::Interrupted => {}
@@ -1421,6 +1444,13 @@ fn process_frame(st: &mut ClientState, frame: &ServerFrame) -> bool {
             }
         }
     }
+    // Evolved-predictor remote metrics (RFC 0007 §3): the server attaches
+    // CAP_METRICS only because we advertised it (a GP species is active).
+    if let Some(cap) = caps::find(&frame.caps, caps::CAP_METRICS) {
+        if let Some(fields) = caps::decode_metrics(&cap.payload) {
+            st.remote_metrics = fields;
+        }
+    }
     consume_agent_caps(st, frame);
     apply_frame(st, frame)
 }
@@ -1528,7 +1558,7 @@ fn apply_frame(st: &mut ClientState, frame: &ServerFrame) -> bool {
     // the client-side mirror of the server's dump_vt_us. For DumpDiff this is
     // the full-dump reparse (the suspected hot spot); for MorphDelta it is the
     // forward `process(escapes)` on the existing model (the optimization).
-    let apply_timer = st.stats.enabled().then(Instant::now);
+    let apply_timer = st.stats.instrument().then(Instant::now);
     let outcome = st.applier.apply(
         st.rows,
         st.cols,
@@ -1652,13 +1682,50 @@ fn compose_frame(st: &mut ClientState, now: u64) -> Vec<u8> {
     // Time the actual render compute (snapshot + prediction/banner overlay +
     // diff), excluding the idle fast-path above so the average reflects real
     // work. enabled() is read and dropped before the borrows below.
-    let compose_timer = st.stats.enabled().then(Instant::now);
+    let compose_timer = st.stats.instrument().then(Instant::now);
     // Optimistic echo gate (FDR 0006): when echo is unsafe (password prompt /
     // full-screen app) the optimistic model drops its pending overlay so the
     // authoritative paint stands; other models ignore this.
     st.predict.set_echo_safe(optimistic_echo_on(st));
     let base = Snapshot::from_term(&st.server_term);
     st.predict.cull(&base, now);
+    // Metric bus (RFC 0007 §3): while a GP species is active, assemble the
+    // client-local terminals from the authoritative screen + transport +
+    // predictor feedback. Cheap field copies; skipped for the non-GP models so
+    // they pay nothing. Server-forwarded/host terminals stay NaN until wired.
+    if is_gp_species(st.predict_model) {
+        let mut metrics = predict::gather_client_local(&base);
+        metrics.fill_transport(
+            st.conn.srtt(),
+            st.conn.rto() as f64,
+            st.conn.send_interval() as f64,
+            st.outbox.pending().len() as f64,
+        );
+        // Render headroom from the most recent event-loop iteration + frame
+        // compute costs (RFC 0007 §2). dump_vt_us is a server-side cost, so it
+        // stays NaN client-side (folded into the server-forwarded work).
+        let busy = st.stats.last_loop_busy_us();
+        let idle = st.stats.last_loop_idle_us();
+        let iter_us = busy + idle;
+        let (fps, busy_frac) = if iter_us > 0 {
+            (1_000_000.0 / iter_us as f64, busy as f64 / iter_us as f64)
+        } else {
+            (f64::NAN, f64::NAN)
+        };
+        metrics.fill_render_headroom(
+            fps,
+            busy_frac,
+            st.stats.last_apply_us() as f64,
+            st.stats.last_compose_us() as f64,
+        );
+        metrics.fill_predictor_feedback(&st.predict.stats());
+        // Session-gate terminals: already client-side, no forwarding (the
+        // alt-screen "indicator" of #97 — the client reconstructs it).
+        metrics.fill_session_gate(st.server_term.is_alt_screen(), st.echo_on);
+        // Remote terminals decoded from the server's CAP_METRICS (RFC 0007 §3).
+        metrics.fill_remote(st.remote_metrics);
+        st.last_metrics = metrics;
+    }
     let mut next = base;
     st.predict.render(&mut next, &*st.renderer);
     // The palette overlay sits above the session (greyed) but below the banner.
@@ -1857,6 +1924,15 @@ fn outgoing_caps(st: &mut ClientState) -> Vec<caps::Cap> {
     if st.want_server_diag {
         extra.push(caps::Cap {
             id: caps::CAP_DIAG,
+            payload: vec![],
+        });
+    }
+    // Evolved predictor (RFC 0007 §3): request the server's remote-host metric
+    // terminals only when a GP species is active, so a default session never
+    // negotiates CAP_METRICS and pays no per-frame overhead.
+    if is_gp_species(st.predict_model) {
+        extra.push(caps::Cap {
+            id: caps::CAP_METRICS,
             payload: vec![],
         });
     }
@@ -2487,6 +2563,8 @@ mod tests {
             renderer: predict::build(PredictionModel::Never, RenderStyle::Replace, false).1,
             predict_model: PredictionModel::Never,
             predict_render: RenderStyle::Replace,
+            last_metrics: predict::MetricVector::unavailable(),
+            remote_metrics: [f64::NAN; 5],
             predict_overwrite: false,
             notify: NotificationEngine::new(0),
             grab_mouse: GrabMouse::Off,

@@ -241,6 +241,13 @@ pub(crate) fn server_loop(
     // CAP_DIAG (only in its debug posture) we attach our live frame/ack/pty state
     // to each frame so its SIGUSR2 dump can show the far side of a wedge.
     let mut peer_wants_diag = false;
+    // Evolved-predictor metric forwarding (RFC 0007 §3): when the peer advertises
+    // CAP_METRICS we attach the remote-host terminals, sampled at most every
+    // METRICS_SAMPLE_INTERVAL ms (the /proc reads are not free).
+    const METRICS_SAMPLE_INTERVAL_MS: u64 = 500;
+    let mut peer_wants_metrics = false;
+    let mut metrics_sample = crate::remote::hostmetrics::RemoteMetrics::default();
+    let mut metrics_sampled_at: u64 = 0;
     let mut dumpdiff_enc = DumpDiff;
     let mut morph_enc = MorphDelta::default();
 
@@ -646,6 +653,8 @@ pub(crate) fn server_loop(
                             caps::find(&msg.caps, caps::CAP_BASE_SUM).is_some();
                         // CAP_DIAG (#6): per-message, like the others.
                         peer_wants_diag = caps::find(&msg.caps, caps::CAP_DIAG).is_some();
+                        // CAP_METRICS (RFC 0007 §3): per-message, like the others.
+                        peer_wants_metrics = caps::find(&msg.caps, caps::CAP_METRICS).is_some();
                     }
                     Ok(None) => continue,
                     Err(e) if e.kind() == std::io::ErrorKind::WouldBlock => break,
@@ -944,6 +953,24 @@ pub(crate) fn server_loop(
                         outstanding: outstanding.len() as u32,
                         pty_open,
                     }));
+                }
+                // Evolved-predictor remote metrics (RFC 0007 §3): sample the
+                // host/app/proc signals (throttled — the /proc reads are not
+                // free) and attach them. The foreground app is taken from the
+                // session pty's foreground process group + the terminal title.
+                if peer_wants_metrics {
+                    let t = now_ms();
+                    if metrics_sampled_at == 0
+                        || t.saturating_sub(metrics_sampled_at) >= METRICS_SAMPLE_INTERVAL_MS
+                    {
+                        metrics_sample = crate::remote::hostmetrics::sample(
+                            pty::foreground_pgid(child.master),
+                            term.title(),
+                            child.pid,
+                        );
+                        metrics_sampled_at = t;
+                    }
+                    extras.push(caps::encode_metrics(metrics_sample.to_terminals()));
                 }
                 if shutdown && peer_wants_exit {
                     if let Some(code) = exit_status {

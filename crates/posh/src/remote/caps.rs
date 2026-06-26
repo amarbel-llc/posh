@@ -91,6 +91,14 @@ pub const MAX_AGENT_DATA_CAPS: usize = 239;
 /// [`encode_server_diag`]).
 pub const CAP_DIAG: u8 = 224;
 
+/// Evolved-predictor metric forwarding (RFC 0007 §3). Experimental id (like
+/// CAP_DIAG) because the payload tracks the metric-vector schema and may evolve.
+/// Client entry (empty payload): "I run an evolved GP predictor; attach the
+/// remote-host metric terminals to each frame." Advertised only when a GP
+/// species is active, so a default session never negotiates it. Server entry:
+/// the [`encode_metrics`] payload (load/mem/frontmost-app/proc-count/fg-proc).
+pub const CAP_METRICS: u8 = 225;
+
 /// The post-table format version we implement (payload of
 /// [`CAP_PROTOCOL_VERSION`]).
 pub const PROTOCOL_VERSION: u8 = 1;
@@ -283,9 +291,65 @@ pub fn decode_server_diag(payload: &[u8]) -> Result<ServerDiag> {
     })
 }
 
+/// Number of `f64` metric fields in a [`CAP_METRICS`] payload (RFC 0007 §3
+/// remote terminals, in order): load1, mem_avail_frac, frontmost_app,
+/// proc_count, fg_proc_id. Absent terminals are encoded as `NaN`.
+pub const METRICS_FIELDS: usize = 5;
+const METRICS_VERSION: u8 = 1;
+
+/// Encode the remote metric terminals as a [`CAP_METRICS`] payload: a version
+/// byte then `METRICS_FIELDS` little-endian `f64`s. Categorical ids are passed
+/// as their `f64` value; absent terminals as `NaN`.
+pub fn encode_metrics(fields: [f64; METRICS_FIELDS]) -> Cap {
+    let mut payload = Vec::with_capacity(1 + 8 * METRICS_FIELDS);
+    payload.push(METRICS_VERSION);
+    for f in fields {
+        payload.extend_from_slice(&f.to_le_bytes());
+    }
+    Cap {
+        id: CAP_METRICS,
+        payload,
+    }
+}
+
+/// Decode a [`CAP_METRICS`] payload. Returns `None` on a version mismatch or a
+/// short payload (the client then keeps its previous values), never panicking
+/// on peer-controlled bytes.
+pub fn decode_metrics(payload: &[u8]) -> Option<[f64; METRICS_FIELDS]> {
+    if payload.first().copied()? != METRICS_VERSION {
+        return None;
+    }
+    let body = payload.get(1..1 + 8 * METRICS_FIELDS)?;
+    let mut out = [f64::NAN; METRICS_FIELDS];
+    for (slot, chunk) in out.iter_mut().zip(body.chunks_exact(8)) {
+        *slot = f64::from_le_bytes(chunk.try_into().unwrap());
+    }
+    Some(out)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn metrics_roundtrip_preserves_values_and_nan() {
+        let fields = [0.5, f64::NAN, 12345.0, 3.0, 67890.0];
+        let cap = encode_metrics(fields);
+        assert_eq!(cap.id, CAP_METRICS);
+        let got = decode_metrics(&cap.payload).unwrap();
+        assert_eq!(got[0], 0.5);
+        assert!(got[1].is_nan());
+        assert_eq!(got[2], 12345.0);
+        assert_eq!(got[3], 3.0);
+        assert_eq!(got[4], 67890.0);
+    }
+
+    #[test]
+    fn metrics_decode_rejects_bad_version_and_short_payload() {
+        assert!(decode_metrics(&[]).is_none());
+        assert!(decode_metrics(&[99]).is_none()); // wrong version
+        assert!(decode_metrics(&[1, 0, 0]).is_none()); // truncated body
+    }
 
     #[test]
     fn roundtrip_with_trailing_body() {

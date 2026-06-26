@@ -9,6 +9,7 @@ pub mod datagram;
 pub mod diag;
 pub mod display;
 pub mod framesync;
+pub mod hostmetrics;
 pub mod palette;
 #[cfg(test)]
 mod perf_probe;

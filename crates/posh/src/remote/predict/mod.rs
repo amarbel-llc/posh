@@ -19,16 +19,24 @@ use posh_term::Cell;
 
 use crate::remote::display::Snapshot;
 
+mod metric;
 mod mosh;
 mod optimistic;
 mod overlay;
 mod render;
+mod species;
 #[cfg(test)]
 mod test_support;
 
+#[allow(unused_imports)] // scaffold surface, referenced once the GP is wired (RFC 0007)
+pub use metric::{
+    gather_client_local, MetricSource, MetricVector, METRIC_SCHEMA_VERSION, TERMINAL_COUNT,
+};
 pub use mosh::MoshPredictor;
 pub use optimistic::OptimisticPredictor;
 pub use render::{DimRenderer, ReplaceRenderer};
+#[allow(unused_imports)] // PolicyKnobs referenced once the controller genome is wired (RFC 0007)
+pub use species::{ControllerPredictor, FromScratchPredictor, PolicyKnobs};
 
 // Timing constants, verbatim from mosh terminaloverlay.h. Used by the mosh
 // model; re-exported where tests reference them.
@@ -104,8 +112,9 @@ pub struct PredictorStats {
 }
 
 /// Prediction model selection. Mirrors mosh's display-preference set; the
-/// adaptive/always/never/experimental variants drive [`MoshPredictor`], while
-/// optimistic drives [`OptimisticPredictor`] (FDR 0006).
+/// adaptive/always/never/experimental variants drive [`MoshPredictor`],
+/// optimistic drives [`OptimisticPredictor`] (FDR 0006), and the evolved
+/// controller/from-scratch species drive the GP predictors (RFC 0007).
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum PredictionModel {
     Always,
@@ -113,6 +122,12 @@ pub enum PredictionModel {
     Adaptive,
     Experimental,
     Optimistic,
+    /// RFC 0007 §4.1: evolved GP program outputs policy knobs that drive the
+    /// existing echo machinery. The safe arm.
+    Controller,
+    /// RFC 0007 §4.2: evolved GP program emits predicted cells directly. The
+    /// research arm.
+    FromScratch,
 }
 
 impl PredictionModel {
@@ -126,6 +141,8 @@ impl PredictionModel {
             Some("never") => Ok(PredictionModel::Never),
             Some("experimental") => Ok(PredictionModel::Experimental),
             Some("optimistic") => Ok(PredictionModel::Optimistic),
+            Some("controller") => Ok(PredictionModel::Controller),
+            Some("scratch") => Ok(PredictionModel::FromScratch),
             Some(other) => Err(format!("unknown prediction model ({other})")),
         }
     }
@@ -162,6 +179,8 @@ pub fn build(
 ) -> (Box<dyn Predictor>, Box<dyn PredictionRenderer>) {
     let predictor: Box<dyn Predictor> = match model {
         PredictionModel::Optimistic => Box::new(OptimisticPredictor::new(predict_overwrite)),
+        PredictionModel::Controller => Box::new(ControllerPredictor::new(predict_overwrite)),
+        PredictionModel::FromScratch => Box::new(FromScratchPredictor::new(predict_overwrite)),
         other => Box::new(MoshPredictor::new(other, predict_overwrite)),
     };
     let renderer: Box<dyn PredictionRenderer> = match render {
