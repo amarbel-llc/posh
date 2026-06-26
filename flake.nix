@@ -44,6 +44,7 @@
       igloo,
       utils,
       conformist,
+      mephisto,
       ...
     }:
     utils.lib.eachDefaultSystem (
@@ -201,6 +202,19 @@
 
           src = ./.;
           cargoLock.lockFile = ./Cargo.lock;
+
+          # RFC 0007: the controller predictor depends on the private `mephisto`
+          # crate, brought in as the `mephisto` flake input (ssh-fetched at eval;
+          # flake.lock pins the rev). Cargo path-deps `vendor/mephisto/v2-rust`,
+          # which is gitignored (so absent from `src`); populate it from the
+          # input's store path before the build — no network or credentials in
+          # the sandbox. The dev-loop gets the same path via the devShell
+          # shellHook below.
+          postPatch = ''
+            mkdir -p vendor
+            cp -r ${mephisto} vendor/mephisto
+            chmod -R u+w vendor
+          '';
 
           # Each crate's build.rs reads POSH_VERSION from the build env and
           # flows it into the crate (cargo:rustc-env=POSH_VERSION); runtime
@@ -475,6 +489,14 @@
               conformistEval.config.build.preCommit # `conformist-pre-commit`
               conformistEval.config.build.repair # `conformist-repair`
             ];
+          # RFC 0007: the dev-loop's mephisto source. The flake build populates
+          # vendor/mephisto from the store (postPatch above); for `just
+          # debug-cargo`, symlink it to the same pinned flake-input store path so
+          # local builds use the locked rev (not an ambient sibling checkout).
+          shellHook = ''
+            mkdir -p vendor
+            ln -sfn ${mephisto} vendor/mephisto
+          '';
         };
       }
     );
