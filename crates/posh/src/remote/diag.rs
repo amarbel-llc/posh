@@ -107,6 +107,10 @@ pub struct ClientState {
     /// Client apply-path histogram + last received frame (#wedge): a climbing
     /// `basemis` with a frozen `term_gen` is the apply-stall fingerprint.
     pub apply: crate::remote::stats::ApplySnapshot,
+    /// Latest server transport state from CAP_DIAG (#6): the far side of a wedge,
+    /// otherwise un-SIGUSR2-able on a remote server. `None` until the server
+    /// reports (only in a debug posture, when the client advertised CAP_DIAG).
+    pub server_diag: Option<crate::remote::caps::ServerDiag>,
 }
 
 impl ClientState {
@@ -117,7 +121,7 @@ impl ClientState {
              send_interval={}ms bytes_rx={} bytes_tx={} predict(active={} shown={} epoch_lag={}) \
              term_gen={} rows={} cols={} echo_on={} codec={} title={:?} \
              apply(adv={} stale={} dup={} basemis={} bsum_mis={} reack={} nochange={} sb_rx={}) \
-             last_rx(num={} base={} body={})",
+             last_rx(num={} base={} body={}) srv={}",
             std::process::id(),
             fmt_addr(self.remote),
             fmt_age(self.last_send_age_ms),
@@ -151,6 +155,7 @@ impl ClientState {
             self.apply.last_rx_num,
             self.apply.last_rx_base,
             self.apply.last_rx_body.as_str(),
+            fmt_server_diag(self.server_diag.as_ref()),
         )
     }
 
@@ -168,6 +173,21 @@ fn fmt_addr(addr: Option<SocketAddr>) -> String {
 fn fmt_age(age: Option<u64>) -> String {
     age.map(|a| a.to_string())
         .unwrap_or_else(|| "never".to_string())
+}
+
+/// The server-side transport piggyback (#6) for the client dump. `none` until
+/// the server reports; otherwise the far side's frame/ack/outstanding/gen/pty,
+/// to compare against the client's own `applied_num`/`term_gen` at a glance —
+/// e.g. server `num` climbing while client `applied_num` is stuck is a clear
+/// apply-stall, vs. both frozen pointing at the server or the path.
+fn fmt_server_diag(d: Option<&crate::remote::caps::ServerDiag>) -> String {
+    match d {
+        None => "none".to_string(),
+        Some(d) => format!(
+            "(num={} acked={} gen={} out={} pty={})",
+            d.current_num, d.acked_num, d.term_gen, d.outstanding, d.pty_open as u8,
+        ),
+    }
 }
 
 /// The session socket dir, lazily created private (0700) like the session dirs.
@@ -417,6 +437,13 @@ mod tests {
                 last_rx_body: crate::remote::stats::FrameKind::Diff,
                 ..Default::default()
             },
+            server_diag: Some(crate::remote::caps::ServerDiag {
+                current_num: 43,
+                acked_num: 41,
+                term_gen: 90,
+                outstanding: 2,
+                pty_open: true,
+            }),
         }
         .format();
         for key in [
@@ -436,9 +463,41 @@ mod tests {
             "title=\"user@host: ~/work\"",
             "apply(adv=0 stale=0 dup=0 basemis=7 bsum_mis=0 reack=0 nochange=0 sb_rx=0)",
             "last_rx(num=41 base=40 body=diff)",
+            "srv=(num=43 acked=41 gen=90 out=2 pty=1)",
         ] {
             assert!(line.contains(key), "missing {key:?} in:\n{line}");
         }
+    }
+
+    #[test]
+    fn client_format_server_diag_absent_reads_none() {
+        let line = ClientState {
+            remote: None,
+            last_send_age_ms: None,
+            last_heard_age_ms: 0,
+            applied_num: 0,
+            outbox_base: 0,
+            outbox_pending: 0,
+            scrollback_len: 0,
+            srtt: 0.0,
+            rto: 0,
+            send_interval: 0,
+            bytes_rx: 0,
+            bytes_tx: 0,
+            predict_active: false,
+            predict_shown: 0,
+            predict_epoch_lag: 0,
+            term_gen: 0,
+            rows: 24,
+            cols: 80,
+            echo_on: false,
+            codec: "dumpdiff",
+            title: String::new(),
+            apply: crate::remote::stats::ApplySnapshot::default(),
+            server_diag: None,
+        }
+        .format();
+        assert!(line.contains("srv=none"), "{line}");
     }
 
     use crate::remote::stats::FrameKind;

@@ -442,6 +442,15 @@ struct ClientState {
     /// One-shot guard so a wedge writes a single forensic bundle, not one per
     /// retransmit (the reack loop fires constantly); reset when apply advances.
     forensic_captured: bool,
+    /// Whether to advertise CAP_DIAG so the server piggybacks its transport
+    /// state (#6). True only in a debug posture (POSH_DEBUG_LOG or
+    /// POSH_WEDGE_WATCHDOG), so a default session never asks and the server
+    /// pays no per-frame overhead. Computed once from `stats` at startup.
+    want_server_diag: bool,
+    /// Latest server transport state from CAP_DIAG (#6), surfaced in the SIGUSR2
+    /// dump so a wedge shows both sides. `None` until the server first reports
+    /// (only when we advertised CAP_DIAG); never sent on a default session.
+    last_server_diag: Option<caps::ServerDiag>,
     /// SSH agent forwarding (FDR 0004): the local-agent proxy + the
     /// bidirectional agent byte stream, and whether the server has advertised
     /// AGENT_FORWARD yet (gates our own AGENT_DATA/ACK; caps don't persist, so
@@ -476,6 +485,11 @@ fn client_loop(
     // unset/empty/other stays on DumpDiff (today's behavior, default-off).
     let framesync = framesync::FrameSync::parse(std::env::var("POSH_FRAMESYNC").ok().as_deref());
     let applier = framesync.applier();
+    // Request server transport-state piggyback (#6) only in a debug posture, so
+    // a default session never negotiates it. Derive from the same Stats that
+    // owns the POSH_DEBUG_LOG / POSH_WEDGE_WATCHDOG decisions.
+    let stats = Stats::new();
+    let want_server_diag = stats.enabled() || stats.wedge_watchdog();
     let mut st = ClientState {
         conn,
         fragmenter: Fragmenter::new(),
@@ -514,10 +528,12 @@ fn client_loop(
         input_sent: VecDeque::new(),
         framesync,
         applier,
-        stats: Stats::new(),
+        stats,
         palette: None,
         last_reack: None,
         forensic_captured: false,
+        want_server_diag,
+        last_server_diag: None,
         // Agent forwarding (FDR 0004): the proxy forwards the resolved source
         // socket; `None` source == forwarding off this connection. The notice
         // (FDR 0004; #96) rides with the proxy — armed only when forwarding is
@@ -683,6 +699,7 @@ fn drive_client(st: &mut ClientState, raw: &RawMode, port: u16) -> Result<i32> {
                 codec: st.framesync.label(),
                 title: st.server_term.title().to_string(),
                 apply: st.stats.apply_snapshot(),
+                server_diag: st.last_server_diag,
             }
             .dump();
             // Also drop a byte-level forensic bundle if an apply-stall is
@@ -1338,6 +1355,14 @@ fn process_frame(st: &mut ClientState, frame: &ServerFrame) -> bool {
     st.echo_on = frame.flags & sync::FLAG_ECHO != 0;
     // Server debug-logging state for the palette's "Server debug logging" label (#3).
     st.server_log_on = frame.flags & sync::FLAG_SERVER_LOG != 0;
+    // Server transport-state piggyback (#6): record the latest report when present
+    // (only after we advertised CAP_DIAG). Keep the prior value on a malformed or
+    // absent payload — the dump shows the most recent good report.
+    if let Some(cap) = caps::find(&frame.caps, caps::CAP_DIAG) {
+        if let Ok(d) = caps::decode_server_diag(&cap.payload) {
+            st.last_server_diag = Some(d);
+        }
+    }
     // The escape-to-shell overlay is up (FDR 0008): the request was honored, so
     // drop the "opening shell…" notice (the request flag is already one-shot).
     if frame.flags & sync::FLAG_OVERLAY != 0 && st.notify.message() == "opening shell\u{2026}" {
@@ -1781,6 +1806,14 @@ fn outgoing_caps(st: &mut ClientState) -> Vec<caps::Cap> {
     if st.framesync.advertises_morph() {
         extra.push(caps::Cap {
             id: caps::CAP_MORPH,
+            payload: vec![],
+        });
+    }
+    // Server transport-state piggyback (#6): ask the server to attach its live
+    // transport state only in a debug posture, so a default session is unchanged.
+    if st.want_server_diag {
+        extra.push(caps::Cap {
+            id: caps::CAP_DIAG,
             payload: vec![],
         });
     }
@@ -2398,6 +2431,8 @@ mod tests {
             palette: None,
             last_reack: None,
             forensic_captured: false,
+            want_server_diag: false,
+            last_server_diag: None,
             agent: None,
             agent_stream: sync::AgentStream::new(),
             agent_seen: false,

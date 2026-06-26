@@ -124,7 +124,15 @@ _POSH_WEDGE_WATCHDOG_
 	sink: peer (server) address, last-send age, applied frame number,
 	input-outbox base and pending bytes, accumulated scrollback depth,
 	smoothed RTT/RTO and send interval, byte counters, prediction gauges,
-	terminal size, and the remote echo state. Written to _$POSH_DEBUG_LOG_
+	terminal size, and the remote echo state. In a debug posture
+	(_POSH_DEBUG_LOG_ or _POSH_WEDGE_WATCHDOG_ set) the client also requests
+	the server's own transport state, which then rides each frame and appears
+	as a trailing _srv=_ field — the server's frame number, ack, frames
+	outstanding, terminal generation, and pty-open flag. This is the far side
+	of a wedge that a remote *posh-server*(1) cannot be *SIGUSR2*'d for
+	directly: server _num_ climbing while the client's _applied_num_ is frozen
+	is an apply-stall, both frozen points at the server or the path. Written
+	to _$POSH_DEBUG_LOG_
 	when set, otherwise to a per-pid default file
 	_<rundir>/posh-client-<pid>.log_ (the same _<rundir>_ resolution as
 	*posh-server*(1)). The dump always goes to a file, never the terminal,

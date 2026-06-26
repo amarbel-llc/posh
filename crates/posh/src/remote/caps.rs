@@ -77,6 +77,20 @@ pub const AGENT_DATA_MAX: usize = u8::MAX as usize - 8; // 247
 #[allow(dead_code)]
 pub const MAX_AGENT_DATA_CAPS: usize = 239;
 
+/// Server transport-state piggyback (#6, diagnostic). Experimental id (224, the
+/// bottom of RFC 0001's 224..=255 experimental range) rather than a registered
+/// low id: this is a debug-only, off-by-default aid whose payload layout may
+/// change, so it intentionally avoids the stable registry. Client entry (empty
+/// payload): "attach your live transport state to each frame so my SIGUSR2 dump
+/// can show both sides of a wedge." A remote `posh-server` has no local socket
+/// to `SIGUSR2`, so its `current_num`/`acked_num`/`outstanding`/`term_gen`/
+/// `pty_open` are otherwise a blind spot when triaging a stall from the client.
+/// The client advertises this only in a debug posture (POSH_DEBUG_LOG or
+/// POSH_WEDGE_WATCHDOG), so a default session never negotiates it and pays no
+/// per-frame overhead. Server entry: a [`ServerDiag`] payload (see
+/// [`encode_server_diag`]).
+pub const CAP_DIAG: u8 = 224;
+
 /// The post-table format version we implement (payload of
 /// [`CAP_PROTOCOL_VERSION`]).
 pub const PROTOCOL_VERSION: u8 = 1;
@@ -214,6 +228,59 @@ pub fn decode_agent_ack(payload: &[u8]) -> Result<u64> {
         .try_into()
         .map_err(|_| Error::from("AGENT_ACK payload is not a u64"))?;
     Ok(u64::from_be_bytes(bytes))
+}
+
+// ---------------------------------------------------------------------------
+// Server transport-state piggyback (#6). The server's live frame/ack/pty state
+// rides one CAP_DIAG entry per frame so the client's SIGUSR2 dump can show the
+// far side of a wedge it cannot SIGUSR2 directly. A plain fixed-layout payload
+// (no length-prefixed chunking like agent data) — it is always one entry.
+
+/// The server transport state the client mirrors into its dump (#6). These are
+/// exactly the fields the server's own SIGUSR2 dump reports that the client
+/// cannot otherwise see: is the server still producing frames (`current_num`
+/// advancing), what does it think we have acked (`acked_num`), how many frames
+/// are in flight / being retransmitted (`outstanding`), is its terminal still
+/// changing (`term_gen`), and is the shell still alive (`pty_open`).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct ServerDiag {
+    pub current_num: u64,
+    pub acked_num: u64,
+    pub term_gen: u64,
+    pub outstanding: u32,
+    pub pty_open: bool,
+}
+
+/// Fixed 29-byte payload: current_num | acked_num | term_gen (u64 BE each) |
+/// outstanding (u32 BE) | pty_open (u8). Well under the 255-byte cap budget.
+pub fn encode_server_diag(d: &ServerDiag) -> Cap {
+    let mut payload = Vec::with_capacity(29);
+    payload.extend_from_slice(&d.current_num.to_be_bytes());
+    payload.extend_from_slice(&d.acked_num.to_be_bytes());
+    payload.extend_from_slice(&d.term_gen.to_be_bytes());
+    payload.extend_from_slice(&d.outstanding.to_be_bytes());
+    payload.push(d.pty_open as u8);
+    Cap {
+        id: CAP_DIAG,
+        payload,
+    }
+}
+
+/// Reads a [`ServerDiag`] payload. A wrong-length payload is malformed (the
+/// peer is authenticated, so this is corruption or a version skew, not an
+/// attack to absorb) and is dropped by the diagnostic consumer.
+pub fn decode_server_diag(payload: &[u8]) -> Result<ServerDiag> {
+    if payload.len() != 29 {
+        return Err(Error::from("CAP_DIAG payload is not 29 bytes"));
+    }
+    let u64_at = |o: usize| u64::from_be_bytes(payload[o..o + 8].try_into().unwrap());
+    Ok(ServerDiag {
+        current_num: u64_at(0),
+        acked_num: u64_at(8),
+        term_gen: u64_at(16),
+        outstanding: u32::from_be_bytes(payload[24..28].try_into().unwrap()),
+        pty_open: payload[28] != 0,
+    })
 }
 
 #[cfg(test)]
@@ -377,6 +444,62 @@ mod tests {
         let (second_off, _) = decode_agent_data(&datas[1].payload).unwrap();
         assert_eq!(first_off, 0);
         assert_eq!(second_off, AGENT_DATA_MAX as u64);
+    }
+
+    #[test]
+    fn server_diag_roundtrips() {
+        let d = ServerDiag {
+            current_num: 0xdead_beef,
+            acked_num: 0xdead_beed,
+            term_gen: 9_001,
+            outstanding: 3,
+            pty_open: true,
+        };
+        let cap = encode_server_diag(&d);
+        assert_eq!(cap.id, CAP_DIAG);
+        assert_eq!(cap.payload.len(), 29);
+        assert_eq!(decode_server_diag(&cap.payload).unwrap(), d);
+    }
+
+    #[test]
+    fn server_diag_pty_closed_roundtrips() {
+        let d = ServerDiag {
+            current_num: 1,
+            acked_num: 1,
+            term_gen: 0,
+            outstanding: 0,
+            pty_open: false,
+        };
+        let got = decode_server_diag(&encode_server_diag(&d).payload).unwrap();
+        assert!(!got.pty_open);
+        assert_eq!(got, d);
+    }
+
+    #[test]
+    fn server_diag_rejects_wrong_length() {
+        assert!(decode_server_diag(&[]).is_err());
+        assert!(decode_server_diag(&[0; 28]).is_err()); // one short
+        assert!(decode_server_diag(&[0; 30]).is_err()); // one long
+    }
+
+    #[test]
+    fn server_diag_survives_table_roundtrip_with_trailing_body() {
+        // It rides the ordinary caps table beside other entries, ahead of the
+        // frame body, and parses back intact (experimental id, preserved).
+        let d = ServerDiag {
+            current_num: 42,
+            acked_num: 40,
+            term_gen: 100,
+            outstanding: 2,
+            pty_open: true,
+        };
+        let table = own_table(&[encode_server_diag(&d)]);
+        let mut bytes = encode_table(&table);
+        bytes.extend_from_slice(b"BODY");
+        let (got, used) = decode_table(&bytes).unwrap();
+        assert_eq!(&bytes[used..], b"BODY");
+        let cap = find(&got, CAP_DIAG).unwrap();
+        assert_eq!(decode_server_diag(&cap.payload).unwrap(), d);
     }
 
     #[test]

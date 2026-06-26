@@ -237,6 +237,10 @@ pub(crate) fn server_loop(
     // each visible Diff/Morph with a checksum of its diff base, so the client can
     // detect a divergent base and resync instead of mis-applying it (#94).
     let mut peer_wants_base_sum = false;
+    // Server transport-state piggyback (#6, diagnostic): when the peer advertises
+    // CAP_DIAG (only in its debug posture) we attach our live frame/ack/pty state
+    // to each frame so its SIGUSR2 dump can show the far side of a wedge.
+    let mut peer_wants_diag = false;
     let mut dumpdiff_enc = DumpDiff;
     let mut morph_enc = MorphDelta::default();
 
@@ -640,6 +644,8 @@ pub(crate) fn server_loop(
                         peer_wants_morph = caps::find(&msg.caps, caps::CAP_MORPH).is_some();
                         peer_wants_base_sum =
                             caps::find(&msg.caps, caps::CAP_BASE_SUM).is_some();
+                        // CAP_DIAG (#6): per-message, like the others.
+                        peer_wants_diag = caps::find(&msg.caps, caps::CAP_DIAG).is_some();
                     }
                     Ok(None) => continue,
                     Err(e) if e.kind() == std::io::ErrorKind::WouldBlock => break,
@@ -924,6 +930,20 @@ pub(crate) fn server_loop(
                         id: caps::CAP_SCROLLBACK,
                         payload: vec![],
                     });
+                }
+                // Server transport-state piggyback (#6): mirror exactly the
+                // fields our own SIGUSR2 dump reports, so a client triaging a
+                // wedge sees whether the server is still producing frames,
+                // what it thinks is acked, how many are outstanding, whether
+                // its terminal is changing, and whether the shell is alive.
+                if peer_wants_diag {
+                    extras.push(caps::encode_server_diag(&caps::ServerDiag {
+                        current_num: current.num,
+                        acked_num,
+                        term_gen: term.generation(),
+                        outstanding: outstanding.len() as u32,
+                        pty_open,
+                    }));
                 }
                 if shutdown && peer_wants_exit {
                     if let Some(code) = exit_status {
