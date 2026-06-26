@@ -56,6 +56,18 @@
         };
         inherit (pkgs) lib;
 
+        # RFC 0007: both rust derivations (.#posh and the mosh-ffi check) build
+        # with src = ./. and load the whole workspace manifest — which includes
+        # crates/posh's path-dep on the private `mephisto` crate. vendor/mephisto
+        # is gitignored (absent from src), so populate it from the `mephisto`
+        # flake input's store path before cargo runs (no network/creds in the
+        # sandbox). Shared so the two derivations can't drift. See docs/rfcs/0007.
+        mephistoVendorPostPatch = ''
+          mkdir -p vendor
+          cp -r ${mephisto} vendor/mephisto
+          chmod -R u+w vendor
+        '';
+
         # posh's single source of truth: version.env at the repo root
         # (POSH_VERSION). Read here for the derivation `version` attr and
         # passed into the build env so each crate's build.rs flows it into
@@ -203,18 +215,10 @@
           src = ./.;
           cargoLock.lockFile = ./Cargo.lock;
 
-          # RFC 0007: the controller predictor depends on the private `mephisto`
-          # crate, brought in as the `mephisto` flake input (ssh-fetched at eval;
-          # flake.lock pins the rev). Cargo path-deps `vendor/mephisto/v2-rust`,
-          # which is gitignored (so absent from `src`); populate it from the
-          # input's store path before the build — no network or credentials in
-          # the sandbox. The dev-loop gets the same path via the devShell
-          # shellHook below.
-          postPatch = ''
-            mkdir -p vendor
-            cp -r ${mephisto} vendor/mephisto
-            chmod -R u+w vendor
-          '';
+          # RFC 0007: vendor the private mephisto crate from the flake input
+          # before cargo runs (shared with the mosh-ffi check). The dev-loop gets
+          # the same path via the devShell shellHook below.
+          postPatch = mephistoVendorPostPatch;
 
           # Each crate's build.rs reads POSH_VERSION from the build env and
           # flows it into the crate (cargo:rustc-env=POSH_VERSION); runtime
@@ -455,6 +459,11 @@
             version = poshVersion;
             src = ./.;
             cargoLock.lockFile = ./Cargo.lock;
+            # RFC 0007: crates/posh (a workspace member this build loads even
+            # though it only compiles -p mosh-ffi) path-deps the private mephisto
+            # crate, so vendor it the same way .#posh does or the workspace
+            # manifest fails to load in the sandbox.
+            postPatch = mephistoVendorPostPatch;
             cargoBuildFlags = [
               "-p"
               "mosh-ffi"
