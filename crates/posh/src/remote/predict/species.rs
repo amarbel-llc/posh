@@ -64,6 +64,23 @@ impl PolicyKnobs {
             ..self
         }
     }
+
+    /// Coerce a controller genome's four root outputs into [`PolicyKnobs`]
+    /// (RFC 0007 §4.1). The tuple-of-4 root order is fixed posh-side:
+    /// `[show, flag, confirm_gate_ms, suppress_on_ambiguity]`. Booleans
+    /// threshold at 0; `confirm_gate_ms` is the raw value clamped. A `NaN` root
+    /// (an input terminal was unavailable) decays to the safe default for that
+    /// knob rather than propagating: don't-show/don't-flag/no-gate/no-suppress.
+    pub fn from_roots(roots: [f64; 4]) -> PolicyKnobs {
+        let [show, flag, gate, suppress] = roots;
+        PolicyKnobs {
+            show: show > 0.0,
+            flag: flag > 0.0,
+            confirm_gate_ms: if gate.is_nan() { 0.0 } else { gate },
+            suppress_on_ambiguity: suppress > 0.0,
+        }
+        .clamped()
+    }
 }
 
 /// RFC 0007 §4.1 controller seam: an evolved program mapping the metric vector
@@ -191,6 +208,19 @@ mod tests {
         }
         .clamped();
         assert_eq!(k.confirm_gate_ms, 5000.0);
+    }
+
+    #[test]
+    fn policy_knobs_from_roots_thresholds_clamps_and_handles_nan() {
+        let k = PolicyKnobs::from_roots([1.0, -1.0, 9999.0, 0.5]);
+        assert!(k.show);
+        assert!(!k.flag);
+        assert_eq!(k.confirm_gate_ms, 5000.0);
+        assert!(k.suppress_on_ambiguity);
+        // NaN gate decays to 0; NaN booleans (> 0.0 is false for NaN) stay off.
+        let n = PolicyKnobs::from_roots([f64::NAN, f64::NAN, f64::NAN, f64::NAN]);
+        assert!(!n.show);
+        assert_eq!(n.confirm_gate_ms, 0.0);
     }
 
     #[test]
