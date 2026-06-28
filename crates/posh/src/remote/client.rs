@@ -112,6 +112,11 @@ fn palette_commands(server_log_on: bool) -> Value {
         { "name": "Echo: optimistic", "action": { "method": "echo.set", "params": { "model": "optimistic" } } },
         { "name": "Echo: always", "action": { "method": "echo.set", "params": { "model": "always" } } },
         { "name": "Echo: never", "action": { "method": "echo.set", "params": { "model": "never" } } },
+        // RFC 0007 evolved-predictor pilot: select `controller` to turn the GP
+        // predictor on (it falls back to the adaptive shadow until it earns the
+        // display, §7.1); pick any other Echo entry to turn it back off.
+        { "name": "Echo: controller (evolved GP)", "action": { "method": "echo.set", "params": { "model": "controller" } } },
+        { "name": "Echo: from-scratch (evolved GP)", "action": { "method": "echo.set", "params": { "model": "scratch" } } },
         { "name": client_log_name, "action": { "method": "logging.set", "params": { "enabled": client_log_enabled } } },
         { "name": server_log_name, "action": { "method": "logging.set", "params": { "scope": "server", "enabled": server_log_enabled } } },
         { "name": "Shell out (server)", "action": { "method": "shell.open" } },
@@ -2454,7 +2459,11 @@ mod tests {
             names.iter().any(|n| n.to_lowercase().contains("wedge debug info")),
             "debug-info command missing: {names:?}"
         );
-        assert_eq!(arr.len(), 12, "expected 12 commands, got {names:?}");
+        assert!(
+            names.iter().any(|n| n.to_lowercase().contains("controller (evolved")),
+            "evolved controller command missing: {names:?}"
+        );
+        assert_eq!(arr.len(), 14, "expected 14 commands, got {names:?}");
     }
 
     #[test]

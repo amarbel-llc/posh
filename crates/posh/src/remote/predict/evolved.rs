@@ -17,9 +17,12 @@
 // fitness exist and are tested now. Allow until the loop consumes them.
 #![allow(dead_code)]
 
+use std::path::PathBuf;
+
 use mephisto::arena::NodeId;
 use mephisto::domain::{evaluate_population, initial_population, step, Domain, LoopConfig};
 use mephisto::genome::{AlphabetWeights, MutParams, MutationWeights};
+use mephisto::persist::{load_population, save_population};
 use mephisto::rng::Rng;
 use mephisto::tuple::TupleBreeder;
 
@@ -217,6 +220,21 @@ fn loop_config() -> LoopConfig {
     }
 }
 
+/// Where the controller population persists across sessions (RFC 0007 §8):
+/// `$XDG_STATE_HOME/posh/controller-population.hyph`, falling back to
+/// `~/.local/state/...`. `None` when neither env var is set.
+fn population_path() -> Option<PathBuf> {
+    // Tests construct ControllerPredictors freely; never let their load/Drop
+    // touch the user's real state dir. The persist logic is covered directly.
+    if cfg!(test) {
+        return None;
+    }
+    let base = std::env::var_os("XDG_STATE_HOME")
+        .map(PathBuf::from)
+        .or_else(|| std::env::var_os("HOME").map(|h| PathBuf::from(h).join(".local/state")))?;
+    Some(base.join("posh").join("controller-population.hyph"))
+}
+
 /// RFC 0007 §4.1 live controller: an evolved GP population whose champion's
 /// [`PolicyKnobs`] gate a swappable base echo — optimistic by default, adaptive
 /// via `POSH_PREDICTION_CONTROLLER_ECHO=adaptive` for A/B. Each server frame it
@@ -267,7 +285,24 @@ impl ControllerPredictor {
         let cfg = loop_config();
         // Fixed seed: reproducible evolution (the A/B the FDR requires).
         let mut rng = Rng::new(0x05f7_0007);
-        let population = initial_population(&mut domain, &cfg, &mut rng);
+        // Seed from the persisted population if its schema still matches the
+        // current leaf set (RFC 0007 §8); otherwise cold-start. A mismatch means
+        // the metric vector changed, so old genomes' leaf indices are stale.
+        let loaded = population_path()
+            .and_then(|p| std::fs::read(p).ok())
+            .and_then(|bytes| {
+                let l = load_population(&mut domain, &bytes).ok()?;
+                (l.schema == CONTROLLER_SCHEMA && !l.genomes.is_empty()).then_some(l.genomes)
+            });
+        let mut population = match loaded {
+            Some(p) => p,
+            None => initial_population(&mut domain, &cfg, &mut rng),
+        };
+        // Normalize to the configured population size (a persisted blob may differ).
+        while population.len() < cfg.population {
+            population.push(domain.random(&mut rng));
+        }
+        population.truncate(cfg.population.max(1));
         let champion = population[0].clone();
         ControllerPredictor {
             domain,
@@ -337,6 +372,26 @@ impl ControllerPredictor {
 impl Default for ControllerPredictor {
     fn default() -> ControllerPredictor {
         ControllerPredictor::new(false)
+    }
+}
+
+impl Drop for ControllerPredictor {
+    /// Best-effort persist on graceful exit / model switch (RFC 0007 §8): the
+    /// next session seeds from it (schema-guarded). Errors are swallowed — a
+    /// failed save just costs the accumulated evolution, never the session.
+    fn drop(&mut self) {
+        let Some(path) = population_path() else {
+            return;
+        };
+        if let Some(dir) = path.parent() {
+            let _ = std::fs::create_dir_all(dir);
+        }
+        let blob = save_population(&self.domain, CONTROLLER_SCHEMA, &self.population);
+        // Write a temp then rename so a crash mid-write can't truncate the blob.
+        let tmp = path.with_extension("hyph.tmp");
+        if std::fs::write(&tmp, &blob).is_ok() {
+            let _ = std::fs::rename(&tmp, &path);
+        }
     }
 }
 
@@ -470,5 +525,24 @@ mod tests {
         c.on_user_byte(b'x', &fb, 1000);
         c.on_server_frame(1, 0, 50);
         assert!(!c.display_champion, "immature champion stays on the shadow floor");
+    }
+
+    #[test]
+    fn population_persists_and_the_schema_guard_detects_a_mismatch() {
+        let mut dom = ControllerDomain::new();
+        let cfg = loop_config();
+        let mut rng = Rng::new(3);
+        let pop = initial_population(&mut dom, &cfg, &mut rng);
+
+        let blob = save_population(&dom, CONTROLLER_SCHEMA, &pop);
+        let loaded = load_population(&mut dom, &blob).expect("loads a well-formed blob");
+        assert_eq!(loaded.schema, CONTROLLER_SCHEMA);
+        assert_eq!(loaded.genomes.len(), pop.len());
+
+        // RFC 0007 §8: a blob saved under a different schema is recognized as
+        // such (the caller cold-starts instead of feeding stale leaf wiring).
+        let stale = save_population(&dom, "mephisto-population-controller-schema_v999", &pop);
+        let l2 = load_population(&mut dom, &stale).expect("loads");
+        assert_ne!(l2.schema, CONTROLLER_SCHEMA);
     }
 }
