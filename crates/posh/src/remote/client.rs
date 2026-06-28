@@ -209,19 +209,20 @@ fn wedge_debug_summary(st: &ClientState, now: u64) -> String {
     )
 }
 
-/// One-line client-side SSH agent-forwarding diagnostic (FDR 0004): whether
-/// forwarding is configured + the local agent socket, whether the peer
-/// advertised `CAP_AGENT_FORWARD` (the "is the server forwarding at all?"
-/// signal — `no` here is the most common misconfig), the live forwarded-channel
-/// count, and the agent byte-stream offsets (`out_base` / unacked `pending` /
-/// `in_ack`). A growing `pending` with a stuck `in_ack` means the peer is not
-/// consuming the stream. Backs the palette `session.agentinfo` action; the
-/// remote endpoint's own channel state is a follow-up (it needs forwarding).
+/// Two-line SSH agent-forwarding diagnostic (FDR 0004). The client line: whether
+/// forwarding is configured + the local agent socket, whether the peer advertised
+/// `CAP_AGENT_FORWARD` (the "is the server forwarding at all?" signal — `no` here
+/// is the most common misconfig), the live forwarded-channel count, and the agent
+/// byte-stream offsets (`out_base` / unacked `pending` / `in_ack`; a growing
+/// `pending` with a stuck `in_ack` means the peer is not consuming the stream).
+/// The server line: the remote `AgentEndpoint`'s own channel count, next
+/// channel id, and well-known-symlink health, forwarded over `CAP_DIAG`. Backs the
+/// palette `session.agentinfo` action.
 fn agent_debug_summary(st: &ClientState) -> String {
     let Some(agent) = st.agent.as_ref() else {
         return "agent-fwd: off (no local SSH agent, or disabled by policy)".to_string();
     };
-    format!(
+    let client = format!(
         "agent-fwd: on sock={} peer-advertised={} channels={} out_base={} pending={}B in_ack={}",
         agent.source().display(),
         if st.agent_seen { "yes" } else { "no" },
@@ -229,7 +230,23 @@ fn agent_debug_summary(st: &ClientState) -> String {
         st.agent_stream.send_base(),
         st.agent_stream.pending().len(),
         st.agent_stream.recv_ack(),
-    )
+    );
+    // The server endpoint's own state, forwarded over CAP_DIAG (FDR 0004).
+    // Absent until the first diag frame arrives; `agent: None` means the
+    // server is not forwarding (or predates this extension).
+    let server = match st.last_server_diag.and_then(|d| d.agent) {
+        Some(a) => format!(
+            "server: endpoint=up channels={} next_chan={} symlink={}",
+            a.live_channels,
+            a.next_channel_id,
+            if a.symlink_ok { "ok" } else { "broken" },
+        ),
+        None if st.last_server_diag.is_some() => {
+            "server: endpoint=down (no server-side forwarding, or an older server)".to_string()
+        }
+        None => "server: (state not yet received)".to_string(),
+    };
+    format!("{client}\n{server}")
 }
 
 /// Dispatch a palette-selected command action (RFC 0005 §7). Returns whether the
@@ -1960,9 +1977,11 @@ fn outgoing_caps(st: &mut ClientState) -> Vec<caps::Cap> {
             payload: vec![],
         });
     }
-    // Server transport-state piggyback (#6): ask the server to attach its live
-    // transport state only in a debug posture, so a default session is unchanged.
-    if st.want_server_diag {
+    // Server transport-state piggyback (#6) + agent-endpoint diag (FDR 0004):
+    // ask the server to attach its live state in a debug posture OR
+    // when agent forwarding is active (so the agent-forwarding palette can show
+    // both ends). A default session — neither — leaves this unsent.
+    if st.want_server_diag || st.agent.is_some() {
         extra.push(caps::Cap {
             id: caps::CAP_DIAG,
             payload: vec![],
@@ -2329,6 +2348,7 @@ mod tests {
             term_gen: 90,
             outstanding: 2,
             pty_open: true,
+            agent: None,
         });
         let line = wedge_debug_summary(&st, 1000);
         assert!(line.contains("applied=41"), "{line}");
@@ -2515,6 +2535,27 @@ mod tests {
         assert!(s.contains("agent-fwd: on"), "summary: {s}");
         assert!(s.contains("peer-advertised=yes"), "summary: {s}");
         assert!(s.contains("/tmp/agent.sock"), "summary: {s}");
+        // Server line present; with no diag received yet it reads "not yet".
+        assert!(s.contains("server: (state not yet received)"), "summary: {s}");
+
+        // Once a server agent-diag arrives, the server line shows that state.
+        st.last_server_diag = Some(caps::ServerDiag {
+            current_num: 5,
+            acked_num: 4,
+            term_gen: 10,
+            outstanding: 1,
+            pty_open: true,
+            agent: Some(caps::AgentDiag {
+                live_channels: 2,
+                next_channel_id: 3,
+                symlink_ok: true,
+            }),
+        });
+        let s = agent_debug_summary(&st);
+        assert!(s.contains("server: endpoint=up"), "summary: {s}");
+        assert!(s.contains("channels=2"), "summary: {s}");
+        assert!(s.contains("next_chan=3"), "summary: {s}");
+        assert!(s.contains("symlink=ok"), "summary: {s}");
     }
 
     #[test]

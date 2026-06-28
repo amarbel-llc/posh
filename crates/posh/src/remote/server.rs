@@ -961,6 +961,9 @@ pub(crate) fn server_loop(
                         term_gen: term.generation(),
                         outstanding: outstanding.len() as u32,
                         pty_open,
+                        // FDR 0004: forward the agent endpoint's state too
+                        // when forwarding is active server-side (None == none).
+                        agent: agent_endpoint.as_ref().map(|ep| ep.diag()),
                     }));
                 }
                 // Evolved-predictor remote metrics (RFC 0007 §3): sample the

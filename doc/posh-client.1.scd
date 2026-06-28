@@ -38,8 +38,8 @@ the host and then launches this client against the reported address.
 	server (FDR 0008, the _POSH_ESCAPE_CMD_ command), reset & resync, dump wedge
 	forensics, show wedge debug info (an on-screen transport-state summary,
 	readable even while the session is frozen, plus a full dump to the
-	diagnostic sink), show agent-forwarding debug info (the client-side
-		SSH agent-forwarding state, FDR 0004), suspend the client, and quit. Type to filter, arrows to
+	diagnostic sink), show agent-forwarding debug info (the
+		SSH agent-forwarding state on both the client and server ends, FDR 0004), suspend the client, and quit. Type to filter, arrows to
 	choose, Enter to run, Esc to
 	dismiss. Rendered by the *posh-palette* helper over a JSON-RPC control
 	channel; the session greys behind it.

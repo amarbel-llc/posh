@@ -443,6 +443,7 @@ mod tests {
                 term_gen: 90,
                 outstanding: 2,
                 pty_open: true,
+                agent: None,
             }),
         }
         .format();

@@ -162,6 +162,29 @@ impl AgentEndpoint {
         }
     }
 
+    /// Whether `agent/sock` currently resolves to *our own* socket — the healthy
+    /// post-`claim_symlink` state. False means another server took it over (a
+    /// roam or takeover), or the link is missing/dangling. (FDR 0004.)
+    fn symlink_points_to_self(&self) -> bool {
+        match std::fs::read_link(&self.well_known) {
+            Ok(target) => self.dir.join(target) == self.own_sock,
+            Err(_) => false,
+        }
+    }
+
+    /// A snapshot of this endpoint's state for the server→client agent-forwarding
+    /// diagnostic (FDR 0004): the live channel count, the next channel id
+    /// to be assigned, and whether we still own the well-known symlink. Rides the
+    /// `CAP_DIAG` `ServerDiag` v2 payload; only built in a debug/agent posture on
+    /// a paced frame stream, so its one `read_link` is not a hot path.
+    pub fn diag(&self) -> crate::remote::caps::AgentDiag {
+        crate::remote::caps::AgentDiag {
+            live_channels: self.live_channel_count() as u32,
+            next_channel_id: self.next_channel_id,
+            symlink_ok: self.symlink_points_to_self(),
+        }
+    }
+
     /// fds to splice into `server_loop`'s poll set: the listener plus every
     /// open channel. The caller records the returned order to map `revents`
     /// back (the listener is always first).

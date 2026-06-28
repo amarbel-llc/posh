@@ -85,10 +85,13 @@ pub const MAX_AGENT_DATA_CAPS: usize = 239;
 /// can show both sides of a wedge." A remote `posh-server` has no local socket
 /// to `SIGUSR2`, so its `current_num`/`acked_num`/`outstanding`/`term_gen`/
 /// `pty_open` are otherwise a blind spot when triaging a stall from the client.
-/// The client advertises this only in a debug posture (POSH_DEBUG_LOG or
-/// POSH_WEDGE_WATCHDOG), so a default session never negotiates it and pays no
+/// The client advertises this in a debug posture (POSH_DEBUG_LOG or
+/// POSH_WEDGE_WATCHDOG) and whenever agent forwarding is active (FDR 0004: to
+/// power the agent-forwarding diagnostic with the server endpoint's state), so a
+/// default session — no debug, no forwarding — never negotiates it and pays no
 /// per-frame overhead. Server entry: a [`ServerDiag`] payload (see
-/// [`encode_server_diag`]).
+/// [`encode_server_diag`]); its v2 form also carries the [`AgentDiag`] endpoint
+/// state.
 pub const CAP_DIAG: u8 = 224;
 
 /// Evolved-predictor metric forwarding (RFC 0007 §3). Experimental id (like
@@ -258,37 +261,69 @@ pub struct ServerDiag {
     pub term_gen: u64,
     pub outstanding: u32,
     pub pty_open: bool,
+    /// The server's agent-forwarding endpoint state (FDR 0004), present
+    /// when the server is forwarding (it has an `AgentEndpoint`). `None` from a
+    /// server with forwarding disabled, or a v1 (transport-only) payload.
+    pub agent: Option<AgentDiag>,
 }
 
-/// Fixed 29-byte payload: current_num | acked_num | term_gen (u64 BE each) |
-/// outstanding (u32 BE) | pty_open (u8). Well under the 255-byte cap budget.
+/// The server `AgentEndpoint` state the client mirrors into its agent-forwarding
+/// diagnostic (FDR 0004): how many channels are live, the next channel
+/// id it will assign, and whether `agent/sock` still points at the server's own
+/// socket (false once a roam/takeover stole it, or if it is missing/dangling).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct AgentDiag {
+    pub live_channels: u32,
+    pub next_channel_id: u32,
+    pub symlink_ok: bool,
+}
+
+/// Versioned by length. v1 (29 bytes): current_num | acked_num | term_gen
+/// (u64 BE each) | outstanding (u32 BE) | pty_open (u8). v2 appends the
+/// [`AgentDiag`] when `d.agent` is `Some`: live_channels | next_channel_id
+/// (u32 BE each) | symlink_ok (u8), for 38 bytes total. Well under the
+/// 255-byte cap budget.
 pub fn encode_server_diag(d: &ServerDiag) -> Cap {
-    let mut payload = Vec::with_capacity(29);
+    let mut payload = Vec::with_capacity(38);
     payload.extend_from_slice(&d.current_num.to_be_bytes());
     payload.extend_from_slice(&d.acked_num.to_be_bytes());
     payload.extend_from_slice(&d.term_gen.to_be_bytes());
     payload.extend_from_slice(&d.outstanding.to_be_bytes());
     payload.push(d.pty_open as u8);
+    if let Some(a) = &d.agent {
+        payload.extend_from_slice(&a.live_channels.to_be_bytes());
+        payload.extend_from_slice(&a.next_channel_id.to_be_bytes());
+        payload.push(a.symlink_ok as u8);
+    }
     Cap {
         id: CAP_DIAG,
         payload,
     }
 }
 
-/// Reads a [`ServerDiag`] payload. A wrong-length payload is malformed (the
-/// peer is authenticated, so this is corruption or a version skew, not an
+/// Reads a [`ServerDiag`] payload. v1 is 29 bytes (transport only); v2 is 38
+/// (transport + [`AgentDiag`]). Any other length is malformed (the peer is
+/// authenticated, so this is corruption or an unknown future version, not an
 /// attack to absorb) and is dropped by the diagnostic consumer.
 pub fn decode_server_diag(payload: &[u8]) -> Result<ServerDiag> {
-    if payload.len() != 29 {
-        return Err(Error::from("CAP_DIAG payload is not 29 bytes"));
+    const V1_LEN: usize = 29;
+    const V2_LEN: usize = 38;
+    if payload.len() != V1_LEN && payload.len() != V2_LEN {
+        return Err(Error::from("CAP_DIAG payload is not 29 or 38 bytes"));
     }
     let u64_at = |o: usize| u64::from_be_bytes(payload[o..o + 8].try_into().unwrap());
+    let agent = (payload.len() == V2_LEN).then(|| AgentDiag {
+        live_channels: u32::from_be_bytes(payload[29..33].try_into().unwrap()),
+        next_channel_id: u32::from_be_bytes(payload[33..37].try_into().unwrap()),
+        symlink_ok: payload[37] != 0,
+    });
     Ok(ServerDiag {
         current_num: u64_at(0),
         acked_num: u64_at(8),
         term_gen: u64_at(16),
         outstanding: u32::from_be_bytes(payload[24..28].try_into().unwrap()),
         pty_open: payload[28] != 0,
+        agent,
     })
 }
 
@@ -525,11 +560,37 @@ mod tests {
             term_gen: 9_001,
             outstanding: 3,
             pty_open: true,
+            agent: None,
         };
         let cap = encode_server_diag(&d);
         assert_eq!(cap.id, CAP_DIAG);
         assert_eq!(cap.payload.len(), 29);
         assert_eq!(decode_server_diag(&cap.payload).unwrap(), d);
+    }
+
+    #[test]
+    fn server_diag_v2_with_agent_roundtrips() {
+        let d = ServerDiag {
+            current_num: 7,
+            acked_num: 6,
+            term_gen: 50,
+            outstanding: 1,
+            pty_open: true,
+            agent: Some(AgentDiag {
+                live_channels: 4,
+                next_channel_id: 9,
+                symlink_ok: true,
+            }),
+        };
+        let cap = encode_server_diag(&d);
+        assert_eq!(cap.payload.len(), 38);
+        assert_eq!(decode_server_diag(&cap.payload).unwrap(), d);
+        // The same diag without agent state encodes as a 29-byte v1 payload and
+        // decodes with `agent = None`.
+        let v1 = ServerDiag { agent: None, ..d };
+        let cap_v1 = encode_server_diag(&v1);
+        assert_eq!(cap_v1.payload.len(), 29);
+        assert!(decode_server_diag(&cap_v1.payload).unwrap().agent.is_none());
     }
 
     #[test]
@@ -540,6 +601,7 @@ mod tests {
             term_gen: 0,
             outstanding: 0,
             pty_open: false,
+            agent: None,
         };
         let got = decode_server_diag(&encode_server_diag(&d).payload).unwrap();
         assert!(!got.pty_open);
@@ -549,8 +611,10 @@ mod tests {
     #[test]
     fn server_diag_rejects_wrong_length() {
         assert!(decode_server_diag(&[]).is_err());
-        assert!(decode_server_diag(&[0; 28]).is_err()); // one short
-        assert!(decode_server_diag(&[0; 30]).is_err()); // one long
+        assert!(decode_server_diag(&[0; 28]).is_err()); // one short of v1
+        assert!(decode_server_diag(&[0; 30]).is_err()); // between v1 and v2
+        assert!(decode_server_diag(&[0; 37]).is_err()); // one short of v2
+        assert!(decode_server_diag(&[0; 39]).is_err()); // one long of v2
     }
 
     #[test]
@@ -563,6 +627,7 @@ mod tests {
             term_gen: 100,
             outstanding: 2,
             pty_open: true,
+            agent: None,
         };
         let table = own_table(&[encode_server_diag(&d)]);
         let mut bytes = encode_table(&table);
