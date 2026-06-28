@@ -194,6 +194,12 @@ impl Domain for ControllerDomain {
 const STEP_EVERY_N_FRAMES: u64 = 32;
 /// Cap on the recent outcome window scored each `evaluate` pass.
 const WINDOW_CAP: usize = 256;
+/// Window samples before the champion is mature enough to be eligible for
+/// display (RFC 0007 §7.1): below this the adaptive shadow always shows.
+const MATURITY_FRAMES: usize = 32;
+/// Sustained frames of champion-good (or -bad) before the §7.1 display flips —
+/// the hysteresis that keeps the displayed predictor from flapping.
+const HYSTERESIS_FRAMES: i32 = 16;
 
 /// Starting LoopConfig for a small live population (mild-willow's suggested
 /// values; tune later). `generations` is unused by `step`.
@@ -235,6 +241,16 @@ pub struct ControllerPredictor {
     frames: u64,
     /// Base outcome counters at the previous frame, to delta the fitness signal.
     last_outcomes: (u64, u64, u64),
+    /// RFC 0007 §7.1 adaptive shadow baseline, run in parallel and scored by the
+    /// same fitness; the display falls back to it whenever the GP champion is
+    /// immature or not net-beneficial, so the user never sees worse than
+    /// `adaptive`.
+    shadow: MoshPredictor,
+    /// Whether the GP champion (vs the shadow) is currently displayed.
+    display_champion: bool,
+    /// Hysteresis counter for the champion-vs-shadow handover, clamped to
+    /// ±[`HYSTERESIS_FRAMES`]; the display flips only at the extremes.
+    champion_streak: i32,
 }
 
 impl ControllerPredictor {
@@ -265,6 +281,10 @@ impl ControllerPredictor {
             echo_safe: false,
             frames: 0,
             last_outcomes: (0, 0, 0),
+            // The §7.1 shadow is always the adaptive model (the floor we must beat).
+            shadow: MoshPredictor::new(PredictionModel::Adaptive, predict_overwrite),
+            display_champion: false,
+            champion_streak: 0,
         }
     }
 
@@ -293,6 +313,20 @@ impl ControllerPredictor {
         if !self.domain.window.is_empty() {
             let scored = evaluate_population(&mut self.domain, &self.population);
             self.champion = scored[0].genome.clone();
+            // §7.1 best-of vs the adaptive shadow: the champion is eligible to
+            // display only once its window is mature AND its fitness is
+            // net-beneficial (rank < 0 means hits outweigh flicker + miss).
+            // Hysteresis keeps the handover from flapping. (v1: a net-benefit
+            // gate; a direct shadow-rank comparison is a follow-up.)
+            let champion_good =
+                self.domain.window.len() >= MATURITY_FRAMES && scored[0].rank < 0.0;
+            self.champion_streak = (self.champion_streak + if champion_good { 1 } else { -1 })
+                .clamp(-HYSTERESIS_FRAMES, HYSTERESIS_FRAMES);
+            if self.champion_streak >= HYSTERESIS_FRAMES {
+                self.display_champion = true;
+            } else if self.champion_streak <= -HYSTERESIS_FRAMES {
+                self.display_champion = false;
+            }
             if self.frames % STEP_EVERY_N_FRAMES == 0 {
                 self.population = step(&mut self.domain, &self.cfg, &mut self.rng, &scored);
             }
@@ -313,51 +347,69 @@ impl Predictor for ControllerPredictor {
 
     fn set_frame_sent(&mut self, offset: u64) {
         self.base.set_frame_sent(offset);
+        self.shadow.set_frame_sent(offset);
     }
 
     fn on_user_byte(&mut self, byte: u8, fb: &Snapshot, now: u64) {
-        // The champion's policy for this keystroke's metric vector.
+        // The champion's policy for this keystroke's metric vector. Both the GP
+        // base and the §7.1 shadow are fed every keystroke so either is ready to
+        // display.
         let knobs = self.domain.knobs(&self.champion, &self.metrics);
         self.show = knobs.show;
         self.base.on_user_byte(byte, fb, now);
+        self.shadow.on_user_byte(byte, fb, now);
     }
 
     fn on_server_frame(&mut self, input_ack: u64, echo_ack: u64, send_interval: u64) {
         self.base.on_server_frame(input_ack, echo_ack, send_interval);
+        self.shadow.on_server_frame(input_ack, echo_ack, send_interval);
         self.tick();
     }
 
     fn set_echo_safe(&mut self, safe: bool) {
         self.echo_safe = safe;
         self.base.set_echo_safe(safe);
+        self.shadow.set_echo_safe(safe);
     }
 
     fn cull(&mut self, fb: &Snapshot, now: u64) {
         self.base.cull(fb, now);
+        self.shadow.cull(fb, now);
     }
 
     fn render(&self, fb: &mut Snapshot, renderer: &dyn PredictionRenderer) {
-        // The champion's `show` knob gates display (RFC 0007 §4.1). The runtime
-        // leak gate is upheld by the base (set_echo_safe drops its overlay).
-        if self.show {
-            self.base.render(fb, renderer);
+        // §7.1 best-of: display the GP champion (gated by its `show` knob, §4.1)
+        // when it has earned it, else the adaptive shadow floor. The runtime leak
+        // gate holds for both (set_echo_safe drops their overlays under ECHO-off).
+        if self.display_champion {
+            if self.show {
+                self.base.render(fb, renderer);
+            }
+        } else {
+            self.shadow.render(fb, renderer);
         }
     }
 
     fn reset(&mut self) {
         self.base.reset();
+        self.shadow.reset();
     }
 
     fn active(&self) -> bool {
-        self.base.active()
+        self.base.active() || self.shadow.active()
     }
 
     fn needs_timer(&self) -> bool {
-        self.base.needs_timer()
+        self.base.needs_timer() || self.shadow.needs_timer()
     }
 
     fn stats(&self) -> PredictorStats {
-        self.base.stats()
+        // Report the currently-displayed predictor's gauges.
+        if self.display_champion {
+            self.base.stats()
+        } else {
+            self.shadow.stats()
+        }
     }
 }
 
@@ -403,5 +455,20 @@ mod tests {
         let g = dom.random(&mut rng);
         let dna = dom.serialize(&g);
         assert_eq!(dom.deserialize(&dna), Some(g));
+    }
+
+    #[test]
+    fn controller_starts_on_the_adaptive_shadow_floor() {
+        // RFC 0007 §7.1: the GP champion never displays until it earns it; an
+        // immature window keeps the adaptive shadow on, and driving a keystroke
+        // + frame must not panic across both base and shadow.
+        let mut c = ControllerPredictor::new(false);
+        assert!(!c.display_champion);
+        let fb = Snapshot::blank(24, 80);
+        c.set_echo_safe(true);
+        c.set_frame_sent(0);
+        c.on_user_byte(b'x', &fb, 1000);
+        c.on_server_frame(1, 0, 50);
+        assert!(!c.display_champion, "immature champion stays on the shadow floor");
     }
 }
