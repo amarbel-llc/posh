@@ -424,10 +424,12 @@ debug-mosh-bless:
     nix develop --command env MOSH_FFI_BLESS=1 cargo test -p mosh-ffi -- --nocapture
 
 # Prove SSH agent forwarding end-to-end (FDR 0004): run the #[ignore]'d agent
-# E2E tests in remote/server.rs — the synthetic byte round-trip AND the REAL
-# ssh-agent test (generate an ephemeral key, load a real ssh-agent, run
-# `ssh-add -l` through the forwarded socket and assert the key round-trips).
-# Needs ssh-keygen/ssh-agent/ssh-add, absent from the hermetic sandbox (hence
+# E2E tests in remote/server.rs, in three layers — the synthetic byte
+# round-trip; the REAL ssh-agent `ssh-add -l` round-trip (in-thread
+# server_loop); and the REAL detached `posh server -A` PROCESS forwarding to an
+# in-process pump client. Each loads a real ssh-agent and asserts the key
+# round-trips through the forwarded socket. Needs the posh binary plus
+# ssh-keygen/ssh-agent/ssh-add, absent from the hermetic sandbox (hence
 # #[ignore]). Debug-only; the hermetic gate is build-rust.
 [group("debug")]
 debug-agent-e2e:

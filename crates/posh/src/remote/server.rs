@@ -2485,4 +2485,170 @@ mod tests {
              (fingerprint {fingerprint}); last stdout: {last:?}"
         );
     }
+
+    // Like the real-ssh-agent test, but the server is the REAL `posh server -A`
+    // BINARY — a detached, double-forked process — instead of an in-thread
+    // server_loop. This proves the actual server CLI path stands up a working
+    // forwarded endpoint: arg parsing, `AgentEndpoint::from_env` reading
+    // POSH_DIR, and the SSH_AUTH_SOCK export. The client stays the in-process
+    // pump: the raw `posh client` carries NO forwarding (main.rs) — that
+    // orchestration lives only in the ssh-bootstrapped `posh host` path, which
+    // needs a real sshd and is covered by the manual walkthrough (FDR 0004,
+    // docs/manual-testing.md), not an automated test. #[ignore]: spawns the
+    // binary + needs ssh tooling; run with `just debug-agent-e2e`.
+    #[test]
+    #[ignore = "real posh-server process E2E; needs the posh binary + ssh tooling; run with --ignored"]
+    fn agent_forward_real_server_process_lists_key() {
+        use std::io::BufRead;
+        use std::os::unix::fs::DirBuilderExt;
+        use std::path::PathBuf;
+        use std::process::{Command, Stdio};
+        use std::sync::atomic::{AtomicBool, Ordering};
+        use std::sync::Arc;
+
+        // The posh binary cargo builds alongside this test: target/<profile>/posh,
+        // the sibling of the unit-test exe in target/<profile>/deps/.
+        let posh_bin = {
+            let exe = std::env::current_exe().expect("current_exe");
+            exe.parent()
+                .and_then(|p| p.parent())
+                .expect("target/<profile> dir")
+                .join("posh")
+        };
+        assert!(
+            posh_bin.exists(),
+            "posh binary not found at {posh_bin:?} (cargo test should have built it)"
+        );
+
+        let base = PathBuf::from(format!("/tmp/posh-srvproc-{}", std::process::id()));
+        std::fs::remove_dir_all(&base).ok();
+        std::fs::DirBuilder::new()
+            .recursive(true)
+            .mode(0o700)
+            .create(&base)
+            .unwrap();
+
+        // (1) An ephemeral key in a real ssh-agent — the LOCAL agent the pump
+        // proxies (the client side of forwarding).
+        let key_path = base.join("id_ed25519");
+        assert!(
+            Command::new("ssh-keygen")
+                .args(["-t", "ed25519", "-N", "", "-C", "posh-srvproc-e2e", "-q", "-f"])
+                .arg(&key_path)
+                .status()
+                .expect("run ssh-keygen")
+                .success(),
+            "ssh-keygen failed"
+        );
+        let fp_out = Command::new("ssh-keygen")
+            .arg("-lf")
+            .arg(key_path.with_extension("pub"))
+            .output()
+            .expect("run ssh-keygen -lf");
+        let fp_text = String::from_utf8_lossy(&fp_out.stdout);
+        let fingerprint = fp_text
+            .split_whitespace()
+            .find(|t| t.starts_with("SHA256:"))
+            .expect("a SHA256 fingerprint")
+            .to_string();
+        let local_agent_sock = base.join("local-agent.sock");
+        let mut agent = Command::new("ssh-agent")
+            .arg("-D")
+            .arg("-a")
+            .arg(&local_agent_sock)
+            .stdout(Stdio::null())
+            .stderr(Stdio::null())
+            .spawn()
+            .expect("spawn ssh-agent");
+        let deadline = now_ms() + 5_000;
+        while !local_agent_sock.exists() {
+            assert!(now_ms() < deadline, "ssh-agent never bound its socket");
+            std::thread::sleep(std::time::Duration::from_millis(20));
+        }
+        assert!(
+            Command::new("ssh-add")
+                .arg(&key_path)
+                .env("SSH_AUTH_SOCK", &local_agent_sock)
+                .status()
+                .expect("run ssh-add")
+                .success(),
+            "ssh-add failed to load the key into the local agent"
+        );
+
+        // (2) The REAL `posh server -A` binary. POSH_DIR fixes the forwarded
+        // agent/sock path; it prints `POSH CONNECT <port> <key>` then double-forks
+        // into a detached server (which inherits the bound UDP socket + the env).
+        let server_dir = base.join("srv");
+        std::fs::DirBuilder::new()
+            .recursive(true)
+            .mode(0o700)
+            .create(&server_dir)
+            .unwrap();
+        let mut server = Command::new(&posh_bin)
+            .args(["server", "-p", "62400:62499", "-A", "--", "sleep", "600"])
+            .env("LC_ALL", "C.UTF-8")
+            .env("POSH_DIR", &server_dir)
+            // The detached server is double-forked (unreapable here); it
+            // self-terminates this long after the pump stops sending.
+            .env("POSH_SERVER_NETWORK_TMOUT", "10")
+            .stdout(Stdio::piped())
+            .stderr(Stdio::null())
+            .spawn()
+            .expect("spawn posh server");
+        let connect = std::io::BufReader::new(server.stdout.take().expect("server stdout piped"))
+            .lines()
+            .map_while(|line| line.ok())
+            .find(|l| l.starts_with("POSH CONNECT "))
+            .expect("posh server printed POSH CONNECT");
+        let _ = server.wait(); // the parent exits right after the double-fork
+        let mut fields = connect
+            .strip_prefix("POSH CONNECT ")
+            .expect("POSH CONNECT prefix")
+            .split_whitespace();
+        let port: u16 = fields.next().expect("port").parse().expect("port number");
+        let key = Key::from_base64(fields.next().expect("key")).expect("valid base64 key");
+
+        // (3) The in-process pump as the client, proxying the real ssh-agent.
+        let done = Arc::new(AtomicBool::new(false));
+        let client = {
+            let done = done.clone();
+            let source = local_agent_sock.clone();
+            std::thread::spawn(move || pump_agent_forward_client(key, port, source, done))
+        };
+
+        // (4) `ssh-add -l` against the forwarded socket must list the key.
+        let forwarded_sock = server_dir.join("agent").join("sock");
+        let deadline = now_ms() + 15_000;
+        let mut last = String::new();
+        let mut listed = false;
+        while now_ms() < deadline {
+            let out = Command::new("timeout")
+                .arg("4")
+                .arg("ssh-add")
+                .arg("-l")
+                .env("SSH_AUTH_SOCK", &forwarded_sock)
+                .output()
+                .expect("run ssh-add -l");
+            last = String::from_utf8_lossy(&out.stdout).into_owned();
+            if out.status.success() && last.contains(&fingerprint) {
+                listed = true;
+                break;
+            }
+            std::thread::sleep(std::time::Duration::from_millis(150));
+        }
+
+        // (5) Teardown. The detached server is not directly reapable (double-fork);
+        // it self-terminates on POSH_SERVER_NETWORK_TMOUT once the pump stops.
+        done.store(true, Ordering::Relaxed);
+        let _ = client.join();
+        let _ = agent.kill();
+        let _ = agent.wait();
+        std::fs::remove_dir_all(&base).ok();
+
+        assert!(
+            listed,
+            "ssh-add -l via the real-server-process forwarded socket never listed \
+             the key (fingerprint {fingerprint}); last stdout: {last:?}"
+        );
+    }
 }
