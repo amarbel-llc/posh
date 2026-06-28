@@ -94,8 +94,10 @@ the `eng-*(7)` manpages — read them with `man eng-versioning`,
   `conformistEval.config.build.{preCommit,repair}` (the module derives both from
   one `mkHookWrapper` body), each baking its own `/nix/store` config — so they
   format with the same pinned toolchain as `nix fmt`, never silent-skipping a
-  file type the ambient PATH lacks. The impure git-state lane (agents-md, git-remotes, sweatfile, …) runs
-  via `just lint-worktree`. The sweatfile wires the spinclass hooks: `pre-commit`
+  file type the ambient PATH lacks. The impure git-state lane (agents-md, git-remotes, sweatfile, clippy, …) runs
+  via `just lint-worktree`; the clippy linter (conformist#69, opt-in, enabled in
+  `conformistImpureEval`) is posh's workspace `cargo clippy --all-targets -- -D warnings`
+  gate. The sweatfile wires the spinclass hooks: `pre-commit`
   (`conformist-pre-commit`, format at authoring time) and `repair`
   (`conformist-repair`, fold fixes in before the pre-merge verify gate); both
   live on the devShell PATH, and a fresh `sc start`/`sc resume` installs the

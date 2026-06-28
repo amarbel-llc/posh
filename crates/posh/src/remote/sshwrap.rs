@@ -240,13 +240,12 @@ mod tests {
     #[test]
     fn server_report_prefers_posh_ip() {
         let mut report = ServerReport::default();
-        assert_eq!(report.feed("Welcome to examplehost!").unwrap(), false);
-        assert_eq!(report.feed("POSH IP 192.0.2.7").unwrap(), false);
-        assert_eq!(
+        assert!(!report.feed("Welcome to examplehost!").unwrap());
+        assert!(!report.feed("POSH IP 192.0.2.7").unwrap());
+        assert!(
             report
                 .feed("POSH CONNECT 60001 AAAAAAAAAAAAAAAAAAAAAA")
-                .unwrap(),
-            true
+                .unwrap()
         );
         assert_eq!(report.ip.as_deref(), Some("192.0.2.7"));
         assert_eq!(report.port, Some(60001));

@@ -67,8 +67,8 @@ pub const CAP_AGENT_ACK: u8 = 8;
 pub const AGENT_DATA_MAX: usize = u8::MAX as usize - 8; // 247
 
 /// Max [`CAP_AGENT_DATA`] entries one message carries. The table length is a
-/// `count: u8`, so the whole table (agent data + protocol version + scrollback
-/// + any other caps) must stay under 256 entries; emitting the entire unacked
+/// `count: u8`, so the whole table (agent data + protocol version + scrollback +
+/// any other caps) must stay under 256 entries; emitting the entire unacked
 /// agent tail unbounded would overflow that count and silently corrupt the
 /// frame. We cap agent data well below 255 to leave headroom for the handful
 /// of non-agent caps, bounding one message at ~`MAX_AGENT_DATA_CAPS *

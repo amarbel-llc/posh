@@ -398,9 +398,9 @@ impl Terminal {
             let orphaned = match width {
                 2 => {
                     c + 1 >= cols
-                        || !self.scr().cell(row, c + 1).is_some_and(|x| x.width == 0)
+                        || self.scr().cell(row, c + 1).is_none_or(|x| x.width != 0)
                 }
-                0 => c == 0 || !self.scr().cell(row, c - 1).is_some_and(|x| x.width == 2),
+                0 => c == 0 || self.scr().cell(row, c - 1).is_none_or(|x| x.width != 2),
                 _ => false,
             };
             if orphaned {

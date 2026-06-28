@@ -66,12 +66,11 @@ impl Terminal {
                 self.touch();
             }
             (0, None, b'b') => self.repeat(param_or(params, 0, 1)),
-            (0, None, b'c') => {
-                if param(params, 0, 0) == 0 {
+            (0, None, b'c')
+                if param(params, 0, 0) == 0 => {
                     // DA1: VT220-class with ANSI color (like a modern xterm).
                     self.respond("\x1b[?62;22c");
                 }
-            }
             (b'>', None, b'c') => self.respond("\x1b[>1;10;0c"),
             (0, None, b'd') => {
                 // VPA
@@ -129,13 +128,12 @@ impl Terminal {
                 }
                 _ => {}
             },
-            (b'?', None, b'n') => {
-                if param(params, 0, 0) == 6 {
+            (b'?', None, b'n')
+                if param(params, 0, 0) == 6 => {
                     // DECXCPR
                     let resp = format!("\x1b[?{};{}R", self.cursor.row + 1, self.cursor.col + 1);
                     self.respond(&resp);
                 }
-            }
             (b'?', Some(b'$'), b'p') => self.decrqm_dec(param(params, 0, 0)),
             (0, Some(b'$'), b'p') => self.decrqm_ansi(param(params, 0, 0)),
             (0, Some(b'!'), b'p') => self.soft_reset(),

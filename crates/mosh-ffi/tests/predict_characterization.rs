@@ -31,6 +31,7 @@ fn fixtures_dir() -> PathBuf {
 ///   1. type `l` (frame 2)            -> prediction, tentative (warm-up), not shown
 ///   2. server echoes `l`, late_ack=3 -> cull confirms it, confirmed_epoch advances
 ///   3. type `s` (frame 4)            -> same epoch, now <= confirmed -> shown speculatively
+///
 /// Expected: row 0 reads `$ ls` (the `l` is real/echoed, the `s` is predicted).
 fn speculative_echo(pref: DisplayPreference) -> String {
     MoshPredictor::set_clock(1000);

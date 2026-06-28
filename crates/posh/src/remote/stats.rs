@@ -477,43 +477,25 @@ impl Stats {
     /// Fraction of considered full-dump bytes avoided by diffing, as a whole
     /// percent. Zero when no frames have been sent yet.
     pub fn diff_saved_pct(&self) -> u64 {
-        if self.full_bytes_considered == 0 {
-            0
-        } else {
-            self.diff_saved_bytes * 100 / self.full_bytes_considered
-        }
+        (self.diff_saved_bytes * 100)
+            .checked_div(self.full_bytes_considered)
+            .unwrap_or(0)
     }
 
     fn avg_dump_vt_us(&self) -> u64 {
-        if self.dump_vt_count == 0 {
-            0
-        } else {
-            self.dump_vt_us_total / self.dump_vt_count
-        }
+        self.dump_vt_us_total.checked_div(self.dump_vt_count).unwrap_or(0)
     }
 
     fn avg_apply_us(&self) -> u64 {
-        if self.apply_count == 0 {
-            0
-        } else {
-            self.apply_us_total / self.apply_count
-        }
+        self.apply_us_total.checked_div(self.apply_count).unwrap_or(0)
     }
 
     fn avg_input_ms(&self) -> u64 {
-        if self.input_count == 0 {
-            0
-        } else {
-            self.input_ms_total / self.input_count
-        }
+        self.input_ms_total.checked_div(self.input_count).unwrap_or(0)
     }
 
     fn avg_compose_us(&self) -> u64 {
-        if self.compose_count == 0 {
-            0
-        } else {
-            self.compose_us_total / self.compose_count
-        }
+        self.compose_us_total.checked_div(self.compose_count).unwrap_or(0)
     }
 
     // --- flushing ------------------------------------------------------------
@@ -559,11 +541,7 @@ impl Stats {
     /// value with a large `max_iter_us` is a stall or a hot path.
     fn loop_busy_pct(&self) -> u64 {
         let total = self.loop_busy_us + self.loop_idle_us;
-        if total == 0 {
-            0
-        } else {
-            self.loop_busy_us * 100 / total
-        }
+        (self.loop_busy_us * 100).checked_div(total).unwrap_or(0)
     }
 
     /// Periodic client summary; no-op unless a flush is due.
@@ -798,8 +776,11 @@ mod tests {
 
     #[test]
     fn wedge_detector_silent_when_disabled() {
-        let mut s = Stats::default(); // enabled = false, watchdog = false
-        s.frames_diff = 50;
+        // enabled = false, watchdog = false
+        let mut s = Stats {
+            frames_diff: 50,
+            ..Default::default()
+        };
         assert!(!s.check_wedge(0, 5, 100, "morph"));
         assert!(!s.check_wedge(WEDGE_FROZEN_MS * 10, 5, 100, "morph"));
     }

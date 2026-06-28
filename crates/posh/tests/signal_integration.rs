@@ -463,6 +463,11 @@ fn remote_client_reports_dead_server_and_times_out() {
         text.contains("imed out waiting for server"),
         "no timeout message in pane: {text:?}"
     );
+    // Reap the client unconditionally so a hung child never leaks a zombie;
+    // kill() is a harmless no-op once the process has self-exited on the
+    // connect timeout (which is what `status` below asserts it did).
+    let _ = child.kill();
+    let _ = child.wait();
     let status = status.expect("client never exited after the connect timeout");
     assert!(!status.success(), "timeout must exit nonzero, got {status:?}");
 }

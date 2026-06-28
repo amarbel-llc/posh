@@ -362,7 +362,7 @@ impl ControllerPredictor {
             } else if self.champion_streak <= -HYSTERESIS_FRAMES {
                 self.display_champion = false;
             }
-            if self.frames % STEP_EVERY_N_FRAMES == 0 {
+            if self.frames.is_multiple_of(STEP_EVERY_N_FRAMES) {
                 self.population = step(&mut self.domain, &self.cfg, &mut self.rng, &scored);
             }
         }

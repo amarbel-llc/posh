@@ -2134,7 +2134,7 @@ mod tests {
         // bound: past MAX_MOUSE_SEQ it isn't a real mouse sequence, so it's
         // flushed raw rather than swallowing input indefinitely.
         let mut junk = b"\x1b[<".to_vec();
-        junk.extend(std::iter::repeat(b'9').take(MAX_MOUSE_SEQ));
+        junk.extend(std::iter::repeat_n(b'9', MAX_MOUSE_SEQ));
         let out = filter_once(&junk, false);
         assert_eq!(out, junk, "over-long candidate is flushed literally");
     }

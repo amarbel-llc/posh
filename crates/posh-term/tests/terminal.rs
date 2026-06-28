@@ -757,7 +757,7 @@ fn kitty_keyboard_separate_alt_stack() {
 #[test]
 fn kitty_graphics_transmit_via_apc() {
     let mut t = term();
-    let pixels = vec![0u8; 4];
+    let pixels = [0u8; 4];
     let payload = {
         // Local base64 for the test (1x1 RGBA zeros).
         assert_eq!(pixels.len(), 4);

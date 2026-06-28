@@ -32,7 +32,7 @@ impl RemoteMetrics {
     /// The remote terminals in `CAP_METRICS` order (RFC 0007 §3): load1,
     /// mem_avail_frac, frontmost_app, proc_count, fg_proc_id. Absent values are
     /// `NaN`; categorical ids widen to `f64`.
-    pub fn to_terminals(&self) -> [f64; 5] {
+    pub fn to_terminals(self) -> [f64; 5] {
         [
             self.load1.unwrap_or(f64::NAN),
             self.mem_avail_frac.unwrap_or(f64::NAN),

@@ -274,7 +274,7 @@ impl MetricVector {
     /// The flat terminal vector the GP program reads. Index order is the
     /// schema-versioned contract (RFC 0007 §2/§8): leaf index `i` is the field
     /// at position `i` here. MUST match [`TERMINAL_COUNT`] and the field order.
-    pub fn to_terminals(&self) -> [f64; TERMINAL_COUNT] {
+    pub fn to_terminals(self) -> [f64; TERMINAL_COUNT] {
         [
             self.srtt_ms,
             self.rto_ms,

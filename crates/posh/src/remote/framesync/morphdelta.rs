@@ -18,6 +18,7 @@
 //!     `is_alt_screen()` (which gates the wheel scroll-view and echo);
 //!   * **dimensions changed** (resize) — `new_frame` would emit a self-clearing
 //!     full repaint anyway, and the off-screen model state must be rebuilt.
+//!
 //! The client's `server_term` therefore stays a faithful mirror across every
 //! Morph, and any non-expressible jump is carried by a `Full` the DumpDiff
 //! applier rebuilds from scratch.

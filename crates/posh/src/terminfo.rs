@@ -349,10 +349,10 @@ mod tests {
         );
         std::fs::write(hexdir.join("ztest"), &bytes).unwrap();
         assert_eq!(
-            lookup_ca_mode("ztest", &[tmp.clone()]),
+            lookup_ca_mode("ztest", std::slice::from_ref(&tmp)),
             Lookup::Found(b"E".to_vec(), b"X".to_vec())
         );
-        assert_eq!(lookup_ca_mode("missing", &[tmp.clone()]), Lookup::NoEntry);
+        assert_eq!(lookup_ca_mode("missing", std::slice::from_ref(&tmp)), Lookup::NoEntry);
         let _ = std::fs::remove_dir_all(&tmp);
     }
 

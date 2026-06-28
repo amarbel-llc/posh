@@ -400,7 +400,16 @@
         # this config drives a working-tree `conformist check` via
         # `just lint-worktree`. See conformist-nix(7) and the eng-impure preset.
         conformistImpureEval = conformist.lib.evalModule pkgs {
-          imports = [ conformist.lib.presets.eng-impure ];
+          imports = [
+            conformist.lib.presets.eng-impure
+            # conformist #69: the first-class clippy linter (opt-in — not in the
+            # eng-impure preset roster). posh had no clippy gate before; this
+            # adopts it. check = `cargo clippy … -- -D warnings`, repair =
+            # `cargo clippy --fix`. The toolchain (cargo/clippy/rustc/gcc)
+            # defaults to `pkgs` (igloo), the same nixpkgs the .#posh build's
+            # rustc comes from, so there is no clippy-version findings delta.
+            { linters.clippy.enable = true; }
+          ];
           package = conformistPkg;
           projectRootFile = "flake.nix";
         };
@@ -488,6 +497,7 @@
               pkgs.clang-tools # clang-format for the devShell + editor LSP
               pkgs.cargo # Rust workspace dev-loop (just debug-cargo)
               pkgs.rustc
+              pkgs.clippy # cargo clippy: the conformist #69 gate + dev-loop lint
               pkgs.scdoc # compile/lint doc/*.scd man pages (just lint-doc)
               pkgs.gum # terminal UI for the maintenance recipes (eng-versioning(7))
               pkgs.gh # `just release` -> gh release create

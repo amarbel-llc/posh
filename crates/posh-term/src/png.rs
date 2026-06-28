@@ -161,7 +161,7 @@ fn to_rgba(hdr: &Header, samples: &[u8], plte: &[u8], trns: &[u8]) -> Result<Vec
             }
         }
         3 => {
-            if plte.is_empty() || plte.len() % 3 != 0 {
+            if plte.is_empty() || !plte.len().is_multiple_of(3) {
                 return Err(PngError::BadData);
             }
             for &idx in samples {

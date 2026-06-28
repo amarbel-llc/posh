@@ -281,11 +281,10 @@ impl Parser {
         }
         match b {
             0x00..=0x17 | 0x19 | 0x1C..=0x1F => out.push(Action::Execute(b)),
-            0x20..=0x2F => {
-                if self.intermediates.len() < MAX_INTERMEDIATES {
+            0x20..=0x2F
+                if self.intermediates.len() < MAX_INTERMEDIATES => {
                     self.intermediates.push(b);
                 }
-            }
             0x30..=0x7E => {
                 out.push(Action::Esc {
                     intermediates: std::mem::take(&mut self.intermediates),
@@ -404,11 +403,10 @@ impl Parser {
         }
         match b {
             0x00..=0x17 | 0x19 | 0x1C..=0x1F => out.push(Action::Execute(b)),
-            0x20..=0x2F => {
-                if self.intermediates.len() < MAX_INTERMEDIATES {
+            0x20..=0x2F
+                if self.intermediates.len() < MAX_INTERMEDIATES => {
                     self.intermediates.push(b);
                 }
-            }
             0x30..=0x3F => self.state = State::CsiIgnore,
             0x40..=0x7E => self.csi_dispatch(b, out),
             _ => {}
@@ -541,11 +539,10 @@ impl Parser {
             return;
         }
         match b {
-            0x20..=0x2F => {
-                if self.intermediates.len() < MAX_INTERMEDIATES {
+            0x20..=0x2F
+                if self.intermediates.len() < MAX_INTERMEDIATES => {
                     self.intermediates.push(b);
                 }
-            }
             0x30..=0x3F => self.state = State::DcsIgnore,
             0x40..=0x7E => self.dcs_hook(b),
             _ => {}

@@ -251,10 +251,10 @@ fn encode_legacy(ev: KeyEvent, app_cursor: bool) -> Vec<u8> {
         // Only shift/alt/ctrl participate in legacy modifier encoding.
         let m = Modifiers(mods.0 & 0x07);
         return if m.0 == 0 {
-            if app_cursor && ss3_ok {
+            // SS3 (\x1bO) when app-cursor mode wants it on an SS3-capable key,
+            // or for F1-F4 which always default to SS3; otherwise CSI (\x1b[).
+            if !ss3_ok || app_cursor {
                 format!("\x1bO{letter}").into_bytes()
-            } else if !ss3_ok {
-                format!("\x1bO{letter}").into_bytes() // F1-F4 default to SS3
             } else {
                 format!("\x1b[{letter}").into_bytes()
             }
