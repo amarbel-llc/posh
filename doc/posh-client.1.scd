@@ -32,12 +32,14 @@ the host and then launches this client against the reported address.
 *Ctrl-^*
 	Open the command palette — the escape menu. It lists every client-local
 	escape command: the predictive-echo models (_adaptive_, _optimistic_,
-	_always_, _never_), the client *and* server debug-logging toggles
+	_always_, _never_, plus the evolved-predictor pilot's _controller_ and
+		_from-scratch_, RFC 0007), the client *and* server debug-logging toggles
 	(_POSH_DEBUG_LOG_; the server toggle rides the transport), shell-out on the
 	server (FDR 0008, the _POSH_ESCAPE_CMD_ command), reset & resync, dump wedge
 	forensics, show wedge debug info (an on-screen transport-state summary,
 	readable even while the session is frozen, plus a full dump to the
-	diagnostic sink), suspend the client, and quit. Type to filter, arrows to
+	diagnostic sink), show agent-forwarding debug info (the client-side
+		SSH agent-forwarding state, FDR 0004), suspend the client, and quit. Type to filter, arrows to
 	choose, Enter to run, Esc to
 	dismiss. Rendered by the *posh-palette* helper over a JSON-RPC control
 	channel; the session greys behind it.

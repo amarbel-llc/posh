@@ -123,6 +123,7 @@ fn palette_commands(server_log_on: bool) -> Value {
         { "name": "Reset & resync (force redraw)", "action": { "method": "session.resync" } },
         { "name": "Dump wedge forensics", "action": { "method": "session.forensics" } },
         { "name": "Show wedge debug info", "action": { "method": "session.debuginfo" } },
+        { "name": "Show agent-forwarding debug info", "action": { "method": "session.agentinfo" } },
         { "name": "Suspend client", "action": { "method": "client.suspend" } },
         { "name": "Quit session", "action": { "method": "app.quit" } },
     ])
@@ -205,6 +206,29 @@ fn wedge_debug_summary(st: &ClientState, now: u64) -> String {
         st.server_term.generation(),
         if st.last_reack.is_some() { "yes" } else { "no" },
         srv,
+    )
+}
+
+/// One-line client-side SSH agent-forwarding diagnostic (FDR 0004): whether
+/// forwarding is configured + the local agent socket, whether the peer
+/// advertised `CAP_AGENT_FORWARD` (the "is the server forwarding at all?"
+/// signal — `no` here is the most common misconfig), the live forwarded-channel
+/// count, and the agent byte-stream offsets (`out_base` / unacked `pending` /
+/// `in_ack`). A growing `pending` with a stuck `in_ack` means the peer is not
+/// consuming the stream. Backs the palette `session.agentinfo` action; the
+/// remote endpoint's own channel state is a follow-up (it needs forwarding).
+fn agent_debug_summary(st: &ClientState) -> String {
+    let Some(agent) = st.agent.as_ref() else {
+        return "agent-fwd: off (no local SSH agent, or disabled by policy)".to_string();
+    };
+    format!(
+        "agent-fwd: on sock={} peer-advertised={} channels={} out_base={} pending={}B in_ack={}",
+        agent.source().display(),
+        if st.agent_seen { "yes" } else { "no" },
+        agent.live_channel_count(),
+        st.agent_stream.send_base(),
+        st.agent_stream.pending().len(),
+        st.agent_stream.recv_ack(),
     )
 }
 
@@ -292,6 +316,14 @@ fn dispatch_palette_action(
             // record without a second terminal or knowing the pid.
             let summary = wedge_debug_summary(st, now);
             dump_client_state(st, now);
+            st.notify.set_message(&summary, false, now);
+            false
+        }
+        "session.agentinfo" => {
+            // FDR 0004: show the client-side agent-forwarding state on-screen and
+            // log it, so forwarding can be diagnosed from the palette in-session.
+            let summary = agent_debug_summary(st);
+            util::log_write("agentinfo", &summary);
             st.notify.set_message(&summary, false, now);
             false
         }
@@ -2463,7 +2495,26 @@ mod tests {
             names.iter().any(|n| n.to_lowercase().contains("controller (evolved")),
             "evolved controller command missing: {names:?}"
         );
-        assert_eq!(arr.len(), 14, "expected 14 commands, got {names:?}");
+        assert!(
+            names.iter().any(|n| n.to_lowercase().contains("agent-forwarding")),
+            "agent-forwarding debug command missing: {names:?}"
+        );
+        assert_eq!(arr.len(), 15, "expected 15 commands, got {names:?}");
+    }
+
+    #[test]
+    fn agent_debug_summary_reports_off_then_on_state() {
+        let mut st = test_state(24, 80);
+        assert!(
+            agent_debug_summary(&st).contains("off"),
+            "no agent configured => off"
+        );
+        st.agent = Some(crate::remote::agent::AgentClient::new("/tmp/agent.sock".into()));
+        st.agent_seen = true;
+        let s = agent_debug_summary(&st);
+        assert!(s.contains("agent-fwd: on"), "summary: {s}");
+        assert!(s.contains("peer-advertised=yes"), "summary: {s}");
+        assert!(s.contains("/tmp/agent.sock"), "summary: {s}");
     }
 
     #[test]

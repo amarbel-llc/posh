@@ -334,6 +334,11 @@ impl AgentClient {
         }
     }
 
+    /// The local agent socket every channel dials (FDR 0004 diagnostics).
+    pub fn source(&self) -> &std::path::Path {
+        &self.source
+    }
+
     /// Channel fds for `client_loop`'s poll set (no listener — the client only
     /// has its outbound connections).
     pub fn pollfds(&self) -> Vec<libc::pollfd> {
@@ -389,8 +394,8 @@ impl AgentClient {
         Ok(())
     }
 
-    #[cfg(test)]
-    fn live_channel_count(&self) -> usize {
+    /// Count of currently-open forwarded channels (FDR 0004 diagnostics).
+    pub fn live_channel_count(&self) -> usize {
         live_count(&self.channels)
     }
 }
