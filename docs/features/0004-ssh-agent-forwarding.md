@@ -1,14 +1,20 @@
 ---
 status: experimental
-date: 2026-06-12
-promotion-criteria: phase-1 implementation (github #55) landed — the
-  loopback E2E test is green (the in-process round-trip in
-  `remote/server.rs`, `cargo test -- --ignored agent_forward`) and the
-  wire ids are allocated in the RFC 0001 registry (6/7/8). Advanced to
-  `experimental` on that basis. The remaining bar for the next tier
-  (`stable`) is the real-world clause: a real `git push` from inside a
-  forwarded session authenticating against the local agent and surviving
-  a network roam, exercised outside the in-process harness.
+date: 2026-06-28
+promotion-criteria: phase-1 implementation (github #55) landed. The agent
+  E2E suite (`just debug-agent-e2e`) is green and now proves, with a real
+  `ssh-agent` and a real `ssh-add -l` through the forwarded socket: the
+  forwarding round-trip; the real detached `posh server -A` process (CLI
+  arg-parse + `AgentEndpoint::from_env` + `SSH_AUTH_SOCK` export); and roam
+  survival (the client rebinds its source port mid-stream, the server
+  re-pins, and the agent op still completes). Wire ids are allocated in the
+  RFC 0001 registry (6/7/8). Advanced to `experimental` on that basis. The
+  remaining bar for `stable` is the fully out-of-process real-world clause:
+  a real `git push` from inside a forwarded `posh host:session` over a real
+  network roam. The raw `posh client` carries no forwarding (it lives in the
+  ssh-bootstrapped `posh host` path), so that clause needs real ssh and is
+  covered by the manual walkthrough (docs/manual-testing.md §5), not an
+  automated test.
 ---
 
 # SSH agent forwarding over the posh transport

@@ -246,6 +246,24 @@ impl Connection {
         })
     }
 
+    /// Test-only: simulate a network roam by rebinding the local socket to a
+    /// fresh ephemeral port while keeping the AEAD session (the sequence counter
+    /// keeps advancing). The next datagram then leaves from a new source address
+    /// but in-sequence, so the server adopts it — exactly the mosh roaming path,
+    /// which on a real host is the kernel changing the source address out from
+    /// under the same socket (e.g. wifi → cellular).
+    #[cfg(test)]
+    pub fn roam_rebind(&mut self) -> std::io::Result<()> {
+        let remote = self.remote.expect("a client connection has a remote");
+        let sock = match remote {
+            SocketAddr::V4(_) => UdpSocket::bind((Ipv4Addr::UNSPECIFIED, 0))?,
+            SocketAddr::V6(_) => UdpSocket::bind((Ipv6Addr::UNSPECIFIED, 0))?,
+        };
+        sock.set_nonblocking(true)?;
+        self.sock = sock;
+        Ok(())
+    }
+
     pub fn raw_fd(&self) -> RawFd {
         self.sock.as_raw_fd()
     }

@@ -2220,7 +2220,7 @@ mod tests {
         let client = {
             let done = done.clone();
             let source = fake_agent_sock.clone();
-            std::thread::spawn(move || pump_agent_forward_client(key, port, source, done))
+            std::thread::spawn(move || pump_agent_forward_client(key, port, source, done, None))
         };
 
         // (4) The agent consumer: connect to the SERVER's agent/sock (what a
@@ -2272,6 +2272,7 @@ mod tests {
         port: u16,
         source_sock: std::path::PathBuf,
         done: std::sync::Arc<std::sync::atomic::AtomicBool>,
+        roam: Option<std::sync::Arc<std::sync::atomic::AtomicBool>>,
     ) {
         use crate::remote::agent::AgentClient;
         use crate::remote::sync::AgentStream;
@@ -2286,6 +2287,14 @@ mod tests {
         let mut agent_seen = false;
 
         while !done.load(Ordering::Relaxed) {
+            // Roam injection (#17): when signalled, rebind to a new source port
+            // mid-stream; the server re-pins to it on the next in-sequence
+            // datagram, and the cumulative agent stream rides the new path.
+            if let Some(r) = &roam {
+                if r.swap(false, Ordering::Relaxed) {
+                    let _ = conn.roam_rebind();
+                }
+            }
             // Advertise AGENT_FORWARD every message; emit DATA/ACK once the
             // server has advertised back (mirrors outgoing_caps).
             let mut extras = vec![caps::Cap {
@@ -2444,7 +2453,7 @@ mod tests {
         let client = {
             let done = done.clone();
             let source = real_agent_sock.clone();
-            std::thread::spawn(move || pump_agent_forward_client(key, port, source, done))
+            std::thread::spawn(move || pump_agent_forward_client(key, port, source, done, None))
         };
 
         // (5) `ssh-add -l` against the FORWARDED socket must list the key. Retry
@@ -2613,7 +2622,7 @@ mod tests {
         let client = {
             let done = done.clone();
             let source = local_agent_sock.clone();
-            std::thread::spawn(move || pump_agent_forward_client(key, port, source, done))
+            std::thread::spawn(move || pump_agent_forward_client(key, port, source, done, None))
         };
 
         // (4) `ssh-add -l` against the forwarded socket must list the key.
@@ -2649,6 +2658,150 @@ mod tests {
             listed,
             "ssh-add -l via the real-server-process forwarded socket never listed \
              the key (fingerprint {fingerprint}); last stdout: {last:?}"
+        );
+    }
+
+    // Agent forwarding must survive a network roam — the FDR 0004 `stable`
+    // criterion. The in-process pump establishes forwarding to a real ssh-agent
+    // and a real `ssh-add -l` lists the key; then the client ROAMS (rebinds to a
+    // new source port mid-stream), the server re-pins to it, and a second
+    // `ssh-add -l` must STILL list the key (the cumulative agent stream rides the
+    // new path). #[ignore]: needs ssh tooling; run with `just debug-agent-e2e`.
+    #[test]
+    #[ignore = "agent-forwarding roam survival; needs ssh tooling; run with --ignored"]
+    fn agent_forward_survives_roam() {
+        use crate::remote::agent::AgentEndpoint;
+        use std::os::unix::fs::DirBuilderExt;
+        use std::path::{Path, PathBuf};
+        use std::process::{Command, Stdio};
+        use std::sync::atomic::{AtomicBool, Ordering};
+        use std::sync::Arc;
+
+        let base = PathBuf::from(format!("/tmp/posh-roam-{}", std::process::id()));
+        std::fs::remove_dir_all(&base).ok();
+        std::fs::DirBuilder::new()
+            .recursive(true)
+            .mode(0o700)
+            .create(&base)
+            .unwrap();
+
+        // A real ssh-agent holding an ephemeral key.
+        let key_path = base.join("id_ed25519");
+        assert!(
+            Command::new("ssh-keygen")
+                .args(["-t", "ed25519", "-N", "", "-C", "posh-roam-e2e", "-q", "-f"])
+                .arg(&key_path)
+                .status()
+                .expect("run ssh-keygen")
+                .success(),
+            "ssh-keygen failed"
+        );
+        let fp_out = Command::new("ssh-keygen")
+            .arg("-lf")
+            .arg(key_path.with_extension("pub"))
+            .output()
+            .expect("run ssh-keygen -lf");
+        let fp_text = String::from_utf8_lossy(&fp_out.stdout);
+        let fingerprint = fp_text
+            .split_whitespace()
+            .find(|t| t.starts_with("SHA256:"))
+            .expect("a SHA256 fingerprint")
+            .to_string();
+        let agent_sock = base.join("agent.sock");
+        let mut agent = Command::new("ssh-agent")
+            .arg("-D")
+            .arg("-a")
+            .arg(&agent_sock)
+            .stdout(Stdio::null())
+            .stderr(Stdio::null())
+            .spawn()
+            .expect("spawn ssh-agent");
+        let deadline = now_ms() + 5_000;
+        while !agent_sock.exists() {
+            assert!(now_ms() < deadline, "ssh-agent never bound its socket");
+            std::thread::sleep(std::time::Duration::from_millis(20));
+        }
+        assert!(
+            Command::new("ssh-add")
+                .arg(&key_path)
+                .env("SSH_AUTH_SOCK", &agent_sock)
+                .status()
+                .expect("run ssh-add")
+                .success(),
+            "ssh-add failed to load the key into the agent"
+        );
+
+        // In-thread server with a live agent endpoint + idling shell.
+        let server_base = base.join("srv");
+        std::fs::DirBuilder::new()
+            .recursive(true)
+            .mode(0o700)
+            .create(&server_base)
+            .unwrap();
+        let key = Key::random();
+        let (server_conn, port) = Connection::server((62600, 62699), &key, Family::Inet).unwrap();
+        let endpoint = AgentEndpoint::new(&server_base).unwrap();
+        let forwarded_sock = endpoint.sock_path().to_path_buf();
+        let cmd: Vec<String> = vec!["/bin/sh".into(), "-c".into(), "sleep 600".into()];
+        let child = crate::pty::spawn_shell(Some(&cmd), 24, 80, &[], None).unwrap();
+        util::set_nonblocking(child.master).unwrap();
+        let server = std::thread::spawn(move || {
+            server_loop(server_conn, child, 24, 80, Some(endpoint));
+        });
+
+        // The pump, with a roam trigger wired in.
+        let done = Arc::new(AtomicBool::new(false));
+        let roam = Arc::new(AtomicBool::new(false));
+        let client = {
+            let done = done.clone();
+            let roam = roam.clone();
+            let source = agent_sock.clone();
+            std::thread::spawn(move || {
+                pump_agent_forward_client(key, port, source, done, Some(roam))
+            })
+        };
+
+        // `ssh-add -l` against the forwarded socket lists the key (retrying
+        // through the forwarding/roam settle window, each attempt timeout-bounded).
+        let lists_key = |sock: &Path| -> bool {
+            let deadline = now_ms() + 12_000;
+            while now_ms() < deadline {
+                let out = Command::new("timeout")
+                    .arg("4")
+                    .arg("ssh-add")
+                    .arg("-l")
+                    .env("SSH_AUTH_SOCK", sock)
+                    .output()
+                    .expect("run ssh-add -l");
+                if out.status.success()
+                    && String::from_utf8_lossy(&out.stdout).contains(&fingerprint)
+                {
+                    return true;
+                }
+                std::thread::sleep(std::time::Duration::from_millis(150));
+            }
+            false
+        };
+
+        let before = lists_key(&forwarded_sock);
+        // Roam: the pump rebinds to a new source port; the server re-pins on its
+        // next in-sequence datagram. A brief settle, then probe again.
+        roam.store(true, Ordering::Relaxed);
+        std::thread::sleep(std::time::Duration::from_millis(300));
+        let after = lists_key(&forwarded_sock);
+
+        // Teardown before asserting, so a failure still cleans up.
+        done.store(true, Ordering::Relaxed);
+        let _ = client.join();
+        let _ = agent.kill();
+        let _ = agent.wait();
+        drop(server);
+        std::fs::remove_dir_all(&base).ok();
+
+        assert!(before, "ssh-add -l did not list the key before the roam");
+        assert!(
+            after,
+            "ssh-add -l did not list the key AFTER the roam — forwarding did not survive"
         );
     }
 }
