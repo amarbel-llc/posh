@@ -33,11 +33,12 @@ mod test_support;
 pub use metric::{
     gather_client_local, MetricSource, MetricVector, METRIC_SCHEMA_VERSION, TERMINAL_COUNT,
 };
+pub use evolved::ControllerPredictor;
 pub use mosh::MoshPredictor;
 pub use optimistic::OptimisticPredictor;
 pub use render::{DimRenderer, ReplaceRenderer};
-#[allow(unused_imports)] // PolicyKnobs referenced once the controller genome is wired (RFC 0007)
-pub use species::{ControllerPredictor, FromScratchPredictor, PolicyKnobs};
+#[allow(unused_imports)] // PolicyKnobs referenced by the controller Domain (RFC 0007)
+pub use species::{FromScratchPredictor, PolicyKnobs};
 
 // Timing constants, verbatim from mosh terminaloverlay.h. Used by the mosh
 // model; re-exported where tests reference them.
@@ -54,6 +55,10 @@ pub const GLITCH_FLAG_THRESHOLD: u64 = 5000; // outstanding this long => underli
 /// server frames. Knows WHAT is predicted and WHETHER it is currently
 /// showable; nothing about how it looks.
 pub trait Predictor: Send {
+    /// Feeds the latest assembled metric vector (RFC 0007 §3) to a predictor
+    /// that consumes it (the evolved controller). Default: ignored, so the
+    /// non-GP models are unaffected.
+    fn set_metrics(&mut self, _metrics: &MetricVector) {}
     /// Records the reliable-input offset the next keystroke is sent at
     /// (mosh's local_frame_sent). Input path.
     fn set_frame_sent(&mut self, offset: u64);

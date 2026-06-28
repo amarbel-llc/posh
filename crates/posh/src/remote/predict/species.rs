@@ -1,8 +1,8 @@
 //! RFC 0007 §4: the two evolved GP predictor species, user-selectable via
 //! `POSH_PREDICTION_MODEL=controller` / `=scratch`.
 //!
-//! - [`ControllerPredictor`] (the safe arm) — an evolved program maps the metric
-//!   vector to bounded [`PolicyKnobs`] that drive posh's existing echo machinery.
+//! - The controller (the safe arm) lives in `evolved` — it maps the metric
+//!   vector to bounded [`PolicyKnobs`] that gate the echo machinery.
 //! - [`FromScratchPredictor`] (the research arm) — an evolved program emits the
 //!   predicted cells directly.
 //!
@@ -83,12 +83,6 @@ impl PolicyKnobs {
     }
 }
 
-/// RFC 0007 §4.1 controller seam: an evolved program mapping the metric vector
-/// to policy knobs. Backed by a mephisto genome once wired.
-pub trait ControllerProgram: Send {
-    fn decide(&self, metrics: &MetricVector) -> PolicyKnobs;
-}
-
 /// One predicted overlay cell from the from-scratch species (RFC 0007 §4.2).
 #[derive(Clone, Copy, Debug, PartialEq)]
 pub struct OverlayOp {
@@ -114,25 +108,6 @@ pub const FROM_SCRATCH_OP_CAP: usize = 4096;
 /// from the input byte, the current screen, and the metric vector.
 pub trait FromScratchProgram: Send {
     fn predict(&self, byte: u8, screen: &Snapshot, metrics: &MetricVector) -> FromScratchOutput;
-}
-
-/// RFC 0007 §4.1 controller species. Delegates to the adaptive shadow until an
-/// evolved [`ControllerProgram`] is wired (RFC 0007 §7.1).
-pub struct ControllerPredictor {
-    shadow: MoshPredictor,
-    // TODO(RFC 0007 §4.1/§7): drive policy from this evolved program and choose
-    // the better-ranked of {shadow, evolved} for display (§7.1 best-of).
-    #[allow(dead_code)]
-    program: Option<Box<dyn ControllerProgram>>,
-}
-
-impl ControllerPredictor {
-    pub fn new(predict_overwrite: bool) -> ControllerPredictor {
-        ControllerPredictor {
-            shadow: MoshPredictor::new(PredictionModel::Adaptive, predict_overwrite),
-            program: None,
-        }
-    }
 }
 
 /// RFC 0007 §4.2 from-scratch species. Delegates to the adaptive shadow until an
@@ -193,7 +168,6 @@ macro_rules! delegate_to_shadow {
     };
 }
 
-delegate_to_shadow!(ControllerPredictor);
 delegate_to_shadow!(FromScratchPredictor);
 
 #[cfg(test)]
@@ -221,20 +195,5 @@ mod tests {
         let n = PolicyKnobs::from_roots([f64::NAN, f64::NAN, f64::NAN, f64::NAN]);
         assert!(!n.show);
         assert_eq!(n.confirm_gate_ms, 0.0);
-    }
-
-    #[test]
-    fn controller_scaffold_behaves_like_adaptive_floor() {
-        // With no evolved program wired, the controller must echo exactly what
-        // the adaptive shadow would (RFC 0007 §7.1 floor).
-        let mut c = ControllerPredictor::new(false);
-        let fb = Snapshot::blank(24, 80);
-        c.set_frame_sent(0);
-        c.on_user_byte(b'l', &fb, 1000);
-        // Delegation is opaque here; the meaningful assertion is that the
-        // scaffold constructs and drives without panicking. Behavioral parity
-        // with adaptive is covered by the shared PredictHarness once the
-        // species are registered there.
-        let _ = c.active();
     }
 }

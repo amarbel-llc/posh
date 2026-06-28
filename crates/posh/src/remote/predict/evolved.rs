@@ -18,13 +18,19 @@
 #![allow(dead_code)]
 
 use mephisto::arena::NodeId;
-use mephisto::domain::Domain;
+use mephisto::domain::{evaluate_population, initial_population, step, Domain, LoopConfig};
 use mephisto::genome::{AlphabetWeights, MutParams, MutationWeights};
 use mephisto::rng::Rng;
 use mephisto::tuple::TupleBreeder;
 
-use super::metric::TERMINAL_COUNT;
+use crate::remote::display::Snapshot;
+
+use super::metric::{MetricVector, TERMINAL_COUNT};
 use super::species::PolicyKnobs;
+use super::{
+    MoshPredictor, OptimisticPredictor, PredictionModel, PredictionRenderer, Predictor,
+    PredictorStats,
+};
 
 /// The schema tag for persisted controller populations (RFC 0007 §8); the
 /// `_v{METRIC_SCHEMA_VERSION}` suffix guards the leaf-set the genome was evolved
@@ -180,6 +186,178 @@ impl Domain for ControllerDomain {
         // Lower is better: reward hits, penalize flicker (weighted heavier than a
         // miss, since visible wrong echo is worse than a hidden-but-correct one).
         2.0 * f64::from(f.flicker) + f64::from(f.missed) - f64::from(f.hits)
+    }
+}
+
+/// Frames between generations: a single frame's outcome is noisy, so accumulate
+/// a window and `step` every N (RFC 0007 §7, mild-willow's cadence guidance).
+const STEP_EVERY_N_FRAMES: u64 = 32;
+/// Cap on the recent outcome window scored each `evaluate` pass.
+const WINDOW_CAP: usize = 256;
+
+/// Starting LoopConfig for a small live population (mild-willow's suggested
+/// values; tune later). `generations` is unused by `step`.
+fn loop_config() -> LoopConfig {
+    LoopConfig {
+        population: 32,
+        generations: 0,
+        survivor_fraction: 0.5,
+        elitism: 2, // keep the live champion
+        tournament: 3,
+        crossover_rate: 0.7,
+        immigrant_fraction: 0.1,
+        local_opt_rate: 0.0,
+        opaque_recombine_rate: 0.0,
+    }
+}
+
+/// RFC 0007 §4.1 live controller: an evolved GP population whose champion's
+/// [`PolicyKnobs`] gate a swappable base echo — optimistic by default, adaptive
+/// via `POSH_PREDICTION_CONTROLLER_ECHO=adaptive` for A/B. Each server frame it
+/// accumulates an outcome sample, re-evaluates the population (cheap), and steps
+/// a generation every [`STEP_EVERY_N_FRAMES`].
+///
+/// The §5.1 runtime leak gate is preserved by the base predictor (its
+/// `set_echo_safe(false)` drops the overlay), so a `show`-happy champion cannot
+/// leak under `ECHO`-off; the fitness additionally penalizes it as lethal (§5.2).
+pub struct ControllerPredictor {
+    domain: ControllerDomain,
+    population: Vec<Vec<NodeId>>,
+    cfg: LoopConfig,
+    rng: Rng,
+    /// The swappable echo machinery the champion's knobs drive.
+    base: Box<dyn Predictor>,
+    champion: Vec<NodeId>,
+    metrics: [f64; TERMINAL_COUNT],
+    /// The champion's `show` decision for the most recent keystroke.
+    show: bool,
+    echo_safe: bool,
+    frames: u64,
+    /// Base outcome counters at the previous frame, to delta the fitness signal.
+    last_outcomes: (u64, u64, u64),
+}
+
+impl ControllerPredictor {
+    pub fn new(predict_overwrite: bool) -> ControllerPredictor {
+        let adapt = std::env::var("POSH_PREDICTION_CONTROLLER_ECHO")
+            .map(|v| v == "adaptive")
+            .unwrap_or(false);
+        let base: Box<dyn Predictor> = if adapt {
+            Box::new(MoshPredictor::new(PredictionModel::Adaptive, predict_overwrite))
+        } else {
+            Box::new(OptimisticPredictor::new(predict_overwrite))
+        };
+        let mut domain = ControllerDomain::new();
+        let cfg = loop_config();
+        // Fixed seed: reproducible evolution (the A/B the FDR requires).
+        let mut rng = Rng::new(0x05f7_0007);
+        let population = initial_population(&mut domain, &cfg, &mut rng);
+        let champion = population[0].clone();
+        ControllerPredictor {
+            domain,
+            population,
+            cfg,
+            rng,
+            base,
+            champion,
+            metrics: [f64::NAN; TERMINAL_COUNT],
+            show: true,
+            echo_safe: false,
+            frames: 0,
+            last_outcomes: (0, 0, 0),
+        }
+    }
+
+    /// Push one outcome sample for the just-finished frame and, every N frames,
+    /// re-evaluate the population and step a generation (RFC 0007 §7).
+    fn tick(&mut self) {
+        // Frame-granular fitness proxy (v1): the delta in the base predictor's
+        // correct/incorrect counters since last frame says whether recent echo
+        // was good. TODO: per-keystroke ground truth tied to each sample.
+        let (c, n, i) = self.base.stats().outcomes;
+        let dc = c.saturating_sub(self.last_outcomes.0);
+        let di = i.saturating_sub(self.last_outcomes.2);
+        self.last_outcomes = (c, n, i);
+        if dc + di > 0 {
+            self.domain.window.push(OutcomeSample {
+                metrics: self.metrics,
+                echoed_ok: dc >= di,
+                echo_safe: self.echo_safe,
+            });
+            if self.domain.window.len() > WINDOW_CAP {
+                let excess = self.domain.window.len() - WINDOW_CAP;
+                self.domain.window.drain(0..excess);
+            }
+        }
+        self.frames = self.frames.wrapping_add(1);
+        if !self.domain.window.is_empty() {
+            let scored = evaluate_population(&mut self.domain, &self.population);
+            self.champion = scored[0].genome.clone();
+            if self.frames % STEP_EVERY_N_FRAMES == 0 {
+                self.population = step(&mut self.domain, &self.cfg, &mut self.rng, &scored);
+            }
+        }
+    }
+}
+
+impl Default for ControllerPredictor {
+    fn default() -> ControllerPredictor {
+        ControllerPredictor::new(false)
+    }
+}
+
+impl Predictor for ControllerPredictor {
+    fn set_metrics(&mut self, metrics: &MetricVector) {
+        self.metrics = metrics.to_terminals();
+    }
+
+    fn set_frame_sent(&mut self, offset: u64) {
+        self.base.set_frame_sent(offset);
+    }
+
+    fn on_user_byte(&mut self, byte: u8, fb: &Snapshot, now: u64) {
+        // The champion's policy for this keystroke's metric vector.
+        let knobs = self.domain.knobs(&self.champion, &self.metrics);
+        self.show = knobs.show;
+        self.base.on_user_byte(byte, fb, now);
+    }
+
+    fn on_server_frame(&mut self, input_ack: u64, echo_ack: u64, send_interval: u64) {
+        self.base.on_server_frame(input_ack, echo_ack, send_interval);
+        self.tick();
+    }
+
+    fn set_echo_safe(&mut self, safe: bool) {
+        self.echo_safe = safe;
+        self.base.set_echo_safe(safe);
+    }
+
+    fn cull(&mut self, fb: &Snapshot, now: u64) {
+        self.base.cull(fb, now);
+    }
+
+    fn render(&self, fb: &mut Snapshot, renderer: &dyn PredictionRenderer) {
+        // The champion's `show` knob gates display (RFC 0007 §4.1). The runtime
+        // leak gate is upheld by the base (set_echo_safe drops its overlay).
+        if self.show {
+            self.base.render(fb, renderer);
+        }
+    }
+
+    fn reset(&mut self) {
+        self.base.reset();
+    }
+
+    fn active(&self) -> bool {
+        self.base.active()
+    }
+
+    fn needs_timer(&self) -> bool {
+        self.base.needs_timer()
+    }
+
+    fn stats(&self) -> PredictorStats {
+        self.base.stats()
     }
 }
 

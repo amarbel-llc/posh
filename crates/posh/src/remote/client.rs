@@ -1725,6 +1725,10 @@ fn compose_frame(st: &mut ClientState, now: u64) -> Vec<u8> {
         // Remote terminals decoded from the server's CAP_METRICS (RFC 0007 §3).
         metrics.fill_remote(st.remote_metrics);
         st.last_metrics = metrics;
+        // Feed the assembled vector to the predictor (the evolved controller
+        // consumes it; other models ignore it) before the next keystroke, so the
+        // champion's policy reads the current metrics.
+        st.predict.set_metrics(&st.last_metrics);
     }
     let mut next = base;
     st.predict.render(&mut next, &*st.renderer);
