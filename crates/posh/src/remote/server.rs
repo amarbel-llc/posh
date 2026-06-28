@@ -2165,8 +2165,7 @@ mod tests {
     #[test]
     #[ignore = "agent-forwarding E2E harness; run with --ignored"]
     fn agent_forward_round_trips_request_to_local_agent() {
-        use crate::remote::agent::{AgentClient, AgentEndpoint};
-        use crate::remote::sync::AgentStream;
+        use crate::remote::agent::AgentEndpoint;
         use std::io::{Read, Write};
         use std::os::unix::net::{UnixListener, UnixStream};
         use std::path::PathBuf;
@@ -2218,75 +2217,11 @@ mod tests {
         // round-trip completes or we time out. Runs on its own thread so the
         // main thread can drive the agent consumer concurrently.
         let done = Arc::new(AtomicBool::new(false));
-        let client_done = done.clone();
-        let client = std::thread::spawn(move || {
-            let addr = format!("127.0.0.1:{port}").parse().unwrap();
-            let mut conn = Connection::client(addr, &key).unwrap();
-            let mut fragmenter = Fragmenter::new();
-            let mut assembly = FragmentAssembly::new();
-            let mut proxy = AgentClient::new(fake_agent_sock.clone());
-            let mut stream = AgentStream::new();
-            let mut agent_seen = false;
-
-            while !client_done.load(Ordering::Relaxed) {
-                // Advertise AGENT_FORWARD every message; emit DATA/ACK once the
-                // server has advertised back (mirrors outgoing_caps).
-                let mut extras = vec![caps::Cap {
-                    id: caps::CAP_AGENT_FORWARD,
-                    payload: vec![],
-                }];
-                if agent_seen {
-                    extras.extend(caps::encode_agent_data(stream.send_base(), stream.pending()));
-                    extras.push(caps::encode_agent_ack(stream.recv_ack()));
-                }
-                let msg = ClientMessage {
-                    flags: 0,
-                    caps: caps::own_table(&extras),
-                    acked_frame: 0,
-                    rows: 24,
-                    cols: 80,
-                    input_base: 0,
-                    input: Vec::new(),
-                };
-                for frag in fragmenter.make_fragments(&msg.encode(), sync::FRAGMENT_CONTENTS_MAX) {
-                    let _ = conn.send(&frag.to_bytes());
-                }
-                // Drain inbound frames; consume the server's agent caps.
-                while let Ok(Some(payload)) = conn.recv() {
-                    let Ok(frag) = sync::Fragment::from_bytes(&payload) else {
-                        continue;
-                    };
-                    let Some(assembled) = assembly.add(frag) else {
-                        continue;
-                    };
-                    let Ok(frame) = ServerFrame::decode(&assembled) else {
-                        continue;
-                    };
-                    if caps::find(&frame.caps, caps::CAP_AGENT_FORWARD).is_some() {
-                        agent_seen = true;
-                    }
-                    for cap in caps::find_all(&frame.caps, caps::CAP_AGENT_DATA) {
-                        if let Ok((offset, bytes)) = caps::decode_agent_data(&cap.payload) {
-                            if let Ok(records) = stream.recv(offset, bytes) {
-                                for reply in proxy.apply_records(&records) {
-                                    stream.send(&reply);
-                                }
-                            }
-                        }
-                    }
-                    if let Some(cap) = caps::find(&frame.caps, caps::CAP_AGENT_ACK) {
-                        if let Ok(upto) = caps::decode_agent_ack(&cap.payload) {
-                            stream.ack(upto);
-                        }
-                    }
-                }
-                // Pump the proxy's local-agent connections -> outbound stream.
-                for rec in proxy.read_channels() {
-                    stream.send(&rec);
-                }
-                std::thread::sleep(std::time::Duration::from_millis(5));
-            }
-        });
+        let client = {
+            let done = done.clone();
+            let source = fake_agent_sock.clone();
+            std::thread::spawn(move || pump_agent_forward_client(key, port, source, done))
+        };
 
         // (4) The agent consumer: connect to the SERVER's agent/sock (what a
         // forwarded `git push` would use as SSH_AUTH_SOCK), send the request,
@@ -2322,6 +2257,232 @@ mod tests {
         assert_eq!(
             got, REPLY,
             "the fake agent's reply round-tripped server endpoint -> UDP -> client proxy -> back"
+        );
+    }
+
+    /// Client half of the agent-forwarding E2E harness: drives the posh
+    /// transport as a client — advertises `AGENT_FORWARD` every message, relays
+    /// `AGENT_DATA`/`AGENT_ACK` between the loopback UDP transport and a local
+    /// `AgentClient` proxy that dials `source_sock`, and pumps the proxy's
+    /// channels back onto the stream — until `done` is set. Mirrors the
+    /// production client loop; the tests vary only what sits behind `source_sock`
+    /// (a fake agent, or a real `ssh-agent`).
+    fn pump_agent_forward_client(
+        key: Key,
+        port: u16,
+        source_sock: std::path::PathBuf,
+        done: std::sync::Arc<std::sync::atomic::AtomicBool>,
+    ) {
+        use crate::remote::agent::AgentClient;
+        use crate::remote::sync::AgentStream;
+        use std::sync::atomic::Ordering;
+
+        let addr = format!("127.0.0.1:{port}").parse().unwrap();
+        let mut conn = Connection::client(addr, &key).unwrap();
+        let mut fragmenter = Fragmenter::new();
+        let mut assembly = FragmentAssembly::new();
+        let mut proxy = AgentClient::new(source_sock);
+        let mut stream = AgentStream::new();
+        let mut agent_seen = false;
+
+        while !done.load(Ordering::Relaxed) {
+            // Advertise AGENT_FORWARD every message; emit DATA/ACK once the
+            // server has advertised back (mirrors outgoing_caps).
+            let mut extras = vec![caps::Cap {
+                id: caps::CAP_AGENT_FORWARD,
+                payload: vec![],
+            }];
+            if agent_seen {
+                extras.extend(caps::encode_agent_data(stream.send_base(), stream.pending()));
+                extras.push(caps::encode_agent_ack(stream.recv_ack()));
+            }
+            let msg = ClientMessage {
+                flags: 0,
+                caps: caps::own_table(&extras),
+                acked_frame: 0,
+                rows: 24,
+                cols: 80,
+                input_base: 0,
+                input: Vec::new(),
+            };
+            for frag in fragmenter.make_fragments(&msg.encode(), sync::FRAGMENT_CONTENTS_MAX) {
+                let _ = conn.send(&frag.to_bytes());
+            }
+            // Drain inbound frames; consume the server's agent caps.
+            while let Ok(Some(payload)) = conn.recv() {
+                let Ok(frag) = sync::Fragment::from_bytes(&payload) else {
+                    continue;
+                };
+                let Some(assembled) = assembly.add(frag) else {
+                    continue;
+                };
+                let Ok(frame) = ServerFrame::decode(&assembled) else {
+                    continue;
+                };
+                if caps::find(&frame.caps, caps::CAP_AGENT_FORWARD).is_some() {
+                    agent_seen = true;
+                }
+                for cap in caps::find_all(&frame.caps, caps::CAP_AGENT_DATA) {
+                    if let Ok((offset, bytes)) = caps::decode_agent_data(&cap.payload) {
+                        if let Ok(records) = stream.recv(offset, bytes) {
+                            for reply in proxy.apply_records(&records) {
+                                stream.send(&reply);
+                            }
+                        }
+                    }
+                }
+                if let Some(cap) = caps::find(&frame.caps, caps::CAP_AGENT_ACK) {
+                    if let Ok(upto) = caps::decode_agent_ack(&cap.payload) {
+                        stream.ack(upto);
+                    }
+                }
+            }
+            // Pump the proxy's local-agent connections -> outbound stream.
+            for rec in proxy.read_channels() {
+                stream.send(&rec);
+            }
+            std::thread::sleep(std::time::Duration::from_millis(5));
+        }
+    }
+
+    // Like the harness above, but with a REAL `ssh-agent` behind the forwarded
+    // socket and a REAL `ssh-add -l` as the consumer: proves the actual SSH agent
+    // protocol (not just opaque bytes) survives the endpoint -> UDP -> proxy ->
+    // agent round-trip, and that the SPECIFIC forwarded key is the one listed.
+    // Shells out to ssh-keygen/ssh-agent/ssh-add (absent from the hermetic build
+    // sandbox), so it is #[ignore]; run with `just debug-agent-e2e`.
+    #[test]
+    #[ignore = "real ssh-agent E2E; needs ssh-keygen/ssh-agent/ssh-add; run with --ignored"]
+    fn agent_forward_real_ssh_agent_lists_forwarded_key() {
+        use crate::remote::agent::AgentEndpoint;
+        use std::os::unix::fs::DirBuilderExt;
+        use std::path::PathBuf;
+        use std::process::{Command, Stdio};
+        use std::sync::atomic::{AtomicBool, Ordering};
+        use std::sync::Arc;
+
+        let base = PathBuf::from(format!("/tmp/posh-e2e-real-{}", std::process::id()));
+        std::fs::remove_dir_all(&base).ok();
+        std::fs::DirBuilder::new()
+            .recursive(true)
+            .mode(0o700)
+            .create(&base)
+            .unwrap();
+
+        // (1) An ephemeral key the real agent will hold, plus the SHA256
+        // fingerprint `ssh-add -l` must report once it round-trips.
+        let key_path = base.join("id_ed25519");
+        assert!(
+            Command::new("ssh-keygen")
+                // Fixed -C comment: the default embeds $USER@$HOSTNAME, which
+                // would leak the runner's identity into captured test output.
+                .args(["-t", "ed25519", "-N", "", "-C", "posh-agent-e2e", "-q", "-f"])
+                .arg(&key_path)
+                .status()
+                .expect("run ssh-keygen")
+                .success(),
+            "ssh-keygen failed"
+        );
+        let fp_out = Command::new("ssh-keygen")
+            .arg("-lf")
+            .arg(key_path.with_extension("pub"))
+            .output()
+            .expect("run ssh-keygen -lf");
+        let fp_text = String::from_utf8_lossy(&fp_out.stdout);
+        let fingerprint = fp_text
+            .split_whitespace()
+            .find(|t| t.starts_with("SHA256:"))
+            .expect("a SHA256 fingerprint in ssh-keygen -lf output")
+            .to_string();
+
+        // (2) A real ssh-agent bound to a known socket, foreground (-D) so we own
+        // the child and reap it on teardown; load the key into it.
+        let real_agent_sock = base.join("real-agent.sock");
+        let mut agent = Command::new("ssh-agent")
+            .arg("-D")
+            .arg("-a")
+            .arg(&real_agent_sock)
+            .stdout(Stdio::null())
+            .stderr(Stdio::null())
+            .spawn()
+            .expect("spawn ssh-agent");
+        let deadline = now_ms() + 5_000;
+        while !real_agent_sock.exists() {
+            assert!(now_ms() < deadline, "ssh-agent never bound its socket");
+            std::thread::sleep(std::time::Duration::from_millis(20));
+        }
+        assert!(
+            Command::new("ssh-add")
+                .arg(&key_path)
+                .env("SSH_AUTH_SOCK", &real_agent_sock)
+                .status()
+                .expect("run ssh-add")
+                .success(),
+            "ssh-add failed to load the key into the real agent"
+        );
+
+        // (3) Real posh server with a live agent endpoint + an idling shell.
+        let server_base = base.join("srv");
+        std::fs::DirBuilder::new()
+            .recursive(true)
+            .mode(0o700)
+            .create(&server_base)
+            .unwrap();
+        let key = Key::random();
+        let (server_conn, port) = Connection::server((62700, 62799), &key, Family::Inet).unwrap();
+        let endpoint = AgentEndpoint::new(&server_base).unwrap();
+        let forwarded_sock = endpoint.sock_path().to_path_buf();
+        let cmd: Vec<String> = vec!["/bin/sh".into(), "-c".into(), "sleep 600".into()];
+        let child = crate::pty::spawn_shell(Some(&cmd), 24, 80, &[], None).unwrap();
+        util::set_nonblocking(child.master).unwrap();
+        let server = std::thread::spawn(move || {
+            server_loop(server_conn, child, 24, 80, Some(endpoint));
+        });
+
+        // (4) Client transport pump whose proxy dials the REAL ssh-agent.
+        let done = Arc::new(AtomicBool::new(false));
+        let client = {
+            let done = done.clone();
+            let source = real_agent_sock.clone();
+            std::thread::spawn(move || pump_agent_forward_client(key, port, source, done))
+        };
+
+        // (5) `ssh-add -l` against the FORWARDED socket must list the key. Retry
+        // the whole command — forwarding takes a few hundred ms to come up
+        // (symlink claim + the client advertising back + the proxy connecting) —
+        // and bound each attempt with `timeout` so a broken path fails fast
+        // instead of blocking on the agent read.
+        let deadline = now_ms() + 10_000;
+        let mut last = String::new();
+        let mut listed = false;
+        while now_ms() < deadline {
+            let out = Command::new("timeout")
+                .arg("4")
+                .arg("ssh-add")
+                .arg("-l")
+                .env("SSH_AUTH_SOCK", &forwarded_sock)
+                .output()
+                .expect("run ssh-add -l");
+            last = String::from_utf8_lossy(&out.stdout).into_owned();
+            if out.status.success() && last.contains(&fingerprint) {
+                listed = true;
+                break;
+            }
+            std::thread::sleep(std::time::Duration::from_millis(100));
+        }
+
+        // (6) Teardown before asserting, so a failure still cleans up.
+        done.store(true, Ordering::Relaxed);
+        let _ = client.join();
+        let _ = agent.kill();
+        let _ = agent.wait();
+        drop(server);
+        std::fs::remove_dir_all(&base).ok();
+
+        assert!(
+            listed,
+            "ssh-add -l via the forwarded socket never listed the forwarded key \
+             (fingerprint {fingerprint}); last stdout: {last:?}"
         );
     }
 }
