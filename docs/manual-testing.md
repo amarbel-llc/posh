@@ -105,6 +105,46 @@ otherwise the wrapper reports "did not find posh server startup message"
 - [ ] `posh otherhost:<Tab>` completes the remote session names (second
       Tab is instant — cached).
 
+## 5. SSH agent forwarding (FDR 0004)
+
+Forwarding is on by default whenever a local agent exists. Prereq: a local
+agent holding a key — `ssh-add -l` on the machine you're sitting at shows a
+fingerprint. That fingerprint is the proof target.
+
+```sh
+ssh-add -l                       # note the SHA256 fingerprint(s)
+$P otherhost:dev                 # forwarding is on by default; -A to force + warn loudly
+# ...then, inside the forwarded session:
+echo $SSH_AUTH_SOCK              # => <base>/agent/sock (e.g. $XDG_RUNTIME_DIR/posh/agent/sock)
+ssh-add -l                       # must list the SAME fingerprint as locally
+ssh -T git@github.com            # or: git ls-remote <a key-only repo> — a real auth over the forwarded key
+```
+
+- [ ] Inside the session, `ssh-add -l` lists the **same** fingerprint your local
+      agent holds — the remote `ssh-add` is talking to your local agent through
+      posh. (`-A`/`--forward-agent` forces it on and warns if no agent is found;
+      `-a`/`--no-forward-agent` or `POSH_FORWARD_AGENT=no` disables it.)
+- [ ] A real operation authenticates: `ssh -T git@github.com` greets you by name,
+      or a `git ls-remote`/`git push` against a key-only repo succeeds.
+- [ ] Diagnostic: `Ctrl-^` → **Show agent-forwarding debug info**. Two lines
+      composite over the session —
+      `agent-fwd: on sock=<local agent> peer-advertised=yes channels=N …` and
+      `server: endpoint=up channels=N next_chan=M symlink=ok`. Run `ssh-add -l`
+      again while watching: `channels` ticks up for the in-flight request.
+- [ ] Roam: switch networks (toggle wifi/VPN) mid-session, then `ssh-add -l`
+      again — still lists the key (the agent socket is stable across the roam).
+- [ ] Forwarded once: open a SECOND `$P otherhost:dev`; both sessions' `ssh-add
+      -l` work, and `agent/sock` points at the newest connection (its diagnostic
+      shows `symlink=ok`; the older connection keeps serving).
+
+Reading the diagnostic when it is NOT working:
+
+- `peer-advertised=no` — the server is not forwarding at all (most common
+  misconfig: server-side `POSH_FORWARD_AGENT=no`, or no local agent was found so
+  the client never advertised).
+- `server: endpoint=down` — server-side forwarding is off (or an older server).
+- `server: … symlink=broken` — another posh server stole the well-known symlink.
+
 ## Known gaps — do not file as new bugs
 
 None currently. The Wave D/E gaps that used to live here — wheel scroll
