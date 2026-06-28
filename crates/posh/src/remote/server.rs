@@ -248,6 +248,11 @@ pub(crate) fn server_loop(
     let mut peer_wants_metrics = false;
     let mut metrics_sample = crate::remote::hostmetrics::RemoteMetrics::default();
     let mut metrics_sampled_at: u64 = 0;
+    // Server retransmit RATE (#11): the cumulative count at the last sample, and
+    // the per-second rate derived from its delta over the sample window. NaN
+    // until the second sample (the first has no window to divide over).
+    let mut last_retransmits: u64 = 0;
+    let mut metrics_retransmit_rate = f64::NAN;
     let mut dumpdiff_enc = DumpDiff;
     let mut morph_enc = MorphDelta::default();
 
@@ -655,6 +660,10 @@ pub(crate) fn server_loop(
                         peer_wants_diag = caps::find(&msg.caps, caps::CAP_DIAG).is_some();
                         // CAP_METRICS (RFC 0007 §3): per-message, like the others.
                         peer_wants_metrics = caps::find(&msg.caps, caps::CAP_METRICS).is_some();
+                        // A GP client wants the server-cost terminals (#11): turn
+                        // on Stats instrumentation so dump_vt timing runs even
+                        // with POSH_DEBUG_LOG off (the `dump_vt_us` terminal).
+                        stats.set_gp_active(peer_wants_metrics);
                     }
                     Ok(None) => continue,
                     Err(e) if e.kind() == std::io::ErrorKind::WouldBlock => break,
@@ -968,9 +977,32 @@ pub(crate) fn server_loop(
                             term.title(),
                             child.pid,
                         );
+                        // Retransmit rate over the elapsed window (#11): the
+                        // count delta since the last sample, per second. The
+                        // first sample has no window, so the rate stays NaN.
+                        let dt_ms = t.saturating_sub(metrics_sampled_at);
+                        let cur_retransmits = stats.retransmits();
+                        if metrics_sampled_at != 0 && dt_ms != 0 {
+                            metrics_retransmit_rate =
+                                cur_retransmits.saturating_sub(last_retransmits) as f64
+                                    / (dt_ms as f64 / 1000.0);
+                        }
+                        last_retransmits = cur_retransmits;
                         metrics_sampled_at = t;
                     }
-                    extras.push(caps::encode_metrics(metrics_sample.to_terminals()));
+                    // Host terminals (throttled, cached) plus the two server-side
+                    // counters (#11): the windowed retransmit_rate, and dump_vt_us
+                    // read fresh (the cost of the dump this frame carries).
+                    let host = metrics_sample.to_terminals();
+                    extras.push(caps::encode_metrics([
+                        host[0],
+                        host[1],
+                        host[2],
+                        host[3],
+                        host[4],
+                        metrics_retransmit_rate,
+                        stats.last_dump_vt_us() as f64,
+                    ]));
                 }
                 if shutdown && peer_wants_exit {
                     if let Some(code) = exit_status {

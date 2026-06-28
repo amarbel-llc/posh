@@ -71,6 +71,9 @@ pub struct Stats {
     // the flush cycle.
     last_apply_us: u64,
     last_compose_us: u64,
+    /// Server: most-recent `dump_vt` cost. The server-forwarded `dump_vt_us`
+    /// metric terminal (RFC 0007 §3); populated whenever `instrument()`.
+    last_dump_vt_us: u64,
     last_loop_busy_us: u64,
     last_loop_idle_us: u64,
 
@@ -242,6 +245,17 @@ impl Stats {
     }
     pub fn last_compose_us(&self) -> u64 {
         self.last_compose_us
+    }
+    /// The server's most-recent single-frame `dump_vt` cost (µs), for the
+    /// RFC 0007 metric bus' server-forwarded `dump_vt_us` terminal. Populated
+    /// whenever `instrument()`, so a GP species reads it without POSH_DEBUG_LOG.
+    pub fn last_dump_vt_us(&self) -> u64 {
+        self.last_dump_vt_us
+    }
+    /// Cumulative server retransmit count (frames re-sent for lack of an ack).
+    /// The metric bus delta's it over the sample window into `retransmit_rate`.
+    pub fn retransmits(&self) -> u64 {
+        self.retransmits
     }
     /// Busy/idle µs of the most recent event-loop iteration (drives fps +
     /// busy-fraction in the metric bus).
@@ -460,9 +474,12 @@ impl Stats {
     }
 
     /// Times `f` (the `dump_vt()` call) and accumulates its cost in
-    /// microseconds. When disabled the closure runs untouched.
+    /// microseconds. When not instrumenting (neither logging nor a GP species
+    /// active) the closure runs untouched. Gated on `instrument()` rather than
+    /// `enabled` so the server-forwarded `dump_vt_us` metric terminal is live
+    /// for a GP client even with POSH_DEBUG_LOG off (RFC 0007 §3).
     pub fn time_dump_vt<F: FnOnce() -> Vec<u8>>(&mut self, f: F) -> Vec<u8> {
-        if !self.enabled {
+        if !self.instrument() {
             return f();
         }
         let t = Instant::now();
@@ -471,6 +488,7 @@ impl Stats {
         self.dump_vt_us_total += us;
         self.dump_vt_count += 1;
         self.dump_vt_us_max = self.dump_vt_us_max.max(us);
+        self.last_dump_vt_us = us;
         out
     }
 

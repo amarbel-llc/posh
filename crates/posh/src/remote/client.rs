@@ -513,7 +513,7 @@ struct ClientState {
     last_metrics: predict::MetricVector,
     /// Latest decoded `CAP_METRICS` remote terminals (RFC 0007 §3), folded into
     /// `last_metrics` each compose. `NaN` until the server forwards them.
-    remote_metrics: [f64; 5],
+    remote_metrics: [f64; caps::METRICS_FIELDS],
     notify: NotificationEngine,
     /// $POSH_GRAB_MOUSE policy; on, intercepted wheel events become arrow keys
     /// instead of driving the scrollback scroll-view (the legacy posh#50 grab).
@@ -641,7 +641,7 @@ fn client_loop(
         predict_render: render,
         predict_overwrite,
         last_metrics: predict::MetricVector::unavailable(),
-        remote_metrics: [f64::NAN; 5],
+        remote_metrics: [f64::NAN; caps::METRICS_FIELDS],
         notify: NotificationEngine::new(now),
         grab_mouse,
         mouse_filter: MouseFilter::default(),
@@ -2628,7 +2628,7 @@ mod tests {
             predict_model: PredictionModel::Never,
             predict_render: RenderStyle::Replace,
             last_metrics: predict::MetricVector::unavailable(),
-            remote_metrics: [f64::NAN; 5],
+            remote_metrics: [f64::NAN; caps::METRICS_FIELDS],
             predict_overwrite: false,
             notify: NotificationEngine::new(0),
             grab_mouse: GrabMouse::Off,

@@ -101,14 +101,14 @@ screen-state block, read client-side from the displayed `Snapshot`):
 | `srtt_ms` | f64 | ms | client | smoothed RTT (`datagram.rs`) |
 | `rto_ms` | f64 | ms | client | retransmit timeout |
 | `send_interval_ms` | f64 | ms | client | server frame cadence |
-| `retransmit_rate` | f64 | 1/s | server-forwarded (deferred) | server-side counter; not yet in `CAP_METRICS` |
+| `retransmit_rate` | f64 | 1/s | server-forwarded | server retransmits/sec over the sample window (`CAP_METRICS` v2) |
 | `outstanding` | f64 | frames | client | unacked frames in flight |
 | `bw_up_bps` | f64 | bit/s | client | upstream bandwidth estimate |
 | `fps` | f64 | 1/s | client | derived from loop-iter cadence |
 | `loop_busy_frac` | f64 | ratio | client | busy/(busy+idle) headroom |
 | `apply_us` | f64 | µs | client | recent frame-apply cost |
 | `compose_us` | f64 | µs | client | recent compose cost |
-| `dump_vt_us` | f64 | µs | server-forwarded (deferred) | server-side cost; not yet in `CAP_METRICS` |
+| `dump_vt_us` | f64 | µs | server-forwarded | server's most-recent frame-dump cost (`CAP_METRICS` v2) |
 | `pred_correct_rate` | f64 | ratio | client | predictor self-feedback, recent window |
 | `pred_nocredit_rate` | f64 | ratio | client | " |
 | `pred_incorrect_rate` | f64 | ratio | client | " |
@@ -170,14 +170,17 @@ existing terminals within a schema version.
   `alt_screen` from the reconstructed `server_term`'s `is_alt_screen()`, and
   `echo_flag` from the per-frame `FLAG_ECHO` runtime bit — neither needs a
   capability.
-- **Server-forwarded** terminals (`remote_*` host/app/proc) MUST be transported
-  over the per-frame capability channel defined by RFC 0001 — the same mechanism
-  that carries the `ECHO` flag, scrollback, and exit-status capabilities today
+- **Server-forwarded** terminals (`remote_*` host/app/proc plus the server-side
+  counters `retransmit_rate` and `dump_vt_us`) MUST be transported over the
+  per-frame capability channel defined by RFC 0001 — the same mechanism that
+  carries the `ECHO` flag, scrollback, and exit-status capabilities today
   (FDR 0006) — as a single `CAP_METRICS` capability, negotiated (the client
   advertises it only when a GP species is active) and sampled server-side at a
-  throttled interval. The server-side counters `retransmit_rate` and
-  `dump_vt_us` are deferred (they need server-side `Stats` read-back getters);
-  they ride a later `CAP_METRICS` payload version and remain `NaN` until then.
+  throttled interval. The `CAP_METRICS` payload is a version byte then N
+  little-endian `f64`s: **v1** carried the five `remote_*` host terminals; **v2**
+  appends `retransmit_rate` (the server's retransmits/sec over the sample window)
+  and `dump_vt_us` (its most-recent frame-dump cost). A peer that decodes an
+  unrecognized version keeps its previous values, so the terminals stay `NaN`.
 - **OSC-sourced** identity (`*_frontmost_app`): the client SHOULD derive
   `local_frontmost_app` from the host windowing system and/or OSC title
   sequences (OSC 0/1/2) it receives; the server SHOULD derive

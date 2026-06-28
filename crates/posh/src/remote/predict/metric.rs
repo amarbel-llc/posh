@@ -244,16 +244,23 @@ impl MetricVector {
         self.echo_flag = bool_terminal(echo_flag);
     }
 
-    /// Fill the server-forwarded REMOTE terminals from a decoded `CAP_METRICS`
-    /// payload (RFC 0007 §3), in `caps::METRICS_FIELDS` order. Absent values
-    /// arrive as `NaN` and pass straight through.
-    pub fn fill_remote(&mut self, fields: [f64; 5]) {
-        let [load1, mem_avail_frac, frontmost_app, proc_count, fg_proc_id] = fields;
+    /// Fill the server-forwarded terminals from a decoded `CAP_METRICS` payload
+    /// (RFC 0007 §3), in `caps::METRICS_FIELDS` order. The first five are the
+    /// remote host/app/proc terminals; the last two are the server-side costs
+    /// the client cannot measure locally — `retransmit_rate` (the server's
+    /// retransmits/sec) and `dump_vt_us` (its most-recent frame-dump cost),
+    /// which `fill_transport`/`fill_render_headroom` deliberately leave `NaN`.
+    /// Absent values arrive as `NaN` and pass straight through.
+    pub fn fill_remote(&mut self, fields: [f64; 7]) {
+        let [load1, mem_avail_frac, frontmost_app, proc_count, fg_proc_id, retransmit_rate, dump_vt_us] =
+            fields;
         self.remote_load1 = load1;
         self.remote_mem_avail_frac = mem_avail_frac;
         self.remote_frontmost_app = frontmost_app;
         self.remote_proc_count = proc_count;
         self.remote_fg_proc_id = fg_proc_id;
+        self.retransmit_rate = retransmit_rate;
+        self.dump_vt_us = dump_vt_us;
     }
 
     /// Fill the predictor SELF-FEEDBACK terminals from the live
@@ -466,5 +473,22 @@ mod tests {
         // Unwired terminals stay NaN.
         assert!(m.srtt_ms.is_nan());
         assert!(m.alt_screen.is_nan());
+    }
+
+    #[test]
+    fn remote_terminals_fill_in_cap_metrics_order() {
+        // The CAP_METRICS v2 payload order (RFC 0007 §3): five remote host/app/
+        // proc terminals, then the two server-side costs.
+        let mut m = MetricVector::unavailable();
+        m.fill_remote([0.8, 0.6, 111.0, 42.0, 222.0, 12.5, 333.0]);
+        assert_eq!(m.remote_load1, 0.8);
+        assert_eq!(m.remote_mem_avail_frac, 0.6);
+        assert_eq!(m.remote_frontmost_app, 111.0);
+        assert_eq!(m.remote_proc_count, 42.0);
+        assert_eq!(m.remote_fg_proc_id, 222.0);
+        // The two server-side counters land in the terminals fill_transport /
+        // fill_render_headroom deliberately leave NaN.
+        assert_eq!(m.retransmit_rate, 12.5);
+        assert_eq!(m.dump_vt_us, 333.0);
     }
 }

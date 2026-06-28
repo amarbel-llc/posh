@@ -96,7 +96,8 @@ pub const CAP_DIAG: u8 = 224;
 /// Client entry (empty payload): "I run an evolved GP predictor; attach the
 /// remote-host metric terminals to each frame." Advertised only when a GP
 /// species is active, so a default session never negotiates it. Server entry:
-/// the [`encode_metrics`] payload (load/mem/frontmost-app/proc-count/fg-proc).
+/// the [`encode_metrics`] payload (load/mem/frontmost-app/proc-count/fg-proc,
+/// plus the v2 server counters retransmit-rate/dump-vt-us).
 pub const CAP_METRICS: u8 = 225;
 
 /// The post-table format version we implement (payload of
@@ -291,11 +292,15 @@ pub fn decode_server_diag(payload: &[u8]) -> Result<ServerDiag> {
     })
 }
 
-/// Number of `f64` metric fields in a [`CAP_METRICS`] payload (RFC 0007 §3
-/// remote terminals, in order): load1, mem_avail_frac, frontmost_app,
-/// proc_count, fg_proc_id. Absent terminals are encoded as `NaN`.
-pub const METRICS_FIELDS: usize = 5;
-const METRICS_VERSION: u8 = 1;
+/// Number of `f64` metric fields in a [`CAP_METRICS`] payload (RFC 0007 §3,
+/// in order): load1, mem_avail_frac, frontmost_app, proc_count, fg_proc_id,
+/// then the v2 server-side counters retransmit_rate (server retransmits/sec
+/// over the sample window) and dump_vt_us (the server's most-recent frame-dump
+/// cost). Absent terminals are encoded as `NaN`.
+pub const METRICS_FIELDS: usize = 7;
+/// `CAP_METRICS` payload version. v2 appended the two server-side counters
+/// (retransmit_rate, dump_vt_us) after v1's five `remote_*` host terminals.
+const METRICS_VERSION: u8 = 2;
 
 /// Encode the remote metric terminals as a [`CAP_METRICS`] payload: a version
 /// byte then `METRICS_FIELDS` little-endian `f64`s. Categorical ids are passed
@@ -333,7 +338,7 @@ mod tests {
 
     #[test]
     fn metrics_roundtrip_preserves_values_and_nan() {
-        let fields = [0.5, f64::NAN, 12345.0, 3.0, 67890.0];
+        let fields = [0.5, f64::NAN, 12345.0, 3.0, 67890.0, 7.5, 250.0];
         let cap = encode_metrics(fields);
         assert_eq!(cap.id, CAP_METRICS);
         let got = decode_metrics(&cap.payload).unwrap();
@@ -342,13 +347,15 @@ mod tests {
         assert_eq!(got[2], 12345.0);
         assert_eq!(got[3], 3.0);
         assert_eq!(got[4], 67890.0);
+        assert_eq!(got[5], 7.5); // retransmit_rate
+        assert_eq!(got[6], 250.0); // dump_vt_us
     }
 
     #[test]
     fn metrics_decode_rejects_bad_version_and_short_payload() {
         assert!(decode_metrics(&[]).is_none());
-        assert!(decode_metrics(&[99]).is_none()); // wrong version
-        assert!(decode_metrics(&[1, 0, 0]).is_none()); // truncated body
+        assert!(decode_metrics(&[1]).is_none()); // old version (v1) rejected
+        assert!(decode_metrics(&[METRICS_VERSION, 0, 0]).is_none()); // truncated body
     }
 
     #[test]
