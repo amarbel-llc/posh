@@ -90,6 +90,8 @@ _posh_completions() {
       server) flags="-p -4 -6" ;;
       client) flags="-4 -6" ;;
       ssh) flags="-p -4 -6" ;;
+      # host:[group/]session namespace form (#67): detached remote spawn.
+      *:*) flags="$flags --detach" ;;
     esac
     COMPREPLY=($(compgen -W "$flags" -- "$cur"))
     return 0
@@ -198,7 +200,11 @@ const ZSH_COMPLETIONS: &str = r#"_posh() {
       esac
       ;;
     trailing)
-      # Additional args for commands like 'attach' or 'run'
+      # host:[group/]session namespace form (#67): --detach after the target
+      # requests a detached remote spawn.
+      if [[ $words[2] == *:* ]]; then
+        _values 'options' '--detach[Create the remote session without attaching]'
+      fi
       ;;
   esac
 }
@@ -338,6 +344,10 @@ complete -c posh -n $no_subcmd -a '(__posh_complete_remote_target)' -d 'Remote s
 complete -c posh -n "__fish_seen_subcommand_from attach run detach kill history" -a '(posh list --short 2>/dev/null)' -d 'Session name'
 
 complete -c posh -n "__posh_subcommand_is attach a" -l detach -d 'Create session without attaching'
+
+# host:[group/]session namespace form (#67): --detach requests a detached
+# remote spawn after the target.
+complete -c posh -n 'string match -q "*:*" -- (__posh_subcommand)' -l detach -d 'Create the remote session without attaching'
 
 complete -c posh -n "__fish_seen_subcommand_from completions" -a 'bash zsh fish' -d 'Shell'
 
@@ -499,6 +509,28 @@ mod tests {
                 "{shell:?} should complete tailnet peers"
             );
         }
+    }
+
+    #[test]
+    fn scripts_complete_detach_on_namespace_form() {
+        // #67: `posh host:[group/]session --detach` is the detached remote
+        // spawn. Each shell must offer --detach on the namespace form, not
+        // only after the `attach` subcommand.
+        let bash = Shell::Bash.script();
+        assert!(
+            bash.contains("*:*) flags=\"$flags --detach\""),
+            "bash must offer --detach on the host:session namespace form"
+        );
+        let zsh = Shell::Zsh.script();
+        assert!(
+            zsh.contains("$words[2] == *:*"),
+            "zsh must offer --detach on the host:session namespace form"
+        );
+        let fish = Shell::Fish.script();
+        assert!(
+            fish.contains(r#"string match -q "*:*" -- (__posh_subcommand)"#),
+            "fish must offer --detach on the host:session namespace form"
+        );
     }
 
     #[test]
