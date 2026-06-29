@@ -140,8 +140,11 @@ posh [user@]host:[group/]session   # persistent session on the host over
                                    # the roaming transport — attach-or-
                                    # create, detach here, reattach from
                                    # anywhere; [fe80::1]:dev for IPv6
+posh host:[group/]session --detach # create a detached session on the host
+                                   # and return (remote attach --detach)
 posh :[group/]session              # explicit local attach
-posh list host:                    # remote listing, host-prefixed names
+posh -g GROUP list host:           # remote listing (host-prefixed names);
+                                   # -g scopes it to GROUP on the host
 posh ssh [-4|-6] [-p RANGE] [user@]host [-- command]
 posh server [new] [-p PORT[:PORT2]] [-4|-6] [-- command...]
 posh client [-4|-6] <host> <port>  # key via POSH_KEY, never on argv
