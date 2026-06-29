@@ -114,7 +114,10 @@ Local persistence over Unix sockets.
 	*--short* prints names only; *--json* prints a machine-readable
 	array. *posh list* _host_*:* lists sessions on a remote host
 	(over a *BatchMode* ssh), printing each name host-prefixed so it
-	pastes back as a target.
+	pastes back as a target. *posh -g* _group_ *list* _host_*:*
+	scopes the remote listing to _group_ (the probe runs *posh -g*
+	_group_ *list --short* on the host), and each name pastes back as
+	_host_*:*_group_*/*_name_; the default group is unprefixed.
 
 *run* _name_ [*--*] _command_... (alias: *r*)
 	Send a command to a session (created if needed) without

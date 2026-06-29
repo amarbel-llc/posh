@@ -117,11 +117,13 @@ fn run() -> Result<()> {
         "list" | "ls" | "l" => {
             // `posh list box:` — remote listing through the namespace
             // (RFC 0001 §1): a trailing-colon host runs the same query
-            // completion uses, output prefixed so names paste back in.
+            // completion uses, output prefixed so names paste back in. The
+            // local `-g`/$POSH_GROUP scopes the remote probe (#66), so a
+            // session in a non-default group on the remote is visible.
             if let Some(arg) = args.iter().find(|a| !a.starts_with('-')) {
                 if arg.ends_with(':') {
                     if let target::Target::Host { user, host } = target::Target::parse(arg) {
-                        return cmd_list_remote(user, host);
+                        return cmd_list_remote(user, host, &group);
                     }
                 }
             }
@@ -365,28 +367,42 @@ fn cmd_ssh_session(
     remote::sshwrap::run(&dest, &inner, &opts)
 }
 
-/// The ssh argv behind `posh list host:` (separated for testability).
-fn remote_list_argv(user: Option<&str>, host: &str) -> Vec<String> {
+/// The ssh argv behind `posh list host:` (separated for testability). A
+/// non-default `group` is threaded as `posh -g GROUP list --short` so the
+/// remote probe is scoped to that group (#66); the default group injects no
+/// `-g`, leaving the pre-#66 wire shape unchanged.
+fn remote_list_argv(user: Option<&str>, host: &str, group: &str) -> Vec<String> {
     let dest = match user {
         Some(u) => format!("{u}@{host}"),
         None => host.to_string(),
     };
-    [
-        "ssh",
-        "-o",
-        "BatchMode=yes",
-        &dest,
-        "posh",
-        "list",
-        "--short",
-    ]
-    .iter()
-    .map(|s| s.to_string())
-    .collect()
+    let mut argv: Vec<String> = ["ssh", "-o", "BatchMode=yes", &dest, "posh"]
+        .iter()
+        .map(|s| s.to_string())
+        .collect();
+    if group != "default" {
+        argv.push("-g".into());
+        argv.push(group.into());
+    }
+    argv.push("list".into());
+    argv.push("--short".into());
+    argv
 }
 
-fn cmd_list_remote(user: Option<String>, host: String) -> Result<()> {
-    let argv = remote_list_argv(user.as_deref(), &host);
+/// The pasteable RemoteSession target for one remote-listed name. A
+/// non-default group carries its `group/` segment so the name resolves back to
+/// the same group (Target::parse: `host:group/session`); default-group names
+/// stay bare (`host:name`).
+fn remote_list_line(prefix: &str, group: &str, name: &str) -> String {
+    if group == "default" {
+        format!("{prefix}:{name}")
+    } else {
+        format!("{prefix}:{group}/{name}")
+    }
+}
+
+fn cmd_list_remote(user: Option<String>, host: String, group: &str) -> Result<()> {
+    let argv = remote_list_argv(user.as_deref(), &host, group);
     let out = std::process::Command::new(&argv[0])
         .args(&argv[1..])
         .output()
@@ -403,7 +419,7 @@ fn cmd_list_remote(user: Option<String>, host: String) -> Result<()> {
     };
     for line in String::from_utf8_lossy(&out.stdout).lines() {
         if !line.is_empty() {
-            println!("{prefix}:{line}");
+            println!("{}", remote_list_line(&prefix, group, line));
         }
     }
     Ok(())
@@ -642,13 +658,48 @@ mod tests {
     #[test]
     fn remote_list_command_shape() {
         // `posh list box:` runs a BatchMode ssh so completion-time and
-        // script callers can never hang on an auth prompt.
+        // script callers can never hang on an auth prompt. The default group
+        // injects no `-g`, so the wire shape is unchanged from pre-#66.
         assert_eq!(
-            remote_list_argv(Some("user"), "box"),
+            remote_list_argv(Some("user"), "box", "default"),
             ["ssh", "-o", "BatchMode=yes", "user@box", "posh", "list", "--short"]
                 .map(String::from)
         );
-        assert_eq!(remote_list_argv(None, "box")[3], "box");
+        assert_eq!(remote_list_argv(None, "box", "default")[3], "box");
+    }
+
+    #[test]
+    fn remote_list_threads_nondefault_group() {
+        // #66: `posh -g GROUP list host:` must scope the remote probe to
+        // GROUP via `posh -g GROUP list --short`, or a session created in a
+        // non-default group on the remote is invisible to the probe.
+        assert_eq!(
+            remote_list_argv(Some("user"), "box", "spinclass"),
+            [
+                "ssh",
+                "-o",
+                "BatchMode=yes",
+                "user@box",
+                "posh",
+                "-g",
+                "spinclass",
+                "list",
+                "--short",
+            ]
+            .map(String::from)
+        );
+    }
+
+    #[test]
+    fn remote_list_line_carries_nondefault_group() {
+        // Every printed name must paste back as a valid RemoteSession in the
+        // SAME group: default-group names stay bare, non-default names carry
+        // the `group/` segment (Target::parse: host:group/session).
+        assert_eq!(remote_list_line("box", "default", "dev"), "box:dev");
+        assert_eq!(
+            remote_list_line("user@box", "spinclass", "id7"),
+            "user@box:spinclass/id7"
+        );
     }
 
     #[test]
