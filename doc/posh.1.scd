@@ -56,7 +56,10 @@ _name_
 	roaming UDP connection: attach-or-create just like a local
 	session. Persistence lives in the remote session daemon, so the
 	transport survives roaming and the session survives detach. Use
-	brackets for IPv6 hosts: *[fe80::1]:dev*.
+	brackets for IPv6 hosts: *[fe80::1]:dev*. The group resolves from
+	the target (_group_/) when given, else *-g*/_$POSH_GROUP_, so
+	*posh -g* _g_ _host_*:*_session_ and *posh* _host_*:*_g_*/*_session_
+	are equivalent.
 
 	A leading *--detach* requests a *detached spawn*: create the
 	session on the host (running _command_, default _$SHELL_) and

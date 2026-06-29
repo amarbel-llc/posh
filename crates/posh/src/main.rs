@@ -203,7 +203,7 @@ fn run() -> Result<()> {
                 host,
                 group: g,
                 session,
-            } => cmd_ssh_session(user, host, g, session, &rest[1..], &forward_flag),
+            } => cmd_ssh_session(user, host, g, &group, session, &rest[1..], &forward_flag),
         },
         flag => Err(Error(format!("unknown option {flag} (see posh help)"))),
     }
@@ -340,16 +340,23 @@ fn cmd_client(args: &[String]) -> Result<()> {
 /// `posh host:group/session` attaches to that same session. This is the
 /// fire-and-return primitive a remote session-manager worker (spinclass
 /// FDR 0006, clown) maps onto.
+///
+/// The group resolves from the target (`host:group/session`) if given, else
+/// the global `-g`/$POSH_GROUP — uniform with the group-scoped remote list
+/// (#66) and the local `:session` path, so a grouped worker can use either
+/// `posh -g G host:id` or `posh host:G/id`.
 fn cmd_ssh_session(
     user: Option<String>,
     host: String,
-    group: Option<String>,
+    target_group: Option<String>,
+    global_group: &str,
     session: String,
     extra: &[String],
     forward_flag: &remote::agent::ForwardFlag,
 ) -> Result<()> {
     let (detached, command) = parse_remote_session_extra(extra);
-    let inner = remote_session_argv(group.as_deref(), &session, detached, command);
+    let group = effective_remote_group(target_group.as_deref(), global_group);
+    let inner = remote_session_argv(group, &session, detached, command);
     let dest = match &user {
         Some(u) => format!("{u}@{host}"),
         None => host,
@@ -410,6 +417,18 @@ fn remote_session_argv(
     }
     argv.extend_from_slice(command);
     argv
+}
+
+/// The effective remote group for `posh [-g G] host:[group/]session`: an
+/// explicit target group (`host:group/session`) wins, else the global
+/// `-g`/$POSH_GROUP. "default" resolves to None so the inner argv omits `-g`
+/// (the remote's own default), matching the group-scoped list path (#66).
+fn effective_remote_group<'a>(
+    target_group: Option<&'a str>,
+    global_group: &'a str,
+) -> Option<&'a str> {
+    let group = target_group.unwrap_or(global_group);
+    (group != "default").then_some(group)
 }
 
 /// The ssh argv behind `posh list host:` (separated for testability). A
@@ -796,6 +815,19 @@ mod tests {
         let (detached, command) = parse_remote_session_extra(&e);
         assert!(!detached);
         assert_eq!(command, &v(&["vim"])[..]);
+    }
+
+    #[test]
+    fn effective_remote_group_target_wins_then_global_then_default() {
+        // An explicit target group (host:group/session) beats the global -g.
+        assert_eq!(effective_remote_group(Some("work"), "spinclass"), Some("work"));
+        // No target group: fall back to the global -g/$POSH_GROUP (#66 list
+        // and the session forms now agree on the source).
+        assert_eq!(effective_remote_group(None, "spinclass"), Some("spinclass"));
+        // "default" from either source omits -g (the remote's own default),
+        // matching the list path's wire shape.
+        assert_eq!(effective_remote_group(None, "default"), None);
+        assert_eq!(effective_remote_group(Some("default"), "work"), None);
     }
 
     #[test]

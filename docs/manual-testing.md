@@ -86,7 +86,7 @@ $P user@otherhost                # mosh-style: plain roaming shell
 $P ssh otherhost                 # explicit form (for bare ssh aliases)
 $P otherhost:dev                 # persistent session over the transport
 $P list otherhost:               # remote session listing
-$P otherhost:work/w1 --detach -- sleep 600      # detached spawn (#67)
+$P -g work otherhost:w1 --detach -- sleep 600   # detached spawn (#67)
 $P -g work list otherhost:       # group-scoped remote listing (#66)
 ```
 
@@ -106,12 +106,12 @@ otherwise the wrapper reports "did not find posh server startup message"
 - [ ] Exit the session shell with `exit 3`; `echo $?` locally prints 3.
 - [ ] `posh otherhost:<Tab>` completes the remote session names (second
       Tab is instant — cached).
-- [ ] Detached spawn (#67): `posh otherhost:work/w1 --detach -- sleep 600`
+- [ ] Detached spawn (#67): `posh -g work otherhost:w1 --detach -- sleep 600`
       returns promptly (no attach, no roaming client), printing the remote
       `session "w1" created`/`already exists` status. Re-running it is
-      idempotent. A later `posh otherhost:work/w1` attaches to that same
-      running session. (For the session forms the group is taken from the
-      target — `host:group/session` — not the global `-g`.)
+      idempotent. A later `posh -g work otherhost:w1` attaches to that same
+      running session. (`-g work` and the target form `otherhost:work/w1`
+      are equivalent — the group resolves from the target, else `-g`.)
 - [ ] Group-scoped remote listing (#66): `posh -g work list otherhost:`
       lists `w1` as `otherhost:work/w1` (pastes back into the same group);
       `posh list otherhost:` (default group) does NOT show it.
