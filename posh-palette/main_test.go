@@ -135,3 +135,40 @@ func TestRecomputeFiltersByName(t *testing.T) {
 		t.Fatalf("want [Logging], got %+v", m.filtered)
 	}
 }
+
+// The "dialog" view (RFC 0005 §3.2) switches the model into viewDialog and
+// renders the supplied body verbatim, with a copy hint.
+func TestShowDialogRendersBody(t *testing.T) {
+	body := "agent-fwd: on channels=0\nserver: endpoint=up symlink=ok"
+	updated, _ := newModel(&conn{}).Update(showMsg{View: "dialog", Title: "agent forwarding", Body: body})
+	dm := updated.(model)
+	if dm.view != viewDialog {
+		t.Fatalf("view = %d, want viewDialog", dm.view)
+	}
+	if dm.body != body {
+		t.Errorf("body = %q, want %q", dm.body, body)
+	}
+	out := dm.dialogView()
+	for _, want := range []string{"agent-fwd: on channels=0", "server: endpoint=up symlink=ok", "copy"} {
+		if !strings.Contains(out, want) {
+			t.Errorf("dialogView() missing %q in:\n%s", want, out)
+		}
+	}
+}
+
+// Pressing copy in a dialog notifies the client (which owns the real terminal
+// and emits the OSC 52); the notification carries no id (RFC 0005 §4.3).
+func TestDialogCopyNotifies(t *testing.T) {
+	c, collect := captureConn(t)
+	m := newModel(c)
+	m.view = viewDialog
+	m.sendCopy()
+
+	msgs := collect()
+	if len(msgs) != 1 || msgs[0].Method != "ui.copy" {
+		t.Fatalf("want a single ui.copy, got %+v", msgs)
+	}
+	if msgs[0].ID != nil {
+		t.Error("a notification must not carry an id")
+	}
+}

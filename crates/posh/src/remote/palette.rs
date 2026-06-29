@@ -38,6 +38,9 @@ pub enum PaletteEvent {
     Action { method: String, params: Value },
     /// The palette was dismissed without a selection, or the renderer closed it.
     Cancelled,
+    /// The user pressed copy in an info dialog (RFC 0005 §4.3). The client copies
+    /// the dialog body to the terminal clipboard (OSC 52); the dialog stays open.
+    Copy,
     /// Nothing actionable yet (a partial line, or only a response/ack arrived).
     None,
 }
@@ -52,6 +55,9 @@ pub struct Palette {
     open: bool,
     ctrl_buf: Vec<u8>,
     next_id: i64,
+    /// The body of the most recent info dialog (RFC 0005 §3.2), held so a
+    /// `ui.copy` can be answered with an OSC 52 to the real terminal.
+    dialog_body: String,
 }
 
 /// Locate the `posh-palette` binary: `$POSH_PALETTE` override, else next to the
@@ -113,6 +119,7 @@ impl Palette {
             open: false,
             ctrl_buf: Vec::new(),
             next_id: 0,
+            dialog_body: String::new(),
         };
         if p.handshake() {
             Some(p)
@@ -147,6 +154,23 @@ impl Palette {
             json!({ "view": "palette", "title": title, "commands": commands }),
         );
         self.open = true;
+    }
+
+    /// Summon an info dialog (RFC 0005 §3.2 `ui.show` view="dialog"): `body` is
+    /// shown with copy + dismiss affordances (#99). The body is retained so a
+    /// later `ui.copy` can be answered with an OSC 52 to the real terminal.
+    pub fn show_dialog(&mut self, title: &str, body: &str) {
+        self.dialog_body = body.to_string();
+        self.send_request(
+            "ui.show",
+            json!({ "view": "dialog", "title": title, "body": body }),
+        );
+        self.open = true;
+    }
+
+    /// The body of the most recent info dialog, for answering a `ui.copy`.
+    pub fn dialog_body(&self) -> &str {
+        &self.dialog_body
     }
 
     /// Drain the renderer PTY into the emulated screen. Returns whether the
@@ -186,6 +210,10 @@ impl Palette {
                 Some("ui.cancelled") => {
                     self.open = false;
                     return PaletteEvent::Cancelled;
+                }
+                Some("ui.copy") => {
+                    // Dialog copy (RFC 0005 §4.3): the dialog stays open.
+                    return PaletteEvent::Copy;
                 }
                 Some(method) if v.get("id").is_some() => {
                     // A selected-command action request: ack, then hand it up.
@@ -363,6 +391,7 @@ mod tests {
             open: true,
             ctrl_buf: Vec::new(),
             next_id: 0,
+            dialog_body: String::new(),
         };
         (p, sp[1])
     }
@@ -400,6 +429,35 @@ mod tests {
         write_line(peer, r#"{"jsonrpc":"2.0","method":"ui.cancelled"}"#);
         assert!(matches!(p.poll_events(), PaletteEvent::Cancelled));
         assert!(!p.is_open());
+        unsafe { libc::close(peer) };
+    }
+
+    // A ui.copy notification surfaces a Copy event and keeps the dialog open
+    // (the client copies the body to the clipboard; the dialog stays up).
+    #[test]
+    fn poll_events_surfaces_copy() {
+        let (mut p, peer) = palette_with_ctrl();
+        write_line(peer, r#"{"jsonrpc":"2.0","method":"ui.copy"}"#);
+        assert!(matches!(p.poll_events(), PaletteEvent::Copy));
+        assert!(p.is_open(), "copy must not close the dialog");
+        unsafe { libc::close(peer) };
+    }
+
+    // show_dialog summons a `dialog` view carrying the body, and retains that
+    // body so a later ui.copy can be answered with an OSC 52.
+    #[test]
+    fn show_dialog_sends_dialog_view_and_keeps_body() {
+        let (mut p, peer) = palette_with_ctrl();
+        p.show_dialog("agent forwarding", "agent-fwd: on\nserver: up");
+        assert_eq!(p.dialog_body(), "agent-fwd: on\nserver: up");
+        assert!(p.is_open());
+        let mut buf = [0u8; 512];
+        let n = unsafe { libc::read(peer, buf.as_mut_ptr() as *mut libc::c_void, buf.len()) };
+        let line = std::str::from_utf8(&buf[..n.max(0) as usize]).unwrap();
+        let v: Value = serde_json::from_str(line.trim()).unwrap();
+        assert_eq!(v["method"], "ui.show");
+        assert_eq!(v["params"]["view"], "dialog");
+        assert_eq!(v["params"]["body"], "agent-fwd: on\nserver: up");
         unsafe { libc::close(peer) };
     }
 

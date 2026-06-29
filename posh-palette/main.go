@@ -120,6 +120,8 @@ type showParams struct {
 	Commands []command `json:"commands,omitempty"`
 	Title    string    `json:"title,omitempty"`
 	Prompt   string    `json:"prompt,omitempty"`
+	// Body is the text rendered by the "dialog" view (RFC 0005 §3.2).
+	Body string `json:"body,omitempty"`
 }
 
 // bubbletea messages produced from control input.
@@ -135,6 +137,13 @@ var (
 			BorderForeground(lipgloss.Color("214")).
 			Padding(1, 2).
 			Width(46)
+
+	// The info dialog shares the palette's frame but sizes to the terminal
+	// (set per-render) rather than the fixed command-list width.
+	dialogStyle = lipgloss.NewStyle().
+			Border(lipgloss.DoubleBorder()).
+			BorderForeground(lipgloss.Color("214")).
+			Padding(1, 2)
 
 	titleStyle = lipgloss.NewStyle().Bold(true).Foreground(lipgloss.Color("214"))
 	// Selection highlight keeps its purple (63), not the yellow border.
@@ -153,10 +162,11 @@ type viewKind int
 const (
 	viewNone viewKind = iota
 	viewPalette
+	viewDialog
 )
 
 type keymap struct {
-	up, down, sel, cancel key.Binding
+	up, down, sel, cancel, copyKey, dismiss key.Binding
 }
 
 type model struct {
@@ -168,6 +178,11 @@ type model struct {
 	commands []command
 	filtered []command
 	selected int
+	// Dialog view (RFC 0005 ui.show view="dialog"): the body text shown, a
+	// transient "copied" footer flag, and the latest known terminal width.
+	body   string
+	copied bool
+	width  int
 }
 
 func newModel(c *conn) model {
@@ -179,10 +194,12 @@ func newModel(c *conn) model {
 		conn:  c,
 		input: in,
 		keys: keymap{
-			up:     key.NewBinding(key.WithKeys("up")),
-			down:   key.NewBinding(key.WithKeys("down")),
-			sel:    key.NewBinding(key.WithKeys("enter")),
-			cancel: key.NewBinding(key.WithKeys("esc")),
+			up:      key.NewBinding(key.WithKeys("up")),
+			down:    key.NewBinding(key.WithKeys("down")),
+			sel:     key.NewBinding(key.WithKeys("enter")),
+			cancel:  key.NewBinding(key.WithKeys("esc")),
+			copyKey: key.NewBinding(key.WithKeys("y", "c")),
+			dismiss: key.NewBinding(key.WithKeys("esc", "q", "enter")),
 		},
 	}
 }
@@ -192,29 +209,54 @@ func (m model) Init() tea.Cmd { return nil }
 func (m model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 	switch msg := msg.(type) {
 	case showMsg:
-		if msg.View != "palette" {
+		switch msg.View {
+		case "palette":
+			m.view = viewPalette
+			m.commands = msg.Commands
+			m.title = msg.Title
+			if m.title == "" {
+				m.title = "Commands"
+			}
+			if msg.Prompt != "" {
+				m.input.Prompt = msg.Prompt
+			}
+			m.input.SetValue("")
+			m.input.Focus()
+			m.selected = 0
+			m.recompute()
+		case "dialog":
+			m.view = viewDialog
+			m.title = msg.Title
+			if m.title == "" {
+				m.title = "Info"
+			}
+			m.body = msg.Body
+			m.copied = false
+		default:
 			m.view = viewNone
-			return m, nil
 		}
-		m.view = viewPalette
-		m.commands = msg.Commands
-		m.title = msg.Title
-		if m.title == "" {
-			m.title = "Commands"
-		}
-		if msg.Prompt != "" {
-			m.input.Prompt = msg.Prompt
-		}
-		m.input.SetValue("")
-		m.input.Focus()
-		m.selected = 0
-		m.recompute()
 		return m, nil
 	case hideMsg:
 		m.view = viewNone
 		return m, nil
+	case tea.WindowSizeMsg:
+		m.width = msg.Width
+		return m, nil
 	case tea.KeyPressMsg:
-		if m.view != viewPalette {
+		switch m.view {
+		case viewDialog:
+			switch {
+			case key.Matches(msg, m.keys.copyKey):
+				m.sendCopy()
+				m.copied = true
+			case key.Matches(msg, m.keys.dismiss):
+				m.conn.notify("ui.cancelled", nil)
+				m.view = viewNone
+			}
+			return m, nil
+		case viewPalette:
+			// fall through to the palette key handling below
+		default:
 			return m, nil // hidden: the client owns the keyboard
 		}
 		switch {
@@ -276,11 +318,45 @@ func (m model) choose() {
 	m.conn.request(a.Method, a.Params)
 }
 
+// sendCopy asks the client to copy the dialog body to the clipboard. The
+// renderer can't reach the real terminal (its output is composited by the
+// client), so the client emits the OSC 52 itself — this notification is the
+// signal (RFC 0005 §4.3).
+func (m model) sendCopy() {
+	m.conn.notify("ui.copy", nil)
+}
+
 func (m model) View() tea.View {
-	if m.view == viewPalette {
+	switch m.view {
+	case viewPalette:
 		return tea.NewView(m.paletteView())
+	case viewDialog:
+		return tea.NewView(m.dialogView())
 	}
 	return tea.NewView("")
+}
+
+func (m model) dialogView() string {
+	var b strings.Builder
+	b.WriteString(titleStyle.Render(m.title))
+	b.WriteString("\n\n")
+	b.WriteString(m.body)
+	b.WriteString("\n\n")
+	footer := "y copy · esc close"
+	if m.copied {
+		footer = "✓ copied · esc close"
+	}
+	b.WriteString(helpStyle.Render(footer))
+	style := dialogStyle
+	// Size to the terminal so long debug lines wrap inside the frame instead of
+	// overrunning it; cap so a wide terminal doesn't yield an unwieldy panel.
+	if w := m.width - 4; w > 20 {
+		if w > 100 {
+			w = 100
+		}
+		style = style.Width(w)
+	}
+	return style.Render(b.String())
 }
 
 func (m model) paletteView() string {
@@ -363,7 +439,7 @@ func readControl(c *conn, r *os.File, p *tea.Program) {
 			c.respond(m.ID, res)
 		case "ui.show":
 			var sp showParams
-			if json.Unmarshal(m.Params, &sp) != nil || sp.View != "palette" {
+			if json.Unmarshal(m.Params, &sp) != nil || (sp.View != "palette" && sp.View != "dialog") {
 				c.respondError(m.ID, -32602, "invalid params: unknown view")
 				continue
 			}

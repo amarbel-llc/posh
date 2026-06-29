@@ -134,13 +134,20 @@ Show a view. `result` is an empty object `{}` acknowledging the view is up
 
 | field      | type      | required | meaning                                  |
 |------------|-----------|----------|------------------------------------------|
-| `view`     | string    | yes      | View to display. Version 1 defines `"palette"`. |
+| `view`     | string    | yes      | View to display. Defines `"palette"` and `"dialog"`. |
 | `commands` | command[] | for `palette` | The command list (§5).             |
-| `title`    | string    | no       | Heading; default `"Commands"`.           |
-| `prompt`   | string    | no       | Filter-input prompt; default `"/ "`.     |
+| `title`    | string    | no       | Heading; default `"Commands"` (palette) / `"Info"` (dialog). |
+| `prompt`   | string    | no       | Filter-input prompt; default `"/ "` (palette only). |
+| `body`     | string    | for `dialog` | The text the `dialog` view displays.   |
 
 An unknown `view` MUST yield error `-32602` (invalid params). A second `ui.show`
 while a view is up REPLACES it (re-configures in place).
+
+The `"palette"` view is the filterable command list. The `"dialog"` view shows
+`body` as read-only text with copy + dismiss affordances: the user MAY copy the
+body (renderer → client `ui.copy`, §4.3) or dismiss it (`ui.cancelled`, §4.2).
+Copy keeps the dialog up; only dismiss closes it. A `dialog` carries no
+`commands`.
 
 #### 3.3 `ui.hide` (request)
 
@@ -177,6 +184,14 @@ A command with no `action` (a no-op/separator) MUST NOT produce a request.
 The renderer sends `ui.cancelled` when the user dismisses a view without
 selecting (e.g. `Esc`). It carries no `params`. The client SHOULD treat this as
 "palette closed, do nothing".
+
+#### 4.3 `ui.copy` (notification)
+
+The renderer sends `ui.copy` when the user presses the copy key in a `"dialog"`
+view (§3.2). It carries no `params`. The renderer cannot reach the real terminal
+(its output is composited by the client), so the client is responsible for
+copying the dialog `body` it sent to the user's clipboard — e.g. by emitting
+OSC 52. The dialog stays open after a copy; only `ui.cancelled` closes it.
 
 ### 5. Command and action model
 

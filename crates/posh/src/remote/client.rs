@@ -249,6 +249,18 @@ fn agent_debug_summary(st: &ClientState) -> String {
     format!("{client}\n{server}")
 }
 
+/// Present a debug-info summary (#99): in a copyable, dismissable palette dialog
+/// when the renderer is available, else the notification banner as a fallback so
+/// the command never silently no-ops. Either surface composites over the session,
+/// so it stays readable even while the session is frozen.
+fn show_debug_info(st: &mut ClientState, title: &str, body: &str, now: u64) {
+    if let Some(p) = st.palette.as_mut() {
+        p.show_dialog(title, body);
+    } else {
+        st.notify.set_message(body, false, now);
+    }
+}
+
 /// Dispatch a palette-selected command action (RFC 0005 §7). Returns whether the
 /// client should send to the server promptly (the escape-to-shell flag or quit).
 fn dispatch_palette_action(
@@ -327,21 +339,21 @@ fn dispatch_palette_action(
             false
         }
         "session.debuginfo" => {
-            // Show the wedge-triage line on-screen (visible even while frozen)
-            // and write the full transport snapshot to the diagnostic sink (#3),
-            // so the user can read the cause in-session and keep the forensic
-            // record without a second terminal or knowing the pid.
+            // Show the wedge-triage info (visible even while frozen) and write the
+            // full transport snapshot to the diagnostic sink (#3), so the user can
+            // read the cause in-session and keep the forensic record without a
+            // second terminal or knowing the pid.
             let summary = wedge_debug_summary(st, now);
             dump_client_state(st, now);
-            st.notify.set_message(&summary, false, now);
+            show_debug_info(st, "wedge debug", &summary, now);
             false
         }
         "session.agentinfo" => {
-            // FDR 0004: show the client-side agent-forwarding state on-screen and
-            // log it, so forwarding can be diagnosed from the palette in-session.
+            // FDR 0004: show the client-side agent-forwarding state and log it, so
+            // forwarding can be diagnosed from the palette in-session.
             let summary = agent_debug_summary(st);
             util::log_write("agentinfo", &summary);
-            st.notify.set_message(&summary, false, now);
+            show_debug_info(st, "agent forwarding", &summary, now);
             false
         }
         "client.suspend" => {
@@ -915,6 +927,22 @@ fn drive_client(st: &mut ClientState, raw: &RawMode, port: u16) -> Result<i32> {
                     }
                     Some(PaletteEvent::Cancelled) => {
                         st.initialized = false; // palette closed -> repaint session
+                    }
+                    Some(PaletteEvent::Copy) => {
+                        // Dialog copy (#99): the renderer can't reach the real
+                        // terminal, so emit the OSC 52 here with the body we sent.
+                        let body = st
+                            .palette
+                            .as_ref()
+                            .map(|p| p.dialog_body().to_string())
+                            .unwrap_or_default();
+                        if !body.is_empty() {
+                            let osc = format!(
+                                "\x1b]52;c;{}\x1b\\",
+                                posh_term::base64::encode(body.as_bytes())
+                            );
+                            let _ = util::write_all_retry(STDOUT, osc.as_bytes(), 1000);
+                        }
                     }
                     _ => {}
                 }
