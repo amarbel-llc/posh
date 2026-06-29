@@ -117,10 +117,12 @@ a *-A* there is the real *ssh* flag, not posh forwarding.
 
 Local persistence over Unix sockets.
 
-*attach* _name_ [_command_...] [*--detach*] (alias: *a*)
+*attach* [*--detach*] _name_ [*--*] [_command_...] (alias: *a*)
 	Attach to a session, creating it (running _command_, default
 	_$SHELL_) if needed. With *--detach*, ensure the session exists,
-	print status, and exit without attaching. Detach key: *Ctrl-\\*.
+	print status, and exit without attaching. A *--* ends option
+	parsing so _command_ is taken literally (it may itself contain
+	*--detach*). Detach key: *Ctrl-\\*.
 
 *list* [*--short*] [*-j*|*--json*] (aliases: *ls*, *l*)
 	List sessions in the group: name, pid, attached client count.

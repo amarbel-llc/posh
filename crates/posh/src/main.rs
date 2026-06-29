@@ -210,21 +210,37 @@ fn run() -> Result<()> {
 }
 
 fn cmd_attach(group: &str, args: &[String]) -> Result<()> {
-    let mut detach_flag = false;
-    let mut name: Option<&str> = None;
-    let mut command: Vec<String> = Vec::new();
-    for arg in args {
-        if arg == "--detach" {
-            detach_flag = true;
-        } else if name.is_none() {
-            name = Some(arg);
-        } else {
-            command.push(arg.clone());
-        }
-    }
-    let name = name.ok_or_else(|| Error::from("attach requires a session name"))?;
-    let command = (!command.is_empty()).then_some(command);
+    let (detach_flag, name, command) = parse_attach_args(args)?;
+    let command = (!command.is_empty()).then(|| command.to_vec());
     session::client::cmd_attach(&Config::new(group)?, name, command, detach_flag)
+}
+
+/// Parse `attach` args as `[--detach] <name> [--detach] [--] [command...]`.
+/// `--detach` is recognized only as an option around the name (either side);
+/// a single `--` ends option parsing so the create-command is OPAQUE — it may
+/// itself contain `--detach` or `--`, matching `posh run` and the remote
+/// namespace path. (Previously `--detach` was scanned across the whole arg
+/// list, silently swallowing one inside the command, and a `--` separator was
+/// passed through as a literal command word.)
+fn parse_attach_args(args: &[String]) -> Result<(bool, &str, &[String])> {
+    let mut detach = false;
+    let mut i = 0;
+    while args.get(i).map(String::as_str) == Some("--detach") {
+        detach = true;
+        i += 1;
+    }
+    let name = args
+        .get(i)
+        .ok_or_else(|| Error::from("attach requires a session name"))?;
+    i += 1;
+    while args.get(i).map(String::as_str) == Some("--detach") {
+        detach = true;
+        i += 1;
+    }
+    if args.get(i).map(String::as_str) == Some("--") {
+        i += 1;
+    }
+    Ok((detach, name, &args[i..]))
 }
 
 fn cmd_history(group: &str, args: &[String]) -> Result<()> {
@@ -592,10 +608,12 @@ GLOBAL OPTIONS
         `poshterity replay FILE` / `posh rec replay FILE`.
 
 SESSION COMMANDS (local persistence)
-    attach <name> [command...] [--detach]      (alias: a)
+    attach [--detach] <name> [--] [command...]  (alias: a)
         Attach to a session, creating it (running command, default $SHELL)
         if needed. With --detach, ensure the session exists, print status,
-        and exit without attaching. Detach key: Ctrl-\\.
+        and exit without attaching. A `--` ends option parsing so the
+        command is taken literally (it may contain --detach). Detach key:
+        Ctrl-\\.
 
     list [--short] [-j|--json]                 (aliases: ls, l)
         List sessions in the group: name, pid, attached client count.
@@ -815,6 +833,51 @@ mod tests {
         let (detached, command) = parse_remote_session_extra(&e);
         assert!(!detached);
         assert_eq!(command, &v(&["vim"])[..]);
+    }
+
+    #[test]
+    fn parse_attach_args_grammar() {
+        let v = |xs: &[&str]| -> Vec<String> { xs.iter().map(|s| s.to_string()).collect() };
+
+        // Name only.
+        let a = v(&["dev"]);
+        let (d, n, c) = parse_attach_args(&a).unwrap();
+        assert!(!d);
+        assert_eq!(n, "dev");
+        assert!(c.is_empty());
+
+        // Leading --detach (the form the integration tests and clown use).
+        let a = v(&["--detach", "dev", "sleep", "300"]);
+        let (d, n, c) = parse_attach_args(&a).unwrap();
+        assert!(d);
+        assert_eq!(n, "dev");
+        assert_eq!(c, &v(&["sleep", "300"])[..]);
+
+        // Post-name --detach (the remote inner-argv form).
+        let a = v(&["dev", "--detach", "worker"]);
+        let (d, n, c) = parse_attach_args(&a).unwrap();
+        assert!(d);
+        assert_eq!(n, "dev");
+        assert_eq!(c, &v(&["worker"])[..]);
+
+        // The #1 fix: a `--` makes the command OPAQUE, so a `--detach` inside
+        // it is preserved as a command word, not swallowed as the flag.
+        let a = v(&["dev", "--detach", "--", "worker", "--detach"]);
+        let (d, n, c) = parse_attach_args(&a).unwrap();
+        assert!(d);
+        assert_eq!(n, "dev");
+        assert_eq!(c, &v(&["worker", "--detach"])[..]);
+
+        // A `--` separator without `--detach`: opaque command, no detach.
+        let a = v(&["dev", "--", "vim", "-u", "NONE"]);
+        let (d, n, c) = parse_attach_args(&a).unwrap();
+        assert!(!d);
+        assert_eq!(n, "dev");
+        assert_eq!(c, &v(&["vim", "-u", "NONE"])[..]);
+
+        // Missing name is an error (with or without a leading flag).
+        assert!(parse_attach_args(&v(&[])).is_err());
+        assert!(parse_attach_args(&v(&["--detach"])).is_err());
     }
 
     #[test]
