@@ -188,6 +188,7 @@ dependencies = [
  "libc",
  "mephisto",
  "posh-build",
+ "posh-proto",
  "posh-term",
  "poshterity",
  "serde_json",
@@ -196,6 +197,14 @@ dependencies = [
 [[package]]
 name = "posh-build"
 version = "0.0.0"
+
+[[package]]
+name = "posh-proto"
+version = "0.0.0"
+dependencies = [
+ "posh-build",
+ "posh-term",
+]
 
 [[package]]
 name = "posh-term"
@@ -210,6 +219,7 @@ version = "0.0.0"
 dependencies = [
  "libc",
  "posh-build",
+ "posh-proto",
  "posh-term",
 ]
 

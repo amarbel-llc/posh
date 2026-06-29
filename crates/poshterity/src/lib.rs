@@ -20,6 +20,10 @@
 pub mod assert;
 pub mod castx;
 pub mod cli;
+/// Deterministic server-frame harness (github #75): drives posh-proto's real
+/// frame codecs over an in-memory channel so remote tests need no socket, PTY,
+/// or clock.
+pub mod framereplay;
 pub mod golden;
 pub mod json;
 pub mod player;

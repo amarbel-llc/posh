@@ -28,6 +28,7 @@ zmx (Zig) lives in its own repository.
 crates/
   posh-term/   standalone terminal emulation library (no dependencies)
   posh/        the posh binary
+  posh-proto/  shared frame/display protocol: Snapshot + new_frame renderer, frame codecs (DumpDiff/MorphDelta), ServerFrame/FrameBody wire types, RFC 0001 caps (github #75)
   poshterity/    deterministic terminal recorder/replayer (lib + poshterity bin; posh rec)
   mosh-ffi/    C++ FFI oracle: drives mosh's terminal + predictor for differential tests (dev/test only; ADR 0004)
 doc/           scdoc man-page sources (man posh, posh-server, posh-client, poshterity, posh(7))

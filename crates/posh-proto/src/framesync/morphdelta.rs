@@ -25,8 +25,8 @@
 
 use posh_term::Terminal;
 
-use crate::remote::display;
-use crate::remote::sync::FrameBody;
+use crate::display;
+use crate::frame::FrameBody;
 
 use super::dumpdiff::DumpDiff;
 use super::{ApplyOutcome, Baseline, CurrentFrame, FrameApplier, FrameEncoder};
@@ -107,7 +107,7 @@ pub(super) fn baseline_from(num: u64, term: &Terminal) -> Baseline {
     Baseline {
         num,
         dump: term.dump_vt(),
-        snapshot: crate::remote::display::Snapshot::from_term(term),
+        snapshot: crate::display::Snapshot::from_term(term),
         alt_screen: term.is_alt_screen(),
         rows: term.rows(),
         cols: term.cols(),

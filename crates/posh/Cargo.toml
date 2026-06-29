@@ -8,6 +8,10 @@ repository.workspace = true
 
 [dependencies]
 posh-term = { path = "../posh-term" }
+# Shared frame/display protocol (github #75): Snapshot + new_frame, the frame
+# codecs, ServerFrame/FrameBody, and the capability table. Extracted so
+# poshterity can drive the same codecs without a posh->poshterity->posh cycle.
+posh-proto = { path = "../posh-proto" }
 # `posh rec ...` aliases the standalone poshterity binary; both call
 # poshterity::cli::run so the replay logic lives in one place.
 poshterity = { path = "../poshterity" }

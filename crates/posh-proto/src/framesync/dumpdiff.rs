@@ -7,7 +7,7 @@
 
 use posh_term::Terminal;
 
-use crate::remote::sync::{self, FrameBody};
+use crate::frame::{self, FrameBody};
 
 use super::{ApplyOutcome, Baseline, CurrentFrame, FrameApplier, FrameEncoder};
 
@@ -22,7 +22,7 @@ impl FrameEncoder for DumpDiff {
         // server.rs where the Stats live; this returns only the chosen body.
         match acked {
             Some(base) => {
-                let diff = sync::make_diff(&base.dump, cur.dump);
+                let diff = frame::make_diff(&base.dump, cur.dump);
                 if diff.len() + 8 < cur.dump.len() {
                     FrameBody::Diff {
                         base: base.num,
@@ -60,7 +60,7 @@ impl FrameApplier for DumpDiff {
             FrameBody::Diff { base: _, diff, .. } => {
                 // The caller has already confirmed base == applied_num before
                 // dispatching here; reconstruct against the held dump.
-                match sync::apply_diff(applied_data, diff) {
+                match frame::apply_diff(applied_data, diff) {
                     Some(bytes) => bytes,
                     None => return ApplyOutcome::ReackAndWait,
                 }

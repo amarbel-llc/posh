@@ -8,6 +8,10 @@ repository.workspace = true
 
 [dependencies]
 posh-term = { path = "../posh-term" }
+# Shared frame/display protocol (github #75): the deterministic server-frame
+# harness drives posh-proto's real codecs (DumpDiff/MorphDelta) over an
+# in-memory FrameChannel.
+posh-proto = { path = "../posh-proto" }
 # Used only by the bin's `record` path (PTY/libc FFI). The lib is
 # #![forbid(unsafe_code)] and never touches libc; the recorder lives in the
 # bin-only src/record.rs.

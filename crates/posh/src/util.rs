@@ -41,6 +41,15 @@ impl From<&str> for Error {
     }
 }
 
+// Bridge posh-proto's mirror error into this crate's error, so the frame
+// decode paths that moved into posh-proto (github #75) keep flowing through
+// `?` at posh-side call sites (e.g. `ClientMessage::decode` in remote::sync).
+impl From<posh_proto::Error> for Error {
+    fn from(e: posh_proto::Error) -> Error {
+        Error(e.0)
+    }
+}
+
 /// Milliseconds since process start (monotonic).
 pub fn now_ms() -> u64 {
     static START: OnceLock<Instant> = OnceLock::new();

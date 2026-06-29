@@ -2,7 +2,7 @@
 //! bit (0x02) of both datagram directions. Unknown ids are preserved on
 //! decode and ignored by consumers; malformed tables reject the message.
 
-use crate::util::{Error, Result};
+use crate::error::{Error, Result};
 
 /// Reserved flags bit (both directions): a capability table follows the
 /// flags byte. Permanent; never reuse for anything else.

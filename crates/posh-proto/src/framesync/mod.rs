@@ -27,8 +27,8 @@
 
 use posh_term::Terminal;
 
-use crate::remote::display::Snapshot;
-use crate::remote::sync::FrameBody;
+use crate::display::Snapshot;
+use crate::frame::FrameBody;
 
 mod dumpdiff;
 mod morphdelta;
@@ -90,6 +90,11 @@ impl FrameSync {
 /// `cols` capture the parts of the terminal state that `Snapshot` does **not**
 /// carry, so an encoder can detect a transition a morph cannot express and
 /// fall back to a keyframe.
+///
+/// `Clone` so a harness can retain each produced frame's baseline and advance
+/// its "acked" base to any of them deterministically (github #75); production
+/// builds one per frame and never clones.
+#[derive(Clone)]
 pub struct Baseline {
     pub num: u64,
     pub dump: Vec<u8>,
@@ -161,7 +166,7 @@ pub trait FrameApplier {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::remote::sync::FrameBody;
+    use crate::frame::FrameBody;
     use morphdelta::{baseline_from, morph_expressible};
     use posh_term::Terminal;
 

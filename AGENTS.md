@@ -16,8 +16,14 @@ crates/
                (#![forbid(unsafe_code)]; frozen public API in src/lib.rs)
   posh/        the posh binary — session daemon, remote transport, CLI.
                All libc/PTY FFI lives here, never in posh-term.
-  posh-rec/    deterministic step-ratcheted terminal recorder/replayer built
-               on posh-term (phase 0 landed; roadmap is the #56 epic)
+  posh-proto/  shared frame/display protocol: the Snapshot + new_frame renderer,
+               the swappable frame codecs (DumpDiff/MorphDelta), the
+               ServerFrame/FrameBody wire types, and the RFC 0001 capability
+               table. Extracted from posh's remote module so poshterity can
+               drive the same codecs without a posh→poshterity→posh cycle (#75).
+  poshterity/  deterministic step-ratcheted terminal recorder/replayer built
+               on posh-term (#56 epic); also hosts the deterministic
+               server-frame harness (framereplay, #75)
 doc/           scdoc man-page SOURCES — posh(1), posh-server(1),
                posh-client(1), posh(7). Compiled by the flake; see below.
 docs/          ADRs (docs/decisions/), RFCs (docs/rfcs/), feature records

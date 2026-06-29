@@ -1,0 +1,14 @@
+[package]
+name = "posh-proto"
+version.workspace = true # inert placeholder; real version flows from version.env (see root Cargo.toml)
+description = "Shared posh frame/display protocol: the Snapshot + new_frame renderer, the swappable frame codecs (DumpDiff/MorphDelta), the ServerFrame/FrameBody wire types, and the RFC 0001 capability table"
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+
+[dependencies]
+posh-term = { path = "../posh-term" }
+
+[build-dependencies]
+# Shared version + git-sha flow-out (github #71). See eng-versioning(7).
+posh-build = { path = "../posh-build" }

@@ -153,11 +153,10 @@ impl Snapshot {
 /// $TERM (hardcoded 1049 when no database answers; nothing under
 /// --no-init or when the entry defines no alternate screen); the explicit
 /// clear covers terminals whose alt buffer isn't cleared on entry.
-pub fn open() -> Vec<u8> {
-    open_with(&crate::terminfo::ca_mode_bracket())
-}
-
-fn open_with(bracket: &Option<(Vec<u8>, Vec<u8>)>) -> Vec<u8> {
+/// `bracket` is the terminfo smcup/rmcup pair for `$TERM` (the `posh` crate's
+/// `terminfo::ca_mode_bracket`); the terminfo lookup stays in `posh` (this
+/// crate is terminfo-free), so `posh`'s `display::open()` wrapper injects it.
+pub fn open_with(bracket: &Option<(Vec<u8>, Vec<u8>)>) -> Vec<u8> {
     let mut out = Vec::new();
     if let Some((smcup, _)) = bracket {
         out.extend_from_slice(smcup);
@@ -170,11 +169,9 @@ fn open_with(bracket: &Option<(Vec<u8>, Vec<u8>)>) -> Vec<u8> {
 /// visible cursor, mouse/paste/focus modes off, scroll region reset, and
 /// finally back to the primary screen (terminfo rmcup) — the user's
 /// pre-connect shell, prompt and all.
-pub fn close() -> Vec<u8> {
-    close_with(&crate::terminfo::ca_mode_bracket())
-}
-
-fn close_with(bracket: &Option<(Vec<u8>, Vec<u8>)>) -> Vec<u8> {
+/// `bracket` is the terminfo smcup/rmcup pair (see [`open_with`]); `posh`'s
+/// `display::close()` wrapper injects it from its `terminfo` module.
+pub fn close_with(bracket: &Option<(Vec<u8>, Vec<u8>)>) -> Vec<u8> {
     let mut out = Vec::from(
         b"\x1b[0m\x1b[?25h\x1b[?1l\x1b>\x1b[?1003l\x1b[?1002l\x1b[?1000l\x1b[?9l\
           \x1b[?1016l\x1b[?1006l\x1b[?1005l\x1b[?2004l\x1b[?1004l\x1b[?1007l\x1b[r"
@@ -1393,7 +1390,7 @@ mod tests {
         let diff_off = new_frame(true, &Snapshot::from_term(&next), &Snapshot::from_term(&prev), false);
         assert!(String::from_utf8_lossy(&diff_off).contains("\x1b[?1007l"));
 
-        assert!(String::from_utf8_lossy(&close()).contains("\x1b[?1007l"));
+        assert!(String::from_utf8_lossy(&close_with(&None)).contains("\x1b[?1007l"));
     }
 
     #[test]
