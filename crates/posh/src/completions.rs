@@ -27,16 +27,37 @@ impl Shell {
     }
 }
 
-const BASH_COMPLETIONS: &str = r#"_posh_remote_sessions() {
+const BASH_COMPLETIONS: &str = r#"_posh_cmdline_group() {
+  # The effective group for a remote query: -g/--group on the command line,
+  # else $POSH_GROUP, else "default" (mirrors posh's own resolution).
+  local i=1
+  while [[ $i -lt ${#COMP_WORDS[@]} ]]; do
+    if [[ "${COMP_WORDS[$i]}" == "-g" || "${COMP_WORDS[$i]}" == "--group" ]]; then
+      echo "${COMP_WORDS[$((i+1))]}"
+      return
+    fi
+    ((i++))
+  done
+  echo "${POSH_GROUP:-default}"
+}
+
+_posh_remote_sessions() {
   # Remote session names for host:<Tab>, via a short-TTL cache so repeated
   # tabs are instant and a dead host stalls at most once per window. The
-  # 2s connect timeout and ~30s TTL are tuning levers (FDR 0001).
-  local host=$1
+  # 2s connect timeout and ~30s TTL are tuning levers (FDR 0001). A
+  # non-default group (#98) is scoped with -g and keyed into the cache, so
+  # `posh -g G host:` and `posh host:G/` list G's sessions, not the default.
+  local host=$1 group=$2
   local cache_dir=${XDG_CACHE_HOME:-$HOME/.cache}/posh
   local cache=$cache_dir/sessions-$host
+  local gflag=""
+  if [[ -n "$group" && "$group" != "default" ]]; then
+    gflag="-g $group"
+    cache=$cache-$group
+  fi
   if [ -z "$(find "$cache" -newermt '-30 seconds' 2>/dev/null)" ]; then
     mkdir -p "$cache_dir"
-    ssh -o BatchMode=yes -o ConnectTimeout=2 "$host" posh list --short \
+    ssh -o BatchMode=yes -o ConnectTimeout=2 "$host" posh $gflag list --short \
       >"$cache.new" 2>/dev/null && mv "$cache.new" "$cache"
   fi
   cat "$cache" 2>/dev/null
@@ -99,9 +120,20 @@ _posh_completions() {
 
   if [[ -z "$subcmd" ]]; then
     # host:<Tab> — complete the host's session names (RFC 0001 namespace).
+    # The group is taken from an embedded host:group/ segment, else the
+    # command-line -g/$POSH_GROUP (#98), and names paste back accordingly.
     if [[ "$cur" == ?*:* && "$cur" != \[* ]]; then
       local rhost="${cur%%:*}"
-      local rsessions=$(_posh_remote_sessions "$rhost" | sed "s|^|$rhost:|" | tr '\n' ' ')
+      local rrest="${cur#*:}"
+      local rgroup rprefix
+      if [[ "$rrest" == */* ]]; then
+        rgroup="${rrest%%/*}"
+        rprefix="$rhost:$rgroup/"
+      else
+        rgroup="$(_posh_cmdline_group)"
+        rprefix="$rhost:"
+      fi
+      local rsessions=$(_posh_remote_sessions "$rhost" "$rgroup" | sed "s|^|$rprefix|" | tr '\n' ' ')
       COMPREPLY=($(compgen -W "$rsessions" -- "$cur"))
       return 0
     fi
@@ -149,6 +181,13 @@ const ZSH_COMPLETIONS: &str = r#"_posh() {
 
   case $state in
     commands)
+      # host:<Tab> / host:group/<Tab> — remote session names over the
+      # namespace (#98; bash/fish had this, zsh did not). Handle it first
+      # and stop, so the colon word isn't also offered as a local name.
+      if [[ $words[CURRENT] == ?*:* && $words[CURRENT] != \[* ]]; then
+        _posh_remote_sessions
+        return 0
+      fi
       # The bare first argument is also the attach shorthand (session
       # name) and the mosh-style remote form (ssh config alias or tailnet peer).
       _posh_sessions
@@ -229,6 +268,56 @@ _posh_sessions() {
   _describe 'local session' sessions
 }
 
+_posh_cmdline_group() {
+  # The effective group for a remote query: -g/--group on the command line,
+  # else $POSH_GROUP, else "default" (mirrors posh's resolution).
+  local i=1
+  while (( i < CURRENT )); do
+    if [[ $words[i] == "-g" || $words[i] == "--group" ]]; then
+      echo ${words[i+1]}
+      return
+    fi
+    (( i++ ))
+  done
+  echo ${POSH_GROUP:-default}
+}
+
+_posh_remote_sessions() {
+  # host:<Tab> / host:group/<Tab> -> host:[group/]session names over a
+  # BatchMode ssh, short-TTL cached (FDR 0001 levers). Group from an
+  # embedded host:group/ segment, else the command-line -g/$POSH_GROUP
+  # (#98); a non-default group is scoped with -g and keyed into the cache.
+  local cur=$words[CURRENT]
+  local host=${cur%%:*}
+  local rest=${cur#*:}
+  local group prefix
+  if [[ $rest == */* ]]; then
+    group=${rest%%/*}
+    prefix="$host:$group/"
+  else
+    group=$(_posh_cmdline_group)
+    prefix="$host:"
+  fi
+  local cache_dir=${XDG_CACHE_HOME:-$HOME/.cache}/posh
+  local cache=$cache_dir/sessions-$host
+  local -a gflag
+  if [[ -n $group && $group != default ]]; then
+    gflag=(-g $group)
+    cache=$cache-$group
+  fi
+  if [[ -z $(find $cache -newermt '-30 seconds' 2>/dev/null) ]]; then
+    mkdir -p $cache_dir
+    ssh -o BatchMode=yes -o ConnectTimeout=2 $host posh $gflag list --short \
+      >$cache.new 2>/dev/null && mv $cache.new $cache
+  fi
+  local -a names
+  names=(${(f)"$(cat $cache 2>/dev/null)"})
+  local -a targets
+  local n
+  for n in $names; do targets+=("$prefix$n"); done
+  compadd -- $targets
+}
+
 _posh_ssh_hosts() {
   # ssh config Host aliases (wildcard patterns dropped). Reads the user
   # config plus the common config.d/conf.d include layouts.
@@ -286,27 +375,63 @@ function __posh_ssh_config_hosts
     end | sort -u
 end
 
+function __posh_cmdline_group
+    # The effective group for a remote query: -g/--group on the command
+    # line, else $POSH_GROUP, else "default" (mirrors posh's resolution).
+    set -l tokens (commandline -opc)
+    set -l i 1
+    set -l n (count $tokens)
+    while test $i -le $n
+        switch $tokens[$i]
+            case -g --group
+                test (math $i + 1) -le $n; and echo $tokens[(math $i + 1)]; and return
+            end
+        set i (math $i + 1)
+    end
+    if set -q POSH_GROUP
+        echo $POSH_GROUP
+    else
+        echo default
+    end
+end
+
 function __posh_remote_sessions
     # Remote session names for host:<Tab>, via a short-TTL cache so
     # repeated tabs are instant and a dead host stalls at most once per
     # window. The 2s connect timeout and ~30s TTL are tuning levers
-    # (FDR 0001).
+    # (FDR 0001). A non-default group (#98) is scoped with -g and keyed
+    # into the cache, so the right group's sessions are listed.
     set -l host $argv[1]
+    set -l group $argv[2]
     set -l cache_dir $HOME/.cache/posh
     set -q XDG_CACHE_HOME; and set cache_dir $XDG_CACHE_HOME/posh
     set -l cache $cache_dir/sessions-$host
+    set -l gflag
+    if test -n "$group" -a "$group" != default
+        set gflag -g $group
+        set cache $cache-$group
+    end
     if test -z "$(find $cache -newermt '-30 seconds' 2>/dev/null)"
         mkdir -p $cache_dir
-        ssh -o BatchMode=yes -o ConnectTimeout=2 $host posh list --short >$cache.new 2>/dev/null
+        ssh -o BatchMode=yes -o ConnectTimeout=2 $host posh $gflag list --short >$cache.new 2>/dev/null
         and mv $cache.new $cache
     end
     cat $cache 2>/dev/null
 end
 
 function __posh_complete_remote_target
-    # host:<Tab> -> host:session candidates (RFC 0001 namespace).
-    set -l m (string match -r '^([^:\[]+):' -- (commandline -ct)); or return
-    __posh_remote_sessions $m[2] | string replace -r '^' "$m[2]:"
+    # host:<Tab> / host:group/<Tab> -> host:[group/]session candidates
+    # (RFC 0001 namespace). Group from an embedded host:group/ segment,
+    # else the command-line -g/$POSH_GROUP (#98).
+    set -l m (string match -r '^([^:\[]+):(.*)$' -- (commandline -ct)); or return
+    set -l host $m[2]
+    set -l rest $m[3]
+    if string match -q '*/*' -- $rest
+        set -l group (string split -m1 / $rest)[1]
+        __posh_remote_sessions $host $group | string replace -r '^' "$host:$group/"
+    else
+        __posh_remote_sessions $host (__posh_cmdline_group) | string replace -r '^' "$host:"
+    end
 end
 
 complete -c posh -f
@@ -470,6 +595,61 @@ mod tests {
     }
 
     #[test]
+    fn zsh_script_parses() {
+        // zsh -n syntax-checks without executing. Skip quietly where zsh is
+        // unavailable (it is absent from the build sandbox). Guards the
+        // hand-written zsh remote-completion path added in #98.
+        use std::io::Write;
+        use std::process::{Command, Stdio};
+        let Ok(mut child) = Command::new("zsh")
+            .arg("-n")
+            .stdin(Stdio::piped())
+            .stderr(Stdio::piped())
+            .spawn()
+        else {
+            return;
+        };
+        child
+            .stdin
+            .as_mut()
+            .unwrap()
+            .write_all(Shell::Zsh.script().as_bytes())
+            .unwrap();
+        let out = child.wait_with_output().unwrap();
+        assert!(
+            out.status.success(),
+            "zsh -n rejected the completion script: {}",
+            String::from_utf8_lossy(&out.stderr)
+        );
+    }
+
+    #[test]
+    fn fish_script_parses() {
+        // `fish --no-execute` syntax-checks a file. Skip quietly where fish
+        // is unavailable. Guards the hand-written fish remote-completion
+        // path (group resolution + embedded-group parsing, #98).
+        use std::process::Command;
+        let path = std::env::temp_dir().join("posh-completions-parse-check.fish");
+        if std::fs::write(&path, Shell::Fish.script()).is_err() {
+            return;
+        }
+        let Ok(out) = Command::new("fish")
+            .arg("--no-execute")
+            .arg(&path)
+            .output()
+        else {
+            let _ = std::fs::remove_file(&path);
+            return;
+        };
+        let _ = std::fs::remove_file(&path);
+        assert!(
+            out.status.success(),
+            "fish --no-execute rejected the completion script: {}",
+            String::from_utf8_lossy(&out.stderr)
+        );
+    }
+
+    #[test]
     fn scripts_complete_ssh_config_aliases() {
         // github #37: the remote forms (bare `posh <host>`, `posh ssh`)
         // complete from ~/.ssh/config Host aliases, wildcards dropped.
@@ -487,7 +667,8 @@ mod tests {
         // RFC 0001 namespace: host:<Tab> queries the host's sessions over
         // ssh — BatchMode so a Tab can never hang on auth, a bounded
         // connect timeout, and a short-TTL cache (FDR 0001 tuning levers).
-        for shell in [Shell::Bash, Shell::Fish] {
+        // All three shells now carry it (#98 added zsh).
+        for shell in [Shell::Bash, Shell::Zsh, Shell::Fish] {
             let script = shell.script();
             for needle in ["BatchMode=yes", "ConnectTimeout=2", "/posh", "sessions-"] {
                 assert!(
@@ -495,6 +676,26 @@ mod tests {
                     "{shell:?} remote completion missing {needle}"
                 );
             }
+        }
+    }
+
+    #[test]
+    fn remote_session_completion_is_group_aware() {
+        // #98: the remote query threads the effective group (command-line
+        // -g/$POSH_GROUP, resolved by *_posh_cmdline_group, or an embedded
+        // host:group/ segment) and scopes the ssh query with -g, so
+        // `posh -g G host:<Tab>` lists G's sessions — not the default group.
+        // All three shells, including zsh, which previously had none.
+        for shell in [Shell::Bash, Shell::Zsh, Shell::Fish] {
+            let script = shell.script();
+            assert!(
+                script.contains("_posh_cmdline_group"),
+                "{shell:?} must resolve the command-line group for remote completion"
+            );
+            assert!(
+                script.contains("posh $gflag list --short"),
+                "{shell:?} must scope the remote query with -g"
+            );
         }
     }
 
