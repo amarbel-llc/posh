@@ -94,7 +94,7 @@ fn set_logging(st: &mut ClientState, enabled: bool, now: u64) {
 /// escape action lives here. The logging entries reflect the current state —
 /// client logging from this process, server logging from the last frame's
 /// FLAG_SERVER_LOG (`server_log_on`).
-fn palette_commands(server_log_on: bool) -> Value {
+fn palette_commands(server_log_on: bool, scroll_opt: bool) -> Value {
     // Imperative labels (the verb is the action): "on"/"off" read ambiguously as
     // status, so a user who saw "…: on" assumed it was already enabled.
     let (client_log_name, client_log_enabled): (&str, bool) = if util::log_active() {
@@ -106,6 +106,14 @@ fn palette_commands(server_log_on: bool) -> Value {
         ("Disable server debug logging", false)
     } else {
         ("Enable server debug logging", true)
+    };
+    // posh#100 diagnostic toggle: disabling the scroll-region optimization
+    // forces full per-row repaints, avoiding the DECSTBM region scroll that
+    // leaves a stuck background on some terminals.
+    let (scroll_opt_name, scroll_opt_enabled): (&str, bool) = if scroll_opt {
+        ("Disable scroll-region optimization", false)
+    } else {
+        ("Enable scroll-region optimization", true)
     };
     json!([
         { "name": "Echo: adaptive", "action": { "method": "echo.set", "params": { "model": "adaptive" } } },
@@ -119,6 +127,7 @@ fn palette_commands(server_log_on: bool) -> Value {
         { "name": "Echo: from-scratch (evolved GP)", "action": { "method": "echo.set", "params": { "model": "scratch" } } },
         { "name": client_log_name, "action": { "method": "logging.set", "params": { "enabled": client_log_enabled } } },
         { "name": server_log_name, "action": { "method": "logging.set", "params": { "scope": "server", "enabled": server_log_enabled } } },
+        { "name": scroll_opt_name, "action": { "method": "render.scroll_opt", "params": { "enabled": scroll_opt_enabled } } },
         { "name": "Shell out (server)", "action": { "method": "shell.open" } },
         { "name": "Reset & resync (force redraw)", "action": { "method": "session.resync" } },
         { "name": "Dump wedge forensics", "action": { "method": "session.forensics" } },
@@ -136,7 +145,7 @@ fn open_palette(st: &mut ClientState) -> bool {
     if st.palette.is_none() {
         st.palette = Palette::spawn(st.rows, st.cols);
     }
-    let commands = palette_commands(st.server_log_on);
+    let commands = palette_commands(st.server_log_on, st.scroll_opt);
     if let Some(p) = st.palette.as_mut() {
         p.open("Commands", commands);
         st.initialized = false; // repaint to show the overlay
@@ -303,6 +312,24 @@ fn dispatch_palette_action(
             }
             if let Some(en) = enabled {
                 set_logging(st, en, now); // client-local (default scope)
+            }
+            false
+        }
+        "render.scroll_opt" => {
+            // posh#100 diagnostic: flip new_frame's scroll-shortcut optimization
+            // and force a full repaint so the new mode takes effect immediately.
+            if let Some(en) = params.get("enabled").and_then(Value::as_bool) {
+                st.scroll_opt = en;
+                st.initialized = false;
+                st.notify.set_message(
+                    if en {
+                        "scroll-region optimization: on"
+                    } else {
+                        "scroll-region optimization: off"
+                    },
+                    false,
+                    now,
+                );
             }
             false
         }
@@ -575,6 +602,11 @@ struct ClientState {
     /// Latest server-reported debug-logging state (FLAG_SERVER_LOG, #3); drives
     /// the palette's "Server debug logging" command label. Off until reported.
     server_log_on: bool,
+    /// Whether `new_frame`'s scroll-shortcut optimization is enabled (default
+    /// on). The palette's "scroll-region optimization" toggle flips it; off
+    /// forces full per-row repaints, avoiding the DECSTBM region scroll that
+    /// leaves a stuck background on some terminals (posh#100).
+    scroll_opt: bool,
     /// Pending keystroke timestamps for the input-latency gauge: (outbox
     /// end-offset after a stdin read, queue time ms). Drained as the server's
     /// `input_ack` covers each offset. Capped so a stalled link can't grow it.
@@ -685,6 +717,7 @@ fn client_loop(
         last_scroll_state: None,
         echo_on: false,
         server_log_on: false,
+        scroll_opt: true,
         input_sent: VecDeque::new(),
         framesync,
         applier,
@@ -1824,7 +1857,7 @@ fn compose_frame(st: &mut ClientState, now: u64) -> Vec<u8> {
     st.notify.apply(&mut next, now);
 
     let wheel = wheel_active(st);
-    let bytes = display::new_frame(st.initialized, &st.last_drawn, &next, wheel);
+    let bytes = display::new_frame_opt(st.initialized, &st.last_drawn, &next, wheel, st.scroll_opt);
     st.initialized = true;
     st.last_drawn = next;
     if let Some(t) = compose_timer {
@@ -1944,7 +1977,8 @@ fn compose_scroll_frame(st: &mut ClientState) -> Vec<u8> {
     let mut snap = Snapshot::from_term(&term);
     snap.cursor_visible = false; // no live cursor in history
     display::apply_scroll_indicator(&mut snap, offset);
-    let bytes = display::new_frame(st.initialized, &st.last_drawn, &snap, wheel_active(st));
+    let bytes =
+        display::new_frame_opt(st.initialized, &st.last_drawn, &snap, wheel_active(st), st.scroll_opt);
     st.initialized = true;
     st.last_drawn = snap;
     bytes
@@ -2516,7 +2550,7 @@ mod tests {
 
     #[test]
     fn palette_commands_includes_both_logging_scopes() {
-        let cmds = palette_commands(false);
+        let cmds = palette_commands(false, true);
         let arr = cmds.as_array().expect("commands is an array");
         let names: Vec<&str> = arr.iter().filter_map(|c| c["name"].as_str()).collect();
         assert!(
@@ -2547,7 +2581,23 @@ mod tests {
             names.iter().any(|n| n.to_lowercase().contains("agent-forwarding")),
             "agent-forwarding debug command missing: {names:?}"
         );
-        assert_eq!(arr.len(), 15, "expected 15 commands, got {names:?}");
+        // posh#100 scroll-region optimization toggle, with a state-dependent
+        // label (Disable when on, Enable when off).
+        assert!(
+            names.iter().any(|n| n.contains("Disable scroll-region optimization")),
+            "scroll-opt disable command missing: {names:?}"
+        );
+        let off: Vec<String> = palette_commands(false, false)
+            .as_array()
+            .unwrap()
+            .iter()
+            .filter_map(|c| c["name"].as_str().map(String::from))
+            .collect();
+        assert!(
+            off.iter().any(|n| n == "Enable scroll-region optimization"),
+            "scroll-opt enable command missing when off: {off:?}"
+        );
+        assert_eq!(arr.len(), 16, "expected 16 commands, got {names:?}");
     }
 
     #[test]
@@ -2713,6 +2763,7 @@ mod tests {
             last_scroll_state: None,
             echo_on: false,
             server_log_on: false,
+            scroll_opt: true,
             input_sent: VecDeque::new(),
             framesync: framesync::FrameSync::DumpDiff,
             applier: Box::new(framesync::DumpDiff),

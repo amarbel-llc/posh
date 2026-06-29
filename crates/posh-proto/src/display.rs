@@ -284,6 +284,23 @@ fn cell_width(cell: &Cell) -> u16 {
 /// terminal turning the wheel into arrows itself (which kitty does
 /// unconditionally on the alt screen). Off, the mode-sync is unchanged.
 pub fn new_frame(initialized: bool, last: &Snapshot, f: &Snapshot, wheel: bool) -> Vec<u8> {
+    new_frame_opt(initialized, last, f, wheel, true)
+}
+
+/// As [`new_frame`], with `allow_scroll` gating the scroll-shortcut
+/// optimization. When false the renderer never emits a scroll (neither a DECSTBM
+/// region scroll nor a screen-wide linefeed scroll) — it repaints shifted rows
+/// cell by cell instead. The posh client exposes this as a runtime palette
+/// toggle: the DECSTBM region scroll interacts badly with a non-default
+/// background pen on some terminals (kitty included), leaving a stuck background
+/// (posh#100), so disabling it is the conservative fallback.
+pub fn new_frame_opt(
+    initialized: bool,
+    last: &Snapshot,
+    f: &Snapshot,
+    wheel: bool,
+    allow_scroll: bool,
+) -> Vec<u8> {
     let mut init = initialized;
     let mut frame = FrameState {
         out: String::new(),
@@ -361,7 +378,7 @@ pub fn new_frame(initialized: bool, last: &Snapshot, f: &Snapshot, wheel: bool) 
     // the match downward, then emit one scroll instead of rewriting every
     // shifted row.
     let mut frame_y: u16 = 0;
-    if init {
+    if init && allow_scroll {
         let height = f.rows as usize;
         let mut lines_scrolled = 0usize;
         let mut scroll_height = 0usize;
@@ -932,6 +949,69 @@ mod tests {
         let mut verify = Terminal::with_scrollback(5, 20, 0);
         verify.process(&bytes);
         assert_screens_match(&verify, &next, &bytes);
+    }
+
+    // Reproduction for posh#100: the remote client paints its real tty
+    // frame-by-frame via new_frame, and that tty ACCUMULATES across frames —
+    // unlike assert_morph, which re-seeds a clean prev each step. A local
+    // (raw-passthrough) attach shows the same raw stream verbatim. Drive a
+    // background-SGR sequence (full-width bars via EL-under-bg, a moving
+    // highlight, scrolling, a cleared status line) through both and assert the
+    // accumulated remote tty matches the local view cell-for-cell. A
+    // background-color bleed / over-paint is exactly a divergence here.
+    #[test]
+    fn accumulating_render_matches_local_no_background_bleed() {
+        let (rows, cols) = (8u16, 24u16);
+        let steps: &[&[u8]] = &[
+            b"\x1b[2J\x1b[H",
+            b"item 1\r\nitem 2\r\nitem 3\r\nitem 4\r\n",
+            // Highlight item 2 with a full-width background bar (EL under bg).
+            b"\x1b[2;1H\x1b[44m\x1b[Kitem 2\x1b[0m",
+            // Move the highlight to item 3: clear the old bar (EL under the
+            // default pen), draw the new bar.
+            b"\x1b[2;1H\x1b[0m\x1b[Kitem 2\x1b[3;1H\x1b[44m\x1b[Kitem 3\x1b[0m",
+            // More output, scrolling the highlighted rows up.
+            b"\x1b[8;1Hitem 5\r\nitem 6\r\nitem 7\r\n",
+            // A red status line across the bottom, then clear it.
+            b"\x1b[8;1H\x1b[41m\x1b[Kstatus\x1b[0m",
+            b"\x1b[8;1H\x1b[0m\x1b[K",
+        ];
+
+        let mut local = Terminal::with_scrollback(rows, cols, 0);
+        let mut outer = Terminal::with_scrollback(rows, cols, 0);
+        let mut last = Snapshot::blank(rows, cols);
+        let mut init = false;
+        for step in steps {
+            local.process(step);
+            let next = Snapshot::from_term(&local);
+            let bytes = new_frame(init, &last, &next, false);
+            outer.process(&bytes);
+            last = next;
+            init = true;
+        }
+        assert_snapshots_match(&Snapshot::from_term(&outer), &Snapshot::from_term(&local), b"");
+    }
+
+    #[test]
+    fn scroll_opt_off_still_renders_a_scroll_correctly() {
+        // posh#100 fallback: with the scroll shortcut disabled, an upward scroll
+        // is repainted row-by-row and must still reproduce the screen exactly —
+        // and the emitted stream differs from the optimized one (the flag has an
+        // effect, so the palette toggle actually does something).
+        let seed: &[u8] = b"a\r\nb\r\nc\r\nd\r\ne\r\nf";
+        let prev = term_with(6, 20, seed);
+        let mut next_t = term_with(6, 20, seed);
+        next_t.process(b"\r\ng"); // scroll up by one row
+        let prev_s = Snapshot::from_term(&prev);
+        let next_s = Snapshot::from_term(&next_t);
+
+        let on = new_frame_opt(true, &prev_s, &next_s, false, true);
+        let off = new_frame_opt(true, &prev_s, &next_s, false, false);
+        assert_ne!(on, off, "the scroll-opt flag must change the emitted stream");
+
+        let mut v = term_with(6, 20, seed);
+        v.process(&off);
+        assert_screens_match(&v, &next_t, &off);
     }
 
     #[test]

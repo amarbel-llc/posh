@@ -37,6 +37,7 @@ impl Dump {
 const USAGE: &str = "\
 usage:
   poshterity replay <file> [--to-marker NAME] [--dump text|vt|flat]
+  poshterity replay <file> --raw [--size COLSxROWS] [--dump text|vt|flat]
   poshterity step <file> (--by byte|escape|write|change|frame|marker [--n N]
                         | --to-marker NAME) [--frame-gap SECS] [--dump ...]
   poshterity bless <file> --golden <path> [--at MARKER] [--kind grid|vt|flat]
@@ -47,7 +48,13 @@ Replay a .castx / asciinema .cast v2 recording through the in-process
 posh-term emulator. `replay` prints the final screen; `step` advances by
 discrete steps; `bless` writes a golden-frame snapshot and `assert` checks
 one (the CI gate). Default --dump text, --kind grid. Timing is never
-replayed as sleeps.";
+replayed as sleeps.
+
+With --raw, <file> is a bare terminal-output byte stream (no .castx header) —
+e.g. a script(1) capture of a posh client's STDOUT. A raw stream carries no
+dimensions, so pass --size COLSxROWS (default 80x24); EL/erase clear to that
+width, so the size must match the captured terminal. --dump vt re-serializes
+SGR so background runs are visible.";
 
 /// Run the poshterity CLI over `args` — the arguments after the program name
 /// (for the `poshterity` bin) or after the `rec` subcommand (for `posh rec`).
@@ -78,6 +85,9 @@ fn run_replay(args: &[String]) -> Result<(), String> {
     let mut file: Option<&str> = None;
     let mut dump = Dump::Text;
     let mut to_marker: Option<&str> = None;
+    let mut raw = false;
+    let mut size: Option<(u16, u16)> = None;
+    let mut max_bytes: Option<usize> = None;
     let mut i = 0;
     while i < args.len() {
         match args[i].as_str() {
@@ -87,6 +97,24 @@ fn run_replay(args: &[String]) -> Result<(), String> {
             }
             "--to-marker" => {
                 to_marker = Some(args.get(i + 1).ok_or("--to-marker requires a value")?);
+                i += 2;
+            }
+            "--raw" => {
+                raw = true;
+                i += 1;
+            }
+            "--size" => {
+                let v = args.get(i + 1).ok_or("--size requires COLSxROWS")?;
+                size = Some(parse_resize(v).ok_or("--size expects COLSxROWS, e.g. 120x40")?);
+                i += 2;
+            }
+            "--bytes" => {
+                max_bytes = Some(
+                    args.get(i + 1)
+                        .ok_or("--bytes requires a count")?
+                        .parse()
+                        .map_err(|_| "--bytes expects a non-negative integer")?,
+                );
                 i += 2;
             }
             flag if flag.starts_with('-') => {
@@ -102,6 +130,31 @@ fn run_replay(args: &[String]) -> Result<(), String> {
         }
     }
     let path = file.ok_or_else(|| format!("replay requires a <file>\n\n{USAGE}"))?;
+
+    // Raw mode: a bare byte stream (e.g. a script(1) capture of a client's
+    // STDOUT), no .castx header and so no markers and no embedded dimensions.
+    if raw {
+        if to_marker.is_some() {
+            return Err("--to-marker is not supported with --raw (a raw stream has no markers)".into());
+        }
+        let mut bytes = std::fs::read(path).map_err(|e| format!("{path}: {e}"))?;
+        // --bytes N replays only the first N bytes, to inspect a transient
+        // mid-stream state (e.g. a bled frame before the session's exit/rmcup
+        // wipes the alt screen). Bisect N to localize when an artifact appears.
+        if let Some(n) = max_bytes {
+            bytes.truncate(n);
+        }
+        let (cols, rows) = size.unwrap_or((80, 24));
+        let out = replay_raw(&bytes, cols, rows, dump);
+        return std::io::stdout().write_all(&out).map_err(|e| format!("write: {e}"));
+    }
+    if size.is_some() {
+        return Err("--size only applies to --raw (a .castx carries its own dimensions)".into());
+    }
+    if max_bytes.is_some() {
+        return Err("--bytes only applies to --raw".into());
+    }
+
     let src = std::fs::read_to_string(path).map_err(|e| format!("{path}: {e}"))?;
     let out = match to_marker {
         // Stop at a named marker instead of feeding the whole stream.
@@ -343,6 +396,18 @@ pub fn replay_source(src: &str, dump: Dump) -> Result<Vec<u8>, String> {
     Ok(dump_terminal(replay.terminal(), dump))
 }
 
+/// Replay a bare terminal-output byte stream (no .castx header) through the
+/// emulator at a fixed size and dump the final screen. For inspecting a capture
+/// taken with `script(1)` or any tool that records raw tty bytes — e.g. a posh
+/// client's STDOUT (github #100). A raw stream carries no dimensions, so the
+/// caller supplies them; EL/erase clear to `cols`, so a wrong width misplaces
+/// trailing-cell clears. `--dump vt` re-serializes SGR so background runs show.
+pub fn replay_raw(bytes: &[u8], cols: u16, rows: u16, dump: Dump) -> Vec<u8> {
+    let mut replay = Replay::new(rows, cols);
+    replay.feed(bytes);
+    dump_terminal(replay.terminal(), dump)
+}
+
 /// Parse an asciinema resize payload `"COLSxROWS"` into `(cols, rows)`.
 fn parse_resize(data: &str) -> Option<(u16, u16)> {
     let (w, h) = data.split_once('x')?;
@@ -367,6 +432,17 @@ mod tests {
         assert_eq!(parse_resize("80x24"), Some((80, 24)));
         assert_eq!(parse_resize("nope"), None);
         assert_eq!(parse_resize("80x"), None);
+    }
+
+    #[test]
+    fn replay_raw_feeds_a_headerless_stream() {
+        // No .castx header: raw bytes go straight to the emulator at the given
+        // size. An EL under a background pen fills to the supplied width, which
+        // is exactly what a raw capture needs to reproduce (github #100).
+        let out = replay_raw(b"\x1b[2J\x1b[Hhello\r\nworld", 20, 3, Dump::Text);
+        let text = String::from_utf8(out).unwrap();
+        assert!(text.contains("hello"), "{text:?}");
+        assert!(text.contains("world"), "{text:?}");
     }
 
     #[test]
