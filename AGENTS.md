@@ -108,9 +108,9 @@ the `eng-*(7)` manpages — read them with `man eng-versioning`,
 - **Docs:** significant designs get a record under `docs/` — ADR for
   architecture decisions, RFC for wire/file-format contracts, FDR for
   user-facing features. The target grammar + capability table is RFC 0001;
-  the FDRs (0001-0009) cover the namespace, takeover, mosh-parity, ssh agent
+  the FDRs (0001-0010) cover the namespace, takeover, mosh-parity, ssh agent
   forwarding, scrollback sync, optimistic echo, the SIGUSR2 transport-state
-  dump, escape-to-shell, and the command palette.
+  dump, escape-to-shell, the command palette, and remote detached spawn.
 
 ## Key design facts (load-bearing, verified)
 
