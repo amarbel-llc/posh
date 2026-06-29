@@ -86,6 +86,8 @@ $P user@otherhost                # mosh-style: plain roaming shell
 $P ssh otherhost                 # explicit form (for bare ssh aliases)
 $P otherhost:dev                 # persistent session over the transport
 $P list otherhost:               # remote session listing
+$P otherhost:work/w1 --detach -- sleep 600      # detached spawn (#67)
+$P -g work list otherhost:       # group-scoped remote listing (#66)
 ```
 
 All run `posh-server new` over ssh (the session form wraps an inner
@@ -104,6 +106,15 @@ otherwise the wrapper reports "did not find posh server startup message"
 - [ ] Exit the session shell with `exit 3`; `echo $?` locally prints 3.
 - [ ] `posh otherhost:<Tab>` completes the remote session names (second
       Tab is instant — cached).
+- [ ] Detached spawn (#67): `posh otherhost:work/w1 --detach -- sleep 600`
+      returns promptly (no attach, no roaming client), printing the remote
+      `session "w1" created`/`already exists` status. Re-running it is
+      idempotent. A later `posh otherhost:work/w1` attaches to that same
+      running session. (For the session forms the group is taken from the
+      target — `host:group/session` — not the global `-g`.)
+- [ ] Group-scoped remote listing (#66): `posh -g work list otherhost:`
+      lists `w1` as `otherhost:work/w1` (pastes back into the same group);
+      `posh list otherhost:` (default group) does NOT show it.
 
 ## 5. SSH agent forwarding (FDR 0004)
 

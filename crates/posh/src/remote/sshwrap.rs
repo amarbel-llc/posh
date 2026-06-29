@@ -191,6 +191,63 @@ pub fn run(target: &str, remote_cmd: &[String], opts: &SshOptions) -> Result<()>
     crate::remote::client::run(&host, port, opts.family, opts.agent_source.clone())
 }
 
+/// #67: create-or-ensure a DETACHED session on the remote host and return,
+/// without standing up the roaming transport. Unlike [`run`], this execs the
+/// inner posh command directly over ssh (no `posh-server new`, no UDP
+/// client): `inner` is `posh [-g GROUP] attach SESSION --detach [command...]`,
+/// which double-forks a session daemon on the host and exits. A later
+/// foreground `posh host:group/session` attaches to that same daemon session
+/// through a fresh, disposable transport pair. Agent forwarding (FDR 0004)
+/// rides that later foreground connection, not the spawn — so no `-A` here.
+pub fn run_detached(target: &str, inner: &[String], opts: &SshOptions) -> Result<()> {
+    let remote_cmd = detached_command(inner, &forwarded_env_vars());
+
+    let mut ssh = Command::new("ssh");
+    match opts.family {
+        Family::Inet => {
+            ssh.arg("-4");
+        }
+        Family::Inet6 => {
+            ssh.arg("-6");
+        }
+        Family::Auto => {}
+    }
+    let status = ssh
+        .arg(target)
+        .arg("--")
+        .arg(&remote_cmd)
+        .stdin(Stdio::inherit()) // keep the tty for auth prompts
+        .stdout(Stdio::inherit()) // pass through `posh attach --detach`'s status line
+        .stderr(Stdio::inherit())
+        .status()
+        .map_err(|e| Error(format!("cannot exec ssh: {e}")))?;
+    if !status.success() {
+        return Err(Error(format!("remote detached spawn failed on {target}")));
+    }
+    Ok(())
+}
+
+/// Builds the remote command for a detached spawn (#67): locale/TERM env
+/// prefixes (the same forwarding the foreground bootstrap applies), then the
+/// inner `posh ... attach ... --detach ...` argv, each element shell-quoted so
+/// a command with spaces survives the remote shell intact.
+fn detached_command(inner: &[String], env_vars: &[(String, String)]) -> String {
+    let mut cmd = String::new();
+    for (name, value) in env_vars {
+        cmd.push_str(name);
+        cmd.push('=');
+        cmd.push_str(&shell_quote(value));
+        cmd.push(' ');
+    }
+    for (i, arg) in inner.iter().enumerate() {
+        if i > 0 {
+            cmd.push(' ');
+        }
+        cmd.push_str(&shell_quote(arg));
+    }
+    cmd
+}
+
 fn parse_connect(rest: &str) -> Option<(u16, String)> {
     let mut words = rest.split_whitespace();
     let port: u16 = words.next()?.parse().ok()?;
@@ -288,6 +345,31 @@ mod tests {
             cmd,
             "posh-server new -- 'posh' '-g' 'grp' 'attach' 'my dev'"
         );
+    }
+
+    #[test]
+    fn detached_command_quotes_inner_and_prefixes_env() {
+        // #67: a detached remote spawn execs `posh ... attach ... --detach
+        // ...` directly (no `posh-server new`), every argv element shell-
+        // quoted, with locale/TERM env prefixes like the foreground bootstrap.
+        let inner: Vec<String> = [
+            "posh", "-g", "spinclass", "attach", "id 7", "--detach", "my worker",
+        ]
+        .iter()
+        .map(|s| s.to_string())
+        .collect();
+        let env = vec![("LANG".to_string(), "en_US.UTF-8".to_string())];
+        assert_eq!(
+            detached_command(&inner, &env),
+            "LANG='en_US.UTF-8' 'posh' '-g' 'spinclass' 'attach' 'id 7' '--detach' 'my worker'"
+        );
+
+        // No env prefixes, no create-command.
+        let bare: Vec<String> = ["posh", "attach", "w", "--detach"]
+            .iter()
+            .map(|s| s.to_string())
+            .collect();
+        assert_eq!(detached_command(&bare, &[]), "'posh' 'attach' 'w' '--detach'");
     }
 
     #[test]

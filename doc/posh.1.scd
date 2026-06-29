@@ -14,7 +14,7 @@ posh - persistent, roaming terminal sessions
 
 *posh* [_user_@]_host_ [*--* _command_...]
 
-*posh* [_user_@]_host_*:*[_group_/]_session_ [_command_...]
+*posh* [_user_@]_host_*:*[_group_/]_session_ [*--detach*] [_command_...]
 
 # DESCRIPTION
 
@@ -51,12 +51,22 @@ _name_
 	literal, or has a trailing colon) is a *plain roaming shell* over
 	the encrypted UDP transport. Shorthand for *posh ssh* _host_.
 
-\[_user_@]_host_*:*[_group_/]_session_
+\[_user_@]_host_*:*[_group_/]_session_ [*--detach*] [_command_...]
 	A *persistent session on a remote host*, transported over the
 	roaming UDP connection: attach-or-create just like a local
 	session. Persistence lives in the remote session daemon, so the
 	transport survives roaming and the session survives detach. Use
 	brackets for IPv6 hosts: *[fe80::1]:dev*.
+
+	A leading *--detach* requests a *detached spawn*: create the
+	session on the host (running _command_, default _$SHELL_) and
+	return promptly, *without* attaching or standing up the roaming
+	transport — the remote analog of *attach* _name_ *--detach*. The
+	session keeps running as a daemon on the host; a later
+	*posh* _host_*:*[_group_/]_session_ attaches to that same session.
+	This is the fire-and-return primitive a remote session manager
+	maps onto. Agent forwarding (FDR 0004) rides the later foreground
+	attach, not the spawn.
 
 # GLOBAL OPTIONS
 

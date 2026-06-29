@@ -332,6 +332,14 @@ fn cmd_client(args: &[String]) -> Result<()> {
 /// command is `posh-server new -- posh [-g GROUP] attach SESSION
 /// [command...]`, so persistence lives in the remote session daemon and
 /// this transport pair stays disposable.
+///
+/// A leading `--detach` requests a DETACHED spawn (#67): create-or-ensure the
+/// session on the host and return promptly, WITHOUT standing up the roaming
+/// transport. The session keeps running as a daemon on the host (the remote
+/// analog of local `posh attach --detach`); a later foreground
+/// `posh host:group/session` attaches to that same session. This is the
+/// fire-and-return primitive a remote session-manager worker (spinclass
+/// FDR 0006, clown) maps onto.
 fn cmd_ssh_session(
     user: Option<String>,
     host: String,
@@ -340,31 +348,68 @@ fn cmd_ssh_session(
     extra: &[String],
     forward_flag: &remote::agent::ForwardFlag,
 ) -> Result<()> {
-    let mut inner: Vec<String> = vec!["posh".into()];
-    if let Some(g) = &group {
-        inner.push("-g".into());
-        inner.push(g.clone());
-    }
-    inner.push("attach".into());
-    inner.push(session);
-    // Anything after the target becomes the create-command, mirroring
-    // `posh attach <name> [command...]` locally.
-    let mut extra = extra;
-    if extra.first().map(|s| s.as_str()) == Some("--") {
-        extra = &extra[1..];
-    }
-    inner.extend_from_slice(extra);
+    let (detached, command) = parse_remote_session_extra(extra);
+    let inner = remote_session_argv(group.as_deref(), &session, detached, command);
     let dest = match &user {
         Some(u) => format!("{u}@{host}"),
         None => host,
     };
-    // Resolve agent forwarding (flag > env > default-on).
+    if detached {
+        // Detached spawn (#67): no transport, so no agent endpoint — execute
+        // the inner `posh attach --detach` directly over ssh and return.
+        let opts = remote::sshwrap::SshOptions {
+            family: Family::Auto,
+            port_range: None,
+            agent_source: None,
+        };
+        return remote::sshwrap::run_detached(&dest, &inner, &opts);
+    }
+    // Foreground roaming attach. Resolve agent forwarding (flag > env >
+    // default-on).
     let opts = remote::sshwrap::SshOptions {
         family: Family::Auto,
         port_range: None,
         agent_source: resolve_agent_source(forward_flag),
     };
     remote::sshwrap::run(&dest, &inner, &opts)
+}
+
+/// Splits the post-target args of `posh host:[group/]session ...` into
+/// `(detached, command)`. A leading `--detach` requests a detached spawn
+/// (#67); a single leading `--` separator (after the optional `--detach`) is
+/// consumed so the rest is the opaque create-command, mirroring `posh run`.
+fn parse_remote_session_extra(extra: &[String]) -> (bool, &[String]) {
+    let detached = extra.first().map(|s| s.as_str()) == Some("--detach");
+    let mut command = if detached { &extra[1..] } else { extra };
+    if command.first().map(|s| s.as_str()) == Some("--") {
+        command = &command[1..];
+    }
+    (detached, command)
+}
+
+/// The inner `posh [-g GROUP] attach SESSION [--detach] [command...]` argv
+/// that rides the remote host — under `posh-server new` for the foreground
+/// roaming attach, or directly over ssh for a detached spawn (#67). `--detach`
+/// lands after SESSION (where the remote `posh attach` recognizes it) and
+/// before the create-command.
+fn remote_session_argv(
+    group: Option<&str>,
+    session: &str,
+    detached: bool,
+    command: &[String],
+) -> Vec<String> {
+    let mut argv: Vec<String> = vec!["posh".into()];
+    if let Some(g) = group {
+        argv.push("-g".into());
+        argv.push(g.into());
+    }
+    argv.push("attach".into());
+    argv.push(session.into());
+    if detached {
+        argv.push("--detach".into());
+    }
+    argv.extend_from_slice(command);
+    argv
 }
 
 /// The ssh argv behind `posh list host:` (separated for testability). A
@@ -501,10 +546,13 @@ SYNOPSIS
     posh <name>                       (shorthand for: posh attach <name>)
     posh :[group/]session             (explicit local attach)
     posh [user@]host [-- command...]  (shorthand for: posh ssh ...)
-    posh [user@]host:[group/]session [command...]
+    posh [user@]host:[group/]session [--detach] [command...]
                                       (persistent session on the host over
                                        the roaming transport; scp-style —
-                                       brackets for IPv6: [fe80::1]:dev)
+                                       brackets for IPv6: [fe80::1]:dev.
+                                       With --detach, create the session on
+                                       the host and return without attaching
+                                       — the remote analog of attach --detach.)
 
 GLOBAL OPTIONS
     -g, --group GROUP
@@ -700,6 +748,54 @@ mod tests {
             remote_list_line("user@box", "spinclass", "id7"),
             "user@box:spinclass/id7"
         );
+    }
+
+    #[test]
+    fn remote_session_argv_foreground_and_detached() {
+        // Foreground attach is unchanged: `posh -g grp attach dev htop`.
+        assert_eq!(
+            remote_session_argv(Some("grp"), "dev", false, &["htop".into()]),
+            ["posh", "-g", "grp", "attach", "dev", "htop"].map(String::from)
+        );
+        // #67 detached spawn: --detach sits after SESSION, before the command.
+        assert_eq!(
+            remote_session_argv(Some("spinclass"), "w1", true, &["worker".into(), "--flag".into()]),
+            ["posh", "-g", "spinclass", "attach", "w1", "--detach", "worker", "--flag"]
+                .map(String::from)
+        );
+        // No group, no command, detached.
+        assert_eq!(
+            remote_session_argv(None, "w", true, &[]),
+            ["posh", "attach", "w", "--detach"].map(String::from)
+        );
+    }
+
+    #[test]
+    fn parse_remote_session_extra_detects_detach_and_strips_separator() {
+        let v = |xs: &[&str]| -> Vec<String> { xs.iter().map(|s| s.to_string()).collect() };
+
+        // Plain create-command, no detach: passed through untouched.
+        let e = v(&["htop"]);
+        assert_eq!(parse_remote_session_extra(&e), (false, &e[..]));
+
+        // #67 spawn form: `--detach -- <command>` (the spinclass/clown shape).
+        // The `--detach` is consumed, the `--` separator stripped, command
+        // opaque.
+        let e = v(&["--detach", "--", "worker", "arg"]);
+        let (detached, command) = parse_remote_session_extra(&e);
+        assert!(detached);
+        assert_eq!(command, &v(&["worker", "arg"])[..]);
+
+        // `--detach` with no create-command.
+        let e = v(&["--detach"]);
+        assert_eq!(parse_remote_session_extra(&e), (true, &[][..]));
+
+        // Leading `--` without `--detach`: a foreground create-command after
+        // the separator (no detach).
+        let e = v(&["--", "vim"]);
+        let (detached, command) = parse_remote_session_extra(&e);
+        assert!(!detached);
+        assert_eq!(command, &v(&["vim"])[..]);
     }
 
     #[test]
