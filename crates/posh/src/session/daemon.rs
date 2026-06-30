@@ -1326,4 +1326,117 @@ mod tests {
         assert_eq!(frame.tag, Tag::Output);
         assert_eq!(frame.payload, raw);
     }
+
+    // ---- Task 1.6: 4-way session-socket version-skew matrix (RFC 0008 §6) ----
+
+    /// Assert a client's whole queued backlog is a single `Tag::Output` record
+    /// carrying `expected` verbatim — the baseline (`Tag::Output`) outcome for
+    /// every skew cell except new×new.
+    fn assert_single_output(write_buf: &[u8], expected: &[u8]) {
+        let mut fb = FrameBuffer::new();
+        fb.feed(write_buf);
+        let frame = fb.next().unwrap().expect("one queued record");
+        assert_eq!(frame.tag, Tag::Output, "expected the baseline Tag::Output");
+        assert_eq!(frame.payload, expected, "Tag::Output must carry the raw broadcast bytes unchanged");
+        assert!(fb.next().unwrap().is_none(), "exactly one queued record");
+    }
+
+    /// The four-way socket version-skew matrix of RFC 0008 §6: the daemon's
+    /// negotiation degrades cleanly across daemon/client versions without a flag
+    /// day. "old daemon" is modelled by the `$POSH_SESSION_FRAMES` gate being
+    /// OFF (the daemon's newness — gate off ⇒ it never constructs a producer, so
+    /// every client gets raw `Tag::Output`); "old client" by a bare 4-byte Init
+    /// with no capability table.
+    ///
+    /// | daemon (gate) | client (Init)        | screen output |
+    /// |---------------|----------------------|---------------|
+    /// | new (on)      | new (caps)           | `Tag::Frame`  |
+    /// | new (on)      | old (bare)           | `Tag::Output` |
+    /// | old (off)     | new (caps + Resize)  | `Tag::Output` |
+    /// | old (off)     | old (bare)           | `Tag::Output` |
+    #[test]
+    fn four_way_socket_version_skew_matrix() {
+        let (rows, cols) = (24u16, 80u16);
+        let mut term = Terminal::with_scrollback(rows, cols, 1000);
+        fill_screen(&mut term);
+        let raw = b"raw screen-output bytes";
+
+        // Cell 1 — new daemon (gate ON) × new client (cap table) ⇒ Tag::Frame.
+        // The frame cap is observed, so the daemon negotiates frames and serves
+        // the screen as a posh-proto ServerFrame (a Full keyframe on first paint).
+        {
+            let (mut c, _peer) = frame_capable_conn(rows, cols);
+            assert!(c.producer.is_some(), "cell 1: gate on + cap table ⇒ producer");
+            broadcast_output(std::slice::from_mut(&mut c), &term, raw);
+            let bodies = decode_frame_bodies(&c.write_buf); // also asserts every record is Tag::Frame
+            assert_eq!(bodies.len(), 1, "cell 1: one screen-output frame");
+            assert!(
+                matches!(bodies[0], FrameBody::Full(_)),
+                "cell 1: a fresh frame-capable attach ⇒ Full keyframe, got {:?}",
+                bodies[0]
+            );
+        }
+
+        // Cell 2 — new daemon (gate ON) × old client (bare Init) ⇒ Tag::Output.
+        // The daemon never observes a frame cap, so even with the gate on it
+        // builds no producer and serves the baseline raw dump.
+        {
+            let mut c = test_client_conn();
+            c.apply_init(&ipc::encode_resize(rows, cols));
+            c.maybe_enable_frames(true);
+            assert!(c.producer.is_none(), "cell 2: no cap table ⇒ no producer even with gate on");
+            broadcast_output(std::slice::from_mut(&mut c), &term, raw);
+            assert_single_output(&c.write_buf, raw);
+        }
+
+        // Cell 3 (the critical cross-version cell) — old daemon (gate OFF) × new
+        // client (cap-extended Init + the Tag::Resize re-assertion) ⇒ Tag::Output,
+        // AND the size the new client conveys is recoverable on an old daemon.
+        {
+            let mut c = test_client_conn();
+            let cap_extended_init = {
+                let mut init = ipc::encode_resize(rows, cols).to_vec();
+                init.extend_from_slice(&caps::encode_table(&caps::own_table(&[])));
+                init
+            };
+            c.apply_init(&cap_extended_init);
+            c.maybe_enable_frames(false); // gate OFF ⇒ "old daemon" ⇒ no frames
+            assert!(c.producer.is_none(), "cell 3: gate off ⇒ no producer regardless of caps");
+
+            broadcast_output(std::slice::from_mut(&mut c), &term, raw);
+            assert_single_output(&c.write_buf, raw);
+
+            // The cross-version size property, pinned on the REAL decoder applied
+            // to the GENUINE payloads (not a field write-then-read tautology):
+            //
+            // (1) An OLD daemon decodes resize from the WHOLE Init payload and
+            // rejects any non-4-byte length, so the cap-extended Init's size is
+            // dropped on its floor — which is precisely why the new client must
+            // re-assert via Tag::Resize.
+            assert!(
+                ipc::decode_resize(&cap_extended_init).is_none(),
+                "cell 3: an old daemon's strict whole-payload decode must drop the cap-extended Init's size"
+            );
+            // (2) The 4-byte Tag::Resize the new client re-asserts after the Init
+            // decodes to the right dims — every daemon version honors Tag::Resize,
+            // so even an old daemon that dropped the Init size recovers it here.
+            let resize_payload = ipc::encode_resize(rows, cols);
+            assert_eq!(
+                ipc::decode_resize(&resize_payload),
+                Some((rows, cols)),
+                "cell 3: the client's Tag::Resize re-assertion must carry the recoverable size"
+            );
+        }
+
+        // Cell 4 — old daemon (gate OFF) × old client (bare Init) ⇒ Tag::Output.
+        // The unchanged baseline: neither side negotiates anything new.
+        {
+            let mut c = test_client_conn();
+            c.apply_init(&ipc::encode_resize(rows, cols));
+            c.maybe_enable_frames(false);
+            assert!(c.producer.is_none(), "cell 4: gate off + no caps ⇒ no producer");
+            broadcast_output(std::slice::from_mut(&mut c), &term, raw);
+            assert_single_output(&c.write_buf, raw);
+        }
+    }
 }
