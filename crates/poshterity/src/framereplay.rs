@@ -412,4 +412,188 @@ mod tests {
         h.ack();
         h.assert_converged();
     }
+
+    // ---- RFC 0008 §2: the reliable transport as the degenerate datagram ----
+
+    use posh_proto::framesync::FrameProducer;
+
+    /// A Diff-friendly multi-step script: one substantial initial paint (cursor
+    /// parked mid-screen, NO scroll), then a sequence of small edits that
+    /// overwrite a single FIXED lower row via absolute cursor positioning. The
+    /// stable 16-line top region is a long shared prefix every later frame
+    /// diffs against, so each edit is a clear prefix/suffix-diff win (`make_diff`
+    /// is prefix/suffix-based) — a `Diff` under DumpDiff, a `Morph` under
+    /// MorphDelta — never a forced `Full`. Successive writes near the cursor are
+    /// exactly what makes the diffs expressible.
+    fn degenerate_script() -> Vec<Vec<u8>> {
+        let mut first = b"\x1b[2J\x1b[H".to_vec();
+        for i in 0..16u8 {
+            first.extend_from_slice(
+                format!("line {i:02} of representative session content\r\n").as_bytes(),
+            );
+        }
+        // Each edit homes to row 18 (1-indexed) and rewrites it under a distinct
+        // pen, erasing to end-of-line so no stale tail survives — including the
+        // background-SGR content (red bar, blue erase-to-EOL) that the posh#100
+        // bleed class lives in.
+        let edits: &[&[u8]] = &[
+            b"\x1b[18;1Hecho hello\x1b[K",
+            b"\x1b[18;1H\x1b[41m red status bar across the row \x1b[0m\x1b[K",
+            b"\x1b[18;1H\x1b[44;37mblue fill then erase to eol\x1b[K",
+            b"\x1b[18;1H\x1b[1;33mbold yellow\x1b[0m back to default\x1b[K",
+            b"\x1b[18;1Hfinal line of the degenerate script\x1b[K",
+        ];
+        let mut steps = vec![first];
+        steps.extend(edits.iter().map(|e| e.to_vec()));
+        steps
+    }
+
+    fn body_kind(b: &FrameBody) -> &'static str {
+        match b {
+            FrameBody::Full(_) => "Full",
+            FrameBody::Diff { .. } => "Diff",
+            FrameBody::Morph { .. } => "Morph",
+            FrameBody::Scrollback { .. } => "Scrollback",
+            FrameBody::Empty => "Empty",
+        }
+    }
+
+    /// Drive the shared [`FrameProducer`] — the very state machine the session
+    /// daemon (RFC 0008) and the roaming server drive — over a lossless,
+    /// immediate-ack channel: feed each step into a server `Terminal`, produce +
+    /// encode one frame, apply it into a mirror through the REAL client-side
+    /// applier, then ack at once so the base for the next frame is always the
+    /// frame just sent. Asserts the mirror converges on the server screen after
+    /// every frame and that no body is ever inapplicable — both impossible to
+    /// violate over a reliable transport. Returns each step's produced body in
+    /// order, so the caller can pin the body-kind sequence the `FrameHarness`
+    /// does not expose.
+    fn drive_producer_immediate(sync: FrameSync, steps: &[Vec<u8>]) -> Vec<FrameBody> {
+        let (rows, cols) = (24u16, 80u16);
+        let use_morph = matches!(sync, FrameSync::Morph);
+        let mut server = Terminal::with_scrollback(rows, cols, 0);
+        let mut producer = FrameProducer::new(rows, cols);
+        let mut client = Terminal::with_scrollback(rows, cols, 0);
+        let mut applier = sync.applier();
+        let mut applied: Vec<u8> = Vec::new();
+        let mut bodies = Vec::new();
+        for step in steps {
+            server.process(step);
+            let _ = server.take_responses();
+            producer.advance_visible(
+                server.dump_vt(),
+                Snapshot::from_term(&server),
+                server.is_alt_screen(),
+                (server.rows(), server.cols()),
+                0,
+            );
+            let body = producer.encode_visible(use_morph);
+            let num = producer.current_num();
+            match applier.apply(rows, cols, &applied, &mut client, &body) {
+                ApplyOutcome::Advanced { dump } => applied = dump,
+                ApplyOutcome::AdvancedNoDump | ApplyOutcome::NoChange => {}
+                ApplyOutcome::ReackAndWait => {
+                    panic!("a lossless transport must never force a re-ack: the base never diverges")
+                }
+            }
+            // Immediate ack: the reliable, ordered socket delivers every frame, so
+            // the producer learns the new base at once and never retransmits.
+            producer.ack(num);
+            assert_eq!(
+                Snapshot::from_term(&client),
+                Snapshot::from_term(&server),
+                "client mirror diverged from server at frame {num} ({})",
+                body_kind(&body),
+            );
+            bodies.push(body);
+        }
+        bodies
+    }
+
+    /// RFC 0008 §2 — the reliable Unix socket is the *degenerate* case of the
+    /// lossy datagram protocol: over an immediate-ack channel the producer's
+    /// loss machinery is inert. The acked base is never lost, so after the
+    /// initial keyframe the codec ships only incremental bodies, and a consumer
+    /// reconstructs the source screen identically at every step.
+    ///
+    /// Two complementary halves:
+    ///   * the [`FrameHarness`] (the #75 deterministic harness the plan names)
+    ///     proves the client mirror converges on the server screen after EVERY
+    ///     delivered-and-acked step;
+    ///   * a [`FrameProducer`] proves the *body sequence* the harness cannot
+    ///     expose — a single keyframe, then only `Diff`/`Morph` — i.e. the base
+    ///     is never re-keyframed mid-stream the way a lost base would force.
+    fn reliable_is_degenerate(sync: FrameSync) {
+        let steps = degenerate_script();
+
+        // (a) Convergence at every step over the lossless, immediate-ack harness.
+        let mut h = FrameHarness::new(24, 80, sync);
+        for step in &steps {
+            h.feed(step);
+            assert!(h.deliver(), "a frame must be pending to deliver");
+            h.ack();
+            h.assert_converged();
+        }
+
+        // (b) The same script through the shared FrameProducer, acking each frame
+        // at once: collect the body kinds (and re-verify convergence through the
+        // real client-side applier inside the driver).
+        let bodies = drive_producer_immediate(sync, &steps);
+        assert_eq!(bodies.len(), steps.len(), "exactly one body per step");
+        let kinds: Vec<&str> = bodies.iter().map(body_kind).collect();
+
+        // The degenerate invariant common to both codecs: no body after the first
+        // is a keyframe. A lossless channel never loses the base, so the producer
+        // never falls back to a forced `Full` (or `Empty`) mid-stream.
+        assert!(
+            bodies[1..]
+                .iter()
+                .all(|b| matches!(b, FrameBody::Diff { .. } | FrameBody::Morph { .. })),
+            "every body after the first must be incremental over a lossless channel: {kinds:?}"
+        );
+
+        match sync {
+            FrameSync::DumpDiff => {
+                // Against the empty frame-0 base a DumpDiff is never a net win, so
+                // the first frame is the one and only `Full`; every later edit is a
+                // `Diff` against the held base. Exactly the "Full once, then Diff"
+                // shape RFC 0008 §2 pins.
+                assert!(
+                    matches!(bodies[0], FrameBody::Full(_)),
+                    "DumpDiff: the first frame is a Full keyframe, got {}",
+                    kinds[0]
+                );
+                assert_eq!(
+                    bodies.iter().filter(|b| matches!(b, FrameBody::Full(_))).count(),
+                    1,
+                    "DumpDiff: exactly one Full over a lossless channel: {kinds:?}"
+                );
+                assert!(
+                    bodies[1..].iter().all(|b| matches!(b, FrameBody::Diff { .. })),
+                    "DumpDiff: every body after the keyframe is a Diff: {kinds:?}"
+                );
+            }
+            FrameSync::Morph => {
+                // The producer starts from a blank frame-0 morph base, and every
+                // step here is morph-expressible (no alt-screen toggle, no resize),
+                // so the base is always held and EVERY body is a `Morph` — zero
+                // forced `Full`s, an even stronger statement of the degenerate
+                // thesis than "one keyframe then incremental".
+                assert!(
+                    bodies.iter().all(|b| matches!(b, FrameBody::Morph { .. })),
+                    "Morph: every body is a Morph, zero forced Fulls: {kinds:?}"
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn reliable_transport_is_degenerate_dumpdiff() {
+        reliable_is_degenerate(FrameSync::DumpDiff);
+    }
+
+    #[test]
+    fn reliable_transport_is_degenerate_morph() {
+        reliable_is_degenerate(FrameSync::Morph);
+    }
 }
