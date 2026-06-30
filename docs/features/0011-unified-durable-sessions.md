@@ -124,6 +124,20 @@ List, with and without workers:
   once at spawn. The unification promotes this #53 edge case to the common
   case. Near-term workaround: `Setenv` IPC / `posh setenv` (#53). End-state: a
   host-global filesystem rendezvous, tracked as **#103**.
+- **Local scrollback ownership moves from the outer terminal to posh.** Today a
+  local session is a raw byte passthrough, so your terminal emulator's native
+  scrollbar/search owns the session's history. Once the local client consumes
+  `ServerFrame`s and repaints the visible screen in place (Phase 2, RFC 0008),
+  the outer terminal no longer accumulates that history; local converges to the
+  *same* posh-managed scrollback as remote — the daemon-authoritative ring
+  synced via the `SCROLLBACK` capability (RFC 0002 / FDR 0005) and presented
+  through posh's own scroll UI. Consistent across local and remote (the goal),
+  but a real UX change for people who use a bare shell precisely for
+  native-terminal scrollback. **Decided:** accept the convergence; a future
+  where capable terminals integrate the session's scrollback into their *native*
+  history (e.g. kitty, negotiated via the reserved `TERM_FEATURES` capability)
+  is tracked as **#104**. This must be resolved in Phase 2 when the local client
+  gains frame consumption — it does not affect Phase 1 (inert infrastructure).
 - **The grammar revision changes two RFC 0001 forms.** `box:` was a plain
   roaming shell and `:` was `LocalSession{":"}`; both now open pickers. There
   is no flag day for the *wire* (negotiated), but the *CLI* meaning of these
@@ -160,5 +174,8 @@ List, with and without workers:
   generalize to local sessions.
 - **FDR 0004** (`0004-ssh-agent-forwarding.md`) and **#103** — agent forwarding
   today and its host-global future.
+- **RFC 0002 (scrollback sync) / FDR 0005 (client-side scrollback)** and **#104**
+  — the posh-managed scrollback local converges to, and the outer-terminal-native
+  (kitty) integration future.
 - **#75** — the posh-proto extraction (`framereplay`, shared codecs) the daemon
   frame engine builds on.

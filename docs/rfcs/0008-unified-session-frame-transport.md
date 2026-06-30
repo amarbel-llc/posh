@@ -148,6 +148,15 @@ Each id is classified by scope:
   unchanged by this document. Agent forwarding for sessions whose shell was
   spawned without a forwarding connection is out of scope (FDR 0011
   Limitations; #103).
+- Because a frame-consuming client repaints the visible screen in place on
+  BOTH transports, it does NOT stream the session's scrolled-off lines into the
+  outer terminal's native scrollback. The daemon is therefore the authoritative
+  scrollback owner, and a client (local or remote) that wants history MUST sync
+  it via `SCROLLBACK` (RFC 0002) and present it itself — the reliable Unix
+  transport does NOT grant outer-terminal-native scrollback for free. This is a
+  deliberate convergence of local onto the remote model (FDR 0011 Limitations);
+  outer-terminal-native scrollback integration on capable terminals, negotiated
+  via the reserved `TERM_FEATURES` capability, is a future direction (#104).
 
 ### 5. Amendments to RFC 0001
 
