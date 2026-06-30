@@ -214,9 +214,14 @@ The socket negotiation MUST handle all four cases without a flag day:
 Because durable daemons may predate an upgrade, the "old daemon / new client"
 case is normal, not exceptional, and MUST be supported indefinitely until the
 promotion criterion (FDR 0011) retires the fallback. An implementation MUST
-provide a single switch (`POSH_FRAMESYNC`-style build/env flag) that forces the
-daemon to emit `Tag::Output` only and the bootstrap to use §5.2(2) — restoring
-Architecture A in one step.
+provide a single switch that forces the daemon to emit `Tag::Output` only and
+the bootstrap to use §5.2(2) — restoring Architecture A in one step. The
+reference implementation's daemon-side half of this switch is the
+`POSH_SESSION_FRAMES` environment gate (truthy = on, default **off**); with it
+off the daemon never constructs a per-client frame producer and every client
+receives raw `Tag::Output`. It is deliberately distinct from `POSH_FRAMESYNC`
+(the *remote* MorphDelta codec opt-in), which selects a codec rather than
+gating frame emission.
 
 ## Security Considerations
 

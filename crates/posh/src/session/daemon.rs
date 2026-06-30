@@ -9,6 +9,9 @@ use posh_term::{ScreenSwitch, Terminal};
 
 use crate::pty::{self, PtyChild};
 use crate::remote::caps;
+use crate::remote::display::Snapshot;
+use crate::remote::framesync::FrameProducer;
+use crate::remote::sync::ServerFrame;
 use crate::session::ipc::{self, FrameBuffer, SessionInfo, Tag};
 use crate::session::{self, Config};
 use crate::util::{self, Error, Result};
@@ -107,12 +110,17 @@ struct ClientConn {
     rows: u16,
     cols: u16,
     // Capabilities the client advertised on its `Tag::Init` (RFC 0001 table,
-    // github #100). Recorded here for the framesync negotiation; this task
-    // only stores them — output stays `Tag::Output` for every client until
-    // frame emission is gated on caps in a later task, which is when this
-    // field gains its first production reader (hence the allow).
-    #[allow(dead_code)]
+    // github #100). Read by `is_frame_capable` to decide whether this client
+    // gets a `FrameProducer` (and thus `Tag::Frame` output) when the session
+    // frame-emission gate is on.
     caps: Vec<caps::Cap>,
+    // Per-client visible-frame producer (RFC 0008), `Some` exactly when this
+    // client advertised frame support AND `$POSH_SESSION_FRAMES` is on. While
+    // `Some`, the daemon emits posh-proto `ServerFrame`s (`Tag::Frame`) to this
+    // client instead of raw `Tag::Output`; each client diffs against its OWN
+    // acked base, so a freshly attached client's first frame is a `Full` while
+    // an established one gets a `Diff`. Default `None` ⇒ today's `Tag::Output`.
+    producer: Option<FrameProducer>,
 }
 
 impl ClientConn {
@@ -150,6 +158,108 @@ impl ClientConn {
             }
         }
         resized
+    }
+
+    /// Whether this client advertised the posh-proto frame protocol — i.e. its
+    /// `Tag::Init` carried a capability table with `CAP_PROTOCOL_VERSION`. A
+    /// baseline (no-table) peer is never frame-capable, so it always receives
+    /// raw `Tag::Output`.
+    fn is_frame_capable(&self) -> bool {
+        caps::find(&self.caps, caps::CAP_PROTOCOL_VERSION).is_some()
+    }
+
+    /// Construct this client's `FrameProducer` when the session frame-emission
+    /// gate is on AND the client is frame-capable. Idempotent: a bare re-`Init`
+    /// (SIGCONT resume) keeps the existing producer (and its acked base) rather
+    /// than resetting it. With `gate` off, NEVER constructs a producer, so the
+    /// client stays on `Tag::Output` — the Phase 1 safety invariant.
+    fn maybe_enable_frames(&mut self, gate: bool) {
+        if gate && self.producer.is_none() && self.is_frame_capable() {
+            self.producer = Some(FrameProducer::new(self.rows.max(1), self.cols.max(1)));
+        }
+    }
+
+    /// Produce a visible frame from the supplied screen state and queue it as
+    /// `Tag::Frame`. Returns `false` (queuing nothing) when this client has no
+    /// producer, so the caller falls back to `Tag::Output`.
+    ///
+    /// Reliable-as-degenerate (RFC 0008 §3): the socket delivers in order with
+    /// no loss, so after queuing the frame we immediately `ack` it — the acked
+    /// base is always the last frame, the next frame is a `Diff` against it, and
+    /// the producer's retransmit machinery idles. `input_ack`/`echo_ack` are
+    /// inert (the socket input stream is itself reliable; Task 1.5).
+    fn queue_frame(&mut self, dump: Vec<u8>, snapshot: Snapshot, alt: bool, dims: (u16, u16)) -> bool {
+        let encoded = match self.producer.as_mut() {
+            None => return false,
+            Some(producer) => {
+                producer.advance_visible(dump, snapshot, alt, dims, 0);
+                // DumpDiff for Phase 1: the local client cannot negotiate
+                // CAP_MORPH over the socket yet, so never select MorphDelta.
+                let body = producer.encode_visible(false);
+                let frame_num = producer.current_num();
+                let bytes = ServerFrame {
+                    flags: 0,
+                    caps: caps::own_table(&[]),
+                    frame_num,
+                    input_ack: 0,
+                    echo_ack: 0,
+                    body,
+                }
+                .encode();
+                producer.ack(frame_num);
+                bytes
+            }
+        };
+        self.queue(Tag::Frame, &encoded);
+        true
+    }
+}
+
+/// Parses the `$POSH_SESSION_FRAMES` daemon frame-emission gate (RFC 0008 §6):
+/// `1`/`true`/`on`/`yes` (case-insensitive, trimmed) turn it ON; anything else
+/// — including unset/empty — leaves it OFF. Kept distinct from `$POSH_FRAMESYNC`
+/// (the *remote* MorphDelta codec opt-in) so the two are never conflated: this
+/// gate decides whether the session daemon emits frames at all, not which codec.
+fn parse_frames_gate(value: Option<&str>) -> bool {
+    matches!(
+        value.map(|v| v.trim().to_ascii_lowercase()).as_deref(),
+        Some("1" | "true" | "on" | "yes")
+    )
+}
+
+/// Whether this daemon emits posh-proto `ServerFrame`s (`Tag::Frame`) to
+/// frame-capable clients. DEFAULT OFF: with the gate off no producer is ever
+/// constructed, so every client — including a frame-capable one — receives raw
+/// `Tag::Output`, byte-for-byte today's behavior. Phase 1 must stay off because
+/// the local client cannot consume frames until Phase 2 (RFC 0008 / FDR 0011).
+fn session_frames_enabled() -> bool {
+    parse_frames_gate(std::env::var("POSH_SESSION_FRAMES").ok().as_deref())
+}
+
+/// Broadcasts a PTY-output chunk to every attached client: a posh-proto
+/// `ServerFrame` (`Tag::Frame`) for each frame-capable client, the raw `bcast`
+/// bytes (`Tag::Output`) for the rest. The dump/snapshot frame inputs are
+/// derived once from `term` and cloned per producer — each client diffs against
+/// its OWN acked base — and ONLY when at least one client is frame-capable, so a
+/// session with none pays exactly today's cost and emits exactly today's
+/// `Tag::Output` bytes (the gate-off invariant).
+fn broadcast_output(clients: &mut [ClientConn], term: &Terminal, bcast: &[u8]) {
+    let frame_inputs = clients.iter().any(|c| c.producer.is_some()).then(|| {
+        (
+            term.dump_vt(),
+            Snapshot::from_term(term),
+            term.is_alt_screen(),
+            (term.rows(), term.cols()),
+        )
+    });
+    for c in clients.iter_mut() {
+        let produced = match &frame_inputs {
+            Some((dump, snap, alt, dims)) => c.queue_frame(dump.clone(), snap.clone(), *alt, *dims),
+            None => false,
+        };
+        if !produced {
+            c.queue(Tag::Output, bcast);
+        }
     }
 }
 
@@ -373,6 +483,10 @@ fn daemon_loop(
     let listener_fd = listener.as_raw_fd();
     let pty_fd = child.master;
     let mut has_pty_output = false;
+    // Frame-emission gate (RFC 0008 §6), read once at startup: when off, no
+    // client ever gets a `FrameProducer`, so every client stays on `Tag::Output`
+    // (today's behavior, byte-for-byte). Default off.
+    let frames_gate = session_frames_enabled();
     let mut filter = ScreenSwitchFilter::default();
     let err_events = libc::POLLHUP | libc::POLLERR | libc::POLLNVAL;
     // t=0 for recording timestamps (only used when recorder.is_some()).
@@ -441,6 +555,7 @@ fn daemon_loop(
                     rows: 0,
                     cols: 0,
                     caps: Vec::new(),
+                    producer: None,
                 });
             }
         }
@@ -479,9 +594,7 @@ fn daemon_loop(
                     }
                     has_pty_output = true;
                     if !bcast.is_empty() {
-                        for c in clients.iter_mut() {
-                            c.queue(Tag::Output, &bcast);
-                        }
+                        broadcast_output(clients, term, &bcast);
                     }
                 }
                 Err(e)
@@ -538,6 +651,11 @@ fn daemon_loop(
                                     if c.apply_init(&frame.payload) {
                                         resized = true;
                                     }
+                                    // Enable per-client frame production for a
+                                    // frame-capable client when the gate is on;
+                                    // a no-op otherwise (the replay/broadcast
+                                    // then stay on Tag::Output). RFC 0008.
+                                    c.maybe_enable_frames(frames_gate);
                                     // Replay the current screen so the client
                                     // sees state it missed (including the first
                                     // attach to a detached-created session). The
@@ -635,8 +753,32 @@ fn daemon_loop(
             // (the outer primary belongs to the user's shell). Session
             // scrollback stays reachable via `posh history`.
             if needs_replay && !remove && i < clients.len() {
-                let dump = term.dump_vt_flat();
-                clients[i].queue(Tag::Output, &dump);
+                // For a frame-capable client the replay IS the producer's first
+                // frame: a fresh producer holds only the empty frame-0 base, so
+                // `encode_visible` yields a `Full` keyframe — the equivalent of
+                // the dump replay. A baseline client keeps the flat `dump_vt`
+                // (it pinned the outer terminal to its alt screen, so the replay
+                // must never switch buffers). RFC 0008.
+                let c = &mut clients[i];
+                // Derive the dump/snapshot frame inputs ONLY when a producer
+                // exists — exactly the lazy guard `broadcast_output` uses — so a
+                // gate-off or non-capable client (the Phase 1 default, hit on
+                // every attach) pays only the single `dump_vt_flat` it always did.
+                let frame_inputs = c.producer.is_some().then(|| {
+                    (
+                        term.dump_vt(),
+                        Snapshot::from_term(term),
+                        term.is_alt_screen(),
+                        (term.rows(), term.cols()),
+                    )
+                });
+                let produced = match frame_inputs {
+                    Some((dump, snap, alt, dims)) => c.queue_frame(dump, snap, alt, dims),
+                    None => false,
+                };
+                if !produced {
+                    c.queue(Tag::Output, &term.dump_vt_flat());
+                }
             }
         }
     }
@@ -786,6 +928,7 @@ mod tests {
             rows: 0,
             cols: 0,
             caps: Vec::new(),
+            producer: None,
         }
     }
 
@@ -863,5 +1006,324 @@ mod tests {
         // Unexpected shapes are dropped whole (the repaint follows anyway).
         assert_eq!(strip_alt_screen_params(b"\x1b[?10\x0749h"), None);
         assert_eq!(strip_alt_screen_params(b"\x1bc"), None);
+    }
+
+    // ---- Task 1.4: per-client frame production (RFC 0008) ----
+
+    use crate::remote::framesync::{ApplyOutcome, DumpDiff, FrameApplier};
+    use crate::remote::sync::FrameBody;
+
+    /// A frame-capable client: its `Tag::Init` carries an RFC 0001 cap table, so
+    /// with the gate on `maybe_enable_frames` constructs its `FrameProducer`.
+    /// The peer end is returned so the socket stays open for the test's lifetime.
+    fn frame_capable_conn(rows: u16, cols: u16) -> (ClientConn, UnixStream) {
+        let (stream, peer) = UnixStream::pair().unwrap();
+        let mut c = ClientConn {
+            stream,
+            read_buf: FrameBuffer::new(),
+            write_buf: Vec::new(),
+            rows: 0,
+            cols: 0,
+            caps: Vec::new(),
+            producer: None,
+        };
+        let mut init = ipc::encode_resize(rows, cols).to_vec();
+        init.extend_from_slice(&caps::encode_table(&caps::own_table(&[])));
+        c.apply_init(&init);
+        c.maybe_enable_frames(true);
+        (c, peer)
+    }
+
+    /// Fills the screen so a later one-character edit is a clear diff win (a
+    /// `Diff`, not a `Full`) — the diff-economics fixture the producer needs.
+    fn fill_screen(term: &mut Terminal) {
+        term.process(b"\x1b[2J\x1b[H");
+        for i in 0..20u8 {
+            term.process(format!("line {i:02} of representative session content\r\n").as_bytes());
+        }
+    }
+
+    /// Decode the `Tag::Frame` `ServerFrame` bodies queued in a client's write
+    /// buffer, asserting every queued record is a `Tag::Frame` (no `Tag::Output`
+    /// leaked in for a frame-capable client).
+    fn decode_frame_bodies(write_buf: &[u8]) -> Vec<FrameBody> {
+        let mut fb = FrameBuffer::new();
+        fb.feed(write_buf);
+        let mut bodies = Vec::new();
+        while let Some(frame) = fb.next().unwrap() {
+            assert_eq!(frame.tag, Tag::Frame, "frame-capable client must receive Tag::Frame");
+            bodies.push(ServerFrame::decode(&frame.payload).unwrap().body);
+        }
+        bodies
+    }
+
+    /// Reconstruct a frame-capable client's view: apply its queued `Tag::Frame`
+    /// stream through the `DumpDiff` applier into a scratch `Terminal` and return
+    /// the rendered `Snapshot`. This is the real client-side codec, so a passing
+    /// equality against the daemon's own `Snapshot` is a genuine round-trip, not
+    /// a tautology.
+    fn reconstruct(write_buf: &[u8], rows: u16, cols: u16) -> Snapshot {
+        let mut fb = FrameBuffer::new();
+        fb.feed(write_buf);
+        let mut term = Terminal::with_scrollback(rows, cols, 0);
+        let mut applier = DumpDiff;
+        let mut applied: Vec<u8> = Vec::new();
+        while let Some(frame) = fb.next().unwrap() {
+            let body = ServerFrame::decode(&frame.payload).unwrap().body;
+            match applier.apply(rows, cols, &applied, &mut term, &body) {
+                ApplyOutcome::Advanced { dump } => applied = dump,
+                ApplyOutcome::AdvancedNoDump | ApplyOutcome::NoChange => {}
+                ApplyOutcome::ReackAndWait => panic!("DumpDiff could not apply a queued body"),
+            }
+        }
+        Snapshot::from_term(&term)
+    }
+
+    #[test]
+    fn frames_gate_defaults_off_and_parses_truthy() {
+        // Default OFF: unset/empty/falsey never turn it on.
+        assert!(!parse_frames_gate(None));
+        assert!(!parse_frames_gate(Some("")));
+        assert!(!parse_frames_gate(Some("0")));
+        assert!(!parse_frames_gate(Some("off")));
+        assert!(!parse_frames_gate(Some("false")));
+        // `morph` is the POSH_FRAMESYNC value, NOT this gate — must stay off.
+        assert!(!parse_frames_gate(Some("morph")));
+        // Truthy spellings (case-insensitive, trimmed) turn it on.
+        for on in ["1", "true", "on", "yes", "  TRUE  ", "On"] {
+            assert!(parse_frames_gate(Some(on)), "{on:?} should enable the gate");
+        }
+    }
+
+    #[test]
+    fn producer_constructed_only_when_gated_and_capable() {
+        // Gate on + capable => producer.
+        let (capable, _p) = frame_capable_conn(24, 80);
+        assert!(capable.producer.is_some(), "gate on + cap table => producer");
+
+        // Gate off + capable => none (the Phase 1 safety invariant).
+        let (stream, _peer) = UnixStream::pair().unwrap();
+        let mut gate_off = ClientConn {
+            stream,
+            read_buf: FrameBuffer::new(),
+            write_buf: Vec::new(),
+            rows: 0,
+            cols: 0,
+            caps: Vec::new(),
+            producer: None,
+        };
+        let mut init = ipc::encode_resize(24, 80).to_vec();
+        init.extend_from_slice(&caps::encode_table(&caps::own_table(&[])));
+        gate_off.apply_init(&init);
+        gate_off.maybe_enable_frames(false);
+        assert!(gate_off.producer.is_none(), "gate off must not construct a producer");
+
+        // Gate on + NOT capable (bare Init) => none.
+        let mut baseline = test_client_conn();
+        baseline.apply_init(&ipc::encode_resize(24, 80));
+        baseline.maybe_enable_frames(true);
+        assert!(baseline.producer.is_none(), "a non-capable client never gets a producer");
+    }
+
+    #[test]
+    fn maybe_enable_frames_is_idempotent_across_reinit() {
+        // A bare re-Init (SIGCONT resume) must NOT rebuild an established
+        // producer — that would reset frame numbering to 0 and stale the
+        // consumer's acked base. Mirrors the cap-idempotency test.
+        let (mut c, _peer) = frame_capable_conn(24, 80);
+        // Advance the producer past frame 0 so a reset would be observable.
+        assert!(c.queue_frame(b"dump".to_vec(), Snapshot::blank(24, 80), false, (24, 80)));
+        let num_before = c.producer.as_ref().unwrap().current_num();
+        assert_eq!(num_before, 1, "producing one frame must advance current_num to 1");
+
+        c.maybe_enable_frames(true);
+
+        assert!(c.producer.is_some(), "the producer survives a re-Init");
+        assert_eq!(
+            c.producer.as_ref().unwrap().current_num(),
+            num_before,
+            "a re-Init must preserve frame numbering, not reset to a fresh producer"
+        );
+    }
+
+    #[test]
+    fn frame_capable_client_receives_reconstructable_frames() {
+        let (rows, cols) = (24u16, 80u16);
+        let mut term = Terminal::with_scrollback(rows, cols, 1000);
+        fill_screen(&mut term);
+
+        let (mut c, _peer) = frame_capable_conn(rows, cols);
+        assert!(c.producer.is_some());
+
+        // Replay on attach: the producer's first frame is a Full keyframe.
+        assert!(c.queue_frame(
+            term.dump_vt(),
+            Snapshot::from_term(&term),
+            term.is_alt_screen(),
+            (rows, cols),
+        ));
+
+        // A later visible change broadcasts a frame against the acked base.
+        // Append at the cursor (screen bottom) so the long shared prefix makes
+        // the prefix/suffix diff a clear win — i.e. a Diff, not a Full.
+        term.process(b"appended output");
+        broadcast_output(std::slice::from_mut(&mut c), &term, b"<raw bytes ignored>");
+
+        let bodies = decode_frame_bodies(&c.write_buf);
+        assert_eq!(bodies.len(), 2, "one replay keyframe + one broadcast frame");
+        assert!(
+            matches!(bodies[0], FrameBody::Full(_)),
+            "fresh attach => Full keyframe, got {:?}",
+            bodies[0]
+        );
+        assert!(
+            matches!(bodies[1], FrameBody::Diff { base: 1, .. }),
+            "established base => Diff against frame 1, got {:?}",
+            bodies[1]
+        );
+
+        // The applied frames reconstruct the daemon's screen exactly.
+        assert_eq!(
+            reconstruct(&c.write_buf, rows, cols),
+            Snapshot::from_term(&term),
+            "client-applied frames must reproduce the daemon screen"
+        );
+    }
+
+    #[test]
+    fn per_client_producers_diff_against_independent_bases() {
+        let (rows, cols) = (24u16, 80u16);
+        let mut term = Terminal::with_scrollback(rows, cols, 1000);
+        fill_screen(&mut term);
+
+        // Client A attaches first and gets its Full keyframe (frame 1).
+        let (mut a, _pa) = frame_capable_conn(rows, cols);
+        assert!(a.queue_frame(
+            term.dump_vt(),
+            Snapshot::from_term(&term),
+            term.is_alt_screen(),
+            (rows, cols),
+        ));
+
+        // A visible change (appended at the cursor so A's diff is a clear win);
+        // then client B attaches AFTER it. B's first-ever frame is a Full of the
+        // NEW screen, while A — in the same broadcast — gets a Diff against its
+        // own acked base.
+        term.process(b"appended output");
+        let (mut b, _pb) = frame_capable_conn(rows, cols);
+        assert!(b.queue_frame(
+            term.dump_vt(),
+            Snapshot::from_term(&term),
+            term.is_alt_screen(),
+            (rows, cols),
+        ));
+        broadcast_output(std::slice::from_mut(&mut a), &term, b"x");
+
+        let a_bodies = decode_frame_bodies(&a.write_buf);
+        let b_bodies = decode_frame_bodies(&b.write_buf);
+        assert!(matches!(a_bodies[0], FrameBody::Full(_)));
+        assert!(
+            matches!(a_bodies[1], FrameBody::Diff { base: 1, .. }),
+            "A's established producer diffs, got {:?}",
+            a_bodies[1]
+        );
+        assert_eq!(b_bodies.len(), 1, "B has only its replay keyframe");
+        assert!(
+            matches!(b_bodies[0], FrameBody::Full(_)),
+            "B's first-ever frame is a Full regardless of A's state, got {:?}",
+            b_bodies[0]
+        );
+
+        // Both clients reconstruct the same final screen.
+        assert_eq!(reconstruct(&a.write_buf, rows, cols), Snapshot::from_term(&term));
+        assert_eq!(reconstruct(&b.write_buf, rows, cols), Snapshot::from_term(&term));
+    }
+
+    #[test]
+    fn gate_off_emits_output_for_every_client() {
+        let (rows, cols) = (24u16, 80u16);
+        let mut term = Terminal::with_scrollback(rows, cols, 100);
+        term.process(b"content");
+
+        // A cap-advertising client, but the gate is OFF => no producer.
+        let (stream, _peer) = UnixStream::pair().unwrap();
+        let mut c = ClientConn {
+            stream,
+            read_buf: FrameBuffer::new(),
+            write_buf: Vec::new(),
+            rows: 0,
+            cols: 0,
+            caps: Vec::new(),
+            producer: None,
+        };
+        let mut init = ipc::encode_resize(rows, cols).to_vec();
+        init.extend_from_slice(&caps::encode_table(&caps::own_table(&[])));
+        c.apply_init(&init);
+        c.maybe_enable_frames(false);
+        assert!(c.producer.is_none());
+
+        let raw = b"raw broadcast bytes";
+        broadcast_output(std::slice::from_mut(&mut c), &term, raw);
+
+        let mut fb = FrameBuffer::new();
+        fb.feed(&c.write_buf);
+        let frame = fb.next().unwrap().expect("one queued record");
+        assert_eq!(frame.tag, Tag::Output, "gate off => Tag::Output");
+        assert_eq!(frame.payload, raw, "gate off => the raw broadcast bytes, unchanged");
+        assert!(fb.next().unwrap().is_none(), "exactly one Output record");
+    }
+
+    #[test]
+    fn non_capable_client_gets_output_even_with_gate_on() {
+        let (rows, cols) = (24u16, 80u16);
+        let mut term = Terminal::with_scrollback(rows, cols, 100);
+        term.process(b"content");
+
+        // No cap table in the Init => baseline peer; gate ON.
+        let mut c = test_client_conn();
+        c.apply_init(&ipc::encode_resize(rows, cols));
+        c.maybe_enable_frames(true);
+        assert!(c.producer.is_none(), "a non-capable client never gets a producer");
+
+        let raw = b"raw broadcast bytes";
+        broadcast_output(std::slice::from_mut(&mut c), &term, raw);
+
+        let mut fb = FrameBuffer::new();
+        fb.feed(&c.write_buf);
+        let frame = fb.next().unwrap().expect("one queued record");
+        assert_eq!(frame.tag, Tag::Output);
+        assert_eq!(frame.payload, raw);
+    }
+
+    #[test]
+    fn mixed_clients_each_get_their_own_transport() {
+        // One frame-capable + one baseline client in the same broadcast: the
+        // capable one gets Tag::Frame, the baseline one gets the raw Tag::Output
+        // — neither regresses the other.
+        let (rows, cols) = (24u16, 80u16);
+        let mut term = Terminal::with_scrollback(rows, cols, 1000);
+        fill_screen(&mut term);
+
+        let (capable, _pc) = frame_capable_conn(rows, cols);
+        let mut baseline = test_client_conn();
+        baseline.apply_init(&ipc::encode_resize(rows, cols));
+        baseline.maybe_enable_frames(true);
+        assert!(baseline.producer.is_none());
+
+        let mut clients = vec![capable, baseline];
+        let raw = b"raw delta";
+        broadcast_output(&mut clients, &term, raw);
+
+        // Capable client => a single Tag::Frame (a Full, since fresh).
+        let cap_bodies = decode_frame_bodies(&clients[0].write_buf);
+        assert_eq!(cap_bodies.len(), 1);
+        assert!(matches!(cap_bodies[0], FrameBody::Full(_)));
+
+        // Baseline client => Tag::Output with the raw bytes.
+        let mut fb = FrameBuffer::new();
+        fb.feed(&clients[1].write_buf);
+        let frame = fb.next().unwrap().expect("one queued record");
+        assert_eq!(frame.tag, Tag::Output);
+        assert_eq!(frame.payload, raw);
     }
 }
