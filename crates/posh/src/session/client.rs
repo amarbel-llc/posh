@@ -6,6 +6,7 @@ use std::os::fd::AsRawFd;
 use std::os::unix::net::UnixStream;
 
 use crate::pty::{self, RawMode};
+use crate::remote::caps;
 use crate::session::ipc::{self, FrameBuffer, Tag};
 use crate::session::{daemon, Config};
 use crate::util::{self, Error, Result};
@@ -183,11 +184,22 @@ fn client_loop(stream: UnixStream, enter: &[u8]) -> Result<i32> {
     let mut detach = DetachMatcher::default();
     let mut stream_writer = &stream;
 
-    // Announce our terminal size so the daemon can size the PTY.
+    // Announce our terminal size so the daemon can size the PTY, and append
+    // our capability table (RFC 0001) so a frame-capable daemon can negotiate
+    // the framesync transport (github #100). The Init payload is the 4-byte
+    // resize prefix followed by the encoded table.
     let (rows, cols) = pty::term_size(STDOUT);
+    let mut init_payload = ipc::encode_resize(rows, cols).to_vec();
+    init_payload.extend_from_slice(&caps::encode_table(&caps::own_table(&[])));
+    ipc::append_frame(&mut sock_write_buf, Tag::Init, &init_payload);
+    // Re-assert the size via Tag::Resize: a pre-#100 daemon runs the strict
+    // decode_resize over the whole Init payload, so the cap-extended Init's
+    // length != 4 makes it drop the initial size. Every daemon version
+    // handles Tag::Resize, so this re-assertion guarantees the size lands; on
+    // a new daemon it merely re-sets the value Init already carried.
     ipc::append_frame(
         &mut sock_write_buf,
-        Tag::Init,
+        Tag::Resize,
         &ipc::encode_resize(rows, cols),
     );
 
@@ -217,6 +229,10 @@ fn client_loop(stream: UnixStream, enter: &[u8]) -> Result<i32> {
             // any size change while stopped).
             let _ = util::write_fd(STDOUT, enter);
             let (rows, cols) = pty::term_size(STDOUT);
+            // Bare 4-byte Init: caps are session-persistent (the daemon
+            // preserves them across bare re-Inits), and an exact-4-byte resize
+            // is accepted by every daemon version, so no cap table or follow-up
+            // Resize is needed here.
             ipc::append_frame(
                 &mut sock_write_buf,
                 Tag::Init,

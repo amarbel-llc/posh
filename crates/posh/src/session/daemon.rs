@@ -8,6 +8,7 @@ use std::os::unix::net::{UnixListener, UnixStream};
 use posh_term::{ScreenSwitch, Terminal};
 
 use crate::pty::{self, PtyChild};
+use crate::remote::caps;
 use crate::session::ipc::{self, FrameBuffer, SessionInfo, Tag};
 use crate::session::{self, Config};
 use crate::util::{self, Error, Result};
@@ -105,11 +106,50 @@ struct ClientConn {
     // Zero means "size not yet reported"; ignored for the shared minimum.
     rows: u16,
     cols: u16,
+    // Capabilities the client advertised on its `Tag::Init` (RFC 0001 table,
+    // github #100). Recorded here for the framesync negotiation; this task
+    // only stores them — output stays `Tag::Output` for every client until
+    // frame emission is gated on caps in a later task, which is when this
+    // field gains its first production reader (hence the allow).
+    #[allow(dead_code)]
+    caps: Vec<caps::Cap>,
 }
 
 impl ClientConn {
     fn queue(&mut self, tag: Tag, payload: &[u8]) {
         ipc::append_frame(&mut self.write_buf, tag, payload);
+    }
+
+    /// Applies a `Tag::Init` payload: a 4-byte resize prefix that sizes the
+    /// PTY, optionally followed by an RFC 0001 capability table (the
+    /// framesync handshake, github #100). Returns whether the reported size
+    /// was updated. The trailing table is parsed and recorded but NOT acted
+    /// on here — the daemon's output path is unchanged this task.
+    ///
+    /// The resize is decoded from the first 4 bytes only, because `posh`'s
+    /// `decode_resize` rejects any non-4-byte payload; a cap-extended Init
+    /// must still size the PTY. An absent or malformed trailing table leaves
+    /// any previously negotiated caps in place (a bare re-`Init` on SIGCONT
+    /// resume does not wipe them).
+    fn apply_init(&mut self, payload: &[u8]) -> bool {
+        let resized = match payload.get(..4).and_then(ipc::decode_resize) {
+            Some((r, w)) => {
+                self.rows = r;
+                self.cols = w;
+                true
+            }
+            None => false,
+        };
+        if payload.len() > 4 {
+            match caps::decode_table(&payload[4..]) {
+                Ok((advertised, _)) => self.caps = advertised,
+                Err(e) => util::log_write(
+                    "warn",
+                    &format!("malformed Init cap table, treating peer as baseline: {e}"),
+                ),
+            }
+        }
+        resized
     }
 }
 
@@ -400,6 +440,7 @@ fn daemon_loop(
                     write_buf: Vec::new(),
                     rows: 0,
                     cols: 0,
+                    caps: Vec::new(),
                 });
             }
         }
@@ -494,9 +535,7 @@ fn daemon_loop(
                                     let _ = util::write_all_retry(pty_fd, &frame.payload, 100);
                                 }
                                 Tag::Init => {
-                                    if let Some((r, w)) = ipc::decode_resize(&frame.payload) {
-                                        c.rows = r;
-                                        c.cols = w;
+                                    if c.apply_init(&frame.payload) {
                                         resized = true;
                                     }
                                     // Replay the current screen so the client
@@ -734,6 +773,77 @@ mod tests {
         assert!(s.contains("\x1b[!p"), "no soft reset in substitute: {s:?}");
         assert!(s.contains("\x1b[2J"), "no repaint after reset: {s:?}");
         assert!(s.ends_with("after"), "{s:?}");
+    }
+
+    fn test_client_conn() -> ClientConn {
+        // A connected pair gives the struct a real fd without a daemon; only
+        // the parse-side fields (rows/cols/caps) are exercised here.
+        let (stream, _peer) = UnixStream::pair().unwrap();
+        ClientConn {
+            stream,
+            read_buf: FrameBuffer::new(),
+            write_buf: Vec::new(),
+            rows: 0,
+            cols: 0,
+            caps: Vec::new(),
+        }
+    }
+
+    #[test]
+    fn init_with_cap_table_records_protocol_version_and_resizes() {
+        let mut c = test_client_conn();
+        let mut payload = ipc::encode_resize(24, 80).to_vec();
+        payload.extend_from_slice(&caps::encode_table(&caps::own_table(&[])));
+
+        let resized = c.apply_init(&payload);
+
+        assert!(resized, "resize prefix must still size the PTY");
+        assert_eq!((c.rows, c.cols), (24, 80), "size decoded from the 4-byte prefix");
+        assert!(
+            caps::find(&c.caps, caps::CAP_PROTOCOL_VERSION).is_some(),
+            "PROTOCOL_VERSION must be recorded from the trailing table: {:?}",
+            c.caps
+        );
+    }
+
+    #[test]
+    fn bare_init_records_empty_caps_and_resizes() {
+        let mut c = test_client_conn();
+
+        let resized = c.apply_init(&ipc::encode_resize(10, 40));
+
+        assert!(resized, "a baseline 4-byte Init still resizes");
+        assert_eq!((c.rows, c.cols), (10, 40));
+        assert!(c.caps.is_empty(), "no trailing table => no caps");
+    }
+
+    #[test]
+    fn bare_reinit_preserves_already_negotiated_caps() {
+        // SIGCONT resume re-Inits with a bare 4-byte payload; that must not
+        // wipe the caps a cap-extended Init negotiated earlier.
+        let mut c = test_client_conn();
+        let mut first = ipc::encode_resize(24, 80).to_vec();
+        first.extend_from_slice(&caps::encode_table(&caps::own_table(&[])));
+        c.apply_init(&first);
+
+        c.apply_init(&ipc::encode_resize(30, 100));
+
+        assert_eq!((c.rows, c.cols), (30, 100), "the re-Init still resizes");
+        assert!(
+            caps::find(&c.caps, caps::CAP_PROTOCOL_VERSION).is_some(),
+            "caps survive a bare re-Init"
+        );
+    }
+
+    #[test]
+    fn strict_decode_resize_rejects_cap_extended_payload() {
+        // Why the client re-asserts its size via Tag::Resize after a
+        // cap-extended Init: a pre-#100 daemon ran decode_resize on the whole
+        // payload, which rejects anything but exactly 4 bytes and would drop
+        // the initial size.
+        let mut payload = ipc::encode_resize(24, 80).to_vec();
+        payload.extend_from_slice(&caps::encode_table(&caps::own_table(&[])));
+        assert!(ipc::decode_resize(&payload).is_none());
     }
 
     #[test]

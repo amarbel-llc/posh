@@ -61,8 +61,15 @@ The session IPC envelope is unchanged: each frame is a 5-byte header (1-byte
 
 The client's `Tag::Init` payload, after the 4-byte resize prefix, MAY carry a
 capability table encoded exactly as RFC 0001 §3 defines (`count: u8`, then
-`count × (id: u8, len: u8, payload: len bytes)`). A baseline daemon that reads
-only the resize prefix MUST ignore trailing bytes, so the extension is safe to
+`count × (id: u8, len: u8, payload: len bytes)`). A frame-capable daemon MUST
+decode the resize from the 4-byte prefix and parse the trailing table from the
+remainder. Because a baseline (pre-this-RFC) daemon decodes the resize from the
+*entire* Init payload and rejects any payload whose length is not exactly 4, a
+client that appends a table MUST immediately re-assert its size with a
+`Tag::Resize` frame carrying the same `(rows, cols)`; every daemon version
+honors `Tag::Resize`, so the size lands even on a baseline daemon that dropped
+the cap-extended Init's size. On a frame-capable daemon the re-assertion merely
+re-sets the size the Init already conveyed. The cap table is therefore safe to
 send unconditionally.
 
 - A client that includes a `PROTOCOL_VERSION` (id 0) entry thereby advertises
