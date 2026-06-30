@@ -23,6 +23,9 @@ pub enum Tag {
     /// Daemon -> client at teardown: the shell's exit status, so an
     /// attached client can exit with the session's real code. github #18.
     Exit = 11,
+    /// Daemon -> client: a posh-proto `ServerFrame` payload, used when the
+    /// client negotiated frame transport instead of raw `Output`. RFC 0008.
+    Frame = 12,
 }
 
 impl Tag {
@@ -40,6 +43,7 @@ impl Tag {
             9 => Tag::Run,
             10 => Tag::Ack,
             11 => Tag::Exit,
+            12 => Tag::Frame,
             _ => return None,
         })
     }
@@ -264,6 +268,16 @@ mod tests {
         let frame = buf.next().unwrap().unwrap();
         assert_eq!(frame.tag, Tag::Exit);
         assert_eq!(decode_exit(&frame.payload), Some(7));
+    }
+
+    #[test]
+    fn frame_tag_roundtrips() {
+        let f = encode_frame(Tag::Frame, b"abc");
+        let mut fb = FrameBuffer::new();
+        fb.feed(&f);
+        let got = fb.next().unwrap().unwrap();
+        assert_eq!(got.tag, Tag::Frame);
+        assert_eq!(got.payload, b"abc");
     }
 
     #[test]

@@ -543,8 +543,10 @@ fn daemon_loop(
                                     let _ = util::write_all_retry(pty_fd, &frame.payload, 1000);
                                     c.queue(Tag::Ack, b"");
                                 }
-                                // Exit is daemon->client only.
-                                Tag::Output | Tag::Ack | Tag::Exit => {}
+                                // Output, Ack, Exit, and Frame are all
+                                // daemon->client only; ignore if received from
+                                // a client.
+                                Tag::Output | Tag::Ack | Tag::Exit | Tag::Frame => {}
                             }
                         }
                     }
