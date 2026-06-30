@@ -32,9 +32,11 @@ use crate::frame::FrameBody;
 
 mod dumpdiff;
 mod morphdelta;
+mod producer;
 
 pub use dumpdiff::DumpDiff;
 pub use morphdelta::MorphDelta;
+pub use producer::FrameProducer;
 
 /// Client-side codec selection (`POSH_FRAMESYNC`): which frame-sync codec the
 /// client uses and, equivalently, whether it advertises `CAP_MORPH`. Defaults

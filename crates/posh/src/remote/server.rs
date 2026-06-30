@@ -11,7 +11,7 @@ use crate::remote::caps;
 use crate::remote::crypto::Key;
 use crate::remote::diag;
 use crate::remote::display::Snapshot;
-use crate::remote::framesync::{Baseline, CurrentFrame, DumpDiff, FrameEncoder, MorphDelta};
+use crate::remote::framesync::FrameProducer;
 use crate::remote::datagram::{Connection, Family, DEFAULT_PORT_RANGE, SEND_INTERVAL_MIN};
 use crate::remote::stats::Stats;
 use crate::remote::sync::{
@@ -116,33 +116,6 @@ pub fn run(
     std::process::exit(0);
 }
 
-struct FrameState {
-    num: u64,
-    /// The visible-screen `dump_vt` bytes as of this frame — the diff base
-    /// for a later `Diff`. A scrollback frame leaves the visible screen
-    /// unchanged, so it records the same visible bytes as the frame before
-    /// it, keeping the diff-base chain intact across interleaved scrollback
-    /// frames.
-    data: Vec<u8>,
-    /// The rendered screen state as of this frame — the morph base for a later
-    /// `Morph` (#15), captured alongside `data` so acking this frame gives the
-    /// MorphDelta encoder both bases. Carried for the same reason as `data` and
-    /// inherited identically by a scrollback frame.
-    snapshot: Snapshot,
-    /// Off-`Snapshot` terminal state at this frame: whether the alt screen is
-    /// active and the dimensions. The MorphDelta encoder reads these to detect
-    /// a transition a morph cannot express (alt-screen toggle, resize) and fall
-    /// back to a `Full` keyframe (#15).
-    alt_screen: bool,
-    dims: (u16, u16),
-    /// Scrollback rows the client will have accumulated after applying this
-    /// frame (RFC 0002): the running high-water that only advances on a
-    /// scrollback frame. Acking this frame tells the server the client holds
-    /// scrollback through here, so the next body's appended count starts
-    /// from it.
-    sb_total: u64,
-}
-
 /// A transient escape-to-shell overlay (FDR 0008): a second PTY running the
 /// configured escape command in the session's cwd, with its own terminal model.
 /// While present it is the broadcast source and the input sink; the live session
@@ -205,27 +178,15 @@ pub(crate) fn server_loop(
     let network_tmout = timeout_env("POSH_SERVER_NETWORK_TMOUT") * 1000;
     let signal_tmout = timeout_env("POSH_SERVER_SIGNAL_TMOUT") * 1000;
 
-    // Frame 0 is the implicit empty initial state shared with the client, so
-    // the very first real frame can already be expressed as a diff.
-    let mut current = FrameState {
-        num: 0,
-        data: Vec::new(),
-        snapshot: Snapshot::blank(rows, cols),
-        alt_screen: false,
-        dims: (rows, cols),
-        sb_total: 0,
-    };
-    // Last frame the client confirmed; None data means we no longer have its
-    // bytes and must send a full dump. `acked_baseline` mirrors `acked_data`
-    // for the MorphDelta encoder: the rendered snapshot + off-Snapshot state
-    // (alt-screen, dims) at the acked frame, so a morph can be built against
-    // it and a non-expressible transition detected (#15). It is Some exactly
-    // when `acked_data` is.
-    let mut acked_num: u64 = 0;
-    let mut acked_data: Option<Vec<u8>> = Some(Vec::new());
-    let mut acked_baseline: Option<(Snapshot, bool, (u16, u16))> =
-        Some((Snapshot::blank(rows, cols), false, (rows, cols)));
-    let mut outstanding: Vec<FrameState> = Vec::new();
+    // The visible-frame production state machine (#100, posh-proto): frame
+    // numbering, the acked diff/morph baseline (the dump bytes + the rendered
+    // snapshot + off-Snapshot alt/dims), the `outstanding` retransmission
+    // window, and the swappable DumpDiff/MorphDelta encoders. Frame 0 is the
+    // implicit empty initial state shared with the client, so the very first
+    // real frame can already be expressed as a diff. The producer owns the
+    // per-frame state both visible and scrollback frames advance; the scrollback
+    // *body* and the sb_total/floor/high accounting below stay here.
+    let mut producer = FrameProducer::new(rows, cols);
 
     // Frame-sync codec negotiation (#15): the client advertises CAP_MORPH only
     // behind POSH_FRAMESYNC=morph. `peer_wants_morph` tracks the latest
@@ -253,8 +214,6 @@ pub(crate) fn server_loop(
     // until the second sample (the first has no window to divide over).
     let mut last_retransmits: u64 = 0;
     let mut metrics_retransmit_rate = f64::NAN;
-    let mut dumpdiff_enc = DumpDiff;
-    let mut morph_enc = MorphDelta::default();
 
     // Scrollback sync (RFC 0002). `peer_wants_scrollback` tracks whether the
     // most recent client message advertised SCROLLBACK (capabilities do not
@@ -334,9 +293,9 @@ pub(crate) fn server_loop(
                 remote: conn.remote(),
                 last_heard_age_ms: now.saturating_sub(last_heard),
                 last_send_age_ms: (last_send != 0).then(|| now.saturating_sub(last_send)),
-                current_num: current.num,
-                acked_num,
-                outstanding: outstanding.len(),
+                current_num: producer.current_num(),
+                acked_num: producer.acked_num(),
+                outstanding: producer.outstanding_len(),
                 srtt: conn.srtt(),
                 rto: conn.rto(),
                 send_interval: conn.send_interval(),
@@ -350,7 +309,7 @@ pub(crate) fn server_loop(
 
         let timeout = if peer_active {
             let mut deadline = last_send + HEARTBEAT_INTERVAL;
-            if acked_num < current.num {
+            if producer.acked_num() < producer.current_num() {
                 deadline = deadline.min(last_send + conn.rto());
             }
             if term.generation() != last_gen || force_frame {
@@ -621,19 +580,18 @@ pub(crate) fn server_loop(
                                 ),
                             }
                         }
-                        update_acks(
-                            &msg,
-                            &current,
-                            &mut outstanding,
-                            &mut acked_num,
-                            &mut acked_data,
-                            &mut acked_baseline,
-                            &mut acked_sb_total,
-                        );
+                        // Advance the producer's acked baseline. A returned
+                        // sb_total (the ack confirmed a frame we still hold)
+                        // carries the client's scrollback coverage forward
+                        // (RFC 0002 §2); a lost-base/rejected ack returns None and
+                        // leaves acked_sb_total untouched.
+                        if let Some(sb_total) = producer.ack(msg.acked_frame) {
+                            acked_sb_total = acked_sb_total.max(sb_total);
+                        }
                         // Force-resync (palette "Reset & resync"): the client is
                         // wedged rejecting diffs against a base it isn't at and the
                         // stale-ack -> Full auto-recovery did not fire. Applied
-                        // AFTER update_acks — which would otherwise repopulate the
+                        // AFTER producer.ack — which would otherwise repopulate the
                         // baseline from this very ack — so the drop sticks: with no
                         // diff base the encoder must emit a Full keyframe, and
                         // force_frame ships it even if the screen is static. The
@@ -641,8 +599,7 @@ pub(crate) fn server_loop(
                         // apply-stall; its ack then repopulates the baseline and
                         // incremental diffing resumes.
                         if msg.flags & sync::CLIENT_FLAG_RESYNC != 0 {
-                            acked_data = None;
-                            acked_baseline = None;
+                            producer.drop_acked_base();
                             force_frame = true;
                         }
                         let now_wants = caps::find(&msg.caps, caps::CAP_SCROLLBACK).is_some();
@@ -714,7 +671,7 @@ pub(crate) fn server_loop(
                 // forward as its diff base; with no acked baseline it would leap
                 // applied_num from the empty initial state past the (unapplied)
                 // first Full, staling the client's visible baseline -> apply-stall.
-                && acked_data.is_some()
+                && producer.has_acked_base()
                 && paced;
             // At most one fresh body per opportunity; when both are ready
             // (heavy output scrolling the screen) alternate so neither kind
@@ -725,93 +682,52 @@ pub(crate) fn server_loop(
             if make_visible {
                 last_gen = src.generation();
                 force_frame = false;
-                outstanding.push(FrameState {
-                    num: current.num,
-                    data: std::mem::take(&mut current.data),
-                    snapshot: std::mem::replace(&mut current.snapshot, Snapshot::blank(1, 1)),
-                    alt_screen: current.alt_screen,
-                    dims: current.dims,
-                    sb_total: current.sb_total,
-                });
-                if outstanding.len() > 8 {
-                    outstanding.remove(0);
-                }
-                current = FrameState {
-                    num: current.num + 1,
-                    data: stats.time_dump_vt(|| src.dump_vt()),
-                    // The morph base for this frame (#15): the rendered state +
-                    // the off-Snapshot fields the keyframe rule reads. `src` is
-                    // the overlay terminal while an escape shell is active.
-                    snapshot: Snapshot::from_term(src),
-                    alt_screen: src.is_alt_screen(),
-                    dims: (src.rows(), src.cols()),
-                    // A visible frame carries no scrollback rows, so applying it
-                    // leaves the client at whatever scrollback it held at the
-                    // diff base (the acked frame): acked_sb_total, NOT sb_high.
-                    // sb_high counts rows put into a scrollback frame that may
-                    // have been lost; if a visible-frame ack confirmed those,
-                    // the rows of a dropped-then-superseded scrollback frame
-                    // would never be re-shipped (finding #1).
-                    sb_total: acked_sb_total,
-                };
+                // The morph base for this frame (#15): the rendered state + the
+                // off-Snapshot fields the keyframe rule reads. `src` is the
+                // overlay terminal while an escape shell is active. A visible
+                // frame carries no scrollback rows, so applying it leaves the
+                // client at whatever scrollback it held at the diff base (the
+                // acked frame): acked_sb_total, NOT sb_high. sb_high counts rows
+                // put into a scrollback frame that may have been lost; if a
+                // visible-frame ack confirmed those, the rows of a
+                // dropped-then-superseded scrollback frame would never be
+                // re-shipped (finding #1).
+                producer.advance_visible(
+                    stats.time_dump_vt(|| src.dump_vt()),
+                    Snapshot::from_term(src),
+                    src.is_alt_screen(),
+                    (src.rows(), src.cols()),
+                    acked_sb_total,
+                );
                 current_is_sb = false;
                 last_was_sb = false;
                 send_frame = true;
                 fresh_frame = true;
             } else if make_scrollback {
-                // The scrollback frame inherits a visible dump as its diff base
-                // (the diff-base chain is unbroken across interleaved frames; the
-                // morph base snapshot/alt/dims is inherited for the same reason,
-                // #15). #95: it MUST inherit the CONFIRMED baseline (acked_data /
-                // acked_baseline), NOT the latest `current.data`. Under loss the
-                // latest visible dump can be ahead of what the client holds, so
-                // acking this scrollback frame (which advances applied_num but not
-                // the client's visible content) would push the server's visible
-                // diff base past a visible frame the client never applied, leaving
-                // its baseline stale -> every later visible Diff short-bases ->
-                // permanent apply-stall. Anchoring to acked_data pins the diff
-                // base to the last visible state the client actually confirmed.
-                // want_scrollback gates on acked_data.is_some(); the fallback is
-                // defensive and preserves the old behavior if that ever changes.
-                let (visible, visible_snapshot, visible_alt, visible_dims) =
-                    match (acked_data.clone(), acked_baseline.clone()) {
-                        (Some(d), Some((s, a, dim))) => (d, s, a, dim),
-                        _ => (
-                            current.data.clone(),
-                            current.snapshot.clone(),
-                            current.alt_screen,
-                            current.dims,
-                        ),
-                    };
-                outstanding.push(FrameState {
-                    num: current.num,
-                    data: std::mem::take(&mut current.data),
-                    snapshot: std::mem::replace(&mut current.snapshot, Snapshot::blank(1, 1)),
-                    alt_screen: current.alt_screen,
-                    dims: current.dims,
-                    sb_total: current.sb_total,
-                });
-                if outstanding.len() > 8 {
-                    outstanding.remove(0);
-                }
-                current = FrameState {
-                    num: current.num + 1,
-                    data: visible,
-                    snapshot: visible_snapshot,
-                    alt_screen: visible_alt,
-                    dims: visible_dims,
-                    sb_total: cur_sb_total,
-                };
+                // The scrollback frame inherits the CONFIRMED visible base as its
+                // diff base (the diff-base chain is unbroken across interleaved
+                // frames; the morph base snapshot/alt/dims is inherited for the
+                // same reason, #15). #95: the producer inherits the acked base,
+                // NOT the latest current dump — under loss the latest visible dump
+                // can be ahead of what the client holds, and acking this
+                // scrollback frame would then push the diff base past a visible
+                // frame the client never applied, staling its baseline. The
+                // advance carries cur_sb_total as this frame's coverage; the
+                // Scrollback body itself is built below. want_scrollback gates on
+                // has_acked_base(); the producer's fallback is defensive.
+                producer.advance_scrollback(cur_sb_total);
                 sb_high = cur_sb_total;
                 current_is_sb = true;
                 last_was_sb = true;
                 send_frame = true;
-            } else if acked_num < current.num && now.saturating_sub(last_send) >= conn.rto() {
+            } else if producer.acked_num() < producer.current_num()
+                && now.saturating_sub(last_send) >= conn.rto()
+            {
                 send_frame = true;
                 stats.record_retransmit();
             } else if now.saturating_sub(last_send) >= HEARTBEAT_INTERVAL {
                 send_empty = true;
-            } else if force_ack && acked_num >= current.num {
+            } else if force_ack && producer.acked_num() >= producer.current_num() {
                 // Input arrived but produced no new frame yet: ack promptly so
                 // the client can clear its outbox.
                 send_empty = true;
@@ -843,54 +759,32 @@ pub(crate) fn server_loop(
                     // (rows since the ack/floor) is capped to what the ring
                     // still holds — evicted older rows are gone by design.
                     let ring_len = term.primary_scrollback_len();
-                    let grown = cur_sb_total.saturating_sub(current.sb_total) as usize;
+                    let frame_sb_total = producer.current_sb_total();
+                    let grown = cur_sb_total.saturating_sub(frame_sb_total) as usize;
                     let end = ring_len.saturating_sub(grown);
-                    let want = current
-                        .sb_total
-                        .saturating_sub(acked_sb_total.max(sb_floor)) as usize;
+                    let want =
+                        frame_sb_total.saturating_sub(acked_sb_total.max(sb_floor)) as usize;
                     let appended = want.min(end);
                     let start = end - appended;
                     let rows: Vec<Vec<u8>> = (start..end)
                         .map(|i| term.dump_scrollback_row(i).unwrap_or_default())
                         .collect();
                     FrameBody::Scrollback {
-                        base: acked_num,
+                        base: producer.acked_num(),
                         rows,
                     }
                 } else {
                     // Visible-frame body via the negotiated codec (#15). The
-                    // acked baseline (Some exactly when acked_data is) gives the
-                    // encoder both the byte-diff base (dump) and the morph base
-                    // (snapshot + off-Snapshot alt/dims). DumpDiff reproduces
-                    // today's behavior verbatim; MorphDelta emits a forward
-                    // escape-delta or a Full keyframe.
-                    let baseline = acked_data.as_ref().zip(acked_baseline.as_ref()).map(
-                        |(dump, (snapshot, alt, dims))| Baseline {
-                            num: acked_num,
-                            dump: dump.clone(),
-                            snapshot: snapshot.clone(),
-                            alt_screen: *alt,
-                            rows: dims.0,
-                            cols: dims.1,
-                        },
-                    );
-                    let cur = CurrentFrame {
-                        dump: &current.data,
-                        snapshot: &current.snapshot,
-                        alt_screen: current.alt_screen,
-                        rows: current.dims.0,
-                        cols: current.dims.1,
-                    };
-                    let mut body = if peer_wants_morph {
-                        morph_enc.encode(baseline.as_ref(), &cur)
-                    } else {
-                        dumpdiff_enc.encode(baseline.as_ref(), &cur)
-                    };
+                    // producer encodes the current frame against its acked
+                    // baseline (the byte-diff dump + the morph snapshot/alt/dims);
+                    // DumpDiff reproduces today's behavior verbatim, MorphDelta
+                    // emits a forward escape-delta or a Full keyframe.
+                    let mut body = producer.encode_visible(peer_wants_morph);
                     // RFC 0006: stamp the diff base's checksum so the client can
                     // confirm it holds the same base before applying. The base is
-                    // the acked dump the diff was computed against (acked_data).
+                    // the acked dump the diff was computed against.
                     if peer_wants_base_sum {
-                        if let Some(acked) = acked_data.as_deref() {
+                        if let Some(acked) = producer.acked_dump() {
                             // Diff only: the client's applied_data IS the DumpDiff
                             // base, so a byte checksum verifies it. A Morph base is
                             // a snapshot, not the client's held dump bytes, so the
@@ -906,17 +800,18 @@ pub(crate) fn server_loop(
                     // a diff-shaped body (Diff/Morph) is the incremental case;
                     // Full is the keyframe. The fresh_frame gate keeps
                     // retransmits out of the per-strategy size sample.
+                    let dump_len = producer.current_dump_len();
                     match &body {
                         FrameBody::Diff { diff, .. } => {
                             stats.record_frame_diff();
                             if fresh_frame {
-                                stats.record_diff_frame(current.data.len(), diff.len());
+                                stats.record_diff_frame(dump_len, diff.len());
                             }
                         }
                         FrameBody::Morph { escapes, .. } => {
                             stats.record_frame_diff();
                             if fresh_frame {
-                                stats.record_diff_frame(current.data.len(), escapes.len());
+                                stats.record_diff_frame(dump_len, escapes.len());
                             }
                         }
                         FrameBody::Full(_) => {
@@ -924,8 +819,8 @@ pub(crate) fn server_loop(
                             // A forced full dump (no baseline) is not a strategy
                             // choice, so it skips the per-strategy size sample —
                             // matching the inline path's None arm.
-                            if fresh_frame && baseline.is_some() {
-                                stats.record_full_frame(current.data.len());
+                            if fresh_frame && producer.has_acked_base() {
+                                stats.record_full_frame(dump_len);
                             }
                         }
                         _ => {}
@@ -956,10 +851,10 @@ pub(crate) fn server_loop(
                 // its terminal is changing, and whether the shell is alive.
                 if peer_wants_diag {
                     extras.push(caps::encode_server_diag(&caps::ServerDiag {
-                        current_num: current.num,
-                        acked_num,
+                        current_num: producer.current_num(),
+                        acked_num: producer.acked_num(),
                         term_gen: term.generation(),
-                        outstanding: outstanding.len() as u32,
+                        outstanding: producer.outstanding_len() as u32,
                         pty_open,
                         // FDR 0004: forward the agent endpoint's state too
                         // when forwarding is active server-side (None == none).
@@ -1072,7 +967,7 @@ pub(crate) fn server_loop(
                         | overlay_flag
                         | server_log_flag,
                     caps: frame_caps,
-                    frame_num: current.num,
+                    frame_num: producer.current_num(),
                     input_ack: inbox.next_offset(),
                     echo_ack: echo.ack(),
                     body,
@@ -1081,7 +976,13 @@ pub(crate) fn server_loop(
                 last_send = now;
             }
         }
-        stats.flush_server(now, conn.srtt(), conn.rto(), outstanding.len(), conn.bytes_tx());
+        stats.flush_server(
+            now,
+            conn.srtt(),
+            conn.rto(),
+            producer.outstanding_len(),
+            conn.bytes_tx(),
+        );
 
         if shutdown {
             // The shell has exited: announce it (frames now carry the
@@ -1090,7 +991,7 @@ pub(crate) fn server_loop(
             if !force_frame
                 && !force_ack
                 && term.generation() == last_gen
-                && acked_num >= current.num
+                && producer.acked_num() >= producer.current_num()
                 && echo.ack() >= inbox.next_offset()
             {
                 break;
@@ -1112,7 +1013,7 @@ pub(crate) fn server_loop(
         now_ms(),
         conn.srtt(),
         conn.rto(),
-        outstanding.len(),
+        producer.outstanding_len(),
         conn.bytes_tx(),
     );
 
@@ -1169,62 +1070,6 @@ fn handle_client_message(
         echo.record(inbox.next_offset(), now_ms());
         *force_ack = true;
     }
-}
-
-#[allow(clippy::too_many_arguments)]
-fn update_acks(
-    msg: &ClientMessage,
-    current: &FrameState,
-    outstanding: &mut Vec<FrameState>,
-    acked_num: &mut u64,
-    acked_data: &mut Option<Vec<u8>>,
-    acked_baseline: &mut Option<(Snapshot, bool, (u16, u16))>,
-    acked_sb_total: &mut u64,
-) {
-    // Ignore acks for frames never sent: an authenticated client claiming a
-    // future frame would otherwise clear `outstanding`, disable retransmits,
-    // and satisfy the shutdown gate without confirming the real final state.
-    if msg.acked_frame <= *acked_num || msg.acked_frame > current.num {
-        return;
-    }
-    *acked_num = msg.acked_frame;
-    // The acked frame's bytes, morph base (snapshot + off-Snapshot alt/dims),
-    // and scrollback total, from `current` or the retained outstanding frame.
-    let acked = if msg.acked_frame == current.num {
-        Some((
-            current.data.clone(),
-            current.snapshot.clone(),
-            current.alt_screen,
-            current.dims,
-            current.sb_total,
-        ))
-    } else {
-        outstanding.iter().find(|f| f.num == msg.acked_frame).map(|f| {
-            (
-                f.data.clone(),
-                f.snapshot.clone(),
-                f.alt_screen,
-                f.dims,
-                f.sb_total,
-            )
-        })
-    };
-    if let Some((data, snapshot, alt, dims, sb_total)) = acked {
-        *acked_data = Some(data);
-        // The morph baseline tracks acked_data exactly (#15): both Some, or
-        // both None when we no longer hold the acked frame's state.
-        *acked_baseline = Some((snapshot, alt, dims));
-        // A frame's sb_total is the scrollback the client holds after applying
-        // it: a scrollback frame advances it by the rows it carries; a visible
-        // frame inherits the acked base's total (it carries no rows). So acking
-        // any frame confirms only scrollback the client actually received, even
-        // when a scrollback frame was lost and leapfrogged (RFC 0002 §2/§3).
-        *acked_sb_total = (*acked_sb_total).max(sb_total);
-    } else {
-        *acked_data = None;
-        *acked_baseline = None;
-    }
-    outstanding.retain(|f| f.num >= msg.acked_frame);
 }
 
 fn send_payload(conn: &mut Connection, fragmenter: &mut Fragmenter, payload: &[u8]) {
@@ -2065,73 +1910,6 @@ mod tests {
              a lost scrollback frame's rows were silently confirmed by a visible-frame ack \
              (sb_total=sb_high) and never re-shipped (finding #1)",
         );
-    }
-
-    #[test]
-    fn update_acks_rejects_frames_never_sent() {
-        // A bare FrameState for the ack bookkeeping test: the morph base fields
-        // (#15) are present but their values are immaterial here — this test
-        // exercises acked_num/acked_data/acked_sb_total movement.
-        let frame = |num: u64, data: &[u8], sb_total: u64| FrameState {
-            num,
-            data: data.to_vec(),
-            snapshot: Snapshot::blank(24, 80),
-            alt_screen: false,
-            dims: (24, 80),
-            sb_total,
-        };
-        let current = frame(3, b"current", 7);
-        let mut outstanding = vec![frame(1, b"one", 2), frame(2, b"two", 5)];
-        let mut acked_num = 1u64;
-        let mut acked_data = Some(b"one".to_vec());
-        let mut acked_baseline = Some((Snapshot::blank(24, 80), false, (24u16, 80u16)));
-        let mut acked_sb_total = 2u64;
-        let msg = ClientMessage {
-            flags: 0,
-            caps: vec![],
-            acked_frame: u64::MAX,
-            rows: 24,
-            cols: 80,
-            input_base: 0,
-            input: Vec::new(),
-        };
-
-        update_acks(
-            &msg,
-            &current,
-            &mut outstanding,
-            &mut acked_num,
-            &mut acked_data,
-            &mut acked_baseline,
-            &mut acked_sb_total,
-        );
-
-        assert_eq!(acked_num, 1, "ack for a frame never sent must be ignored");
-        assert_eq!(acked_data.as_deref(), Some(b"one".as_slice()));
-        assert_eq!(acked_sb_total, 2, "scrollback ack must not advance either");
-        assert_eq!(outstanding.len(), 2, "outstanding frames must be kept");
-
-        // A legitimate ack of the newest frame still works, carrying its
-        // scrollback coverage forward (RFC 0002 §2).
-        let msg = ClientMessage {
-            acked_frame: 3,
-            ..msg
-        };
-        update_acks(
-            &msg,
-            &current,
-            &mut outstanding,
-            &mut acked_num,
-            &mut acked_data,
-            &mut acked_baseline,
-            &mut acked_sb_total,
-        );
-        assert_eq!(acked_num, 3);
-        assert_eq!(acked_data.as_deref(), Some(b"current".as_slice()));
-        // The morph baseline tracks acked_data: both Some after a real ack (#15).
-        assert!(acked_baseline.is_some(), "morph baseline tracks acked_data");
-        assert_eq!(acked_sb_total, 7, "acking a frame confirms its scrollback");
-        assert!(outstanding.is_empty());
     }
 
     #[test]
