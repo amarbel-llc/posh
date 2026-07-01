@@ -36,6 +36,8 @@ pub(crate) type ScrollMemo = Option<(usize, usize, u64)>;
 /// next compose repaints) and returns `true` — the caller invalidates any
 /// *additional* memo of its own (the remote client's live-render memo). At
 /// offset 0 the caller resumes the live view.
+#[must_use = "the `changed` bool gates the caller's own memo invalidation; \
+    ignore it explicitly with `let _` only when there is no additional memo"]
 pub(crate) fn set_scroll(
     scroll_offset: &mut usize,
     scroll_memo: &mut ScrollMemo,
@@ -55,6 +57,8 @@ pub(crate) fn set_scroll(
 /// Applies wheel ticks to the scroll offset: positive = up (scroll back into
 /// history), negative = down (toward live); reaching 0 returns to the live view
 /// (FDR 0005). Returns `true` when the offset actually moved (see [`set_scroll`]).
+#[must_use = "the `changed` bool gates the caller's own memo invalidation; \
+    ignore it explicitly with `let _` only when there is no additional memo"]
 pub(crate) fn scroll_by(
     scroll_offset: &mut usize,
     scroll_memo: &mut ScrollMemo,
@@ -433,9 +437,9 @@ mod tests {
         let mut offset = 0usize;
         let mut memo: ScrollMemo = None;
         let ring_len = 2; // ring depth 2
-        scroll_by(&mut offset, &mut memo, ring_len, 1); // +WHEEL_STEP, clamped
+        let _ = scroll_by(&mut offset, &mut memo, ring_len, 1); // +WHEEL_STEP, clamped
         assert_eq!(offset, 2);
-        scroll_by(&mut offset, &mut memo, ring_len, -1); // back past the bottom → live
+        let _ = scroll_by(&mut offset, &mut memo, ring_len, -1); // back past the bottom → live
         assert_eq!(offset, 0);
     }
 
