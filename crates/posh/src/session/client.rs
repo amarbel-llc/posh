@@ -5,8 +5,13 @@ use std::io::Write;
 use std::os::fd::AsRawFd;
 use std::os::unix::net::UnixStream;
 
+use posh_term::Terminal;
+
 use crate::pty::{self, RawMode};
 use crate::remote::caps;
+use crate::remote::display::{self, Snapshot};
+use crate::remote::framesync::{ApplyOutcome, FrameApplier, FrameSync};
+use crate::remote::sync::ServerFrame;
 use crate::session::ipc::{self, FrameBuffer, Tag};
 use crate::session::{daemon, Config};
 use crate::util::{self, Error, Result};
@@ -169,6 +174,126 @@ impl DetachMatcher {
     }
 }
 
+/// Client-side consumer of the daemon's posh-proto `ServerFrame` stream
+/// (RFC 0008 / FDR 0011): a minimal, reliable-socket mirror of the remote
+/// client's apply+compose core. It holds a client-side terminal model, applies
+/// each received `FrameBody` through the DumpDiff applier — the only codec the
+/// local client negotiates in Phase 1 — and renders the resulting screen as a
+/// display diff against what the tty last showed. No resync/base-sum,
+/// prediction, palette, or scrollback: those are later unification tasks.
+///
+/// This path runs only when the daemon sends `Tag::Frame`
+/// (`POSH_SESSION_FRAMES=on`, negotiated by Task 1.4). A default gate-off
+/// session serves raw `Tag::Output` and never constructs a `FrameRenderer`, so
+/// its byte stream is unchanged.
+struct FrameRenderer {
+    /// The client's mirror of the daemon terminal. DumpDiff rebuilds it from a
+    /// fresh model on every apply, so it is effectively write-then-read here;
+    /// a persistent model is nonetheless the seam a later in-place codec
+    /// (Morph/scrollback) would advance, so it is held rather than local.
+    server_term: Terminal,
+    applier: Box<dyn FrameApplier>,
+    /// The last applied frame's `dump_vt` bytes — the byte-diff base a `Diff`
+    /// reconstructs against.
+    applied_data: Vec<u8>,
+    /// The frame number the model currently reflects.
+    applied_num: u64,
+    /// What the tty last showed, so the renderer emits only the delta.
+    last_drawn: Snapshot,
+    /// False until the first render (and after an external clear), so the next
+    /// frame clears + fully repaints — this is what lets a leading raw
+    /// `Tag::Output` be overwritten by the first `Full` keyframe, and a `Diff`
+    /// land cleanly after a SIGCONT re-enter.
+    initialized: bool,
+    rows: u16,
+    cols: u16,
+}
+
+impl FrameRenderer {
+    fn new(rows: u16, cols: u16) -> FrameRenderer {
+        let rows = rows.max(1);
+        let cols = cols.max(1);
+        FrameRenderer {
+            server_term: Terminal::with_scrollback(rows, cols, 0),
+            // DumpDiff: the daemon encodes visible frames with DumpDiff in
+            // Phase 1 (Task 1.4) and the client advertises only
+            // PROTOCOL_VERSION over the socket (never CAP_MORPH), so the
+            // matching applier is DumpDiff. Selected through `FrameSync` so the
+            // codec choice lives in one place.
+            applier: FrameSync::DumpDiff.applier(),
+            applied_data: Vec::new(),
+            applied_num: 0,
+            last_drawn: Snapshot::blank(rows, cols),
+            initialized: false,
+            rows,
+            cols,
+        }
+    }
+
+    /// Track a tty resize (SIGWINCH): the daemon re-encodes at the new size, so
+    /// the model must apply subsequent frames at the same dimensions (DumpDiff's
+    /// reparse clamps to these). Forces the next frame to fully repaint at the
+    /// new size.
+    fn resize(&mut self, rows: u16, cols: u16) {
+        self.rows = rows.max(1);
+        self.cols = cols.max(1);
+        self.initialized = false;
+    }
+
+    /// Force the next rendered frame to clear + fully repaint — used after the
+    /// tty was externally cleared (SIGCONT re-enter) so a subsequent `Diff`
+    /// (which carries only the delta) still lands on a known-blank screen.
+    fn invalidate(&mut self) {
+        self.initialized = false;
+    }
+
+    /// Decode, apply, and render one `Tag::Frame` payload, returning the escape
+    /// stream to write to the tty (empty when the frame produced no visible
+    /// change). Over the reliable Unix socket a frame always applies against the
+    /// last one, so an inability to apply (`ReackAndWait`) is a genuine protocol
+    /// bug — surfaced as an error rather than silently retried, since the local
+    /// client has no resync/keyframe-request path yet (a later task).
+    fn render_frame(&mut self, payload: &[u8]) -> Result<Vec<u8>> {
+        let frame = ServerFrame::decode(payload)?;
+        match self.applier.apply(
+            self.rows,
+            self.cols,
+            &self.applied_data,
+            &mut self.server_term,
+            &frame.body,
+        ) {
+            ApplyOutcome::Advanced { dump } => {
+                self.applied_data = dump;
+                self.applied_num = frame.frame_num;
+            }
+            ApplyOutcome::AdvancedNoDump => {
+                // The applier advanced the model in place without re-dumping it
+                // (MorphDelta): `applied_data` intentionally stays at the last
+                // Full/Diff dump, since a Morph session emits no Diff body that
+                // would read it. DumpDiff never returns this in Phase 1, but
+                // handle it generically so a later codec swap is inert here.
+                self.applied_num = frame.frame_num;
+            }
+            ApplyOutcome::NoChange => return Ok(Vec::new()),
+            ApplyOutcome::ReackAndWait => {
+                return Err(Error(format!(
+                    "session frame {} could not be applied on the reliable socket",
+                    frame.frame_num
+                )));
+            }
+        }
+        // The minimal compose: non-scroll, non-prediction, non-palette. `false`
+        // = no outer wheel reporting; `true` = the scroll-shortcut optimization
+        // on (new_frame's default). The remote client's compose_frame adds the
+        // prediction/notification/palette overlays on top of exactly this.
+        let next = Snapshot::from_term(&self.server_term);
+        let bytes = display::new_frame_opt(self.initialized, &self.last_drawn, &next, false, true);
+        self.last_drawn = next;
+        self.initialized = true;
+        Ok(bytes)
+    }
+}
+
 /// Bridges the tty to the daemon until detach or session end. Returns the
 /// session shell's exit status (0 on detach or connection loss).
 /// `enter` is re-written on SIGCONT, when the outer terminal may have
@@ -203,10 +328,22 @@ fn client_loop(stream: UnixStream, enter: &[u8]) -> Result<i32> {
         &ipc::encode_resize(rows, cols),
     );
 
+    // Consumer of the daemon's `Tag::Frame` stream (RFC 0008): stays None —
+    // fully inert — until the first frame arrives, so a default gate-off session
+    // (`Tag::Output` only) constructs nothing and behaves exactly as today.
+    // `frame_size` seeds a lazily-built renderer at the current tty size and
+    // tracks SIGWINCH so it stays correct if frames begin after a resize.
+    let mut frame_renderer: Option<FrameRenderer> = None;
+    let mut frame_size = (rows, cols);
+
     let err_events = libc::POLLHUP | libc::POLLERR | libc::POLLNVAL;
     loop {
         if util::take_flag(&util::SIGWINCH_RECEIVED) {
             let (rows, cols) = pty::term_size(STDOUT);
+            frame_size = (rows, cols);
+            if let Some(fr) = frame_renderer.as_mut() {
+                fr.resize(rows, cols);
+            }
             ipc::append_frame(
                 &mut sock_write_buf,
                 Tag::Resize,
@@ -228,6 +365,11 @@ fn client_loop(stream: UnixStream, enter: &[u8]) -> Result<i32> {
             // then re-Init so the daemon replays the screen (and picks up
             // any size change while stopped).
             let _ = util::write_fd(STDOUT, enter);
+            // `enter` just cleared the tty; force the next frame to fully
+            // repaint over the blank screen so a replay `Diff` isn't lost.
+            if let Some(fr) = frame_renderer.as_mut() {
+                fr.invalidate();
+            }
             let (rows, cols) = pty::term_size(STDOUT);
             // Bare 4-byte Init: caps are session-persistent (the daemon
             // preserves them across bare re-Inits), and an exact-4-byte resize
@@ -288,6 +430,18 @@ fn client_loop(stream: UnixStream, enter: &[u8]) -> Result<i32> {
                         Ok(Some(frame)) => match frame.tag {
                             Tag::Output if !frame.payload.is_empty() => {
                                 stdout_buf.extend_from_slice(&frame.payload);
+                            }
+                            // Frame transport (RFC 0008), only when the daemon
+                            // negotiated it (`POSH_SESSION_FRAMES=on`): apply the
+                            // ServerFrame into the client model and append the
+                            // rendered delta. Build the consumer lazily on the
+                            // first frame so the gate-off path stays inert.
+                            Tag::Frame => {
+                                let fr = frame_renderer.get_or_insert_with(|| {
+                                    FrameRenderer::new(frame_size.0, frame_size.1)
+                                });
+                                let bytes = fr.render_frame(&frame.payload)?;
+                                stdout_buf.extend_from_slice(&bytes);
                             }
                             Tag::Exit => {
                                 // Session over: flush the final output and
@@ -413,5 +567,169 @@ mod tests {
         let (fwd, detached) = m.feed(b"7;5u");
         assert!(!detached);
         assert_eq!(fwd, b"\x1b[97;5u");
+    }
+
+    // ---- Task 2.1: local client renders posh-proto ServerFrames (RFC 0008) ----
+
+    use crate::remote::framesync::FrameProducer;
+    use crate::remote::sync::FrameBody;
+
+    /// Encode one visible frame the way the session daemon's `queue_frame` does
+    /// (DumpDiff, reliable-socket immediate self-ack), returning the `Tag::Frame`
+    /// `ServerFrame` payload bytes the client would receive off the socket.
+    fn daemon_frame(producer: &mut FrameProducer, term: &Terminal) -> Vec<u8> {
+        producer.advance_visible(
+            term.dump_vt(),
+            Snapshot::from_term(term),
+            term.is_alt_screen(),
+            (term.rows(), term.cols()),
+            0,
+        );
+        let body = producer.encode_visible(false);
+        let frame_num = producer.current_num();
+        let bytes = ServerFrame {
+            flags: 0,
+            caps: caps::own_table(&[]),
+            frame_num,
+            input_ack: 0,
+            echo_ack: 0,
+            body,
+        }
+        .encode();
+        producer.ack(frame_num);
+        bytes
+    }
+
+    /// Fill a screen so a later small edit diffs as a clear win (a `Diff`, not a
+    /// `Full`) — mirrors the daemon-side frame fixture. SGR is varied per line
+    /// (bold+colour on even rows) so the per-cell style check in
+    /// `assert_screens_match` has real signal: a scrambled-attribute regression
+    /// would leave the text identical but the pens wrong.
+    fn fill_screen(term: &mut Terminal) {
+        term.process(b"\x1b[2J\x1b[H");
+        for i in 0..20u8 {
+            let line = if i % 2 == 0 {
+                format!("\x1b[1;32mline {i:02} bold green session content\x1b[0m\r\n")
+            } else {
+                format!("line {i:02} plain session content\r\n")
+            };
+            term.process(line.as_bytes());
+        }
+    }
+
+    /// Assert two terminals show the same visible grid: per-row text, per-cell
+    /// SGR pen for every glyph-bearing cell, and cursor position. The style
+    /// check is what catches an apply→render regression that scrambled
+    /// colours/attributes while leaving the text intact. Blank cells' pens are
+    /// deliberately skipped — the escape stream does not round-trip the pen of
+    /// empty trailing cells — as are the Snapshot fields (bell/clipboard) that
+    /// never travel through the rendered escapes.
+    fn assert_screens_match(rendered: &Terminal, expected: &Terminal) {
+        let (rs, es) = (rendered.screen(), expected.screen());
+        for r in 0..expected.rows() {
+            let (rrow, erow) = (rs.row(r).unwrap(), es.row(r).unwrap());
+            assert_eq!(rrow.text(true), erow.text(true), "row {r} text diverged");
+            for (c, (rc, ec)) in rrow.cells().iter().zip(erow.cells()).enumerate() {
+                if ec.ch != ' ' && ec.ch != '\0' {
+                    assert_eq!(rc.style, ec.style, "row {r} col {c} style diverged");
+                }
+            }
+        }
+        assert_eq!(rendered.cursor().row, expected.cursor().row, "cursor row");
+        assert_eq!(rendered.cursor().col, expected.cursor().col, "cursor col");
+    }
+
+    /// The core Task 2.1 property: the local client's `FrameRenderer` consumes
+    /// the daemon's `Tag::Frame` stream and reproduces the daemon screen — i.e.
+    /// the same screen the raw `Tag::Output` path (a `dump_vt` replay of that
+    /// daemon screen) would have produced, since `Snapshot::from_term(&daemon)`
+    /// IS what raw output renders. Checked at two levels: the applier's model
+    /// equals the daemon screen (apply correctness), and an outer terminal fed
+    /// the RENDERED escape stream shows the same grid + cursor (render
+    /// correctness), across a `Full` keyframe then a `Diff`.
+    #[test]
+    fn frame_renderer_reproduces_the_daemon_screen() {
+        let (rows, cols) = (24u16, 80u16);
+        let mut daemon = Terminal::with_scrollback(rows, cols, 1000);
+        fill_screen(&mut daemon);
+
+        let mut producer = FrameProducer::new(rows, cols);
+        let mut renderer = FrameRenderer::new(rows, cols);
+        // The outer tty: a fresh model fed ONLY the client's rendered bytes,
+        // i.e. exactly what the user's terminal would display.
+        let mut outer = Terminal::with_scrollback(rows, cols, 0);
+
+        let play = |renderer: &mut FrameRenderer, outer: &mut Terminal, payload: &[u8]| {
+            let bytes = renderer
+                .render_frame(payload)
+                .expect("a frame must apply on the reliable socket");
+            outer.process(&bytes);
+            if outer.rows() != rows || outer.cols() != cols {
+                outer.resize(rows, cols);
+            }
+        };
+
+        // Frame 1: the replay-on-attach Full keyframe (nothing acked but the
+        // empty frame-0 base, so a DumpDiff against it is never a win).
+        let f1 = daemon_frame(&mut producer, &daemon);
+        assert!(
+            matches!(ServerFrame::decode(&f1).unwrap().body, FrameBody::Full(_)),
+            "a fresh attach's first frame must be a Full keyframe"
+        );
+        play(&mut renderer, &mut outer, &f1);
+        assert_eq!(renderer.applied_num, 1, "the keyframe advances applied_num to 1");
+        assert_eq!(
+            Snapshot::from_term(&renderer.server_term),
+            Snapshot::from_term(&daemon),
+            "the applier model must equal the daemon screen after the keyframe"
+        );
+        assert_screens_match(&outer, &daemon);
+
+        // A visible edit at the cursor => a Diff against the acked base (frame 1).
+        daemon.process(b"appended output");
+        let f2 = daemon_frame(&mut producer, &daemon);
+        assert!(
+            matches!(
+                ServerFrame::decode(&f2).unwrap().body,
+                FrameBody::Diff { base: 1, .. }
+            ),
+            "an established base must yield a Diff against frame 1"
+        );
+        play(&mut renderer, &mut outer, &f2);
+        assert_eq!(renderer.applied_num, 2, "the Diff advances applied_num to 2");
+        assert_eq!(
+            Snapshot::from_term(&renderer.server_term),
+            Snapshot::from_term(&daemon),
+            "the applier model must track the daemon screen across a Diff"
+        );
+        assert_screens_match(&outer, &daemon);
+    }
+
+    /// The first `Full` keyframe overwrites any leading raw `Tag::Output` (#17):
+    /// before frames begin the daemon may emit a little raw output, which the
+    /// client writes verbatim; the first frame is a `Full` applied with
+    /// `initialized == false`, so the render clears + fully repaints, erasing the
+    /// stale raw bytes. Here the outer terminal is pre-seeded with leftover
+    /// output; after the keyframe it must match the daemon exactly.
+    #[test]
+    fn first_full_keyframe_overwrites_leading_raw_output() {
+        let (rows, cols) = (24u16, 80u16);
+        let mut daemon = Terminal::with_scrollback(rows, cols, 1000);
+        fill_screen(&mut daemon);
+
+        let mut producer = FrameProducer::new(rows, cols);
+        let mut renderer = FrameRenderer::new(rows, cols);
+
+        // Stale leading raw output on the tty (the pre-frame `Tag::Output`).
+        let mut outer = Terminal::with_scrollback(rows, cols, 0);
+        outer.process(b"stale leading raw output line\r\nand another\r\n");
+
+        let f1 = daemon_frame(&mut producer, &daemon);
+        let bytes = renderer.render_frame(&f1).expect("keyframe applies");
+        outer.process(&bytes);
+        if outer.rows() != rows || outer.cols() != cols {
+            outer.resize(rows, cols);
+        }
+        assert_screens_match(&outer, &daemon);
     }
 }
