@@ -12,6 +12,10 @@
 
 **Normative references:** FDR 0011 (`docs/features/0011-unified-durable-sessions.md`), RFC 0008 (`docs/rfcs/0008-unified-session-frame-transport.md`), design trail (`docs/plans/2026-06-30-unified-session-transport-design.md`), committed at `7622029`.
 
+**Downstream / adjacent (sequenced in from upstream, 2026-07-01):**
+- **FDR 0012** (`docs/features/0012-session-layer-collapse.md`, `exploring`) — a relay-*retarget* feature (posh-in-posh collapse) that hangs off Phase 3's relay. RFC 0008 §3 was amended to anticipate retargeting. It is **not** implemented in this plan; it only **constrains the Phase 3 relay design** (below) and MUST NOT promote past `proposed` until this plan's relay is `experimental`.
+- **`docs/wheel-scroll-behavior.md`** — the default gate-OFF wheel→arrow passthrough (terminal-native alternate-scroll) and the *maturity* bar for flipping `POSH_SESSION_FRAMES` on. Sharpens the Phase 2 exit gate / Phase 5 flip call (below).
+
 ---
 
 ## Granularity note
@@ -171,11 +175,15 @@ Landmarks: remote consumer/render machinery `remote/client.rs:1585-1984` (`apply
 
 **Phase 2 exit gate:** local attach renders frames + palette + scrollback locally; `POSH_SESSION_FRAMES` can be flipped on for local without regression; `just` green. (Defaulting the gate ON is a rollout decision, deferred to Phase 5 / a separate call.)
 
+**Gate-flip maturity bar (per `docs/wheel-scroll-behavior.md`).** Flipping the fleet default is *not* just "no regression": it changes user-visible behavior — the wheel goes from terminal-native arrows (alternate-scroll passthrough) to posh's scroll-view, and scrollback ownership moves to posh (the #104 convergence). So the flip call weighs **soak + palette-local (2.4)**, not the gate alone. Reconciling the doc with this plan's thesis: it lists "no resync/prediction" as a consumer gap, but on the reliable local socket those are absent **by design** (reliable-as-degenerate, Phase 2 intro) — *not* a maturity deficit. The genuine pre-flip items are therefore palette-local (2.4) and a real end-to-end soak; the #106 wheel-teardown and #107 resize-gap accept are already resolved. A personal `POSH_SESSION_FRAMES=1` opt-in (`~/.env`) is the dogfooding path ahead of the fleet-wide call; eng/clown set no gate, so the fleet default stays OFF until then.
+
 ---
 
 # Phase 3 — Frame relay (reduce posh-server)
 
 **Goal:** `posh-server`, in the `host:session` case, connects to the session socket and relays frames over UDP instead of running an inner `posh attach` in a second PTY. No second terminal model.
+
+**Design constraint (FDR 0012 — retarget-readiness).** The relay's only per-session state is *which daemon socket it is connected to*. Structure that target as a **replaceable field, not a construction invariant**: the relay must be able to drop its current daemon connection and open a new one mid-transport, letting the new daemon's `Full` keyframe (§2) re-establish the base — the same reset as a fresh attach. RFC 0008 §3 (amended) says nothing may presume a single fixed target for the transport's lifetime. Do **not** build the layer-collapse UX (trigger, replace-vs-stack, the offer prompt) here — that is FDR 0012's job, downstream — but do not *preclude* it: a retrofit from a hardcoded single target is expensive, a replaceable field is nearly free now.
 
 **Tasks:**
 - **3.1 Relay mode in posh-server.** New path: connect to the session's Unix socket as a frame-capable client (reuse `client_core`/`FrameBuffer`), relay each `Tag::Frame` body into a datagram `ServerFrame` (it already *is* one — re-seal/fragment, don't re-model). Bridge the UDP reliable input stream (`InputInbox`, `sync.rs:422-445`) into socket `Tag::Input` writes. Reuse the `FrameProducer`? No — the daemon now produces; the relay forwards. Acceptance: `posh box:dev` over loopback works with one terminal model (assert no second `Terminal` constructed in the session path).
