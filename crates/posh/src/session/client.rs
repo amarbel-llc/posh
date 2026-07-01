@@ -246,6 +246,12 @@ struct FrameRenderer {
     /// isn't also a mouse_mode change — e.g. an app entering the alt-screen
     /// without a mouse mode (github #106).
     last_wheel: bool,
+    /// Whether `new_frame`'s scroll-region (DECSTBM) optimization is enabled
+    /// (default on). The palette's scroll-region-optimization toggle flips it;
+    /// off forces full per-row repaints, avoiding the DECSTBM region scroll that
+    /// leaves a stuck background on some terminals (posh#100) — the local escape
+    /// hatch the roaming client already exposes.
+    scroll_opt: bool,
     rows: u16,
     cols: u16,
 }
@@ -271,6 +277,7 @@ impl FrameRenderer {
             last_drawn: Snapshot::blank(rows, cols),
             initialized: false,
             last_wheel: false,
+            scroll_opt: true,
             rows,
             cols,
         }
@@ -394,8 +401,8 @@ impl FrameRenderer {
     /// the diff (mirror remote client.rs render() ordering) so the overlay box
     /// paints in the same frame. `wheel` enables outer-terminal mouse reporting at
     /// a bare prompt so the wheel arrives as SGR events the scroll-view can
-    /// intercept (mirrors the remote client); `true` = the scroll-shortcut
-    /// optimization on (new_frame's default).
+    /// intercept (mirrors the remote client). The scroll-shortcut optimization
+    /// follows `self.scroll_opt` (the palette toggle; default on).
     fn compose_live(&mut self, palette: Option<&Terminal>) -> Vec<u8> {
         let mut next = Snapshot::from_term(&self.server_term);
         if let Some(rterm) = palette {
@@ -408,7 +415,7 @@ impl FrameRenderer {
             &next,
             wheel,
             self.last_wheel,
-            true,
+            self.scroll_opt,
         );
         self.last_drawn = next;
         self.last_wheel = wheel;
@@ -425,8 +432,8 @@ impl FrameRenderer {
     }
 
     /// Repaints the frozen history window at the current offset via the shared
-    /// `remote::scrollview` compose. `scroll_opt = true`: the local client has no
-    /// palette toggle for the scroll-shortcut, so it stays at new_frame's default.
+    /// `remote::scrollview` compose, honoring the palette's scroll-region toggle
+    /// (`self.scroll_opt`) exactly as the live compose does.
     fn compose_scroll(&mut self) -> Vec<u8> {
         scrollview::compose_scroll_frame(
             self.scroll_offset,
@@ -437,7 +444,7 @@ impl FrameRenderer {
             &mut self.last_scroll_state,
             &mut self.initialized,
             &mut self.last_drawn,
-            true,
+            self.scroll_opt,
         )
     }
 
@@ -452,6 +459,14 @@ impl FrameRenderer {
             ring_len,
             offset,
         );
+    }
+
+    /// Flip the scroll-region (DECSTBM) optimization (posh#100 diagnostic toggle,
+    /// driven by the palette). Forcing a full repaint is the caller's job (the
+    /// palette dispatch does `invalidate` + recompose), so the new mode takes
+    /// effect on the next frame.
+    fn set_scroll_opt(&mut self, on: bool) {
+        self.scroll_opt = on;
     }
 
     /// Applies wheel ticks to the scroll offset (+ = up into history).
@@ -511,16 +526,25 @@ impl FrameRenderer {
     }
 }
 
-/// The local session's palette command set (FDR 0011 Phase 2.4a/b). The
+/// The local session's palette command set (FDR 0011 Phase 2.4). The
 /// transport-aware entries that make sense on a reliable local socket: Suspend
 /// (background the client), Shell out (a daemon-spawned escape-to-shell overlay,
-/// FDR 0008), and Detach (leave the session running). The remote client's
-/// echo/prediction/resync/forensics/agent/server-log commands are
-/// UDP/prediction-only and intentionally omitted.
-fn palette_commands() -> Value {
+/// FDR 0008), the scroll-region-optimization toggle (posh#100 escape hatch, its
+/// label reflecting the current `scroll_opt` state), and Detach (leave the
+/// session running). The remote client's echo/prediction/resync/forensics/agent/
+/// server-log commands are UDP/prediction-only and intentionally omitted.
+fn palette_commands(scroll_opt: bool) -> Value {
+    // Imperative label (the verb is the action), matching the remote palette:
+    // enabled now => offer "Disable"; disabled now => offer "Enable".
+    let (scroll_opt_name, scroll_opt_enabled) = if scroll_opt {
+        ("Disable scroll-region optimization", false)
+    } else {
+        ("Enable scroll-region optimization", true)
+    };
     json!([
         { "name": "Suspend client", "action": { "method": "client.suspend" } },
         { "name": "Shell out", "action": { "method": "shell.open" } },
+        { "name": scroll_opt_name, "action": { "method": "render.scroll_opt", "params": { "enabled": scroll_opt_enabled } } },
         { "name": "Detach", "action": { "method": "app.detach" } },
     ])
 }
@@ -555,7 +579,7 @@ fn open_local_palette(
     let Some(p) = palette.as_mut() else {
         return false;
     };
-    p.open("Commands", palette_commands());
+    p.open("Commands", palette_commands(fr.scroll_opt));
     fr.set_scroll(0);
     fr.invalidate();
     stdout_buf.extend_from_slice(&fr.recompose(p.screen()));
@@ -571,13 +595,17 @@ enum LocalAction {
     None,
     /// Run [`suspend`] with the loop's `RawMode`.
     Suspend,
+    /// Set the renderer's scroll-region optimization (posh#100 toggle). Applied
+    /// to the `FrameRenderer` at the call site (dispatch holds no renderer).
+    SetScrollOpt(bool),
 }
 
-/// Dispatch a palette selection on the local client. Wire-only effects (Detach)
-/// are applied here against `sock_write_buf`; the tty-side Suspend is returned
-/// for the caller to run with its `RawMode`. Splitting it this way keeps the
-/// dispatch unit-testable without a real tty.
-fn dispatch_local_action(method: &str, sock_write_buf: &mut Vec<u8>) -> LocalAction {
+/// Dispatch a palette selection on the local client. Wire-only effects (Detach,
+/// Shell out) are applied here against `sock_write_buf`; effects that need the
+/// loop's `RawMode` (Suspend) or the `FrameRenderer` (scroll-opt toggle) are
+/// returned for the caller to run. Splitting it this way keeps the dispatch
+/// unit-testable without a real tty or renderer.
+fn dispatch_local_action(method: &str, params: &Value, sock_write_buf: &mut Vec<u8>) -> LocalAction {
     match method {
         "app.detach" => {
             // Same wire effect as the DetachMatcher path: ask the daemon to
@@ -594,6 +622,16 @@ fn dispatch_local_action(method: &str, sock_write_buf: &mut Vec<u8>) -> LocalAct
             LocalAction::None
         }
         "client.suspend" => LocalAction::Suspend,
+        "render.scroll_opt" => {
+            // posh#100 escape hatch: flip the DECSTBM scroll-region optimization.
+            // `enabled` is the desired new state (the command labels itself from
+            // the current one). Default to on if the param is malformed.
+            let on = params
+                .get("enabled")
+                .and_then(Value::as_bool)
+                .unwrap_or(true);
+            LocalAction::SetScrollOpt(on)
+        }
         _ => LocalAction::None, // unknown method: the renderer already closed
     }
 }
@@ -903,14 +941,19 @@ fn client_loop(stream: UnixStream, enter: &[u8], raw: &RawMode) -> Result<i32> {
             }
             if fds[base + 1].revents & libc::POLLIN != 0 {
                 match palette.as_mut().map(Palette::poll_events) {
-                    Some(PaletteEvent::Action { method, .. }) => {
-                        if let LocalAction::Suspend =
-                            dispatch_local_action(&method, &mut sock_write_buf)
-                        {
-                            suspend(raw);
+                    Some(PaletteEvent::Action { method, params }) => {
+                        match dispatch_local_action(&method, &params, &mut sock_write_buf) {
+                            LocalAction::Suspend => suspend(raw),
+                            LocalAction::SetScrollOpt(on) => {
+                                if let Some(fr) = frame_renderer.as_mut() {
+                                    fr.set_scroll_opt(on);
+                                }
+                            }
+                            LocalAction::None => {}
                         }
                         // The palette closed and (for Suspend) the tty was cleared
-                        // and restored: force a full repaint of the plain session.
+                        // and restored: force a full repaint of the plain session
+                        // (also applies the new scroll-opt mode immediately).
                         if let Some(fr) = frame_renderer.as_mut() {
                             fr.invalidate();
                             stdout_buf.extend_from_slice(&fr.recompose(None));
@@ -1467,7 +1510,7 @@ mod tests {
     fn dispatch_detach_appends_a_detach_frame() {
         let mut buf = Vec::new();
         assert!(matches!(
-            dispatch_local_action("app.detach", &mut buf),
+            dispatch_local_action("app.detach", &json!({}), &mut buf),
             LocalAction::None
         ));
         assert_eq!(buf, ipc::encode_frame(Tag::Detach, b""));
@@ -1480,7 +1523,7 @@ mod tests {
     fn dispatch_shell_open_appends_a_shell_frame() {
         let mut buf = Vec::new();
         assert!(matches!(
-            dispatch_local_action("shell.open", &mut buf),
+            dispatch_local_action("shell.open", &json!({}), &mut buf),
             LocalAction::None
         ));
         assert_eq!(buf, ipc::encode_frame(Tag::Shell, b""));
@@ -1493,7 +1536,7 @@ mod tests {
     fn dispatch_suspend_routes_to_the_suspend_action() {
         let mut buf = Vec::new();
         assert!(matches!(
-            dispatch_local_action("client.suspend", &mut buf),
+            dispatch_local_action("client.suspend", &json!({}), &mut buf),
             LocalAction::Suspend
         ));
         assert!(buf.is_empty(), "suspend queues no wire frame");
@@ -1504,10 +1547,76 @@ mod tests {
     fn dispatch_unknown_method_is_inert() {
         let mut buf = Vec::new();
         assert!(matches!(
-            dispatch_local_action("no.such.method", &mut buf),
+            dispatch_local_action("no.such.method", &json!({}), &mut buf),
             LocalAction::None
         ));
         assert!(buf.is_empty());
+    }
+
+    /// The posh#100 scroll-region toggle routes to a renderer-side action
+    /// carrying the requested state (applied to the FrameRenderer at the call
+    /// site), and queues no wire frame.
+    #[test]
+    fn dispatch_scroll_opt_routes_to_a_renderer_toggle() {
+        let mut buf = Vec::new();
+        assert!(matches!(
+            dispatch_local_action("render.scroll_opt", &json!({ "enabled": false }), &mut buf),
+            LocalAction::SetScrollOpt(false)
+        ));
+        assert!(matches!(
+            dispatch_local_action("render.scroll_opt", &json!({ "enabled": true }), &mut buf),
+            LocalAction::SetScrollOpt(true)
+        ));
+        assert!(buf.is_empty(), "the scroll-opt toggle queues no wire frame");
+    }
+
+    /// The palette's scroll-region toggle labels itself from the CURRENT state
+    /// (enabled now => offer Disable, and vice versa) and carries the desired new
+    /// state in its params — the same imperative convention as the remote palette.
+    #[test]
+    fn palette_commands_labels_the_scroll_opt_toggle_by_state() {
+        let text = |cmds: &Value| serde_json::to_string(cmds).unwrap();
+        let on = palette_commands(true);
+        assert!(
+            text(&on).contains("Disable scroll-region optimization"),
+            "enabled now => offer Disable: {}",
+            text(&on)
+        );
+        let off = palette_commands(false);
+        assert!(
+            text(&off).contains("Enable scroll-region optimization"),
+            "disabled now => offer Enable: {}",
+            text(&off)
+        );
+    }
+
+    /// The toggle is wired end to end: a renderer with the scroll-region
+    /// optimization off emits a different stream for a scroll-inducing change
+    /// than one with it on (the local escape hatch actually changes rendering,
+    /// not just a field). Mirrors display.rs's scroll_opt_changes_stream at the
+    /// FrameRenderer level.
+    #[test]
+    fn scroll_opt_toggle_changes_the_emitted_stream() {
+        let (rows, cols) = (6u16, 20u16);
+        let seed = b"a\r\nb\r\nc\r\nd\r\ne\r\nf";
+        let render = |scroll_opt: bool| {
+            let mut daemon = Terminal::with_scrollback(rows, cols, 0);
+            daemon.process(seed);
+            let mut producer = FrameProducer::new(rows, cols);
+            let mut fr = FrameRenderer::new(rows, cols);
+            fr.set_scroll_opt(scroll_opt);
+            // Establish the base, then a one-row scroll (the region-scroll case).
+            let f1 = daemon_frame(&mut producer, &daemon);
+            fr.render_frame(&f1, None).expect("keyframe applies");
+            daemon.process(b"\r\ng");
+            let f2 = daemon_frame(&mut producer, &daemon);
+            fr.render_frame(&f2, None).expect("diff applies")
+        };
+        assert_ne!(
+            render(true),
+            render(false),
+            "toggling the scroll-region optimization must change the emitted stream"
+        );
     }
 
     /// The core 2.4a render property: the palette renderer's screen composites
