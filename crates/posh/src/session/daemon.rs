@@ -7,6 +7,7 @@ use std::os::unix::net::{UnixListener, UnixStream};
 
 use posh_term::{ScreenSwitch, Terminal};
 
+use crate::overlay::{close_overlay, escape_command, Overlay};
 use crate::pty::{self, PtyChild};
 use crate::remote::caps;
 use crate::remote::display::Snapshot;
@@ -363,6 +364,33 @@ fn broadcast_output(clients: &mut [ClientConn], term: &Terminal, bcast: &[u8]) {
     }
 }
 
+/// Force every frame-capable client's producer to emit a fresh `Full` keyframe
+/// on its next frame, then broadcast `src`. Called on both edges of the
+/// escape-to-shell overlay (FDR 0008): the broadcast source swaps wholesale
+/// (session↔overlay), so a `Diff` against each client's acked base would be a
+/// full-screen diff — correct but huge. Dropping the acked base makes the next
+/// `encode_visible` a `Full` (mirrors the remote server's `force_frame = true`).
+/// `bcast` is the raw fallback for any baseline (non-framing) client.
+fn broadcast_source_swap(clients: &mut [ClientConn], src: &Terminal, bcast: &[u8]) {
+    for c in clients.iter_mut() {
+        if let Some(p) = c.producer.as_mut() {
+            p.drop_acked_base();
+        }
+    }
+    broadcast_output(clients, src, bcast);
+}
+
+/// The terminal a client should render: the escape overlay's screen while one is
+/// up (FDR 0008), else the live session. The broadcast source AND a
+/// (re)attaching client's replay must agree on this — a client that attaches or
+/// SIGCONT-resumes mid-overlay has to base on the overlay screen, not the live
+/// session underneath (else it renders the session until the next overlay
+/// output — indefinite at an idle prompt — and a baseline client is corrupted by
+/// overlay deltas applied on a session base).
+fn active_source<'a>(overlay_term: Option<&'a Terminal>, term: &'a Terminal) -> &'a Terminal {
+    overlay_term.unwrap_or(term)
+}
+
 /// Substituted for RIS in the broadcast: the model performed a full reset,
 /// so push the outer terminal's shared modes back to defaults without
 /// letting it leave the alternate screen the client pinned it to (a raw
@@ -591,6 +619,12 @@ fn daemon_loop(
     let err_events = libc::POLLHUP | libc::POLLERR | libc::POLLNVAL;
     // t=0 for recording timestamps (only used when recorder.is_some()).
     let rec_start = std::time::Instant::now();
+    // Escape-to-shell overlay (FDR 0008), generalized from the roaming server to
+    // the daemon (FDR 0011 Phase 2.4b). `Some` while a transient shell spawned by
+    // a client's `Tag::Shell` is up: it becomes the broadcast source and input
+    // sink, the live session keeps advancing `term` underneath, and the session
+    // repaints when the overlay shell exits. `None` ⇒ today's behavior, exactly.
+    let mut overlay: Option<Overlay> = None;
 
     'daemon: loop {
         if util::take_flag(&util::SIGTERM_RECEIVED) {
@@ -616,7 +650,7 @@ fn daemon_loop(
             }
         });
 
-        let mut fds = Vec::with_capacity(2 + clients.len());
+        let mut fds = Vec::with_capacity(3 + clients.len());
         fds.push(util::pollfd(listener_fd, libc::POLLIN));
         fds.push(util::pollfd(pty_fd, libc::POLLIN));
         for c in clients.iter() {
@@ -626,6 +660,16 @@ fn daemon_loop(
             }
             fds.push(util::pollfd(c.stream.as_raw_fd(), events));
         }
+        // Client fds occupy indices 2..2+n_client_fds; the overlay master (if
+        // up) is appended AFTER them so the fixed client index math is unchanged.
+        let n_client_fds = clients.len();
+        let overlay_idx = match &overlay {
+            Some(o) => {
+                fds.push(util::pollfd(o.child.master, libc::POLLIN));
+                fds.len() - 1
+            }
+            None => usize::MAX,
+        };
 
         match util::poll(&mut fds, -1) {
             Ok(_) => {}
@@ -695,7 +739,10 @@ fn daemon_loop(
                         let _ = util::write_all_retry(pty_fd, &responses, 100);
                     }
                     has_pty_output = true;
-                    if !bcast.is_empty() {
+                    // While an escape overlay is up it owns the broadcast (FDR
+                    // 0008): the session model still advances above, but its
+                    // output is not broadcast until the overlay closes.
+                    if overlay.is_none() && !bcast.is_empty() {
                         broadcast_output(clients, term, &bcast);
                     }
                 }
@@ -710,9 +757,49 @@ fn daemon_loop(
             }
         }
 
+        // Escape-overlay shell output (FDR 0008): feed the overlay terminal (the
+        // active broadcast source) and broadcast from it. On EOF/EIO the overlay
+        // shell exited — tear it down and repaint the restored session, forcing a
+        // keyframe since the broadcast source swaps back to the live session.
+        if overlay_idx != usize::MAX
+            && fds[overlay_idx].revents & (libc::POLLIN | err_events) != 0
+        {
+            let mut closed = false;
+            let mut ov_bcast: Vec<u8> = Vec::new();
+            if let Some(o) = overlay.as_mut() {
+                let mut buf = [0u8; 4096];
+                match util::read_fd(o.child.master, &mut buf) {
+                    Ok(0) => closed = true,
+                    Ok(n) => {
+                        o.term.process(&buf[..n]);
+                        let responses = o.term.take_responses();
+                        if !responses.is_empty() {
+                            let _ = util::write_all_retry(o.child.master, &responses, 100);
+                        }
+                        ov_bcast.extend_from_slice(&buf[..n]);
+                    }
+                    Err(e)
+                        if e.kind() == std::io::ErrorKind::WouldBlock
+                            || e.kind() == std::io::ErrorKind::Interrupted => {}
+                    Err(_) => closed = true,
+                }
+            }
+            if closed {
+                close_overlay(&mut overlay);
+                // Restore the live session view (Ctrl-D returned to the session).
+                broadcast_source_swap(clients, term, &term.dump_vt_flat());
+            } else if !ov_bcast.is_empty() {
+                // Frame-capable clients diff/dump from the overlay terminal; a
+                // baseline client receives the raw overlay bytes.
+                if let Some(o) = overlay.as_ref() {
+                    broadcast_output(clients, &o.term, &ov_bcast);
+                }
+            }
+        }
+
         // Client traffic. Iterate only over the clients present when the
         // pollfd set was built; walk backwards so removal is safe.
-        let polled = fds.len() - 2;
+        let polled = n_client_fds;
         let mut i = clients.len().min(polled);
         while i > 0 {
             i -= 1;
@@ -724,6 +811,7 @@ fn daemon_loop(
             let mut resized = false;
             let mut needs_replay = false;
             let mut detach_all = false;
+            let mut open_shell = false;
             let total_clients = clients.len();
             {
                 let c = &mut clients[i];
@@ -747,7 +835,13 @@ fn daemon_loop(
                             };
                             match frame.tag {
                                 Tag::Input => {
-                                    let _ = util::write_all_retry(pty_fd, &frame.payload, 100);
+                                    // Route to the overlay shell while it is up
+                                    // (FDR 0008), else the session PTY.
+                                    let target = overlay
+                                        .as_ref()
+                                        .map(|o| o.child.master)
+                                        .unwrap_or(pty_fd);
+                                    let _ = util::write_all_retry(target, &frame.payload, 100);
                                 }
                                 Tag::Init => {
                                     if c.apply_init(&frame.payload) {
@@ -811,6 +905,14 @@ fn daemon_loop(
                                     let _ = util::write_all_retry(pty_fd, &frame.payload, 1000);
                                     c.queue(Tag::Ack, b"");
                                 }
+                                Tag::Shell => {
+                                    // Escape-to-shell (FDR 0008): defer the spawn
+                                    // out of this per-client borrow so the source
+                                    // swap can iterate every client's producer.
+                                    // The `overlay.is_none()` guard (below) makes
+                                    // a retransmitted request idempotent.
+                                    open_shell = true;
+                                }
                                 // Output, Ack, Exit, and Frame are all
                                 // daemon->client only; ignore if received from
                                 // a client.
@@ -849,6 +951,12 @@ fn daemon_loop(
             }
             if resized {
                 apply_client_size(clients, pty_fd, term);
+                // Keep the escape overlay sized to the session in lockstep (FDR
+                // 0008): both PTYs and both terminal models track the new dims.
+                if let Some(o) = overlay.as_mut() {
+                    pty::set_term_size(o.child.master, term.rows(), term.cols());
+                    o.term.resize(term.rows(), term.cols());
+                }
                 // Record the new effective size (asciinema "COLSxROWS").
                 if let Some(rec) = recorder.as_mut() {
                     let t = rec_start.elapsed().as_secs_f64();
@@ -885,6 +993,11 @@ fn daemon_loop(
                 // the dump replay. A baseline client keeps the flat `dump_vt`
                 // (it pinned the outer terminal to its alt screen, so the replay
                 // must never switch buffers). RFC 0008.
+                // Replay the ACTIVE broadcast source: while an escape overlay is
+                // up it is what every client sees (FDR 0008), so a client
+                // attaching / resuming mid-overlay must base on the overlay
+                // screen, not the live session underneath (see `active_source`).
+                let src = active_source(overlay.as_ref().map(|o| &o.term), term);
                 let c = &mut clients[i];
                 // Derive the dump/snapshot frame inputs ONLY when a producer
                 // exists — exactly the lazy guard `broadcast_output` uses — so a
@@ -892,10 +1005,10 @@ fn daemon_loop(
                 // every attach) pays only the single `dump_vt_flat` it always did.
                 let frame_inputs = c.producer.is_some().then(|| {
                     (
-                        term.dump_vt(),
-                        Snapshot::from_term(term),
-                        term.is_alt_screen(),
-                        (term.rows(), term.cols()),
+                        src.dump_vt(),
+                        Snapshot::from_term(src),
+                        src.is_alt_screen(),
+                        (src.rows(), src.cols()),
                     )
                 });
                 let produced = match frame_inputs {
@@ -903,11 +1016,46 @@ fn daemon_loop(
                     None => false,
                 };
                 if !produced {
-                    c.queue(Tag::Output, &term.dump_vt_flat());
+                    c.queue(Tag::Output, &src.dump_vt_flat());
+                }
+            }
+            // Escape-to-shell (FDR 0008): a client asked to open the overlay.
+            // Deferred here so the source swap can iterate every client's
+            // producer without conflicting with the per-client borrow above.
+            // Idempotent via the `overlay.is_none()` guard: a retransmitted
+            // request while the overlay is up is a no-op.
+            if open_shell && overlay.is_none() {
+                let ov_cwd = if term.pwd().is_empty() {
+                    cwd.to_string()
+                } else {
+                    term.pwd().to_string()
+                };
+                let cmd = escape_command();
+                let (r, w) = (term.rows(), term.cols());
+                match pty::spawn_shell(cmd.as_deref(), r, w, &[], Some(&ov_cwd)) {
+                    Ok(oc) => {
+                        let _ = util::set_nonblocking(oc.master);
+                        overlay = Some(Overlay {
+                            child: oc,
+                            term: Terminal::new(r, w),
+                        });
+                        // Force a keyframe on the source swap and paint the (blank)
+                        // overlay now; the shell's prompt follows as a Diff.
+                        if let Some(o) = overlay.as_ref() {
+                            let dump = o.term.dump_vt_flat();
+                            broadcast_source_swap(clients, &o.term, &dump);
+                        }
+                    }
+                    Err(e) => {
+                        util::log_write("error", &format!("escape-to-shell spawn failed: {e}"))
+                    }
                 }
             }
         }
     }
+
+    // Tear down any escape overlay before the shell/session cleanup (FDR 0008).
+    close_overlay(&mut overlay);
 
     // Flush the recording's held UTF-8 tail + buffered writer on the way out
     // (shell exit / SIGTERM / kill).
@@ -1732,5 +1880,138 @@ mod tests {
                 "a client without CAP_SCROLLBACK must receive no Scrollback bodies"
             );
         }
+    }
+
+    // ---- Task 2.4b: daemon escape-to-shell overlay (FDR 0008) ----
+
+    /// The core Task 2.4b property, exercised at the level the daemon's overlay
+    /// logic is testable without a live shell PTY: when the broadcast source
+    /// swaps wholesale (session→overlay on `Tag::Shell`, overlay→session on the
+    /// overlay shell's EOF), `broadcast_source_swap` forces every frame-capable
+    /// client's producer to emit a fresh `Full` keyframe — never a full-screen
+    /// `Diff` against the now-irrelevant acked base — and broadcasts the new
+    /// source's screen. The keyframe force is the resolution of the plan's Step 4:
+    /// `FrameProducer::drop_acked_base` (already used by the remote server's
+    /// RESYNC) makes the next `encode_visible` a `Full`. The poll/spawn/EOF
+    /// plumbing around it is a straight-line mirror of the tested remote server.
+    #[test]
+    fn overlay_source_swap_forces_keyframes_and_broadcasts_each_screen() {
+        let (rows, cols) = (24u16, 80u16);
+        let mut session = Terminal::with_scrollback(rows, cols, 1000);
+        fill_screen(&mut session);
+
+        let (mut c, _peer) = frame_capable_conn(rows, cols);
+        assert!(c.producer.is_some());
+
+        // Establish the acked visible base (attach replay): a Full keyframe.
+        assert!(c.queue_frame(
+            session.dump_vt(),
+            Snapshot::from_term(&session),
+            session.is_alt_screen(),
+            (rows, cols),
+        ));
+
+        // A live session edit broadcasts a Diff against that base — the contrast
+        // that proves the later keyframes come from the source swap, not a fresh
+        // producer.
+        session.process(b"appended session output");
+        broadcast_output(std::slice::from_mut(&mut c), &session, b"<raw ignored>");
+
+        // Overlay ENTER: the daemon spawns a shell overlay and swaps the
+        // broadcast source to it. Its screen replaces the session view.
+        let mut overlay = Terminal::new(rows, cols);
+        overlay.process(b"\x1b[2J\x1b[Hoverlay-shell:/session/cwd$ ");
+        broadcast_source_swap(
+            std::slice::from_mut(&mut c),
+            &overlay,
+            &overlay.dump_vt_flat(),
+        );
+        let after_enter = c.write_buf.clone();
+
+        // Overlay EXIT (the shell's Ctrl-D/EOF): swap back to the live session.
+        broadcast_source_swap(
+            std::slice::from_mut(&mut c),
+            &session,
+            &session.dump_vt_flat(),
+        );
+
+        // Body sequence: the base Full, the live-edit Diff, then a Full on EACH
+        // source swap. A plain broadcast at those points would have been a Diff;
+        // the two Fulls are the keyframe force.
+        let bodies = decode_frame_bodies(&c.write_buf);
+        assert_eq!(bodies.len(), 4, "base + edit + enter + exit");
+        assert!(matches!(bodies[0], FrameBody::Full(_)), "base keyframe");
+        assert!(
+            matches!(bodies[1], FrameBody::Diff { base: 1, .. }),
+            "an established base diffs, got {:?}",
+            bodies[1]
+        );
+        assert!(
+            matches!(bodies[2], FrameBody::Full(_)),
+            "overlay ENTER forces a Full keyframe, got {:?}",
+            bodies[2]
+        );
+        assert!(
+            matches!(bodies[3], FrameBody::Full(_)),
+            "overlay EXIT forces a Full keyframe, got {:?}",
+            bodies[3]
+        );
+
+        // Reconstructed screens: the overlay screen is what the client shows while
+        // the overlay is up, and the live session resumes once it closes.
+        assert_eq!(
+            reconstruct(&after_enter, rows, cols),
+            Snapshot::from_term(&overlay),
+            "the overlay screen replaces the session view for the client"
+        );
+        assert_eq!(
+            reconstruct(&c.write_buf, rows, cols),
+            Snapshot::from_term(&session),
+            "the live session resumes when the overlay closes"
+        );
+    }
+
+    /// Regression for the Task 2.4b replay-source bug (found in code review):
+    /// a client that attaches (or SIGCONT-resumes) WHILE an escape overlay is up
+    /// must replay the OVERLAY screen, not the live session underneath. The
+    /// daemon's replay derives its first producer frame from `active_source`, so
+    /// with an overlay present the attaching client reconstructs the overlay; with
+    /// none it reconstructs the session.
+    #[test]
+    fn replay_mid_overlay_bases_on_the_overlay_screen() {
+        let (rows, cols) = (24u16, 80u16);
+        let mut session = Terminal::with_scrollback(rows, cols, 1000);
+        fill_screen(&mut session);
+        let mut overlay = Terminal::new(rows, cols);
+        overlay.process(b"\x1b[2J\x1b[Hoverlay-shell:/tmp$ ");
+
+        // Source selection: the overlay while up, the session when gone.
+        assert_eq!(
+            Snapshot::from_term(active_source(Some(&overlay), &session)),
+            Snapshot::from_term(&overlay),
+            "active_source picks the overlay while one is up"
+        );
+        assert_eq!(
+            Snapshot::from_term(active_source(None, &session)),
+            Snapshot::from_term(&session),
+            "active_source falls back to the session with no overlay"
+        );
+
+        // A frame-capable client attaching mid-overlay replays the overlay screen
+        // (the bug: it used to replay `session` and render it until the next
+        // overlay output).
+        let (mut c, _peer) = frame_capable_conn(rows, cols);
+        let src = active_source(Some(&overlay), &session);
+        assert!(c.queue_frame(
+            src.dump_vt(),
+            Snapshot::from_term(src),
+            src.is_alt_screen(),
+            (rows, cols),
+        ));
+        assert_eq!(
+            reconstruct(&c.write_buf, rows, cols),
+            Snapshot::from_term(&overlay),
+            "a mid-overlay attach reconstructs the overlay screen, not the session"
+        );
     }
 }

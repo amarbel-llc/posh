@@ -511,14 +511,16 @@ impl FrameRenderer {
     }
 }
 
-/// The local session's palette command set (FDR 0011 Phase 2.4a). Only the
+/// The local session's palette command set (FDR 0011 Phase 2.4a/b). The
 /// transport-aware entries that make sense on a reliable local socket: Suspend
-/// (background the client) and Detach (leave the session running). The remote
-/// client's echo/prediction/resync/forensics/agent/server-log commands are
-/// UDP/prediction-only and intentionally omitted; "Shell out" arrives in 2.4b.
+/// (background the client), Shell out (a daemon-spawned escape-to-shell overlay,
+/// FDR 0008), and Detach (leave the session running). The remote client's
+/// echo/prediction/resync/forensics/agent/server-log commands are
+/// UDP/prediction-only and intentionally omitted.
 fn palette_commands() -> Value {
     json!([
         { "name": "Suspend client", "action": { "method": "client.suspend" } },
+        { "name": "Shell out", "action": { "method": "shell.open" } },
         { "name": "Detach", "action": { "method": "app.detach" } },
     ])
 }
@@ -581,6 +583,14 @@ fn dispatch_local_action(method: &str, sock_write_buf: &mut Vec<u8>) -> LocalAct
             // Same wire effect as the DetachMatcher path: ask the daemon to
             // detach this client, leaving the session running.
             ipc::append_frame(sock_write_buf, Tag::Detach, b"");
+            LocalAction::None
+        }
+        "shell.open" => {
+            // Escape-to-shell (FDR 0008): ask the daemon to open a transient
+            // shell overlay in the session cwd. Pure wire effect — the client
+            // stays a passive frame consumer; the overlay's screen arrives over
+            // the existing Tag::Frame path, and Ctrl-D closes it daemon-side.
+            ipc::append_frame(sock_write_buf, Tag::Shell, b"");
             LocalAction::None
         }
         "client.suspend" => LocalAction::Suspend,
@@ -1461,6 +1471,19 @@ mod tests {
             LocalAction::None
         ));
         assert_eq!(buf, ipc::encode_frame(Tag::Detach, b""));
+    }
+
+    /// `shell.open` dispatch queues a `Tag::Shell` wire frame (empty payload) —
+    /// the daemon spawns the escape-to-shell overlay (FDR 0008) on receipt — and
+    /// reports no tty-side action; the client stays a passive frame consumer.
+    #[test]
+    fn dispatch_shell_open_appends_a_shell_frame() {
+        let mut buf = Vec::new();
+        assert!(matches!(
+            dispatch_local_action("shell.open", &mut buf),
+            LocalAction::None
+        ));
+        assert_eq!(buf, ipc::encode_frame(Tag::Shell, b""));
     }
 
     /// `client.suspend` is routed as a tty-side action (run with the loop's

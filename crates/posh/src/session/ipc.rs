@@ -26,6 +26,10 @@ pub enum Tag {
     /// Daemon -> client: a posh-proto `ServerFrame` payload, used when the
     /// client negotiated frame transport instead of raw `Output`. RFC 0008.
     Frame = 12,
+    /// Client -> daemon: open a transient escape-to-shell overlay (FDR 0008) in
+    /// the session cwd. Empty payload; the daemon guards `overlay.is_none()` so
+    /// retransmits are idempotent. The palette's "Shell out" command (FDR 0011).
+    Shell = 13,
 }
 
 impl Tag {
@@ -44,6 +48,7 @@ impl Tag {
             10 => Tag::Ack,
             11 => Tag::Exit,
             12 => Tag::Frame,
+            13 => Tag::Shell,
             _ => return None,
         })
     }
@@ -278,6 +283,18 @@ mod tests {
         let got = fb.next().unwrap().unwrap();
         assert_eq!(got.tag, Tag::Frame);
         assert_eq!(got.payload, b"abc");
+    }
+
+    #[test]
+    fn shell_tag_roundtrips() {
+        // Client -> daemon escape-to-shell trigger (FDR 0008 / FDR 0011): empty
+        // payload, round-trips through the frame layer like the other tags.
+        let f = encode_frame(Tag::Shell, b"");
+        let mut fb = FrameBuffer::new();
+        fb.feed(&f);
+        let got = fb.next().unwrap().unwrap();
+        assert_eq!(got.tag, Tag::Shell);
+        assert!(got.payload.is_empty());
     }
 
     #[test]

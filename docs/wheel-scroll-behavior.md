@@ -74,7 +74,10 @@ At a bare prompt inside the session, run `cat -v` and scroll:
 Enable posh's own scroll-view by setting `POSH_SESSION_FRAMES=on` in the
 daemon's launch env (the client then builds the `FrameRenderer` and the wheel
 drives the local scrollback view at a bare prompt). This is the built, tested
-FDR 0005 path — but it is a bigger change than a config toggle: the local
-FrameRenderer is a minimal Phase-1/2 consumer (no resync/prediction/palette),
-so flipping it on fleet-wide should be validated for maturity first, not assumed
-production-ready from the gate alone.
+FDR 0005 path — but it is a bigger change than a config toggle, so flipping it
+on fleet-wide should be validated for maturity first, not assumed
+production-ready from the gate alone. The local `FrameRenderer` now also carries
+the command palette (FDR 0011 Phase 2.4: `Ctrl-^`, with Suspend / Detach /
+Shell out); resync and prediction remain absent, but on the reliable local
+socket that is by design (reliable-as-degenerate, RFC 0008 §2), not a maturity
+gap — the genuine pre-flip items are a real soak of the frame path.

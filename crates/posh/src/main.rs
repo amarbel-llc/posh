@@ -4,6 +4,7 @@
 //! Unix sockets) with mosh-style roaming remote sessions (encrypted UDP).
 
 mod completions;
+mod overlay;
 mod pty;
 mod remote;
 mod session;

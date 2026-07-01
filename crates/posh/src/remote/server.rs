@@ -6,6 +6,7 @@ use std::time::Instant;
 
 use posh_term::Terminal;
 
+use crate::overlay::{close_overlay, escape_command, Overlay};
 use crate::pty;
 use crate::remote::caps;
 use crate::remote::crypto::Key;
@@ -120,36 +121,6 @@ pub fn run(
 
     server_loop(conn, child, rows, cols, agent_endpoint);
     std::process::exit(0);
-}
-
-/// A transient escape-to-shell overlay (FDR 0008): a second PTY running the
-/// configured escape command in the session's cwd, with its own terminal model.
-/// While present it is the broadcast source and the input sink; the live session
-/// keeps running underneath (read into the main `term`, just not broadcast), and
-/// is repainted when the overlay's shell exits.
-struct Overlay {
-    child: pty::PtyChild,
-    term: Terminal,
-}
-
-/// `$POSH_ESCAPE_CMD` parsed into argv (whitespace-split; `sc exec` and most
-/// commands need nothing fancier). `None` (unset/blank) means spawn `$SHELL` as
-/// a login shell — the same default as the session shell.
-fn escape_command() -> Option<Vec<String>> {
-    std::env::var("POSH_ESCAPE_CMD")
-        .ok()
-        .filter(|s| !s.trim().is_empty())
-        .map(|s| s.split_whitespace().map(str::to_string).collect())
-}
-
-/// Tear down an active escape overlay: hang up its shell's process group, reap
-/// it, and close the master fd. No-op when there is no overlay.
-fn close_overlay(overlay: &mut Option<Overlay>) {
-    if let Some(o) = overlay.take() {
-        util::kill_pgroup(o.child.pid, libc::SIGHUP);
-        let _ = util::try_reap(o.child.pid);
-        util::close_fd(o.child.master);
-    }
 }
 
 pub(crate) fn server_loop(
