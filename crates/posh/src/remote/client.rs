@@ -33,6 +33,11 @@ const STDIN: i32 = libc::STDIN_FILENO;
 const STDOUT: i32 = libc::STDOUT_FILENO;
 const SHUTDOWN_GRACE: u64 = 5000; // ms to wait for the shutdown ack
 
+/// Sticky banner raised when the server reports FLAG_WEDGE (the organic wedge
+/// watchdog fired, #wedge). Sticky so it survives a fast self-recovery — the
+/// user notices even if the stall already passed; dismissed on the next keystroke.
+const WEDGE_BANNER: &str = "posh: session stall detected - captured to server log (press any key)";
+
 /// Depth of the client's local scrollback ring (RFC 0002 §3), in rows.
 /// Matches the server's default primary ring so a durable local reader can
 /// hold roughly what the server syncs; bounds client memory.
@@ -658,6 +663,10 @@ struct ClientState {
     /// shown when a forwarded-agent channel opens. `Some` only when forwarding
     /// is active (it rides on the proxy and owns the host name it reports).
     agent_notice: Option<crate::remote::agent::AgentNotice>,
+    /// Edge-detect latch for the server's FLAG_WEDGE (#wedge): true once the
+    /// sticky stall banner has been raised for the current capture episode, reset
+    /// when the flag clears so a later episode re-raises it.
+    wedge_seen: bool,
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -745,6 +754,7 @@ fn client_loop(
         agent: agent_source.map(crate::remote::agent::AgentClient::new),
         agent_stream: sync::AgentStream::new(),
         agent_seen: false,
+        wedge_seen: false,
     };
     // RFC 0007: collect the compute-timing terminals when a GP species is the
     // startup model, independent of POSH_DEBUG_LOG.
@@ -1141,6 +1151,13 @@ fn process_user_input(st: &mut ClientState, buf: &[u8]) -> bool {
     let now = now_ms();
     let mut dirty = false;
 
+    // Dismiss the sticky wedge banner (#wedge) on the user's next keystroke: they
+    // have seen it, and typing is also the action that tends to break the stall.
+    // Gated on the message so it only clears our own banner, not another notice.
+    if !buf.is_empty() && st.notify.message() == WEDGE_BANNER {
+        st.notify.set_message("", false, now);
+    }
+
     // While the palette overlay is up, the renderer owns the keyboard: forward
     // raw keystrokes to it and send nothing to the session. It reports the
     // selection/cancel over the control channel (handled in the poll loop).
@@ -1369,6 +1386,18 @@ fn process_frame(st: &mut ClientState, frame: &ServerFrame) -> bool {
     st.echo_on = frame.flags & sync::FLAG_ECHO != 0;
     // Server debug-logging state for the palette's "Server debug logging" label (#3).
     st.server_log_on = frame.flags & sync::FLAG_SERVER_LOG != 0;
+    // Organic wedge watchdog (#wedge): the server sets FLAG_WEDGE for the life of
+    // an auto-capture episode. Edge-triggered — raise the sticky banner once when
+    // it first appears; reset the latch when it clears so a later episode
+    // re-raises. The banner itself persists (sticky) until a keystroke dismisses
+    // it, so a fast self-recovery doesn't rob the user of the notice.
+    let wedge_now = frame.flags & sync::FLAG_WEDGE != 0;
+    if wedge_now && !st.wedge_seen {
+        st.wedge_seen = true;
+        st.notify.set_message(WEDGE_BANNER, true, now);
+    } else if !wedge_now && st.wedge_seen {
+        st.wedge_seen = false;
+    }
     // Server transport-state piggyback (#6): record the latest report when present
     // (only after we advertised CAP_DIAG). Keep the prior value on a malformed or
     // absent payload — the dump shows the most recent good report.
@@ -2059,6 +2088,39 @@ mod tests {
     }
 
     #[test]
+    fn wedge_flag_raises_sticky_banner_once_and_resets() {
+        // #wedge: the server's FLAG_WEDGE edge raises the sticky banner exactly
+        // once per episode; a keystroke dismisses it while the stall continues,
+        // and only after the flag clears does a fresh episode re-raise it.
+        let mut st = test_state(24, 80);
+        let empty = |flags: u8, num: u64| ServerFrame {
+            flags,
+            caps: vec![],
+            frame_num: num,
+            input_ack: 0,
+            echo_ack: 0,
+            body: FrameBody::Empty,
+        };
+        // Flag rises -> sticky banner, latch set.
+        process_frame(&mut st, &empty(sync::FLAG_WEDGE, 1));
+        assert!(st.wedge_seen, "latch set on first FLAG_WEDGE");
+        assert_eq!(st.notify.message(), WEDGE_BANNER);
+        // A keystroke dismisses the banner; the latch stays (still stalled).
+        let _ = process_user_input(&mut st, b"x");
+        assert_eq!(st.notify.message(), "", "keystroke dismisses the banner");
+        assert!(st.wedge_seen, "latch persists across a dismissal mid-episode");
+        // Same flag still set on later frames: no re-raise mid-episode.
+        process_frame(&mut st, &empty(sync::FLAG_WEDGE, 2));
+        assert_eq!(st.notify.message(), "", "no re-raise while the flag stays set");
+        // Flag clears -> latch resets.
+        process_frame(&mut st, &empty(0, 3));
+        assert!(!st.wedge_seen, "latch reset when FLAG_WEDGE clears");
+        // A new episode re-raises the banner.
+        process_frame(&mut st, &empty(sync::FLAG_WEDGE, 4));
+        assert_eq!(st.notify.message(), WEDGE_BANNER, "a new episode re-raises");
+    }
+
+    #[test]
     fn wedge_debug_summary_reports_apply_stall_and_server_state() {
         // The on-screen line (#3): with an apply-stall pending and a CAP_DIAG
         // report in hand, it shows reack=yes and the far-side srv state, so the
@@ -2440,6 +2502,7 @@ mod tests {
             agent_stream: sync::AgentStream::new(),
             agent_seen: false,
             agent_notice: None,
+            wedge_seen: false,
         }
     }
 

@@ -89,6 +89,13 @@ pub const FLAG_OVERLAY: u8 = 8;
 /// show the true state and confirm a toggle (#3). `0x10` is the next free
 /// runtime bit after FLAG_OVERLAY.
 pub const FLAG_SERVER_LOG: u8 = 16;
+/// The server's organic wedge watchdog has an active capture episode (#wedge):
+/// its terminal model advanced without a visible frame for longer than the stall
+/// threshold, so it lazily opened a diagnostic capture. Reported per frame — it
+/// rides heartbeats, so it reaches the client even mid-stall — so the client can
+/// raise a sticky "stall detected" banner. Cleared once the stall recovers.
+/// `0x20` is the next free runtime bit after FLAG_SERVER_LOG.
+pub const FLAG_WEDGE: u8 = 32;
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum FrameBody {

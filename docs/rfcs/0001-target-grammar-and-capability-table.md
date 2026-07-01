@@ -181,6 +181,7 @@ each direction (e.g. `0x04`). Currently assigned:
 | `0x08` | server | `OVERLAY` | An escape-to-shell overlay is active (FDR 0008); echoed so the client stops re-requesting. |
 | `0x10` | client | `LOG_OFF` | Client requests the server disable its debug logging (FDR 0009, #3). One-shot; idempotent. |
 | `0x10` | server | `SERVER_LOG` | The server's debug logging is on (FDR 0009, #3), reported per frame so the client's palette shows the true state and confirms a toggle. |
+| `0x20` | server | `WEDGE` | The server's organic wedge watchdog has an active capture episode (a session stall it auto-captured); reported per frame — rides heartbeats, so it reaches the client mid-stall — so the client raises a sticky "stall detected" banner. Cleared on recovery. |
 
 The capability table is:
 

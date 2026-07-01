@@ -111,6 +111,19 @@ _POSH_DEBUG_LOG_
 	enabled that way without _POSH_DEBUG_LOG_ set, the sink is the same
 	per-pid default file the *SIGUSR2* dump uses. See *posh-client*(1).
 
+_POSH_WEDGE_CAPTURE_
+	Controls the organic wedge watchdog (on by default). The server
+	continuously watches for its own terminal model advancing without a
+	visible frame going out — a stall otherwise indistinguishable from an
+	idle session by transport state. When that persists past an internal
+	threshold it lazily opens the same per-pid diagnostic sink the
+	*SIGUSR2* dump uses (unless _POSH_DEBUG_LOG_ already armed one) and
+	records the frame-emission gate variables, once per stall episode, so
+	an intermittent freeze is captured without pre-arming logging. Set to
+	_0_, _off_, _false_, or _no_ to disable it if it ever misbehaves.
+	Distinct from the client-side _POSH_WEDGE_WATCHDOG_ (see
+	*posh-client*(1)), which is opt-in and acts on apply-stalls.
+
 # SIGNALS
 
 *SIGUSR1*

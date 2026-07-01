@@ -17,7 +17,7 @@ use posh_proto::frame::{decode_flags_and_caps, flags_with_extension};
 // streams below stay in posh and re-import these.
 pub use posh_proto::frame::{
     base_checksum, FrameBody, ServerFrame, FLAG_ECHO, FLAG_OVERLAY, FLAG_SERVER_LOG, FLAG_SHUTDOWN,
-    HEARTBEAT_INTERVAL,
+    FLAG_WEDGE, HEARTBEAT_INTERVAL,
 };
 // make_diff/apply_diff are exercised only by tests now (the DumpDiff codec that
 // used them moved to posh-proto); test-only re-export keeps `sync::make_diff`

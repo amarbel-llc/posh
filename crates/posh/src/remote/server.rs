@@ -24,6 +24,12 @@ const SHUTDOWN_GRACE: u64 = 10_000; // ms to wait for the final-state ack
 /// Silence after which the peer is forgotten (sending stops, the session
 /// stays alive waiting for the client to come back).
 const PEER_TIMEOUT: u64 = 60_000; // ms
+/// #wedge organic watchdog: the model advancing (dirty) without a visible frame
+/// for this long is abnormal — a healthy server frames within one send_interval
+/// (<= 250ms). Persistence past this is the Case-A stall signature (model moved,
+/// frame suppressed), which is otherwise indistinguishable from an idle session
+/// by transport state. Set well clear of pacing + retransmit slack.
+const WEDGE_STUCK_MS: u64 = 1000;
 
 /// POSH_SERVER_NETWORK_TMOUT / POSH_SERVER_SIGNAL_TMOUT, in seconds
 /// (0 = disabled), as mosh's MOSH_SERVER_*_TMOUT.
@@ -240,6 +246,18 @@ pub(crate) fn server_loop(
     let mut agent_seen = false;
 
     let mut last_gen = term.generation();
+    // #wedge organic watchdog. Auto-captures the Case-A stall (model advanced,
+    // visible frame suppressed) to a lazily-opened per-pid sink, once per stall
+    // episode, without the operator pre-arming logging. On by default; disable
+    // with POSH_WEDGE_CAPTURE=0 (or off/false/no) if it ever misbehaves in prod.
+    // `dirty_since` marks when the model went dirty-without-frame (0 = in sync);
+    // `wedge_captured` bounds it to one capture per episode.
+    let wedge_watchdog = !matches!(
+        std::env::var("POSH_WEDGE_CAPTURE").as_deref(),
+        Ok("0") | Ok("off") | Ok("false") | Ok("no")
+    );
+    let mut dirty_since: u64 = 0;
+    let mut wedge_captured = false;
     let mut last_send: u64 = 0;
     let mut last_heard: u64 = now_ms();
     let mut client_size: (u16, u16) = (rows, cols);
@@ -379,8 +397,26 @@ pub(crate) fn server_loop(
                     pty_open = false;
                 }
                 Ok(n) => {
+                    let gen_before = term.generation();
                     term.process(&buf[..n]);
                     let responses = term.take_responses();
+                    // #wedge breadcrumb (active whenever a sink is open — manual
+                    // logging or an auto-capture episode). Did post-exit PTY bytes
+                    // arrive and move the terminal model? A `gen X->X` here (or no
+                    // line at all across a program exit) is Case B — the output
+                    // never changed the model; a nonzero `resp` with no gen bump
+                    // means the bytes were a pure terminal query awaiting a reply.
+                    // A gen bump rules Case B out and points at the emission gate.
+                    if util::log_active() {
+                        util::log_write(
+                            "wedge",
+                            &format!(
+                                "pty_read n={n} gen {gen_before}->{} resp={}B",
+                                term.generation(),
+                                responses.len()
+                            ),
+                        );
+                    }
                     if !responses.is_empty() {
                         let _ = util::write_all_retry(child.master, &responses, 100);
                     }
@@ -679,6 +715,84 @@ pub(crate) fn server_loop(
             let make_scrollback = want_scrollback && (!want_visible || !last_was_sb);
             let make_visible = want_visible && !make_scrollback;
 
+            // #wedge organic watchdog. The model advanced past the last framed
+            // generation (dirty) yet this iteration emits no visible frame. A
+            // healthy server clears dirty within a send_interval; persistence
+            // past WEDGE_STUCK_MS is the Case-A stall (indistinguishable from an
+            // idle session by transport state, so we arm on the persistence). On
+            // the first stuck iteration we lazily open a per-pid sink and record
+            // the gate vars; while any sink is open we log per-iteration detail;
+            // on recovery we mark it. The sink is left open (it rotates at
+            // LOG_MAX_SIZE) — reopening could truncate a prior incident.
+            if dirty && !make_visible {
+                if dirty_since == 0 {
+                    dirty_since = now;
+                }
+                if wedge_watchdog
+                    && !wedge_captured
+                    && now.saturating_sub(dirty_since) >= WEDGE_STUCK_MS
+                {
+                    if !util::log_active() {
+                        diag::enable_logging("server");
+                    }
+                    util::log_write(
+                        "wedge",
+                        &format!(
+                            "STUCK {}ms: force_frame={} paced={} want_vis={} want_sb={} \
+                             make_sb={} num={} acked={} send_age={} send_int={} gen={}",
+                            now.saturating_sub(dirty_since),
+                            force_frame as u8,
+                            paced as u8,
+                            want_visible as u8,
+                            want_scrollback as u8,
+                            make_scrollback as u8,
+                            producer.current_num(),
+                            producer.acked_num(),
+                            now.saturating_sub(last_send),
+                            conn.send_interval(),
+                            src.generation(),
+                        ),
+                    );
+                    wedge_captured = true;
+                    // Surface the banner promptly: an empty ack-frame carries the
+                    // fresh FLAG_WEDGE out now rather than waiting for the next
+                    // heartbeat (num==acked here, so this hits the force_ack path).
+                    force_ack = true;
+                }
+                if util::log_active() {
+                    util::log_write(
+                        "wedge",
+                        &format!(
+                            "frame_suppressed force_frame={} paced={} want_vis={} \
+                             want_sb={} make_sb={} num={} acked={} send_age={} send_int={}",
+                            force_frame as u8,
+                            paced as u8,
+                            want_visible as u8,
+                            want_scrollback as u8,
+                            make_scrollback as u8,
+                            producer.current_num(),
+                            producer.acked_num(),
+                            now.saturating_sub(last_send),
+                            conn.send_interval(),
+                        ),
+                    );
+                }
+            } else {
+                if wedge_captured {
+                    util::log_write(
+                        "wedge",
+                        &format!(
+                            "CLEARED after {}ms: num={} gen={}",
+                            now.saturating_sub(dirty_since),
+                            producer.current_num(),
+                            src.generation(),
+                        ),
+                    );
+                }
+                dirty_since = 0;
+                wedge_captured = false;
+            }
+
             if make_visible {
                 last_gen = src.generation();
                 force_frame = false;
@@ -961,11 +1075,21 @@ pub(crate) fn server_loop(
                 } else {
                     0
                 };
+                // #wedge organic watchdog: advertise an active capture episode so
+                // the client can raise a sticky "stall detected" banner. Rides
+                // every frame (incl. heartbeats) for the episode, so it reaches
+                // the client even while the session content is stalled.
+                let wedge_flag = if wedge_captured {
+                    sync::FLAG_WEDGE
+                } else {
+                    0
+                };
                 let frame = ServerFrame {
                     flags: (if shutdown { sync::FLAG_SHUTDOWN } else { 0 })
                         | echo_flag
                         | overlay_flag
-                        | server_log_flag,
+                        | server_log_flag
+                        | wedge_flag,
                     caps: frame_caps,
                     frame_num: producer.current_num(),
                     input_ack: inbox.next_offset(),

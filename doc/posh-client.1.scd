@@ -21,6 +21,14 @@ invoke it directly: bare *posh* _host_ and *posh* _host_*:*_session_
 run the ssh bootstrap (*posh ssh*), which starts a *posh-server*(1) on
 the host and then launches this client against the reported address.
 
+When the remote *posh-server*(1)'s organic wedge watchdog detects a session
+stall — its terminal advanced but no frame was produced for longer than the
+stall threshold (see _POSH_WEDGE_CAPTURE_ in *posh-server*(1)) — it signals
+that on the wire and the client raises a sticky one-line banner over the
+session: _session stall detected - captured to server log_. The banner is
+sticky so a fast self-recovery does not rob you of the notice; it is dismissed
+by the next keystroke.
+
 # OPTIONS
 
 *-4*, *-6*
