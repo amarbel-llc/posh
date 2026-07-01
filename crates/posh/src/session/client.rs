@@ -291,10 +291,14 @@ impl FrameRenderer {
         // processing the matching `Tag::Resize`, during which in-flight
         // scrollback frames produced at the OLD width may arrive and append to
         // the cleared ring. The window is bounded by socket latency (≈0 on a
-        // local socket) and the rows scrolled in that interval. Acknowledged as a
-        // non-blocking minor; harmless while the ring is captured-not-rendered —
-        // the later task that scrolls the ring into view decides whether to drop
-        // stale-width rows.
+        // local socket) and the rows scrolled in that interval. DECIDED to
+        // accept for the POSH_SESSION_FRAMES gate flip (github #107): the
+        // artifact is a few boundary rows that render slightly off only when
+        // scrolled into view, and self-heals as they scroll out of history. The
+        // robust fix — a daemon-stamped resize epoch on `FrameBody::Scrollback`
+        // so the client drops pre-resize rows deterministically — is deferred
+        // there; remote's per-message cap-suppression lever does not port to the
+        // once-negotiated local socket.
         self.scrollback.clear();
     }
 
