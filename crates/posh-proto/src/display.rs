@@ -319,8 +319,13 @@ pub fn new_frame_opt(
         cursor_visible: last.cursor_visible,
     };
 
-    // Title.
-    if !init || f.title != last.title {
+    // Title. Emit on a real change (including an app's deliberate clear to
+    // empty, via `f.title != last.title`), and re-assert a non-empty title on a
+    // full repaint. But do NOT emit an empty `\x1b]0;\x07` on the first frame /
+    // a repaint when we hold no title of our own: that resets the outer
+    // terminal's INHERITED title (e.g. an outer nesting layer's), after which
+    // terminals fall back to showing the foreground process name (github #108).
+    if f.title != last.title || (!init && !f.title.is_empty()) {
         let _ = write!(frame.out, "\x1b]0;{}\x07", f.title);
     }
 
@@ -1359,6 +1364,54 @@ mod tests {
         let diff = new_frame(true, &Snapshot::from_term(&prev), &Snapshot::from_term(&next), false);
         let s = String::from_utf8_lossy(&diff);
         assert!(s.contains("\x1b]0;new title\x07"), "{s:?}");
+    }
+
+    #[test]
+    fn first_frame_with_no_title_leaves_the_outer_title_untouched() {
+        // github #108: on the first frame the session usually holds no title yet
+        // (the shell hasn't set one). Emitting `\x1b]0;\x07` would reset the
+        // outer terminal's INHERITED title (e.g. a nesting layer's), and
+        // terminals then show the foreground process name. The first frame must
+        // not touch the title when it is empty.
+        let term = term_with(3, 20, b"hello"); // no OSC title set
+        assert_eq!(Snapshot::from_term(&term).title, "", "no title set");
+        let bytes = new_frame(false, &Snapshot::blank(3, 20), &Snapshot::from_term(&term), false);
+        assert!(
+            !String::from_utf8_lossy(&bytes).contains("\x1b]0;"),
+            "an empty title on the first frame must emit no OSC-0 reset: {:?}",
+            String::from_utf8_lossy(&bytes)
+        );
+    }
+
+    #[test]
+    fn first_frame_asserts_a_real_title() {
+        // The complement: a session that DOES hold a title asserts it on attach,
+        // so the outer terminal shows the session's title, not a stale one.
+        let mut term = term_with(3, 20, b"");
+        term.process(b"\x1b]0;my session\x07");
+        let bytes = new_frame(false, &Snapshot::blank(3, 20), &Snapshot::from_term(&term), false);
+        assert!(
+            String::from_utf8_lossy(&bytes).contains("\x1b]0;my session\x07"),
+            "a real title must be asserted on the first frame"
+        );
+    }
+
+    #[test]
+    fn deliberate_title_clear_still_propagates() {
+        // An app that SET a title and then clears it: the empty title is a real
+        // change (distinct from never-having-a-title on the first frame) and
+        // must reach the outer terminal so the app's clear is honored.
+        let mut prev = term_with(3, 20, b"");
+        prev.process(b"\x1b]0;something\x07");
+        let mut next = term_with(3, 20, b"");
+        next.process(b"\x1b]0;something\x07\x1b]0;\x07"); // set, then clear
+        assert_eq!(Snapshot::from_term(&next).title, "", "app cleared its title");
+        let diff = new_frame(true, &Snapshot::from_term(&prev), &Snapshot::from_term(&next), false);
+        assert!(
+            String::from_utf8_lossy(&diff).contains("\x1b]0;\x07"),
+            "a deliberate clear must propagate as an empty OSC-0: {:?}",
+            String::from_utf8_lossy(&diff)
+        );
     }
 
     #[test]
