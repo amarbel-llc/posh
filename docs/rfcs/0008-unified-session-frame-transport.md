@@ -121,6 +121,16 @@ its reduced role). The relay:
   applies, and the `ServerFrame` body is opaque to the relay except for the
   `flags` it must honor (e.g. shutdown).
 
+Because the relay holds no terminal model and its only per-session state is
+which Unix socket it is connected to, *retargeting* the relay at a different
+daemon socket mid-transport is a natural extension: the relay drops its current
+connection, opens a new one, and the new daemon's `Full` keyframe (§2)
+re-establishes the base — the same reset as any fresh attach. This RFC does not
+yet specify the retarget trigger or whether the relay tracks a single target or
+a target stack; that is the subject of **FDR 0012** (session layer collapse),
+which hangs off this contract. Nothing in this section presumes a single fixed
+target for the transport's lifetime.
+
 ### 4. Capability re-homing
 
 No new registry ids are allocated; the socket reuses the RFC 0001 §3 registry.
@@ -274,6 +284,8 @@ gating frame emission.
 ## References
 
 - FDR 0011: Unified durable sessions (`docs/features/`).
+- FDR 0012: Session layer collapse (`docs/features/`) — the relay-retarget
+  extension anticipated by §3, exploring layer collapse for posh-in-posh.
 - RFC 0001: Target grammar and capability table — amended by §5.
 - RFC 0004: Incremental frame sync (`MORPH`); RFC 0002: scrollback sync;
   RFC 0006: base-integrity checksums — the content-capability bodies re-homed

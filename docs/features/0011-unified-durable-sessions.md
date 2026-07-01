@@ -179,3 +179,8 @@ List, with and without workers:
   (kitty) integration future.
 - **#75** — the posh-proto extraction (`framereplay`, shared codecs) the daemon
   frame engine builds on.
+- **FDR 0012** (`0012-session-layer-collapse.md`) — a capability this
+  unification unlocks at its tail: once `posh-server` is the RFC 0008 §3 relay,
+  a remote client can collapse into an inner local session (the clown/spinclass
+  posh-in-posh case) by retargeting the relay, instead of nesting a second
+  session. Blocked on this feature's relay; explores the layer-collapse UX.
