@@ -11,13 +11,21 @@ use crate::pty::{self, RawMode};
 use crate::remote::caps;
 use crate::remote::display::{self, Snapshot};
 use crate::remote::framesync::{ApplyOutcome, FrameApplier, FrameSync};
-use crate::remote::sync::ServerFrame;
+use crate::remote::sync::{FrameBody, ScrollbackRing, ServerFrame};
 use crate::session::ipc::{self, FrameBuffer, Tag};
 use crate::session::{daemon, Config};
 use crate::util::{self, Error, Result};
 
 const STDIN: i32 = libc::STDIN_FILENO;
 const STDOUT: i32 = libc::STDOUT_FILENO;
+
+/// Depth of the local client's scrollback ring (RFC 0002 §3), in rows. Matches
+/// the session daemon's primary ring (`daemon::SCROLLBACK`, 10_000) — the client
+/// advertises `CAP_SCROLLBACK` with a `0` payload (server-default depth), so it
+/// mirrors that here — and bounds client memory. The captured rows are not yet
+/// rendered (a scrollable local viewport is a later task); this task only rings
+/// them.
+const SCROLLBACK_RING_DEPTH: usize = 10_000;
 
 /// Mode resets written on detach before leaving the alternate screen:
 /// mouse reporting (1000/1002/1003/1006), alternate scroll (1007),
@@ -198,6 +206,12 @@ struct FrameRenderer {
     applied_data: Vec<u8>,
     /// The frame number the model currently reflects.
     applied_num: u64,
+    /// Local, partial, monotonically-growing view of the daemon's scrolled-off
+    /// primary rows (RFC 0002 §3). `FrameBody::Scrollback` frames append here
+    /// without touching the visible model; a width resize clears it (§4). This
+    /// task only CAPTURES history — a scrollable local viewport that reads it is
+    /// a later task, so the ring is written but not yet rendered.
+    scrollback: ScrollbackRing,
     /// What the tty last showed, so the renderer emits only the delta.
     last_drawn: Snapshot,
     /// False until the first render (and after an external clear), so the next
@@ -223,6 +237,7 @@ impl FrameRenderer {
             applier: FrameSync::DumpDiff.applier(),
             applied_data: Vec::new(),
             applied_num: 0,
+            scrollback: ScrollbackRing::new(SCROLLBACK_RING_DEPTH),
             last_drawn: Snapshot::blank(rows, cols),
             initialized: false,
             rows,
@@ -238,6 +253,21 @@ impl FrameRenderer {
         self.rows = rows.max(1);
         self.cols = cols.max(1);
         self.initialized = false;
+        // A width change reflows the old rows (RFC 0002 §4): drop the ring and
+        // re-accumulate at the new width. The daemon restarts its per-client
+        // appended-row counting when it PROCESSES the matching `Tag::Resize`, so
+        // both sides go forward-only from that point — no mixed-width rows, no
+        // re-ship of old ones.
+        //
+        // Note: a brief window exists between this ring-clear and the daemon
+        // processing the matching `Tag::Resize`, during which in-flight
+        // scrollback frames produced at the OLD width may arrive and append to
+        // the cleared ring. The window is bounded by socket latency (≈0 on a
+        // local socket) and the rows scrolled in that interval. Acknowledged as a
+        // non-blocking minor; harmless while the ring is captured-not-rendered —
+        // the later task that scrolls the ring into view decides whether to drop
+        // stale-width rows.
+        self.scrollback.clear();
     }
 
     /// Force the next rendered frame to clear + fully repaint — used after the
@@ -255,6 +285,25 @@ impl FrameRenderer {
     /// client has no resync/keyframe-request path yet (a later task).
     fn render_frame(&mut self, payload: &[u8]) -> Result<Vec<u8>> {
         let frame = ServerFrame::decode(payload)?;
+        // Scrollback growth (RFC 0002 §3): intercept BEFORE the applier — a
+        // scrollback frame appends scrolled-off rows to the local ring and
+        // leaves the visible model (and thus the tty) untouched, so it produces
+        // no render bytes. Mirrors the remote client's pre-applier intercept.
+        // The dup (`frame_num == applied_num`) and base (`base != applied_num`)
+        // guards are degenerate on the reliable socket — frames arrive once, in
+        // order — but kept for parity so a retransmit or superseding body never
+        // double-appends.
+        if let FrameBody::Scrollback { base, rows } = &frame.body {
+            if frame.frame_num == self.applied_num {
+                return Ok(Vec::new());
+            }
+            if *base != self.applied_num {
+                return Ok(Vec::new());
+            }
+            self.scrollback.append(rows);
+            self.applied_num = frame.frame_num;
+            return Ok(Vec::new());
+        }
         match self.applier.apply(
             self.rows,
             self.cols,
@@ -315,7 +364,14 @@ fn client_loop(stream: UnixStream, enter: &[u8]) -> Result<i32> {
     // resize prefix followed by the encoded table.
     let (rows, cols) = pty::term_size(STDOUT);
     let mut init_payload = ipc::encode_resize(rows, cols).to_vec();
-    init_payload.extend_from_slice(&caps::encode_table(&caps::own_table(&[])));
+    // Advertise CAP_SCROLLBACK (RFC 0002 §1) alongside the base table so a
+    // frame-emitting daemon syncs scrolled-off rows to our local ring. The `0`
+    // payload requests the server-default ring depth. Harmless when the daemon
+    // isn't producing frames (gate off): the cap is parsed and ignored.
+    init_payload.extend_from_slice(&caps::encode_table(&caps::own_table(&[caps::Cap {
+        id: caps::CAP_SCROLLBACK,
+        payload: vec![0],
+    }])));
     ipc::append_frame(&mut sock_write_buf, Tag::Init, &init_payload);
     // Re-assert the size via Tag::Resize: a pre-#100 daemon runs the strict
     // decode_resize over the whole Init payload, so the cap-extended Init's
@@ -731,5 +787,114 @@ mod tests {
             outer.resize(rows, cols);
         }
         assert_screens_match(&outer, &daemon);
+    }
+
+    // ---- Task 2.5a: local client rings scrollback frames (RFC 0002) ----
+
+    /// Encode a `FrameBody::Scrollback` the way the daemon's `maybe_queue_scrollback`
+    /// does: advance a scrollback slot (carrying the row count forward), anchor
+    /// the body to the CONFIRMED visible base (`acked_num`), and self-ack — the
+    /// reliable-socket production the local client consumes.
+    fn daemon_scrollback_frame(producer: &mut FrameProducer, rows: Vec<Vec<u8>>) -> Vec<u8> {
+        let sb_total = producer.current_sb_total() + rows.len() as u64;
+        producer.advance_scrollback(sb_total);
+        let frame_num = producer.current_num();
+        let bytes = ServerFrame {
+            flags: 0,
+            caps: caps::own_table(&[]),
+            frame_num,
+            input_ack: 0,
+            echo_ack: 0,
+            body: FrameBody::Scrollback {
+                base: producer.acked_num(),
+                rows,
+            },
+        }
+        .encode();
+        producer.ack(frame_num);
+        bytes
+    }
+
+    /// The core Task 2.5a client property: a `FrameBody::Scrollback` frame is
+    /// intercepted before the applier — it appends the carried rows to the
+    /// renderer's local ring, advances `applied_num`, and produces NO render
+    /// bytes while leaving the visible model byte-identical (scrollback never
+    /// touches the visible screen).
+    #[test]
+    fn frame_renderer_rings_scrollback_without_touching_the_screen() {
+        let (rows, cols) = (24u16, 80u16);
+        let mut daemon = Terminal::with_scrollback(rows, cols, 1000);
+        fill_screen(&mut daemon);
+
+        let mut producer = FrameProducer::new(rows, cols);
+        let mut renderer = FrameRenderer::new(rows, cols);
+        let mut outer = Terminal::with_scrollback(rows, cols, 0);
+
+        // Frame 1: the Full keyframe establishes the visible base (applied_num=1).
+        let f1 = daemon_frame(&mut producer, &daemon);
+        outer.process(&renderer.render_frame(&f1).expect("keyframe applies"));
+        assert_eq!(renderer.applied_num, 1);
+        let visible_after_keyframe = Snapshot::from_term(&renderer.server_term);
+        assert!(renderer.scrollback.is_empty(), "no scrollback rung yet");
+
+        // Frame 2: a Scrollback body carrying two rows, based on the keyframe.
+        let sb_rows = vec![
+            b"scrolled row A\r\n".to_vec(),
+            b"scrolled row B\r\n".to_vec(),
+        ];
+        let f2 = daemon_scrollback_frame(&mut producer, sb_rows.clone());
+        let bytes = renderer.render_frame(&f2).expect("scrollback applies");
+
+        // No render bytes, visible model unchanged, applied_num advanced, ring
+        // holds exactly the carried rows.
+        assert!(bytes.is_empty(), "a scrollback frame must produce no render bytes");
+        assert_eq!(
+            Snapshot::from_term(&renderer.server_term),
+            visible_after_keyframe,
+            "the visible model must be untouched by a scrollback frame"
+        );
+        assert_eq!(renderer.applied_num, 2, "the scrollback frame advances applied_num");
+        assert_eq!(renderer.scrollback.len(), 2);
+        assert_eq!(renderer.scrollback.row(0), Some(sb_rows[0].as_slice()));
+        assert_eq!(renderer.scrollback.row(1), Some(sb_rows[1].as_slice()));
+
+        // A subsequent visible Diff still applies cleanly against the scrollback
+        // frame's number — the diff-base chain threads through the scrollback frame.
+        daemon.process(b"more output");
+        let f3 = daemon_frame(&mut producer, &daemon);
+        assert!(
+            matches!(
+                ServerFrame::decode(&f3).unwrap().body,
+                FrameBody::Diff { base: 2, .. }
+            ),
+            "the visible diff must anchor on the scrollback frame (base 2)"
+        );
+        renderer.render_frame(&f3).expect("the diff applies after scrollback");
+        assert_eq!(renderer.applied_num, 3);
+        assert_eq!(
+            Snapshot::from_term(&renderer.server_term),
+            Snapshot::from_term(&daemon),
+            "the visible model tracks the daemon across the interleaved scrollback"
+        );
+        // The ring is undisturbed by the later visible frame.
+        assert_eq!(renderer.scrollback.len(), 2, "a visible frame must not touch the ring");
+    }
+
+    /// A width resize drops the local ring (RFC 0002 §4): the old rows were at a
+    /// different width, so the renderer re-accumulates forward at the new width.
+    #[test]
+    fn resize_clears_the_scrollback_ring() {
+        let (rows, cols) = (24u16, 80u16);
+        let mut renderer = FrameRenderer::new(rows, cols);
+        renderer
+            .scrollback
+            .append(&[b"old width row\r\n".to_vec()]);
+        assert_eq!(renderer.scrollback.len(), 1);
+
+        renderer.resize(rows, 100);
+        assert!(
+            renderer.scrollback.is_empty(),
+            "a resize must clear the ring so the new width re-accumulates cleanly"
+        );
     }
 }

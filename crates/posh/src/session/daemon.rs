@@ -11,7 +11,7 @@ use crate::pty::{self, PtyChild};
 use crate::remote::caps;
 use crate::remote::display::Snapshot;
 use crate::remote::framesync::FrameProducer;
-use crate::remote::sync::ServerFrame;
+use crate::remote::sync::{FrameBody, ServerFrame};
 use crate::session::ipc::{self, FrameBuffer, SessionInfo, Tag};
 use crate::session::{self, Config};
 use crate::util::{self, Error, Result};
@@ -121,6 +121,18 @@ struct ClientConn {
     // acked base, so a freshly attached client's first frame is a `Full` while
     // an established one gets a `Diff`. Default `None` ⇒ today's `Tag::Output`.
     producer: Option<FrameProducer>,
+    // Per-client scrollback-sync bookkeeping (RFC 0002 §2/§3), the session-socket
+    // analog of the roaming server's per-connection `sb_floor`/`acked_sb_total`.
+    // `sb_floor` is the daemon terminal's monotonic scrollback total at which
+    // this client's forward-only accumulation (re)started — set when frames are
+    // enabled (attach) and again on a resize (§4: a width change reflows, so
+    // counting restarts at the new width). `acked_sb_total` is the total the
+    // client holds; on the reliable socket each scrollback frame is self-acked at
+    // once, so it advances immediately (no separate `sb_high` is needed —
+    // produced always equals acked here). A scrollback frame is emitted only when
+    // the daemon total grows past `acked_sb_total.max(sb_floor)`.
+    sb_floor: u64,
+    acked_sb_total: u64,
 }
 
 impl ClientConn {
@@ -213,6 +225,88 @@ impl ClientConn {
         self.queue(Tag::Frame, &encoded);
         true
     }
+
+    /// Whether this client advertised `CAP_SCROLLBACK` (RFC 0002 §1) on its
+    /// `Tag::Init` — i.e. it understands `FrameBody::Scrollback` and wants
+    /// scrolled-off rows synced to its local ring. Socket caps are Init-only and
+    /// persistent (unlike the UDP path's per-message advertisement), so this is a
+    /// stable per-connection property.
+    fn wants_scrollback(&self) -> bool {
+        caps::find(&self.caps, caps::CAP_SCROLLBACK).is_some()
+    }
+
+    /// Produce a scrollback-growth frame from the daemon terminal and queue it as
+    /// a SEPARATE `Tag::Frame` — mirroring the roaming server's scrollback body
+    /// (server.rs). Meant to ride immediately AFTER this client's visible frame:
+    /// that frame advanced the acked base, and the scrollback frame threads off
+    /// it (its `base` is the confirmed visible frame, and it inherits that visible
+    /// dump so the diff-base chain stays unbroken across the interleaved frames).
+    ///
+    /// Returns `false` (queuing nothing) unless every gate holds: the client
+    /// wants scrollback, the terminal is on its primary screen (the alt screen
+    /// has no scrollback), a visible baseline is confirmed (#95 — a Scrollback
+    /// body carries the acked visible dump forward as its diff base), and the
+    /// daemon's monotonic scrollback total has grown past this client's
+    /// floor/ack. Reliable-as-degenerate (RFC 0008 §3): the frame is self-acked at
+    /// once, so `acked_sb_total` tracks the shipped total immediately.
+    fn maybe_queue_scrollback(&mut self, term: &Terminal) -> bool {
+        if !self.wants_scrollback() || term.is_alt_screen() {
+            return false;
+        }
+        let cur_sb_total = term.primary_scrollback_total();
+        let floor = self.acked_sb_total.max(self.sb_floor);
+        if cur_sb_total <= floor {
+            return false;
+        }
+        let has_base = self
+            .producer
+            .as_ref()
+            .is_some_and(FrameProducer::has_acked_base);
+        if !has_base {
+            return false;
+        }
+        let producer = self.producer.as_mut().expect("has_base implies Some");
+        producer.advance_scrollback(cur_sb_total);
+        // The rows that entered scrollback since this client's floor/ack, bounded
+        // by what the ring still holds. Work in ring positions (newest-anchored):
+        // `grown` rows entered since this frame's coverage and sit at the tail — 0
+        // on the reliable socket, where produced == acked — so `end` is the whole
+        // ring; `want` (rows since the floor/ack) is capped to what the ring still
+        // holds, since evicted older rows are gone by design.
+        //
+        // mirror of server.rs:761-770 — keep in sync.
+        let ring_len = term.primary_scrollback_len();
+        let frame_sb_total = producer.current_sb_total();
+        let grown = cur_sb_total.saturating_sub(frame_sb_total) as usize;
+        let end = ring_len.saturating_sub(grown);
+        let want = frame_sb_total.saturating_sub(floor) as usize;
+        let appended = want.min(end);
+        let start = end - appended;
+        let rows: Vec<Vec<u8>> = (start..end)
+            .map(|i| term.dump_scrollback_row(i).unwrap_or_default())
+            .collect();
+        let frame_num = producer.current_num();
+        // `base` reads the CONFIRMED visible frame (before the self-ack below),
+        // exactly as server.rs builds the body.
+        let body = FrameBody::Scrollback {
+            base: producer.acked_num(),
+            rows,
+        };
+        let bytes = ServerFrame {
+            flags: 0,
+            caps: caps::own_table(&[]),
+            frame_num,
+            input_ack: 0,
+            echo_ack: 0,
+            body,
+        }
+        .encode();
+        if let Some(sb_total) = producer.ack(frame_num) {
+            self.acked_sb_total = self.acked_sb_total.max(sb_total);
+        }
+        self.queue(Tag::Frame, &bytes);
+        true
+    }
 }
 
 /// Parses the `$POSH_SESSION_FRAMES` daemon frame-emission gate (RFC 0008 §6):
@@ -259,6 +353,12 @@ fn broadcast_output(clients: &mut [ClientConn], term: &Terminal, bcast: &[u8]) {
         };
         if !produced {
             c.queue(Tag::Output, bcast);
+        } else {
+            // Scrollback growth rides as a SEPARATE frame AFTER the visible one
+            // (RFC 0002): the visible frame just advanced this client's acked
+            // base, so the scrollback frame threads off it. A no-op unless the
+            // client wants scrollback and the terminal grew primary rows.
+            c.maybe_queue_scrollback(term);
         }
     }
 }
@@ -556,6 +656,8 @@ fn daemon_loop(
                     cols: 0,
                     caps: Vec::new(),
                     producer: None,
+                    sb_floor: 0,
+                    acked_sb_total: 0,
                 });
             }
         }
@@ -655,7 +757,16 @@ fn daemon_loop(
                                     // frame-capable client when the gate is on;
                                     // a no-op otherwise (the replay/broadcast
                                     // then stay on Tag::Output). RFC 0008.
+                                    let framed_before = c.producer.is_some();
                                     c.maybe_enable_frames(frames_gate);
+                                    // Forward-only scrollback (RFC 0002 §3): a
+                                    // freshly framed client starts with an empty
+                                    // ring, so anchor its floor at the current
+                                    // total — only rows appended AFTER attach are
+                                    // synced, never pre-attach history.
+                                    if !framed_before && c.producer.is_some() {
+                                        c.sb_floor = term.primary_scrollback_total();
+                                    }
                                     // Replay the current screen so the client
                                     // sees state it missed (including the first
                                     // attach to a detached-created session). The
@@ -743,6 +854,21 @@ fn daemon_loop(
                     let t = rec_start.elapsed().as_secs_f64();
                     if rec.resize(t, term.cols(), term.rows()).is_err() {
                         recorder = None;
+                    }
+                }
+                // Scrollback resize reset (RFC 0002 §4): a width change reflows
+                // the terminal, so restart every frame-capable client's
+                // appended-row counting at the reflowed total. This is the
+                // session-socket stand-in for the UDP client's one-message
+                // CAP_SCROLLBACK suppression — socket caps are Init-only, so the
+                // restart is handled daemon-side. The matching client drops its
+                // ring on the same resize (RFC 0002 §4), so both sides go
+                // forward-only from here: no reflowed rows shipped against a stale
+                // floor, no mixed-width rows in the ring.
+                let sb_total = term.primary_scrollback_total();
+                for c in clients.iter_mut() {
+                    if c.producer.is_some() {
+                        c.sb_floor = sb_total;
                     }
                 }
             }
@@ -929,6 +1055,8 @@ mod tests {
             cols: 0,
             caps: Vec::new(),
             producer: None,
+            sb_floor: 0,
+            acked_sb_total: 0,
         }
     }
 
@@ -1011,7 +1139,7 @@ mod tests {
     // ---- Task 1.4: per-client frame production (RFC 0008) ----
 
     use crate::remote::framesync::{ApplyOutcome, DumpDiff, FrameApplier};
-    use crate::remote::sync::FrameBody;
+    use crate::remote::sync::{FrameBody, ScrollbackRing};
 
     /// A frame-capable client: its `Tag::Init` carries an RFC 0001 cap table, so
     /// with the gate on `maybe_enable_frames` constructs its `FrameProducer`.
@@ -1026,6 +1154,8 @@ mod tests {
             cols: 0,
             caps: Vec::new(),
             producer: None,
+            sb_floor: 0,
+            acked_sb_total: 0,
         };
         let mut init = ipc::encode_resize(rows, cols).to_vec();
         init.extend_from_slice(&caps::encode_table(&caps::own_table(&[])));
@@ -1111,6 +1241,8 @@ mod tests {
             cols: 0,
             caps: Vec::new(),
             producer: None,
+            sb_floor: 0,
+            acked_sb_total: 0,
         };
         let mut init = ipc::encode_resize(24, 80).to_vec();
         init.extend_from_slice(&caps::encode_table(&caps::own_table(&[])));
@@ -1255,6 +1387,8 @@ mod tests {
             cols: 0,
             caps: Vec::new(),
             producer: None,
+            sb_floor: 0,
+            acked_sb_total: 0,
         };
         let mut init = ipc::encode_resize(rows, cols).to_vec();
         init.extend_from_slice(&caps::encode_table(&caps::own_table(&[])));
@@ -1437,6 +1571,166 @@ mod tests {
             assert!(c.producer.is_none(), "cell 4: gate off + no caps ⇒ no producer");
             broadcast_output(std::slice::from_mut(&mut c), &term, raw);
             assert_single_output(&c.write_buf, raw);
+        }
+    }
+
+    // ---- Task 2.5a: daemon produces scrollback frames (RFC 0002) ----
+
+    /// A frame-capable client that ALSO advertises `CAP_SCROLLBACK` (RFC 0002
+    /// §1), so with the gate on it both frames the screen AND wants scrolled-off
+    /// rows synced. `gate` off models an "old daemon" (no producer at all).
+    fn scrollback_capable_conn(
+        rows: u16,
+        cols: u16,
+        gate: bool,
+    ) -> (ClientConn, UnixStream) {
+        let (stream, peer) = UnixStream::pair().unwrap();
+        let mut c = ClientConn {
+            stream,
+            read_buf: FrameBuffer::new(),
+            write_buf: Vec::new(),
+            rows: 0,
+            cols: 0,
+            caps: Vec::new(),
+            producer: None,
+            sb_floor: 0,
+            acked_sb_total: 0,
+        };
+        let mut init = ipc::encode_resize(rows, cols).to_vec();
+        init.extend_from_slice(&caps::encode_table(&caps::own_table(&[caps::Cap {
+            id: caps::CAP_SCROLLBACK,
+            payload: vec![0],
+        }])));
+        c.apply_init(&init);
+        c.maybe_enable_frames(gate);
+        (c, peer)
+    }
+
+    /// Push `n` lines through the terminal so more rows than the screen holds
+    /// scroll off the top into the primary scrollback ring.
+    fn scroll_off(term: &mut Terminal, n: u16) {
+        for i in 0..n {
+            term.process(format!("scrollback row {i:03}\r\n").as_bytes());
+        }
+    }
+
+    /// The core Task 2.5a property: a scrollback-capable client, framed with the
+    /// gate on, receives the scrolled-off rows as `FrameBody::Scrollback` bodies,
+    /// and a `ScrollbackRing` fed those bodies holds exactly the daemon's
+    /// `dump_scrollback_row(i)` for every scrolled-off row. Attach happens while
+    /// the daemon scrollback is empty (`sb_floor` = 0), so accumulation is
+    /// forward-only from there — every row scrolled off after attach is synced.
+    #[test]
+    fn scrollback_capable_client_rings_the_daemons_scrolled_off_rows() {
+        let (rows, cols) = (5u16, 24u16);
+        let mut term = Terminal::with_scrollback(rows, cols, 1000);
+
+        let (mut c, _peer) = scrollback_capable_conn(rows, cols, true);
+        assert!(c.producer.is_some(), "gate on + caps ⇒ producer");
+        assert!(c.wants_scrollback(), "the client advertised CAP_SCROLLBACK");
+
+        // Attach replay: the Full keyframe establishes the acked visible base
+        // (frame 1) that scrollback bodies thread off. The term's scrollback is
+        // empty here, so sb_floor stays 0 and later growth is fully synced.
+        assert!(c.queue_frame(
+            term.dump_vt(),
+            Snapshot::from_term(&term),
+            term.is_alt_screen(),
+            (rows, cols),
+        ));
+
+        // Scroll many rows off the top, then broadcast the growth.
+        scroll_off(&mut term, 12);
+        broadcast_output(std::slice::from_mut(&mut c), &term, b"<raw ignored>");
+
+        let scrolled = term.primary_scrollback_len();
+        assert!(scrolled > 0, "the output must have scrolled rows into scrollback");
+
+        // Reconstruct the client's ring from the Scrollback bodies it received.
+        // `decode_frame_bodies` also asserts every queued record is a Tag::Frame.
+        let mut ring = ScrollbackRing::new(1000);
+        let mut sb_frames = 0;
+        let mut saw_visible = false;
+        for body in decode_frame_bodies(&c.write_buf) {
+            match body {
+                FrameBody::Scrollback { base, rows } => {
+                    // The scrollback frame threads off the confirmed visible base.
+                    assert!(base >= 1, "a scrollback frame's base is a real visible frame");
+                    ring.append(&rows);
+                    sb_frames += 1;
+                }
+                _ => saw_visible = true,
+            }
+        }
+        assert!(saw_visible, "the broadcast still carries the visible frame(s)");
+        assert!(sb_frames >= 1, "a scrollback-capable client must receive Scrollback frames");
+        assert_eq!(ring.len(), scrolled, "the ring holds every scrolled-off row");
+        for i in 0..scrolled {
+            assert_eq!(
+                ring.row(i).map(<[u8]>::to_vec),
+                term.dump_scrollback_row(i),
+                "ring row {i} must equal the daemon's dump_scrollback_row(i)"
+            );
+        }
+    }
+
+    /// Gate OFF ⇒ no producer ⇒ the client stays on `Tag::Output`, so no
+    /// scrollback frame is ever emitted even for a scrollback-capable client that
+    /// scrolls heavily. The gate-off invariant extends to scrollback unchanged.
+    #[test]
+    fn gate_off_emits_no_scrollback_frames() {
+        let (rows, cols) = (5u16, 24u16);
+        let mut term = Terminal::with_scrollback(rows, cols, 1000);
+
+        let (mut c, _peer) = scrollback_capable_conn(rows, cols, false);
+        assert!(c.producer.is_none(), "gate off ⇒ no producer regardless of caps");
+
+        scroll_off(&mut term, 12);
+        let raw = b"raw broadcast bytes";
+        broadcast_output(std::slice::from_mut(&mut c), &term, raw);
+
+        // Every queued record is a raw Tag::Output — never a Tag::Frame.
+        let mut fb = FrameBuffer::new();
+        fb.feed(&c.write_buf);
+        let mut records = 0;
+        while let Some(frame) = fb.next().unwrap() {
+            assert_eq!(frame.tag, Tag::Output, "gate off must never emit Tag::Frame");
+            assert_eq!(frame.payload, raw, "the raw broadcast bytes, unchanged");
+            records += 1;
+        }
+        assert_eq!(records, 1, "exactly one Tag::Output record");
+    }
+
+    /// A frame-capable client that did NOT advertise `CAP_SCROLLBACK` gets its
+    /// visible frames but never a Scrollback body — the daemon must not push
+    /// scrollback to a client that cannot consume it. Isolates the cap gate from
+    /// the frame gate.
+    #[test]
+    fn frame_client_without_scrollback_cap_gets_no_scrollback_frames() {
+        let (rows, cols) = (5u16, 24u16);
+        let mut term = Terminal::with_scrollback(rows, cols, 1000);
+
+        // frame_capable_conn advertises only PROTOCOL_VERSION — no CAP_SCROLLBACK.
+        let (mut c, _peer) = frame_capable_conn(rows, cols);
+        assert!(c.producer.is_some());
+        assert!(!c.wants_scrollback(), "no CAP_SCROLLBACK advertised");
+
+        // Replay keyframe (establish the base), then scroll and broadcast.
+        assert!(c.queue_frame(
+            term.dump_vt(),
+            Snapshot::from_term(&term),
+            term.is_alt_screen(),
+            (rows, cols),
+        ));
+        scroll_off(&mut term, 12);
+        broadcast_output(std::slice::from_mut(&mut c), &term, b"<raw ignored>");
+
+        assert!(term.primary_scrollback_len() > 0, "output really did scroll");
+        for body in decode_frame_bodies(&c.write_buf) {
+            assert!(
+                !matches!(body, FrameBody::Scrollback { .. }),
+                "a client without CAP_SCROLLBACK must receive no Scrollback bodies"
+            );
         }
     }
 }
