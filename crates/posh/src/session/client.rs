@@ -6,11 +6,13 @@ use std::os::fd::AsRawFd;
 use std::os::unix::net::UnixStream;
 
 use posh_term::Terminal;
+use serde_json::{json, Value};
 
 use crate::pty::{self, RawMode};
 use crate::remote::caps;
 use crate::remote::display::{self, Snapshot};
 use crate::remote::framesync::{ApplyOutcome, FrameApplier, FrameSync};
+use crate::remote::palette::{composite_palette, Palette, PaletteEvent};
 use crate::remote::scrollview;
 use crate::remote::sync::{FrameBody, ScrollbackRing, ServerFrame};
 use crate::session::ipc::{self, FrameBuffer, Tag};
@@ -19,6 +21,11 @@ use crate::util::{self, Error, Result};
 
 const STDIN: i32 = libc::STDIN_FILENO;
 const STDOUT: i32 = libc::STDOUT_FILENO;
+
+/// The command-palette summon key, Ctrl-^ (mirrors `remote::client::ESCAPE_KEY`).
+/// On the frames-on local path a lone `0x1e` opens the palette; gate-off it is an
+/// ordinary byte forwarded to the shell.
+const ESCAPE_KEY: u8 = 0x1e;
 
 /// Depth of the local client's scrollback ring (RFC 0002 §3), in rows. Matches
 /// the session daemon's primary ring (`daemon::SCROLLBACK`, 10_000) — the client
@@ -101,7 +108,7 @@ pub fn cmd_attach(
     let bracket = crate::terminfo::ca_mode_bracket();
     let enter = enter_seq(&bracket);
     let _ = util::write_fd(STDOUT, &enter);
-    let result = client_loop(stream, &enter);
+    let result = client_loop(stream, &enter, &raw);
     let _ = util::write_fd(STDOUT, &restore_seq(&bracket));
     drop(raw);
     // When the session ended (rather than detached), carry the shell's
@@ -315,7 +322,7 @@ impl FrameRenderer {
     /// last one, so an inability to apply (`ReackAndWait`) is a genuine protocol
     /// bug — surfaced as an error rather than silently retried, since the local
     /// client has no resync/keyframe-request path yet (a later task).
-    fn render_frame(&mut self, payload: &[u8]) -> Result<Vec<u8>> {
+    fn render_frame(&mut self, payload: &[u8], palette: Option<&Terminal>) -> Result<Vec<u8>> {
         let frame = ServerFrame::decode(payload)?;
         // Scrollback growth (RFC 0002 §3): intercept BEFORE the applier — a
         // scrollback frame appends scrolled-off rows to the local ring and
@@ -379,15 +386,21 @@ impl FrameRenderer {
         if self.scroll_offset > 0 {
             return Ok(self.compose_scroll());
         }
-        Ok(self.compose_live())
+        Ok(self.compose_live(palette))
     }
 
-    /// The live visible compose: non-prediction, non-palette. `wheel` enables
-    /// outer-terminal mouse reporting at a bare prompt so the wheel arrives as
-    /// SGR events the scroll-view can intercept (mirrors the remote client);
-    /// `true` = the scroll-shortcut optimization on (new_frame's default).
-    fn compose_live(&mut self) -> Vec<u8> {
-        let next = Snapshot::from_term(&self.server_term);
+    /// The live visible compose: non-prediction, palette-aware. When `palette` is
+    /// `Some`, the renderer's screen is composited over the greyed session before
+    /// the diff (mirror remote client.rs render() ordering) so the overlay box
+    /// paints in the same frame. `wheel` enables outer-terminal mouse reporting at
+    /// a bare prompt so the wheel arrives as SGR events the scroll-view can
+    /// intercept (mirrors the remote client); `true` = the scroll-shortcut
+    /// optimization on (new_frame's default).
+    fn compose_live(&mut self, palette: Option<&Terminal>) -> Vec<u8> {
+        let mut next = Snapshot::from_term(&self.server_term);
+        if let Some(rterm) = palette {
+            composite_palette(&mut next, rterm, self.rows, self.cols);
+        }
         let wheel = scrollview::wheel_active(&self.server_term);
         let bytes = display::new_frame_opt(
             self.initialized,
@@ -401,6 +414,14 @@ impl FrameRenderer {
         self.last_wheel = wheel;
         self.initialized = true;
         bytes
+    }
+
+    /// Re-run the live compose for a palette-activity repaint (the renderer
+    /// pumped, or the palette opened/closed) that isn't driven by an incoming
+    /// `Tag::Frame`. Threads the palette overlay, or `None` to clear it. The local
+    /// client has no periodic render tick, so these repaints happen on demand.
+    fn recompose(&mut self, palette: Option<&Terminal>) -> Vec<u8> {
+        self.compose_live(palette)
     }
 
     /// Repaints the frozen history window at the current offset via the shared
@@ -481,17 +502,116 @@ impl FrameRenderer {
         // normally below — you are about to type at the prompt.
         if !forward.is_empty() && self.scroll_offset > 0 {
             self.set_scroll(0);
-            repaint = self.compose_live();
+            // `handle_input` runs only while the palette is closed (the loop
+            // forwards keystrokes straight to the renderer when it is open), so
+            // the return-to-live repaint never carries an overlay.
+            repaint = self.compose_live(None);
         }
         (forward, repaint)
     }
 }
 
+/// The local session's palette command set (FDR 0011 Phase 2.4a). Only the
+/// transport-aware entries that make sense on a reliable local socket: Suspend
+/// (background the client) and Detach (leave the session running). The remote
+/// client's echo/prediction/resync/forensics/agent/server-log commands are
+/// UDP/prediction-only and intentionally omitted; "Shell out" arrives in 2.4b.
+fn palette_commands() -> Value {
+    json!([
+        { "name": "Suspend client", "action": { "method": "client.suspend" } },
+        { "name": "Detach", "action": { "method": "app.detach" } },
+    ])
+}
+
+/// Split a forwarded stdin batch at the first Ctrl-^ (the frames-on palette-open
+/// key). Returns the bytes before the escape (ordinary input) and, when an
+/// escape was present, the bytes after it (routed to the palette; the `0x1e`
+/// itself is dropped). The caller only consults this when a `FrameRenderer` is
+/// live — gate-off leaves the `0x1e` in the ordinary-input slice.
+fn split_escape(forward: &[u8]) -> (&[u8], Option<&[u8]>) {
+    match forward.iter().position(|&b| b == ESCAPE_KEY) {
+        Some(pos) => (&forward[..pos], Some(&forward[pos + 1..])),
+        None => (forward, None),
+    }
+}
+
+/// Open the command palette over the live session (frames-on only): spawn the
+/// renderer on first use, summon it, drop any scroll-view back to the live bottom
+/// (the palette overlays the live session, not history), force a repaint, and
+/// paint the greyed overlay now. Returns false if the renderer can't be spawned,
+/// leaving the caller to forward the `Ctrl-^` to the shell as an ordinary byte.
+fn open_local_palette(
+    palette: &mut Option<Palette>,
+    fr: &mut FrameRenderer,
+    stdout_buf: &mut Vec<u8>,
+    rows: u16,
+    cols: u16,
+) -> bool {
+    if palette.is_none() {
+        *palette = Palette::spawn(rows, cols);
+    }
+    let Some(p) = palette.as_mut() else {
+        return false;
+    };
+    p.open("Commands", palette_commands());
+    fr.set_scroll(0);
+    fr.invalidate();
+    stdout_buf.extend_from_slice(&fr.recompose(p.screen()));
+    true
+}
+
+/// The tty-side effect a dispatched palette action still needs applied after it
+/// returns. `client.suspend` can't run inside [`dispatch_local_action`] (it needs
+/// the loop's `RawMode` and blocks in `SIGSTOP`), so it is surfaced here and run
+/// at the call site; `Detach` is a pure wire effect handled inline.
+enum LocalAction {
+    /// The action's effect is complete (its wire frame, if any, is queued).
+    None,
+    /// Run [`suspend`] with the loop's `RawMode`.
+    Suspend,
+}
+
+/// Dispatch a palette selection on the local client. Wire-only effects (Detach)
+/// are applied here against `sock_write_buf`; the tty-side Suspend is returned
+/// for the caller to run with its `RawMode`. Splitting it this way keeps the
+/// dispatch unit-testable without a real tty.
+fn dispatch_local_action(method: &str, sock_write_buf: &mut Vec<u8>) -> LocalAction {
+    match method {
+        "app.detach" => {
+            // Same wire effect as the DetachMatcher path: ask the daemon to
+            // detach this client, leaving the session running.
+            ipc::append_frame(sock_write_buf, Tag::Detach, b"");
+            LocalAction::None
+        }
+        "client.suspend" => LocalAction::Suspend,
+        _ => LocalAction::None, // unknown method: the renderer already closed
+    }
+}
+
+/// Suspend the local client (mirror remote client.rs `suspend`): leave the
+/// alternate screen and restore the tty driver so the parent shell is visible,
+/// print the suspend banner, stop our own process group, and — on `SIGCONT`
+/// (fg) — re-enter raw mode and the alternate screen. The forced repaint of the
+/// resumed session is the caller's `fr.invalidate()` + recompose (and the loop's
+/// `SIGCONT` handler), matching the remote client's `st.initialized = false`.
+fn suspend(raw: &RawMode) {
+    let _ = util::write_all_retry(STDOUT, &display::close(), 1000);
+    raw.restore();
+    let _ = util::write_all_retry(STDOUT, b"\r\n\x1b[37;44m[posh is suspended.]\x1b[m\r\n", 1000);
+    util::stop_own_pgroup();
+    // Execution resumes here after SIGCONT (fg): back onto the alternate screen
+    // before the caller's forced repaint redraws it.
+    raw.reapply();
+    let _ = util::write_all_retry(STDOUT, &display::open(), 1000);
+}
+
 /// Bridges the tty to the daemon until detach or session end. Returns the
 /// session shell's exit status (0 on detach or connection loss).
 /// `enter` is re-written on SIGCONT, when the outer terminal may have
-/// left our alternate screen while we were stopped.
-fn client_loop(stream: UnixStream, enter: &[u8]) -> Result<i32> {
+/// left our alternate screen while we were stopped. `raw` is the tty's raw-mode
+/// guard, borrowed for the palette's Suspend command (temporary restore + re-arm
+/// around `SIGSTOP`).
+fn client_loop(stream: UnixStream, enter: &[u8], raw: &RawMode) -> Result<i32> {
     stream.set_nonblocking(true)?;
     let sock_fd = stream.as_raw_fd();
     util::set_nonblocking(STDIN)?;
@@ -536,13 +656,25 @@ fn client_loop(stream: UnixStream, enter: &[u8]) -> Result<i32> {
     let mut frame_renderer: Option<FrameRenderer> = None;
     let mut frame_size = (rows, cols);
 
+    // The command-palette overlay (FDR 0011 Phase 2.4a): stays None until the
+    // user first opens it with Ctrl-^ on a frames-on session, then persists
+    // (spawned renderer reused across opens) until loop teardown. A gate-off
+    // session never builds a FrameRenderer, so Ctrl-^ is never intercepted and
+    // this stays None — the palette is a frames-on feature.
+    let mut palette: Option<Palette> = None;
+
     let err_events = libc::POLLHUP | libc::POLLERR | libc::POLLNVAL;
-    loop {
+    let result: Result<i32> = 'client: loop {
         if util::take_flag(&util::SIGWINCH_RECEIVED) {
             let (rows, cols) = pty::term_size(STDOUT);
             frame_size = (rows, cols);
             if let Some(fr) = frame_renderer.as_mut() {
                 fr.resize(rows, cols);
+            }
+            // Keep the palette renderer sized to the tty while it is up (mirror
+            // remote client.rs); a closed renderer is resized when next opened.
+            if let Some(p) = palette.as_mut().filter(|p| p.is_open()) {
+                p.resize(rows, cols);
             }
             ipc::append_frame(
                 &mut sock_write_buf,
@@ -556,7 +688,7 @@ fn client_loop(stream: UnixStream, enter: &[u8]) -> Result<i32> {
             // cmd_attach restores the tty on the way out either way.
             ipc::append_frame(&mut sock_write_buf, Tag::Detach, b"");
             let _ = util::write_all_retry(sock_fd, &sock_write_buf, 100);
-            return Ok(0);
+            break 'client Ok(0);
         }
 
         if util::take_flag(&util::SIGCONT_RECEIVED) {
@@ -591,6 +723,16 @@ fn client_loop(stream: UnixStream, enter: &[u8]) -> Result<i32> {
         if !stdout_buf.is_empty() {
             fds.push(util::pollfd(STDOUT, libc::POLLOUT));
         }
+        // Poll the palette renderer's fds (its PTY + control socket) while it is
+        // resident, so its output drains and selections are seen promptly (mirror
+        // remote client.rs `palette_base`). Recorded after the fixed fds so the
+        // base index maps `revents` back to master (base) and ctrl (base + 1).
+        let palette_base = palette.as_ref().map(|p| {
+            let base = fds.len();
+            fds.push(util::pollfd(p.master_fd(), libc::POLLIN));
+            fds.push(util::pollfd(p.ctrl_fd(), libc::POLLIN));
+            base
+        });
 
         // Bounded timeout: a signal landing between the flag checks above
         // and this poll sets the flag without an EINTR; an infinite poll
@@ -599,49 +741,87 @@ fn client_loop(stream: UnixStream, enter: &[u8]) -> Result<i32> {
         match util::poll(&mut fds, 1000) {
             Ok(_) => {}
             Err(e) if e.kind() == std::io::ErrorKind::Interrupted => continue,
-            Err(e) => return Err(e.into()),
+            Err(e) => break 'client Err(e.into()),
         }
 
         // stdin -> daemon
         if fds[0].revents & (libc::POLLIN | err_events) != 0 {
             let mut buf = [0u8; 4096];
             match util::read_fd(STDIN, &mut buf) {
-                Ok(0) => return Ok(0),
+                Ok(0) => break 'client Ok(0),
                 Ok(n) => {
-                    let (forward, detached) = detach.feed(&buf[..n]);
-                    if !forward.is_empty() {
-                        // Frame path: when a FrameRenderer is live it intercepts
-                        // the wheel for the local scroll-view (bare prompt only)
-                        // and repaints the tty; the remaining bytes forward as
-                        // input. Gate-off (no renderer) forwards `forward`
-                        // verbatim — the raw wheel reaches the daemon exactly as
-                        // today, byte for byte.
-                        let to_daemon = if let Some(fr) = frame_renderer.as_mut() {
-                            let (fwd, repaint) = fr.handle_input(&forward);
-                            if !repaint.is_empty() {
-                                stdout_buf.extend_from_slice(&repaint);
-                            }
-                            fwd
+                    let input = &buf[..n];
+                    // While the palette overlay is up the renderer owns the
+                    // keyboard: forward raw keystrokes to it and send nothing to
+                    // the daemon (mirror remote client.rs). Its selection/cancel
+                    // arrives on the control channel, serviced below.
+                    if let Some(p) = palette.as_ref().filter(|p| p.is_open()) {
+                        p.forward_input(input);
+                    } else {
+                        let (forward, detached) = detach.feed(input);
+                        // Frames-on only: a lone Ctrl-^ opens the palette. The
+                        // bytes before it are ordinary input; the bytes after it
+                        // route to the palette (the 0x1e is dropped). Gate-off (no
+                        // renderer) never looks for the escape, so 0x1e stays in
+                        // the ordinary-input slice and reaches the shell.
+                        let (normal, after_escape) = if frame_renderer.is_some() {
+                            split_escape(&forward)
                         } else {
-                            forward
+                            (&forward[..], None)
                         };
-                        if !to_daemon.is_empty() {
-                            ipc::append_frame(&mut sock_write_buf, Tag::Input, &to_daemon);
+                        // Ordinary input: when a FrameRenderer is live it
+                        // intercepts the wheel for the local scroll-view (bare
+                        // prompt only) and repaints the tty; the rest forwards as
+                        // input. Gate-off forwards `normal` verbatim — the raw
+                        // wheel reaches the daemon byte for byte, exactly as today.
+                        if !normal.is_empty() {
+                            let to_daemon = if let Some(fr) = frame_renderer.as_mut() {
+                                let (fwd, repaint) = fr.handle_input(normal);
+                                if !repaint.is_empty() {
+                                    stdout_buf.extend_from_slice(&repaint);
+                                }
+                                fwd
+                            } else {
+                                normal.to_vec()
+                            };
+                            if !to_daemon.is_empty() {
+                                ipc::append_frame(&mut sock_write_buf, Tag::Input, &to_daemon);
+                            }
                         }
-                    }
-                    if detached {
-                        ipc::append_frame(&mut sock_write_buf, Tag::Detach, b"");
+                        // Open the palette on the escape byte (frames-on). If the
+                        // renderer can't be spawned, forward the Ctrl-^ and its
+                        // trailing bytes to the shell as ordinary input.
+                        if let Some(after) = after_escape {
+                            let fr = frame_renderer
+                                .as_mut()
+                                .expect("split_escape only fires with a live renderer");
+                            let (rows, cols) = frame_size;
+                            if open_local_palette(&mut palette, fr, &mut stdout_buf, rows, cols) {
+                                if !after.is_empty() {
+                                    if let Some(p) = palette.as_ref() {
+                                        p.forward_input(after);
+                                    }
+                                }
+                            } else {
+                                let mut literal = vec![ESCAPE_KEY];
+                                literal.extend_from_slice(after);
+                                ipc::append_frame(&mut sock_write_buf, Tag::Input, &literal);
+                            }
+                        }
+                        if detached {
+                            ipc::append_frame(&mut sock_write_buf, Tag::Detach, b"");
+                        }
                     }
                 }
                 Err(e) if e.kind() == std::io::ErrorKind::WouldBlock => {}
-                Err(e) => return Err(e.into()),
+                Err(e) => break 'client Err(e.into()),
             }
         }
 
         // daemon -> stdout
         if fds[1].revents & libc::POLLIN != 0 {
             match read_buf.read_from(sock_fd) {
-                Ok(0) => return Ok(0),
+                Ok(0) => break 'client Ok(0),
                 Ok(_) => loop {
                     match read_buf.next() {
                         Ok(Some(frame)) => match frame.tag {
@@ -652,12 +832,21 @@ fn client_loop(stream: UnixStream, enter: &[u8]) -> Result<i32> {
                             // negotiated it (`POSH_SESSION_FRAMES=on`): apply the
                             // ServerFrame into the client model and append the
                             // rendered delta. Build the consumer lazily on the
-                            // first frame so the gate-off path stays inert.
+                            // first frame so the gate-off path stays inert. The
+                            // palette overlay (when open) composites on top of the
+                            // freshly-applied frame in the same render.
                             Tag::Frame => {
+                                let screen = palette
+                                    .as_ref()
+                                    .filter(|p| p.is_open())
+                                    .and_then(Palette::screen);
                                 let fr = frame_renderer.get_or_insert_with(|| {
                                     FrameRenderer::new(frame_size.0, frame_size.1)
                                 });
-                                let bytes = fr.render_frame(&frame.payload)?;
+                                let bytes = match fr.render_frame(&frame.payload, screen) {
+                                    Ok(bytes) => bytes,
+                                    Err(e) => break 'client Err(e),
+                                };
                                 stdout_buf.extend_from_slice(&bytes);
                             }
                             Tag::Exit => {
@@ -666,12 +855,12 @@ fn client_loop(stream: UnixStream, enter: &[u8]) -> Result<i32> {
                                 if !stdout_buf.is_empty() {
                                     let _ = util::write_all_retry(STDOUT, &stdout_buf, 1000);
                                 }
-                                return Ok(ipc::decode_exit(&frame.payload).unwrap_or(0));
+                                break 'client Ok(ipc::decode_exit(&frame.payload).unwrap_or(0));
                             }
                             _ => {}
                         },
                         Ok(None) => break,
-                        Err(e) => return Err(e),
+                        Err(e) => break 'client Err(e),
                     }
                 },
                 Err(e) if e.kind() == std::io::ErrorKind::WouldBlock => {}
@@ -679,9 +868,55 @@ fn client_loop(stream: UnixStream, enter: &[u8]) -> Result<i32> {
                     if e.kind() == std::io::ErrorKind::ConnectionReset
                         || e.kind() == std::io::ErrorKind::BrokenPipe =>
                 {
-                    return Ok(0);
+                    break 'client Ok(0);
                 }
-                Err(e) => return Err(e.into()),
+                Err(e) => break 'client Err(e.into()),
+            }
+        }
+
+        // Palette overlay servicing (mirror remote client.rs): drain the
+        // renderer's screen so the overlay repaints, and act on any
+        // selection/cancel it reported. The local client has no periodic render
+        // tick, so each palette activity recomposites here on demand.
+        if let Some(base) = palette_base {
+            if fds[base].revents & libc::POLLIN != 0 {
+                let changed = palette.as_mut().map(Palette::pump).unwrap_or(false);
+                if changed {
+                    if let Some(fr) = frame_renderer.as_mut() {
+                        let screen = palette
+                            .as_ref()
+                            .filter(|p| p.is_open())
+                            .and_then(Palette::screen);
+                        stdout_buf.extend_from_slice(&fr.recompose(screen));
+                    }
+                }
+            }
+            if fds[base + 1].revents & libc::POLLIN != 0 {
+                match palette.as_mut().map(Palette::poll_events) {
+                    Some(PaletteEvent::Action { method, .. }) => {
+                        if let LocalAction::Suspend =
+                            dispatch_local_action(&method, &mut sock_write_buf)
+                        {
+                            suspend(raw);
+                        }
+                        // The palette closed and (for Suspend) the tty was cleared
+                        // and restored: force a full repaint of the plain session.
+                        if let Some(fr) = frame_renderer.as_mut() {
+                            fr.invalidate();
+                            stdout_buf.extend_from_slice(&fr.recompose(None));
+                        }
+                    }
+                    Some(PaletteEvent::Cancelled) => {
+                        // Dismissed without a selection: repaint the plain session.
+                        if let Some(fr) = frame_renderer.as_mut() {
+                            fr.invalidate();
+                            stdout_buf.extend_from_slice(&fr.recompose(None));
+                        }
+                    }
+                    // The local 2.4a menu has no dialog commands, so Copy is
+                    // unreachable; a later dialog command would emit OSC 52 here.
+                    Some(PaletteEvent::Copy) | Some(PaletteEvent::None) | None => {}
+                }
             }
         }
 
@@ -696,9 +931,9 @@ fn client_loop(stream: UnixStream, enter: &[u8]) -> Result<i32> {
                     if e.kind() == std::io::ErrorKind::ConnectionReset
                         || e.kind() == std::io::ErrorKind::BrokenPipe =>
                 {
-                    return Ok(0);
+                    break 'client Ok(0);
                 }
-                Err(e) => return Err(e.into()),
+                Err(e) => break 'client Err(e.into()),
             }
         }
 
@@ -708,14 +943,21 @@ fn client_loop(stream: UnixStream, enter: &[u8]) -> Result<i32> {
                     stdout_buf.drain(..n);
                 }
                 Err(e) if e.kind() == std::io::ErrorKind::WouldBlock => {}
-                Err(e) => return Err(e.into()),
+                Err(e) => break 'client Err(e.into()),
             }
         }
 
         if fds[1].revents & err_events != 0 {
-            return Ok(0);
+            break 'client Ok(0);
         }
+    };
+
+    // Tear down the palette renderer (if any) on every loop exit — detach,
+    // session end, signal, or error.
+    if let Some(p) = palette.take() {
+        p.shutdown();
     }
+    result
 }
 
 #[cfg(test)]
@@ -878,7 +1120,7 @@ mod tests {
 
         let play = |renderer: &mut FrameRenderer, outer: &mut Terminal, payload: &[u8]| {
             let bytes = renderer
-                .render_frame(payload)
+                .render_frame(payload, None)
                 .expect("a frame must apply on the reliable socket");
             outer.process(&bytes);
             if outer.rows() != rows || outer.cols() != cols {
@@ -942,7 +1184,7 @@ mod tests {
         outer.process(b"stale leading raw output line\r\nand another\r\n");
 
         let f1 = daemon_frame(&mut producer, &daemon);
-        let bytes = renderer.render_frame(&f1).expect("keyframe applies");
+        let bytes = renderer.render_frame(&f1, None).expect("keyframe applies");
         outer.process(&bytes);
         if outer.rows() != rows || outer.cols() != cols {
             outer.resize(rows, cols);
@@ -993,7 +1235,7 @@ mod tests {
 
         // Frame 1: the Full keyframe establishes the visible base (applied_num=1).
         let f1 = daemon_frame(&mut producer, &daemon);
-        outer.process(&renderer.render_frame(&f1).expect("keyframe applies"));
+        outer.process(&renderer.render_frame(&f1, None).expect("keyframe applies"));
         assert_eq!(renderer.applied_num, 1);
         let visible_after_keyframe = Snapshot::from_term(&renderer.server_term);
         assert!(renderer.scrollback.is_empty(), "no scrollback rung yet");
@@ -1004,7 +1246,7 @@ mod tests {
             b"scrolled row B\r\n".to_vec(),
         ];
         let f2 = daemon_scrollback_frame(&mut producer, sb_rows.clone());
-        let bytes = renderer.render_frame(&f2).expect("scrollback applies");
+        let bytes = renderer.render_frame(&f2, None).expect("scrollback applies");
 
         // No render bytes, visible model unchanged, applied_num advanced, ring
         // holds exactly the carried rows.
@@ -1030,7 +1272,7 @@ mod tests {
             ),
             "the visible diff must anchor on the scrollback frame (base 2)"
         );
-        renderer.render_frame(&f3).expect("the diff applies after scrollback");
+        renderer.render_frame(&f3, None).expect("the diff applies after scrollback");
         assert_eq!(renderer.applied_num, 3);
         assert_eq!(
             Snapshot::from_term(&renderer.server_term),
@@ -1095,7 +1337,7 @@ mod tests {
         let mut daemon = Terminal::with_scrollback(rows, cols, 1000);
         daemon.process(b"\x1b[2J\x1b[Hlive prompt line");
         let f1 = daemon_frame(&mut producer, &daemon);
-        outer.process(&renderer.render_frame(&f1).expect("keyframe applies"));
+        outer.process(&renderer.render_frame(&f1, None).expect("keyframe applies"));
         assert_eq!(renderer.scroll_offset, 0, "starts at the live bottom");
 
         // Ring up eight history rows via a scrollback frame (no repaint at
@@ -1104,7 +1346,7 @@ mod tests {
             .map(|i| format!("history line {i}\r\n").into_bytes())
             .collect();
         let f2 = daemon_scrollback_frame(&mut producer, hist.clone());
-        let sb_bytes = renderer.render_frame(&f2).expect("scrollback applies");
+        let sb_bytes = renderer.render_frame(&f2, None).expect("scrollback applies");
         assert!(sb_bytes.is_empty(), "ringing history while live paints nothing");
         assert_eq!(renderer.scrollback.len(), 8);
 
@@ -1153,7 +1395,7 @@ mod tests {
         let mut daemon = Terminal::with_scrollback(rows, cols, 1000);
         daemon.process(b"\x1b[?1000h\x1b[?1006h");
         let f1 = daemon_frame(&mut producer, &daemon);
-        renderer.render_frame(&f1).expect("keyframe applies");
+        renderer.render_frame(&f1, None).expect("keyframe applies");
 
         let wheel = b"\x1b[<64;10;5M";
         let (to_daemon, repaint) = renderer.handle_input(wheel);
@@ -1172,5 +1414,136 @@ mod tests {
         let mut m = DetachMatcher::default();
         let wheel = b"\x1b[<64;10;5M";
         assert_eq!(m.feed(wheel), (wheel.to_vec(), false));
+    }
+
+    // ---- Task 2.4a: command palette on the local session client ------------
+
+    /// `split_escape` is the open decision the loop makes when a FrameRenderer is
+    /// live: a lone Ctrl-^ (0x1e) partitions the batch into the ordinary input
+    /// before it and the palette-bound bytes after it, dropping the escape byte.
+    #[test]
+    fn split_escape_partitions_input_at_ctrl_caret() {
+        assert_eq!(
+            split_escape(b"ab\x1ecd"),
+            (b"ab".as_slice(), Some(b"cd".as_slice())),
+            "bytes before the escape are input; bytes after route to the palette"
+        );
+        assert_eq!(
+            split_escape(b"\x1e"),
+            (b"".as_slice(), Some(b"".as_slice())),
+            "a lone Ctrl-^ opens the palette with no leading input and an empty tail"
+        );
+        assert_eq!(
+            split_escape(b"abc"),
+            (b"abc".as_slice(), None),
+            "no escape: the whole batch is ordinary input"
+        );
+    }
+
+    /// Gate-off invariant: with `POSH_SESSION_FRAMES` off there is no
+    /// FrameRenderer, so the loop never calls `split_escape` and Ctrl-^ is not
+    /// intercepted. The only stage before `Tag::Input` is the detach matcher,
+    /// which forwards the `0x1e` byte untouched — the shell receives it, exactly
+    /// as before this task (mirror `gate_off_forwards_wheel_bytes_...`).
+    #[test]
+    fn gate_off_leaves_ctrl_caret_in_the_forwarded_stream() {
+        let mut m = DetachMatcher::default();
+        assert_eq!(m.feed(b"\x1e"), (vec![0x1e], false));
+    }
+
+    /// `app.detach` dispatch queues the same `Tag::Detach` wire frame the
+    /// `DetachMatcher` path emits, and reports no further tty-side action.
+    #[test]
+    fn dispatch_detach_appends_a_detach_frame() {
+        let mut buf = Vec::new();
+        assert!(matches!(
+            dispatch_local_action("app.detach", &mut buf),
+            LocalAction::None
+        ));
+        assert_eq!(buf, ipc::encode_frame(Tag::Detach, b""));
+    }
+
+    /// `client.suspend` is routed as a tty-side action (run with the loop's
+    /// RawMode at the call site) and queues no wire frame. The actual SIGSTOP is
+    /// not unit-testable, matching the remote client.
+    #[test]
+    fn dispatch_suspend_routes_to_the_suspend_action() {
+        let mut buf = Vec::new();
+        assert!(matches!(
+            dispatch_local_action("client.suspend", &mut buf),
+            LocalAction::Suspend
+        ));
+        assert!(buf.is_empty(), "suspend queues no wire frame");
+    }
+
+    /// An unknown method (the renderer already closed the palette) is inert.
+    #[test]
+    fn dispatch_unknown_method_is_inert() {
+        let mut buf = Vec::new();
+        assert!(matches!(
+            dispatch_local_action("no.such.method", &mut buf),
+            LocalAction::None
+        ));
+        assert!(buf.is_empty());
+    }
+
+    /// The core 2.4a render property: the palette renderer's screen composites
+    /// onto the live local session — the session greys behind it and the
+    /// renderer's box is anchored a third of the way down — and clears cleanly on
+    /// close. Driven through the real `FrameRenderer::recompose`, with the
+    /// rendered escapes replayed onto an outer terminal to check what the user
+    /// sees (mirrors the moved `composite_palette_*` tests, but end-to-end).
+    #[test]
+    fn palette_screen_composites_onto_the_local_snapshot() {
+        let (rows, cols) = (24u16, 80u16);
+        let mut daemon = Terminal::with_scrollback(rows, cols, 1000);
+        fill_screen(&mut daemon);
+        let mut producer = FrameProducer::new(rows, cols);
+        let mut renderer = FrameRenderer::new(rows, cols);
+        let mut outer = Terminal::with_scrollback(rows, cols, 0);
+
+        // Establish the live session on the outer tty (bright, undimmed).
+        let f1 = daemon_frame(&mut producer, &daemon);
+        outer.process(&renderer.render_frame(&f1, None).expect("keyframe applies"));
+        assert!(
+            !outer.screen().cell(0, 0).unwrap().style.dim,
+            "the session starts bright, before any overlay"
+        );
+
+        // A palette renderer screen showing "HI" at row 0.
+        let mut pterm = Terminal::new(rows, cols);
+        pterm.process(b"HI");
+
+        // Recompose with the overlay (as the loop does on palette open / pump).
+        renderer.invalidate();
+        outer.process(&renderer.recompose(Some(&pterm)));
+
+        let has_hi = |t: &Terminal| {
+            let snap = Snapshot::from_term(t);
+            (0..rows).any(|r| {
+                (0..cols.saturating_sub(1)).any(|c| {
+                    snap.cell(r, c).map(|x| x.ch) == Some('H')
+                        && snap.cell(r, c + 1).map(|x| x.ch) == Some('I')
+                })
+            })
+        };
+        assert!(
+            has_hi(&outer),
+            "the palette 'HI' box is composited onto the session"
+        );
+        assert!(
+            outer.screen().cell(0, 0).unwrap().style.dim,
+            "the session is greyed behind the palette overlay"
+        );
+
+        // Closing the overlay (recompose with None) repaints the plain session:
+        // the box is gone and the session is bright again.
+        renderer.invalidate();
+        outer.process(&renderer.recompose(None));
+        assert!(!has_hi(&outer), "the overlay is cleared on close");
+        assert!(
+            !outer.screen().cell(0, 0).unwrap().style.dim,
+            "the session brightens back on close"
+        );
     }
 }
