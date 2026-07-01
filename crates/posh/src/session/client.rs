@@ -11,6 +11,7 @@ use crate::pty::{self, RawMode};
 use crate::remote::caps;
 use crate::remote::display::{self, Snapshot};
 use crate::remote::framesync::{ApplyOutcome, FrameApplier, FrameSync};
+use crate::remote::scrollview;
 use crate::remote::sync::{FrameBody, ScrollbackRing, ServerFrame};
 use crate::session::ipc::{self, FrameBuffer, Tag};
 use crate::session::{daemon, Config};
@@ -22,9 +23,9 @@ const STDOUT: i32 = libc::STDOUT_FILENO;
 /// Depth of the local client's scrollback ring (RFC 0002 §3), in rows. Matches
 /// the session daemon's primary ring (`daemon::SCROLLBACK`, 10_000) — the client
 /// advertises `CAP_SCROLLBACK` with a `0` payload (server-default depth), so it
-/// mirrors that here — and bounds client memory. The captured rows are not yet
-/// rendered (a scrollable local viewport is a later task); this task only rings
-/// them.
+/// mirrors that here — and bounds client memory. The captured rows are rendered
+/// into a scrollable local viewport by the shared `remote::scrollview` machinery
+/// when the wheel scrolls up (Task 2.5b).
 const SCROLLBACK_RING_DEPTH: usize = 10_000;
 
 /// Mode resets written on detach before leaving the alternate screen:
@@ -187,8 +188,11 @@ impl DetachMatcher {
 /// client's apply+compose core. It holds a client-side terminal model, applies
 /// each received `FrameBody` through the DumpDiff applier — the only codec the
 /// local client negotiates in Phase 1 — and renders the resulting screen as a
-/// display diff against what the tty last showed. No resync/base-sum,
-/// prediction, palette, or scrollback: those are later unification tasks.
+/// display diff against what the tty last showed. It also captures scrolled-off
+/// rows into a local ring and renders a frozen scroll-view when the wheel
+/// scrolls up (Task 2.5b), sharing the `remote::scrollview` machinery with the
+/// roaming client. No resync/base-sum, prediction, or palette: those remain
+/// later unification tasks.
 ///
 /// This path runs only when the daemon sends `Tag::Frame`
 /// (`POSH_SESSION_FRAMES=on`, negotiated by Task 1.4). A default gate-off
@@ -208,10 +212,21 @@ struct FrameRenderer {
     applied_num: u64,
     /// Local, partial, monotonically-growing view of the daemon's scrolled-off
     /// primary rows (RFC 0002 §3). `FrameBody::Scrollback` frames append here
-    /// without touching the visible model; a width resize clears it (§4). This
-    /// task only CAPTURES history — a scrollable local viewport that reads it is
-    /// a later task, so the ring is written but not yet rendered.
+    /// without touching the visible model; a width resize clears it (§4). The
+    /// scroll-view (below) renders a window of it when `scroll_offset > 0`.
     scrollback: ScrollbackRing,
+    /// How far up the captured history the view sits (FDR 0005), in logical
+    /// rows; 0 = the live bottom (normal render). Driven by the wheel through
+    /// `mouse_filter`; any keystroke returns it to 0.
+    scroll_offset: usize,
+    /// Scroll-view render memo (`remote::scrollview`): skips a repaint while the
+    /// offset, ring length, and server generation are all unchanged.
+    last_scroll_state: scrollview::ScrollMemo,
+    /// Intercepts the outer terminal's wheel (SGR mouse) so it drives the local
+    /// scroll-view instead of reaching the daemon. Persists across reads so a
+    /// sequence split across `read()`s reassembles (posh#52). Shared with the
+    /// roaming client via `remote::scrollview`.
+    mouse_filter: scrollview::MouseFilter,
     /// What the tty last showed, so the renderer emits only the delta.
     last_drawn: Snapshot,
     /// False until the first render (and after an external clear), so the next
@@ -238,6 +253,9 @@ impl FrameRenderer {
             applied_data: Vec::new(),
             applied_num: 0,
             scrollback: ScrollbackRing::new(SCROLLBACK_RING_DEPTH),
+            scroll_offset: 0,
+            last_scroll_state: None,
+            mouse_filter: scrollview::MouseFilter::default(),
             last_drawn: Snapshot::blank(rows, cols),
             initialized: false,
             rows,
@@ -253,6 +271,10 @@ impl FrameRenderer {
         self.rows = rows.max(1);
         self.cols = cols.max(1);
         self.initialized = false;
+        // A resize returns to the live view (FDR 0005): the frozen viewport was
+        // measured against the old geometry and the ring is about to be cleared.
+        self.scroll_offset = 0;
+        self.last_scroll_state = None;
         // A width change reflows the old rows (RFC 0002 §4): drop the ring and
         // re-accumulate at the new width. The daemon restarts its per-client
         // appended-row counting when it PROCESSES the matching `Tag::Resize`, so
@@ -300,8 +322,17 @@ impl FrameRenderer {
             if *base != self.applied_num {
                 return Ok(Vec::new());
             }
+            let grew = rows.len();
             self.scrollback.append(rows);
             self.applied_num = frame.frame_num;
+            // While scrolled up, keep the frozen viewport anchored on the same
+            // content as new rows arrive (FDR 0005: output accumulates but does
+            // not yank to the bottom), then repaint the scroll-view — the local
+            // client has no periodic render tick, so the repaint happens here.
+            if self.scroll_offset > 0 {
+                self.set_scroll(self.scroll_offset + grew);
+                return Ok(self.compose_scroll());
+            }
             return Ok(Vec::new());
         }
         match self.applier.apply(
@@ -331,15 +362,110 @@ impl FrameRenderer {
                 )));
             }
         }
-        // The minimal compose: non-scroll, non-prediction, non-palette. `false`
-        // = no outer wheel reporting; `true` = the scroll-shortcut optimization
-        // on (new_frame's default). The remote client's compose_frame adds the
-        // prediction/notification/palette overlays on top of exactly this.
+        // While scrolled up, the live model advanced underneath but the viewport
+        // stays frozen: repaint the scroll-view (memoized on the server
+        // generation, so an out-of-window change diffs to nothing) rather than
+        // yanking to the live bottom.
+        if self.scroll_offset > 0 {
+            return Ok(self.compose_scroll());
+        }
+        Ok(self.compose_live())
+    }
+
+    /// The live visible compose: non-prediction, non-palette. `wheel` enables
+    /// outer-terminal mouse reporting at a bare prompt so the wheel arrives as
+    /// SGR events the scroll-view can intercept (mirrors the remote client);
+    /// `true` = the scroll-shortcut optimization on (new_frame's default).
+    fn compose_live(&mut self) -> Vec<u8> {
         let next = Snapshot::from_term(&self.server_term);
-        let bytes = display::new_frame_opt(self.initialized, &self.last_drawn, &next, false, true);
+        let wheel = scrollview::wheel_active(&self.server_term);
+        let bytes = display::new_frame_opt(self.initialized, &self.last_drawn, &next, wheel, true);
         self.last_drawn = next;
         self.initialized = true;
-        Ok(bytes)
+        bytes
+    }
+
+    /// Repaints the frozen history window at the current offset via the shared
+    /// `remote::scrollview` compose. `scroll_opt = true`: the local client has no
+    /// palette toggle for the scroll-shortcut, so it stays at new_frame's default.
+    fn compose_scroll(&mut self) -> Vec<u8> {
+        scrollview::compose_scroll_frame(
+            self.scroll_offset,
+            &self.scrollback,
+            &self.server_term,
+            self.rows,
+            self.cols,
+            &mut self.last_scroll_state,
+            &mut self.initialized,
+            &mut self.last_drawn,
+            true,
+        )
+    }
+
+    /// Sets the scroll offset (clamped to the ring) via the shared helper. The
+    /// local client keeps no separate live-render memo, so the shared helper's
+    /// scroll-memo invalidation is all that is needed.
+    fn set_scroll(&mut self, offset: usize) {
+        let ring_len = self.scrollback.len();
+        scrollview::set_scroll(
+            &mut self.scroll_offset,
+            &mut self.last_scroll_state,
+            ring_len,
+            offset,
+        );
+    }
+
+    /// Applies wheel ticks to the scroll offset (+ = up into history).
+    fn scroll_by(&mut self, ticks: i32) {
+        let ring_len = self.scrollback.len();
+        scrollview::scroll_by(
+            &mut self.scroll_offset,
+            &mut self.last_scroll_state,
+            ring_len,
+            ticks,
+        );
+    }
+
+    /// Processes one batch of stdin bytes on the frame path: intercepts the wheel
+    /// for the local scroll-view, returning `(to_daemon, repaint)` — the bytes to
+    /// forward to the daemon as `Tag::Input`, and any tty repaint to emit now.
+    ///
+    /// When not intercepting (the inner app set its own mouse mode, or is on the
+    /// alt screen) bytes pass straight through and no repaint is produced, so a
+    /// full-screen app receives raw wheel events. A wheel tick is a purely local
+    /// view change and is never forwarded; any keystroke while scrolled returns
+    /// the view to the live bottom and then forwards normally (FDR 0005).
+    fn handle_input(&mut self, buf: &[u8]) -> (Vec<u8>, Vec<u8>) {
+        let mut repaint = Vec::new();
+        let forward: Vec<u8> = if scrollview::wheel_active(&self.server_term) {
+            let app_cursor_keys = self.server_term.app_cursor_keys();
+            // The local client has no POSH_GRAB_MOUSE arrows mode: always scroll.
+            let out = self.mouse_filter.feed(buf, app_cursor_keys, true);
+            if out.wheel != 0 {
+                self.scroll_by(out.wheel);
+                repaint = self.compose_scroll();
+            }
+            out.bytes
+        } else {
+            // Not intercepting: hand back any partial held from when the wheel
+            // was last active (the app enabled its own mouse mode mid-sequence)
+            // so the app receives the complete sequence rather than a torn tail.
+            let pending = self.mouse_filter.take_pending();
+            if pending.is_empty() {
+                buf.to_vec()
+            } else {
+                let mut joined = pending;
+                joined.extend_from_slice(buf);
+                joined
+            }
+        };
+        // Any keystroke while scrolled returns to the live view, then forwards
+        // normally below — you are about to type at the prompt.
+        if !forward.is_empty() && self.scroll_offset > 0 {
+            self.set_scroll(0);
+            repaint = self.compose_live();
+        }
+        (forward, repaint)
     }
 }
 
@@ -466,7 +592,24 @@ fn client_loop(stream: UnixStream, enter: &[u8]) -> Result<i32> {
                 Ok(n) => {
                     let (forward, detached) = detach.feed(&buf[..n]);
                     if !forward.is_empty() {
-                        ipc::append_frame(&mut sock_write_buf, Tag::Input, &forward);
+                        // Frame path: when a FrameRenderer is live it intercepts
+                        // the wheel for the local scroll-view (bare prompt only)
+                        // and repaints the tty; the remaining bytes forward as
+                        // input. Gate-off (no renderer) forwards `forward`
+                        // verbatim — the raw wheel reaches the daemon exactly as
+                        // today, byte for byte.
+                        let to_daemon = if let Some(fr) = frame_renderer.as_mut() {
+                            let (fwd, repaint) = fr.handle_input(&forward);
+                            if !repaint.is_empty() {
+                                stdout_buf.extend_from_slice(&repaint);
+                            }
+                            fwd
+                        } else {
+                            forward
+                        };
+                        if !to_daemon.is_empty() {
+                            ipc::append_frame(&mut sock_write_buf, Tag::Input, &to_daemon);
+                        }
                     }
                     if detached {
                         ipc::append_frame(&mut sock_write_buf, Tag::Detach, b"");
@@ -896,5 +1039,120 @@ mod tests {
             renderer.scrollback.is_empty(),
             "a resize must clear the ring so the new width re-accumulates cleanly"
         );
+    }
+
+    // ---- Task 2.5b: the local scroll-view is scrollable (wheel + view) -------
+
+    /// Read a rendered outer terminal's rows as trimmed strings, for content
+    /// assertions on the scroll-view.
+    fn rows_text(term: &Terminal) -> Vec<String> {
+        let snap = Snapshot::from_term(term);
+        (0..term.rows())
+            .map(|r| {
+                (0..term.cols())
+                    .filter_map(|c| snap.cell(r, c))
+                    .map(|cell| if cell.ch == '\0' { ' ' } else { cell.ch })
+                    .collect::<String>()
+                    .trim_end()
+                    .to_string()
+            })
+            .collect()
+    }
+
+    /// The core Task 2.5b property: with a populated ring, a wheel-up scrolls the
+    /// local view into captured history (SCROLLBACK indicator + history rows),
+    /// forwarding nothing to the daemon; a subsequent keystroke returns to the
+    /// live screen and forwards the key. Driven end-to-end through the real input
+    /// path (`handle_input` fed synthetic SGR wheel bytes), with the rendered
+    /// escape stream replayed onto an outer terminal to check what the user sees.
+    #[test]
+    fn frame_renderer_scrolls_captured_history_and_returns_to_live() {
+        let (rows, cols) = (5u16, 20u16);
+        let mut producer = FrameProducer::new(rows, cols);
+        let mut renderer = FrameRenderer::new(rows, cols);
+        // The outer tty: a fresh model fed ONLY the client's rendered bytes.
+        let mut outer = Terminal::with_scrollback(rows, cols, 0);
+
+        // Visible keyframe: a bare prompt on the primary screen (wheel-active).
+        let mut daemon = Terminal::with_scrollback(rows, cols, 1000);
+        daemon.process(b"\x1b[2J\x1b[Hlive prompt line");
+        let f1 = daemon_frame(&mut producer, &daemon);
+        outer.process(&renderer.render_frame(&f1).expect("keyframe applies"));
+        assert_eq!(renderer.scroll_offset, 0, "starts at the live bottom");
+
+        // Ring up eight history rows via a scrollback frame (no repaint at
+        // offset 0).
+        let hist: Vec<Vec<u8>> = (0..8)
+            .map(|i| format!("history line {i}\r\n").into_bytes())
+            .collect();
+        let f2 = daemon_scrollback_frame(&mut producer, hist.clone());
+        let sb_bytes = renderer.render_frame(&f2).expect("scrollback applies");
+        assert!(sb_bytes.is_empty(), "ringing history while live paints nothing");
+        assert_eq!(renderer.scrollback.len(), 8);
+
+        // Wheel up two ticks (2 * WHEEL_STEP = 6 lines) → scroll into history.
+        let wheel_up = b"\x1b[<64;1;1M\x1b[<64;1;1M";
+        let (to_daemon, repaint) = renderer.handle_input(wheel_up);
+        assert!(to_daemon.is_empty(), "a wheel tick is a local view change, not input");
+        assert!(renderer.scroll_offset > 0, "the wheel scrolled the view up");
+        assert!(!repaint.is_empty(), "the scroll-view painted");
+        outer.process(&repaint);
+
+        let view = rows_text(&outer);
+        assert!(view[0].contains("SCROLLBACK"), "indicator on the top row: {view:?}");
+        assert!(
+            view.iter().any(|r| r.contains("history line")),
+            "captured history is visible in the scroll-view: {view:?}"
+        );
+        assert!(
+            !view.iter().any(|r| r.contains("live prompt line")),
+            "the live prompt is scrolled out of the frozen window: {view:?}"
+        );
+
+        // A keystroke returns to the live view and forwards to the daemon.
+        let (fwd, repaint) = renderer.handle_input(b"x");
+        assert_eq!(fwd, b"x", "the keystroke forwards to the daemon");
+        assert_eq!(renderer.scroll_offset, 0, "a keystroke returns to the live bottom");
+        outer.process(&repaint);
+        let live = rows_text(&outer);
+        assert!(live[0].contains("live prompt line"), "the live screen is restored: {live:?}");
+        assert!(
+            !live.iter().any(|r| r.contains("SCROLLBACK")),
+            "the scroll indicator is gone on return to live: {live:?}"
+        );
+    }
+
+    /// While an app has mouse mode on (or is on the alt screen) the wheel is NOT
+    /// intercepted: raw SGR wheel bytes pass straight through `handle_input` to
+    /// the daemon, so full-screen apps (vim/htop) get real wheel events.
+    #[test]
+    fn wheel_passes_through_when_app_holds_mouse_mode() {
+        let (rows, cols) = (5u16, 20u16);
+        let mut producer = FrameProducer::new(rows, cols);
+        let mut renderer = FrameRenderer::new(rows, cols);
+
+        // Keyframe where the inner app has enabled SGR mouse tracking.
+        let mut daemon = Terminal::with_scrollback(rows, cols, 1000);
+        daemon.process(b"\x1b[?1000h\x1b[?1006h");
+        let f1 = daemon_frame(&mut producer, &daemon);
+        renderer.render_frame(&f1).expect("keyframe applies");
+
+        let wheel = b"\x1b[<64;10;5M";
+        let (to_daemon, repaint) = renderer.handle_input(wheel);
+        assert_eq!(to_daemon, wheel, "raw wheel forwards unchanged to the app");
+        assert!(repaint.is_empty(), "no local scroll-view while the app owns the mouse");
+        assert_eq!(renderer.scroll_offset, 0, "the wheel did not scroll the local view");
+    }
+
+    /// Gate-off invariant: with `POSH_SESSION_FRAMES` off there is no
+    /// FrameRenderer, so the client_loop stdin path forwards `forward` verbatim.
+    /// The only stage between raw stdin and `Tag::Input` is the detach matcher,
+    /// which passes wheel SGR bytes through untouched — the daemon receives the
+    /// raw wheel exactly as before this task.
+    #[test]
+    fn gate_off_forwards_wheel_bytes_to_daemon_unchanged() {
+        let mut m = DetachMatcher::default();
+        let wheel = b"\x1b[<64;10;5M";
+        assert_eq!(m.feed(wheel), (wheel.to_vec(), false));
     }
 }

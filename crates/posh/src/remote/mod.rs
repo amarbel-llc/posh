@@ -40,6 +40,11 @@ pub mod palette;
 #[cfg(test)]
 mod perf_probe;
 pub mod predict;
+/// Shared scrollback scroll-view machinery (FDR 0005): the wheel-intercept
+/// `MouseFilter`, the scroll-offset math, and the frozen-history compose. Used
+/// by both this crate's roaming client (`remote::client`) and the local session
+/// frame client (`session::client`) so the two share one implementation.
+pub mod scrollview;
 pub mod server;
 pub mod sshwrap;
 pub mod stats;
