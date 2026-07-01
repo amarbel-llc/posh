@@ -7,7 +7,7 @@ use std::collections::VecDeque;
 use std::net::{SocketAddr, ToSocketAddrs};
 use std::time::Instant;
 
-use posh_term::{Color, Screen, Style, Terminal};
+use posh_term::Terminal;
 use serde_json::{json, Value};
 
 use crate::pty::{self, RawMode};
@@ -17,7 +17,7 @@ use crate::remote::datagram::{Connection, Family};
 use crate::remote::diag;
 use crate::remote::display::{self, NotificationEngine, Snapshot};
 use crate::remote::framesync::{self, ApplyOutcome, FrameApplier};
-use crate::remote::palette::{Palette, PaletteEvent};
+use crate::remote::palette::{composite_palette, Palette, PaletteEvent};
 use crate::remote::predict::{
     self, PredictionModel, PredictionRenderer, Predictor, RenderStyle,
 };
@@ -1707,72 +1707,6 @@ fn compose_frame(st: &mut ClientState, now: u64) -> Vec<u8> {
     bytes
 }
 
-/// Composite the open palette over the session snapshot: grey the session
-/// behind it, then paint the renderer's non-blank bounding box anchored a third
-/// of the way down, centered, and map the renderer's cursor into that box.
-fn composite_palette(next: &mut Snapshot, rterm: &Terminal, rows: u16, cols: u16) {
-    // Grey the session background: keep the glyphs, flatten the style.
-    let dim = Style {
-        fg: Color::Rgb(0x70, 0x70, 0x70),
-        dim: true,
-        ..Style::default()
-    };
-    for row in next.cells.iter_mut() {
-        for cell in row.iter_mut() {
-            cell.style = dim;
-        }
-    }
-
-    let screen = rterm.screen();
-    let Some((r0, c0, r1, c1)) = bbox(screen) else {
-        next.cursor_visible = false;
-        return;
-    };
-    let bh = r1 - r0 + 1;
-    let bw = c1 - c0 + 1;
-    // Anchor a third of the way down, but shift up so a panel taller than the
-    // remaining space doesn't clip off the bottom (#3: the longer command list
-    // pushed "Server debug logging" and below past the screen edge).
-    let dr = (rows / 3).min(rows.saturating_sub(bh));
-    let dc = cols.saturating_sub(bw) / 2;
-    for r in 0..bh {
-        for c in 0..bw {
-            if let (Some(src), Some(dst)) =
-                (screen.cell(r0 + r, c0 + c), next.cell_mut(dr + r, dc + c))
-            {
-                *dst = src.clone();
-            }
-        }
-    }
-
-    // Put the real cursor in the palette's input field (mapped from the
-    // renderer's cursor); hide it when that cursor falls outside the box.
-    let cur = rterm.cursor();
-    if cur.visible && cur.row >= r0 && cur.row <= r1 && cur.col >= c0 && cur.col <= c1 {
-        next.cursor_row = dr + (cur.row - r0);
-        next.cursor_col = dc + (cur.col - c0);
-        next.cursor_visible = true;
-    } else {
-        next.cursor_visible = false;
-    }
-}
-
-/// Non-blank bounding box of a screen: (top, left, bottom, right), or None.
-fn bbox(scr: &Screen) -> Option<(u16, u16, u16, u16)> {
-    let mut found: Option<(u16, u16, u16, u16)> = None;
-    for r in 0..scr.rows() {
-        for c in 0..scr.cols() {
-            if scr.cell(r, c).is_some_and(|cell| !cell.is_blank()) {
-                found = Some(match found {
-                    None => (r, c, r, c),
-                    Some((r0, c0, r1, c1)) => (r0.min(r), c0.min(c), r1.max(r), c1.max(c)),
-                });
-            }
-        }
-    }
-    found
-}
-
 /// Builds the scroll-view escape stream (FDR 0005) via the shared
 /// [`scrollview::compose_scroll_frame`], threading this client's fields: the
 /// scroll offset + memo, the accumulated ring, the server model, the tty size,
@@ -2709,47 +2643,6 @@ mod tests {
         assert_eq!(st.predict_model, PredictionModel::Optimistic);
         assert!(st.notify.message().contains("Optimistic"), "banner names the new model");
         assert!(!st.initialized, "swapping the predictor forces a clean repaint");
-    }
-
-    #[test]
-    fn composite_palette_keeps_a_tall_panel_on_screen() {
-        // #3: a panel nearly as tall as the screen must not have its bottom
-        // commands clipped off by the 1/3-down anchor. Renderer marks its top
-        // and near-bottom rows; both must survive compositing onto a short screen.
-        let rows = 16u16;
-        let mut snap = Snapshot::blank(rows, 80);
-        let mut rterm = Terminal::new(rows, 80);
-        rterm.process(b"TOPMARK");
-        rterm.process(b"\x1b[14;1HBOTMARK"); // row 14 (1-indexed) => screen row 13
-        composite_palette(&mut snap, &rterm, rows, 80);
-
-        let text: String = snap.cells.iter().flatten().map(|c| c.ch).collect();
-        assert!(text.contains("TOPMARK"), "top of the panel present");
-        assert!(
-            text.contains("BOTMARK"),
-            "bottom of the panel must stay on screen, not clip off the edge"
-        );
-    }
-
-    #[test]
-    fn composite_palette_dims_session_and_anchors_renderer() {
-        let mut snap = Snapshot::blank(24, 80);
-        snap.cell_mut(0, 0).unwrap().ch = 'X'; // a session glyph to check greying
-
-        let mut rterm = Terminal::new(24, 80);
-        rterm.process(b"HI"); // renderer screen: "HI" at row 0, cols 0-1
-
-        composite_palette(&mut snap, &rterm, 24, 80);
-
-        // Session is greyed (glyph kept, style flattened to dim).
-        let bg = snap.cell_mut(0, 0).unwrap();
-        assert_eq!(bg.ch, 'X');
-        assert!(bg.style.dim, "session cell is dimmed behind the palette");
-
-        // bbox("HI") = rows 0, cols 0..1 (bw=2); anchored at row 24/3=8,
-        // col (80-2)/2=39.
-        assert_eq!(snap.cells[8][39].ch, 'H');
-        assert_eq!(snap.cells[8][40].ch, 'I');
     }
 
     #[test]

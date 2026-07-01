@@ -36,6 +36,11 @@ pub mod framesync {
     pub use posh_proto::framesync::*;
 }
 pub mod hostmetrics;
+/// The command-palette overlay renderer subprocess driver (RFC 0005) and the
+/// `composite_palette` compositor. Shared by both this crate's roaming client
+/// (`remote::client`) and the local session frame client (`session::client`) so
+/// the palette hosts and overlays identically over a roaming and a local
+/// session (FDR 0011 Phase 2.3).
 pub mod palette;
 #[cfg(test)]
 mod perf_probe;
