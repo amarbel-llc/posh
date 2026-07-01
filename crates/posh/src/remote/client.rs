@@ -556,6 +556,11 @@ struct ClientState {
     /// False when the outer terminal state is unknown (startup, resize,
     /// Ctrl-L): the next frame repaints from scratch.
     initialized: bool,
+    /// The wheel intent of the last live render, so the shared renderer tears
+    /// the wheel-grab down (or re-arms it) on a want_wheel transition that is
+    /// not also a mouse_mode change — an app entering the alt-screen without a
+    /// mouse mode (github #106).
+    last_wheel: bool,
     predict: Box<dyn Predictor>,
     renderer: Box<dyn PredictionRenderer>,
     /// Cached prediction config so the model can be rebuilt live (Ctrl-^ e
@@ -697,6 +702,7 @@ fn client_loop(
         suppress_scrollback_once: false,
         last_drawn: Snapshot::blank(rows, cols),
         initialized: false,
+        last_wheel: false,
         predict,
         renderer,
         predict_model: model,
@@ -1684,8 +1690,16 @@ fn compose_frame(st: &mut ClientState, now: u64) -> Vec<u8> {
     st.notify.apply(&mut next, now);
 
     let wheel = wheel_active(st);
-    let bytes = display::new_frame_opt(st.initialized, &st.last_drawn, &next, wheel, st.scroll_opt);
+    let bytes = display::new_frame_opt(
+        st.initialized,
+        &st.last_drawn,
+        &next,
+        wheel,
+        st.last_wheel,
+        st.scroll_opt,
+    );
     st.initialized = true;
+    st.last_wheel = wheel;
     st.last_drawn = next;
     if let Some(t) = compose_timer {
         st.stats.record_compose_us(t.elapsed().as_micros() as u64);
@@ -2456,6 +2470,7 @@ mod tests {
             suppress_scrollback_once: false,
             last_drawn: Snapshot::blank(rows, cols),
             initialized: false,
+            last_wheel: false,
             predict: predict::build(PredictionModel::Never, RenderStyle::Replace, false).0,
             renderer: predict::build(PredictionModel::Never, RenderStyle::Replace, false).1,
             predict_model: PredictionModel::Never,

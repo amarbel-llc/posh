@@ -283,8 +283,15 @@ fn cell_width(cell: &Cell) -> u16 {
 /// the legacy wheel→arrow grab transform (posh#50) — instead of the outer
 /// terminal turning the wheel into arrows itself (which kitty does
 /// unconditionally on the alt screen). Off, the mode-sync is unchanged.
+///
+/// This 4-argument form assumes `wheel` is unchanged from the prior frame (no
+/// wheel-intent transition) — it suits callers that never toggle the wheel
+/// across frames: the morph codec, benchmarks, one-shot renders. Interactive
+/// clients that flip `wheel` as the app enters/leaves a mouse mode OR the
+/// alt-screen must call [`new_frame_opt`] with the prior frame's wheel, so the
+/// grab is torn down (and re-armed) on the transition (github #106).
 pub fn new_frame(initialized: bool, last: &Snapshot, f: &Snapshot, wheel: bool) -> Vec<u8> {
-    new_frame_opt(initialized, last, f, wheel, true)
+    new_frame_opt(initialized, last, f, wheel, wheel, true)
 }
 
 /// As [`new_frame`], with `allow_scroll` gating the scroll-shortcut
@@ -299,6 +306,7 @@ pub fn new_frame_opt(
     last: &Snapshot,
     f: &Snapshot,
     wheel: bool,
+    last_wheel: bool,
     allow_scroll: bool,
 ) -> Vec<u8> {
     let mut init = initialized;
@@ -504,11 +512,16 @@ pub fn new_frame_opt(
     // (scrollback scroll-view FDR 0005, or the legacy posh#50 grab transform),
     // put the outer terminal into SGR mouse reporting instead of mouse-off, so
     // wheel ticks come back as events the client consumes rather than the
-    // terminal doing its own wheel→arrow. `wheel` is constant within a frame, so
-    // a change is always also a mouse_mode change (None<->Some) — the existing
-    // condition already catches it; no separate last-state term is needed.
+    // terminal doing its own wheel→arrow. The desired reporting state is a
+    // function of BOTH mouse_mode and the wheel intent, and the two move
+    // independently: an app that enters the alt-screen without setting any
+    // mouse mode (plain `less`) flips `wheel` false while mouse_mode stays 0
+    // (github #106). Fire on a change to EITHER a mouse_mode change or a
+    // want_wheel transition — otherwise the grab's ?1000h leaks into the app,
+    // and in reverse is never re-armed on the return to the bare prompt.
     let want_wheel = f.mouse_mode == 0 && wheel;
-    if !init || f.mouse_mode != last.mouse_mode {
+    let last_want_wheel = last.mouse_mode == 0 && last_wheel;
+    if !init || f.mouse_mode != last.mouse_mode || want_wheel != last_want_wheel {
         if f.mouse_mode == 0 {
             if want_wheel {
                 // Clear any higher tracking mode the app left set (1003/1002/9
@@ -549,8 +562,13 @@ pub fn new_frame_opt(
         });
     }
 
-    // Mouse encoding.
-    if !init || f.mouse_encoding != last.mouse_encoding {
+    // Mouse encoding. Fire on a want_wheel transition too, mirroring the mouse-
+    // mode block: the wheel-grab sets SGR (?1006h) with mouse_encoding still 0,
+    // so tearing the grab down (want_wheel true->false) never bumps
+    // mouse_encoding — without the transition term the X10 reset below is
+    // unreachable and the outer terminal is left in SGR, misparsing a later
+    // X10-tracking app's reports (github #106).
+    if !init || f.mouse_encoding != last.mouse_encoding || want_wheel != last_want_wheel {
         if f.mouse_encoding == 0 {
             // Under the wheel-grab, the mouse-mode block above asserted SGR
             // (?1006h) — and the encoding block must then touch NOTHING:
@@ -558,7 +576,8 @@ pub fn new_frame_opt(
             // terminals (posh-term's own csi.rs models the same), so
             // resetting even the "unused" 1005/1016 knocks the register
             // back to X10 and the grabbed wheel arrives X10-encoded,
-            // bypassing the client's SGR translation entirely.
+            // bypassing the client's SGR translation entirely. On teardown
+            // (!want_wheel) the reset IS wanted, restoring X10 for the app.
             if !want_wheel {
                 frame.append("\x1b[?1016l\x1b[?1006l\x1b[?1005l");
             }
@@ -1005,8 +1024,8 @@ mod tests {
         let prev_s = Snapshot::from_term(&prev);
         let next_s = Snapshot::from_term(&next_t);
 
-        let on = new_frame_opt(true, &prev_s, &next_s, false, true);
-        let off = new_frame_opt(true, &prev_s, &next_s, false, false);
+        let on = new_frame_opt(true, &prev_s, &next_s, false, false, true);
+        let off = new_frame_opt(true, &prev_s, &next_s, false, false, false);
         assert_ne!(on, off, "the scroll-opt flag must change the emitted stream");
 
         let mut v = term_with(6, 20, seed);
@@ -1403,6 +1422,59 @@ mod tests {
         let p = String::from_utf8_lossy(&plain);
         assert!(p.contains("\x1b[?1000l"), "no grab: mouse stays off: {p:?}");
         assert!(!p.contains("\x1b[?1000h"), "no grab: never enables 1000: {p:?}");
+    }
+
+    #[test]
+    fn wheel_grab_torn_down_and_rearmed_on_a_want_wheel_transition() {
+        // github #106: `wheel` and `mouse_mode` move independently. An app that
+        // enters the alt-screen without setting any mouse mode (plain `less`)
+        // flips the client's wheel intent false while mouse_mode stays 0. The
+        // old guard fired only on a mouse_mode change, so ?1000l was never sent
+        // and the grab's reporting leaked into the app; the reverse (returning
+        // to the bare prompt) never re-armed it. new_frame_opt now fires on the
+        // want_wheel transition too. Same snapshot both sides isolates the
+        // wheel-intent flip as the *only* thing that changed.
+        let bare = term_with(3, 20, b"");
+        let snap = Snapshot::from_term(&bare);
+        assert_eq!(snap.mouse_mode, 0, "bare prompt: no app mouse mode");
+
+        // wheel true -> false, mouse_mode unchanged (0): teardown must fire —
+        // BOTH the reporting mode (?1000l) AND the SGR encoding (?1006l). The
+        // encoding reset is the #106 gap: the grab left the outer terminal in
+        // SGR, and without resetting it a later X10-tracking app misparses.
+        let torn = new_frame_opt(true, &snap, &snap, false, true, true);
+        let t = String::from_utf8_lossy(&torn);
+        assert!(
+            t.contains("\x1b[?1000l"),
+            "losing the wheel with mouse_mode still 0 must tear the grab down: {t:?}"
+        );
+        assert!(
+            t.contains("\x1b[?1006l"),
+            "teardown must restore X10 encoding so a later app is not stuck in SGR: {t:?}"
+        );
+
+        // wheel false -> true, mouse_mode unchanged (0): grab must re-arm, and
+        // must NOT reset the encoding register (that would knock SGR back to X10
+        // and the grabbed wheel would arrive X10-encoded, bypassing the filter).
+        let rearmed = new_frame_opt(true, &snap, &snap, true, false, true);
+        let r = String::from_utf8_lossy(&rearmed);
+        assert!(
+            r.contains("\x1b[?1000h") && r.contains("\x1b[?1006h"),
+            "regaining the wheel must re-assert Normal+SGR reporting: {r:?}"
+        );
+        assert!(
+            !r.contains("\x1b[?1006l"),
+            "re-arming must not reset the SGR encoding it just asserted: {r:?}"
+        );
+
+        // wheel steady (no transition, no mode change): nothing about mouse
+        // reporting churns — the guard must not fire spuriously every frame.
+        let steady = new_frame_opt(true, &snap, &snap, true, true, true);
+        assert!(
+            steady.is_empty(),
+            "a steady wheel-grabbed frame emits no mouse-reporting churn: {:?}",
+            String::from_utf8_lossy(&steady)
+        );
     }
 
     #[test]

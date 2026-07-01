@@ -128,13 +128,12 @@ pub(crate) fn compose_scroll_frame(
     let mut snap = Snapshot::from_term(&term);
     snap.cursor_visible = false; // no live cursor in history
     display::apply_scroll_indicator(&mut snap, offset);
-    let bytes = display::new_frame_opt(
-        *initialized,
-        last_drawn,
-        &snap,
-        wheel_active(server_term),
-        scroll_opt,
-    );
+    // `last_wheel` is passed equal to the current wheel intent (self-referential
+    // = "no transition"): reporting must stay on across a history scroll even if
+    // the live model goes alt-screen underneath, so the grab teardown is left to
+    // the scroll->live return through the live compose path (github #106).
+    let wheel = wheel_active(server_term);
+    let bytes = display::new_frame_opt(*initialized, last_drawn, &snap, wheel, wheel, scroll_opt);
     *initialized = true;
     *last_drawn = snap;
     bytes

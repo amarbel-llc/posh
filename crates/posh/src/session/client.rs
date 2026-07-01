@@ -234,6 +234,11 @@ struct FrameRenderer {
     /// `Tag::Output` be overwritten by the first `Full` keyframe, and a `Diff`
     /// land cleanly after a SIGCONT re-enter.
     initialized: bool,
+    /// The wheel intent of the last live compose, so the shared renderer can
+    /// tear the wheel-grab down (or re-arm it) on a want_wheel transition that
+    /// isn't also a mouse_mode change — e.g. an app entering the alt-screen
+    /// without a mouse mode (github #106).
+    last_wheel: bool,
     rows: u16,
     cols: u16,
 }
@@ -258,6 +263,7 @@ impl FrameRenderer {
             mouse_filter: scrollview::MouseFilter::default(),
             last_drawn: Snapshot::blank(rows, cols),
             initialized: false,
+            last_wheel: false,
             rows,
             cols,
         }
@@ -379,8 +385,16 @@ impl FrameRenderer {
     fn compose_live(&mut self) -> Vec<u8> {
         let next = Snapshot::from_term(&self.server_term);
         let wheel = scrollview::wheel_active(&self.server_term);
-        let bytes = display::new_frame_opt(self.initialized, &self.last_drawn, &next, wheel, true);
+        let bytes = display::new_frame_opt(
+            self.initialized,
+            &self.last_drawn,
+            &next,
+            wheel,
+            self.last_wheel,
+            true,
+        );
         self.last_drawn = next;
+        self.last_wheel = wheel;
         self.initialized = true;
         bytes
     }
