@@ -10,6 +10,7 @@ use crate::castx::{EventCode, Reader};
 use crate::golden::{self, GoldenKind};
 use crate::player::{Granularity, Player};
 use crate::Replay;
+use posh_proto::display::{new_frame, Snapshot};
 use std::io::Write;
 
 /// How `replay --dump` renders the final screen.
@@ -38,6 +39,7 @@ const USAGE: &str = "\
 usage:
   poshterity replay <file> [--to-marker NAME] [--dump text|vt|flat]
   poshterity replay <file> --raw [--size COLSxROWS] [--dump text|vt|flat]
+  poshterity render <file> --raw [--size COLSxROWS] [--bytes N]
   poshterity step <file> (--by byte|escape|write|change|frame|marker [--n N]
                         | --to-marker NAME) [--frame-gap SECS] [--dump ...]
   poshterity bless <file> --golden <path> [--at MARKER] [--kind grid|vt|flat]
@@ -54,7 +56,14 @@ With --raw, <file> is a bare terminal-output byte stream (no .castx header) —
 e.g. a script(1) capture of a posh client's STDOUT. A raw stream carries no
 dimensions, so pass --size COLSxROWS (default 80x24); EL/erase clear to that
 width, so the size must match the captured terminal. --dump vt re-serializes
-SGR so background runs are visible.";
+SGR so background runs are visible.
+
+`render` is the server→client round trip (github #100): it feeds <file> through
+a server posh-term, then emits the CLIENT tty bytes new_frame would send for the
+resulting screen (a full repaint) to stdout. Cat that into a real terminal to
+see what the roaming client actually paints — the emulator agrees with the
+model, so this is how a model-level artifact (e.g. a BCE-on-scroll background)
+becomes visible in kitty. --raw and --size behave as for replay.";
 
 /// Run the poshterity CLI over `args` — the arguments after the program name
 /// (for the `poshterity` bin) or after the `rec` subcommand (for `posh rec`).
@@ -62,6 +71,7 @@ SGR so background runs are visible.";
 pub fn run(args: &[String]) -> Result<(), String> {
     match args.first().map(String::as_str) {
         Some("replay") => run_replay(&args[1..]),
+        Some("render") => run_render(&args[1..]),
         Some("step") => run_step(&args[1..]),
         Some("bless") => run_bless(&args[1..]),
         Some("assert") => run_assert(&args[1..]),
@@ -169,6 +179,72 @@ fn run_replay(args: &[String]) -> Result<(), String> {
     };
     std::io::stdout()
         .write_all(&out)
+        .map_err(|e| format!("write: {e}"))
+}
+
+/// `render`: feed a raw byte stream through a server posh-term and emit the
+/// CLIENT tty bytes `new_frame` would send for the resulting screen (a full
+/// repaint), so a model-level artifact becomes visible in a real terminal
+/// (github #100). Only `--raw` is supported today (a .castx would need its
+/// own frame cadence).
+fn run_render(args: &[String]) -> Result<(), String> {
+    let mut file: Option<&str> = None;
+    let mut size: Option<(u16, u16)> = None;
+    let mut raw = false;
+    let mut max_bytes: Option<usize> = None;
+    let mut i = 0;
+    while i < args.len() {
+        match args[i].as_str() {
+            "--raw" => {
+                raw = true;
+                i += 1;
+            }
+            "--size" => {
+                let v = args.get(i + 1).ok_or("--size requires COLSxROWS")?;
+                size = Some(parse_resize(v).ok_or("--size expects COLSxROWS, e.g. 120x40")?);
+                i += 2;
+            }
+            "--bytes" => {
+                max_bytes = Some(
+                    args.get(i + 1)
+                        .ok_or("--bytes requires a count")?
+                        .parse()
+                        .map_err(|_| "--bytes expects a non-negative integer")?,
+                );
+                i += 2;
+            }
+            flag if flag.starts_with('-') => {
+                return Err(format!("unknown flag {flag:?}\n\n{USAGE}"));
+            }
+            positional => {
+                if file.is_some() {
+                    return Err(format!("unexpected extra argument {positional:?}"));
+                }
+                file = Some(positional);
+                i += 1;
+            }
+        }
+    }
+    if !raw {
+        return Err("render requires --raw (a headerless byte stream)".into());
+    }
+    let path = file.ok_or_else(|| format!("render requires a <file>\n\n{USAGE}"))?;
+    let mut bytes = std::fs::read(path).map_err(|e| format!("{path}: {e}"))?;
+    if let Some(n) = max_bytes {
+        bytes.truncate(n);
+    }
+    let (cols, rows) = size.unwrap_or((80, 24));
+    let mut replay = Replay::new(rows, cols);
+    replay.feed(&bytes);
+    // The client's mirror converges to the server screen, so its tty output is
+    // new_frame() of the server snapshot. `initialized = false` forces a full
+    // repaint from a blank outer terminal (clear + paint), which is what a fresh
+    // `cat` into a terminal wants.
+    let snapshot = Snapshot::from_term(replay.terminal());
+    let blank = Snapshot::blank(rows, cols);
+    let client = new_frame(false, &blank, &snapshot, false);
+    std::io::stdout()
+        .write_all(&client)
         .map_err(|e| format!("write: {e}"))
 }
 

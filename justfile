@@ -930,3 +930,83 @@ debug-posh-pathloss peer count="20":
     echo
     echo "== tailscale netcheck (NAT / firewall / port-mapping posture) =="
     timeout 25 tailscale netcheck || true
+
+# posh#100 background-bleed: the BCE-on-scroll test. posh-term fills scrolled-in
+# lines with the active pen's background (scroll_up_n -> blank_style, terminal.rs),
+# but kitty does NOT background-color-erase that scroll — so the SAME bytes render
+# clean in pure kitty but leave a stuck steel-blue line after a round-trip through
+# posh (posh-term models the BCE, new_frame paints it into the client). Two cases,
+# NO forced resize (natural width, so no wrap confound):
+#   E1  scroll a DECSTBM region with the bg pen STILL ACTIVE  -> BCE fills the new
+#       bottom line with steel-blue in posh-term's model
+#   E2  identical, but reset the pen (ESC[0m) BEFORE the scroll -> default pen, no
+#       spurious bg (the control)
+# Prediction: pure kitty shows BOTH clean; through posh, E1's scrolled-in line
+# (row 9) is steel-blue and E2's (row 19) is not. That difference IS #100.
+# Cat .tmp/bleedscroll.raw once in a raw kitty and once inside posh; report each.
+[group("debug")]
+debug-posh-bleed-scroll:
+    #!/usr/bin/env bash
+    set -euo pipefail
+    mkdir -p .tmp
+    out=.tmp/bleedscroll.raw
+    E=$'\033'
+    BG="${E}[0;48;2;38;79;120m"
+    R="${E}[0m"
+    {
+      printf '%s[2J' "$E"
+      printf '%s[2;1H%sE1: DECSTBM region rows 5-9, scroll with the bg pen ACTIVE (BCE).' "$E" "$R"
+      printf '%s[3;1H%s    After the scroll, row 9 should be BLANK. Steel-blue there = #100.' "$E" "$R"
+      printf '%s[5;9r' "$E"                                              # region rows 5-9
+      printf '%s[9;1H%s  E1 bottom-margin fill (scrolls up)  \r\n%s%s[r' "$E" "$BG" "$R" "$E"
+      printf '%s[12;1H%sE2 (control): same, but ESC[0m BEFORE the scroll (default pen).' "$E" "$R"
+      printf '%s[13;1H%s    Row 19 should be BLANK in every terminal.' "$E" "$R"
+      printf '%s[15;19r' "$E"                                            # region rows 15-19
+      printf '%s[19;1H%s  E2 bottom-margin fill (scrolls up)  %s\r\n%s[r' "$E" "$BG" "$R" "$E"
+      printf '%s[22;1H%sE1=row9 (expect bleed via posh only)   E2=row19 (expect always clean)' "$E" "$R"
+      printf '%s[24;1H' "$E"
+    } > "$out"
+    echo "wrote $out ($(wc -c < "$out") bytes) at the terminal's natural size (no resize)"
+    echo "test A (pure kitty): cat $out ; sleep 20 ; reset   -> expect BOTH rows 9 and 19 clean"
+    echo "test B (inside posh): cat $out ; sleep 20 ; reset   -> expect row 9 steel-blue, row 19 clean"
+
+# posh#100 background-bleed: report a terminal's `bce` (background-color-erase)
+# terminfo capability — the crux of the bug. kitty deliberately omits bce; the
+# xterm lineage has it. mosh's renderer gates its erase optimization on the
+# CLIENT's bce (Display::can_use_erase = has_bce || default-pen); posh-term's
+# model BCEs unconditionally. Read-only. Usage: just debug-term-bce xterm-kitty
+[group("debug")]
+debug-term-bce term:
+    #!/usr/bin/env bash
+    set -euo pipefail
+    if ! command -v infocmp >/dev/null 2>&1; then
+      echo "infocmp not on PATH" >&2; exit 1
+    fi
+    if ! infocmp -1 '{{ term }}' >/dev/null 2>&1; then
+      echo "{{ term }}: not in the terminfo DB"; exit 0
+    fi
+    if infocmp -1 '{{ term }}' | grep -qE '^\s*bce,'; then
+      echo "{{ term }}: bce = YES (BCE — scroll/erase keep the pen background)"
+    else
+      echo "{{ term }}: bce = no (non-BCE — scroll/erase fall back to default background)"
+    fi
+
+# posh#100: render the BCE-on-scroll synthetic through the server->client round
+# trip (poshterity render) into the exact CLIENT tty bytes a roaming posh client
+# would paint — so #100 reproduces in a PURE kitty with NO live posh session, and
+# (post-fix) this same file must render clean. Writes .tmp/bleedscroll-client.raw.
+# SIZE is the client width (default 80x24). Rebuild-free: uses debug cargo.
+[group("debug")]
+debug-posh-bleed-render size="80x24":
+    #!/usr/bin/env bash
+    set -euo pipefail
+    raw="$PWD/.tmp/bleedscroll.raw"
+    [ -f "$raw" ] || { echo "missing $raw — run: just debug-posh-bleed-scroll" >&2; exit 1; }
+    out="$PWD/.tmp/bleedscroll-client.raw"
+    nix develop --command cargo run -q -p poshterity -- \
+      render --raw "$raw" --size '{{ size }}' > "$out"
+    echo "wrote $out ($(wc -c < "$out") bytes) — the CLIENT tty bytes for bleedscroll.raw"
+    echo
+    echo "cat it into a PURE kitty (NO posh):  cat $out ; sleep 20 ; reset"
+    echo "row 9 (E1): steel-blue = the #100 bleed (pre-fix); CLEAN = fixed (ADR 0005)."
+    echo "row 8 stays steel-blue either way — the fill text that scrolled up (legit)."

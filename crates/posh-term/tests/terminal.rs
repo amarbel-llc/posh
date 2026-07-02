@@ -248,6 +248,28 @@ fn bce_erase_uses_background() {
 }
 
 #[test]
+fn scroll_does_not_bce_the_new_line() {
+    // posh#100: unlike an in-place erase (bce_erase_uses_background), a SCROLL
+    // must leave the newly-exposed line at the DEFAULT background even when a
+    // non-default bg pen is active. The terminals posh renders into (kitty) do
+    // not background-color-erase a scroll, so carrying the pen bg onto the
+    // scrolled-in line paints a stuck colored line on the remote client. posh-
+    // term targets kitty-parity, so its model must not BCE the scroll either
+    // (ADR 0005; the dual of the #42 background-drop check).
+    let mut t = term();
+    feed(&mut t, "top\r\nA\r\nB\r\nC\r\nbottom");
+    // Region rows 2..4, cursor at the bottom margin, a red bg pen, then LF to
+    // scroll the region up by one.
+    feed(&mut t, "\x1b[2;4r\x1b[4;1H\x1b[41m\n");
+    // Row 3 (0-based) is the scrolled-in line; its cells must be default bg.
+    assert_eq!(
+        t.screen().cell(3, 0).unwrap().style.bg,
+        Color::Default,
+        "scrolled-in line must not carry the pen bg (#100 BCE-on-scroll)"
+    );
+}
+
+#[test]
 fn ich_dch_ech() {
     let mut t = term();
     feed(&mut t, "abcdef\x1b[1;2H\x1b[2@");
