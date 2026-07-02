@@ -227,6 +227,15 @@ _POSH_GRAB_MOUSE_
 	the outer terminal's click-to-select while active; apps that grab
 	the mouse themselves are unaffected.
 
+_POSH_RELAY_
+	Remote *host:session* bootstrap selection (default on): the
+	single-model frame relay, in which *posh-server* forwards the session
+	daemon's frames directly instead of running an inner *posh attach* in a
+	second terminal (RFC 0008). _0_ forces the legacy inner-attach
+	bootstrap. A relay bootstrap also auto-falls-back to the legacy path
+	against a daemon that does not emit frames, so both interoperate with
+	no flag day.
+
 _POSH_NO_TERM_INIT_
 	Set by *--no-init*; suppresses the alternate-screen takeover.
 

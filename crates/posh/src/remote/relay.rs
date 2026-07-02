@@ -48,21 +48,32 @@
 //! `agent/sock`. (An already-running session's shell keeps the `SSH_AUTH_SOCK` it
 //! was born with — the #103 limitation, out of scope for FDR 0011.)
 //!
-//! The `cmd_server` relay verb + bootstrap is 3.3.
+//! # Bootstrap + rollback (Task 3.3)
 //!
-//! Task 3.3 wires `cmd_server`'s `relay` verb as the non-test caller of [`run`];
-//! until then the surface here has only the inline-test caller (mirroring
-//! `session::ipc::encode_frame_ack`), hence the module-level `dead_code` allow.
+//! [`run`] is reached from `main::cmd_server_relay` (the `posh-server new … relay`
+//! verb). Before entering the steady loop it reads the daemon's FIRST content
+//! record: a frames-on daemon replies `Tag::Frame` (steady single-model relay); a
+//! frames-off / pre-frames daemon replies `Tag::Output`, and the relay tears down
+//! its frame path and runs the LEGACY [`crate::remote::server::server_loop`] with
+//! an inner `posh attach` PTY ([`fallback_to_server`]), reusing the already-peered
+//! `conn`. That fallback is the ONE place the single-model invariant yields (it
+//! legitimately constructs the second `posh_term::Terminal`); the happy path stays
+//! `Terminal`-free. The client-side `POSH_RELAY=0` lever (in `main`) is the other
+//! rollback: it never emits a relay bootstrap at all.
+//!
+//! Some helpers here are still exercised only from `#[cfg(test)]`, hence the
+//! module-level `dead_code` allow.
 #![allow(dead_code)]
 
 use std::io::Write;
 use std::os::fd::AsRawFd;
 use std::os::unix::net::UnixStream;
 
+use crate::pty;
 use crate::remote::agent::AgentEndpoint;
 use crate::remote::caps::{self, Cap};
 use crate::remote::datagram::{Connection, SEND_INTERVAL_MIN};
-use crate::remote::server::send_payload;
+use crate::remote::server::{send_payload, server_loop};
 use crate::remote::sync::{
     self, AgentStream, ClientMessage, FragmentAssembly, Fragmenter, FrameBody, InputInbox,
     ServerFrame, FLAG_SHUTDOWN,
@@ -247,7 +258,9 @@ pub(crate) fn run(
     // 2. Connect to / create the session and Init as a LOSSY, frame-capable
     //    client (mirror session/client.rs: cap-extended Init + a Tag::Resize
     //    re-assert, since a strict daemon drops a non-4-byte Init's size).
-    let stream = session::connect_or_create(cfg, name, command)?;
+    //    `command` is cloned in so a legacy fallback (below) can rebuild the
+    //    inner `posh attach` argv.
+    let stream = session::connect_or_create(cfg, name, command.clone())?;
     stream.set_nonblocking(true)?;
     let mut link = DaemonLink {
         stream,
@@ -267,7 +280,188 @@ pub(crate) fn run(
         &ipc::encode_resize(rows, cols),
     );
 
-    relay_loop(conn, link, (rows, cols), agent)
+    // 3. Path selection (RFC 0008 §3 rollback): the daemon's FIRST content record
+    //    decides. `Tag::Frame` ⇒ a frames-on daemon; stay in the single-model
+    //    relay (forward that frame, then loop). `Tag::Output` ⇒ a frames-off /
+    //    pre-frames daemon; the frame path can't apply, so DROP this daemon link
+    //    (the daemon sheds the dead frame-client) and run the legacy inner-PTY
+    //    server against a FRESH `posh attach` client of the same daemon, reusing
+    //    the already-peered `conn`. No flag day — either daemon works.
+    match first_daemon_record(&mut link, &mut conn)? {
+        FirstRecord::Frame(frame) => relay_loop(conn, link, (rows, cols), agent, Some(frame)),
+        FirstRecord::Output => {
+            drop(link); // shed the dead frame-client before the fresh attach
+            fallback_to_server(conn, cfg, name, command, agent, rows, cols)
+        }
+        FirstRecord::Closed => Ok(()), // daemon vanished before any content
+    }
+}
+
+/// The daemon's first content record, which selects the relay's path (RFC 0008
+/// §3): a frames-on daemon replies [`FirstRecord::Frame`]; a frames-off /
+/// pre-frames daemon replies [`FirstRecord::Output`] (the legacy-fallback
+/// trigger); a daemon that closes first is [`FirstRecord::Closed`].
+enum FirstRecord {
+    Frame(ServerFrame),
+    Output,
+    Closed,
+}
+
+/// Flush the queued Init+Resize to the daemon, then block (polling) until its
+/// first content record arrives and classify it (RFC 0008 §3), all while keeping
+/// the UDP client alive with heartbeats. `Tag::Frame` ⇒ steady relay; `Tag::Output`
+/// ⇒ legacy fallback; `Tag::Exit` or a closed socket ⇒ `Closed`. Non-content
+/// records (none expected before the first frame/output) are skipped.
+///
+/// The daemon greets a new frame-capable client with an attach replay only when
+/// the session has produced output (`daemon.rs`: `needs_replay = has_pty_output`);
+/// on a frames-off daemon that replay is a `Tag::Output`, and every later PTY
+/// chunk broadcasts as `Tag::Output` too — so a real interactive session (which
+/// prompts at once) classifies immediately. But a session whose create-command
+/// prints NOTHING yet (`sleep 30`, a headless worker that computes before
+/// printing, a slow rc chain) yields no daemon record for a while, so this can
+/// block for seconds.
+///
+/// During that wait the UDP client must keep HEARING the server, or its 15 s
+/// `POSH_CONNECT_TMOUT` (`remote/client.rs`) fires and it ABORTS a perfectly good
+/// connection to a quiet session. So this drives the same client servicing the
+/// steady `relay_loop` does: an Empty heartbeat (frame_num 0) paced at
+/// `HEARTBEAT_INTERVAL`, plus a recv-drain of the client's datagrams so the socket
+/// buffer can't overflow on a long wait and `conn` learns a roamed peer address
+/// (the payloads are discarded: no input is forwarded pre-session, and the client
+/// retransmits its cumulative outbox once `relay_loop` runs).
+///
+/// The Empty heartbeat flips the client's `heard`/`last_heard` WITHOUT advancing
+/// its `applied_num` (`FrameBody::Empty` never applies), so the first real frame
+/// still applies over it — a `FrameProducer` numbers its first visible frame one,
+/// above the client's initial zero — and a fallback's `server_loop`, which
+/// likewise starts numbering at one, is unaffected. The heartbeats ride a throwaway
+/// `Fragmenter` whose ids restart from `relay_loop`'s fresh one, which is harmless:
+/// `FragmentAssembly` switches to any incoming id (no back-rejection, no
+/// completed-id dedup) and single-fragment Empty frames leave no partial state.
+fn first_daemon_record(link: &mut DaemonLink, conn: &mut Connection) -> Result<FirstRecord> {
+    // The daemon will not send anything until it has our Init+Resize.
+    if !link.write.is_empty() {
+        util::write_all_retry(link.stream.as_raw_fd(), &link.write, 5000)?;
+        link.write.clear();
+    }
+    // Heartbeat machinery for the wait (a throwaway fragmenter/inbox: no client
+    // input is accepted here, so the ack offset stays 0). `last_hb = None` fires the
+    // first heartbeat on the first iteration, before any poll, so the client hears
+    // the server within milliseconds of connect. (A `0` sentinel would NOT work:
+    // `now_ms()` is monotonic from a recent base, not epoch ms, so early in the
+    // process `now - 0` is a small number below HEARTBEAT_INTERVAL — the first
+    // heartbeat would then wait until the clock crossed 3 s.)
+    let mut hb_fragmenter = Fragmenter::new();
+    let idle_inbox = InputInbox::new();
+    let mut last_hb: Option<u64> = None;
+    loop {
+        // Drain any records already buffered from a prior read.
+        loop {
+            match link.read.next() {
+                Ok(Some(frame)) => match frame.tag {
+                    Tag::Frame => {
+                        return Ok(FirstRecord::Frame(ServerFrame::decode(&frame.payload)?));
+                    }
+                    Tag::Output => return Ok(FirstRecord::Output),
+                    Tag::Exit => return Ok(FirstRecord::Closed),
+                    _ => {} // skip Ack/Info/etc.; keep waiting for content
+                },
+                Ok(None) => break,
+                Err(e) => return Err(e),
+            }
+        }
+        // Keep the client hearing from us (RFC 0008 §3): an Empty heartbeat paced at
+        // HEARTBEAT_INTERVAL, so a slow/quiet session doesn't trip the client's 15 s
+        // connect timeout. Gated on a reachable peer (pinned in `wait_for_handshake`).
+        let now = util::now_ms();
+        let due = last_hb.is_none_or(|t| now.saturating_sub(t) >= sync::HEARTBEAT_INTERVAL);
+        if conn.has_remote() && due {
+            send_empty(conn, &mut hb_fragmenter, &idle_inbox, 0, &[]);
+            last_hb = Some(now);
+        }
+        // Wake in time for the next heartbeat even with no fd activity.
+        let since_hb = last_hb.map_or(0, |t| now.saturating_sub(t));
+        let hb_wait = sync::HEARTBEAT_INTERVAL.saturating_sub(since_hb);
+        let mut fds = [
+            util::pollfd(link.stream.as_raw_fd(), libc::POLLIN),
+            util::pollfd(conn.raw_fd(), libc::POLLIN),
+        ];
+        match util::poll(&mut fds, hb_wait.min(1000) as i32) {
+            Ok(_) => {}
+            Err(e) if e.kind() == std::io::ErrorKind::Interrupted => continue,
+            Err(e) => return Err(e.into()),
+        }
+        // Drain client datagrams: `conn.recv()` authenticates each and updates the
+        // peer address (roam); the payloads are discarded (see the doc comment).
+        if fds[1].revents & libc::POLLIN != 0 {
+            while let Ok(Some(_)) = conn.recv() {}
+        }
+        match link.read.read_from(link.stream.as_raw_fd()) {
+            Ok(0) => return Ok(FirstRecord::Closed), // daemon closed the socket
+            Ok(_) => {}
+            Err(e) if e.kind() == std::io::ErrorKind::WouldBlock => {}
+            Err(e)
+                if e.kind() == std::io::ErrorKind::ConnectionReset
+                    || e.kind() == std::io::ErrorKind::BrokenPipe =>
+            {
+                return Ok(FirstRecord::Closed);
+            }
+            Err(e) => return Err(e.into()),
+        }
+    }
+}
+
+/// Legacy fallback (RFC 0008 §3 rollback): the daemon streamed `Tag::Output` (a
+/// frames-off or pre-frames daemon), so the single-model frame path cannot apply.
+/// Run the LEGACY inner-PTY server ([`server_loop`]) with a FRESH
+/// `posh [-g GROUP] attach SESSION [command...]` client of the SAME daemon,
+/// reusing the already-peered UDP `conn`. This is the one place that legitimately
+/// constructs the second `posh_term::Terminal` the relay's happy path forbids —
+/// the single-model invariant yields here so frames-on and frames-off daemons both
+/// work with no flag day. The bytes read off the relay's own (now-dropped) daemon
+/// link are discarded: the inner `posh attach` is an independent client and
+/// re-establishes from its own replay.
+#[allow(clippy::too_many_arguments)]
+fn fallback_to_server(
+    conn: Connection,
+    cfg: &Config,
+    name: &str,
+    command: Option<Vec<String>>,
+    agent: Option<AgentEndpoint>,
+    rows: u16,
+    cols: u16,
+) -> Result<()> {
+    // Inner client argv: attach to the session (already created by
+    // connect_or_create). `-g` is omitted for the default group, matching
+    // main::effective_remote_group / remote_session_argv.
+    let mut inner: Vec<String> = vec!["posh".into()];
+    if cfg.group != "default" {
+        inner.push("-g".into());
+        inner.push(cfg.group.clone());
+    }
+    inner.push("attach".into());
+    inner.push(name.to_string());
+    if let Some(cmd) = &command {
+        inner.extend(cmd.iter().cloned());
+    }
+
+    // Mirror server::run: a resolved TERM/COLORTERM for the shell, plus
+    // SSH_AUTH_SOCK when agent forwarding stood up an endpoint. (`run` also seeded
+    // SSH_AUTH_SOCK into this process's env before connect_or_create, so a session
+    // created here already inherited it; server_loop owns the endpoint and bridges
+    // its bytes to the UDP client exactly as the legacy path does.)
+    let mut shell_env = crate::terminfo::session_env();
+    if let Some(ep) = &agent {
+        shell_env.push((
+            "SSH_AUTH_SOCK".to_string(),
+            ep.sock_path().to_string_lossy().into_owned(),
+        ));
+    }
+    let child = pty::spawn_shell(Some(&inner), rows, cols, &shell_env, None)?;
+    util::set_nonblocking(child.master)?;
+    server_loop(conn, child, rows, cols, agent);
+    Ok(())
 }
 
 /// Block (polling) on the UDP socket until the first authentic, sized
@@ -315,6 +509,7 @@ fn relay_loop(
     mut link: DaemonLink,
     mut client_size: (u16, u16),
     mut agent: Option<AgentEndpoint>,
+    first_frame: Option<ServerFrame>,
 ) -> Result<()> {
     let mut fragmenter = Fragmenter::new();
     let mut assembly = FragmentAssembly::new();
@@ -352,6 +547,28 @@ fn relay_loop(
     // can't carry fresh caps, so it needs the carrier — on an independent clock.
     let mut last_agent_send = 0u64;
     let err_events = libc::POLLHUP | libc::POLLERR | libc::POLLNVAL;
+
+    // The path-selection read in `run` consumed the daemon's first `Tag::Frame`
+    // off `link`; replay it here exactly as the in-loop Tag::Frame arm would, with
+    // the loop's still-initial state (empty inbox/agent stream, nothing held), so
+    // it holds + sends before the steady loop. `None` on the test-driven path.
+    if let Some(frame) = first_frame {
+        forward_daemon_frame(
+            frame,
+            &mut conn,
+            &mut fragmenter,
+            link.frame_offset,
+            &inbox,
+            &agent_stream,
+            agent_seen,
+            agent.is_some(),
+            &mut held,
+            &mut last_frame_num,
+            &mut last_send,
+            &mut last_agent_send,
+            util::now_ms(),
+        );
+    }
 
     loop {
         // Wake in time to retransmit the held frame (on the RTO) or heartbeat (on
@@ -561,40 +778,21 @@ fn relay_loop(
                         Ok(Some(frame)) => match frame.tag {
                             Tag::Frame => {
                                 let daemon_frame = ServerFrame::decode(&frame.payload)?;
-                                // input_ack is the relay's own received-input
-                                // offset (the daemon sends 0). echo_ack mirrors it:
-                                // TODO(3.1b): proper EchoAck maturity (mosh
-                                // ECHO_TIMEOUT). The happy path has no
-                                // optimistic-echo client, so acking received input
-                                // as echoed is inert here.
-                                let ack = inbox.next_offset();
-                                let mut out = rewrap(daemon_frame, link.frame_offset, ack, ack);
-                                // Stamp the relay-terminated agent caps onto the
-                                // outgoing frame (Task 3.2): the daemon forwards
-                                // content caps verbatim, but AGENT_FORWARD/DATA/ACK
-                                // are the relay's own (RFC 0008 §4). Appended to the
-                                // daemon's already-`own_table`d caps.
-                                out.caps
-                                    .extend(agent_caps(&agent_stream, agent_seen, agent.is_some()));
-                                last_frame_num = out.frame_num;
-                                // Supersede the held frame (O(1)): the daemon
-                                // anchored this frame at the client's acked base,
-                                // so it fully replaces any prior unacked one.
-                                held.hold(out.frame_num, out.encode());
-                                // Send now when the peer is reachable; while it is
-                                // roamed away we keep holding (each new frame just
-                                // replaces) and the retransmit tick delivers the
-                                // latest once the peer returns.
-                                if conn.has_remote() {
-                                    if let Some(bytes) = held.bytes() {
-                                        send_payload(&mut conn, &mut fragmenter, bytes);
-                                    }
-                                    last_send = now;
-                                    // This fresh frame carried the current agent
-                                    // caps, so advance the carrier clock too — no
-                                    // redundant agent carrier right behind it.
-                                    last_agent_send = now;
-                                }
+                                forward_daemon_frame(
+                                    daemon_frame,
+                                    &mut conn,
+                                    &mut fragmenter,
+                                    link.frame_offset,
+                                    &inbox,
+                                    &agent_stream,
+                                    agent_seen,
+                                    agent.is_some(),
+                                    &mut held,
+                                    &mut last_frame_num,
+                                    &mut last_send,
+                                    &mut last_agent_send,
+                                    now,
+                                );
                             }
                             Tag::Exit => {
                                 // Session over: tell the UDP client and wind down.
@@ -608,13 +806,16 @@ fn relay_loop(
                                 );
                                 return Ok(());
                             }
-                            // A frames-OFF daemon serves raw Tag::Output; the
-                            // runtime fallback to the legacy server is Task 3.3.
-                            // The 3.1a test always runs a frames-on daemon.
+                            // Path selection (`run`/`first_daemon_record`) already
+                            // routed a frames-off daemon to the legacy fallback on
+                            // its FIRST record, so reaching relay_loop means the
+                            // daemon committed to frames. A `Tag::Output` here is
+                            // therefore an unexpected mid-stream regression (a
+                            // producer never un-forms); log and ignore it.
                             Tag::Output => util::log_write(
                                 "warn",
-                                "relay received Tag::Output from a frames-off daemon \
-                                 (3.3 legacy fallback not wired)",
+                                "relay received an unexpected mid-stream Tag::Output \
+                                 (daemon frame production regressed)",
                             ),
                             _ => {}
                         },
@@ -717,6 +918,50 @@ fn relay_loop(
         if fds[1].revents & err_events != 0 {
             return Ok(());
         }
+    }
+}
+
+/// Forward one daemon `Tag::Frame` to the UDP client: re-wrap it with the relay's
+/// own input/echo acks (the daemon sends 0), stamp the relay-terminated agent
+/// caps (Task 3.2, RFC 0008 §4) onto the daemon's already-`own_table`d caps, hold
+/// it as the O(1) retransmit buffer (it supersedes any prior unacked frame — the
+/// daemon anchored it at the client's acked base, RFC 0008 §3), and send it now
+/// when the peer is reachable (while roamed away we keep holding; the retransmit
+/// tick delivers the latest on return). A fresh frame carries the current agent
+/// caps, so it stamps BOTH the reliability and agent-carrier clocks. Shared by the
+/// steady loop and the pre-loop first-frame replay (which the path selection in
+/// `run` consumed off the daemon link).
+///
+/// input_ack is the relay's own received-input offset; echo_ack mirrors it —
+/// TODO(3.1b): proper EchoAck maturity (mosh ECHO_TIMEOUT). The happy path has no
+/// optimistic-echo client, so acking received input as echoed is inert here.
+#[allow(clippy::too_many_arguments)]
+fn forward_daemon_frame(
+    daemon_frame: ServerFrame,
+    conn: &mut Connection,
+    fragmenter: &mut Fragmenter,
+    frame_offset: u64,
+    inbox: &InputInbox,
+    agent_stream: &AgentStream,
+    agent_seen: bool,
+    has_agent: bool,
+    held: &mut HeldFrame,
+    last_frame_num: &mut u64,
+    last_send: &mut u64,
+    last_agent_send: &mut u64,
+    now: u64,
+) {
+    let ack = inbox.next_offset();
+    let mut out = rewrap(daemon_frame, frame_offset, ack, ack);
+    out.caps.extend(agent_caps(agent_stream, agent_seen, has_agent));
+    *last_frame_num = out.frame_num;
+    held.hold(out.frame_num, out.encode());
+    if conn.has_remote() {
+        if let Some(bytes) = held.bytes() {
+            send_payload(conn, fragmenter, bytes);
+        }
+        *last_send = now;
+        *last_agent_send = now;
     }
 }
 
@@ -908,6 +1153,167 @@ mod tests {
         assert_eq!(rewrap(daemon, 100, 0, 0).frame_num, 105);
     }
 
+    /// Task 3.3 path selection (RFC 0008 §3): `first_daemon_record` classifies the
+    /// daemon's FIRST content record over a real `UnixStream` pair. `Tag::Frame` ⇒
+    /// steady relay (the frame is decoded and returned); `Tag::Output` ⇒ the legacy
+    /// fallback trigger; a daemon that closes first ⇒ `Closed`. This is the
+    /// deterministic guard; the full PTY fallback (spawning `posh attach` +
+    /// `server_loop`) needs a real daemon and is covered by `docs/manual-testing.md`.
+    #[test]
+    fn first_daemon_record_classifies_frame_output_and_close() {
+        let new_link = || {
+            let (relay_end, daemon_end) = UnixStream::pair().unwrap();
+            relay_end.set_nonblocking(true).unwrap();
+            let link = DaemonLink {
+                stream: relay_end,
+                read: FrameBuffer::new(),
+                write: Vec::new(),
+                frame_offset: 0,
+            };
+            (link, daemon_end)
+        };
+        // An UNPEERED conn (no client hello): `has_remote()` is false, so the
+        // heartbeat path stays inert and this is a pure classification test.
+        let key = Key::random();
+        let (mut conn, _port) = Connection::server((63000, 63099), &key, Family::Inet).unwrap();
+
+        // Frames-on daemon: a Tag::Frame first record ⇒ steady relay path.
+        let (mut link, daemon_end) = new_link();
+        let sf = ServerFrame {
+            flags: 0,
+            caps: caps::own_table(&[]),
+            frame_num: 1,
+            input_ack: 0,
+            echo_ack: 0,
+            body: FrameBody::Full(b"screen".to_vec()),
+        };
+        let mut rec = Vec::new();
+        ipc::append_frame(&mut rec, Tag::Frame, &sf.encode());
+        util::write_all_retry(daemon_end.as_raw_fd(), &rec, 1000).unwrap();
+        match first_daemon_record(&mut link, &mut conn).unwrap() {
+            FirstRecord::Frame(f) => assert_eq!(f.frame_num, 1, "the daemon frame is returned"),
+            FirstRecord::Output => panic!("expected Frame, got Output"),
+            FirstRecord::Closed => panic!("expected Frame, got Closed"),
+        }
+
+        // Frames-off / pre-frames daemon: a Tag::Output first record ⇒ fallback.
+        let (mut link, daemon_end) = new_link();
+        let mut rec = Vec::new();
+        ipc::append_frame(&mut rec, Tag::Output, b"raw screen bytes");
+        util::write_all_retry(daemon_end.as_raw_fd(), &rec, 1000).unwrap();
+        assert!(
+            matches!(
+                first_daemon_record(&mut link, &mut conn).unwrap(),
+                FirstRecord::Output
+            ),
+            "a frames-off daemon's Tag::Output triggers the legacy fallback"
+        );
+
+        // Daemon closes before any content ⇒ Closed (relay returns Ok).
+        let (mut link, daemon_end) = new_link();
+        drop(daemon_end);
+        assert!(matches!(
+            first_daemon_record(&mut link, &mut conn).unwrap(),
+            FirstRecord::Closed
+        ));
+    }
+
+    /// Regression (RFC 0008 §3): a frames-on daemon that hasn't produced output yet
+    /// leaves `first_daemon_record` waiting; WITHOUT the heartbeat the UDP client
+    /// would hear nothing and trip its 15 s `POSH_CONNECT_TMOUT`, aborting a good
+    /// connection to a quiet/slow-starting session. Assert the client hears an Empty
+    /// heartbeat during the wait. The first heartbeat fires on the first loop
+    /// iteration (before the daemon record is even read), so a Frame available
+    /// immediately still yields exactly one heartbeat ahead of it.
+    #[test]
+    fn first_daemon_record_heartbeats_the_client_during_the_wait() {
+        let key = Key::random();
+        let (mut relay_conn, port) =
+            Connection::server((63200, 63299), &key, Family::Inet).unwrap();
+        let addr = format!("127.0.0.1:{port}").parse().unwrap();
+        let mut client_conn = Connection::client(addr, &key).unwrap();
+
+        // The client's hello teaches the relay conn the peer address (has_remote()).
+        let mut fragmenter = Fragmenter::new();
+        let hello = ClientMessage {
+            flags: 0,
+            caps: vec![],
+            acked_frame: 0,
+            rows: 24,
+            cols: 80,
+            input_base: 0,
+            input: Vec::new(),
+        };
+        for frag in fragmenter.make_fragments(&hello.encode(), sync::FRAGMENT_CONTENTS_MAX) {
+            client_conn.send(&frag.to_bytes()).unwrap();
+        }
+        let deadline = now_ms() + 2000;
+        loop {
+            match relay_conn.recv() {
+                Ok(Some(_)) => break,
+                _ => {
+                    if now_ms() > deadline {
+                        panic!("relay never heard the client hello");
+                    }
+                    std::thread::sleep(Duration::from_millis(5));
+                }
+            }
+        }
+        assert!(relay_conn.has_remote(), "relay conn peered before the wait");
+
+        // Daemon end: a Tag::Frame available immediately (the heartbeat still
+        // precedes the read, so the client hears it first).
+        let (relay_end, daemon_end) = UnixStream::pair().unwrap();
+        relay_end.set_nonblocking(true).unwrap();
+        let mut link = DaemonLink {
+            stream: relay_end,
+            read: FrameBuffer::new(),
+            write: Vec::new(),
+            frame_offset: 0,
+        };
+        let sf = ServerFrame {
+            flags: 0,
+            caps: caps::own_table(&[]),
+            frame_num: 1,
+            input_ack: 0,
+            echo_ack: 0,
+            body: FrameBody::Full(b"screen".to_vec()),
+        };
+        let mut rec = Vec::new();
+        ipc::append_frame(&mut rec, Tag::Frame, &sf.encode());
+        util::write_all_retry(daemon_end.as_raw_fd(), &rec, 1000).unwrap();
+
+        match first_daemon_record(&mut link, &mut relay_conn).unwrap() {
+            FirstRecord::Frame(f) => assert_eq!(f.frame_num, 1),
+            _ => panic!("expected Frame"),
+        }
+
+        // The client must have received at least one Empty heartbeat.
+        let mut assembly = FragmentAssembly::new();
+        let mut saw_empty = false;
+        let deadline = now_ms() + 2000;
+        while now_ms() < deadline && !saw_empty {
+            match client_conn.recv() {
+                Ok(Some(payload)) => {
+                    if let Ok(frag) = sync::Fragment::from_bytes(&payload) {
+                        if let Some(assembled) = assembly.add(frag) {
+                            if let Ok(frame) = ServerFrame::decode(&assembled) {
+                                if matches!(frame.body, FrameBody::Empty) {
+                                    saw_empty = true;
+                                }
+                            }
+                        }
+                    }
+                }
+                _ => std::thread::sleep(Duration::from_millis(5)),
+            }
+        }
+        assert!(
+            saw_empty,
+            "client must hear an Empty heartbeat during the wait (defeats POSH_CONNECT_TMOUT)"
+        );
+    }
+
     /// The O(1) supersession invariant (RFC 0008 §3), proven deterministically on
     /// the real buffer the loop uses: `hold` REPLACES (never accumulates), an ack
     /// below the held number keeps it, an ack at/above releases it, and `clear`
@@ -1089,7 +1495,7 @@ mod tests {
         );
         ipc::append_frame(&mut link.write, Tag::Resize, &ipc::encode_resize(rows, cols));
 
-        let relay = std::thread::spawn(move || relay_loop(relay_conn, link, (rows, cols), None));
+        let relay = std::thread::spawn(move || relay_loop(relay_conn, link, (rows, cols), None, None));
 
         // --- synthetic UDP client state ---
         let mut client_term = Terminal::with_scrollback(rows, cols, 0);
@@ -1317,7 +1723,7 @@ mod tests {
             );
             ipc::append_frame(&mut link.write, Tag::Resize, &ipc::encode_resize(rows, cols));
 
-            let relay = std::thread::spawn(move || relay_loop(relay_conn, link, (rows, cols), None));
+            let relay = std::thread::spawn(move || relay_loop(relay_conn, link, (rows, cols), None, None));
 
             let mut dterm = Terminal::with_scrollback(rows, cols, 1000);
             fill_screen(&mut dterm);
@@ -1772,7 +2178,7 @@ mod tests {
         ipc::append_frame(&mut link.write, Tag::Resize, &ipc::encode_resize(rows, cols));
 
         let relay =
-            std::thread::spawn(move || relay_loop(relay_conn, link, (rows, cols), Some(endpoint)));
+            std::thread::spawn(move || relay_loop(relay_conn, link, (rows, cols), Some(endpoint), None));
 
         // The agent CONSUMER dials the relay's agent/sock and issues one request.
         // The listener socket exists (bound in AgentEndpoint::new before the thread

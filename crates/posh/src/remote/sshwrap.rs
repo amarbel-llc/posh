@@ -53,13 +53,22 @@ impl ServerReport {
 }
 
 /// Builds the remote command: locale variables forwarded as POSIX-sh
-/// environment prefixes (LANG/LC_*, so the server sees the client's
-/// charset), then `posh-server new` with the relevant flags — mosh
-/// (`mosh-server new`) parity; the package installs posh-server as an
-/// alias of posh.
+/// environment prefixes (LANG/LC_*, so the server sees the client's charset),
+/// then `posh-server new [-A] [-4|-6] [-p R]`, then the caller-supplied server
+/// `tail` appended verbatim — mosh (`mosh-server new`) parity; the package
+/// installs posh-server as an alias of posh.
+///
+/// The caller OWNS the tail shape (RFC 0008 §3), so one function serves every
+/// bootstrap: legacy `-- posh [-g G] attach SESSION [cmd...]`, single-model
+/// `relay [-g G] SESSION [-- cmd...]`, or the bare-host `[-- cmd...]`. Each tail
+/// token is shell-quoted for a lossless argv (a session name or command word
+/// with spaces survives the remote shell) EXCEPT a bare `--`, which is emitted
+/// unquoted so the legacy wire string stays byte-identical to the pre-relay
+/// bootstrap. (`--` means the same argument quoted or not, so this is cosmetic
+/// for the relay tail and load-bearing only for legacy byte-identity.)
 pub fn remote_command(
     opts: &SshOptions,
-    remote_cmd: &[String],
+    tail: &[String],
     locale_vars: &[(String, String)],
 ) -> String {
     let mut cmd = String::new();
@@ -84,10 +93,11 @@ pub fn remote_command(
         cmd.push_str(" -p ");
         cmd.push_str(range);
     }
-    if !remote_cmd.is_empty() {
-        cmd.push_str(" --");
-        for arg in remote_cmd {
-            cmd.push(' ');
+    for arg in tail {
+        cmd.push(' ');
+        if arg == "--" {
+            cmd.push_str("--");
+        } else {
             cmd.push_str(&shell_quote(arg));
         }
     }
@@ -336,7 +346,9 @@ mod tests {
             port_range: None,
             agent_source: None,
         };
-        let inner: Vec<String> = ["posh", "-g", "grp", "attach", "my dev"]
+        // New contract (RFC 0008 §3): the caller owns the `--`; the legacy tail
+        // leads with it, then the shell-quoted inner argv. Byte-identical output.
+        let inner: Vec<String> = ["--", "posh", "-g", "grp", "attach", "my dev"]
             .iter()
             .map(|s| s.to_string())
             .collect();
@@ -380,7 +392,12 @@ mod tests {
             agent_source: None,
         };
         let locale = vec![("LANG".to_string(), "en_US.UTF-8".to_string())];
-        let cmd = remote_command(&opts, &["htop".to_string(), "-d".to_string()], &locale);
+        // The bare-host tail now carries its own leading `--` (caller-owned).
+        let cmd = remote_command(
+            &opts,
+            &["--".to_string(), "htop".to_string(), "-d".to_string()],
+            &locale,
+        );
         assert_eq!(
             cmd,
             "LANG='en_US.UTF-8' posh-server new -6 -p 60100:60200 -- 'htop' '-d'"
@@ -396,6 +413,61 @@ mod tests {
             &[],
         );
         assert_eq!(plain, "posh-server new");
+    }
+
+    #[test]
+    fn remote_command_relay_tail() {
+        // RFC 0008 §3: the single-model relay bootstrap. The `relay` verb, its
+        // `-g GROUP SESSION`, then `-- cmd`. Tokens are shell-quoted for a
+        // lossless argv (a spaced session name survives); the `--` stays
+        // unquoted, like legacy. The relay CREATES via connect_or_create, so the
+        // command rides after the relay's own `--` (no inner `attach`).
+        let opts = SshOptions {
+            family: Family::Auto,
+            port_range: None,
+            agent_source: None,
+        };
+        let tail: Vec<String> = ["relay", "-g", "grp", "dev", "--", "htop"]
+            .iter()
+            .map(|s| s.to_string())
+            .collect();
+        assert_eq!(
+            remote_command(&opts, &tail, &[]),
+            "posh-server new 'relay' '-g' 'grp' 'dev' -- 'htop'"
+        );
+    }
+
+    #[test]
+    fn remote_command_relay_no_group_no_command() {
+        // Default group ⇒ no `-g`; no create-command ⇒ no `--` tail.
+        let opts = SshOptions {
+            family: Family::Auto,
+            port_range: None,
+            agent_source: None,
+        };
+        let tail: Vec<String> = ["relay", "dev"].iter().map(|s| s.to_string()).collect();
+        assert_eq!(remote_command(&opts, &tail, &[]), "posh-server new 'relay' 'dev'");
+    }
+
+    #[test]
+    fn remote_command_relay_appends_dash_a_before_the_tail() {
+        // -A rides right after `new`, before the relay tail — exactly as it does
+        // before the legacy tail; the source path never hits the wire (C4).
+        let opts = SshOptions {
+            family: Family::Inet,
+            port_range: Some("60001:60999".to_string()),
+            agent_source: Some("/run/user/1000/agent.sock".into()),
+        };
+        let tail: Vec<String> = ["relay", "-g", "grp", "dev"]
+            .iter()
+            .map(|s| s.to_string())
+            .collect();
+        let cmd = remote_command(&opts, &tail, &[]);
+        assert_eq!(
+            cmd,
+            "posh-server new -A -4 -p 60001:60999 'relay' '-g' 'grp' 'dev'"
+        );
+        assert!(!cmd.contains("agent.sock"), "source path must not hit the wire");
     }
 
     #[test]

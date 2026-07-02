@@ -51,12 +51,19 @@ fn timeout_env(name: &str) -> u64 {
     }
 }
 
-pub fn run(
+/// The server-side transport bootstrap shared by [`run`] (the legacy
+/// Architecture-A inner-PTY server) and the single-model relay verb
+/// (`main::cmd_server_relay`, RFC 0008 §3): the UTF-8 locale check, a fresh AEAD
+/// key + bound UDP `Connection`, the `POSH IP`/`POSH CONNECT` handshake lines on
+/// stdout, then the double-fork into the background. Returns `Ok(None)` in the
+/// PARENT (the caller returns `Ok(())`) and `Ok(Some(conn))` in the detached
+/// CHILD (the un-peered transport it goes on to drive; the peer is learned
+/// in-loop / by the relay handshake). Factored out so both bootstraps produce a
+/// byte-identical `POSH CONNECT` line and detach identically.
+pub(crate) fn bootstrap_transport(
     port_range: Option<(u16, u16)>,
     family: Family,
-    command: Option<Vec<String>>,
-    agent_forward: bool,
-) -> Result<()> {
+) -> Result<Option<Connection>> {
     util::check_utf8_locale("posh-server")?;
 
     let key = Key::random();
@@ -77,13 +84,25 @@ pub fn run(
     util::ignore_signal(libc::SIGHUP);
     if util::double_fork()? {
         eprintln!("[posh-server detached]");
-        return Ok(());
+        return Ok(None);
     }
     util::redirect_stdio_devnull();
     util::install_sigusr1_handler();
     // SIGUSR2 dumps live transport state on demand (remote::diag) — the only
     // way to introspect a wedged, already-running server without restarting it.
     util::install_sigusr2_handler();
+    Ok(Some(conn))
+}
+
+pub fn run(
+    port_range: Option<(u16, u16)>,
+    family: Family,
+    command: Option<Vec<String>>,
+    agent_forward: bool,
+) -> Result<()> {
+    let Some(conn) = bootstrap_transport(port_range, family)? else {
+        return Ok(()); // the detached parent
+    };
 
     // Agent forwarding (FDR 0004): when active, stand up the remote endpoint
     // (the agent/sock the session shell will use as SSH_AUTH_SOCK) before the

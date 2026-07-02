@@ -156,6 +156,47 @@ Reading the diagnostic when it is NOT working:
 - `server: endpoint=down` — server-side forwarding is off (or an older server).
 - `server: … symlink=broken` — another posh server stole the well-known symlink.
 
+## 6. Single-model relay (RFC 0008 Phase 3)
+
+The remote `host:session` bootstrap is the frame RELAY by default: `posh-server`
+connects to the session daemon's socket and forwards its `ServerFrame` stream over
+UDP, instead of running an inner `posh attach` in a second PTY. One terminal
+model, server-side. `POSH_RELAY=0` forces the legacy inner-attach bootstrap; a
+daemon that does not emit frames (default — `POSH_SESSION_FRAMES` off) makes the
+relay auto-fall-back to the legacy inner-attach path at runtime, so both a
+frames-on and a frames-off remote daemon work with no flag day.
+
+```sh
+$P otherhost:dev                 # default: single-model relay bootstrap
+# on otherhost, in another shell, while attached:
+just debug-posh-procs            # or: pgrep -af posh-server; pgrep -af 'posh attach'
+```
+
+- [ ] Single model: on the server host the process table shows a `posh-server`
+      running the `relay` verb (`posh-server new … relay -g <grp> dev`) and NO
+      inner `posh attach` child under it. (The legacy path, by contrast, shows a
+      `posh-server` whose child IS `posh … attach dev`.)
+- [ ] The session behaves identically to the legacy path: typing, repaint,
+      scrollback, the `Ctrl-^` palette, and exit-status propagation all work.
+- [ ] Agent forwarding through the relay (FDR 0004, unchanged): with a local
+      agent, inside the session `echo $SSH_AUTH_SOCK` points at `<base>/agent/sock`
+      and `ssh-add -l` lists your local fingerprint; a real `ssh -T git@github.com`
+      / `git ls-remote` authenticates over the forwarded key. (The relay TERMINATES
+      the agent caps; the daemon Init carries none.)
+- [ ] Roam under the relay: suspend the laptop / switch networks mid-session —
+      typing resumes and the screen stays converged after the RTO retransmit.
+- [ ] Rollback lever — `POSH_RELAY=0 $P otherhost:dev`: forces the LEGACY
+      bootstrap (`posh-server new -- posh … attach dev`); the process table now
+      shows the inner `posh attach` child. Behaviour is unchanged from pre-relay.
+- [ ] Auto-fallback: against a default (frames-off) remote daemon, a plain
+      `$P otherhost:dev` still works — the relay sees the daemon's `Tag::Output`
+      first record and transparently runs the legacy inner-attach server, reusing
+      the same UDP connection (the process table then shows the inner
+      `posh attach`, as in the `POSH_RELAY=0` case). No visible difference to the
+      user; confirm typing/repaint/exit-status all work.
+- [ ] `POSH_RELAY=0` on the same session another time still interoperates —
+      relay and legacy bootstraps are negotiation-compatible against either daemon.
+
 ## Known gaps — do not file as new bugs
 
 None currently. The Wave D/E gaps that used to live here — wheel scroll

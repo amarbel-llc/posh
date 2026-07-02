@@ -290,6 +290,13 @@ fn cmd_server(args: &[String]) -> Result<()> {
                 agent_forward = true;
                 i += 1;
             }
+            // The single-model frame relay bootstrap (RFC 0008 §3): flags
+            // always precede the `relay` verb, so port_range/family/agent_forward
+            // are fully parsed by the time we branch. Everything after `relay` is
+            // the relay verb's own `-g GROUP SESSION [-- cmd]`.
+            "relay" => {
+                return cmd_server_relay(&rest[i + 1..], port_range, family, agent_forward);
+            }
             "--" => {
                 let cmd: Vec<String> = rest[i + 1..].to_vec();
                 command = (!cmd.is_empty()).then_some(cmd);
@@ -299,6 +306,56 @@ fn cmd_server(args: &[String]) -> Result<()> {
         }
     }
     remote::server::run(port_range, family, command, agent_forward)
+}
+
+/// The `relay` server verb (RFC 0008 §3): the single-model frame relay. Parses
+/// `-g GROUP SESSION [-- cmd...]`, stands up the same transport as
+/// [`remote::server::run`] via `bootstrap_transport`, then runs the relay as a
+/// lossy frame client of the session daemon (creating the session if needed).
+/// Unlike the legacy bootstrap there is no inner `posh attach` / second PTY — the
+/// daemon is the single frame producer. `args` starts AFTER the `relay` token.
+fn cmd_server_relay(
+    args: &[String],
+    port_range: Option<(u16, u16)>,
+    family: Family,
+    agent_forward: bool,
+) -> Result<()> {
+    let mut group = "default".to_string();
+    let mut session: Option<String> = None;
+    let mut command: Option<Vec<String>> = None;
+    let mut i = 0;
+    while i < args.len() {
+        match args[i].as_str() {
+            "-g" | "--group" => {
+                group = args
+                    .get(i + 1)
+                    .ok_or_else(|| Error::from("relay -g requires a group"))?
+                    .clone();
+                i += 2;
+            }
+            "--" => {
+                // The create-command for a freshly created session, opaque after
+                // the separator (mirrors the `posh-server new --` handling).
+                let cmd: Vec<String> = args[i + 1..].to_vec();
+                command = (!cmd.is_empty()).then_some(cmd);
+                break;
+            }
+            other if !other.starts_with('-') => {
+                if session.is_some() {
+                    return Err(Error(format!("relay: unexpected extra argument {other}")));
+                }
+                session = Some(other.to_string());
+                i += 1;
+            }
+            other => return Err(Error(format!("unknown relay option {other}"))),
+        }
+    }
+    let session = session.ok_or_else(|| Error::from("relay requires a session name"))?;
+    let Some(conn) = remote::server::bootstrap_transport(port_range, family)? else {
+        return Ok(()); // the detached parent
+    };
+    let cfg = Config::new(&group)?;
+    remote::relay::run(conn, &cfg, &session, command, agent_forward)
 }
 
 fn parse_port_range(s: &str) -> Result<(u16, u16)> {
@@ -373,14 +430,16 @@ fn cmd_ssh_session(
 ) -> Result<()> {
     let (detached, command) = parse_remote_session_extra(extra);
     let group = effective_remote_group(target_group.as_deref(), global_group);
-    let inner = remote_session_argv(group, &session, detached, command);
     let dest = match &user {
         Some(u) => format!("{u}@{host}"),
         None => host,
     };
     if detached {
         // Detached spawn (#67): no transport, so no agent endpoint — execute
-        // the inner `posh attach --detach` directly over ssh and return.
+        // the inner `posh attach --detach` directly over ssh and return. This
+        // path is untouched by the relay bootstrap (there is no transport to
+        // relay); it always uses the inner-attach argv.
+        let inner = remote_session_argv(group, &session, true, command);
         let opts = remote::sshwrap::SshOptions {
             family: Family::Auto,
             port_range: None,
@@ -395,7 +454,60 @@ fn cmd_ssh_session(
         port_range: None,
         agent_source: resolve_agent_source(forward_flag),
     };
-    remote::sshwrap::run(&dest, &inner, &opts)
+    // Bootstrap selection (RFC 0008 §3): the single-model relay by default;
+    // `POSH_RELAY=0` forces the legacy Architecture-A inner-`posh attach`
+    // composition (byte-identical to the pre-relay wire). The runtime
+    // `Tag::Output` fallback (a frames-off/pre-frames daemon) is handled
+    // server-side inside the relay, so a relay bootstrap works against either.
+    let tail = foreground_server_tail(relay_enabled(), group, &session, command);
+    remote::sshwrap::run(&dest, &tail, &opts)
+}
+
+/// The single-model relay is the default bootstrap; `POSH_RELAY=0` forces the
+/// legacy Architecture-A inner-`posh attach` composition (RFC 0008 §3
+/// client-side rollback). Any other value (or unset) keeps the relay.
+fn relay_enabled() -> bool {
+    std::env::var("POSH_RELAY").as_deref() != Ok("0")
+}
+
+/// The `posh-server new` tail for the foreground `host:session` bootstrap, chosen
+/// by `relay` (RFC 0008 §3). The RELAY tail is `relay [-g G] SESSION [-- cmd]`
+/// (the relay creates the session itself, so the create-command rides after its
+/// own `--`); the LEGACY tail is the pre-relay `-- posh [-g G] attach SESSION
+/// [cmd]` inner argv, with a leading `--` the caller now owns (see
+/// `remote::sshwrap::remote_command`). Factored out (pure) so the selection is
+/// unit-tested without touching `$POSH_RELAY` (global, racy under parallel tests).
+fn foreground_server_tail(
+    relay: bool,
+    group: Option<&str>,
+    session: &str,
+    command: &[String],
+) -> Vec<String> {
+    if relay {
+        remote_relay_argv(group, session, command)
+    } else {
+        let mut tail = vec!["--".to_string()];
+        tail.extend(remote_session_argv(group, session, false, command));
+        tail
+    }
+}
+
+/// The relay bootstrap tail `relay [-g GROUP] SESSION [-- command...]` (RFC 0008
+/// §3). `-g` is omitted for the default group (matching `effective_remote_group`/
+/// `remote_session_argv`); the create-command rides after the relay's own `--`
+/// (the relay creates via `connect_or_create`, so there is no inner `attach`).
+fn remote_relay_argv(group: Option<&str>, session: &str, command: &[String]) -> Vec<String> {
+    let mut argv: Vec<String> = vec!["relay".into()];
+    if let Some(g) = group {
+        argv.push("-g".into());
+        argv.push(g.into());
+    }
+    argv.push(session.into());
+    if !command.is_empty() {
+        argv.push("--".into());
+        argv.extend_from_slice(command);
+    }
+    argv
 }
 
 /// Splits the post-target args of `posh host:[group/]session ...` into
@@ -551,7 +663,15 @@ fn cmd_ssh(args: &[String], forward: Option<&remote::agent::ForwardFlag>) -> Res
         port_range,
         agent_source: forward.and_then(resolve_agent_source),
     };
-    remote::sshwrap::run(target, remote_cmd, &opts)
+    // The server tail is caller-owned now (RFC 0008 §3): a bare host runs
+    // `posh-server new [flags]` with `-- command...` only when a command was
+    // given — the same wire shape as before, just with the `--` supplied here.
+    let mut tail: Vec<String> = Vec::new();
+    if !remote_cmd.is_empty() {
+        tail.push("--".into());
+        tail.extend_from_slice(remote_cmd);
+    }
+    remote::sshwrap::run(target, &tail, &opts)
 }
 
 /// Resolves the local agent socket to forward (FDR 0004) from the CLI flag plus
@@ -708,6 +828,11 @@ ENVIRONMENT
                     same across terminals (kitty otherwise sprays arrows on
                     its own). Costs the outer terminal's click-to-select
                     while active; apps that grab the mouse are unaffected.
+    POSH_RELAY      Remote host:session bootstrap selection (default on): the
+                    single-model frame relay. POSH_RELAY=0 forces the legacy
+                    inner-`posh attach` bootstrap. A relay bootstrap also falls
+                    back automatically when the remote daemon does not emit
+                    frames, so both interoperate by negotiation.
     POSH_SERVER_NETWORK_TMOUT
                     Server exits after N seconds without client contact
                     (0 = never, the default)
@@ -805,6 +930,52 @@ mod tests {
         assert_eq!(
             remote_session_argv(None, "w", true, &[]),
             ["posh", "attach", "w", "--detach"].map(String::from)
+        );
+    }
+
+    #[test]
+    fn remote_relay_argv_group_and_command() {
+        // RFC 0008 §3 relay tail: `relay [-g G] SESSION [-- cmd]`. The create-
+        // command rides after the relay's own `--` (no inner `attach`).
+        assert_eq!(
+            remote_relay_argv(Some("grp"), "dev", &["htop".into()]),
+            ["relay", "-g", "grp", "dev", "--", "htop"].map(String::from)
+        );
+        // No group ⇒ no `-g`; no command ⇒ no `--`.
+        assert_eq!(
+            remote_relay_argv(None, "dev", &[]),
+            ["relay", "dev"].map(String::from)
+        );
+        // Group but no command.
+        assert_eq!(
+            remote_relay_argv(Some("work"), "w1", &[]),
+            ["relay", "-g", "work", "w1"].map(String::from)
+        );
+    }
+
+    #[test]
+    fn foreground_server_tail_relay_vs_legacy() {
+        // Relay ON (the default): the single-model relay tail.
+        let cmd = vec!["htop".to_string()];
+        assert_eq!(
+            foreground_server_tail(true, Some("grp"), "dev", &cmd),
+            ["relay", "-g", "grp", "dev", "--", "htop"].map(String::from)
+        );
+        // POSH_RELAY=0: the legacy `-- posh -g GROUP attach SESSION [cmd]` tail,
+        // its leading `--` now caller-owned. Wire shape unchanged from pre-relay.
+        assert_eq!(
+            foreground_server_tail(false, Some("grp"), "dev", &cmd),
+            ["--", "posh", "-g", "grp", "attach", "dev", "htop"].map(String::from)
+        );
+        // Default group (None) omits `-g` in both bootstraps; no command ⇒ no `--`
+        // tail on the relay side.
+        assert_eq!(
+            foreground_server_tail(true, None, "dev", &[]),
+            ["relay", "dev"].map(String::from)
+        );
+        assert_eq!(
+            foreground_server_tail(false, None, "dev", &[]),
+            ["--", "posh", "attach", "dev"].map(String::from)
         );
     }
 
