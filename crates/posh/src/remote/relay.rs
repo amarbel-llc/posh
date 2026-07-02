@@ -33,7 +33,22 @@
 //!   `Tag::FrameAck` with `FRAME_ACK_RESYNC`, so the daemon drops its base and its
 //!   next frame is a recovering `Full`, and discards the diverged held frame.
 //!
-//! Agent-cap termination is 3.2; the `cmd_server` relay verb + bootstrap is 3.3.
+//! # Agent forwarding (Task 3.2)
+//!
+//! The relay TERMINATES the transport-scoped agent caps (`CAP_AGENT_FORWARD`/
+//! `CAP_AGENT_DATA`/`CAP_AGENT_ACK`, RFC 0008 §4): it owns the remote
+//! [`AgentEndpoint`] (the `agent/sock` a session shell dials as its
+//! `SSH_AUTH_SOCK`) and proxies agent bytes to the UDP client over the frame
+//! stream, lifted verbatim from the legacy `server_loop`. Those caps NEVER reach
+//! the daemon — [`content_caps`] forwards only MORPH/SCROLLBACK/BASE_SUM into the
+//! daemon Init. Because the DAEMON (not the relay) owns the session shell in this
+//! model, the relay seeds `SSH_AUTH_SOCK` into its OWN process env before
+//! creating the session ([`run`]); the double-forked daemon inherits that environ
+//! at fork, so a session CREATED through a forwarding relay gets the stable
+//! `agent/sock`. (An already-running session's shell keeps the `SSH_AUTH_SOCK` it
+//! was born with — the #103 limitation, out of scope for FDR 0011.)
+//!
+//! The `cmd_server` relay verb + bootstrap is 3.3.
 //!
 //! Task 3.3 wires `cmd_server`'s `relay` verb as the non-test caller of [`run`];
 //! until then the surface here has only the inline-test caller (mirroring
@@ -44,12 +59,13 @@ use std::io::Write;
 use std::os::fd::AsRawFd;
 use std::os::unix::net::UnixStream;
 
+use crate::remote::agent::AgentEndpoint;
 use crate::remote::caps::{self, Cap};
-use crate::remote::datagram::Connection;
+use crate::remote::datagram::{Connection, SEND_INTERVAL_MIN};
 use crate::remote::server::send_payload;
 use crate::remote::sync::{
-    self, ClientMessage, FragmentAssembly, Fragmenter, FrameBody, InputInbox, ServerFrame,
-    FLAG_SHUTDOWN,
+    self, AgentStream, ClientMessage, FragmentAssembly, Fragmenter, FrameBody, InputInbox,
+    ServerFrame, FLAG_SHUTDOWN,
 };
 use crate::session::ipc::{self, FrameBuffer, Tag};
 use crate::session::{self, Config};
@@ -77,6 +93,26 @@ fn content_caps(client_caps: &[Cap]) -> Vec<Cap> {
         .iter()
         .filter_map(|&id| caps::find(client_caps, id).cloned())
         .collect()
+}
+
+/// The relay-TERMINATED agent caps to stamp onto an OUTGOING frame toward the
+/// UDP client (RFC 0008 §4, lifted from `server.rs:998-1014`). `CAP_AGENT_FORWARD`
+/// advertises the endpoint so the client may begin; the `CAP_AGENT_DATA` chunks +
+/// `CAP_AGENT_ACK` are emitted only once the client has advertised back
+/// (`agent_seen`), never before (RFC 0001). Empty when forwarding is inactive.
+fn agent_caps(stream: &AgentStream, agent_seen: bool, has_endpoint: bool) -> Vec<Cap> {
+    let mut extras = Vec::new();
+    if has_endpoint {
+        extras.push(Cap {
+            id: caps::CAP_AGENT_FORWARD,
+            payload: vec![],
+        });
+        if agent_seen {
+            extras.extend(caps::encode_agent_data(stream.send_base(), stream.pending()));
+            extras.push(caps::encode_agent_ack(stream.recv_ack()));
+        }
+    }
+    extras
 }
 
 /// The daemon `Tag::Init` payload: the 4-byte resize prefix then the RFC 0001
@@ -174,12 +210,39 @@ pub(crate) fn run(
     cfg: &Config,
     name: &str,
     command: Option<Vec<String>>,
+    agent_forward: bool,
 ) -> Result<()> {
     // 1. Handshake: learn the UDP client's terminal size + advertised caps from
     //    its first datagram BEFORE connecting to the daemon, so the daemon Init
     //    carries the right size and forwarded content caps (RFC 0008 §3). The
     //    datagram also teaches `conn` its peer address, so later sends land.
     let (rows, cols, client_caps) = wait_for_handshake(&mut conn)?;
+
+    // Agent forwarding (FDR 0004, Task 3.2): stand up the remote endpoint BEFORE
+    // creating the session, and seed SSH_AUTH_SOCK into THIS process's env. In
+    // the relay model the DAEMON owns the session shell, so — unlike server::run,
+    // which sets SSH_AUTH_SOCK directly in the PTY's shell_env — the relay relies
+    // on env inheritance: `ensure_session` double-forks the daemon from this
+    // process, so a session CREATED here inherits our environ (incl.
+    // SSH_AUTH_SOCK) at fork, and the daemon's `spawn_shell` `putenv`s it into the
+    // shell (C5). An already-running session's shell keeps its birth SSH_AUTH_SOCK
+    // (the #103 limitation, out of scope for FDR 0011). The agent caps are
+    // relay-TERMINATED and never forwarded to the daemon; a best-effort endpoint
+    // failure just leaves the session without forwarding rather than refusing it.
+    let agent = if agent_forward {
+        match AgentEndpoint::from_env() {
+            Ok(ep) => {
+                std::env::set_var("SSH_AUTH_SOCK", ep.sock_path());
+                Some(ep)
+            }
+            Err(e) => {
+                util::log_write("warn", &format!("agent forwarding disabled: {e}"));
+                None
+            }
+        }
+    } else {
+        None
+    };
 
     // 2. Connect to / create the session and Init as a LOSSY, frame-capable
     //    client (mirror session/client.rs: cap-extended Init + a Tag::Resize
@@ -204,7 +267,7 @@ pub(crate) fn run(
         &ipc::encode_resize(rows, cols),
     );
 
-    relay_loop(conn, link, (rows, cols))
+    relay_loop(conn, link, (rows, cols), agent)
 }
 
 /// Block (polling) on the UDP socket until the first authentic, sized
@@ -247,10 +310,25 @@ fn wait_for_handshake(conn: &mut Connection) -> Result<(u16, u16, Vec<Cap>)> {
 /// replaces the PTY fd, and there is no `Terminal`/`FrameProducer`/`Overlay`).
 /// Forwards the daemon `ServerFrame` stream out to the UDP client and the client's
 /// input/resize/frame-acks back to the daemon.
-fn relay_loop(mut conn: Connection, mut link: DaemonLink, mut client_size: (u16, u16)) -> Result<()> {
+fn relay_loop(
+    mut conn: Connection,
+    mut link: DaemonLink,
+    mut client_size: (u16, u16),
+    mut agent: Option<AgentEndpoint>,
+) -> Result<()> {
     let mut fragmenter = Fragmenter::new();
     let mut assembly = FragmentAssembly::new();
     let mut inbox = InputInbox::new();
+    // Agent forwarding (FDR 0004, Task 3.2): the bidirectional agent byte stream
+    // the relay TERMINATES, and the peer's per-message AGENT_FORWARD latch.
+    // `agent_seen` gates our own AGENT_DATA/ACK emission (RFC 0001: never before
+    // seeing the peer's AGENT_FORWARD). Both inert unless `agent` is Some.
+    let mut agent_stream = AgentStream::new();
+    let mut agent_seen = false;
+    // Last authentic client datagram (ms), for the agent endpoint's stricter
+    // peer-liveness gate (AGENT_PEER_ACTIVE) — a roamed-away peer fast-fails a
+    // blocked `git push` rather than hanging it.
+    let mut last_heard = util::now_ms();
     // Highest UDP-client `acked_frame` already forwarded to the daemon as a
     // `Tag::FrameAck`, so the daemon advances its diff base (RFC 0008 §3).
     let mut acked_forwarded = 0u64;
@@ -263,6 +341,16 @@ fn relay_loop(mut conn: Connection, mut link: DaemonLink, mut client_size: (u16,
     // exactly as `server.rs` shares one `last_send` for retransmit + heartbeat.
     let mut held = HeldFrame::default();
     let mut last_send = 0u64;
+    // The agent-output empty carrier runs on its OWN clock, NOT `last_send`, so it
+    // can never starve the held-frame RTO retransmit: `SEND_INTERVAL_MIN` (20ms) <
+    // `MIN_RTO` (50ms), so a shared clock would let a continuously-pending agent
+    // stream reset `last_send` every 20ms and keep `since_send >= rto` from ever
+    // tripping — a lost visible frame would never retransmit while agent bytes
+    // flow (code-review fix). server.rs avoids this differently: its force-ack is
+    // gated behind "no outstanding frame" and its retransmit re-encodes fresh
+    // caps, so it needs no separate carrier; the relay's pre-encoded held bytes
+    // can't carry fresh caps, so it needs the carrier — on an independent clock.
+    let mut last_agent_send = 0u64;
     let err_events = libc::POLLHUP | libc::POLLERR | libc::POLLNVAL;
 
     loop {
@@ -271,10 +359,32 @@ fn relay_loop(mut conn: Connection, mut link: DaemonLink, mut client_size: (u16,
         // select deadline. This `now` only sizes the timeout; the send decisions
         // below re-read the clock post-poll.
         let now = util::now_ms();
+
+        // Agent-forwarding maintenance (FDR 0004): symlink takeover, dead-sock GC,
+        // and the stricter AGENT_PEER_ACTIVE (15 s) liveness gate that fast-fails a
+        // blocked `git push` when the peer has roamed. Channels the tick closes are
+        // framed back onto the outbound agent stream. Lifted from `server.rs`.
+        if let Some(ep) = agent.as_mut() {
+            let agent_peer_active = conn.has_remote()
+                && now.saturating_sub(last_heard) < crate::remote::agent::AGENT_PEER_ACTIVE;
+            for rec in ep.tick(agent_peer_active, now) {
+                agent_stream.send(&rec);
+            }
+        }
+        // Pending outbound agent bytes must be ferried promptly (like `server.rs`'s
+        // `force_ack`): they ride an empty ack frame paced at SEND_INTERVAL_MIN, not
+        // the 3 s heartbeat. Gated on `agent_seen` (never emit before the peer's
+        // AGENT_FORWARD, RFC 0001).
+        let agent_out_pending =
+            agent.is_some() && agent_seen && !agent_stream.pending().is_empty();
+
         let timeout = if conn.has_remote() {
             let mut deadline = last_send + sync::HEARTBEAT_INTERVAL;
             if held.is_held() {
                 deadline = deadline.min(last_send + conn.rto());
+            }
+            if agent_out_pending {
+                deadline = deadline.min(last_agent_send + SEND_INTERVAL_MIN);
             }
             deadline.saturating_sub(now).min(1000) as i32
         } else {
@@ -295,6 +405,18 @@ fn relay_loop(mut conn: Connection, mut link: DaemonLink, mut client_size: (u16,
             link_events |= libc::POLLOUT;
         }
         fds.push(util::pollfd(link.stream.as_raw_fd(), link_events));
+        // Agent-forwarding fds (FDR 0004): the listener then each open channel, in
+        // `AgentEndpoint::pollfds` order. `agent_fd_base` is the index of the
+        // first; `usize::MAX` when forwarding is inactive. Lifted from `server.rs`.
+        let (agent_fd_base, agent_fd_count) = match &agent {
+            Some(ep) => {
+                let agent_fds = ep.pollfds();
+                let base = fds.len();
+                fds.extend_from_slice(&agent_fds);
+                (base, agent_fds.len())
+            }
+            None => (usize::MAX, 0),
+        };
 
         match util::poll(&mut fds, timeout) {
             Ok(_) => {}
@@ -318,6 +440,44 @@ fn relay_loop(mut conn: Connection, mut link: DaemonLink, mut client_size: (u16,
                         let Ok(msg) = ClientMessage::decode(&assembled) else {
                             continue;
                         };
+                        last_heard = now;
+                        // Agent forwarding (FDR 0004, Task 3.2): consume the peer's
+                        // relay-TERMINATED agent caps into the stream + endpoint,
+                        // lifted verbatim from `server.rs`. AGENT_FORWARD latches
+                        // `agent_seen` (gates our own AGENT_DATA/ACK); AGENT_DATA
+                        // chunks feed the inbox -> decoder -> channel writes;
+                        // AGENT_ACK drains our outbox. A decoder error tears the
+                        // endpoint down (a corrupt authenticated stream is
+                        // unrecoverable). These caps NEVER go to the daemon.
+                        if let Some(ep) = agent.as_mut() {
+                            if caps::find(&msg.caps, caps::CAP_AGENT_FORWARD).is_some() {
+                                agent_seen = true;
+                            }
+                            let mut decode_failed = false;
+                            for cap in caps::find_all(&msg.caps, caps::CAP_AGENT_DATA) {
+                                let Ok((offset, bytes)) = caps::decode_agent_data(&cap.payload)
+                                else {
+                                    decode_failed = true;
+                                    break;
+                                };
+                                match agent_stream.recv(offset, bytes) {
+                                    Ok(records) => ep.apply_records(&records),
+                                    Err(_) => {
+                                        decode_failed = true;
+                                        break;
+                                    }
+                                }
+                            }
+                            if let Some(cap) = caps::find(&msg.caps, caps::CAP_AGENT_ACK) {
+                                if let Ok(upto) = caps::decode_agent_ack(&cap.payload) {
+                                    agent_stream.ack(upto);
+                                }
+                            }
+                            if decode_failed {
+                                agent = None; // drop the endpoint + channels
+                                agent_seen = false;
+                            }
+                        }
                         // Resize -> Tag::Resize (mirror handle_client_message).
                         if msg.rows > 0 && msg.cols > 0 && (msg.rows, msg.cols) != client_size {
                             client_size = (msg.rows, msg.cols);
@@ -372,6 +532,26 @@ fn relay_loop(mut conn: Connection, mut link: DaemonLink, mut client_size: (u16,
             }
         }
 
+        // Agent-forwarding sockets (FDR 0004, Task 3.2): accept new connections
+        // and read agent-client bytes, framing both as records onto the outbound
+        // stream. `read_channels` scans every channel, so any signalled agent fd
+        // drives it. Lifted from `server.rs`; the records ride out as CAP_AGENT_*
+        // on the relay's frames (never to the daemon).
+        if agent_fd_base != usize::MAX {
+            if let Some(ep) = agent.as_mut() {
+                let agent_revents = (agent_fd_base..agent_fd_base + agent_fd_count)
+                    .any(|i| fds[i].revents & (libc::POLLIN | err_events) != 0);
+                if agent_revents {
+                    for rec in ep.accept_pending() {
+                        agent_stream.send(&rec);
+                    }
+                    for rec in ep.read_channels() {
+                        agent_stream.send(&rec);
+                    }
+                }
+            }
+        }
+
         // --- daemon -> UDP client ---
         if fds[1].revents & libc::POLLIN != 0 {
             match link.read.read_from(link.stream.as_raw_fd()) {
@@ -388,7 +568,14 @@ fn relay_loop(mut conn: Connection, mut link: DaemonLink, mut client_size: (u16,
                                 // optimistic-echo client, so acking received input
                                 // as echoed is inert here.
                                 let ack = inbox.next_offset();
-                                let out = rewrap(daemon_frame, link.frame_offset, ack, ack);
+                                let mut out = rewrap(daemon_frame, link.frame_offset, ack, ack);
+                                // Stamp the relay-terminated agent caps onto the
+                                // outgoing frame (Task 3.2): the daemon forwards
+                                // content caps verbatim, but AGENT_FORWARD/DATA/ACK
+                                // are the relay's own (RFC 0008 §4). Appended to the
+                                // daemon's already-`own_table`d caps.
+                                out.caps
+                                    .extend(agent_caps(&agent_stream, agent_seen, agent.is_some()));
                                 last_frame_num = out.frame_num;
                                 // Supersede the held frame (O(1)): the daemon
                                 // anchored this frame at the client's acked base,
@@ -403,6 +590,10 @@ fn relay_loop(mut conn: Connection, mut link: DaemonLink, mut client_size: (u16,
                                         send_payload(&mut conn, &mut fragmenter, bytes);
                                     }
                                     last_send = now;
+                                    // This fresh frame carried the current agent
+                                    // caps, so advance the carrier clock too — no
+                                    // redundant agent carrier right behind it.
+                                    last_agent_send = now;
                                 }
                             }
                             Tag::Exit => {
@@ -459,23 +650,59 @@ fn relay_loop(mut conn: Connection, mut link: DaemonLink, mut client_size: (u16,
             }
         }
 
-        // Retransmit the one held (unacked) frame on the RTO, or — when nothing is
-        // held — heartbeat an Empty frame so a static screen still advances the
-        // client's input ack and signals peer-liveness. Both gate on a reachable
-        // peer and restamp `last_send`; a fresh daemon frame this iteration already
-        // stamped `last_send = now`, so neither re-fires. Mirrors `server.rs`'s
-        // retransmit / send_empty gates (one shared `last_send`).
+        // The periodic-send decision (see `periodic_send`): retransmit + heartbeat
+        // run on `last_send` (the frame-reliability clock); the agent-output carrier
+        // runs on its OWN `last_agent_send` clock so a continuously-pending agent
+        // stream can never starve the RTO retransmit. Every empty frame carries the
+        // current agent caps (Task 3.2) so AGENT_FORWARD stays advertised and pending
+        // AGENT_DATA/ACK flow even while the screen is idle. A fresh daemon frame this
+        // iteration already stamped both clocks to `now`.
+        let out_agent_caps = agent_caps(&agent_stream, agent_seen, agent.is_some());
         if conn.has_remote() {
-            if held.is_held() {
-                if now.saturating_sub(last_send) >= conn.rto() {
-                    if let Some(bytes) = held.bytes() {
-                        send_payload(&mut conn, &mut fragmenter, bytes);
-                    }
-                    last_send = now;
+            // Recompute the pending flag LIVE here (like `held.is_held()`), not from
+            // the pre-poll snapshot used to size the timeout: this iteration's
+            // agent-socket reads (`accept_pending`/`read_channels` above) may have
+            // enqueued bytes since, and gating the carrier on the stale snapshot
+            // would defer them a full loop. `agent_stream.pending()` reflects them.
+            let carrier_pending =
+                agent.is_some() && agent_seen && !agent_stream.pending().is_empty();
+            let due = periodic_send(
+                held.is_held(),
+                carrier_pending,
+                now,
+                last_send,
+                last_agent_send,
+                conn.rto(),
+            );
+            // A held visible frame's pre-encoded bytes already carry the agent caps
+            // stamped when it was held; fresh agent bytes ride the independent carrier.
+            if due.retransmit {
+                if let Some(bytes) = held.bytes() {
+                    send_payload(&mut conn, &mut fragmenter, bytes);
                 }
-            } else if now.saturating_sub(last_send) >= sync::HEARTBEAT_INTERVAL {
-                send_empty(&mut conn, &mut fragmenter, &inbox, last_frame_num);
                 last_send = now;
+            } else if due.heartbeat {
+                send_empty(
+                    &mut conn,
+                    &mut fragmenter,
+                    &inbox,
+                    last_frame_num,
+                    &out_agent_caps,
+                );
+                last_send = now;
+            }
+            // The carrier fires even while a visible frame is held or being
+            // retransmitted (the held frame's bytes can't carry FRESH agent caps),
+            // and advances `last_agent_send` only — never `last_send`.
+            if due.agent_carrier {
+                send_empty(
+                    &mut conn,
+                    &mut fragmenter,
+                    &inbox,
+                    last_frame_num,
+                    &out_agent_caps,
+                );
+                last_agent_send = now;
             }
         }
 
@@ -493,23 +720,25 @@ fn relay_loop(mut conn: Connection, mut link: DaemonLink, mut client_size: (u16,
     }
 }
 
-/// Send the UDP client an Empty heartbeat frame carrying the current input acks
-/// (RFC 0008 §3): on a static screen it advances the client's `input_ack` and
-/// signals peer-liveness when no visible frame is flowing. Reuses `frame_num`
-/// (the last forwarded number) — an Empty body advances no apply state, so the
-/// client reads the fresher acks without disturbing its screen. Mirrors
-/// `server.rs`'s heartbeat empty-frame path. The caller has already confirmed a
-/// reachable peer.
+/// Send the UDP client an Empty heartbeat / ack frame carrying the current input
+/// acks (RFC 0008 §3) plus any relay-terminated agent caps (`extras`, Task 3.2):
+/// on a static screen it advances the client's `input_ack`, signals peer-liveness,
+/// and ferries pending AGENT_DATA/ACK when no visible frame is flowing. Reuses
+/// `frame_num` (the last forwarded number) — an Empty body advances no apply
+/// state, so the client reads the fresher acks/caps without disturbing its screen.
+/// Mirrors `server.rs`'s heartbeat empty-frame path. The caller has already
+/// confirmed a reachable peer.
 fn send_empty(
     conn: &mut Connection,
     fragmenter: &mut Fragmenter,
     inbox: &InputInbox,
     frame_num: u64,
+    extras: &[Cap],
 ) {
     let ack = inbox.next_offset();
     let frame = ServerFrame {
         flags: 0,
-        caps: caps::own_table(&[]),
+        caps: caps::own_table(extras),
         frame_num,
         input_ack: ack,
         echo_ack: ack,
@@ -551,6 +780,51 @@ fn send_shutdown(
     send_payload(conn, fragmenter, &frame.encode());
 }
 
+/// Which periodic frames the relay loop should emit this iteration.
+struct PeriodicSend {
+    /// Resend the held (unacked) visible frame; caller restamps `last_send`.
+    retransmit: bool,
+    /// Send an Empty heartbeat (static screen, nothing pending); caller restamps
+    /// `last_send`.
+    heartbeat: bool,
+    /// Send an Empty carrier ferrying pending agent bytes; caller restamps
+    /// `last_agent_send` ONLY.
+    agent_carrier: bool,
+}
+
+/// Decide the relay's periodic (non-frame-driven) sends, factored out of
+/// `relay_loop` so the clock decoupling is unit-testable.
+///
+/// The retransmit and heartbeat gate on `last_send` (the frame-reliability clock);
+/// the agent carrier gates on its OWN `last_agent_send`. This decoupling is the
+/// Task 3.2 code-review fix: on a SHARED clock, `SEND_INTERVAL_MIN` (20ms) <
+/// `MIN_RTO` (50ms) would let a continuously-pending agent stream reset the clock
+/// every 20ms and keep the `>= rto` retransmit gate from ever tripping — a lost
+/// visible frame would never retransmit while agent bytes flow. `server.rs` avoids
+/// this differently (its force-ack is gated behind "no outstanding frame" and its
+/// retransmit re-encodes fresh caps, so it needs no separate carrier); the relay's
+/// pre-encoded held bytes can't carry FRESH agent caps, so it needs the carrier —
+/// on the independent clock. Retransmit and carrier may both be due in one
+/// iteration (a lost frame plus freshly-pending agent bytes); that is correct — the
+/// retransmit replays the held bytes and the carrier ferries the new agent caps.
+fn periodic_send(
+    held: bool,
+    agent_out_pending: bool,
+    now: u64,
+    last_send: u64,
+    last_agent_send: u64,
+    rto: u64,
+) -> PeriodicSend {
+    PeriodicSend {
+        retransmit: held && now.saturating_sub(last_send) >= rto,
+        heartbeat: !held
+            && !agent_out_pending
+            && now.saturating_sub(last_send) >= sync::HEARTBEAT_INTERVAL,
+        agent_carrier: agent_out_pending
+            && now.saturating_sub(last_agent_send) >= SEND_INTERVAL_MIN,
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -559,13 +833,14 @@ mod tests {
     use posh_term::Terminal;
 
     use crate::remote::caps::{
-        CAP_AGENT_FORWARD, CAP_LOSSY, CAP_MORPH, CAP_PROTOCOL_VERSION, CAP_SCROLLBACK,
+        CAP_AGENT_ACK, CAP_AGENT_DATA, CAP_AGENT_FORWARD, CAP_LOSSY, CAP_MORPH,
+        CAP_PROTOCOL_VERSION, CAP_SCROLLBACK,
     };
     use crate::remote::crypto::Key;
     use crate::remote::datagram::Family;
     use crate::remote::display::Snapshot;
     use crate::remote::framesync::{ApplyOutcome, FrameApplier, FrameProducer, FrameSync};
-    use crate::remote::sync::InputOutbox;
+    use crate::remote::sync::{AgentRecord, InputOutbox, RecordKind};
     use crate::util::now_ms;
 
     // ---- pure re-wrap / cap-handshake helpers ------------------------------
@@ -666,6 +941,74 @@ mod tests {
         assert!(!held.is_held(), "RESYNC clears the held frame");
     }
 
+    /// The Task 3.2 anti-starvation invariant: a held (lost) visible frame plus a
+    /// continuously-pending agent stream. On a SHARED clock the 20ms agent carrier
+    /// (`SEND_INTERVAL_MIN` < the 50ms `rto`) would keep resetting the clock so the
+    /// retransmit gate never trips. With the decoupled `last_agent_send`, the
+    /// retransmit is due the instant `now - last_send >= rto`, no matter how
+    /// recently the carrier fired.
+    #[test]
+    fn agent_carrier_never_starves_the_rto_retransmit() {
+        let rto = 50u64;
+        let last_send = 0u64; // the held frame was last sent at t=0
+        let mut last_agent_send = 0u64;
+        let mut retransmit_at = None;
+        // Step every 10ms; the agent carrier fires whenever due (every 20ms),
+        // advancing only ITS clock — exactly the shared-clock starvation trigger.
+        let mut t = 0u64;
+        while t <= 60 {
+            let due = periodic_send(
+                /* held */ true, /* agent_out_pending */ true, t, last_send,
+                last_agent_send, rto,
+            );
+            if due.agent_carrier {
+                last_agent_send = t;
+            }
+            if due.retransmit {
+                retransmit_at = Some(t);
+                break;
+            }
+            t += 10;
+        }
+        assert_eq!(
+            retransmit_at,
+            Some(50),
+            "the held frame retransmits at ~rto even while the agent carrier fires \
+             every SEND_INTERVAL_MIN"
+        );
+    }
+
+    /// Retransmit and heartbeat gate on `last_send`; the carrier gates on its own
+    /// clock. The heartbeat and carrier are mutually exclusive on the pending state,
+    /// and the retransmit ignores `last_agent_send` entirely.
+    #[test]
+    fn periodic_send_clocks_are_decoupled() {
+        // A held frame past the rto retransmits even though the carrier fired just
+        // 1ms ago (last_agent_send=99) — the retransmit gate ignores that clock.
+        let due = periodic_send(true, true, 100, 0, 99, 50);
+        assert!(due.retransmit, "held frame past rto retransmits");
+        assert!(
+            !due.agent_carrier,
+            "carrier not due 1ms after firing — yet the retransmit above still is"
+        );
+        assert!(!due.heartbeat, "no heartbeat while a frame is held");
+
+        // Pending agent bytes ⇒ carrier due, heartbeat suppressed.
+        let due = periodic_send(false, true, 10_000, 0, 0, 50);
+        assert!(due.agent_carrier);
+        assert!(!due.heartbeat);
+        assert!(!due.retransmit, "nothing held ⇒ nothing to retransmit");
+
+        // Static screen, no agent bytes, past the heartbeat interval ⇒ heartbeat.
+        let due = periodic_send(false, false, sync::HEARTBEAT_INTERVAL + 1, 0, 0, 50);
+        assert!(due.heartbeat);
+        assert!(!due.agent_carrier);
+
+        // A recently-sent held frame (within rto) does NOT retransmit yet.
+        let due = periodic_send(true, false, 10, 0, 0, 50);
+        assert!(!due.retransmit, "held frame within rto waits");
+    }
+
     // ---- integration: real relay_loop + synthetic daemon + synthetic client -
 
     /// Fill a screen so a later small append diffs as a clear win (a `Diff`, not
@@ -746,7 +1089,7 @@ mod tests {
         );
         ipc::append_frame(&mut link.write, Tag::Resize, &ipc::encode_resize(rows, cols));
 
-        let relay = std::thread::spawn(move || relay_loop(relay_conn, link, (rows, cols)));
+        let relay = std::thread::spawn(move || relay_loop(relay_conn, link, (rows, cols), None));
 
         // --- synthetic UDP client state ---
         let mut client_term = Terminal::with_scrollback(rows, cols, 0);
@@ -974,7 +1317,7 @@ mod tests {
             );
             ipc::append_frame(&mut link.write, Tag::Resize, &ipc::encode_resize(rows, cols));
 
-            let relay = std::thread::spawn(move || relay_loop(relay_conn, link, (rows, cols)));
+            let relay = std::thread::spawn(move || relay_loop(relay_conn, link, (rows, cols), None));
 
             let mut dterm = Terminal::with_scrollback(rows, cols, 1000);
             fill_screen(&mut dterm);
@@ -1320,5 +1663,282 @@ mod tests {
             "client outbox cleared by the heartbeat ack"
         );
         h.join();
+    }
+
+    // ---- 3.2 capability bridging: agent-terminate, content-forward ---------
+
+    /// The outgoing agent-cap stamping (Task 3.2): no endpoint ⇒ nothing;
+    /// endpoint-but-peer-unseen ⇒ advertise CAP_AGENT_FORWARD only (RFC 0001: no
+    /// DATA/ACK before the peer's own AGENT_FORWARD); peer seen ⇒ FORWARD plus the
+    /// pending DATA + ACK. The mirror of `content_caps`'s daemon-facing split.
+    #[test]
+    fn agent_caps_advertises_forward_and_gates_data_on_seen() {
+        let mut stream = AgentStream::new();
+        stream.send(&AgentRecord {
+            channel: 1,
+            kind: RecordKind::Data,
+            payload: b"x".to_vec(),
+        });
+
+        // No endpoint: no agent caps at all, even if the peer was seen.
+        assert!(agent_caps(&stream, true, false).is_empty());
+
+        // Endpoint up, peer not yet seen: advertise FORWARD, withhold DATA/ACK.
+        let before = agent_caps(&stream, false, true);
+        assert!(caps::find(&before, CAP_AGENT_FORWARD).is_some());
+        assert!(
+            caps::find(&before, CAP_AGENT_DATA).is_none(),
+            "no DATA before the peer's AGENT_FORWARD"
+        );
+        assert!(caps::find(&before, CAP_AGENT_ACK).is_none());
+
+        // Peer seen: FORWARD + the pending DATA + the ACK.
+        let after = agent_caps(&stream, true, true);
+        assert!(caps::find(&after, CAP_AGENT_FORWARD).is_some());
+        assert!(
+            caps::find(&after, CAP_AGENT_DATA).is_some(),
+            "pending agent bytes ride as DATA once the peer is seen"
+        );
+        assert!(caps::find(&after, CAP_AGENT_ACK).is_some());
+    }
+
+    /// Task 3.2 acceptance: agent forwarding TERMINATES at the relay and
+    /// round-trips through it, and the relay-terminated agent caps NEVER reach the
+    /// daemon. Rig: a real `relay_loop` with a live `AgentEndpoint`; a synthetic
+    /// UDP CLIENT that advertises CAP_AGENT_FORWARD and decodes/replies to agent
+    /// records directly (a lightweight stand-in for the `AgentClient` proxy); and
+    /// a fake agent CONSUMER (a plain unix socket — the `git`/`ssh` end) dialing
+    /// the endpoint's `agent/sock`. The consumer's request rides Open+Data records
+    /// out as CAP_AGENT_DATA on the relay's frames; the client's reply rides
+    /// CAP_AGENT_DATA back and the relay writes it to the consumer socket. The
+    /// synthetic DAEMON (a `UnixStream` pair) is inspected to prove its Init caps
+    /// carry NO CAP_AGENT_* even though the client advertised them.
+    #[test]
+    fn agent_forwarding_terminates_at_relay_and_round_trips() {
+        use crate::remote::agent::AgentEndpoint;
+        use std::io::{Read, Write};
+        use std::os::unix::fs::DirBuilderExt;
+        use std::sync::atomic::{AtomicU32, Ordering};
+
+        let (rows, cols) = (24u16, 80u16);
+
+        // Relay AgentEndpoint under a SHORT /tmp base (SUN_LEN, like agent.rs).
+        static COUNTER: AtomicU32 = AtomicU32::new(0);
+        let n = COUNTER.fetch_add(1, Ordering::Relaxed);
+        let pid = unsafe { libc::getpid() };
+        let base = std::path::PathBuf::from(format!("/tmp/posh-relay-agt-{pid}-{n}"));
+        std::fs::remove_dir_all(&base).ok();
+        std::fs::DirBuilder::new()
+            .recursive(true)
+            .mode(0o700)
+            .create(&base)
+            .unwrap();
+        let endpoint = AgentEndpoint::new(&base).unwrap();
+        let agent_sock = endpoint.sock_path().to_path_buf();
+
+        // UDP loopback + daemon socket pair.
+        let key = Key::random();
+        let (relay_conn, port) = Connection::server((62700, 62799), &key, Family::Inet).unwrap();
+        let addr = format!("127.0.0.1:{port}").parse().unwrap();
+        let mut client_conn = Connection::client(addr, &key).unwrap();
+
+        let (relay_end, daemon_end) = UnixStream::pair().unwrap();
+        relay_end.set_nonblocking(true).unwrap();
+        daemon_end.set_nonblocking(true).unwrap();
+
+        // The Init the relay would send: the CLIENT advertises CAP_AGENT_FORWARD,
+        // but `content_caps` strips it so the daemon Init carries only content caps.
+        let client_advertised = vec![
+            Cap {
+                id: CAP_AGENT_FORWARD,
+                payload: vec![],
+            },
+            Cap {
+                id: CAP_SCROLLBACK,
+                payload: vec![0],
+            },
+        ];
+        let mut link = DaemonLink {
+            stream: relay_end,
+            read: FrameBuffer::new(),
+            write: Vec::new(),
+            frame_offset: 0,
+        };
+        ipc::append_frame(
+            &mut link.write,
+            Tag::Init,
+            &init_payload(rows, cols, &content_caps(&client_advertised)),
+        );
+        ipc::append_frame(&mut link.write, Tag::Resize, &ipc::encode_resize(rows, cols));
+
+        let relay =
+            std::thread::spawn(move || relay_loop(relay_conn, link, (rows, cols), Some(endpoint)));
+
+        // The agent CONSUMER dials the relay's agent/sock and issues one request.
+        // The listener socket exists (bound in AgentEndpoint::new before the thread
+        // spawn), so this connect + write queue for the relay's first poll.
+        let mut consumer = UnixStream::connect(&agent_sock).unwrap();
+        consumer.set_nonblocking(true).unwrap();
+        consumer.write_all(b"REQUEST").unwrap();
+
+        // Synthetic UDP client: decode agent records, reply to the request.
+        let mut cstream = AgentStream::new();
+        let mut client_agent_seen = false;
+        let mut saw_open = false;
+        let mut got_request = false;
+        let mut sent_reply = false;
+
+        let mut fragmenter = Fragmenter::new();
+        let mut assembly = FragmentAssembly::new();
+
+        // Daemon side: capture the Init caps once (must carry no agent caps).
+        let mut dread = FrameBuffer::new();
+        let mut daemon_init_caps: Option<Vec<Cap>> = None;
+
+        let mut consumer_reply: Vec<u8> = Vec::new();
+        let mut done = false;
+        let deadline = now_ms() + 15_000;
+        while now_ms() < deadline {
+            // client -> relay: advertise FORWARD; add DATA/ACK once FORWARD is seen.
+            let mut extras = vec![Cap {
+                id: CAP_AGENT_FORWARD,
+                payload: vec![],
+            }];
+            if client_agent_seen {
+                extras.extend(caps::encode_agent_data(cstream.send_base(), cstream.pending()));
+                extras.push(caps::encode_agent_ack(cstream.recv_ack()));
+            }
+            let msg = ClientMessage {
+                flags: 0,
+                caps: caps::own_table(&extras),
+                acked_frame: 0,
+                rows,
+                cols,
+                input_base: 0,
+                input: Vec::new(),
+            };
+            for frag in fragmenter.make_fragments(&msg.encode(), sync::FRAGMENT_CONTENTS_MAX) {
+                client_conn.send(&frag.to_bytes()).unwrap();
+            }
+
+            std::thread::sleep(Duration::from_millis(10));
+
+            // relay -> client: consume agent caps; decode records; reply once.
+            loop {
+                match client_conn.recv() {
+                    Ok(Some(payload)) => {
+                        let Ok(frag) = sync::Fragment::from_bytes(&payload) else {
+                            continue;
+                        };
+                        let Some(assembled) = assembly.add(frag) else {
+                            continue;
+                        };
+                        let Ok(frame) = ServerFrame::decode(&assembled) else {
+                            continue;
+                        };
+                        if caps::find(&frame.caps, CAP_AGENT_FORWARD).is_some() {
+                            client_agent_seen = true;
+                        }
+                        for cap in caps::find_all(&frame.caps, CAP_AGENT_DATA) {
+                            let Ok((offset, bytes)) = caps::decode_agent_data(&cap.payload) else {
+                                continue;
+                            };
+                            let Ok(records) = cstream.recv(offset, bytes) else {
+                                continue;
+                            };
+                            for rec in records {
+                                match rec.kind {
+                                    RecordKind::Open => saw_open = true,
+                                    RecordKind::Data if rec.payload == b"REQUEST" => {
+                                        got_request = true;
+                                        if !sent_reply {
+                                            cstream.send(&AgentRecord {
+                                                channel: rec.channel,
+                                                kind: RecordKind::Data,
+                                                payload: b"REPLY".to_vec(),
+                                            });
+                                            sent_reply = true;
+                                        }
+                                    }
+                                    _ => {}
+                                }
+                            }
+                        }
+                        if let Some(cap) = caps::find(&frame.caps, CAP_AGENT_ACK) {
+                            if let Ok(upto) = caps::decode_agent_ack(&cap.payload) {
+                                cstream.ack(upto);
+                            }
+                        }
+                    }
+                    Ok(None) => continue,
+                    Err(e) if e.kind() == std::io::ErrorKind::WouldBlock => break,
+                    Err(_) => break,
+                }
+            }
+
+            // daemon side: capture the Init caps once.
+            let _ = dread.read_from(daemon_end.as_raw_fd());
+            while let Ok(Some(rec)) = dread.next() {
+                if rec.tag == Tag::Init && daemon_init_caps.is_none() {
+                    if let Some((table, _)) =
+                        rec.payload.get(4..).and_then(|b| caps::decode_table(b).ok())
+                    {
+                        daemon_init_caps = Some(table);
+                    }
+                }
+            }
+
+            // consumer: collect the relay-applied reply bytes.
+            let mut buf = [0u8; 64];
+            if let Ok(got) = consumer.read(&mut buf) {
+                if got > 0 {
+                    consumer_reply.extend_from_slice(&buf[..got]);
+                }
+            }
+
+            if saw_open && got_request && consumer_reply == b"REPLY" {
+                done = true;
+                break;
+            }
+        }
+
+        // Wind the relay down, draining the daemon so its Detach write lands.
+        let shutdown = ClientMessage {
+            flags: sync::CLIENT_FLAG_SHUTDOWN,
+            caps: caps::own_table(&[]),
+            acked_frame: 0,
+            rows,
+            cols,
+            input_base: 0,
+            input: Vec::new(),
+        };
+        for frag in fragmenter.make_fragments(&shutdown.encode(), sync::FRAGMENT_CONTENTS_MAX) {
+            let _ = client_conn.send(&frag.to_bytes());
+        }
+        let drain_deadline = now_ms() + 3000;
+        while now_ms() < drain_deadline && !relay.is_finished() {
+            let _ = dread.read_from(daemon_end.as_raw_fd());
+            while let Ok(Some(_)) = dread.next() {}
+            std::thread::sleep(Duration::from_millis(10));
+        }
+        relay.join().unwrap().unwrap();
+
+        assert!(
+            done,
+            "agent round-trip did not complete: saw_open={saw_open} \
+             got_request={got_request} reply={consumer_reply:?}"
+        );
+        let init = daemon_init_caps.expect("daemon never received an Init");
+        for id in [CAP_AGENT_FORWARD, CAP_AGENT_DATA, CAP_AGENT_ACK] {
+            assert!(
+                caps::find(&init, id).is_none(),
+                "relay-terminated agent cap {id} leaked into the daemon Init"
+            );
+        }
+        assert!(
+            caps::find(&init, CAP_SCROLLBACK).is_some(),
+            "content caps must still reach the daemon (regression guard)"
+        );
+        std::fs::remove_dir_all(&base).ok();
     }
 }
