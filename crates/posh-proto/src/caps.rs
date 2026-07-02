@@ -57,6 +57,17 @@ pub const CAP_AGENT_DATA: u8 = 7;
 /// `u64` big-endian offset, one past the last contiguous byte received.
 #[allow(dead_code)]
 pub const CAP_AGENT_ACK: u8 = 8;
+/// Lossy-relay marker (RFC 0008 §3, the Phase 3 frame relay). Client entry
+/// (empty payload): "I relay your frames onto a LOSSY link (encrypted UDP to a
+/// remote posh client), so do NOT self-ack me — advance my diff base only on a
+/// forwarded `Tag::FrameAck`." The session daemon's per-client `FrameProducer`
+/// then runs in the same ack-gated, base-anchored mode it uses for a real UDP
+/// peer (each new frame supersedes the last unacked one, so the relay keeps only
+/// O(1) retransmit state). A reliable local client never sends this, so its
+/// stream stays byte-identical to today (self-acked, always-diff, DumpDiff). Id 9
+/// — the next free low id after the agent trio (6/7/8); id 2 stays reserved for
+/// the anticipated TERM_FEATURES.
+pub const CAP_LOSSY: u8 = 9;
 
 /// Max agent-stream bytes carried by one [`CAP_AGENT_DATA`] entry: the table's
 /// `len: u8` budget (255) minus the 8-byte `u64` offset prefix. Keeping agent

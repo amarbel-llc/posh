@@ -12,7 +12,7 @@ use crate::pty::{self, PtyChild};
 use crate::remote::caps;
 use crate::remote::display::Snapshot;
 use crate::remote::framesync::FrameProducer;
-use crate::remote::sync::{FrameBody, ServerFrame};
+use crate::remote::sync::{base_checksum, FrameBody, ServerFrame};
 use crate::session::ipc::{self, FrameBuffer, SessionInfo, Tag};
 use crate::session::{self, Config};
 use crate::util::{self, Error, Result};
@@ -122,6 +122,16 @@ struct ClientConn {
     // acked base, so a freshly attached client's first frame is a `Full` while
     // an established one gets a `Diff`. Default `None` ⇒ today's `Tag::Output`.
     producer: Option<FrameProducer>,
+    // Whether this client relays its frames onto a LOSSY link (it advertised
+    // `CAP_LOSSY` on Init — the Phase 3 frame relay, RFC 0008 §3). A lossy client
+    // is NOT self-acked: `queue_frame`/scrollback skip the immediate
+    // `producer.ack`, so the diff base advances only on a forwarded
+    // `Tag::FrameAck`, each new frame supersedes the last unacked one, and the
+    // relay keeps O(1) retransmit state. It also selects the codec (MorphDelta if
+    // `CAP_MORPH`) and stamps `base_sum` (if `CAP_BASE_SUM`) from its caps. A
+    // reliable local client never sets this, so `lossy` stays false and its frame
+    // stream is byte-identical to today (self-acked, DumpDiff, no base_sum).
+    lossy: bool,
     // Per-client scrollback-sync bookkeeping (RFC 0002 §2/§3), the session-socket
     // analog of the roaming server's per-connection `sb_floor`/`acked_sb_total`.
     // `sb_floor` is the daemon terminal's monotonic scrollback total at which
@@ -163,7 +173,14 @@ impl ClientConn {
         };
         if payload.len() > 4 {
             match caps::decode_table(&payload[4..]) {
-                Ok((advertised, _)) => self.caps = advertised,
+                Ok((advertised, _)) => {
+                    // A relay advertises `CAP_LOSSY` to opt this client into
+                    // lossy mode (no self-ack; RFC 0008 §3). Tracks the latest
+                    // negotiated table, so a bare re-Init (which skips this block)
+                    // preserves it exactly like `self.caps`.
+                    self.lossy = caps::find(&advertised, caps::CAP_LOSSY).is_some();
+                    self.caps = advertised;
+                }
                 Err(e) => util::log_write(
                     "warn",
                     &format!("malformed Init cap table, treating peer as baseline: {e}"),
@@ -196,19 +213,42 @@ impl ClientConn {
     /// `Tag::Frame`. Returns `false` (queuing nothing) when this client has no
     /// producer, so the caller falls back to `Tag::Output`.
     ///
-    /// Reliable-as-degenerate (RFC 0008 §3): the socket delivers in order with
-    /// no loss, so after queuing the frame we immediately `ack` it — the acked
-    /// base is always the last frame, the next frame is a `Diff` against it, and
-    /// the producer's retransmit machinery idles. `input_ack`/`echo_ack` are
-    /// inert (the socket input stream is itself reliable; Task 1.5).
+    /// Reliable client (the default local path): reliable-as-degenerate (RFC 0008
+    /// §3) — the socket delivers in order with no loss, so after queuing the frame
+    /// we immediately `ack` it. The acked base is always the last frame, the next
+    /// frame is a `Diff` against it (DumpDiff — the socket cannot negotiate a
+    /// codec), and the producer's retransmit machinery idles. `input_ack`/
+    /// `echo_ack` are inert (the socket input stream is itself reliable).
+    ///
+    /// Lossy client (the Phase 3 relay, `CAP_LOSSY`): NOT self-acked — the base
+    /// advances only on a forwarded `Tag::FrameAck`, so each new frame supersedes
+    /// the last unacked one (bounding the relay's retransmit buffer to O(1)). The
+    /// codec is selected from the negotiated caps (`CAP_MORPH` ⇒ MorphDelta) and,
+    /// with `CAP_BASE_SUM`, the diff base's checksum is stamped so the far client
+    /// can verify its base before applying (mirror of `server.rs`).
     fn queue_frame(&mut self, dump: Vec<u8>, snapshot: Snapshot, alt: bool, dims: (u16, u16)) -> bool {
+        // Read the lossy-mode inputs before borrowing `producer` mutably. A
+        // reliable client leaves all three false ⇒ today's exact behavior.
+        let lossy = self.lossy;
+        let use_morph = lossy && caps::find(&self.caps, caps::CAP_MORPH).is_some();
+        let stamp_base_sum = lossy && caps::find(&self.caps, caps::CAP_BASE_SUM).is_some();
         let encoded = match self.producer.as_mut() {
             None => return false,
             Some(producer) => {
                 producer.advance_visible(dump, snapshot, alt, dims, 0);
-                // DumpDiff for Phase 1: the local client cannot negotiate
-                // CAP_MORPH over the socket yet, so never select MorphDelta.
-                let body = producer.encode_visible(false);
+                let mut body = producer.encode_visible(use_morph);
+                // RFC 0006: stamp the diff base's checksum so a lossy client can
+                // confirm it holds the same base before applying (mirror
+                // server.rs:871-883). Diff only — a Morph base is a snapshot, not
+                // the client's held dump bytes, so the byte checksum does not
+                // apply there.
+                if stamp_base_sum {
+                    if let Some(acked) = producer.acked_dump() {
+                        if let FrameBody::Diff { base_sum, .. } = &mut body {
+                            *base_sum = Some(base_checksum(acked));
+                        }
+                    }
+                }
                 let frame_num = producer.current_num();
                 let bytes = ServerFrame {
                     flags: 0,
@@ -219,12 +259,44 @@ impl ClientConn {
                     body,
                 }
                 .encode();
-                producer.ack(frame_num);
+                // Reliable client: self-ack now (degenerate loss machinery). Lossy
+                // client: withhold — its base advances only on `Tag::FrameAck`.
+                if !lossy {
+                    producer.ack(frame_num);
+                }
                 bytes
             }
         };
         self.queue(Tag::Frame, &encoded);
         true
+    }
+
+    /// Apply a `Tag::FrameAck` from a lossy relay client (RFC 0008 §3): advance
+    /// this client's producer base to the acked frame — the base-advance a
+    /// reliable client gets from the immediate self-ack in `queue_frame`. The
+    /// `FRAME_ACK_RESYNC` flag additionally drops the base so the next frame is a
+    /// forced `Full` keyframe (base-sum divergence recovery). A non-lossy client,
+    /// a malformed payload, or a producerless client is a no-op. Extracted (like
+    /// `apply_init`) so the daemon-loop arm and the inline tests drive one path.
+    fn apply_frame_ack(&mut self, payload: &[u8]) {
+        // `Tag::FrameAck` is a lossy-relay verb: a reliable client self-acks in
+        // `queue_frame` and never sends it, so ignore it here — that keeps a
+        // reliable client's producer state provably untouched by this path.
+        if !self.lossy {
+            return;
+        }
+        let Some((acked, flags)) = ipc::decode_frame_ack(payload) else {
+            return;
+        };
+        let Some(producer) = self.producer.as_mut() else {
+            return;
+        };
+        if let Some(sb_total) = producer.ack(acked) {
+            self.acked_sb_total = self.acked_sb_total.max(sb_total);
+        }
+        if flags & ipc::FRAME_ACK_RESYNC != 0 {
+            producer.drop_acked_base();
+        }
     }
 
     /// Whether this client advertised `CAP_SCROLLBACK` (RFC 0002 §1) on its
@@ -302,8 +374,13 @@ impl ClientConn {
             body,
         }
         .encode();
-        if let Some(sb_total) = producer.ack(frame_num) {
-            self.acked_sb_total = self.acked_sb_total.max(sb_total);
+        // Reliable client self-acks the scrollback frame at once (produced ==
+        // acked); a lossy client is NOT self-acked — its base advances only on a
+        // forwarded `Tag::FrameAck`, mirroring the visible-frame path.
+        if !self.lossy {
+            if let Some(sb_total) = producer.ack(frame_num) {
+                self.acked_sb_total = self.acked_sb_total.max(sb_total);
+            }
         }
         self.queue(Tag::Frame, &bytes);
         true
@@ -700,6 +777,7 @@ fn daemon_loop(
                     cols: 0,
                     caps: Vec::new(),
                     producer: None,
+                    lossy: false,
                     sb_floor: 0,
                     acked_sb_total: 0,
                 });
@@ -913,6 +991,12 @@ fn daemon_loop(
                                     // a retransmitted request idempotent.
                                     open_shell = true;
                                 }
+                                // A lossy relay client (RFC 0008 §3) acking one of
+                                // its `Tag::Frame`s — the base-advance a reliable
+                                // client gets from the immediate self-ack. Shared
+                                // with the tests via `apply_frame_ack` (like
+                                // `apply_init`).
+                                Tag::FrameAck => c.apply_frame_ack(&frame.payload),
                                 // Output, Ack, Exit, and Frame are all
                                 // daemon->client only; ignore if received from
                                 // a client.
@@ -1203,6 +1287,7 @@ mod tests {
             cols: 0,
             caps: Vec::new(),
             producer: None,
+            lossy: false,
             sb_floor: 0,
             acked_sb_total: 0,
         }
@@ -1302,6 +1387,7 @@ mod tests {
             cols: 0,
             caps: Vec::new(),
             producer: None,
+            lossy: false,
             sb_floor: 0,
             acked_sb_total: 0,
         };
@@ -1389,6 +1475,7 @@ mod tests {
             cols: 0,
             caps: Vec::new(),
             producer: None,
+            lossy: false,
             sb_floor: 0,
             acked_sb_total: 0,
         };
@@ -1535,6 +1622,7 @@ mod tests {
             cols: 0,
             caps: Vec::new(),
             producer: None,
+            lossy: false,
             sb_floor: 0,
             acked_sb_total: 0,
         };
@@ -1741,6 +1829,7 @@ mod tests {
             cols: 0,
             caps: Vec::new(),
             producer: None,
+            lossy: false,
             sb_floor: 0,
             acked_sb_total: 0,
         };
@@ -2013,5 +2102,323 @@ mod tests {
             Snapshot::from_term(&overlay),
             "a mid-overlay attach reconstructs the overlay screen, not the session"
         );
+    }
+
+    // ---- Task 3.0: daemon lossy-client mode + Tag::FrameAck (RFC 0008 §3) ----
+
+    /// A LOSSY relay client: its `Tag::Init` advertises `CAP_LOSSY` plus any
+    /// `extra` content caps (MORPH/BASE_SUM/SCROLLBACK). With the gate on it gets a
+    /// `FrameProducer` like any frame-capable client, but `lossy` is set so it is
+    /// NOT self-acked — its base advances only on `apply_frame_ack`.
+    fn lossy_conn(rows: u16, cols: u16, extra: &[caps::Cap]) -> (ClientConn, UnixStream) {
+        let (stream, peer) = UnixStream::pair().unwrap();
+        let mut c = ClientConn {
+            stream,
+            read_buf: FrameBuffer::new(),
+            write_buf: Vec::new(),
+            rows: 0,
+            cols: 0,
+            caps: Vec::new(),
+            producer: None,
+            lossy: false,
+            sb_floor: 0,
+            acked_sb_total: 0,
+        };
+        let mut table = vec![caps::Cap {
+            id: caps::CAP_LOSSY,
+            payload: vec![],
+        }];
+        table.extend_from_slice(extra);
+        let mut init = ipc::encode_resize(rows, cols).to_vec();
+        init.extend_from_slice(&caps::encode_table(&caps::own_table(&table)));
+        c.apply_init(&init);
+        c.maybe_enable_frames(true);
+        (c, peer)
+    }
+
+    /// Decode the queued `Tag::Frame` records into whole `ServerFrame`s (header +
+    /// body), asserting every record is a `Tag::Frame`. Unlike `decode_frame_bodies`
+    /// this keeps `frame_num`, so the ack-lag test can check the number climbing
+    /// while the diff base stays frozen.
+    fn decode_server_frames(write_buf: &[u8]) -> Vec<ServerFrame> {
+        let mut fb = FrameBuffer::new();
+        fb.feed(write_buf);
+        let mut out = Vec::new();
+        while let Some(frame) = fb.next().unwrap() {
+            assert_eq!(frame.tag, Tag::Frame, "a frame client must receive Tag::Frame");
+            out.push(ServerFrame::decode(&frame.payload).unwrap());
+        }
+        out
+    }
+
+    #[test]
+    fn init_with_cap_lossy_marks_client_lossy() {
+        let mut c = test_client_conn();
+        let mut init = ipc::encode_resize(24, 80).to_vec();
+        init.extend_from_slice(&caps::encode_table(&caps::own_table(&[caps::Cap {
+            id: caps::CAP_LOSSY,
+            payload: vec![],
+        }])));
+        c.apply_init(&init);
+        assert!(c.lossy, "CAP_LOSSY on Init marks the client lossy");
+
+        // A bare re-Init preserves it (skips the cap block), like `self.caps`.
+        c.apply_init(&ipc::encode_resize(30, 100));
+        assert!(c.lossy, "a bare re-Init preserves the lossy marker");
+
+        // A reliable Init (no CAP_LOSSY) leaves it false.
+        let mut r = test_client_conn();
+        let mut rinit = ipc::encode_resize(24, 80).to_vec();
+        rinit.extend_from_slice(&caps::encode_table(&caps::own_table(&[])));
+        r.apply_init(&rinit);
+        assert!(!r.lossy, "no CAP_LOSSY ⇒ reliable");
+    }
+
+    /// (a) A lossy client is NOT self-acked: withholding `Tag::FrameAck` freezes
+    /// the diff base while `frame_num` keeps climbing (ack-lag), exactly like the
+    /// UDP server. Once the relay forwards an ack the base advances there.
+    #[test]
+    fn lossy_client_frames_are_not_self_acked_and_base_lags() {
+        let (rows, cols) = (24u16, 80u16);
+        let mut term = Terminal::with_scrollback(rows, cols, 1000);
+        fill_screen(&mut term);
+
+        // DumpDiff (no CAP_MORPH) so bodies stay decodable and `base` is readable.
+        let (mut c, _peer) = lossy_conn(rows, cols, &[]);
+        assert!(c.lossy && c.producer.is_some());
+
+        // Frame 1: the attach Full (against the empty frame-0 base). NOT self-acked.
+        assert!(c.queue_frame(term.dump_vt(), Snapshot::from_term(&term), false, (rows, cols)));
+        assert_eq!(c.producer.as_ref().unwrap().current_num(), 1);
+        assert_eq!(
+            c.producer.as_ref().unwrap().acked_num(),
+            0,
+            "a lossy client must NOT self-ack: the base stays at frame 0"
+        );
+
+        // The relay forwards an ack for frame 1 ⇒ base advances to 1.
+        c.apply_frame_ack(&ipc::encode_frame_ack(1, 0));
+        assert_eq!(c.producer.as_ref().unwrap().acked_num(), 1);
+
+        // Several visible edits with NO further FrameAck: each frame's number
+        // climbs but every body anchors at the FROZEN base 1 (each new frame
+        // supersedes the last unacked one — the O(1) relay-buffer property).
+        for i in 0..3 {
+            term.process(format!("edit {i} ").as_bytes());
+            broadcast_output(std::slice::from_mut(&mut c), &term, b"<raw ignored>");
+        }
+        let frames = decode_server_frames(&c.write_buf);
+        assert_eq!(frames.len(), 4, "one attach Full + three lagged edits");
+        assert_eq!(frames[0].frame_num, 1);
+        assert!(matches!(frames[0].body, FrameBody::Full(_)), "attach ⇒ Full");
+        for (offset, f) in frames[1..].iter().enumerate() {
+            assert_eq!(f.frame_num, 2 + offset as u64, "frame_num climbs with each edit");
+            match &f.body {
+                FrameBody::Diff { base, .. } => {
+                    assert_eq!(*base, 1, "ack-lag freezes the diff base at the last acked frame")
+                }
+                other => panic!("expected a Diff anchored at base 1, got {other:?}"),
+            }
+        }
+        assert_eq!(
+            c.producer.as_ref().unwrap().acked_num(),
+            1,
+            "the base is still 1 — no further FrameAck arrived"
+        );
+    }
+
+    /// (b) A `Tag::FrameAck{acked}` advances the diff base so the next frame
+    /// anchors there — the base tracks the acks the relay forwards.
+    #[test]
+    fn frame_ack_advances_the_diff_base() {
+        let (rows, cols) = (24u16, 80u16);
+        let mut term = Terminal::with_scrollback(rows, cols, 1000);
+        fill_screen(&mut term);
+        let (mut c, _peer) = lossy_conn(rows, cols, &[]);
+
+        // Frame 1 (Full), acked ⇒ base 1.
+        assert!(c.queue_frame(term.dump_vt(), Snapshot::from_term(&term), false, (rows, cols)));
+        c.apply_frame_ack(&ipc::encode_frame_ack(1, 0));
+
+        // Frame 2 diffs against base 1; ack it ⇒ base 2.
+        term.process(b"first edit ");
+        broadcast_output(std::slice::from_mut(&mut c), &term, b"<raw ignored>");
+        c.apply_frame_ack(&ipc::encode_frame_ack(2, 0));
+        assert_eq!(c.producer.as_ref().unwrap().acked_num(), 2);
+
+        // Frame 3 now anchors at the freshly acked base 2.
+        term.process(b"second edit ");
+        broadcast_output(std::slice::from_mut(&mut c), &term, b"<raw ignored>");
+
+        let frames = decode_server_frames(&c.write_buf);
+        assert!(matches!(frames[1].body, FrameBody::Diff { base: 1, .. }), "got {:?}", frames[1].body);
+        assert!(matches!(frames[2].body, FrameBody::Diff { base: 2, .. }), "got {:?}", frames[2].body);
+    }
+
+    /// (c) A `Tag::FrameAck` with the RESYNC flag drops the acked base, forcing the
+    /// next body to a `Full` keyframe (base-sum divergence recovery).
+    #[test]
+    fn frame_ack_resync_forces_a_full_keyframe() {
+        let (rows, cols) = (24u16, 80u16);
+        let mut term = Terminal::with_scrollback(rows, cols, 1000);
+        fill_screen(&mut term);
+        let (mut c, _peer) = lossy_conn(rows, cols, &[]);
+
+        // Frame 1 (Full) acked ⇒ base 1; frame 2 is a Diff against it.
+        assert!(c.queue_frame(term.dump_vt(), Snapshot::from_term(&term), false, (rows, cols)));
+        c.apply_frame_ack(&ipc::encode_frame_ack(1, 0));
+        term.process(b"an edit ");
+        broadcast_output(std::slice::from_mut(&mut c), &term, b"<raw ignored>");
+
+        // RESYNC (acking frame 2, then dropping the base): the next frame is a Full.
+        c.apply_frame_ack(&ipc::encode_frame_ack(2, ipc::FRAME_ACK_RESYNC));
+        assert!(!c.producer.as_ref().unwrap().has_acked_base(), "RESYNC drops the base");
+        term.process(b"more ");
+        broadcast_output(std::slice::from_mut(&mut c), &term, b"<raw ignored>");
+
+        let bodies = decode_frame_bodies(&c.write_buf);
+        assert!(matches!(bodies[0], FrameBody::Full(_)), "attach ⇒ Full");
+        assert!(matches!(bodies[1], FrameBody::Diff { base: 1, .. }), "got {:?}", bodies[1]);
+        assert!(
+            matches!(bodies[2], FrameBody::Full(_)),
+            "RESYNC forces the next body to a Full keyframe, got {:?}",
+            bodies[2]
+        );
+    }
+
+    /// (d) The codec is selected from the negotiated caps: `CAP_MORPH` ⇒ MorphDelta
+    /// bodies for a lossy client (a reliable socket client is always DumpDiff).
+    #[test]
+    fn lossy_client_uses_morph_codec_when_negotiated() {
+        let (rows, cols) = (24u16, 80u16);
+        let mut term = Terminal::with_scrollback(rows, cols, 1000);
+        fill_screen(&mut term);
+        let (mut c, _peer) = lossy_conn(
+            rows,
+            cols,
+            &[caps::Cap {
+                id: caps::CAP_MORPH,
+                payload: vec![],
+            }],
+        );
+
+        // Frame 1 against the empty base is a Full even under Morph; ack it.
+        assert!(c.queue_frame(term.dump_vt(), Snapshot::from_term(&term), false, (rows, cols)));
+        c.apply_frame_ack(&ipc::encode_frame_ack(1, 0));
+
+        // A small edit now morphs against the acked base. (The first frame's codec
+        // is left unasserted: against the blank frame-0 base MorphDelta may emit
+        // either a Full keyframe or a from-blank Morph; the negotiated-codec claim
+        // is what the post-ack frame proves.)
+        term.process(b"appended");
+        broadcast_output(std::slice::from_mut(&mut c), &term, b"<raw ignored>");
+
+        let bodies = decode_frame_bodies(&c.write_buf);
+        assert!(
+            matches!(bodies[1], FrameBody::Morph { base: 1, .. }),
+            "CAP_MORPH ⇒ a Morph against the acked base, got {:?}",
+            bodies[1]
+        );
+    }
+
+    /// (e) With `CAP_BASE_SUM` the daemon stamps the diff base's checksum on the
+    /// Diff so the far client can verify its base before applying (RFC 0006). A
+    /// reliable client's Diff carries no base_sum — the contrast.
+    #[test]
+    fn lossy_client_stamps_base_sum_when_negotiated() {
+        let (rows, cols) = (24u16, 80u16);
+        let mut term = Terminal::with_scrollback(rows, cols, 1000);
+        fill_screen(&mut term);
+        let (mut c, _peer) = lossy_conn(
+            rows,
+            cols,
+            &[caps::Cap {
+                id: caps::CAP_BASE_SUM,
+                payload: vec![],
+            }],
+        );
+
+        // Frame 1 (Full) over the base bytes we capture, then relay-ack it so
+        // frame 2 diffs against that confirmed base.
+        let base_dump = term.dump_vt();
+        assert!(c.queue_frame(base_dump.clone(), Snapshot::from_term(&term), false, (rows, cols)));
+        c.apply_frame_ack(&ipc::encode_frame_ack(1, 0));
+        term.process(b"appended");
+        broadcast_output(std::slice::from_mut(&mut c), &term, b"<raw ignored>");
+
+        let bodies = decode_frame_bodies(&c.write_buf);
+        match &bodies[1] {
+            FrameBody::Diff { base, base_sum, .. } => {
+                assert_eq!(*base, 1);
+                assert_eq!(
+                    *base_sum,
+                    Some(base_checksum(&base_dump)),
+                    "the stamp must checksum the acked diff base bytes"
+                );
+            }
+            other => panic!("expected a checksummed Diff, got {other:?}"),
+        }
+    }
+
+    /// A RELIABLE client (no `CAP_LOSSY`) is unchanged: it self-acks with no
+    /// `Tag::FrameAck` and emits DumpDiff Diffs with no base_sum — the byte-for-byte
+    /// pre-Task-3.0 behavior the lossy branch must not disturb.
+    #[test]
+    fn reliable_client_self_acks_and_uses_dumpdiff() {
+        let (rows, cols) = (24u16, 80u16);
+        let mut term = Terminal::with_scrollback(rows, cols, 1000);
+        fill_screen(&mut term);
+
+        let (mut c, _peer) = frame_capable_conn(rows, cols);
+        assert!(!c.lossy, "no CAP_LOSSY ⇒ reliable");
+
+        // Frame 1: the self-ack advances the base to 1 with NO Tag::FrameAck.
+        assert!(c.queue_frame(term.dump_vt(), Snapshot::from_term(&term), false, (rows, cols)));
+        assert_eq!(
+            c.producer.as_ref().unwrap().acked_num(),
+            1,
+            "a reliable client self-acks: the base advances without any FrameAck"
+        );
+
+        // The next frame is a DumpDiff Diff against the self-acked base, no base_sum.
+        term.process(b"appended");
+        broadcast_output(std::slice::from_mut(&mut c), &term, b"<raw ignored>");
+        let bodies = decode_frame_bodies(&c.write_buf);
+        assert!(
+            matches!(bodies[1], FrameBody::Diff { base: 1, base_sum: None, .. }),
+            "reliable ⇒ DumpDiff Diff against the self-acked base, no base_sum, got {:?}",
+            bodies[1]
+        );
+        assert_eq!(
+            reconstruct(&c.write_buf, rows, cols),
+            Snapshot::from_term(&term),
+            "the reliable client's frames still reconstruct the daemon screen"
+        );
+    }
+
+    /// A reliable (non-lossy) client's `Tag::FrameAck` is a no-op: it self-acks in
+    /// `queue_frame` and never sends the verb, so `apply_frame_ack` must not touch
+    /// its producer — even a stray RESYNC must NOT drop its base. Makes the
+    /// reliable-path-unchanged guarantee airtight (code-review hardening).
+    #[test]
+    fn reliable_client_frame_ack_is_ignored() {
+        let (rows, cols) = (24u16, 80u16);
+        let mut term = Terminal::with_scrollback(rows, cols, 1000);
+        fill_screen(&mut term);
+        let (mut c, _peer) = frame_capable_conn(rows, cols);
+        assert!(!c.lossy);
+
+        // Self-ack advances the base to 1.
+        assert!(c.queue_frame(term.dump_vt(), Snapshot::from_term(&term), false, (rows, cols)));
+        assert_eq!(c.producer.as_ref().unwrap().acked_num(), 1);
+
+        // A stray FrameAck (even RESYNC) is ignored for a reliable client: its
+        // base is neither advanced past nor dropped.
+        c.apply_frame_ack(&ipc::encode_frame_ack(1, ipc::FRAME_ACK_RESYNC));
+        assert!(
+            c.producer.as_ref().unwrap().has_acked_base(),
+            "a reliable client's FrameAck is ignored: its base is not dropped"
+        );
+        assert_eq!(c.producer.as_ref().unwrap().acked_num(), 1);
     }
 }

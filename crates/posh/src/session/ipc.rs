@@ -30,6 +30,13 @@ pub enum Tag {
     /// the session cwd. Empty payload; the daemon guards `overlay.is_none()` so
     /// retransmits are idempotent. The palette's "Shell out" command (FDR 0011).
     Shell = 13,
+    /// Client -> daemon: acknowledge a `Tag::Frame`, for a LOSSY client whose
+    /// frames the daemon does NOT self-ack (RFC 0008 §3, the Phase 3 frame
+    /// relay). Payload is `acked_frame: u64` (LE) then a `flags: u8` whose bit
+    /// [`FRAME_ACK_RESYNC`] (0x01) asks the daemon to drop its acked base so the
+    /// next frame is a `Full`. A reliable local client never sends this — the
+    /// daemon self-acks it — so this verb exists only on the relay path.
+    FrameAck = 14,
 }
 
 impl Tag {
@@ -49,6 +56,7 @@ impl Tag {
             11 => Tag::Exit,
             12 => Tag::Frame,
             13 => Tag::Shell,
+            14 => Tag::FrameAck,
             _ => return None,
         })
     }
@@ -114,6 +122,33 @@ pub fn encode_exit(code: i32) -> [u8; 4] {
 
 pub fn decode_exit(payload: &[u8]) -> Option<i32> {
     Some(i32::from_le_bytes(payload.try_into().ok()?))
+}
+
+/// `Tag::FrameAck` flags bit: request a base resync. The daemon drops its acked
+/// base (`FrameProducer::drop_acked_base`) so the client's next `Tag::Frame`
+/// body is a `Full` keyframe. The relay forwards this from the UDP client's
+/// `CLIENT_FLAG_RESYNC`.
+pub const FRAME_ACK_RESYNC: u8 = 0x01;
+
+/// `Tag::FrameAck` payload: the acked frame number (u64 little-endian) then a
+/// single flags byte ([`FRAME_ACK_RESYNC`]). Client -> daemon on the relay path.
+/// `#[allow(dead_code)]` until the relay (Phase 3.1) lands as its caller — the
+/// daemon only decodes; the encode side is the relay's, mirroring the agent
+/// chunk helpers in `caps.rs`.
+#[allow(dead_code)]
+pub fn encode_frame_ack(acked_frame: u64, flags: u8) -> [u8; 9] {
+    let mut out = [0u8; 9];
+    out[..8].copy_from_slice(&acked_frame.to_le_bytes());
+    out[8] = flags;
+    out
+}
+
+pub fn decode_frame_ack(payload: &[u8]) -> Option<(u64, u8)> {
+    if payload.len() != 9 {
+        return None;
+    }
+    let acked_frame = u64::from_le_bytes(payload[..8].try_into().ok()?);
+    Some((acked_frame, payload[8]))
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -295,6 +330,31 @@ mod tests {
         let got = fb.next().unwrap().unwrap();
         assert_eq!(got.tag, Tag::Shell);
         assert!(got.payload.is_empty());
+    }
+
+    #[test]
+    fn frame_ack_roundtrips() {
+        // The lossy-client ack (RFC 0008 §3): acked frame number + a flags byte,
+        // round-tripping both through the payload codec and the frame layer.
+        assert_eq!(decode_frame_ack(&encode_frame_ack(0, 0)), Some((0, 0)));
+        assert_eq!(
+            decode_frame_ack(&encode_frame_ack(42, FRAME_ACK_RESYNC)),
+            Some((42, FRAME_ACK_RESYNC))
+        );
+        assert_eq!(
+            decode_frame_ack(&encode_frame_ack(u64::MAX, 0xff)),
+            Some((u64::MAX, 0xff))
+        );
+        // Wrong lengths are rejected (not 9 bytes).
+        assert_eq!(decode_frame_ack(b""), None);
+        assert_eq!(decode_frame_ack(&[0u8; 8]), None);
+        assert_eq!(decode_frame_ack(&[0u8; 10]), None);
+        // And through the frame layer.
+        let mut buf = FrameBuffer::new();
+        buf.feed(&encode_frame(Tag::FrameAck, &encode_frame_ack(7, FRAME_ACK_RESYNC)));
+        let frame = buf.next().unwrap().unwrap();
+        assert_eq!(frame.tag, Tag::FrameAck);
+        assert_eq!(decode_frame_ack(&frame.payload), Some((7, FRAME_ACK_RESYNC)));
     }
 
     #[test]
