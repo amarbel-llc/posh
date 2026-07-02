@@ -18,6 +18,12 @@ pub struct SshOptions {
     /// `posh-server new` exactly when this is set (C4: the bootstrap carries
     /// the outcome; the path itself stays client-side, never on the wire).
     pub agent_source: Option<std::path::PathBuf>,
+    /// Real OpenSSH `-a`/`-A` to pass through to the bootstrap `ssh` process
+    /// itself (FDR 0004 §Limitations: "`posh ssh` stays a thin ssh wrapper").
+    /// `Some(true)` = `-A`, `Some(false)` = `-a`, `None` = say nothing, let
+    /// ssh use its own default/config. Orthogonal to `agent_source`, which is
+    /// posh's own transport-level forwarding to the roaming session.
+    pub real_ssh_agent_forward: Option<bool>,
 }
 
 /// What the wrapped server reported on stdout.
@@ -160,6 +166,15 @@ pub fn run(target: &str, remote_cmd: &[String], opts: &SshOptions) -> Result<()>
             ssh.arg("-6");
         }
         Family::Auto => {}
+    }
+    match opts.real_ssh_agent_forward {
+        Some(true) => {
+            ssh.arg("-A");
+        }
+        Some(false) => {
+            ssh.arg("-a");
+        }
+        None => {}
     }
     let mut child = ssh
         .arg(target)
@@ -345,6 +360,7 @@ mod tests {
             family: Family::Auto,
             port_range: None,
             agent_source: None,
+            real_ssh_agent_forward: None,
         };
         // New contract (RFC 0008 §3): the caller owns the `--`; the legacy tail
         // leads with it, then the shell-quoted inner argv. Byte-identical output.
@@ -390,6 +406,7 @@ mod tests {
             family: Family::Inet6,
             port_range: Some("60100:60200".to_string()),
             agent_source: None,
+            real_ssh_agent_forward: None,
         };
         let locale = vec![("LANG".to_string(), "en_US.UTF-8".to_string())];
         // The bare-host tail now carries its own leading `--` (caller-owned).
@@ -407,7 +424,8 @@ mod tests {
             &SshOptions {
                 family: Family::Auto,
                 port_range: None,
-                    agent_source: None,
+                agent_source: None,
+                real_ssh_agent_forward: None,
             },
             &[],
             &[],
@@ -426,6 +444,7 @@ mod tests {
             family: Family::Auto,
             port_range: None,
             agent_source: None,
+            real_ssh_agent_forward: None,
         };
         let tail: Vec<String> = ["relay", "-g", "grp", "dev", "--", "htop"]
             .iter()
@@ -444,6 +463,7 @@ mod tests {
             family: Family::Auto,
             port_range: None,
             agent_source: None,
+            real_ssh_agent_forward: None,
         };
         let tail: Vec<String> = ["relay", "dev"].iter().map(|s| s.to_string()).collect();
         assert_eq!(remote_command(&opts, &tail, &[]), "posh-server new 'relay' 'dev'");
@@ -457,6 +477,7 @@ mod tests {
             family: Family::Inet,
             port_range: Some("60001:60999".to_string()),
             agent_source: Some("/run/user/1000/agent.sock".into()),
+            real_ssh_agent_forward: None,
         };
         let tail: Vec<String> = ["relay", "-g", "grp", "dev"]
             .iter()
@@ -479,6 +500,7 @@ mod tests {
             family: Family::Inet,
             port_range: Some("60001:60999".to_string()),
             agent_source: Some("/run/user/1000/agent.sock".into()),
+            real_ssh_agent_forward: None,
         };
         let cmd = remote_command(&opts, &[], &[]);
         assert_eq!(cmd, "posh-server new -A -4 -p 60001:60999");
@@ -489,6 +511,7 @@ mod tests {
             family: Family::Auto,
             port_range: None,
             agent_source: None,
+            real_ssh_agent_forward: None,
         };
         assert_eq!(remote_command(&off, &[], &[]), "posh-server new");
     }
@@ -502,6 +525,7 @@ mod tests {
             family: Family::Auto,
             port_range: None,
             agent_source: None,
+            real_ssh_agent_forward: None,
         };
         let env = vec![
             ("TERM".to_string(), "xterm-kitty".to_string()),

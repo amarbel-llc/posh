@@ -171,7 +171,7 @@ Roaming over encrypted UDP. See *posh-server*(1) and *posh-client*(1)
 for the two endpoints; most users never invoke these directly — bare
 *posh* _host_ and *posh* _host_*:*_session_ drive them.
 
-*ssh* [*-4*|*-6*] [*-p* _PORT_[*:*_PORT2_]] [_user_@]_host_ [*--* _command_...]
+*ssh* [*-4*|*-6*] [*-a*|*-A*] [*-p* _PORT_[*:*_PORT2_]] [_user_@]_host_ [*--* _command_...]
 	Convenience wrapper (mosh-style; also reached as a bare
 	*posh* [_user_@]_host_ when the host contains _@_, _._, or _:_):
 	start *posh-server new* on the host via ssh (forwarding the
@@ -179,6 +179,11 @@ for the two endpoints; most users never invoke these directly — bare
 	*-p*/*-4*/*-6* flags), then connect to the address the
 	server reports. The remote host needs *posh-server*(1) on its
 	non-interactive PATH. Survives IP changes and sleep/resume.
+	*-a*/*-A* here are the real *ssh*(1) agent-forwarding flags,
+	passed through verbatim to the bootstrap *ssh* connection —
+	not posh's own transport-level forwarding (see GLOBAL
+	OPTIONS above), which only applies to the
+	\[_user_@]_host_*:*_session_ roaming path.
 
 *server* [*new*] [*-p* _PORT_[*:*_PORT2_]] [*-4*|*-6*] [*--* _command_...]
 	Start a remote server; see *posh-server*(1).

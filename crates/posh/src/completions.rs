@@ -110,7 +110,7 @@ _posh_completions() {
       history|hi) flags="--vt" ;;
       server) flags="-p -4 -6" ;;
       client) flags="-4 -6" ;;
-      ssh) flags="-p -4 -6" ;;
+      ssh) flags="-p -4 -6 -a -A" ;;
       # host:[group/]session namespace form (#67): detached remote spawn.
       *:*) flags="$flags --detach" ;;
     esac

@@ -444,6 +444,7 @@ fn cmd_ssh_session(
             family: Family::Auto,
             port_range: None,
             agent_source: None,
+            real_ssh_agent_forward: None,
         };
         return remote::sshwrap::run_detached(&dest, &inner, &opts);
     }
@@ -453,6 +454,7 @@ fn cmd_ssh_session(
         family: Family::Auto,
         port_range: None,
         agent_source: resolve_agent_source(forward_flag),
+        real_ssh_agent_forward: None,
     };
     // Bootstrap selection (RFC 0008 §3): the single-model relay by default;
     // `POSH_RELAY=0` forces the legacy Architecture-A inner-`posh attach`
@@ -618,14 +620,27 @@ fn cmd_list_remote(user: Option<String>, host: String, group: &str) -> Result<()
     Ok(())
 }
 
-// `forward` is Some for the mosh-parity bare `posh host` roaming path (which
-// honors agent forwarding like `host:session`), and None for the explicit
-// `posh ssh` subcommand, which stays a thin ssh wrapper — a `-A` there is the
-// real ssh flag, not posh forwarding (FDR 0004 §Limitations).
-fn cmd_ssh(args: &[String], forward: Option<&remote::agent::ForwardFlag>) -> Result<()> {
-    let usage = "usage: posh ssh [-4|-6] [-p PORT[:PORT2]] [user@]host [-- command...]";
+const SSH_USAGE: &str =
+    "usage: posh ssh [-4|-6] [-a|-A] [-p PORT[:PORT2]] [user@]host [-- command...]";
+
+/// Parsed `posh ssh` argv. Pure and side-effect-free so the grammar is
+/// unit-tested without spawning ssh — mirrors `parse_attach_args`.
+struct SshArgs<'a> {
+    family: Family,
+    port_range: Option<String>,
+    /// The real-ssh agent-forward flag: `Some(true)` = `-A`, `Some(false)` =
+    /// `-a`, `None` = neither given.
+    real_ssh_agent_forward: Option<bool>,
+    target: &'a str,
+    /// The remaining create-command, with any leading `--` separator already
+    /// stripped.
+    remote_cmd: &'a [String],
+}
+
+fn parse_ssh_args(args: &[String]) -> Result<SshArgs<'_>> {
     let mut family = Family::Auto;
     let mut port_range: Option<String> = None;
+    let mut real_ssh_agent_forward: Option<bool> = None;
     let mut target: Option<&str> = None;
     let mut i = 0;
     while i < args.len() {
@@ -634,8 +649,19 @@ fn cmd_ssh(args: &[String], forward: Option<&remote::agent::ForwardFlag>) -> Res
                 family = Family::from_flag(flag).expect("matched flag");
                 i += 1;
             }
+            // Real ssh agent-forwarding flags, passed through verbatim to the
+            // bootstrap `ssh` process (FDR 0004 §Limitations) — distinct from
+            // posh's own `-a`/`-A` forwarding on the roaming path above.
+            "-a" => {
+                real_ssh_agent_forward = Some(false);
+                i += 1;
+            }
+            "-A" => {
+                real_ssh_agent_forward = Some(true);
+                i += 1;
+            }
             "-p" | "--port" => {
-                let value = args.get(i + 1).ok_or_else(|| Error::from(usage))?;
+                let value = args.get(i + 1).ok_or_else(|| Error::from(SSH_USAGE))?;
                 parse_port_range(value)?; // validate locally before passing on
                 port_range = Some(value.clone());
                 i += 2;
@@ -651,17 +677,42 @@ fn cmd_ssh(args: &[String], forward: Option<&remote::agent::ForwardFlag>) -> Res
             _ => break,
         }
     }
-    let target = target.ok_or_else(|| Error::from(usage))?;
+    let target = target.ok_or_else(|| Error::from(SSH_USAGE))?;
     let mut remote_cmd = &args[i..];
     if remote_cmd.first().map(|s| s.as_str()) == Some("--") {
         remote_cmd = &remote_cmd[1..];
     }
+    Ok(SshArgs {
+        family,
+        port_range,
+        real_ssh_agent_forward,
+        target,
+        remote_cmd,
+    })
+}
+
+// `forward` is Some for the mosh-parity bare `posh host` roaming path (which
+// honors agent forwarding like `host:session`), and None for the explicit
+// `posh ssh` subcommand, which stays a thin ssh wrapper — a `-A`/`-a` there
+// is the real ssh flag, not posh forwarding (FDR 0004 §Limitations). For the
+// bare-host path, `-a`/`-A` are already consumed by the global argv loop in
+// `run()` before dispatch (into `forward_flag`), so they never reach this
+// function's own `-a`/`-A` arm in that case.
+fn cmd_ssh(args: &[String], forward: Option<&remote::agent::ForwardFlag>) -> Result<()> {
+    let SshArgs {
+        family,
+        port_range,
+        real_ssh_agent_forward,
+        target,
+        remote_cmd,
+    } = parse_ssh_args(args)?;
     // Resolve agent forwarding for the roaming bare-host path; the explicit
     // `posh ssh` subcommand passes None and stays a thin wrapper.
     let opts = remote::sshwrap::SshOptions {
         family,
         port_range,
         agent_source: forward.and_then(resolve_agent_source),
+        real_ssh_agent_forward,
     };
     // The server tail is caller-owned now (RFC 0008 §3): a bare host runs
     // `posh-server new [flags]` with `-- command...` only when a command was
@@ -789,7 +840,7 @@ REMOTE COMMANDS (roaming over encrypted UDP)
         the screen is updated with minimal diffs.
         Quit sequence: Ctrl-^ then \".\" (Ctrl-^ twice for a literal one).
 
-    ssh [-4|-6] [-p PORT[:PORT2]] [user@]host [-- command...]
+    ssh [-4|-6] [-a|-A] [-p PORT[:PORT2]] [user@]host [-- command...]
         Convenience wrapper (mosh-style; also reachable as a bare
         `posh [user@]host` when the host contains @ . or :): start
         `posh-server new` on the host via ssh (forwarding LANG/LC_* and
@@ -797,6 +848,10 @@ REMOTE COMMANDS (roaming over encrypted UDP)
         reports. The remote host needs `posh-server` on its
         non-interactive PATH (the nix package installs it next to posh).
         Survives IP changes and sleep/resume.
+        -a/-A here are real ssh agent-forwarding flags, passed through
+        verbatim to the bootstrap ssh connection (not posh's own
+        transport-level forwarding, which only applies to the
+        `[user@]host:session` roaming path).
 
 TOOLS
     rec replay <file> [--to-marker NAME] [--dump text|vt|flat]
@@ -1050,6 +1105,56 @@ mod tests {
         // Missing name is an error (with or without a leading flag).
         assert!(parse_attach_args(&v(&[])).is_err());
         assert!(parse_attach_args(&v(&["--detach"])).is_err());
+    }
+
+    #[test]
+    fn parse_ssh_args_grammar() {
+        let v = |xs: &[&str]| -> Vec<String> { xs.iter().map(|s| s.to_string()).collect() };
+
+        // Bare host, no flags.
+        let a = v(&["box"]);
+        let parsed = parse_ssh_args(&a).unwrap();
+        assert_eq!(parsed.family, Family::Auto);
+        assert_eq!(parsed.port_range, None);
+        assert_eq!(parsed.real_ssh_agent_forward, None);
+        assert_eq!(parsed.target, "box");
+        assert!(parsed.remote_cmd.is_empty());
+
+        // `-A` before the host: real-ssh explicit enable (github: posh ssh -A/-a).
+        let a = v(&["-A", "box"]);
+        let parsed = parse_ssh_args(&a).unwrap();
+        assert_eq!(parsed.real_ssh_agent_forward, Some(true));
+        assert_eq!(parsed.target, "box");
+
+        // `-a`: real-ssh explicit disable, distinct from `-A`.
+        let a = v(&["-a", "box"]);
+        let parsed = parse_ssh_args(&a).unwrap();
+        assert_eq!(parsed.real_ssh_agent_forward, Some(false));
+        assert_eq!(parsed.target, "box");
+
+        // `-A` after the host (order-independent, like -4/-6/-p).
+        let a = v(&["box", "-A"]);
+        let parsed = parse_ssh_args(&a).unwrap();
+        assert_eq!(parsed.real_ssh_agent_forward, Some(true));
+        assert_eq!(parsed.target, "box");
+
+        // No `-a`/`-A` at all: None, distinct from either explicit flag.
+        let a = v(&["box"]);
+        let parsed = parse_ssh_args(&a).unwrap();
+        assert_eq!(parsed.real_ssh_agent_forward, None);
+
+        // Combines with -4/-6/-p and a trailing command.
+        let a = v(&["-A", "-6", "-p", "60100:60200", "box", "--", "htop"]);
+        let parsed = parse_ssh_args(&a).unwrap();
+        assert_eq!(parsed.family, Family::Inet6);
+        assert_eq!(parsed.port_range, Some("60100:60200".to_string()));
+        assert_eq!(parsed.real_ssh_agent_forward, Some(true));
+        assert_eq!(parsed.target, "box");
+        assert_eq!(parsed.remote_cmd, &v(&["htop"])[..]);
+
+        // Missing target is an error.
+        assert!(parse_ssh_args(&v(&["-A"])).is_err());
+        assert!(parse_ssh_args(&v(&[])).is_err());
     }
 
     #[test]
