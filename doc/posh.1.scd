@@ -183,7 +183,9 @@ for the two endpoints; most users never invoke these directly — bare
 	passed through verbatim to the bootstrap *ssh* connection —
 	not posh's own transport-level forwarding (see GLOBAL
 	OPTIONS above), which only applies to the
-	\[_user_@]_host_*:*_session_ roaming path.
+	\[_user_@]_host_*:*_session_ roaming path. Defaults to *-A*
+	(forwarding on), matching the roaming paths' best-effort
+	default; pass *-a* to opt out for this connection.
 
 *server* [*new*] [*-p* _PORT_[*:*_PORT2_]] [*-4*|*-6*] [*--* _command_...]
 	Start a remote server; see *posh-server*(1).

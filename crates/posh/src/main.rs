@@ -691,6 +691,15 @@ fn parse_ssh_args(args: &[String]) -> Result<SshArgs<'_>> {
     })
 }
 
+/// Resolves the real-ssh `-a`/`-A` flag parsed from `posh ssh` argv to the
+/// bootstrap ssh's actual forwarding decision: `-A` defaults ON, matching the
+/// roaming paths' best-effort default (FDR 0004 §Interface — posh targets are
+/// overwhelmingly the user's own hosts); `-a` opts out for this connection;
+/// an explicit `-A` is accepted too but is a no-op spelling of the default.
+fn resolve_real_ssh_agent_forward(flag: Option<bool>) -> bool {
+    flag.unwrap_or(true)
+}
+
 // `forward` is Some for the mosh-parity bare `posh host` roaming path (which
 // honors agent forwarding like `host:session`), and None for the explicit
 // `posh ssh` subcommand, which stays a thin ssh wrapper — a `-A`/`-a` there
@@ -712,7 +721,7 @@ fn cmd_ssh(args: &[String], forward: Option<&remote::agent::ForwardFlag>) -> Res
         family,
         port_range,
         agent_source: forward.and_then(resolve_agent_source),
-        real_ssh_agent_forward,
+        real_ssh_agent_forward: Some(resolve_real_ssh_agent_forward(real_ssh_agent_forward)),
     };
     // The server tail is caller-owned now (RFC 0008 §3): a bare host runs
     // `posh-server new [flags]` with `-- command...` only when a command was
@@ -851,7 +860,8 @@ REMOTE COMMANDS (roaming over encrypted UDP)
         -a/-A here are real ssh agent-forwarding flags, passed through
         verbatim to the bootstrap ssh connection (not posh's own
         transport-level forwarding, which only applies to the
-        `[user@]host:session` roaming path).
+        `[user@]host:session` roaming path). Defaults to -A (forwarding
+        on); pass -a to opt out for this connection.
 
 TOOLS
     rec replay <file> [--to-marker NAME] [--dump text|vt|flat]
@@ -1155,6 +1165,17 @@ mod tests {
         // Missing target is an error.
         assert!(parse_ssh_args(&v(&["-A"])).is_err());
         assert!(parse_ssh_args(&v(&[])).is_err());
+    }
+
+    #[test]
+    fn resolve_real_ssh_agent_forward_defaults_on() {
+        // No -a/-A given: default is on (-A), matching the roaming paths'
+        // best-effort default (FDR 0004 §Interface).
+        assert!(resolve_real_ssh_agent_forward(None));
+        // Explicit -a opts out.
+        assert!(!resolve_real_ssh_agent_forward(Some(false)));
+        // Explicit -A is a no-op spelling of the default.
+        assert!(resolve_real_ssh_agent_forward(Some(true)));
     }
 
     #[test]
