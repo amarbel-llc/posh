@@ -45,6 +45,11 @@ pub mod palette;
 #[cfg(test)]
 mod perf_probe;
 pub mod predict;
+/// Thin frame relay (RFC 0008 §3 / FDR 0012 Phase 3): a frame-capable client of
+/// the session daemon's socket that forwards the daemon's `ServerFrame` stream
+/// to a remote roaming client over the AEAD-UDP transport, owning no terminal
+/// model of its own (the single-model collapse).
+pub mod relay;
 /// Shared scrollback scroll-view machinery (FDR 0005): the wheel-intercept
 /// `MouseFilter`, the scroll-offset math, and the frozen-history compose. Used
 /// by both this crate's roaming client (`remote::client`) and the local session

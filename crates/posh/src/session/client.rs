@@ -83,8 +83,8 @@ pub fn cmd_attach(
         ));
     }
 
-    let created = daemon::ensure_session(cfg, name, command)?;
     if detach_flag {
+        let created = daemon::ensure_session(cfg, name, command)?;
         if created {
             println!("session \"{name}\" created");
         } else {
@@ -93,9 +93,8 @@ pub fn cmd_attach(
         return Ok(());
     }
 
-    let path = cfg.socket_path(name)?;
-    let stream = UnixStream::connect(&path)
-        .map_err(|e| Error(format!("connect {}: {e}", path.display())))?;
+    // The relay (remote::relay) shares this ensure-then-connect path.
+    let stream = crate::session::connect_or_create(cfg, name, command)?;
 
     // Handlers go in before raw mode and the takeover write: the first
     // byte on the tty is the outside world's readiness signal, and a

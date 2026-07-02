@@ -1167,7 +1167,7 @@ fn handle_client_message(
     }
 }
 
-fn send_payload(conn: &mut Connection, fragmenter: &mut Fragmenter, payload: &[u8]) {
+pub(crate) fn send_payload(conn: &mut Connection, fragmenter: &mut Fragmenter, payload: &[u8]) {
     for frag in fragmenter.make_fragments(payload, sync::FRAGMENT_CONTENTS_MAX) {
         let _ = conn.send(&frag.to_bytes());
     }

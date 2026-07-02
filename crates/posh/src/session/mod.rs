@@ -99,6 +99,22 @@ impl Config {
     }
 }
 
+/// Ensure the named session exists (spawning a detached daemon when it does
+/// not) and return a fresh client connection to its socket. Factored from the
+/// ensure-then-connect that `client::cmd_attach` did inline (github: RFC 0008
+/// §3) so the local attach client and the frame relay (`remote::relay`) share
+/// one connect path. `command` seeds a freshly created session's shell and is
+/// ignored when the session already exists.
+pub(crate) fn connect_or_create(
+    cfg: &Config,
+    name: &str,
+    command: Option<Vec<String>>,
+) -> Result<UnixStream> {
+    daemon::ensure_session(cfg, name, command)?;
+    let path = cfg.socket_path(name)?;
+    UnixStream::connect(&path).map_err(|e| Error(format!("connect {}: {e}", path.display())))
+}
+
 pub fn session_socket_exists(path: &Path) -> bool {
     match std::fs::symlink_metadata(path) {
         Ok(meta) => meta.file_type().is_socket(),
