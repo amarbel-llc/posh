@@ -700,7 +700,7 @@ fn client_loop(
     // Request server transport-state piggyback (#6) only in a debug posture, so
     // a default session never negotiates it. Derive from the same Stats that
     // owns the POSH_DEBUG_LOG / POSH_WEDGE_WATCHDOG decisions.
-    let stats = Stats::new("client");
+    let stats = Stats::new();
     let want_server_diag = stats.enabled() || stats.wedge_watchdog();
     let mut st = ClientState {
         conn,
@@ -2609,7 +2609,7 @@ mod tests {
             input_sent: VecDeque::new(),
             framesync: framesync::FrameSync::DumpDiff,
             applier: Box::new(framesync::DumpDiff),
-            stats: Stats::new("client"),
+            stats: Stats::new(),
             palette: None,
             last_reack: None,
             forensic_captured: false,

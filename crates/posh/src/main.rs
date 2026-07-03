@@ -910,13 +910,12 @@ ENVIRONMENT
     POSH_SERVER_SIGNAL_TMOUT
                     On SIGUSR1, the server exits if the client has been
                     silent for N seconds (0 = never, the default)
-    POSH_DEBUG_LOG  Debug logging for the roaming remote transport is ON by
-                    default: client and server each append periodic one-line
-                    summaries plus #wedge breadcrumbs (5 MB rotation) to a
-                    per-pid file under $XDG_LOG_HOME/posh (else
-                    $XDG_STATE_HOME/posh/log, else the runtime dir). Set to a
-                    path to redirect the sink (forwarded to the remote for the
-                    bare host:session form); set to 0 or empty to opt out.
+    POSH_DEBUG_LOG  Path to a diagnostics log for the roaming remote transport.
+                    Opt-in: when set to a writable path, the client and server
+                    each append periodic one-line summaries plus #wedge
+                    breadcrumbs (5 MB rotation). For the bare host:session form
+                    it is forwarded to the remote, so the server logs to that
+                    path on the remote host. Unset = no logging.
     POSH_SERVER_CMD Full path to the remote posh-server binary to exec over ssh
                     (bare host:session form). Overrides the packaged posh-server
                     on the remote PATH, so a debug/instrumented build can be

@@ -92,7 +92,7 @@ _POSH_ESCAPE_CMD_
 	remote server. See *posh-client*(1).
 
 _POSH_DEBUG_LOG_
-	Logging is on by default. The server appends periodic one-line
+	When set to a writable path, the server appends periodic one-line
 	performance summaries — smoothed RTT, RTO, transmitted frame counts
 	(full/diff/empty), diff-saved percentage, _dump_vt_ time as
 	_avg/max_ microseconds (the max is the worst single serialization in
@@ -105,13 +105,11 @@ _POSH_DEBUG_LOG_
 	_/dev/null_, this file is its only diagnostic sink. For the bare
 	*posh* _host:session_ form the path is forwarded from the client, so
 	it is interpreted on the remote host. The on-demand *SIGUSR2* state
-	dump (*SIGNALS*) is written to this same sink. Logging is on by
-	default to a per-pid file under _$XDG_LOG_HOME/posh_ (else
-	_$XDG_STATE_HOME/posh/log_, else the run-dir the *SIGUSR2* dump uses);
-	set _POSH_DEBUG_LOG_ to a writable path to redirect it, or to _0_ or
-	empty to opt out. A connected client can also toggle the summaries at
-	runtime from its *Ctrl-^* command palette (*Server debug logging*).
-	See *posh-client*(1).
+	dump (*SIGNALS*) is written to this same sink. Unset disables logging
+	at startup, but a connected client can turn the summaries on or off at
+	runtime from its *Ctrl-^* command palette (*Server debug logging*); when
+	enabled that way without _POSH_DEBUG_LOG_ set, the sink is the same
+	per-pid default file the *SIGUSR2* dump uses. See *posh-client*(1).
 
 _POSH_WEDGE_CAPTURE_
 	Controls the organic wedge watchdog (on by default). The server

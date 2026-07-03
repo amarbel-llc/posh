@@ -152,7 +152,7 @@ pub(crate) fn server_loop(
     // Optional perf instrumentation (POSH_DEBUG_LOG). run() has already
     // double-forked and redirected stdio to /dev/null, so this file fd is the
     // server's only viable diagnostic sink; inert when the env var is unset.
-    let mut stats = Stats::new("server");
+    let mut stats = Stats::new();
     let mut term = Terminal::new(rows, cols);
     let mut fragmenter = Fragmenter::new();
     let mut assembly = FragmentAssembly::new();

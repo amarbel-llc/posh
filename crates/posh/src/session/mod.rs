@@ -37,32 +37,6 @@ pub fn resolve_socket_base(
     PathBuf::from(format!("/tmp/posh-{uid}"))
 }
 
-/// Log directory base resolution for default-on debug logging: POSH_LOG_DIR >
-/// $XDG_LOG_HOME/posh > $XDG_STATE_HOME/posh/log > `socket_fallback`. The
-/// fallback (normally `resolve_socket_base`, i.e. $XDG_RUNTIME_DIR/posh) is the
-/// remote-server path: a non-interactive `ssh … posh-server new` env carries no
-/// XDG_LOG_HOME but does have XDG_RUNTIME_DIR, so a roaming server still lands a
-/// discoverable per-pid log beside its sockets. Unlike the socket dir this may
-/// be a persistent location (XDG_LOG_HOME/XDG_STATE_HOME), which is intended:
-/// wedge logs must survive a reboot to be useful post-mortem.
-pub fn resolve_log_base(
-    posh_log_dir: Option<&str>,
-    xdg_log_home: Option<&str>,
-    xdg_state_home: Option<&str>,
-    socket_fallback: PathBuf,
-) -> PathBuf {
-    if let Some(dir) = posh_log_dir.filter(|d| !d.is_empty()) {
-        return PathBuf::from(dir);
-    }
-    if let Some(dir) = xdg_log_home.filter(|d| !d.is_empty()) {
-        return Path::new(dir).join("posh");
-    }
-    if let Some(dir) = xdg_state_home.filter(|d| !d.is_empty()) {
-        return Path::new(dir).join("posh").join("log");
-    }
-    socket_fallback
-}
-
 pub struct Config {
     pub socket_dir: PathBuf,
     pub group: String,
@@ -782,54 +756,6 @@ mod tests {
     #[test]
     fn socket_base_ignores_empty_values() {
         let base = resolve_socket_base(Some(""), Some(""), Some(""), 42);
-        assert_eq!(base, PathBuf::from("/tmp/posh-42"));
-    }
-
-    #[test]
-    fn log_base_prefers_posh_log_dir() {
-        let base = resolve_log_base(
-            Some("/var/log/posh"),
-            Some("/home/u/.local/log"),
-            Some("/home/u/.local/state"),
-            PathBuf::from("/run/user/7/posh"),
-        );
-        assert_eq!(base, PathBuf::from("/var/log/posh"));
-    }
-
-    #[test]
-    fn log_base_prefers_xdg_log_home() {
-        let base = resolve_log_base(
-            None,
-            Some("/home/u/.local/log"),
-            Some("/home/u/.local/state"),
-            PathBuf::from("/run/user/7/posh"),
-        );
-        assert_eq!(base, PathBuf::from("/home/u/.local/log/posh"));
-    }
-
-    #[test]
-    fn log_base_falls_back_to_xdg_state_home() {
-        let base = resolve_log_base(
-            None,
-            None,
-            Some("/home/u/.local/state"),
-            PathBuf::from("/run/user/7/posh"),
-        );
-        assert_eq!(base, PathBuf::from("/home/u/.local/state/posh/log"));
-    }
-
-    #[test]
-    fn log_base_final_fallback_is_socket_dir() {
-        // The remote-server path: a non-interactive ssh env has neither
-        // XDG_LOG_HOME nor XDG_STATE_HOME, so it degrades to the runtime
-        // socket-dir the caller passes in.
-        let base = resolve_log_base(None, None, None, PathBuf::from("/run/user/7/posh"));
-        assert_eq!(base, PathBuf::from("/run/user/7/posh"));
-    }
-
-    #[test]
-    fn log_base_ignores_empty_values() {
-        let base = resolve_log_base(Some(""), Some(""), Some(""), PathBuf::from("/tmp/posh-42"));
         assert_eq!(base, PathBuf::from("/tmp/posh-42"));
     }
 }

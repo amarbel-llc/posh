@@ -16,7 +16,7 @@ use std::net::SocketAddr;
 use std::os::unix::fs::DirBuilderExt;
 use std::path::PathBuf;
 
-use crate::session::{resolve_log_base, resolve_socket_base};
+use crate::session::resolve_socket_base;
 use crate::util;
 
 /// Server-side transport snapshot, copied out of `server_loop`'s locals when the
@@ -217,31 +217,6 @@ fn sink_base() -> PathBuf {
 /// file is discoverable beside them.
 fn default_dump_path(role: &str) -> PathBuf {
     sink_base().join(format!("posh-{role}-{}.log", std::process::id()))
-}
-
-/// The per-pid sink for DEFAULT-ON logging (`Stats::new`, `POSH_DEBUG_LOG`
-/// unset). Prefers `$XDG_LOG_HOME/posh` (persistent, per the XDG base-dir
-/// convention — wedge logs must survive a reboot), degrading to
-/// `$XDG_STATE_HOME/posh/log` and finally the runtime socket-dir (`sink_base`) —
-/// the last is the remote-server path, where a non-interactive ssh env has no
-/// XDG_LOG_HOME but does have XDG_RUNTIME_DIR. Creates the directory, since
-/// `util::log_init` does not create parents (a missing dir would silently
-/// disable logging).
-pub fn default_log_path(role: &str) -> PathBuf {
-    let env = |k: &str| std::env::var(k).ok();
-    let base = resolve_log_base(
-        env("POSH_LOG_DIR").as_deref(),
-        env("XDG_LOG_HOME").as_deref(),
-        env("XDG_STATE_HOME").as_deref(),
-        sink_base(),
-    );
-    // Best-effort like sink_base(); the caller's log_init reports a real failure
-    // (and Stats::new treats a failed open as "logging off").
-    let _ = std::fs::DirBuilder::new()
-        .recursive(true)
-        .mode(0o700)
-        .create(&base);
-    base.join(format!("posh-{role}-{}.log", std::process::id()))
 }
 
 /// Enable debug logging at runtime to the default per-pid sink (if not already

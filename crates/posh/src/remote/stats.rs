@@ -202,23 +202,15 @@ pub struct ApplySnapshot {
 }
 
 impl Stats {
-    /// Debug logging is DEFAULT-ON (#83 wedge capture). Sink selection from
-    /// `$POSH_DEBUG_LOG`:
-    /// - a real path → use it (unchanged behaviour);
-    /// - empty or `"0"` → the explicit opt-out (no logging, inert no-op);
-    /// - unset → the per-role well-known sink (`diag::default_log_path`,
-    ///   preferring `$XDG_LOG_HOME/posh`).
-    ///
-    /// `enabled` tracks whether a sink actually opened. `role` is "client" or
-    /// "server" and names the per-pid file so the two ends never collide.
-    pub fn new(role: &str) -> Stats {
+    /// Reads `$POSH_DEBUG_LOG`; on a non-empty path that `log_init` accepts the
+    /// collector is enabled, otherwise it is an inert no-op. Logging is opt-in:
+    /// the `#wedge` breadcrumbs and periodic summaries stay in the binary but are
+    /// dormant until `$POSH_DEBUG_LOG` names a writable path (or the runtime
+    /// `Ctrl-^` toggle / `SIGUSR2` opens a sink).
+    pub fn new() -> Stats {
         let enabled = match std::env::var_os("POSH_DEBUG_LOG") {
-            // Explicit opt-out: empty or "0" turns off all default-on logging.
-            Some(p) if p.is_empty() || p.to_str() == Some("0") => false,
-            // Explicit path.
-            Some(p) => util::log_init(Path::new(&p)).is_ok(),
-            // Default-on: the per-role well-known sink.
-            None => util::log_init(&crate::remote::diag::default_log_path(role)).is_ok(),
+            Some(p) if !p.is_empty() => util::log_init(Path::new(&p)).is_ok(),
+            _ => false,
         };
         let now = now_ms();
         Stats {
