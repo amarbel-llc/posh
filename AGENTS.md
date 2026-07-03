@@ -176,9 +176,13 @@ read-only, `debug` group):
   forensics" palette command. Implementation: `remote/diag.rs::capture_forensics`.
 - `just debug-posh-server-smoke` — start a detached loopback server for
   headless transport debugging (e.g. exercising the dump without a tty).
-- `POSH_DEBUG_LOG=<path>` (set before connecting) turns on *continuous*
-  periodic transport summaries to that file — the complement to the on-demand
-  `SIGUSR2` dump.
+- Debug logging is **on by default** now: the client and server write
+  *continuous* periodic transport summaries — plus the `#wedge` breadcrumbs
+  (`pty_read`, the per-second `poll` aggregate, and the client `render`-skip
+  line) — to a per-pid file under `$XDG_LOG_HOME/posh` (fallbacks:
+  `$XDG_STATE_HOME/posh/log`, then the runtime socket-dir the bare remote
+  server lands in). `POSH_DEBUG_LOG=<path>` redirects the sink; `POSH_DEBUG_LOG=0`
+  (or empty) opts out. Complement to the on-demand `SIGUSR2` dump.
 - `just debug-posh-log-gaps <pid|log>` / `debug-posh-log-loss <pid|log>` —
   offline scans of a `[stats]` log: `-gaps` finds event-loop STALLS (timestamp
   jumps between records = a wedge/no-paint freeze); `-loss` finds transport
