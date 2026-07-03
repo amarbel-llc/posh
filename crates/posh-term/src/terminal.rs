@@ -247,12 +247,14 @@ impl Terminal {
         }
     }
 
-    /// Erase style: background-color-erase keeps the pen's background.
+    /// Style for a newly-blanked cell (erase, scroll, insert/delete of lines or
+    /// chars, clears). posh-term is non-BCE for kitty-parity (ADR 0005): a blank
+    /// takes the DEFAULT background, never the current pen's, so a scroll or
+    /// erase under a highlight can't leave a stuck colored region on the remote
+    /// client (#100 / #110). This is the single point that decides BCE; making it
+    /// aware of the actual client terminal's `bce` capability is tracked in #115.
     pub(crate) fn blank_style(&self) -> Style {
-        Style {
-            bg: self.cursor.style.bg,
-            ..Style::default()
-        }
+        Style::default()
     }
 
     pub(crate) fn touch(&mut self) {
@@ -525,21 +527,14 @@ impl Terminal {
     pub(crate) fn scroll_up_n(&mut self, n: u16) {
         let (top, bot) = self.region();
         let save = !self.alt_active && top == 0 && bot == self.rows() - 1;
-        // Scrolled-in lines take the DEFAULT background, not the pen's: unlike an
-        // in-place erase (blank_style, BCE), the terminals posh renders into
-        // (kitty) do not background-color-erase a scroll, so carrying the pen bg
-        // here paints a stuck colored line on the remote client (posh#100, ADR
-        // 0005 — a deliberate divergence from mosh's `newrow()`).
-        let style = Style::default();
+        let style = self.blank_style();
         self.scr_mut().scroll_up(top, bot, n, save, style);
         self.touch();
     }
 
     pub(crate) fn scroll_down_n(&mut self, n: u16) {
         let (top, bot) = self.region();
-        // Default background on the scrolled-in lines (no BCE on scroll); see
-        // scroll_up_n and ADR 0005 (posh#100).
-        let style = Style::default();
+        let style = self.blank_style();
         self.scr_mut().scroll_down(top, bot, n, style);
         self.touch();
     }

@@ -239,23 +239,45 @@ fn ed3_clears_scrollback() {
 }
 
 #[test]
-fn bce_erase_uses_background() {
+fn erase_does_not_bce() {
+    // posh#110: posh-term is non-BCE (kitty-parity, ADR 0005). An erase under a
+    // non-default bg pen clears to the DEFAULT background, not the pen's, so the
+    // remote client never paints a stuck colored region. kitty's terminfo has
+    // `bce` unset; a client-cap-aware BCE is tracked in #115.
     let mut t = term();
     feed(&mut t, "\x1b[41m\x1b[2J");
-    assert_eq!(t.screen().cell(2, 2).unwrap().style.bg, Color::Indexed(1));
-    // Other attributes do not propagate to erased cells.
+    assert_eq!(t.screen().cell(2, 2).unwrap().style.bg, Color::Default);
+    // Nor does any other pen attribute propagate onto the cleared cell.
     assert!(!t.screen().cell(2, 2).unwrap().style.bold);
 }
 
 #[test]
+fn erase_line_and_insert_line_do_not_bce() {
+    // Non-BCE holds across the other blank-creating ops, not just ED (#110): both
+    // erase-to-EOL (EL) and insert-line (IL) under a bg pen fill the default bg.
+    let mut t = term();
+    // EL: red pen, then erase row 0 from the start.
+    feed(&mut t, "\x1b[41m\x1b[1;1H\x1b[K");
+    assert_eq!(
+        t.screen().cell(0, 5).unwrap().style.bg,
+        Color::Default,
+        "EL under a bg pen"
+    );
+    // IL: red pen, then insert a blank line at row 2 — the inserted line is default.
+    feed(&mut t, "\x1b[41m\x1b[2;1H\x1b[L");
+    assert_eq!(
+        t.screen().cell(1, 3).unwrap().style.bg,
+        Color::Default,
+        "IL under a bg pen"
+    );
+}
+
+#[test]
 fn scroll_does_not_bce_the_new_line() {
-    // posh#100: unlike an in-place erase (bce_erase_uses_background), a SCROLL
-    // must leave the newly-exposed line at the DEFAULT background even when a
-    // non-default bg pen is active. The terminals posh renders into (kitty) do
-    // not background-color-erase a scroll, so carrying the pen bg onto the
-    // scrolled-in line paints a stuck colored line on the remote client. posh-
-    // term targets kitty-parity, so its model must not BCE the scroll either
-    // (ADR 0005; the dual of the #42 background-drop check).
+    // A scroll under a non-default bg pen must leave the newly-exposed line at
+    // the DEFAULT background (#100). posh-term is non-BCE for kitty-parity (ADR
+    // 0005; the dual of the #42 background-drop check) — carrying the pen bg onto
+    // the scrolled-in line would paint a stuck colored line on the remote client.
     let mut t = term();
     feed(&mut t, "top\r\nA\r\nB\r\nC\r\nbottom");
     // Region rows 2..4, cursor at the bottom margin, a red bg pen, then LF to
