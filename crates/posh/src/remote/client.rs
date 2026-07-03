@@ -651,9 +651,10 @@ struct ClientState {
     /// retransmit (the reack loop fires constantly); reset when apply advances.
     forensic_captured: bool,
     /// Whether to advertise CAP_DIAG so the server piggybacks its transport
-    /// state (#6). True only in a debug posture (POSH_DEBUG_LOG or
-    /// POSH_WEDGE_WATCHDOG), so a default session never asks and the server
-    /// pays no per-frame overhead. Computed once from `stats` at startup.
+    /// state (#6). True only in a debug posture (POSH_DEBUG_LOG set, or
+    /// POSH_WEDGE_WATCHDOG EXPLICITLY on — the watchdog default (#117) does not
+    /// count), so a default session never asks and the server pays no per-frame
+    /// overhead. Computed once from `stats` at startup.
     want_server_diag: bool,
     /// Latest server transport state from CAP_DIAG (#6), surfaced in the SIGUSR2
     /// dump so a wedge shows both sides. `None` until the server first reports
@@ -698,10 +699,11 @@ fn client_loop(
     let framesync = framesync::FrameSync::parse(std::env::var("POSH_FRAMESYNC").ok().as_deref());
     let applier = framesync.applier();
     // Request server transport-state piggyback (#6) only in a debug posture, so
-    // a default session never negotiates it. Derive from the same Stats that
-    // owns the POSH_DEBUG_LOG / POSH_WEDGE_WATCHDOG decisions.
+    // a default session never negotiates it. The watchdog RECOVERY is default-on
+    // (#117), so the posture signal is an EXPLICIT POSH_WEDGE_WATCHDOG, not the
+    // watchdog being armed.
     let stats = Stats::new();
-    let want_server_diag = stats.enabled() || stats.wedge_watchdog();
+    let want_server_diag = stats.enabled() || stats.wedge_watchdog_explicit();
     let mut st = ClientState {
         conn,
         fragmenter: Fragmenter::new(),
@@ -1025,9 +1027,9 @@ fn drive_client(st: &mut ClientState, raw: &RawMode, port: u16) -> Result<i32> {
             }
         }
         render(st, now);
-        // Self-logging apply-stall detector (#wedge): a visible model frozen
-        // past the threshold while diff frames keep arriving emits one diagnostic
-        // line. Cheap no-op when POSH_DEBUG_LOG is unset.
+        // Apply-stall detector (#wedge): a visible model frozen past the
+        // threshold while diff frames keep arriving. Detection is unconditional
+        // and cheap; the log line inside is POSH_DEBUG_LOG-gated.
         let wedged = st.stats.check_wedge(
             now,
             st.server_term.generation(),
@@ -1035,11 +1037,14 @@ fn drive_client(st: &mut ClientState, raw: &RawMode, port: u16) -> Result<i32> {
             st.framesync.label(),
         );
         if wedged && st.stats.wedge_watchdog() {
-            // #8 opt-in auto-recovery: a visible model frozen past the threshold
-            // while diff frames keep arriving is an apply-stall the reack/base_sum
-            // paths did not catch (repeated dup/nochange, or a transport-side
-            // stall). Capture forensics if a body is pending, arm the diagnostic
-            // sink, and force a resync to break it.
+            // #117 default-on auto-recovery (opt out: POSH_WEDGE_WATCHDOG=0): a
+            // frozen model with frames still arriving is a stall some silent-drop
+            // apply path let through (stale-drop, scrollback/base mismatch,
+            // repeated dup/nochange, a transport-side stall) — the uniform net
+            // over the whole #95/#117 class. Capture forensics if a body is
+            // pending, arm the diagnostic sink, and force a resync to break it.
+            // Fires once per episode (check_wedge latches until the model
+            // advances), so a long freeze cannot storm resyncs.
             if let Some(reack) = st.last_reack.as_ref() {
                 let _ = diag::capture_forensics(st.applied_num, &st.applied_data, reack);
             }

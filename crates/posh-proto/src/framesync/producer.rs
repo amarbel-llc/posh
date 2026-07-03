@@ -79,6 +79,15 @@ pub struct FrameProducer {
     /// ack landing on one of them can recover its base. Bounded to the most
     /// recent 8.
     outstanding: Vec<ProducedFrame>,
+    /// The newest VISIBLE frame's number, and whether the client ever acked it
+    /// DIRECTLY (`acked_frame == last_visible_num`) rather than leaping past it
+    /// via a later scrollback frame's ack. An ack past a never-directly-acked
+    /// visible frame is the #95/#117 leap signature: the client may have
+    /// silently dropped that frame's content, and with the model idle no new
+    /// frame would ever re-deliver it — the caller breaks that quiescence with
+    /// one forced visible frame (`visible_frame_leapt`).
+    last_visible_num: u64,
+    visible_directly_acked: bool,
     dumpdiff: DumpDiff,
     morph: MorphDelta,
 }
@@ -102,6 +111,10 @@ impl FrameProducer {
             acked_data: Some(Vec::new()),
             acked_baseline: Some((Snapshot::blank(rows, cols), false, (rows, cols))),
             outstanding: Vec::new(),
+            // Frame 0 is the implicit blank base both sides share: visible and
+            // attested by construction.
+            last_visible_num: 0,
+            visible_directly_acked: true,
             dumpdiff: DumpDiff,
             morph: MorphDelta::default(),
         }
@@ -158,6 +171,10 @@ impl FrameProducer {
         sb_total: u64,
     ) {
         let num = self.current.num + 1;
+        // #117: this is now the newest visible frame; its delivery is
+        // unattested until the client acks exactly this number.
+        self.last_visible_num = num;
+        self.visible_directly_acked = false;
         self.rotate_current(ProducedFrame {
             num,
             data: dump,
@@ -267,6 +284,12 @@ impl FrameProducer {
             return None;
         }
         self.acked_num = acked_frame;
+        // #117: only an ack landing EXACTLY on the newest visible frame attests
+        // its delivery; an ack beyond it (a later scrollback slot) may have
+        // leapt a silently-dropped visible frame.
+        if acked_frame == self.last_visible_num {
+            self.visible_directly_acked = true;
+        }
         // The acked frame's bytes, morph base, and scrollback total, from
         // `current` or the retained outstanding frame.
         let acked = if acked_frame == self.current.num {
@@ -308,6 +331,24 @@ impl FrameProducer {
     pub fn drop_acked_base(&mut self) {
         self.acked_data = None;
         self.acked_baseline = None;
+    }
+
+    /// The #95/#117 leap signature: the client's ack has moved PAST the newest
+    /// visible frame (via a later scrollback slot) without ever acking it
+    /// directly — its content may have been silently dropped (stale/base
+    /// mismatch), and with the model idle nothing would re-deliver it. The
+    /// caller breaks that quiescence by forcing one fresh visible frame: a
+    /// no-op repaint for a healthy client, the missing content for a wedged
+    /// one. Self-clearing — the forced frame becomes the newest visible frame,
+    /// and its direct ack re-attests delivery.
+    pub fn visible_frame_leapt(&self) -> bool {
+        self.acked_num > self.last_visible_num && !self.visible_directly_acked
+    }
+
+    /// The newest visible frame's number (diagnostics: names the frame a leap
+    /// jumped over).
+    pub fn last_visible_num(&self) -> u64 {
+        self.last_visible_num
     }
 }
 
@@ -416,6 +457,8 @@ mod tests {
             acked_data: Some(b"one".to_vec()),
             acked_baseline: Some((Snapshot::blank(ROWS, COLS), false, (ROWS, COLS))),
             outstanding: vec![frame(1, b"one", 2), frame(2, b"two", 5)],
+            last_visible_num: 3,
+            visible_directly_acked: false,
             dumpdiff: DumpDiff,
             morph: MorphDelta::default(),
         };
@@ -433,5 +476,38 @@ mod tests {
         assert_eq!(p.acked_data.as_deref(), Some(b"current".as_slice()));
         assert!(p.acked_baseline.is_some(), "the morph baseline tracks acked_data");
         assert!(p.outstanding.is_empty());
+    }
+
+    /// #117: the leap detector. A direct ack of the newest visible frame
+    /// attests its delivery; an ack that jumps past it via a later scrollback
+    /// slot leaves it unattested (`visible_frame_leapt`), and producing a fresh
+    /// visible frame self-clears the signal.
+    #[test]
+    fn visible_frame_leapt_tracks_direct_acks() {
+        let mut p = FrameProducer::new(ROWS, COLS);
+        let snap = || Snapshot::blank(ROWS, COLS);
+        assert!(!p.visible_frame_leapt(), "frame 0 is attested by construction");
+
+        // Visible frame 1, acked directly: attested, no leap.
+        p.advance_visible(screen("a"), snap(), false, (ROWS, COLS), 0);
+        assert!(!p.visible_frame_leapt(), "unacked but not yet leapt");
+        assert_eq!(p.ack(1), Some(0));
+        assert!(!p.visible_frame_leapt(), "direct ack attests delivery");
+
+        // Visible frame 2 then scrollback frame 3; the client's cumulative ack
+        // lands on 3 only — the #95 leap: frame 2 was never directly acked.
+        p.advance_visible(screen("b"), snap(), false, (ROWS, COLS), 0);
+        p.advance_scrollback(5);
+        assert_eq!(p.last_visible_num(), 2);
+        assert_eq!(p.ack(3), Some(5));
+        assert!(p.visible_frame_leapt(), "ack 3 leapt visible frame 2");
+
+        // The nudge produces a fresh visible frame: the signal self-clears
+        // (nothing to re-force while it is in flight)...
+        p.advance_visible(screen("b"), snap(), false, (ROWS, COLS), 5);
+        assert!(!p.visible_frame_leapt(), "a fresh visible frame clears the leap");
+        // ...and its direct ack re-attests delivery.
+        assert_eq!(p.ack(4), Some(5));
+        assert!(!p.visible_frame_leapt());
     }
 }

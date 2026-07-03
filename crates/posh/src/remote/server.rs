@@ -712,6 +712,30 @@ pub(crate) fn server_loop(
             let src: &Terminal = overlay.as_ref().map(|o| &o.term).unwrap_or(&term);
             let dirty = src.generation() != last_gen;
             let cur_sb_total = term.primary_scrollback_total();
+            // #117 anti-quiescence nudge: the client's ack leapt past the newest
+            // visible frame via a later scrollback slot without ever acking it
+            // directly — it may have silently dropped that frame's content — and
+            // the session is otherwise quiescent (model idle, everything acked),
+            // so nothing would ever re-deliver it. Force one fresh visible
+            // frame: a no-op repaint for a healthy client, the missing content
+            // for a wedged one. Self-clearing via the forced frame's own ack.
+            if !dirty
+                && !shutdown
+                && producer.acked_num() >= producer.current_num()
+                && producer.visible_frame_leapt()
+            {
+                force_frame = true;
+                if util::log_active() {
+                    util::log_write(
+                        "wedge",
+                        &format!(
+                            "nudge: visible frame {} leapt by ack {} at quiescence; forcing repaint",
+                            producer.last_visible_num(),
+                            producer.acked_num(),
+                        ),
+                    );
+                }
+            }
             let mut send_frame = false;
             let mut send_empty = false;
             // A freshly produced frame (vs a retransmission of the current one):

@@ -122,7 +122,7 @@ _POSH_WEDGE_CAPTURE_
 	an intermittent freeze is captured without pre-arming logging. Set to
 	_0_, _off_, _false_, or _no_ to disable it if it ever misbehaves.
 	Distinct from the client-side _POSH_WEDGE_WATCHDOG_ (see
-	*posh-client*(1)), which is opt-in and acts on apply-stalls.
+	*posh-client*(1)), which is also on by default and acts on apply-stalls.
 
 # SIGNALS
 

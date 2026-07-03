@@ -121,14 +121,17 @@ _POSH_DEBUG_LOG_
 	(*SIGNALS*) is written to this same sink. Unset disables logging.
 
 _POSH_WEDGE_WATCHDOG_
-	When set, arms an opt-in apply-stall watchdog (off by default). If the
-	visible model stays frozen past a threshold while diff frames keep
-	arriving — the apply-stall signature — the client auto-captures a wedge
-	forensic bundle, arms the diagnostic sink, and forces a resync to break
-	the stall. The RFC 0006 base-integrity check and the auto-escalate on an
-	undecodable diff already recover the common cases; this is a
-	belt-and-suspenders catch-all for a freeze those paths miss (e.g. a
-	transport-side stall). Independent of _POSH_DEBUG_LOG_.
+	Controls the apply-stall watchdog (*on by default*). If the visible
+	model stays frozen past a threshold while diff frames keep arriving —
+	the apply-stall signature — the client auto-captures a wedge forensic
+	bundle, arms the diagnostic sink, and forces a resync to break the
+	stall, once per episode. The RFC 0006 base-integrity check and the
+	auto-escalate on an undecodable diff recover the common cases; this is
+	the uniform net over the silent-drop apply paths those miss (a stale or
+	base-mismatched frame dropped without recovery, a transport-side
+	stall). Set to _0_, _off_, _false_, or _no_ to disable. Setting it
+	*explicitly* on also counts as a debug posture (see *SIGNALS*).
+	Independent of _POSH_DEBUG_LOG_.
 
 # SIGNALS
 
@@ -138,7 +141,8 @@ _POSH_WEDGE_WATCHDOG_
 	input-outbox base and pending bytes, accumulated scrollback depth,
 	smoothed RTT/RTO and send interval, byte counters, prediction gauges,
 	terminal size, and the remote echo state. In a debug posture
-	(_POSH_DEBUG_LOG_ or _POSH_WEDGE_WATCHDOG_ set) the client also requests
+	(_POSH_DEBUG_LOG_ set, or _POSH_WEDGE_WATCHDOG_ *explicitly* on — its
+	default-on state does not count) the client also requests
 	the server's own transport state, which then rides each frame and appears
 	as a trailing _srv=_ field — the server's pid (so a wedged client maps to
 	the exact remote posh-server log), frame number, ack, frames outstanding,

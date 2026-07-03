@@ -25,10 +25,16 @@ const WEDGE_FROZEN_MS: u64 = 3000;
 #[derive(Default)]
 pub struct Stats {
     enabled: bool,
-    /// #8 watchdog: opt-in (POSH_WEDGE_WATCHDOG) auto-recovery. Independent of
-    /// `enabled` so the apply-stall fingerprint runs and triggers recovery even
-    /// when periodic logging (POSH_DEBUG_LOG) is off.
+    /// #8/#117 watchdog auto-recovery: ON by default (a frozen visible model
+    /// while frames keep arriving forces a resync — the uniform net over every
+    /// silent-drop apply path). POSH_WEDGE_WATCHDOG=0/off/false/no opts out.
+    /// Independent of `enabled` so recovery runs with periodic logging off.
     wedge_watchdog: bool,
+    /// Whether POSH_WEDGE_WATCHDOG was EXPLICITLY set on (not just defaulted):
+    /// the debug-posture signal that `want_server_diag` (CAP_DIAG, #6) keys on,
+    /// so the default-on watchdog does not silently re-enable the per-frame
+    /// server piggyback that default sessions deliberately avoid.
+    wedge_watchdog_explicit: bool,
     /// RFC 0007 metric bus: when a GP predictor species is active the client
     /// needs the compute-timing terminals (apply/compose/loop) even with
     /// periodic logging off, so timing is collected when `instrument()` — i.e.
@@ -212,11 +218,20 @@ impl Stats {
             Some(p) if !p.is_empty() => util::log_init(Path::new(&p)).is_ok(),
             _ => false,
         };
+        // #117: watchdog recovery is ON by default; POSH_WEDGE_WATCHDOG only
+        // opts out (0/off/false/no) — mirroring the server's POSH_WEDGE_CAPTURE.
+        // An explicit ON value is remembered separately as the debug-posture
+        // signal for CAP_DIAG (want_server_diag), which must NOT default on.
+        let watchdog_env = std::env::var("POSH_WEDGE_WATCHDOG").ok();
+        let off = matches!(
+            watchdog_env.as_deref(),
+            Some("0") | Some("off") | Some("false") | Some("no")
+        );
         let now = now_ms();
         Stats {
             enabled,
-            wedge_watchdog: std::env::var_os("POSH_WEDGE_WATCHDOG")
-                .is_some_and(|v| !v.is_empty()),
+            wedge_watchdog: !off,
+            wedge_watchdog_explicit: !off && watchdog_env.as_deref().is_some_and(|v| !v.is_empty()),
             last_flush: now,
             wedge_term_gen_since: now,
             ..Default::default()
@@ -358,11 +373,9 @@ impl Stats {
     /// `wedge` line carrying the apply histogram and the rejected frame, then
     /// latch until the model advances. Returns whether it emitted (for tests).
     pub fn check_wedge(&mut self, now: u64, term_gen: u64, applied_num: u64, codec: &str) -> bool {
-        // Detection runs when logging is armed OR the #8 watchdog is on; only the
-        // wedge log line below is gated on `enabled`.
-        if !self.enabled && !self.wedge_watchdog {
-            return false;
-        }
+        // Detection is UNCONDITIONAL (#117): a cheap gen/timestamp compare per
+        // loop iteration, so the default-on watchdog recovery always has its
+        // signal. Only the wedge log line below is gated on `enabled`.
         if term_gen != self.wedge_last_term_gen {
             self.wedge_last_term_gen = term_gen;
             self.wedge_term_gen_since = now;
@@ -417,10 +430,16 @@ impl Stats {
         self.enabled
     }
 
-    /// Whether the #8 wedge watchdog (POSH_WEDGE_WATCHDOG) is armed, so the
-    /// client acts (forensics + resync) on a `check_wedge` fire.
+    /// Whether the wedge watchdog is armed (default ON, #117), so the client
+    /// acts (forensics + resync) on a `check_wedge` fire.
     pub fn wedge_watchdog(&self) -> bool {
         self.wedge_watchdog
+    }
+
+    /// Whether POSH_WEDGE_WATCHDOG was EXPLICITLY set on — the debug-posture
+    /// signal for CAP_DIAG negotiation, distinct from the default-on recovery.
+    pub fn wedge_watchdog_explicit(&self) -> bool {
+        self.wedge_watchdog_explicit
     }
 
     /// Client: accumulate one apply_frame re-parse (full-dump `term.process`).
@@ -796,21 +815,23 @@ mod tests {
     }
 
     #[test]
-    fn wedge_detector_silent_when_disabled() {
-        // enabled = false, watchdog = false
-        let mut s = Stats {
-            frames_diff: 50,
-            ..Default::default()
-        };
+    fn wedge_detection_is_unconditional() {
+        // #117: detection runs even with logging AND the watchdog off — the
+        // return value is the recovery signal, and the caller owns the gating.
+        // (Only the log line is `enabled`-gated.)
+        let mut s = Stats::default(); // enabled = false, watchdog = false
         assert!(!s.check_wedge(0, 5, 100, "morph"));
-        assert!(!s.check_wedge(WEDGE_FROZEN_MS * 10, 5, 100, "morph"));
+        s.record_frame_diff();
+        assert!(
+            s.check_wedge(WEDGE_FROZEN_MS, 5, 100, "morph"),
+            "fires with everything off"
+        );
     }
 
     #[test]
     fn wedge_watchdog_detects_even_without_logging() {
         // #8: with the watchdog armed but POSH_DEBUG_LOG off, the apply-stall
-        // fingerprint still fires (so the client can auto-recover) -- unlike the
-        // plain disabled case above, which stays silent.
+        // fingerprint still fires (so the client can auto-recover).
         let mut s = Stats {
             wedge_watchdog: true,
             ..Default::default()

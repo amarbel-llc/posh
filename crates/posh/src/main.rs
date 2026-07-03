@@ -916,6 +916,11 @@ ENVIRONMENT
                     breadcrumbs (5 MB rotation). For the bare host:session form
                     it is forwarded to the remote, so the server logs to that
                     path on the remote host. Unset = no logging.
+    POSH_WEDGE_WATCHDOG
+                    Client apply-stall watchdog (on by default): a visible
+                    model frozen while frames keep arriving auto-captures
+                    forensics and forces a resync, once per episode. Set to
+                    0/off/false/no to disable.
     POSH_SERVER_CMD Full path to the remote posh-server binary to exec over ssh
                     (bare host:session form). Overrides the packaged posh-server
                     on the remote PATH, so a debug/instrumented build can be

@@ -96,8 +96,9 @@ pub const MAX_AGENT_DATA_CAPS: usize = 239;
 /// can show both sides of a wedge." A remote `posh-server` has no local socket
 /// to `SIGUSR2`, so its `current_num`/`acked_num`/`outstanding`/`term_gen`/
 /// `pty_open` are otherwise a blind spot when triaging a stall from the client.
-/// The client advertises this in a debug posture (POSH_DEBUG_LOG or
-/// POSH_WEDGE_WATCHDOG) and whenever agent forwarding is active (FDR 0004: to
+/// The client advertises this in a debug posture (POSH_DEBUG_LOG set, or
+/// POSH_WEDGE_WATCHDOG explicitly on — its #117 default-on state does not
+/// count) and whenever agent forwarding is active (FDR 0004: to
 /// power the agent-forwarding diagnostic with the server endpoint's state), so a
 /// default session — no debug, no forwarding — never negotiates it and pays no
 /// per-frame overhead. Server entry: a [`ServerDiag`] payload (see
