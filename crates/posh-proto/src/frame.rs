@@ -134,6 +134,19 @@ pub enum FrameBody {
     /// absence of a trailing newline). Visible screen state is unchanged by
     /// this body.
     Scrollback { base: u64, rows: Vec<Vec<u8>> },
+    /// Scrollback stream v2 (RFC 0009 §2): rows addressed by their absolute
+    /// offset in the epoch's monotonically-growing row space, fully decoupled
+    /// from the visible frame sequence — this body never advances
+    /// `applied_num`, and its carrying frame's `frame_num` is a diagnostic
+    /// annotation only. `epoch` is the server's scrollback epoch (bumped on a
+    /// reflow-invalidating reset, e.g. a width change); a body whose epoch
+    /// does not match the client's current one is discarded. Row format is
+    /// identical to `Scrollback`.
+    Scrollback2 {
+        epoch: u8,
+        row_offset: u64,
+        rows: Vec<Vec<u8>>,
+    },
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -164,6 +177,9 @@ const BODY_MORPH: u8 = 4;
 /// divergent base before applying.
 const BODY_DIFF_SUM: u8 = 5;
 const BODY_MORPH_SUM: u8 = 6;
+/// Scrollback stream v2 (RFC 0009): epoch u8 | row_offset u64 LE |
+/// appended u32 LE | rows. Emitted only after `CAP_SCROLLBACK2` is negotiated.
+const BODY_SCROLLBACK2: u8 = 7;
 
 /// Upper bound on rows in one `BODY_SCROLLBACK` body. A single frame's
 /// payload is already bounded by the fragmentation layer, but `appended` is
@@ -219,6 +235,20 @@ impl ServerFrame {
             FrameBody::Scrollback { base, rows } => {
                 out.push(BODY_SCROLLBACK);
                 out.extend_from_slice(&base.to_le_bytes());
+                out.extend_from_slice(&(rows.len() as u32).to_le_bytes());
+                for row in rows {
+                    out.extend_from_slice(&(row.len() as u16).to_le_bytes());
+                    out.extend_from_slice(row);
+                }
+            }
+            FrameBody::Scrollback2 {
+                epoch,
+                row_offset,
+                rows,
+            } => {
+                out.push(BODY_SCROLLBACK2);
+                out.push(*epoch);
+                out.extend_from_slice(&row_offset.to_le_bytes());
                 out.extend_from_slice(&(rows.len() as u32).to_le_bytes());
                 for row in rows {
                     out.extend_from_slice(&(row.len() as u16).to_le_bytes());
@@ -317,6 +347,40 @@ impl ServerFrame {
                     p = end;
                 }
                 FrameBody::Scrollback { base, rows }
+            }
+            BODY_SCROLLBACK2 => {
+                // epoch u8 | row_offset u64 | appended u32: 14 bytes incl. the
+                // discriminator. Same bounds discipline as BODY_SCROLLBACK.
+                if data.len() < at + 14 {
+                    return Err(Error::from("scrollback2 frame too short"));
+                }
+                let epoch = data[at + 1];
+                let row_offset = u64::from_le_bytes(data[at + 2..at + 10].try_into().unwrap());
+                let appended =
+                    u32::from_le_bytes(data[at + 10..at + 14].try_into().unwrap()) as usize;
+                if appended > MAX_SCROLLBACK_ROWS || appended * 2 > data.len() - (at + 14) {
+                    return Err(Error::from("scrollback2 row count exceeds body"));
+                }
+                let mut rows = Vec::with_capacity(appended);
+                let mut p = at + 14;
+                for _ in 0..appended {
+                    let (Some(&lo), Some(&hi)) = (data.get(p), data.get(p + 1)) else {
+                        return Err(Error::from("scrollback2 row header truncated"));
+                    };
+                    let len = u16::from_le_bytes([lo, hi]) as usize;
+                    p += 2;
+                    let end = p + len;
+                    let Some(bytes) = data.get(p..end) else {
+                        return Err(Error::from("scrollback2 row truncated"));
+                    };
+                    rows.push(bytes.to_vec());
+                    p = end;
+                }
+                FrameBody::Scrollback2 {
+                    epoch,
+                    row_offset,
+                    rows,
+                }
             }
             _ => return Err(Error::from("unknown frame body kind")),
         };
@@ -457,6 +521,52 @@ mod tests {
             echo_ack: 0,
             body: FrameBody::Scrollback {
                 base: 0,
+                rows: vec![b"hello".to_vec()],
+            },
+        }
+        .encode();
+        let mut truncated = good.clone();
+        truncated.truncate(truncated.len() - 2);
+        assert!(ServerFrame::decode(&truncated).is_err());
+        let mut huge = good;
+        let at = huge.len() - 5 /* "hello" */ - 2 /* row len */ - 4 /* appended */;
+        huge[at..at + 4].copy_from_slice(&u32::MAX.to_le_bytes());
+        assert!(ServerFrame::decode(&huge).is_err());
+    }
+
+    #[test]
+    fn scrollback2_body_roundtrips_and_bounds() {
+        // RFC 0009 §2: epoch, row_offset, and each row survive encode→decode,
+        // including the empty body; truncation and a bogus count are rejected
+        // with the same discipline as v1.
+        for rows in [
+            vec![],
+            vec![b"one row".to_vec()],
+            vec![b"a".to_vec(), Vec::new(), b"ccc".to_vec()],
+        ] {
+            let frame = ServerFrame {
+                flags: 0,
+                caps: vec![],
+                frame_num: 9,
+                input_ack: 3,
+                echo_ack: 4,
+                body: FrameBody::Scrollback2 {
+                    epoch: 7,
+                    row_offset: u64::MAX - 1,
+                    rows,
+                },
+            };
+            assert_eq!(ServerFrame::decode(&frame.encode()).unwrap(), frame);
+        }
+        let good = ServerFrame {
+            flags: 0,
+            caps: vec![],
+            frame_num: 1,
+            input_ack: 0,
+            echo_ack: 0,
+            body: FrameBody::Scrollback2 {
+                epoch: 1,
+                row_offset: 5,
                 rows: vec![b"hello".to_vec()],
             },
         }

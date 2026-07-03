@@ -69,6 +69,68 @@ pub const CAP_AGENT_ACK: u8 = 8;
 /// the anticipated TERM_FEATURES.
 pub const CAP_LOSSY: u8 = 9;
 
+/// Scrollback stream v2 (RFC 0009 §1): scrollback leaves the visible frame
+/// sequence and gains its own cumulative acknowledgement. Client entry: 10-byte
+/// payload — ring depth u8 (256-row units, `0` = server default, as RFC 0002),
+/// epoch u8 (the epoch the client is accumulating in), acked_sb_rows u64 LE
+/// (cumulative rows accepted this epoch) — the per-message scrollback ack.
+/// Server entry: 2-byte payload {0x02, epoch u8} acknowledging v2 and naming
+/// the current epoch (bumped on a reflow-invalidating reset, e.g. a width
+/// change; the client clears its ring and zeroes its count on a bump).
+pub const CAP_SCROLLBACK2: u8 = 10;
+
+/// The client's [`CAP_SCROLLBACK2`] entry, decoded (RFC 0009 §1/§3).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct Scrollback2Client {
+    pub ring_depth: u8,
+    pub epoch: u8,
+    pub acked_rows: u64,
+}
+
+/// Encode the client's per-message SCROLLBACK2 entry (advertisement + ack).
+pub fn encode_scrollback2_client(c: &Scrollback2Client) -> Cap {
+    let mut payload = Vec::with_capacity(10);
+    payload.push(c.ring_depth);
+    payload.push(c.epoch);
+    payload.extend_from_slice(&c.acked_rows.to_le_bytes());
+    Cap {
+        id: CAP_SCROLLBACK2,
+        payload,
+    }
+}
+
+/// Decode a client SCROLLBACK2 payload. Exactly 10 bytes; anything else is
+/// malformed (authenticated peer: corruption or an unknown future version) and
+/// the entry is ignored by the consumer.
+pub fn decode_scrollback2_client(payload: &[u8]) -> Result<Scrollback2Client> {
+    if payload.len() != 10 {
+        return Err(Error::from("SCROLLBACK2 client payload is not 10 bytes"));
+    }
+    Ok(Scrollback2Client {
+        ring_depth: payload[0],
+        epoch: payload[1],
+        acked_rows: u64::from_le_bytes(payload[2..10].try_into().unwrap()),
+    })
+}
+
+/// Encode the server's SCROLLBACK2 acknowledgement: version byte 0x02 + the
+/// current epoch.
+pub fn encode_scrollback2_ack(epoch: u8) -> Cap {
+    Cap {
+        id: CAP_SCROLLBACK2,
+        payload: vec![0x02, epoch],
+    }
+}
+
+/// Decode a server SCROLLBACK2 acknowledgement, returning the epoch. The
+/// version byte must be 0x02.
+pub fn decode_scrollback2_ack(payload: &[u8]) -> Result<u8> {
+    if payload.len() != 2 || payload[0] != 0x02 {
+        return Err(Error::from("SCROLLBACK2 ack payload is not {0x02, epoch}"));
+    }
+    Ok(payload[1])
+}
+
 /// Max agent-stream bytes carried by one [`CAP_AGENT_DATA`] entry: the table's
 /// `len: u8` budget (255) minus the 8-byte `u64` offset prefix. Keeping agent
 /// data as length-prefixed entries (rather than a negotiated body-layout

@@ -176,7 +176,9 @@ impl ClientSide {
                 }
             }
             // Scrollback production isn't modelled here yet (github #75 follow-up).
-            FrameBody::Scrollback { .. } => {}
+            // v2 bodies (RFC 0009) carry no visible state and never touch
+            // applied_num by design, so ignoring them here is exact.
+            FrameBody::Scrollback { .. } | FrameBody::Scrollback2 { .. } => {}
         }
         ClientAck { acked_frame: self.applied_num }
     }
@@ -454,6 +456,7 @@ mod tests {
             FrameBody::Diff { .. } => "Diff",
             FrameBody::Morph { .. } => "Morph",
             FrameBody::Scrollback { .. } => "Scrollback",
+            FrameBody::Scrollback2 { .. } => "Scrollback2",
             FrameBody::Empty => "Empty",
         }
     }

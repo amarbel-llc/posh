@@ -1,5 +1,5 @@
 ---
-status: proposed
+status: experimental
 date: 2026-07-03
 ---
 
@@ -72,7 +72,7 @@ A new RFC 0001 §3 registry entry is allocated:
 
 | id | Name | Direction | Payload | Meaning |
 |---|---|---|---|---|
-| 10 | `SCROLLBACK2` | both | client: 9 bytes; server: 1 byte | Client entry advertises v2 scrollback support and carries the client's scrollback acknowledgement (section 3): 1 byte requested ring depth in units of 256 rows (`0` = server default, as RFC 0002) followed by `acked_sb_rows: u64 LE`. Server entry acknowledges v2 with a 1-byte payload of `0x02`. |
+| 10 | `SCROLLBACK2` | both | client: 10 bytes; server: 2 bytes | Client entry advertises v2 scrollback support and carries the client's scrollback acknowledgement (section 3): ring depth u8 (256-row units, `0` = server default, as RFC 0002), epoch u8 (the epoch the client is accumulating in, section 1.1), then `acked_sb_rows: u64 LE`. Server entry acknowledges v2 with `{0x02, epoch: u8}`, naming the current epoch. Both entries ride every message (capabilities do not persist, RFC 0001 §3). |
 
 - A client implementing this specification MUST advertise `SCROLLBACK2` in
   every message (capabilities do not persist across messages, RFC 0001 §3).
@@ -92,6 +92,27 @@ A new RFC 0001 §3 registry entry is allocated:
   frame-number aliasing that produced divergent bases, but content
   divergence (#94) remains detectable only by checksum.
 
+#### 1.1 Epochs
+
+The row space is scoped to an **epoch**, identified by a u8 the server owns.
+Epochs exist because a client resize invalidates accumulated rows (reflow;
+RFC 0002 §4) while stale v2 bodies from before the reset may still be in
+flight — without an epoch tag, a cumulative-offset receiver would append
+old-width rows into a freshly-cleared ring.
+
+- The server MUST bump the epoch (wrapping) and re-anchor the row space
+  (row 0 = the monotonic scrollback total at the bump) whenever the client's
+  reported terminal size changes, and MAY bump it for any other
+  reset-requiring event. The server MUST ignore an `acked_sb_rows` whose
+  entry names a different epoch.
+- The client learns the current epoch from the server's `SCROLLBACK2` ack.
+  On a change (including the first ack) it MUST clear its ring and zero its
+  cumulative count. On its own resize it MUST treat the epoch as unknown —
+  discarding every v2 body — until the server's post-resize ack names the
+  fresh epoch.
+- A client MUST discard a v2 body whose `epoch` differs from the one it is
+  accumulating in.
+
 ### 2. v2 scrollback body
 
 A new body-kind discriminator is allocated in the RFC 0001 registry
@@ -102,13 +123,19 @@ BODY_SCROLLBACK2 = 7
 ```
 
 ```
-row_offset: u64 LE  -- absolute index, within the session's monotonically
+epoch:      u8      -- the epoch this body's row space belongs to (§1.1); a
+                       receiver in a different epoch discards the body
+row_offset: u64 LE  -- absolute index, within the epoch's monotonically
                        growing scrollback row space, of the first row this
                        body carries. Row 0 is the first row pushed to
-                       scrollback after the server acknowledged SCROLLBACK2.
+                       scrollback after the epoch opened.
 appended:   u32 LE  -- count of rows in this body
 rows:       appended × Row
 ```
+
+A server SHOULD cap the rows per body (the reference implementation uses
+256) so a long-disconnect resend chunks into fragmentation-friendly frames;
+the cumulative repeat loop carries the remainder as acks advance.
 
 `Row` is unchanged from RFC 0002 §2 (`len: u16 LE` + `bytes`), including the
 `dump_vt` rendering contract and the wrap-flag convention. RFC 0002's bounds
@@ -123,9 +150,9 @@ in particular its acknowledgements (section 4) — from a v2 body's
 ### 3. Client accumulation and the scrollback acknowledgement
 
 The client maintains a cumulative row total `T`: the number of scrollback
-rows it has accepted since the server acknowledged `SCROLLBACK2` (including
-rows its ring has since evicted for capacity; `T` never decreases). On
-receiving a v2 body:
+rows it has accepted in the current epoch (including rows its ring has since
+evicted for capacity; `T` never decreases within an epoch and resets to zero
+on an epoch change, §1.1). On receiving a v2 body of its current epoch:
 
 - `row_offset + appended <= T`: a retransmission already covered — the
   client MUST discard it (idempotency).
@@ -203,11 +230,10 @@ Tests MUST use `bats-emo` binary injection (`require_bin POSH posh`) once a
 
 | Requirement | Test | Description |
 |---|---|---|
-| §1, server MUST NOT emit v1 bodies once v2 acknowledged | to be added with the implementation | A v2 session's frame stream contains no `BODY_SCROLLBACK` (3). |
-| §2, v2 body encode/decode roundtrip + bounds | to be added | `row_offset`/`appended`/rows survive roundtrip; truncated and oversized bodies are rejected. |
-| §3, offset-gated append: dup discard, in-order append, forward-jump accept | to be added | `T` advances exactly per §3's three cases. |
-| §4, scrollback MUST NOT advance `acked_frame` | to be added | Under interleaved loss, `acked_frame` names only applied visible frames. |
-| §4, the #95 leap is impossible | extend `remote::client::wedge_repro_server_loop_with_loss_and_titles` | The loss harness under v2 completes with `reack=0`, no stale visible drops, and the final visible content delivered without watchdog/nudge intervention. |
+| §2, v2 body encode/decode roundtrip + bounds | `posh-proto frame::tests::scrollback2_body_roundtrips_and_bounds` | `epoch`/`row_offset`/`appended`/rows survive roundtrip; truncated and oversized bodies are rejected. |
+| §1, cap payload roundtrips | `posh remote::client::tests::outgoing_caps_advertises_v2_and_drops_v1_once_acked` | The 10-byte client entry carries epoch + `acked_sb_rows`; the v1 entry rides only until v2 is acked. |
+| §1.1/§3, epoch adoption + offset-gated append | `remote::client::tests::scrollback2_epoch_adoption_resets_ring_and_count`, `scrollback2_apply_rules_never_touch_applied_num` | Epoch change clears the ring and zeroes `T`; dup discard / in-order append / forward-jump accept / partial-overlap discard behave per §3; `applied_num` is inert throughout (§4). |
+| §4, the #95 leap is impossible end-to-end | `remote::client::tests::wedge_repro_server_loop_with_loss_and_titles` | The real `server_loop` under 35% induced loss with v2 negotiated: `reack=0`, `base_sum_mismatch=0`, and the harness asserts v2 engaged (epoch adopted, rows accumulated), so it cannot vacuously pass. |
 
 ## Compatibility
 

@@ -556,6 +556,15 @@ struct ClientState {
     /// next outgoing message (RFC 0002 §4: a resize ceases scrollback so the
     /// server restarts appended-row counting afresh at the new width).
     suppress_scrollback_once: bool,
+    /// Scrollback stream v2 (RFC 0009): the epoch we are accumulating in —
+    /// adopted from the server's SCROLLBACK2 ack cap, `None` until the first
+    /// ack arrives or after a local resize (stale in-flight bodies are
+    /// discarded until the server, seeing our new size, opens a new epoch).
+    sb2_epoch: Option<u8>,
+    /// Cumulative v2 rows accepted this epoch (`T`, RFC 0009 §3) — includes
+    /// rows the ring has since evicted; reported as `acked_sb_rows` in every
+    /// outgoing SCROLLBACK2 entry. Never advances `applied_num`.
+    sb2_rows: u64,
     /// What the physical tty currently shows.
     last_drawn: Snapshot,
     /// False when the outer terminal state is unknown (startup, resize,
@@ -718,6 +727,8 @@ fn client_loop(
         server_term: Terminal::with_scrollback(rows, cols, 0),
         scrollback: ScrollbackRing::new(SCROLLBACK_RING_DEPTH),
         suppress_scrollback_once: false,
+        sb2_epoch: None,
+        sb2_rows: 0,
         last_drawn: Snapshot::blank(rows, cols),
         initialized: false,
         last_wheel: false,
@@ -879,6 +890,11 @@ fn drive_client(st: &mut ClientState, raw: &RawMode, port: u16) -> Result<i32> {
             st.scrollback.clear();
             st.scroll_offset = 0; // FDR 0005: a resize returns to the live view
             st.suppress_scrollback_once = true;
+            // v2 (RFC 0009): expect a fresh epoch — the server, seeing our new
+            // size, bumps it; until its ack arrives, in-flight v2 bodies from
+            // the superseded row space are discarded (unknown epoch).
+            st.sb2_epoch = None;
+            st.sb2_rows = 0;
             send_now = true;
         }
 
@@ -1380,7 +1396,9 @@ fn process_frame(st: &mut ClientState, frame: &ServerFrame) -> bool {
         // Scrollback bodies carry no visible-screen change, so they stay out of
         // the Full/Diff/Empty economics — but are counted separately (#wedge) so
         // a scrollback storm/reset is not invisible.
-        FrameBody::Scrollback { .. } => st.stats.record_frame_scrollback(),
+        FrameBody::Scrollback { .. } | FrameBody::Scrollback2 { .. } => {
+            st.stats.record_frame_scrollback()
+        }
     }
     st.notify.server_heard(now);
     st.outbox.ack(frame.input_ack);
@@ -1418,6 +1436,20 @@ fn process_frame(st: &mut ClientState, frame: &ServerFrame) -> bool {
     if let Some(cap) = caps::find(&frame.caps, caps::CAP_DIAG) {
         if let Ok(d) = caps::decode_server_diag(&cap.payload) {
             st.last_server_diag = Some(d);
+        }
+    }
+    // Scrollback stream v2 (RFC 0009 §1): adopt the server's epoch from its
+    // SCROLLBACK2 ack. A change (or a first ack, or the ack after our local
+    // resize cleared `sb2_epoch`) opens a fresh epoch: clear the ring and zero
+    // the cumulative count — the server counts row 0 from the epoch start.
+    if let Some(cap) = caps::find(&frame.caps, caps::CAP_SCROLLBACK2) {
+        if let Ok(epoch) = caps::decode_scrollback2_ack(&cap.payload) {
+            if st.sb2_epoch != Some(epoch) {
+                st.scrollback.clear();
+                st.scroll_offset = 0;
+                st.sb2_rows = 0;
+                st.sb2_epoch = Some(epoch);
+            }
         }
     }
     // The escape-to-shell overlay is up (FDR 0008): the request was honored, so
@@ -1479,6 +1511,48 @@ fn apply_frame(st: &mut ClientState, frame: &ServerFrame) -> bool {
             st.stats
                 .record_apply_rx(frame.frame_num, *base, FrameKind::Scrollback)
         }
+        FrameBody::Scrollback2 { row_offset, .. } => {
+            st.stats
+                .record_apply_rx(frame.frame_num, *row_offset, FrameKind::Scrollback)
+        }
+    }
+    // Scrollback stream v2 (RFC 0009 §3): handled BEFORE the stale gate — its
+    // carrying frame_num is a diagnostic annotation, never state, and this
+    // body MUST NOT touch applied_num (the whole point of the separation: no
+    // scrollback traffic can launder or stale the visible baseline).
+    if let FrameBody::Scrollback2 {
+        epoch,
+        row_offset,
+        rows,
+    } = &frame.body
+    {
+        // Wrong or unknown epoch (pre-first-ack, mid-resize): a stale in-flight
+        // body from a superseded row space — discard, never append.
+        if st.sb2_epoch != Some(*epoch) {
+            st.stats.record_apply_stale();
+            return true;
+        }
+        let end = *row_offset + rows.len() as u64;
+        if end <= st.sb2_rows {
+            st.stats.record_apply_dup();
+            return true; // fully covered retransmission
+        }
+        if *row_offset < st.sb2_rows {
+            // Partial overlap: a conforming server anchors at our ack, so this
+            // is transient reordering — discard and let the re-anchor arrive.
+            st.stats.record_apply_basemis();
+            return true;
+        }
+        // In-order append, or a forward jump (server-ring eviction): the gap is
+        // permanently lost and the partial view is first-class (FDR 0005).
+        let grew = rows.len();
+        st.scrollback.append(rows);
+        if st.scroll_offset > 0 {
+            set_scroll(st, st.scroll_offset + grew);
+        }
+        st.sb2_rows = end;
+        st.stats.record_apply_advanced();
+        return true;
     }
     if frame.frame_num < st.applied_num {
         st.stats.record_apply_stale();
@@ -1549,7 +1623,9 @@ fn apply_frame(st: &mut ClientState, frame: &ServerFrame) -> bool {
         }
         FrameBody::Full(_) => {}
         // Handled above (returns early); listed so the match stays total.
-        FrameBody::Scrollback { .. } => unreachable!("scrollback handled above"),
+        FrameBody::Scrollback { .. } | FrameBody::Scrollback2 { .. } => {
+            unreachable!("scrollback handled above")
+        }
     }
     if frame.frame_num == st.applied_num {
         st.stats.record_apply_dup();
@@ -1863,10 +1939,21 @@ fn outgoing_caps(st: &mut ClientState) -> Vec<caps::Cap> {
     if st.suppress_scrollback_once {
         st.suppress_scrollback_once = false;
     } else {
-        extra.push(caps::Cap {
-            id: caps::CAP_SCROLLBACK,
-            payload: vec![0],
-        });
+        // Scrollback stream v2 (RFC 0009 §1): always advertise SCROLLBACK2 —
+        // it doubles as the per-message ack (epoch + cumulative rows). Keep
+        // the v1 SCROLLBACK entry only until the server acknowledges v2, so a
+        // v1-only server still provides RFC 0002 scrollback.
+        extra.push(caps::encode_scrollback2_client(&caps::Scrollback2Client {
+            ring_depth: 0,
+            epoch: st.sb2_epoch.unwrap_or(0),
+            acked_rows: st.sb2_rows,
+        }));
+        if st.sb2_epoch.is_none() {
+            extra.push(caps::Cap {
+                id: caps::CAP_SCROLLBACK,
+                payload: vec![0],
+            });
+        }
     }
     // Incremental frame sync (#15): advertise CAP_MORPH only behind the
     // POSH_FRAMESYNC=morph opt-in. A default session never sends it, so the
@@ -2584,6 +2671,8 @@ mod tests {
             server_term: Terminal::with_scrollback(rows, cols, 0),
             scrollback: ScrollbackRing::new(SCROLLBACK_RING_DEPTH),
             suppress_scrollback_once: false,
+            sb2_epoch: None,
+            sb2_rows: 0,
             last_drawn: Snapshot::blank(rows, cols),
             initialized: false,
             last_wheel: false,
@@ -2680,12 +2769,14 @@ mod tests {
         let deadline = now_ms() + 8_000;
         let mut frames_applied = 0u64;
         while now_ms() < deadline {
-            // Advertise the real caps (CAP_SCROLLBACK etc.) so the server
-            // interleaves scrollback frames with visible frames. This is the
-            // necessary ingredient: a scrollback frame advances applied_num past
-            // an unapplied visible frame, leaving the visible applied_data stale
-            // -> later visible Diffs fail apply_diff (short base) -> apply-stall.
-            // (Control: swapping this for `Vec::new()` makes the wedge vanish.)
+            // Advertise the real caps so the server interleaves scrollback with
+            // visible frames — historically (#95) the wedge ingredient: a v1
+            // scrollback frame advanced applied_num past an unapplied visible
+            // frame -> stale visible baseline -> apply-stall. Under RFC 0009
+            // the client advertises SCROLLBACK2, the server delivers rows as a
+            // cumulative offset stream outside the frame sequence, and the
+            // leap is impossible by construction — this harness now validates
+            // exactly that (§4), plus the v2 accumulation under 35% loss.
             let caps = outgoing_caps(&mut st);
             let msg = ClientMessage {
                 flags: st.flags,
@@ -2732,9 +2823,19 @@ mod tests {
                             FrameBody::Scrollback { base, rows } => {
                                 format!("Scrollback(base={base}, rows={})", rows.len())
                             }
+                            FrameBody::Scrollback2 {
+                                epoch,
+                                row_offset,
+                                rows,
+                            } => format!(
+                                "Scrollback2(epoch={epoch}, off={row_offset}, rows={})",
+                                rows.len()
+                            ),
                             FrameBody::Empty => "Empty".to_string(),
                         };
-                        apply_frame(&mut st, &frame);
+                        // The full frame path (not bare apply_frame): v2 epoch
+                        // adoption rides the frame's SCROLLBACK2 ack cap.
+                        process_frame(&mut st, &frame);
                         frames_applied += 1;
                         if st.stats.apply_snapshot().reack > before {
                             let ps = if let FrameBody::Diff { diff, .. } = &frame.body {
@@ -2811,8 +2912,22 @@ mod tests {
             "base divergence detected ({bsm}x): the client's diff base diverged \
              from the server's (would corrupt or wedge without the RFC 0006 checksum)"
         );
+        // RFC 0009: the v2 stream must actually have engaged (epoch adopted from
+        // the server's SCROLLBACK2 ack) and delivered the flood's history rows —
+        // guarding against the harness silently degrading to visible-only and
+        // vacuously passing the wedge assertions.
+        assert!(
+            st.sb2_epoch.is_some(),
+            "SCROLLBACK2 never negotiated: the harness is not exercising v2"
+        );
+        assert!(
+            st.sb2_rows > 0,
+            "no v2 scrollback rows accepted despite a scrolling flood"
+        );
         eprintln!(
-            "harness CLEAN: {frames_applied} frames applied, reack=0, base_sum_mismatch=0"
+            "harness CLEAN: {frames_applied} frames applied, reack=0, \
+             base_sum_mismatch=0, sb2_rows={}",
+            st.sb2_rows
         );
     }
 
@@ -2971,6 +3086,98 @@ mod tests {
             caps::find(&caps, caps::CAP_SCROLLBACK).is_some(),
             "scrollback resumes after the resize message"
         );
+    }
+
+    #[test]
+    fn scrollback2_apply_rules_never_touch_applied_num() {
+        // RFC 0009 §3/§4: dup discard, in-order append, forward-jump accept,
+        // partial-overlap discard, epoch gating — and applied_num is inert
+        // throughout (the class-killing invariant).
+        let mut st = test_state(5, 20);
+        st.applied_num = 7;
+        st.sb2_epoch = Some(3);
+        let body = |epoch: u8, off: u64, n: usize| ServerFrame {
+            flags: 0,
+            caps: vec![],
+            frame_num: 99,
+            input_ack: 0,
+            echo_ack: 0,
+            body: FrameBody::Scrollback2 {
+                epoch,
+                row_offset: off,
+                rows: (0..n).map(|i| format!("r{i}\r\n").into_bytes()).collect(),
+            },
+        };
+        // Wrong epoch: a stale in-flight body from a superseded row space.
+        assert!(apply_frame(&mut st, &body(2, 0, 2)));
+        assert_eq!(st.sb2_rows, 0);
+        assert!(st.scrollback.is_empty());
+        // In-order append.
+        assert!(apply_frame(&mut st, &body(3, 0, 2)));
+        assert_eq!(st.sb2_rows, 2);
+        assert_eq!(st.scrollback.len(), 2);
+        // Fully-covered dup: discarded (idempotent under retransmit).
+        assert!(apply_frame(&mut st, &body(3, 0, 2)));
+        assert_eq!(st.sb2_rows, 2);
+        assert_eq!(st.scrollback.len(), 2);
+        // Partial overlap: discarded (a conforming server re-anchors at our ack).
+        assert!(apply_frame(&mut st, &body(3, 1, 3)));
+        assert_eq!(st.sb2_rows, 2);
+        // Forward jump (server-ring eviction): accepted; the gap is lost
+        // history and the partial view is first-class (FDR 0005).
+        assert!(apply_frame(&mut st, &body(3, 10, 1)));
+        assert_eq!(st.sb2_rows, 11);
+        assert_eq!(st.scrollback.len(), 3);
+        // The invariant that kills the #95/#117 class:
+        assert_eq!(st.applied_num, 7, "scrollback v2 must never advance applied_num");
+    }
+
+    #[test]
+    fn scrollback2_epoch_adoption_resets_ring_and_count() {
+        // RFC 0009 §1: the server's ack cap names the epoch; a change clears
+        // the ring and zeroes the cumulative count; a repeat does not.
+        let mut st = test_state(5, 20);
+        st.scrollback.append(&[b"old\r\n".to_vec()]);
+        st.sb2_rows = 5;
+        st.sb2_epoch = Some(1);
+        let frame = ServerFrame {
+            flags: 0,
+            caps: vec![caps::encode_scrollback2_ack(2)],
+            frame_num: 1,
+            input_ack: 0,
+            echo_ack: 0,
+            body: FrameBody::Empty,
+        };
+        process_frame(&mut st, &frame);
+        assert_eq!(st.sb2_epoch, Some(2));
+        assert_eq!(st.sb2_rows, 0);
+        assert!(st.scrollback.is_empty(), "a fresh epoch clears the ring");
+        st.sb2_rows = 4;
+        st.scrollback.append(&[b"kept\r\n".to_vec()]);
+        process_frame(&mut st, &frame);
+        assert_eq!(st.sb2_rows, 4, "the same epoch again must not reset");
+        assert_eq!(st.scrollback.len(), 1);
+    }
+
+    #[test]
+    fn outgoing_caps_advertises_v2_and_drops_v1_once_acked() {
+        // RFC 0009 §1: v2 always advertised (it carries the per-message ack);
+        // the v1 entry rides only until the server acknowledges v2.
+        let mut st = test_state(5, 20);
+        let caps = outgoing_caps(&mut st);
+        assert!(caps::find(&caps, caps::CAP_SCROLLBACK2).is_some());
+        assert!(caps::find(&caps, caps::CAP_SCROLLBACK).is_some());
+
+        st.sb2_epoch = Some(4);
+        st.sb2_rows = 123;
+        let caps = outgoing_caps(&mut st);
+        assert!(
+            caps::find(&caps, caps::CAP_SCROLLBACK).is_none(),
+            "v1 dropped once v2 is acked"
+        );
+        let entry = caps::find(&caps, caps::CAP_SCROLLBACK2).expect("v2 advertised");
+        let c = caps::decode_scrollback2_client(&entry.payload).unwrap();
+        assert_eq!((c.epoch, c.acked_rows), (4, 123));
     }
 
     /// RFC 0002 §3: a `Full` visible reset re-establishes the visible screen

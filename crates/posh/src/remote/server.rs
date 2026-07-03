@@ -25,6 +25,10 @@ const SHUTDOWN_GRACE: u64 = 10_000; // ms to wait for the final-state ack
 /// Silence after which the peer is forgotten (sending stops, the session
 /// stays alive waiting for the client to come back).
 const PEER_TIMEOUT: u64 = 60_000; // ms
+/// Max rows per v2 scrollback body (RFC 0009 §2): chunks a long-disconnect
+/// resend into fragmentation-friendly frames; the cumulative repeat loop
+/// carries the rest forward as acks advance.
+const SB2_ROWS_PER_BODY: u64 = 256;
 /// #wedge organic watchdog: the model advancing (dirty) without a visible frame
 /// for this long is abnormal — a healthy server frames within one send_interval
 /// (<= 250ms). Persistence past this is the Case-A stall signature (model moved,
@@ -226,6 +230,20 @@ pub(crate) fn server_loop(
     let mut acked_sb_total: u64 = 0;
     let mut current_is_sb = false;
     let mut last_was_sb = false;
+    // Scrollback stream v2 (RFC 0009): active once the client advertises
+    // SCROLLBACK2 (the v1 state above is then forced off for this peer). Rows
+    // are counted in an epoch-relative space anchored at `sb2_epoch_base` (the
+    // monotonic primary-scrollback total at epoch start); the epoch bumps on a
+    // client resize, invalidating in-flight bodies from the old row space.
+    // Delivery is a cumulative repeat-until-acked stream (like the input
+    // channel), fully outside the producer's visible frame slots.
+    let mut sb2_active = false;
+    let mut sb2_epoch: u8 = 1;
+    let mut sb2_epoch_base: u64 = 0;
+    let mut sb2_acked_rows: u64 = 0;
+    let mut sb2_sent_upto: u64 = 0;
+    let mut sb2_last_send: u64 = 0;
+    let mut sb2_size: (u16, u16) = (rows, cols);
 
     // Agent forwarding (FDR 0004). The bidirectional agent byte stream and the
     // peer's per-message AGENT_FORWARD advertisement. `agent_seen` latches once
@@ -670,7 +688,39 @@ pub(crate) fn server_loop(
                             producer.drop_acked_base();
                             force_frame = true;
                         }
-                        let now_wants = caps::find(&msg.caps, caps::CAP_SCROLLBACK).is_some();
+                        // SCROLLBACK2 (RFC 0009 §1): v2 supersedes v1 for this
+                        // peer. The first advertisement opens the epoch at the
+                        // current monotonic total; every entry carries the
+                        // client's cumulative ack, valid only when its epoch
+                        // byte matches ours (a stale-epoch ack is ignored).
+                        if let Some(cap) = caps::find(&msg.caps, caps::CAP_SCROLLBACK2) {
+                            if let Ok(c) = caps::decode_scrollback2_client(&cap.payload) {
+                                if !sb2_active {
+                                    sb2_active = true;
+                                    sb2_epoch_base = term.primary_scrollback_total();
+                                    sb2_acked_rows = 0;
+                                    sb2_sent_upto = 0;
+                                }
+                                if c.epoch == sb2_epoch {
+                                    sb2_acked_rows = sb2_acked_rows.max(c.acked_rows);
+                                }
+                            }
+                        }
+                        // A client resize invalidates the epoch's row space
+                        // (reflow; the client cleared its ring and awaits a
+                        // fresh epoch): bump and re-anchor. handle_client_message
+                        // above already applied the new size to client_size.
+                        if client_size != sb2_size {
+                            sb2_size = client_size;
+                            if sb2_active {
+                                sb2_epoch = sb2_epoch.wrapping_add(1);
+                                sb2_epoch_base = term.primary_scrollback_total();
+                                sb2_acked_rows = 0;
+                                sb2_sent_upto = 0;
+                            }
+                        }
+                        let now_wants = !sb2_active
+                            && caps::find(&msg.caps, caps::CAP_SCROLLBACK).is_some();
                         if now_wants && !peer_wants_scrollback {
                             // (Re)activation: accumulate forward from here.
                             sb_floor = term.primary_scrollback_total();
@@ -738,6 +788,9 @@ pub(crate) fn server_loop(
             }
             let mut send_frame = false;
             let mut send_empty = false;
+            // This iteration's frame carries a v2 scrollback body (RFC 0009):
+            // rides the current frame number without advancing the producer.
+            let mut send_sb2 = false;
             // A freshly produced frame (vs a retransmission of the current one):
             // gates the diff-economics sampling so retransmits don't skew it.
             let mut fresh_frame = false;
@@ -769,7 +822,24 @@ pub(crate) fn server_loop(
             // (heavy output scrolling the screen) alternate so neither kind
             // starves the other.
             let make_scrollback = want_scrollback && (!want_visible || !last_was_sb);
-            let make_visible = want_visible && !make_scrollback;
+            // Scrollback stream v2 (RFC 0009): cumulative repeat-until-acked
+            // delivery. Send when fresh rows exist beyond the send cursor, or
+            // when the cursor is unacked past the RTO (resend from the ack).
+            // Independent of the alt screen — the primary ring only grows on
+            // the primary screen, and delivering retained history is
+            // orthogonal to what is currently displayed. Alternates with
+            // visible frames via the same last_was_sb coin as v1.
+            let sb2_avail = cur_sb_total.saturating_sub(sb2_epoch_base);
+            let sb2_resend_due = sb2_acked_rows < sb2_sent_upto
+                && now.saturating_sub(sb2_last_send) >= conn.rto();
+            let want_sb2 = sb2_active
+                && overlay.is_none()
+                && !force_frame
+                && !shutdown
+                && paced
+                && (sb2_avail > sb2_sent_upto || sb2_resend_due);
+            let make_sb2 = want_sb2 && (!want_visible || !last_was_sb);
+            let make_visible = want_visible && !make_scrollback && !make_sb2;
 
             // #wedge organic watchdog. The model advanced past the last framed
             // generation (dirty) yet this iteration emits no visible frame. A
@@ -890,6 +960,13 @@ pub(crate) fn server_loop(
                 current_is_sb = true;
                 last_was_sb = true;
                 send_frame = true;
+            } else if make_sb2 {
+                // v2 (RFC 0009): no producer slot, no frame-number advance —
+                // the body is cumulative-offset-addressed and acked via the
+                // client's SCROLLBACK2 entry, never via acked_frame.
+                send_sb2 = true;
+                last_was_sb = true;
+                send_frame = true;
             } else if producer.acked_num() < producer.current_num()
                 && now.saturating_sub(last_send) >= conn.rto()
             {
@@ -911,6 +988,41 @@ pub(crate) fn server_loop(
                 let body = if !send_frame {
                     stats.record_frame_empty();
                     FrameBody::Empty
+                } else if send_sb2 {
+                    // v2 scrollback body (RFC 0009 §2): rows of this epoch from
+                    // the send cursor (or re-anchored at the ack on an RTO
+                    // resend), bounded by what the ring retains — an evicted
+                    // gap becomes a forward jump the client accepts as
+                    // permanently-lost history — and by a per-body row cap so
+                    // a long-disconnect resend chunks instead of building one
+                    // oversized frame.
+                    let ring_len = term.primary_scrollback_len() as u64;
+                    let retained = ring_len.min(sb2_avail);
+                    let floor_rel = sb2_avail - retained;
+                    let cursor = if sb2_resend_due {
+                        sb2_acked_rows
+                    } else {
+                        sb2_sent_upto
+                    };
+                    let start_rel = cursor.max(floor_rel);
+                    let count = (sb2_avail - start_rel).min(SB2_ROWS_PER_BODY) as usize;
+                    let rows: Vec<Vec<u8>> = (0..count)
+                        .map(|k| {
+                            let r = start_rel + k as u64;
+                            // Epoch-relative row r sits at ring index
+                            // ring_len - (avail - r): the newest epoch row
+                            // (avail-1) is the newest ring row (ring_len-1).
+                            let idx = (ring_len - (sb2_avail - r)) as usize;
+                            term.dump_scrollback_row(idx).unwrap_or_default()
+                        })
+                        .collect();
+                    sb2_sent_upto = start_rel + count as u64;
+                    sb2_last_send = now;
+                    FrameBody::Scrollback2 {
+                        epoch: sb2_epoch,
+                        row_offset: start_rel,
+                        rows,
+                    }
                 } else if current_is_sb {
                     // Scrollback body (RFC 0002 §2), fresh or retransmitted:
                     // the rows that entered scrollback between the acked
@@ -1006,6 +1118,12 @@ pub(crate) fn server_loop(
                 // Capability table on the frame (RFC 0001 §3). Only peers
                 // that advertised a capability receive its payload.
                 let mut extras: Vec<caps::Cap> = Vec::new();
+                // SCROLLBACK2 ack (RFC 0009 §1) rides every frame: it names the
+                // current epoch, and the client keys its ring reset (fresh
+                // epoch adoption) off it.
+                if sb2_active {
+                    extras.push(caps::encode_scrollback2_ack(sb2_epoch));
+                }
                 if peer_wants_scrollback {
                     // Acknowledge that we emit scrollback bodies (RFC 0002
                     // §1); empty payload.
@@ -1995,6 +2113,9 @@ mod tests {
                                 }
                             }
                             FrameBody::Empty => {}
+                            // This harness's client advertises v1 SCROLLBACK
+                            // only, so the server never emits v2 bodies here.
+                            FrameBody::Scrollback2 { .. } => {}
                         }
                     }
                     Ok(None) => continue,
