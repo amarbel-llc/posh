@@ -284,18 +284,30 @@ it. Objective weights SHOULD be exposed as tunable parameters.
 
 The client drives mephisto's public single-generation API. The contract is:
 
-- `mephisto::domain::initial_population(dom, cfg, rng) -> Vec<Genome>` — seed
-  once at session start when no persisted population is loaded.
+- `mephisto::domain::initial_population(dom, cfg, rng) -> Vec<Bred>` — seed
+  once at session start when no persisted population is loaded. `Bred` pairs a
+  genome with its engine-carried, self-adaptive `Recombinator` strategy
+  (operator, mix, mate preference — mephisto #21): the reproductive strategy is
+  itself under selection, so the species opts in via
+  `Domain::uses_recombinator` and supplies the operator dispatch
+  (`Domain::recombine`) plus an assortative-mating `Domain::similarity` signal.
 - `mephisto::domain::evaluate_population(dom, &pop) -> Vec<Scored>` — score and
   rank best-first; called per server-frame tick. This call MUST NOT consume
   randomness (it is reproducible).
-- `mephisto::domain::step(dom, cfg, rng, &scored) -> Vec<Genome>` — advance one
+- `mephisto::domain::step(dom, cfg, rng, &scored) -> Vec<Bred>` — advance one
   generation.
-- `Scored { genome, fitness, rank }` — `scored[0]` is the champion the client
-  evaluates for display.
+- `Scored { genome, fitness, rank, recomb }` — `scored[0]` is the champion the
+  client evaluates for display.
 
 The client loop is: seed-or-load once, then per tick `{ evaluate_population;
 champion = scored[0]; choose display (§7.1); step }`.
+
+Because the online loop is long-lived (a session ticks generations for hours),
+the client MUST bound the domain's append-only arena by periodically compacting
+it to the live set via `Domain::gc` (mephisto #33), on the `gc_interval`
+cadence `LoopConfig` declares. GC is trajectory-neutral — a faithful structural
+re-expression drawing no randomness — so it never changes the search, only the
+memory bound.
 
 #### 7.1 Adaptive shadow baseline
 
@@ -332,6 +344,29 @@ wrong metrics.
 
 The persisted blob stores program *structure*, not metric *values*; it
 therefore does not embed host environment data (see Security Considerations).
+
+Two persisted artifacts exist, on different lifecycles:
+
+- **The working population** — the whole population saved at session end and
+  reloaded to seed the next session. Working state, so it lives under
+  `$XDG_STATE_HOME/posh/`.
+- **Champion records** — the current champion, serialized *periodically during
+  the session* (and at session end) as a standalone one-genome hyphence
+  document, so a crash never costs the champion lineage. Champions are the
+  durable, inspectable artifacts of the evolution — user data — so they
+  accumulate under `$XDG_DATA_HOME/posh/predict/champions/`, one file per
+  distinct champion, content-addressed (`<content-id>.hyph`, mephisto's
+  `gene_pool::content_id` over the document bytes) so an unchanged champion
+  re-saved — in this session or any later one — dedups to one file. Champion
+  docs carry their own schema tag (the same `_vN` leaf-set guard as the
+  population blob) and MUST be subject to the same §8 version gate on any
+  future reintroduction as seeds.
+
+The client SHOULD expose the live evolution state — generations stepped,
+population/window sizes, the champion's rank and size, the §7.1 display
+decision, and the champion-record path — through its inspection surface (posh:
+the command palette's *Show echo prediction stats*), so the evolved predictor
+is observable in-session without a debug sink.
 
 ## Security Considerations
 
@@ -418,7 +453,8 @@ Normative:
 - [RFC 0001] Target Grammar and Capability Table (`docs/rfcs/0001-…`) — the
   per-frame capability channel server-forwarded metrics extend.
 - [mephisto domain API] `mephisto::domain::{initial_population,
-  evaluate_population, step, Scored}` and `mephisto::rng::Rng`.
+  evaluate_population, step, Bred, Scored, Recombinator}` and
+  `mephisto::rng::Rng`.
 
 Informative:
 

@@ -46,7 +46,12 @@ by the next keystroke.
 	server (FDR 0008, the _POSH_ESCAPE_CMD_ command), reset & resync, dump wedge
 	forensics, show wedge debug info (an on-screen transport-state summary,
 	readable even while the session is frozen, plus a full dump to the
-	diagnostic sink), show agent-forwarding debug info (the
+	diagnostic sink), show echo prediction stats (the local-echo outcome
+	gauges plus, for the evolved GP models, the live evolution state — RFC
+	0007: generations, population and fitness-window sizes, the champion's
+	rank/size and whether it or the adaptive shadow is displayed, and the
+	champion hyphence-doc record under
+	_$XDG_DATA_HOME/posh/predict/champions/_), show agent-forwarding debug info (the
 		SSH agent-forwarding state on both the client and server ends, FDR 0004), suspend the client, and quit. Type to filter, arrows to
 	choose, Enter to run, Esc to
 	dismiss. Rendered by the *posh-palette* helper over a JSON-RPC control

@@ -138,6 +138,10 @@ fn palette_commands(server_log_on: bool, scroll_opt: bool) -> Value {
         { "name": "Reset & resync (force redraw)", "action": { "method": "session.resync" } },
         { "name": "Dump wedge forensics", "action": { "method": "session.forensics" } },
         { "name": "Show wedge debug info", "action": { "method": "session.debuginfo" } },
+        // RFC 0007: the local-echo prediction state — outcome gauges for every
+        // model, plus the live evolution-loop stats (generations, champion,
+        // hyphence champion record) when a GP species is selected.
+        { "name": "Show echo prediction stats", "action": { "method": "session.predictinfo" } },
         { "name": "Show agent-forwarding debug info", "action": { "method": "session.agentinfo" } },
         { "name": "Suspend client", "action": { "method": "client.suspend" } },
         { "name": "Quit session", "action": { "method": "app.quit" } },
@@ -264,6 +268,53 @@ fn agent_debug_summary(st: &ClientState) -> String {
     format!("{client}\n{server}")
 }
 
+/// The local-echo prediction summary for the "Show echo prediction stats"
+/// palette command (RFC 0007): the selected model and which predictor is
+/// actually displayed, the outcome gauges every model reports, and — when an
+/// evolved GP species is running — the evolution-loop state: generations
+/// stepped, population/window sizes, the champion's rank/size and its §7.1
+/// standing vs the adaptive shadow, and the champion hyphence-doc record under
+/// `$XDG_DATA_HOME` (§8).
+fn predict_debug_summary(st: &ClientState) -> String {
+    let ps = st.predict.stats();
+    let (correct, nocredit, incorrect) = ps.outcomes;
+    let mut out = format!(
+        "echo model: {:?}\noutcomes: correct={correct} nocredit={nocredit} incorrect={incorrect} \
+         resets={} epoch_lag={} shown_cells={} srtt_trigger={}",
+        st.predict_model,
+        ps.mispredict_resets,
+        ps.epoch_lag,
+        ps.shown_cells,
+        if ps.srtt_trigger { "on" } else { "off" },
+    );
+    match st.predict.evolution() {
+        Some(ev) => {
+            out.push_str(&format!(
+                "\nevolution: gen={} pop={} window={} displayed={} streak={:+}\
+                 \nchampion: rank={} size={} nodes, saves={}",
+                ev.generations,
+                ev.population,
+                ev.window,
+                if ev.champion_displayed {
+                    "champion (GP)"
+                } else {
+                    "shadow (adaptive floor)"
+                },
+                ev.champion_streak,
+                ev.champion_rank,
+                ev.champion_size,
+                ev.champion_saves,
+            ));
+            match ev.last_champion_doc {
+                Some(p) => out.push_str(&format!("\nchampion doc: {}", p.display())),
+                None => out.push_str("\nchampion doc: (none written yet)"),
+            }
+        }
+        None => out.push_str("\nevolution: inactive (select an evolved GP echo model)"),
+    }
+    out
+}
+
 /// Present a debug-info summary (#99): in a copyable, dismissable palette dialog
 /// when the renderer is available, else the notification banner as a fallback so
 /// the command never silently no-ops. Either surface composites over the session,
@@ -379,6 +430,16 @@ fn dispatch_palette_action(
             let summary = wedge_debug_summary(st, now);
             dump_client_state(st, now);
             show_debug_info(st, "wedge debug", &summary, now);
+            false
+        }
+        "session.predictinfo" => {
+            // RFC 0007: show the local-echo prediction state (model, outcome
+            // gauges, evolution-loop stats + champion record) and log it, so
+            // the evolved predictor can be inspected from the palette
+            // in-session, without a debug sink or a second terminal.
+            let summary = predict_debug_summary(st);
+            util::log_write("predictinfo", &summary);
+            show_debug_info(st, "echo prediction", &summary, now);
             false
         }
         "session.agentinfo" => {
@@ -2511,6 +2572,10 @@ mod tests {
             names.iter().any(|n| n.to_lowercase().contains("agent-forwarding")),
             "agent-forwarding debug command missing: {names:?}"
         );
+        assert!(
+            names.iter().any(|n| n.to_lowercase().contains("echo prediction stats")),
+            "prediction-stats command missing: {names:?}"
+        );
         // posh#100 scroll-region optimization toggle, with a state-dependent
         // label (Disable when on, Enable when off).
         assert!(
@@ -2527,7 +2592,39 @@ mod tests {
             off.iter().any(|n| n == "Enable scroll-region optimization"),
             "scroll-opt enable command missing when off: {off:?}"
         );
-        assert_eq!(arr.len(), 16, "expected 16 commands, got {names:?}");
+        assert_eq!(arr.len(), 17, "expected 17 commands, got {names:?}");
+    }
+
+    #[test]
+    fn dispatch_predictinfo_is_local_and_reports_inactive_evolution() {
+        // The "Show echo prediction stats" command is client-local (no wire
+        // send). Under the default adaptive model there is no evolution loop,
+        // and the summary must say so rather than showing zeros.
+        let raw = pty_raw_mode();
+        let mut st = test_state(24, 80);
+        let send = dispatch_palette_action(&mut st, &raw, "session.predictinfo", &json!({}), 0);
+        assert!(!send, "prediction stats are client-local, no wire send");
+        let summary = predict_debug_summary(&st);
+        assert!(summary.contains("outcomes:"), "{summary}");
+        assert!(summary.contains("evolution: inactive"), "{summary}");
+    }
+
+    #[test]
+    fn predict_debug_summary_reports_the_gp_evolution_state() {
+        // With the evolved controller selected, the summary carries the
+        // evolution gauges (RFC 0007): generations, the §7.1 display decision
+        // (a fresh controller sits on the adaptive shadow floor), and the
+        // champion hyphence-doc record (none written yet).
+        let mut st = test_state(24, 80);
+        apply_echo_model(&mut st, PredictionModel::Controller, 0);
+        let summary = predict_debug_summary(&st);
+        assert!(summary.contains("echo model: Controller"), "{summary}");
+        assert!(summary.contains("evolution: gen=0"), "{summary}");
+        assert!(summary.contains("shadow (adaptive floor)"), "{summary}");
+        assert!(
+            summary.contains("champion doc: (none written yet)"),
+            "{summary}"
+        );
     }
 
     #[test]
