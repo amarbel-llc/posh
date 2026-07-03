@@ -184,8 +184,8 @@ fn fmt_server_diag(d: Option<&crate::remote::caps::ServerDiag>) -> String {
     match d {
         None => "none".to_string(),
         Some(d) => format!(
-            "(num={} acked={} gen={} out={} pty={})",
-            d.current_num, d.acked_num, d.term_gen, d.outstanding, d.pty_open as u8,
+            "(pid={} num={} acked={} gen={} out={} pty={})",
+            d.pid, d.current_num, d.acked_num, d.term_gen, d.outstanding, d.pty_open as u8,
         ),
     }
 }
@@ -468,6 +468,7 @@ mod tests {
                 term_gen: 90,
                 outstanding: 2,
                 pty_open: true,
+                pid: 4242,
                 agent: None,
             }),
         }
@@ -489,7 +490,7 @@ mod tests {
             "title=\"user@host: ~/work\"",
             "apply(adv=0 stale=0 dup=0 basemis=7 bsum_mis=0 reack=0 nochange=0 sb_rx=0)",
             "last_rx(num=41 base=40 body=diff)",
-            "srv=(num=43 acked=41 gen=90 out=2 pty=1)",
+            "srv=(pid=4242 num=43 acked=41 gen=90 out=2 pty=1)",
         ] {
             assert!(line.contains(key), "missing {key:?} in:\n{line}");
         }

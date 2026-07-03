@@ -272,6 +272,10 @@ pub struct ServerDiag {
     pub term_gen: u64,
     pub outstanding: u32,
     pub pty_open: bool,
+    /// The server process's pid (#83 debug): lets a client wedge be mapped to
+    /// the exact remote `posh-server` log for a session, without a port→pid
+    /// lookup on the server host. 0 from a pre-pid (v1/v2) server.
+    pub pid: u32,
     /// The server's agent-forwarding endpoint state (FDR 0004), present
     /// when the server is forwarding (it has an `AgentEndpoint`). `None` from a
     /// server with forwarding disabled, or a v1 (transport-only) payload.
@@ -289,18 +293,20 @@ pub struct AgentDiag {
     pub symlink_ok: bool,
 }
 
-/// Versioned by length. v1 (29 bytes): current_num | acked_num | term_gen
-/// (u64 BE each) | outstanding (u32 BE) | pty_open (u8). v2 appends the
-/// [`AgentDiag`] when `d.agent` is `Some`: live_channels | next_channel_id
-/// (u32 BE each) | symlink_ok (u8), for 38 bytes total. Well under the
-/// 255-byte cap budget.
+/// Versioned by length. The 29-byte transport core is current_num | acked_num |
+/// term_gen (u64 BE each) | outstanding (u32 BE) | pty_open (u8). A u32 BE `pid`
+/// (#83) appends 4 bytes; the [`AgentDiag`] (FDR 0004, when `d.agent` is `Some`)
+/// appends 9. This encoder always writes the pid, so it emits 33 bytes (no
+/// agent) or 42 (with agent); the decoder still accepts the old pid-less 29/38.
+/// Well under the 255-byte cap budget.
 pub fn encode_server_diag(d: &ServerDiag) -> Cap {
-    let mut payload = Vec::with_capacity(38);
+    let mut payload = Vec::with_capacity(42);
     payload.extend_from_slice(&d.current_num.to_be_bytes());
     payload.extend_from_slice(&d.acked_num.to_be_bytes());
     payload.extend_from_slice(&d.term_gen.to_be_bytes());
     payload.extend_from_slice(&d.outstanding.to_be_bytes());
     payload.push(d.pty_open as u8);
+    payload.extend_from_slice(&d.pid.to_be_bytes());
     if let Some(a) = &d.agent {
         payload.extend_from_slice(&a.live_channels.to_be_bytes());
         payload.extend_from_slice(&a.next_channel_id.to_be_bytes());
@@ -312,28 +318,34 @@ pub fn encode_server_diag(d: &ServerDiag) -> Cap {
     }
 }
 
-/// Reads a [`ServerDiag`] payload. v1 is 29 bytes (transport only); v2 is 38
-/// (transport + [`AgentDiag`]). Any other length is malformed (the peer is
-/// authenticated, so this is corruption or an unknown future version, not an
-/// attack to absorb) and is dropped by the diagnostic consumer.
+/// Reads a [`ServerDiag`] payload. Four valid shapes (by length): 29 = core
+/// only (pre-pid); 33 = core + pid; 38 = core + agent (pre-pid); 42 = core +
+/// pid + agent. A pid-less peer decodes with `pid = 0`. Any other length is
+/// malformed (the peer is authenticated, so this is corruption or an unknown
+/// future version, not an attack to absorb) and is dropped by the consumer.
 pub fn decode_server_diag(payload: &[u8]) -> Result<ServerDiag> {
-    const V1_LEN: usize = 29;
-    const V2_LEN: usize = 38;
-    if payload.len() != V1_LEN && payload.len() != V2_LEN {
-        return Err(Error::from("CAP_DIAG payload is not 29 or 38 bytes"));
-    }
     let u64_at = |o: usize| u64::from_be_bytes(payload[o..o + 8].try_into().unwrap());
-    let agent = (payload.len() == V2_LEN).then(|| AgentDiag {
-        live_channels: u32::from_be_bytes(payload[29..33].try_into().unwrap()),
-        next_channel_id: u32::from_be_bytes(payload[33..37].try_into().unwrap()),
-        symlink_ok: payload[37] != 0,
+    let u32_at = |o: usize| u32::from_be_bytes(payload[o..o + 4].try_into().unwrap());
+    // (pid, agent-block offset) keyed on the payload length.
+    let (pid, agent_off) = match payload.len() {
+        29 => (0u32, None),
+        33 => (u32_at(29), None),
+        38 => (0u32, Some(29usize)),
+        42 => (u32_at(29), Some(33usize)),
+        _ => return Err(Error::from("CAP_DIAG payload is not 29/33/38/42 bytes")),
+    };
+    let agent = agent_off.map(|o| AgentDiag {
+        live_channels: u32_at(o),
+        next_channel_id: u32_at(o + 4),
+        symlink_ok: payload[o + 8] != 0,
     });
     Ok(ServerDiag {
         current_num: u64_at(0),
         acked_num: u64_at(8),
         term_gen: u64_at(16),
-        outstanding: u32::from_be_bytes(payload[24..28].try_into().unwrap()),
+        outstanding: u32_at(24),
         pty_open: payload[28] != 0,
+        pid,
         agent,
     })
 }
@@ -571,12 +583,17 @@ mod tests {
             term_gen: 9_001,
             outstanding: 3,
             pty_open: true,
+            pid: 1_069_334,
             agent: None,
         };
         let cap = encode_server_diag(&d);
         assert_eq!(cap.id, CAP_DIAG);
-        assert_eq!(cap.payload.len(), 29);
+        assert_eq!(cap.payload.len(), 33);
         assert_eq!(decode_server_diag(&cap.payload).unwrap(), d);
+        // A pre-pid (29-byte) peer still decodes, with pid = 0.
+        let old = decode_server_diag(&cap.payload[..29]).unwrap();
+        assert_eq!(old.pid, 0);
+        assert_eq!(old.current_num, d.current_num);
     }
 
     #[test]
@@ -587,6 +604,7 @@ mod tests {
             term_gen: 50,
             outstanding: 1,
             pty_open: true,
+            pid: 4242,
             agent: Some(AgentDiag {
                 live_channels: 4,
                 next_channel_id: 9,
@@ -594,14 +612,16 @@ mod tests {
             }),
         };
         let cap = encode_server_diag(&d);
-        assert_eq!(cap.payload.len(), 38);
+        assert_eq!(cap.payload.len(), 42);
         assert_eq!(decode_server_diag(&cap.payload).unwrap(), d);
-        // The same diag without agent state encodes as a 29-byte v1 payload and
-        // decodes with `agent = None`.
-        let v1 = ServerDiag { agent: None, ..d };
-        let cap_v1 = encode_server_diag(&v1);
-        assert_eq!(cap_v1.payload.len(), 29);
-        assert!(decode_server_diag(&cap_v1.payload).unwrap().agent.is_none());
+        // The same diag without agent state encodes as a 33-byte payload (core +
+        // pid) and decodes with `agent = None`.
+        let no_agent = ServerDiag { agent: None, ..d };
+        let cap_na = encode_server_diag(&no_agent);
+        assert_eq!(cap_na.payload.len(), 33);
+        let got_na = decode_server_diag(&cap_na.payload).unwrap();
+        assert!(got_na.agent.is_none());
+        assert_eq!(got_na.pid, 4242);
     }
 
     #[test]
@@ -612,6 +632,7 @@ mod tests {
             term_gen: 0,
             outstanding: 0,
             pty_open: false,
+            pid: 7,
             agent: None,
         };
         let got = decode_server_diag(&encode_server_diag(&d).payload).unwrap();
@@ -621,11 +642,19 @@ mod tests {
 
     #[test]
     fn server_diag_rejects_wrong_length() {
-        assert!(decode_server_diag(&[]).is_err());
-        assert!(decode_server_diag(&[0; 28]).is_err()); // one short of v1
-        assert!(decode_server_diag(&[0; 30]).is_err()); // between v1 and v2
-        assert!(decode_server_diag(&[0; 37]).is_err()); // one short of v2
-        assert!(decode_server_diag(&[0; 39]).is_err()); // one long of v2
+        // Valid lengths are 29/33/38/42 (core, +pid, +agent, +pid+agent).
+        for bad in [0usize, 28, 30, 34, 37, 39, 41, 43] {
+            assert!(
+                decode_server_diag(&vec![0u8; bad]).is_err(),
+                "len {bad} should be rejected"
+            );
+        }
+        for ok in [29usize, 33, 38, 42] {
+            assert!(
+                decode_server_diag(&vec![0u8; ok]).is_ok(),
+                "len {ok} should decode"
+            );
+        }
     }
 
     #[test]
@@ -638,6 +667,7 @@ mod tests {
             term_gen: 100,
             outstanding: 2,
             pty_open: true,
+            pid: 99,
             agent: None,
         };
         let table = own_table(&[encode_server_diag(&d)]);

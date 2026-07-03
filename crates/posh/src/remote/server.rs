@@ -1002,6 +1002,9 @@ pub(crate) fn server_loop(
                         term_gen: term.generation(),
                         outstanding: producer.outstanding_len() as u32,
                         pty_open,
+                        // #83: our pid, so a wedged client maps to this exact
+                        // remote posh-server log without a port->pid lookup.
+                        pid: std::process::id(),
                         // FDR 0004: forward the agent endpoint's state too
                         // when forwarding is active server-side (None == none).
                         agent: agent_endpoint.as_ref().map(|ep| ep.diag()),

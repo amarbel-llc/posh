@@ -208,8 +208,8 @@ fn dump_client_state(st: &ClientState, now: u64) {
 fn wedge_debug_summary(st: &ClientState, now: u64) -> String {
     let srv = match st.last_server_diag {
         Some(d) => format!(
-            "(num={} acked={} out={} pty={})",
-            d.current_num, d.acked_num, d.outstanding, d.pty_open as u8
+            "(pid={} num={} acked={} out={} pty={})",
+            d.pid, d.current_num, d.acked_num, d.outstanding, d.pty_open as u8
         ),
         None => "off".to_string(),
     };
@@ -2186,12 +2186,13 @@ mod tests {
             term_gen: 90,
             outstanding: 2,
             pty_open: true,
+            pid: 1234,
             agent: None,
         });
         let line = wedge_debug_summary(&st, 1000);
         assert!(line.contains("applied=41"), "{line}");
         assert!(line.contains("reack=yes"), "{line}");
-        assert!(line.contains("srv=(num=43 acked=41 out=2 pty=1)"), "{line}");
+        assert!(line.contains("srv=(pid=1234 num=43 acked=41 out=2 pty=1)"), "{line}");
     }
 
     #[test]
@@ -2399,6 +2400,7 @@ mod tests {
             term_gen: 10,
             outstanding: 1,
             pty_open: true,
+            pid: 555,
             agent: Some(caps::AgentDiag {
                 live_channels: 2,
                 next_channel_id: 3,

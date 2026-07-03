@@ -753,6 +753,23 @@ debug-posh-dump pid:
     echo ">> $f"
     tail -n1 "$f"
 
+# THROWAWAY (#83 debug): fetch a remote roaming server's newest posh-server log
+# to twerk for correlation with a client wedge. The remote server logs to its
+# XDG_RUNTIME_DIR/posh (XDG_LOG_HOME is unset over non-interactive ssh). Drop
+# this recipe once the #83 investigation lands.
+[group("debug")]
+debug-posh-fetch-server host="clown-dev" dest="/home/sasha/.local/log/posh/remote-server.log":
+    #!/usr/bin/env bash
+    set -euo pipefail
+    # Remote login shell is fish (no bash ${VAR:-default}); resolve the uid, then
+    # use find (no glob-abort) across the runtime dir and the XDG log dir.
+    uid="$(ssh {{ host }} id -u)"
+    src="$(ssh {{ host }} "find /run/user/$uid/posh \$HOME/.local/log/posh -maxdepth 1 -name 'posh-server-*.log' -printf '%T@ %p\n' 2>/dev/null | sort -rn | head -1 | cut -d' ' -f2-")"
+    [ -n "$src" ] || { echo "no posh-server log found on {{ host }}" >&2; exit 1; }
+    echo ">> {{ host }}:$src -> {{ dest }}"
+    scp -q {{ host }}:"$src" "{{ dest }}"
+    ls -l "{{ dest }}"
+
 # Print the most recent wedge-forensics bundle for a roaming posh CLIENT pid.
 # A bundle is written on an apply-stall (ReackAndWait), and on demand via the
 # SIGUSR2 dump or the "Dump wedge forensics" palette command. The .txt carries
