@@ -758,7 +758,7 @@ debug-posh-dump pid:
 # that EXACT server; without it, the newest. The remote logs to its
 # XDG_RUNTIME_DIR/posh or ~/.local/log/posh. Part of the #83 instrumented setup.
 [group("debug")]
-debug-posh-fetch-server host="clown-dev" pid="" dest="/home/sasha/.local/log/posh/remote-server.log":
+debug-posh-fetch-server host="posh-remote" pid="" dest="/tmp/posh-remote-server.log":
     #!/usr/bin/env bash
     set -euo pipefail
     # Remote login shell is fish (no bash ${VAR:-default}); resolve the uid, then
@@ -778,8 +778,10 @@ debug-posh-fetch-server host="clown-dev" pid="" dest="/home/sasha/.local/log/pos
 # Build .#posh and copy its closure to a remote host, so the remote has the same
 # instrumented posh-server the local client will exec via POSH_SERVER_CMD. Run
 # after a code change; prints the store path. Non-interactive (no launch).
+# `posh-remote` is an ssh alias — map it to your host in ~/.ssh/config, or pass
+# host=<your-host>.
 [group("debug")]
-debug-posh-copy-server host="clown-dev":
+debug-posh-copy-server host="posh-remote":
     #!/usr/bin/env bash
     set -euo pipefail
     out="$(nix build .#posh --no-link --print-out-paths)"
@@ -793,7 +795,7 @@ debug-posh-copy-server host="clown-dev":
 # POSH_SERVER_CMD pointed at the copied server's binary. Keeps the #83
 # instrumented client+server in lockstep. Interactive — run from your terminal.
 [group("debug")]
-debug-posh-run host="clown-dev" target="sasha@clown-dev" *args:
+debug-posh-run host="posh-remote" target="posh-remote" *args:
     #!/usr/bin/env bash
     set -euo pipefail
     out="$(nix build .#posh --no-link --print-out-paths)"

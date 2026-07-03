@@ -140,8 +140,9 @@ _POSH_WEDGE_WATCHDOG_
 	terminal size, and the remote echo state. In a debug posture
 	(_POSH_DEBUG_LOG_ or _POSH_WEDGE_WATCHDOG_ set) the client also requests
 	the server's own transport state, which then rides each frame and appears
-	as a trailing _srv=_ field — the server's frame number, ack, frames
-	outstanding, terminal generation, and pty-open flag. This is the far side
+	as a trailing _srv=_ field — the server's pid (so a wedged client maps to
+	the exact remote posh-server log), frame number, ack, frames outstanding,
+	terminal generation, and pty-open flag. This is the far side
 	of a wedge that a remote *posh-server*(1) cannot be *SIGUSR2*'d for
 	directly: server _num_ climbing while the client's _applied_num_ is frozen
 	is an apply-stall, both frozen points at the server or the path. Written
