@@ -379,7 +379,7 @@ impl FrameRenderer {
             }
             ApplyOutcome::NoChange => return Ok(Vec::new()),
             ApplyOutcome::ReackAndWait => {
-                return Err(Error(format!(
+                return Err(Error::Msg(format!(
                     "session frame {} could not be applied on the reliable socket",
                     frame.frame_num
                 )));

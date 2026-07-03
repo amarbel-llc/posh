@@ -85,7 +85,7 @@ pub fn ensure_session(cfg: &Config, name: &str, command: Option<Vec<String>>) ->
             }
         }
     } else if std::fs::symlink_metadata(&path).is_ok() {
-        return Err(Error(format!(
+        return Err(Error::Msg(format!(
             "{} exists and is not a socket",
             path.display()
         )));
@@ -94,7 +94,7 @@ pub fn ensure_session(cfg: &Config, name: &str, command: Option<Vec<String>>) ->
     // Bind before forking so a racing client can connect (and queue) as soon
     // as the parent returns.
     let listener =
-        UnixListener::bind(&path).map_err(|e| Error(format!("bind {}: {e}", path.display())))?;
+        UnixListener::bind(&path).map_err(|e| Error::Msg(format!("bind {}: {e}", path.display())))?;
     if util::double_fork()? {
         drop(listener);
         std::thread::sleep(std::time::Duration::from_millis(10));

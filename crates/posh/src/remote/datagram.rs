@@ -222,7 +222,7 @@ impl Connection {
                 return Ok((conn, port));
             }
         }
-        Err(Error(format!(
+        Err(Error::Msg(format!(
             "could not bind any UDP port in {low}:{high}"
         )))
     }

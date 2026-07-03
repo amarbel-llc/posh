@@ -174,7 +174,7 @@ fn run() -> Result<()> {
                 .first()
                 .ok_or_else(|| Error::from("usage: posh completions <bash|zsh|fish>"))?;
             let shell = completions::Shell::from_str(shell_arg)
-                .ok_or_else(|| Error(format!("unknown shell {shell_arg} (bash, zsh, or fish)")))?;
+                .ok_or_else(|| Error::Msg(format!("unknown shell {shell_arg} (bash, zsh, or fish)")))?;
             println!("{}", shell.script());
             Ok(())
         }
@@ -206,7 +206,7 @@ fn run() -> Result<()> {
                 session,
             } => cmd_ssh_session(user, host, g, &group, session, &rest[1..], &forward_flag),
         },
-        flag => Err(Error(format!("unknown option {flag} (see posh help)"))),
+        flag => Err(Error::Msg(format!("unknown option {flag} (see posh help)"))),
     }
 }
 
@@ -302,7 +302,7 @@ fn cmd_server(args: &[String]) -> Result<()> {
                 command = (!cmd.is_empty()).then_some(cmd);
                 break;
             }
-            other => return Err(Error(format!("unknown server option {other}"))),
+            other => return Err(Error::Msg(format!("unknown server option {other}"))),
         }
     }
     remote::server::run(port_range, family, command, agent_forward)
@@ -342,12 +342,12 @@ fn cmd_server_relay(
             }
             other if !other.starts_with('-') => {
                 if session.is_some() {
-                    return Err(Error(format!("relay: unexpected extra argument {other}")));
+                    return Err(Error::Msg(format!("relay: unexpected extra argument {other}")));
                 }
                 session = Some(other.to_string());
                 i += 1;
             }
-            other => return Err(Error(format!("unknown relay option {other}"))),
+            other => return Err(Error::Msg(format!("unknown relay option {other}"))),
         }
     }
     let session = session.ok_or_else(|| Error::from("relay requires a session name"))?;
@@ -361,7 +361,7 @@ fn cmd_server_relay(
 fn parse_port_range(s: &str) -> Result<(u16, u16)> {
     let parse = |v: &str| -> Result<u16> {
         v.parse::<u16>()
-            .map_err(|_| Error(format!("invalid port number ({v})")))
+            .map_err(|_| Error::Msg(format!("invalid port number ({v})")))
     };
     let (low, high) = match s.split_once(':') {
         Some((l, h)) => (parse(l)?, parse(h)?),
@@ -371,7 +371,7 @@ fn parse_port_range(s: &str) -> Result<(u16, u16)> {
         }
     };
     if low == 0 || low > high {
-        return Err(Error(format!("invalid port range ({s})")));
+        return Err(Error::Msg(format!("invalid port range ({s})")));
     }
     Ok((low, high))
 }
@@ -390,7 +390,7 @@ fn cmd_client(args: &[String]) -> Result<()> {
         [host, port] => (
             host.as_str(),
             port.parse::<u16>()
-                .map_err(|_| Error(format!("invalid port ({port})")))?,
+                .map_err(|_| Error::Msg(format!("invalid port ({port})")))?,
         ),
         _ => return Err(Error::from("usage: posh client [-4|-6] <host> <port>")),
     };
@@ -601,11 +601,11 @@ fn cmd_list_remote(user: Option<String>, host: String, group: &str) -> Result<()
     let out = std::process::Command::new(&argv[0])
         .args(&argv[1..])
         .output()
-        .map_err(|e| Error(format!("ssh: {e}")))?;
+        .map_err(|e| Error::Msg(format!("ssh: {e}")))?;
     if !out.status.success() {
         use std::io::Write;
         let _ = std::io::stderr().write_all(&out.stderr);
-        return Err(Error(format!("remote list failed on {host}")));
+        return Err(Error::Msg(format!("remote list failed on {host}")));
     }
     // Every printed name is itself a valid RemoteSession target.
     let prefix = match &user {

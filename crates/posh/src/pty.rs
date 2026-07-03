@@ -77,12 +77,12 @@ pub fn spawn_shell(
     argv.push(std::ptr::null());
     let env_owned: Vec<CString> = extra_env
         .iter()
-        .map(|(k, v)| CString::new(format!("{k}={v}")).map_err(|e| Error(e.to_string())))
+        .map(|(k, v)| CString::new(format!("{k}={v}")).map_err(|e| Error::Msg(e.to_string())))
         .collect::<Result<_>>()?;
     // Pre-allocate the cwd CString before fork(); the child only dereferences
     // the raw pointer (chdir is async-signal-safe).
     let cwd_owned: Option<CString> = match cwd {
-        Some(d) => Some(CString::new(d).map_err(|e| Error(e.to_string()))?),
+        Some(d) => Some(CString::new(d).map_err(|e| Error::Msg(e.to_string()))?),
         None => None,
     };
     let cwd_ptr: *const libc::c_char =
@@ -243,18 +243,18 @@ pub fn spawn_with_control(bin: &CString, rows: u16, cols: u16) -> Result<PtyCont
 fn build_argv(command: Option<&[String]>) -> Result<(CString, Vec<CString>)> {
     match command {
         Some(args) if !args.is_empty() => {
-            let path = CString::new(args[0].as_str()).map_err(|e| Error(e.to_string()))?;
+            let path = CString::new(args[0].as_str()).map_err(|e| Error::Msg(e.to_string()))?;
             let argv = args
                 .iter()
-                .map(|a| CString::new(a.as_str()).map_err(|e| Error(e.to_string())))
+                .map(|a| CString::new(a.as_str()).map_err(|e| Error::Msg(e.to_string())))
                 .collect::<Result<_>>()?;
             Ok((path, argv))
         }
         _ => {
             let shell = std::env::var("SHELL").unwrap_or_else(|_| "/bin/sh".to_string());
             let base = shell.rsplit('/').next().unwrap_or(&shell);
-            let path = CString::new(shell.as_str()).map_err(|e| Error(e.to_string()))?;
-            let argv0 = CString::new(format!("-{base}")).map_err(|e| Error(e.to_string()))?;
+            let path = CString::new(shell.as_str()).map_err(|e| Error::Msg(e.to_string()))?;
+            let argv0 = CString::new(format!("-{base}")).map_err(|e| Error::Msg(e.to_string()))?;
             Ok((path, vec![argv0]))
         }
     }
@@ -287,7 +287,7 @@ impl RawMode {
         unsafe {
             let mut orig: libc::termios = std::mem::zeroed();
             if libc::tcgetattr(fd, &mut orig) != 0 {
-                return Err(Error("not a terminal".to_string()));
+                return Err(Error::Msg("not a terminal".to_string()));
             }
             if libc::tcsetattr(fd, libc::TCSANOW, &raw_termios(&orig)) != 0 {
                 return Err(std::io::Error::last_os_error().into());

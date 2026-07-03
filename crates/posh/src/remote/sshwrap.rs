@@ -42,14 +42,14 @@ impl ServerReport {
         if let Some(rest) = line.strip_prefix("POSH IP ") {
             let ip = rest.trim();
             if ip.is_empty() || ip.contains(char::is_whitespace) {
-                return Err(Error(format!("bad POSH IP string: {line}")));
+                return Err(Error::Msg(format!("bad POSH IP string: {line}")));
             }
             self.ip = Some(ip.to_string());
             return Ok(false);
         }
         if let Some(rest) = line.strip_prefix("POSH CONNECT ") {
             let (port, key) = parse_connect(rest)
-                .ok_or_else(|| Error(format!("bad POSH CONNECT string: {line}")))?;
+                .ok_or_else(|| Error::Msg(format!("bad POSH CONNECT string: {line}")))?;
             self.port = Some(port);
             self.key = Some(key);
             return Ok(true);
@@ -202,7 +202,7 @@ pub fn run(target: &str, remote_cmd: &[String], opts: &SshOptions) -> Result<()>
         .stdout(Stdio::piped())
         .stderr(Stdio::inherit())
         .spawn()
-        .map_err(|e| Error(format!("cannot exec ssh: {e}")))?;
+        .map_err(|e| Error::Msg(format!("cannot exec ssh: {e}")))?;
 
     let stdout = child.stdout.take().expect("piped stdout");
     let mut report = ServerReport::default();
@@ -263,9 +263,9 @@ pub fn run_detached(target: &str, inner: &[String], opts: &SshOptions) -> Result
         .stdout(Stdio::inherit()) // pass through `posh attach --detach`'s status line
         .stderr(Stdio::inherit())
         .status()
-        .map_err(|e| Error(format!("cannot exec ssh: {e}")))?;
+        .map_err(|e| Error::Msg(format!("cannot exec ssh: {e}")))?;
     if !status.success() {
-        return Err(Error(format!("remote detached spawn failed on {target}")));
+        return Err(Error::Msg(format!("remote detached spawn failed on {target}")));
     }
     Ok(())
 }

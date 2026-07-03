@@ -48,7 +48,7 @@ impl Config {
             return Err(Error::from("group name cannot be empty"));
         }
         if group.contains('/') || group.contains("..") {
-            return Err(Error(format!("invalid group name: {group}")));
+            return Err(Error::Msg(format!("invalid group name: {group}")));
         }
         let env = |k: &str| std::env::var(k).ok();
         let uid = util::uid();
@@ -70,7 +70,7 @@ impl Config {
         builder.recursive(true).mode(0o700);
         builder
             .create(&socket_dir)
-            .map_err(|e| Error(format!("cannot create {}: {e}", socket_dir.display())))?;
+            .map_err(|e| Error::Msg(format!("cannot create {}: {e}", socket_dir.display())))?;
         // The leaf that actually holds the sockets must be private (0700) and
         // self-owned — reject an attacker-planted group dir. github #7.
         validate_session_dir(&socket_dir, uid, true)?;
@@ -84,7 +84,7 @@ impl Config {
         let encoded = util::encode_session_name(name);
         let path = self.socket_dir.join(&encoded);
         if path.as_os_str().len() > MAX_SOCKET_PATH {
-            return Err(Error(format!(
+            return Err(Error::Msg(format!(
                 "socket path too long ({} bytes, max {MAX_SOCKET_PATH}): {}",
                 path.as_os_str().len(),
                 path.display()
@@ -112,7 +112,7 @@ pub(crate) fn connect_or_create(
 ) -> Result<UnixStream> {
     daemon::ensure_session(cfg, name, command)?;
     let path = cfg.socket_path(name)?;
-    UnixStream::connect(&path).map_err(|e| Error(format!("connect {}: {e}", path.display())))
+    UnixStream::connect(&path).map_err(|e| Error::Msg(format!("connect {}: {e}", path.display())))
 }
 
 pub fn session_socket_exists(path: &Path) -> bool {
@@ -130,7 +130,7 @@ pub struct Probe {
 /// Connects to a session socket and asks for Info; one-second timeout. Used
 /// both for liveness checks and to enumerate session metadata.
 pub fn probe_session(path: &Path) -> Result<Probe> {
-    let stream = UnixStream::connect(path).map_err(|e| Error(format!("connect: {e}")))?;
+    let stream = UnixStream::connect(path).map_err(|e| Error::Msg(format!("connect: {e}")))?;
     stream.set_read_timeout(Some(Duration::from_secs(1)))?;
     ipc::send(std::os::fd::AsRawFd::as_raw_fd(&stream), Tag::Info, b"")?;
     let frame = wait_for_frame(&stream, Tag::Info, "info")?;
@@ -153,9 +153,9 @@ fn wait_for_frame(mut stream: &UnixStream, tag: Tag, what: &str) -> Result<ipc::
         let mut tmp = [0u8; 4096];
         let n = stream
             .read(&mut tmp)
-            .map_err(|e| Error(format!("waiting for {what}: {e}")))?;
+            .map_err(|e| Error::Msg(format!("waiting for {what}: {e}")))?;
         if n == 0 {
-            return Err(Error(format!("connection closed waiting for {what}")));
+            return Err(Error::Msg(format!("connection closed waiting for {what}")));
         }
         fb.feed(&tmp[..n]);
     }
@@ -169,29 +169,33 @@ fn wait_for_frame(mut stream: &UnixStream, tag: Tag, what: &str) -> Result<ipc::
 pub(crate) fn validate_session_dir(path: &Path, uid: u32, require_private: bool) -> Result<()> {
     let meta = match std::fs::symlink_metadata(path) {
         Ok(m) => m,
-        Err(_) => return Ok(()),
+        // Only NotFound is the benign "not created yet" case (#120): a
+        // permission-denied or I/O error must surface rather than silently
+        // passing a directory we could not actually validate.
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(()),
+        Err(e) => return Err(e.into()),
     };
     let ft = meta.file_type();
     if ft.is_symlink() {
-        return Err(Error(format!(
+        return Err(Error::Msg(format!(
             "refusing symlinked session dir: {}",
             path.display()
         )));
     }
     if !ft.is_dir() {
-        return Err(Error(format!(
+        return Err(Error::Msg(format!(
             "session dir is not a directory: {}",
             path.display()
         )));
     }
     if meta.uid() != uid {
-        return Err(Error(format!(
+        return Err(Error::Msg(format!(
             "session dir {} is not owned by uid {uid}",
             path.display()
         )));
     }
     if require_private && meta.mode() & 0o077 != 0 {
-        return Err(Error(format!(
+        return Err(Error::Msg(format!(
             "session dir {} is group/other-accessible (mode {:o})",
             path.display(),
             meta.mode() & 0o777
@@ -414,7 +418,7 @@ fn print_session_line(s: &SessionEntry, format: ListFormat, current: Option<&str
 pub fn cmd_kill(cfg: &Config, name: &str) -> Result<()> {
     let path = cfg.socket_path(name)?;
     if !session_socket_exists(&path) {
-        return Err(Error(format!(
+        return Err(Error::Msg(format!(
             "cannot kill session because it does not exist session_name={name}"
         )));
     }
@@ -428,7 +432,7 @@ pub fn cmd_kill(cfg: &Config, name: &str) -> Result<()> {
             if cleanup_stale_socket(&path) {
                 println!("cleaned up stale session {name}");
             } else {
-                return Err(Error(format!("session {name} is unresponsive: {e}")));
+                return Err(Error::Msg(format!("session {name} is unresponsive: {e}")));
             }
         }
     }
@@ -450,7 +454,7 @@ pub fn cmd_detach(cfg: &Config, name: Option<&str>) -> Result<()> {
     };
     let path = cfg.socket_path(name)?;
     if !session_socket_exists(&path) {
-        return Err(Error(format!("session does not exist session_name={name}")));
+        return Err(Error::Msg(format!("session does not exist session_name={name}")));
     }
     match probe_session(&path) {
         Ok(probe) => {
@@ -460,7 +464,7 @@ pub fn cmd_detach(cfg: &Config, name: Option<&str>) -> Result<()> {
         }
         Err(e) => {
             cleanup_stale_socket(&path);
-            Err(Error(format!("session unresponsive: {e}")))
+            Err(Error::Msg(format!("session unresponsive: {e}")))
         }
     }
 }
@@ -517,7 +521,7 @@ pub fn cmd_run(cfg: &Config, name: &str, args: &[String]) -> Result<()> {
     }
 
     let path = cfg.socket_path(name)?;
-    let probe = probe_session(&path).map_err(|e| Error(format!("session not ready: {e}")))?;
+    let probe = probe_session(&path).map_err(|e| Error::Msg(format!("session not ready: {e}")))?;
     let fd = std::os::fd::AsRawFd::as_raw_fd(&probe.stream);
     ipc::send(fd, Tag::Run, text.as_bytes())?;
 
@@ -546,7 +550,7 @@ pub fn cmd_fork(cfg: &Config, target: Option<&str>) -> Result<()> {
         Ok(p) => p,
         Err(e) => {
             cleanup_stale_socket(&source_path);
-            return Err(Error(format!("source session unresponsive: {e}")));
+            return Err(Error::Msg(format!("source session unresponsive: {e}")));
         }
     };
     let info = probe.info;
@@ -558,7 +562,7 @@ pub fn cmd_fork(cfg: &Config, target: Option<&str>) -> Result<()> {
     };
     let target_path = cfg.socket_path(&target_name)?;
     if session_socket_exists(&target_path) {
-        return Err(Error(format!("session already exists: {target_name}")));
+        return Err(Error::Msg(format!("session already exists: {target_name}")));
     }
 
     let args = info.cmd_argv();
@@ -637,13 +641,13 @@ pub fn cmd_groups() -> Result<()> {
 pub fn cmd_history(cfg: &Config, name: &str, vt: bool) -> Result<()> {
     let path = cfg.socket_path(name)?;
     if !session_socket_exists(&path) {
-        return Err(Error(format!("session does not exist session_name={name}")));
+        return Err(Error::Msg(format!("session does not exist session_name={name}")));
     }
     let probe = match probe_session(&path) {
         Ok(p) => p,
         Err(e) => {
             cleanup_stale_socket(&path);
-            return Err(Error(format!("session unresponsive: {e}")));
+            return Err(Error::Msg(format!("session unresponsive: {e}")));
         }
     };
     let fd = std::os::fd::AsRawFd::as_raw_fd(&probe.stream);
@@ -757,5 +761,40 @@ mod tests {
     fn socket_base_ignores_empty_values() {
         let base = resolve_socket_base(Some(""), Some(""), Some(""), 42);
         assert_eq!(base, PathBuf::from("/tmp/posh-42"));
+    }
+
+    #[test]
+    fn validate_session_dir_distinguishes_absent_from_unreadable() {
+        // #120: only NotFound is the benign "not created yet" case; a stat
+        // that fails for another reason (here: an unsearchable parent →
+        // PermissionDenied) must surface instead of silently validating.
+        use std::os::unix::fs::PermissionsExt;
+        let base = std::env::temp_dir().join(format!("posh-vsd-test-{}", std::process::id()));
+        std::fs::create_dir_all(&base).unwrap();
+        let uid = util::uid();
+
+        assert!(
+            validate_session_dir(&base.join("missing"), uid, true).is_ok(),
+            "absent dir is the caller-creates-it case"
+        );
+
+        let locked = base.join("locked");
+        let child = locked.join("dir");
+        std::fs::create_dir_all(&child).unwrap();
+        let mut perms = std::fs::metadata(&locked).unwrap().permissions();
+        perms.set_mode(0o000);
+        std::fs::set_permissions(&locked, perms.clone()).unwrap();
+        let result = validate_session_dir(&child, uid, true);
+        // (Root can stat through 0o000, so only assert when the stat failed.)
+        if let Err(err) = result {
+            assert_eq!(
+                err.kind(),
+                Some(std::io::ErrorKind::PermissionDenied),
+                "unreadable parent must surface as PermissionDenied"
+            );
+        }
+        perms.set_mode(0o700);
+        std::fs::set_permissions(&locked, perms).unwrap();
+        let _ = std::fs::remove_dir_all(&base);
     }
 }

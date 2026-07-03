@@ -195,7 +195,7 @@ impl FrameBuffer {
             }
             let len = u32::from_le_bytes([avail[1], avail[2], avail[3], avail[4]]) as usize;
             if len > MAX_FRAME_LEN {
-                return Err(util::Error(format!(
+                return Err(util::Error::Msg(format!(
                     "frame length {len} exceeds maximum {MAX_FRAME_LEN}"
                 )));
             }

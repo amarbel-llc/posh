@@ -419,7 +419,7 @@ impl GrabMouse {
                 Ok(GrabMouse::Off)
             }
             Some("on") | Some("always") | Some("1") | Some("true") => Ok(GrabMouse::On),
-            Some(other) => Err(Error(format!("unknown POSH_GRAB_MOUSE setting ({other})"))),
+            Some(other) => Err(Error::Msg(format!("unknown POSH_GRAB_MOUSE setting ({other})"))),
         }
     }
 }
@@ -445,9 +445,9 @@ pub fn run(
     let model_env = std::env::var("POSH_PREDICTION_MODEL")
         .ok()
         .or_else(|| std::env::var("POSH_PREDICTION").ok());
-    let model = PredictionModel::parse(model_env.as_deref()).map_err(Error)?;
+    let model = PredictionModel::parse(model_env.as_deref()).map_err(Error::Msg)?;
     let render_env = std::env::var("POSH_PREDICTION_RENDER").ok();
-    let render = RenderStyle::parse(render_env.as_deref()).map_err(Error)?;
+    let render = RenderStyle::parse(render_env.as_deref()).map_err(Error::Msg)?;
     let predict_overwrite = std::env::var("POSH_PREDICTION_OVERWRITE")
         .map(|v| !v.is_empty())
         .unwrap_or(false);
@@ -523,7 +523,7 @@ fn resolve(host: &str, port: u16, family: Family) -> Result<SocketAddr> {
         }
     }
 
-    Err(Error(format!(
+    Err(Error::Msg(format!(
         "could not resolve {host} (system resolver and tailnet)"
     )))
 }
@@ -1030,7 +1030,7 @@ fn drive_client(st: &mut ClientState, raw: &RawMode, port: u16) -> Result<i32> {
         if !heard {
             let waited = now.saturating_sub(started);
             if connect_timeout > 0 && waited >= connect_timeout {
-                break 'client Err(Error(format!(
+                break 'client Err(Error::Msg(format!(
                     "Timed out waiting for server on UDP port {port}."
                 )));
             }

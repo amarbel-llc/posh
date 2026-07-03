@@ -12,32 +12,61 @@ use std::time::Instant;
 
 pub type Result<T> = std::result::Result<T, Error>;
 
+/// The crate error: a plain message, or an I/O error kept whole so callers
+/// can branch on `io::ErrorKind` (#120) instead of string-matching — e.g.
+/// distinguishing NotFound (benign "not created yet") from PermissionDenied
+/// at a stat site. Display output is identical to the old stringly type.
+/// (posh-proto keeps its own string-tuple Error: protocol decode errors carry
+/// no I/O kind — a deliberate divergence, not drift.)
 #[derive(Debug)]
-pub struct Error(pub String);
+pub enum Error {
+    Io(std::io::Error),
+    Msg(String),
+}
 
-impl fmt::Display for Error {
-    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        f.write_str(&self.0)
+impl Error {
+    /// The underlying I/O error kind, when there is one.
+    pub fn kind(&self) -> Option<std::io::ErrorKind> {
+        match self {
+            Error::Io(e) => Some(e.kind()),
+            Error::Msg(_) => None,
+        }
     }
 }
 
-impl std::error::Error for Error {}
+impl fmt::Display for Error {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            Error::Io(e) => e.fmt(f),
+            Error::Msg(s) => f.write_str(s),
+        }
+    }
+}
+
+impl std::error::Error for Error {
+    fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
+        match self {
+            Error::Io(e) => Some(e),
+            Error::Msg(_) => None,
+        }
+    }
+}
 
 impl From<std::io::Error> for Error {
     fn from(e: std::io::Error) -> Error {
-        Error(e.to_string())
+        Error::Io(e)
     }
 }
 
 impl From<String> for Error {
     fn from(s: String) -> Error {
-        Error(s)
+        Error::Msg(s)
     }
 }
 
 impl From<&str> for Error {
     fn from(s: &str) -> Error {
-        Error(s.to_string())
+        Error::Msg(s.to_string())
     }
 }
 
@@ -46,7 +75,7 @@ impl From<&str> for Error {
 // `?` at posh-side call sites (e.g. `ClientMessage::decode` in remote::sync).
 impl From<posh_proto::Error> for Error {
     fn from(e: posh_proto::Error) -> Error {
-        Error(e.0)
+        Error::Msg(e.0)
     }
 }
 
@@ -154,7 +183,7 @@ pub fn check_utf8_locale(program: &str) -> Result<()> {
     } else {
         format!("{name}={value}")
     };
-    Err(Error(format!(
+    Err(Error::Msg(format!(
         "{program} needs a UTF-8 native locale to run.\n\n\
          Unfortunately, the environment ({var}) specifies\n\
          the character set \"{charset}\"."
