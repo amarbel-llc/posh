@@ -107,7 +107,7 @@ _POSH_NO_TERM_INIT_
 	*--no-init*).
 
 _POSH_DEBUG_LOG_
-	When set to a writable path, the client appends periodic one-line
+	Logging is on by default. The client appends periodic one-line
 	performance summaries — smoothed RTT, RTO, send interval, received
 	frame counts (full/diff/empty), download bandwidth, prediction
 	state, render activity (writes, bytes, idle skips), and per-frame
@@ -115,10 +115,14 @@ _POSH_DEBUG_LOG_
 	_apply_us_ and render _compose_us_; the max is the worst single frame
 	in the interval), keystroke→consumed input latency (_input_ms_, the
 	lag you feel), and event-loop timing (_loop iters=… busy=…us idle=…us
-	busy_pct=…% max_iter_us=…_, the stall / busy-CPU view) — plus a final
-	line on exit. All timings are windowed per interval. Rotated at 5 MB. The
-	on-demand *SIGUSR2* state dump (*SIGNALS*) is written to this same
-	sink. Unset disables logging.
+	busy_pct=…% max_iter_us=…_, the stall / busy-CPU view) — plus _#wedge_
+	breadcrumbs and a final line on exit. All timings are windowed per
+	interval. Rotated at 5 MB. The on-demand *SIGUSR2* state dump
+	(*SIGNALS*) is written to this same sink. The sink defaults to a
+	per-pid file _<logdir>/posh-client-<pid>.log_, where _<logdir>_ is
+	_$XDG_LOG_HOME/posh_, else _$XDG_STATE_HOME/posh/log_, else the
+	*SIGUSR2* run-dir default. Set _POSH_DEBUG_LOG_ to a writable path to
+	redirect the sink, or to _0_ or empty to opt out of logging.
 
 _POSH_WEDGE_WATCHDOG_
 	When set, arms an opt-in apply-stall watchdog (off by default). If the

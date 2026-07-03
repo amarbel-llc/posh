@@ -693,7 +693,7 @@ fn client_loop(
     // Request server transport-state piggyback (#6) only in a debug posture, so
     // a default session never negotiates it. Derive from the same Stats that
     // owns the POSH_DEBUG_LOG / POSH_WEDGE_WATCHDOG decisions.
-    let stats = Stats::new();
+    let stats = Stats::new("client");
     let want_server_diag = stats.enabled() || stats.wedge_watchdog();
     let mut st = ClientState {
         conn,
@@ -1653,6 +1653,7 @@ fn compose_frame(st: &mut ClientState, now: u64) -> Vec<u8> {
     {
         return Vec::new();
     }
+    let prev_render_state = st.last_render_state;
     st.last_render_state = model_state;
     st.last_render_overlays = overlays_live;
 
@@ -1730,6 +1731,20 @@ fn compose_frame(st: &mut ClientState, now: u64) -> Vec<u8> {
     st.initialized = true;
     st.last_wheel = wheel;
     st.last_drawn = next;
+    // #wedge render-skip breadcrumb (#83): the VISIBLE model advanced
+    // (server_term generation bumped) yet the tty diff came out empty — the
+    // content is in the client model but nothing repainted. Keyed on the
+    // generation, not applied_num, so a scrollback-only advance (which carries no
+    // visible change and legitimately paints nothing) does not false-fire.
+    if util::log_active() && bytes.is_empty() && model_state.1 != prev_render_state.1 {
+        util::log_write(
+            "render",
+            &format!(
+                "model advanced but painted nothing: frame={} gen {}->{}",
+                st.applied_num, prev_render_state.1, model_state.1
+            ),
+        );
+    }
     if let Some(t) = compose_timer {
         st.stats.record_compose_us(t.elapsed().as_micros() as u64);
     }
@@ -2492,7 +2507,7 @@ mod tests {
             input_sent: VecDeque::new(),
             framesync: framesync::FrameSync::DumpDiff,
             applier: Box::new(framesync::DumpDiff),
-            stats: Stats::new(),
+            stats: Stats::new("client"),
             palette: None,
             last_reack: None,
             forensic_captured: false,

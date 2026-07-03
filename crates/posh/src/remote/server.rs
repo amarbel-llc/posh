@@ -152,7 +152,7 @@ pub(crate) fn server_loop(
     // Optional perf instrumentation (POSH_DEBUG_LOG). run() has already
     // double-forked and redirected stdio to /dev/null, so this file fd is the
     // server's only viable diagnostic sink; inert when the env var is unset.
-    let mut stats = Stats::new();
+    let mut stats = Stats::new("server");
     let mut term = Terminal::new(rows, cols);
     let mut fragmenter = Fragmenter::new();
     let mut assembly = FragmentAssembly::new();
@@ -262,6 +262,18 @@ pub(crate) fn server_loop(
     // Set when the shell exits: forces one final frame (with FLAG_SHUTDOWN)
     // that the client must ack before we go away.
     let mut force_frame = false;
+    // #wedge poll-wakeup aggregate (#83 Case B). The `pty_read` breadcrumb only
+    // fires when a read HAPPENS; this counts the poll cycles that produced no
+    // read, so an always-on log positively distinguishes the two Case-B causes.
+    // Flushed ~1/s while a sink is open (`poll_log_at` = last flush). Fingerprint:
+    // `wakes` climbing with `pty_pollin=0` and `gen` frozen = post-exit bytes
+    // never signalled readable (source-quiet / below-master stall); `pty_pollin>0`
+    // with `reads=0` = a drain bug (readable but not consumed).
+    let mut poll_wakes: u64 = 0;
+    let mut poll_pty_pollin: u64 = 0;
+    let mut poll_pty_reads: u64 = 0;
+    let mut poll_pty_bytes: u64 = 0;
+    let mut poll_log_at: u64 = now_ms();
 
     loop {
         let iter_start = stats.enabled().then(Instant::now);
@@ -377,6 +389,13 @@ pub(crate) fn server_loop(
         }
         let idle_us = poll_start.map_or(0, |t| t.elapsed().as_micros() as u64);
 
+        // #wedge poll aggregate (#83 Case B): count this wake and whether the PTY
+        // signalled readable, before the read branch consumes it.
+        poll_wakes += 1;
+        if pty_open && fds[pty_idx].revents & libc::POLLIN != 0 {
+            poll_pty_pollin += 1;
+        }
+
         // Session shell output -> the main terminal model. Read even while an
         // overlay is up so the live session stays current underneath; it just
         // isn't broadcast until the overlay closes.
@@ -387,6 +406,8 @@ pub(crate) fn server_loop(
                     pty_open = false;
                 }
                 Ok(n) => {
+                    poll_pty_reads += 1;
+                    poll_pty_bytes += n as u64;
                     let gen_before = term.generation();
                     term.process(&buf[..n]);
                     let responses = term.take_responses();
@@ -426,6 +447,27 @@ pub(crate) fn server_loop(
                 // The whole session is ending: tear down any escape overlay.
                 close_overlay(&mut overlay);
             }
+        }
+
+        // #wedge poll aggregate flush (#83 Case B): one compact line ~1/s while a
+        // sink is open. `wakes` climbing with `pty_pollin=0` and `gen` frozen is
+        // the source-quiet Case B; `pty_pollin>0` with `reads=0` is a drain bug.
+        // Its absence (no lines at all) means the loop itself stopped cycling.
+        if util::log_active() && now.saturating_sub(poll_log_at) >= 1000 {
+            util::log_write(
+                "wedge",
+                &format!(
+                    "poll wakes={poll_wakes} pty_pollin={poll_pty_pollin} \
+                     reads={poll_pty_reads} bytes={poll_pty_bytes} pty_open={} gen={}",
+                    pty_open as u8,
+                    term.generation(),
+                ),
+            );
+            poll_wakes = 0;
+            poll_pty_pollin = 0;
+            poll_pty_reads = 0;
+            poll_pty_bytes = 0;
+            poll_log_at = now;
         }
 
         // Escape-overlay shell output -> the overlay terminal model (the active

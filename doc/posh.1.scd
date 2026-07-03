@@ -275,15 +275,17 @@ _POSH_SERVER_SIGNAL_TMOUT_
 	seconds (0 = never, the default). See *posh-server*(1).
 
 _POSH_DEBUG_LOG_
-	Path to a performance-diagnostics log for the roaming remote
-	transport. When set, *posh client* and *posh server* each append
-	periodic one-line summaries (RTT, bandwidth, frame counts, full-vs-
-	diff economics, prediction state, render activity, per-frame compute
-	timing), rotated at 5 MB.
-	For the bare _host:session_ form it is forwarded to the remote, so the
-	server logs to that path on the remote host (failing closed if it is
-	not writable there). The on-demand *SIGUSR2* dump (*SIGNALS*) shares
-	this sink. Unset disables logging. See *posh-client*(1) and
+	Debug logging for the roaming remote transport is *on by default*:
+	*posh client* and *posh server* each append periodic one-line
+	summaries (RTT, bandwidth, frame counts, full-vs-diff economics,
+	prediction state, render activity, per-frame compute timing) plus
+	_#wedge_ breadcrumbs, rotated at 5 MB, to a per-pid file under
+	_$XDG_LOG_HOME/posh_ (else _$XDG_STATE_HOME/posh/log_, else the
+	run-dir the *SIGUSR2* dump uses). Set this to a writable path to
+	redirect the sink; for the bare _host:session_ form the path is
+	forwarded to the remote, so the server logs there (failing closed if
+	not writable). Set it to _0_ or empty to opt out. The on-demand
+	*SIGUSR2* dump (*SIGNALS*) shares this sink. See *posh-client*(1) and
 	*posh-server*(1).
 
 # SIGNALS
