@@ -1,12 +1,13 @@
 ---
-status: proposed
+status: experimental
 date: 2026-06-30
 promotion-criteria: >
   proposed -> experimental: the daemon emits ServerFrames over its socket
   behind capability negotiation, a single unified client consumes frames over
   both the Unix and UDP transports, and the RFC 0008 conformance tests (socket
   skew matrix, reliable-as-degenerate property test) are green. The double-model
-  inner-attach path still exists behind the POSH_FRAMESYNC rollback switch.
+  inner-attach path still exists behind the POSH_SESSION_FRAMES rollback switch
+  (RFC 0008 §6; the remote-bootstrap half is POSH_RELAY).
   experimental -> testing: `posh attach` (picker + host-scoped + attach-or-create),
   `posh list` (unified, worker-filtered, spinclass-styled), and the command
   palette on a local session are all in daily use on both fleet hosts.

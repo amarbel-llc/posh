@@ -1,5 +1,5 @@
 ---
-status: proposed
+status: experimental
 date: 2026-06-12
 promotion-criteria: a working implementation exists where, attached to a
   real remote session over a lossy link, the wheel scrolls back through
