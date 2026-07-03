@@ -116,11 +116,12 @@ struct ClientConn {
     // frame-emission gate is on.
     caps: Vec<caps::Cap>,
     // Per-client visible-frame producer (RFC 0008), `Some` exactly when this
-    // client advertised frame support AND `$POSH_SESSION_FRAMES` is on. While
-    // `Some`, the daemon emits posh-proto `ServerFrame`s (`Tag::Frame`) to this
-    // client instead of raw `Tag::Output`; each client diffs against its OWN
-    // acked base, so a freshly attached client's first frame is a `Full` while
-    // an established one gets a `Diff`. Default `None` ⇒ today's `Tag::Output`.
+    // client advertised frame support AND the frame-emission gate is on (the
+    // default; `$POSH_SESSION_FRAMES` not set to an off value). While `Some`, the
+    // daemon emits posh-proto `ServerFrame`s (`Tag::Frame`) to this client instead
+    // of raw `Tag::Output`; each client diffs against its OWN acked base, so a
+    // freshly attached client's first frame is a `Full` while an established one
+    // gets a `Diff`. `None` (gate off / non-frame client) ⇒ legacy `Tag::Output`.
     producer: Option<FrameProducer>,
     // Whether this client relays its frames onto a LOSSY link (it advertised
     // `CAP_LOSSY` on Init — the Phase 3 frame relay, RFC 0008 §3). A lossy client
@@ -388,22 +389,26 @@ impl ClientConn {
 }
 
 /// Parses the `$POSH_SESSION_FRAMES` daemon frame-emission gate (RFC 0008 §6):
-/// `1`/`true`/`on`/`yes` (case-insensitive, trimmed) turn it ON; anything else
-/// — including unset/empty — leaves it OFF. Kept distinct from `$POSH_FRAMESYNC`
-/// (the *remote* MorphDelta codec opt-in) so the two are never conflated: this
-/// gate decides whether the session daemon emits frames at all, not which codec.
+/// an **opt-out**. `0`/`false`/`off`/`no` (case-insensitive, trimmed) turn it
+/// OFF; anything else — including unset/empty and any unrecognized value — leaves
+/// it ON (the default since the fleet gate-flip). Kept distinct from
+/// `$POSH_FRAMESYNC` (the *remote* MorphDelta codec opt-in) so the two are never
+/// conflated: this gate decides whether the session daemon emits frames at all,
+/// not which codec. `POSH_SESSION_FRAMES=0` restores today's raw-`Tag::Output`
+/// path byte-for-byte.
 fn parse_frames_gate(value: Option<&str>) -> bool {
-    matches!(
+    !matches!(
         value.map(|v| v.trim().to_ascii_lowercase()).as_deref(),
-        Some("1" | "true" | "on" | "yes")
+        Some("0" | "false" | "off" | "no")
     )
 }
 
 /// Whether this daemon emits posh-proto `ServerFrame`s (`Tag::Frame`) to
-/// frame-capable clients. DEFAULT OFF: with the gate off no producer is ever
-/// constructed, so every client — including a frame-capable one — receives raw
-/// `Tag::Output`, byte-for-byte today's behavior. Phase 1 must stay off because
-/// the local client cannot consume frames until Phase 2 (RFC 0008 / FDR 0011).
+/// frame-capable clients. DEFAULT ON (opt-out): frames flow to every frame-capable
+/// client unless `POSH_SESSION_FRAMES` is explicitly set off (`0`/`false`/`off`/
+/// `no`), in which case no producer is ever constructed and every client receives
+/// raw `Tag::Output`, byte-for-byte the legacy behavior. The local client has
+/// consumed frames since Phase 2 (RFC 0008 / FDR 0011), so on-by-default is safe.
 fn session_frames_enabled() -> bool {
     parse_frames_gate(std::env::var("POSH_SESSION_FRAMES").ok().as_deref())
 }
@@ -690,7 +695,8 @@ fn daemon_loop(
     let mut has_pty_output = false;
     // Frame-emission gate (RFC 0008 §6), read once at startup: when off, no
     // client ever gets a `FrameProducer`, so every client stays on `Tag::Output`
-    // (today's behavior, byte-for-byte). Default off.
+    // (legacy behavior, byte-for-byte). Default ON (opt-out); off only when
+    // `POSH_SESSION_FRAMES` is `0`/`false`/`off`/`no`.
     let frames_gate = session_frames_enabled();
     let mut filter = ScreenSwitchFilter::default();
     let err_events = libc::POLLHUP | libc::POLLERR | libc::POLLNVAL;
@@ -1444,18 +1450,22 @@ mod tests {
     }
 
     #[test]
-    fn frames_gate_defaults_off_and_parses_truthy() {
-        // Default OFF: unset/empty/falsey never turn it on.
-        assert!(!parse_frames_gate(None));
-        assert!(!parse_frames_gate(Some("")));
-        assert!(!parse_frames_gate(Some("0")));
-        assert!(!parse_frames_gate(Some("off")));
-        assert!(!parse_frames_gate(Some("false")));
-        // `morph` is the POSH_FRAMESYNC value, NOT this gate — must stay off.
-        assert!(!parse_frames_gate(Some("morph")));
-        // Truthy spellings (case-insensitive, trimmed) turn it on.
-        for on in ["1", "true", "on", "yes", "  TRUE  ", "On"] {
-            assert!(parse_frames_gate(Some(on)), "{on:?} should enable the gate");
+    fn frames_gate_defaults_on_and_parses_falsey() {
+        // Default ON (opt-out): unset/empty and any unrecognized value leave it on.
+        assert!(parse_frames_gate(None));
+        assert!(parse_frames_gate(Some("")));
+        assert!(parse_frames_gate(Some("1")));
+        assert!(parse_frames_gate(Some("on")));
+        assert!(parse_frames_gate(Some("true")));
+        // `morph` is the POSH_FRAMESYNC value, NOT this gate — it is not an off
+        // spelling, so it leaves the frame gate on (unrecognized ⇒ default).
+        assert!(parse_frames_gate(Some("morph")));
+        // Falsey spellings (case-insensitive, trimmed) turn it OFF.
+        for off in ["0", "false", "off", "no", "  FALSE  ", "Off"] {
+            assert!(
+                !parse_frames_gate(Some(off)),
+                "{off:?} should disable the gate"
+            );
         }
     }
 

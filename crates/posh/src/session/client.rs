@@ -200,10 +200,10 @@ impl DetachMatcher {
 /// roaming client. No resync/base-sum, prediction, or palette: those remain
 /// later unification tasks.
 ///
-/// This path runs only when the daemon sends `Tag::Frame`
-/// (`POSH_SESSION_FRAMES=on`, negotiated by Task 1.4). A default gate-off
-/// session serves raw `Tag::Output` and never constructs a `FrameRenderer`, so
-/// its byte stream is unchanged.
+/// This path runs only when the daemon sends `Tag::Frame` (the default; the
+/// frame gate negotiated by Task 1.4). A gate-off session (`POSH_SESSION_FRAMES=0`)
+/// serves raw `Tag::Output` and never constructs a `FrameRenderer`, so its byte
+/// stream is the legacy one, unchanged.
 struct FrameRenderer {
     /// The client's mirror of the daemon terminal. DumpDiff rebuilds it from a
     /// fresh model on every apply, so it is effectively write-then-read here;
@@ -1461,11 +1461,11 @@ mod tests {
         assert_eq!(renderer.scroll_offset, 0, "the wheel did not scroll the local view");
     }
 
-    /// Gate-off invariant: with `POSH_SESSION_FRAMES` off there is no
-    /// FrameRenderer, so the client_loop stdin path forwards `forward` verbatim.
-    /// The only stage between raw stdin and `Tag::Input` is the detach matcher,
-    /// which passes wheel SGR bytes through untouched — the daemon receives the
-    /// raw wheel exactly as before this task.
+    /// Gate-off invariant: with `POSH_SESSION_FRAMES=0` (frames now default ON,
+    /// so off is explicit) there is no FrameRenderer, so the client_loop stdin
+    /// path forwards `forward` verbatim. The only stage between raw stdin and
+    /// `Tag::Input` is the detach matcher, which passes wheel SGR bytes through
+    /// untouched — the daemon receives the raw wheel exactly as on the legacy path.
     #[test]
     fn gate_off_forwards_wheel_bytes_to_daemon_unchanged() {
         let mut m = DetachMatcher::default();
@@ -1497,11 +1497,12 @@ mod tests {
         );
     }
 
-    /// Gate-off invariant: with `POSH_SESSION_FRAMES` off there is no
-    /// FrameRenderer, so the loop never calls `split_escape` and Ctrl-^ is not
-    /// intercepted. The only stage before `Tag::Input` is the detach matcher,
-    /// which forwards the `0x1e` byte untouched — the shell receives it, exactly
-    /// as before this task (mirror `gate_off_forwards_wheel_bytes_...`).
+    /// Gate-off invariant: with `POSH_SESSION_FRAMES=0` (frames now default ON, so
+    /// off is explicit) there is no FrameRenderer, so the loop never calls
+    /// `split_escape` and Ctrl-^ is not intercepted. The only stage before
+    /// `Tag::Input` is the detach matcher, which forwards the `0x1e` byte untouched
+    /// — the shell receives it, exactly as on the legacy path (mirror
+    /// `gate_off_forwards_wheel_bytes_...`).
     #[test]
     fn gate_off_leaves_ctrl_caret_in_the_forwarded_stream() {
         let mut m = DetachMatcher::default();

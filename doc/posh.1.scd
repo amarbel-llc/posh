@@ -222,6 +222,14 @@ _POSH_PREDICTION_RENDER_
 _POSH_PREDICTION_OVERWRITE_
 	When set, predictions overwrite instead of inserting.
 
+_POSH_SESSION_FRAMES_
+	Session frame transport (RFC 0008), an opt-out: default *on*, so a local
+	*posh attach* renders through posh's own frame path (the Ctrl-^ command
+	palette and the mouse-wheel scroll-view are active). _0_/_false_/_off_/_no_
+	disables it, restoring the legacy raw-output path — the wheel then passes
+	through to the outer terminal's native scrollback/arrows. Distinct from
+	_POSH_FRAMESYNC_, which selects a codec rather than gating frame emission.
+
 _POSH_FRAMESYNC_
 	Server→client screen-sync codec (experimental): _morph_ for the
 	incremental escape-delta path; the default re-parses a full screen

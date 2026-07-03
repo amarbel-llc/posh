@@ -191,20 +191,22 @@ read-only, `debug` group):
   retransmit climb with ~0% measured loss points at the RTO margin
   (`RttEstimator::rto`, `remote/datagram.rs`), not the path.
 
-## Debugging a local session (wheel scrolls, arrow keys)
+## Debugging a local session (wheel scrolls vs arrow keys)
 
-- **Wheel emits arrow keys, not scrollback, in a default local session.** This
-  is expected, not a bug: on the local path the wheel-intercept/scroll-view
-  (`remote/scrollview.rs`, FDR 0005) is behind the `POSH_SESSION_FRAMES` daemon
-  gate, which is **default-OFF**. Gate off ⇒ no `FrameProducer`/`FrameRenderer`
-  ⇒ stdin forwards verbatim, so the wheel reaches the shell and the *outer
-  terminal's* alternate-scroll mode (`DECSET ?1007`) turns it into `↑`/`↓`.
-  posh is a passthrough here; it never translates the wheel to arrows itself
-  (the `POSH_GRAB_MOUSE` wheel→arrow grab is a remote-client-only path, ADR-0002,
-  also default-off). clown launches posh as a local `posh attach` session and
-  sets no `POSH_*` gates. Diagnose with `cat -v` at a bare prompt: `^[[A`/`^[[B`
-  = the terminal already translated (this story); `^[[<64;…M` = a different
-  culprit. Full write-up incl. the enable path (`POSH_SESSION_FRAMES=on`) in
+- **The wheel scrolls posh's scroll-view by default; if it emits arrow keys,
+  frames are OFF.** Since the fleet gate-flip the `POSH_SESSION_FRAMES` daemon gate
+  is **default-ON** (an opt-out), so the local wheel-intercept/scroll-view
+  (`remote/scrollview.rs`, FDR 0005) is live and the wheel scrolls posh's
+  scrollback (tmux-like). With frames OFF (`POSH_SESSION_FRAMES=0`, or an old
+  daemon) ⇒ no `FrameProducer`/`FrameRenderer` ⇒ stdin forwards verbatim, so the
+  wheel reaches the shell and the *outer terminal's* alternate-scroll mode
+  (`DECSET ?1007`) turns it into `↑`/`↓`. posh never translates the wheel to
+  arrows itself (the `POSH_GRAB_MOUSE` wheel→arrow grab is a remote-client-only
+  path, ADR-0002, default-off). clown launches posh as a local `posh attach`
+  session and sets no `POSH_*` gates, so it runs on the default (frames on).
+  Diagnose an unexpected-arrows case with `cat -v` at a bare prompt: `^[[A`/`^[[B`
+  = frames off, the terminal translated it; `^[[<64;…M` = a different culprit.
+  Full write-up incl. the `POSH_SESSION_FRAMES=0` opt-out in
   `docs/wheel-scroll-behavior.md`.
 
 ## When working here

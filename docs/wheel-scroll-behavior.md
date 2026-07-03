@@ -1,83 +1,89 @@
-# Wheel scroll behavior in local posh sessions (the alternate-scroll passthrough)
+# Wheel scroll behavior in local posh sessions
 
-A debugging note, not a design record. It captures a behavior that surprises
-agents and users: **in a default posh local session, scrolling the wheel emits
-arrow keys, not scrollback.** This is not a posh bug — posh is a passthrough in
-that configuration — but the symptom looks like one, so it is written down here
-with the diagnostic that distinguishes the layers.
+A note on a behavior that trips up agents and users, and the diagnostic that
+distinguishes the layers. Since the session frame transport became **default-ON**
+(RFC 0008, the fleet gate-flip), scrolling the wheel at a **bare prompt** in a
+local posh session drives **posh's own scroll-view** (scrollback) — like tmux,
+and unlike a bare terminal. The inverse is the thing to recognize: if the wheel
+instead emits **arrow keys** (`↑`/`↓`) to the shell, posh's frames are **disabled**
+for that session (`POSH_SESSION_FRAMES=0`, or an old / pre-frames daemon) and posh
+has fallen back to a passthrough.
 
-## The symptom
+## The two behaviors, by gate state
 
 Inside a posh local session (e.g. one clown self-wraps you in — clown's default
-multiplexer is posh; see below), scrolling the mouse wheel at a **bare prompt**
-prints `↑`/`↓` to the shell (and on the **alt screen** the same, driving whatever
-the TUI does with cursor keys). It does *not* open a scrollback view. Under a
-previous multiplexer (e.g. tmux) the wheel gave real scrollback, so the change
-reads as a regression introduced by adopting posh.
+multiplexer is posh; see below), scrolling the mouse wheel at a **bare prompt**:
+
+- **frames on (the default):** opens posh's scroll-view and scrolls its
+  scrollback ring — the tmux-like behavior most users expect.
+- **frames off (`POSH_SESSION_FRAMES=0`, or an old daemon):** prints `↑`/`↓` to
+  the shell (and on the **alt screen** the same, driving whatever the TUI does
+  with cursor keys) — posh is a passthrough and the *outer terminal* translates
+  the wheel. Before frames were the default this was the only behavior, which is
+  why it can read as a regression to someone who remembers it.
 
 ## Why it happens (verified)
 
 posh has a full wheel-intercept + local scroll-view feature
 (`crates/posh/src/remote/scrollview.rs`, shared by the local and roaming
-clients; FDR 0005). But on the **local session path** it is behind the
-`POSH_SESSION_FRAMES` daemon gate, which is **default-OFF**
-(`crates/posh/src/session/daemon.rs`, `parse_frames_gate` /
-`session_frames_enabled`; the `frames_gate_defaults_off_and_parses_truthy`
-test):
+clients; FDR 0005), driven on the local session path by the `POSH_SESSION_FRAMES`
+daemon gate, now **default-ON** (an opt-out) (`crates/posh/src/session/daemon.rs`,
+`parse_frames_gate` / `session_frames_enabled`; the
+`frames_gate_defaults_on_and_parses_falsey` test):
 
-- Gate off ⇒ the daemon never builds a `FrameProducer` ⇒ it sends raw
-  `Tag::Output`, never `Tag::Frame`.
-- The client therefore never builds a `FrameRenderer`
-  (`crates/posh/src/session/client.rs`) ⇒ the entire wheel-intercept /
-  scroll-view / `MouseFilter` path is **inert**.
-- stdin forwards **verbatim** to the daemon (only the detach matcher sits
-  between raw stdin and `Tag::Input`, and it passes wheel bytes through
-  untouched — the `gate_off_forwards_wheel_bytes_to_daemon_unchanged` test).
+- Gate on (the default) ⇒ the daemon builds a `FrameProducer` per frame-capable
+  client and sends `Tag::Frame` ⇒ the client builds a `FrameRenderer`
+  (`crates/posh/src/session/client.rs`) whose wheel-intercept / scroll-view /
+  `MouseFilter` path is live, so the wheel scrolls posh's scrollback in place.
+- Gate off (`POSH_SESSION_FRAMES=0`) ⇒ no `FrameProducer` ⇒ raw `Tag::Output`,
+  never `Tag::Frame` ⇒ the client never builds a `FrameRenderer` ⇒ the whole
+  wheel-intercept path is **inert**, and stdin forwards **verbatim** to the daemon
+  (only the detach matcher sits between raw stdin and `Tag::Input`, and it passes
+  wheel bytes through untouched — the
+  `gate_off_forwards_wheel_bytes_to_daemon_unchanged` test). The wheel bytes then
+  reach the shell's PTY, and the **outer terminal's alternate-scroll mode**
+  (`DECSET ?1007`) converts wheel-up/down into `↑`/`↓` when no mouse tracking is
+  active — the passthrough that predated the flip.
 
-So the wheel bytes pass straight through posh to the shell's PTY. The arrow keys
-are produced by the **outer terminal's alternate-scroll mode** (`DECSET ?1007`):
-the terminal itself converts wheel-up/down into `↑`/`↓` when no mouse tracking
-is active. This fits both observed cases — alt-screen (where alternate-scroll is
-designed to fire) and bare prompt (where the terminal leaves it on). The
-previous multiplexer was *catching* the wheel for its own scrollback; posh at
-gate-off does not, so the terminal's native arrows now reach the shell.
-
-Note also: posh's local client, even with frames ON, only ever *scrolls* on the
+Note also: posh's local client, even with frames on, only ever *scrolls* on the
 wheel — it never translates to arrows. The wheel→arrow grab
 (`POSH_GRAB_MOUSE`, ADR-0002) is a **remote-client-only** path and is default-off
 regardless. clown/eng set no `POSH_SESSION_FRAMES` and no `POSH_GRAB_MOUSE`
-anywhere; the only `POSH_*` var in the eng tree is `POSH_DIR` (a socket-path
-fix, `eng/home/spinclass.nix`).
+anywhere, so a clown-launched session runs on the default (frames on); the only
+`POSH_*` var in the eng tree is `POSH_DIR` (a socket-path fix,
+`eng/home/spinclass.nix`).
 
 ## How clown launches posh
 
 clown's `default-clownfile` sets `multiplexer = "posh"` and launches
 `posh attach {id} {entry}` — a **local** session (the `session/*` path), not a
 remote roaming session. It sets none of the `POSH_*` gates, so the session runs
-with `POSH_SESSION_FRAMES` unset ⇒ off.
+with `POSH_SESSION_FRAMES` unset ⇒ **on** (the default) ⇒ posh's scroll-view.
+Set `POSH_SESSION_FRAMES=0` in the launch env to restore the old passthrough.
 
 ## Diagnosing it (distinguishing the layers)
 
-At a bare prompt inside the session, run `cat -v` and scroll:
+If the wheel emits arrows when you expected scrolling, run `cat -v` at a bare
+prompt inside the session and scroll:
 
 - Bytes arrive as `^[[A` / `^[[B` (CSI cursor keys) ⇒ the **outer terminal**
-  already translated the wheel before posh saw it; posh forwarded verbatim.
-  This is the alternate-scroll passthrough described here — expected in the
-  default (gate-off) config.
+  translated the wheel before posh saw it; posh forwarded verbatim ⇒ frames are
+  **off** for this session (`POSH_SESSION_FRAMES=0`, or an old / pre-frames
+  daemon). Turn frames on (the default — unset the var, or upgrade the daemon) to
+  get posh's scroll-view back.
+- No bytes reach the shell and the view scrolls instead ⇒ frames are **on** (the
+  default) and posh's scroll-view is handling the wheel — working as intended.
 - Bytes arrive as SGR mouse form `^[[<64;…M` / `^[[<65;…M` ⇒ the terminal is
-  emitting raw wheel events and something *downstream* is translating them.
-  That is a different investigation — the passthrough story above does not
-  apply.
+  emitting raw wheel events and something *downstream* is translating them. That
+  is a different investigation — the passthrough story above does not apply.
 
-## Making the wheel scroll instead
+## Getting the old terminal-native wheel back
 
-Enable posh's own scroll-view by setting `POSH_SESSION_FRAMES=on` in the
-daemon's launch env (the client then builds the `FrameRenderer` and the wheel
-drives the local scrollback view at a bare prompt). This is the built, tested
-FDR 0005 path — but it is a bigger change than a config toggle, so flipping it
-on fleet-wide should be validated for maturity first, not assumed
-production-ready from the gate alone. The local `FrameRenderer` now also carries
+posh's scroll-view is now the default. To restore the pre-flip behavior — the
+wheel passing through to the outer terminal's alternate-scroll arrows — set
+`POSH_SESSION_FRAMES=0` in the daemon's launch env; the daemon then serves raw
+`Tag::Output`, the client builds no `FrameRenderer`, and the wheel reaches the
+shell exactly as on a bare terminal. The default `FrameRenderer` path also carries
 the command palette (FDR 0011 Phase 2.4: `Ctrl-^`, with Suspend / Detach /
-Shell out); resync and prediction remain absent, but on the reliable local
-socket that is by design (reliable-as-degenerate, RFC 0008 §2), not a maturity
-gap — the genuine pre-flip items are a real soak of the frame path.
+Shell out); resync and prediction are absent on the reliable local socket by
+design (reliable-as-degenerate, RFC 0008 §2), not a gap.

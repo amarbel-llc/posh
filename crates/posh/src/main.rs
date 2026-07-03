@@ -898,6 +898,12 @@ ENVIRONMENT
                     inner-`posh attach` bootstrap. A relay bootstrap also falls
                     back automatically when the remote daemon does not emit
                     frames, so both interoperate by negotiation.
+    POSH_SESSION_FRAMES
+                    Session frame transport (RFC 0008, default on): a local
+                    posh attach renders via posh's own frame path (Ctrl-^
+                    palette, mouse-wheel scroll-view). POSH_SESSION_FRAMES=0
+                    (or false/off/no) restores the legacy raw-output path
+                    (the wheel then passes through to the terminal's arrows).
     POSH_SERVER_NETWORK_TMOUT
                     Server exits after N seconds without client contact
                     (0 = never, the default)
