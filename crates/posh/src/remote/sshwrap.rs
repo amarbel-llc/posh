@@ -84,7 +84,17 @@ pub fn remote_command(
         cmd.push_str(&shell_quote(value));
         cmd.push(' ');
     }
-    cmd.push_str("posh-server new");
+    // `POSH_SERVER_CMD` overrides the remote server binary — a full path to a
+    // `posh-server` — so a debug/instrumented build can be driven over ssh
+    // without touching the remote's PATH. Unset (the default) uses the packaged
+    // `posh-server` on the remote's non-interactive PATH. A store path is
+    // shell-safe unquoted; the value is otherwise trusted (operator-set).
+    let server_bin = std::env::var("POSH_SERVER_CMD")
+        .ok()
+        .filter(|s| !s.is_empty())
+        .unwrap_or_else(|| "posh-server".to_string());
+    cmd.push_str(&server_bin);
+    cmd.push_str(" new");
     // C4: the bootstrap carries only the outcome (forward or not), never the
     // source path — that lives client-side. A bare `-A` to posh-server.
     if opts.agent_source.is_some() {

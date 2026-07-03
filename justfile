@@ -753,22 +753,54 @@ debug-posh-dump pid:
     echo ">> $f"
     tail -n1 "$f"
 
-# THROWAWAY (#83 debug): fetch a remote roaming server's newest posh-server log
-# to twerk for correlation with a client wedge. The remote server logs to its
-# XDG_RUNTIME_DIR/posh (XDG_LOG_HOME is unset over non-interactive ssh). Drop
-# this recipe once the #83 investigation lands.
+# Fetch a remote roaming server's posh-server log to this host for correlation
+# with a client wedge. With `pid=` (read off the client's `srv=(pid=…)`), fetch
+# that EXACT server; without it, the newest. The remote logs to its
+# XDG_RUNTIME_DIR/posh or ~/.local/log/posh. Part of the #83 instrumented setup.
 [group("debug")]
-debug-posh-fetch-server host="clown-dev" dest="/home/sasha/.local/log/posh/remote-server.log":
+debug-posh-fetch-server host="clown-dev" pid="" dest="/home/sasha/.local/log/posh/remote-server.log":
     #!/usr/bin/env bash
     set -euo pipefail
     # Remote login shell is fish (no bash ${VAR:-default}); resolve the uid, then
-    # use find (no glob-abort) across the runtime dir and the XDG log dir.
+    # use find (no glob-abort). `\$HOME` defers to the remote's home; $uid is
+    # expanded locally.
     uid="$(ssh {{ host }} id -u)"
-    src="$(ssh {{ host }} "find /run/user/$uid/posh \$HOME/.local/log/posh -maxdepth 1 -name 'posh-server-*.log' -printf '%T@ %p\n' 2>/dev/null | sort -rn | head -1 | cut -d' ' -f2-")"
-    [ -n "$src" ] || { echo "no posh-server log found on {{ host }}" >&2; exit 1; }
+    if [ -n "{{ pid }}" ]; then
+      src="$(ssh {{ host }} "find /run/user/$uid/posh \$HOME/.local/log/posh -maxdepth 1 -name 'posh-server-{{ pid }}.log' 2>/dev/null | head -1")"
+    else
+      src="$(ssh {{ host }} "find /run/user/$uid/posh \$HOME/.local/log/posh -maxdepth 1 -name 'posh-server-*.log' -printf '%T@ %p\n' 2>/dev/null | sort -rn | head -1 | cut -d' ' -f2-")"
+    fi
+    [ -n "$src" ] || { echo "no posh-server log on {{ host }} (pid='{{ pid }}')" >&2; exit 1; }
     echo ">> {{ host }}:$src -> {{ dest }}"
     scp -q {{ host }}:"$src" "{{ dest }}"
     ls -l "{{ dest }}"
+
+# Build .#posh and copy its closure to a remote host, so the remote has the same
+# instrumented posh-server the local client will exec via POSH_SERVER_CMD. Run
+# after a code change; prints the store path. Non-interactive (no launch).
+[group("debug")]
+debug-posh-copy-server host="clown-dev":
+    #!/usr/bin/env bash
+    set -euo pipefail
+    out="$(nix build .#posh --no-link --print-out-paths)"
+    echo ">> copying $out closure to {{ host }}…" >&2
+    nix copy --to "ssh://{{ host }}" "$out"
+    echo "$out"
+
+# Run the locally-built (instrumented) posh CLIENT against a remote host with the
+# SAME build serving as the server, without touching the remote's PATH: build
+# .#posh, copy the closure to the remote, then exec the client with
+# POSH_SERVER_CMD pointed at the copied server's binary. Keeps the #83
+# instrumented client+server in lockstep. Interactive — run from your terminal.
+[group("debug")]
+debug-posh-run host="clown-dev" target="sasha@clown-dev" *args:
+    #!/usr/bin/env bash
+    set -euo pipefail
+    out="$(nix build .#posh --no-link --print-out-paths)"
+    echo ">> built $out; copying closure to {{ host }}…" >&2
+    nix copy --to "ssh://{{ host }}" "$out"
+    echo ">> client -> {{ target }}, POSH_SERVER_CMD=$out/bin/posh-server" >&2
+    exec env POSH_SERVER_CMD="$out/bin/posh-server" "$out/bin/posh" {{ target }} {{ args }}
 
 # Print the most recent wedge-forensics bundle for a roaming posh CLIENT pid.
 # A bundle is written on an apply-stall (ReackAndWait), and on demand via the

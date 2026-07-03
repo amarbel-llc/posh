@@ -917,6 +917,10 @@ ENVIRONMENT
                     $XDG_STATE_HOME/posh/log, else the runtime dir). Set to a
                     path to redirect the sink (forwarded to the remote for the
                     bare host:session form); set to 0 or empty to opt out.
+    POSH_SERVER_CMD Full path to the remote posh-server binary to exec over ssh
+                    (bare host:session form). Overrides the packaged posh-server
+                    on the remote PATH, so a debug/instrumented build can be
+                    driven without touching the remote's PATH. Unset = PATH.
 
 OTHER
     help            Show this help message
