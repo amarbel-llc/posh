@@ -337,6 +337,12 @@ normative, consistent with RFC 0001.
   (`docs/rfcs/0001-target-grammar-and-capability-table.md`) — normative;
   this RFC allocates capability id 3 and body kind 3 within its registries
   and inherits its negotiation, bounds-checking, and compatibility rules.
+- RFC 0009: posh Scrollback Stream Separation
+  (`docs/rfcs/0009-scrollback-stream-separation.md`) — the proposed v2
+  revision: scrollback leaves the visible frame sequence and gains its own
+  cumulative acknowledgement, removing the posh#95/#117 wedge class this
+  protocol's shared frame numbering permits. Supersedes this document once
+  accepted.
 - FDR 0005: Client-side scrollback (`docs/features/`) — the user-facing
   feature this protocol enables, including the local scroll-view behavior
   that is out of scope here.
