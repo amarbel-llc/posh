@@ -924,7 +924,9 @@ ENVIRONMENT
     POSH_SERVER_CMD Full path to the remote posh-server binary to exec over ssh
                     (bare host:session form). Overrides the packaged posh-server
                     on the remote PATH, so a debug/instrumented build can be
-                    driven without touching the remote's PATH. Unset = PATH.
+                    driven without touching the remote's PATH. A single
+                    executable path (shell-quoted on the wire), not a command
+                    line. Unset = PATH.
 
 OTHER
     help            Show this help message

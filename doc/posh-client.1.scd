@@ -125,7 +125,9 @@ _POSH_WEDGE_WATCHDOG_
 	model stays frozen past a threshold while diff frames keep arriving —
 	the apply-stall signature — the client auto-captures a wedge forensic
 	bundle, arms the diagnostic sink, and forces a resync to break the
-	stall, once per episode. The RFC 0006 base-integrity check and the
+	stall, once per episode. Forensic bundles contain *raw screen bytes*
+	(whatever was on the terminal at capture time) and, like the
+	diagnostic log, are created private (mode 0600). The RFC 0006 base-integrity check and the
 	auto-escalate on an undecodable diff recover the common cases; this is
 	the uniform net over the silent-drop apply paths those miss (a stale or
 	base-mismatched frame dropped without recovery, a transport-side

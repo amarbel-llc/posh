@@ -462,8 +462,35 @@ struct LogFile {
 
 static LOGGER: Mutex<Option<LogFile>> = Mutex::new(None);
 
+/// Open `path` for appending, creating it PRIVATE (0600) if absent (#118):
+/// diagnostic sinks carry terminal titles and transport state, so they must
+/// not be born world-readable under a permissive umask. An existing file
+/// keeps its mode (`mode()` applies at creation only).
+pub(crate) fn open_private_append(path: &Path) -> std::io::Result<File> {
+    use std::os::unix::fs::OpenOptionsExt;
+    OpenOptions::new()
+        .create(true)
+        .append(true)
+        .mode(0o600)
+        .open(path)
+}
+
+/// Write `data` to a PRIVATE (0600) file, truncating any existing one (#118).
+/// For diagnostic payloads — forensic bundles — that contain raw screen bytes
+/// (whatever was on the terminal: prompts, credentials, output).
+pub fn write_private(path: &Path, data: &[u8]) -> std::io::Result<()> {
+    use std::os::unix::fs::OpenOptionsExt;
+    let mut f = OpenOptions::new()
+        .create(true)
+        .write(true)
+        .truncate(true)
+        .mode(0o600)
+        .open(path)?;
+    f.write_all(data)
+}
+
 pub fn log_init(path: &Path) -> Result<()> {
-    let file = OpenOptions::new().create(true).append(true).open(path)?;
+    let file = open_private_append(path)?;
     let size = file.metadata().map(|m| m.len()).unwrap_or(0);
     *LOGGER.lock().unwrap() = Some(LogFile {
         file,
@@ -496,7 +523,7 @@ pub fn log_write(level: &str, msg: &str) {
     if log.size >= LOG_MAX_SIZE {
         let old = log.path.with_extension("log.old");
         let _ = std::fs::rename(&log.path, &old);
-        if let Ok(file) = OpenOptions::new().create(true).append(true).open(&log.path) {
+        if let Ok(file) = open_private_append(&log.path) {
             log.file = file;
             log.size = 0;
         }
@@ -539,6 +566,28 @@ mod tests {
     fn decode_preserves_invalid_escapes() {
         assert_eq!(decode_session_name("50%"), "50%");
         assert_eq!(decode_session_name("a%zz"), "a%zz");
+    }
+
+    #[test]
+    fn diagnostic_files_are_created_private() {
+        // #118: diagnostic sinks and forensic payloads carry terminal content
+        // (raw screen bytes in forensics), so both creation paths must produce
+        // 0600 files regardless of umask.
+        use std::os::unix::fs::PermissionsExt;
+        let dir = std::env::temp_dir().join(format!("posh-util-test-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+
+        let w = dir.join("private-write");
+        write_private(&w, b"screen bytes").unwrap();
+        let mode = std::fs::metadata(&w).unwrap().permissions().mode() & 0o777;
+        assert_eq!(mode, 0o600, "write_private must create 0600, got {mode:o}");
+
+        let a = dir.join("private-append");
+        drop(open_private_append(&a).unwrap());
+        let mode = std::fs::metadata(&a).unwrap().permissions().mode() & 0o777;
+        assert_eq!(mode, 0o600, "open_private_append must create 0600, got {mode:o}");
+
+        let _ = std::fs::remove_dir_all(&dir);
     }
 
     #[test]

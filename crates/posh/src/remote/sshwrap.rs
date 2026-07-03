@@ -72,6 +72,21 @@ impl ServerReport {
 /// unquoted so the legacy wire string stays byte-identical to the pre-relay
 /// bootstrap. (`--` means the same argument quoted or not, so this is cosmetic
 /// for the relay tail and load-bearing only for legacy byte-identity.)
+/// The remote server executable in the bootstrap command: the packaged
+/// `posh-server` from the remote's non-interactive PATH by default, or — when
+/// `POSH_SERVER_CMD` names one — that binary, shell-quoted (#119). The
+/// override is the one operator-supplied string in the bootstrap; quoting it
+/// like every other interpolation makes a path with spaces work and renders
+/// shell metacharacters inert on the remote. It is a single executable path,
+/// not a command line. The default stays unquoted so the baseline wire string
+/// remains byte-identical to the pre-override bootstrap.
+fn server_command_head(override_cmd: Option<&str>) -> String {
+    match override_cmd.filter(|s| !s.is_empty()) {
+        Some(bin) => shell_quote(bin),
+        None => "posh-server".to_string(),
+    }
+}
+
 pub fn remote_command(
     opts: &SshOptions,
     tail: &[String],
@@ -84,16 +99,9 @@ pub fn remote_command(
         cmd.push_str(&shell_quote(value));
         cmd.push(' ');
     }
-    // `POSH_SERVER_CMD` overrides the remote server binary — a full path to a
-    // `posh-server` — so a debug/instrumented build can be driven over ssh
-    // without touching the remote's PATH. Unset (the default) uses the packaged
-    // `posh-server` on the remote's non-interactive PATH. A store path is
-    // shell-safe unquoted; the value is otherwise trusted (operator-set).
-    let server_bin = std::env::var("POSH_SERVER_CMD")
-        .ok()
-        .filter(|s| !s.is_empty())
-        .unwrap_or_else(|| "posh-server".to_string());
-    cmd.push_str(&server_bin);
+    cmd.push_str(&server_command_head(
+        std::env::var("POSH_SERVER_CMD").ok().as_deref(),
+    ));
     cmd.push_str(" new");
     // C4: the bootstrap carries only the outcome (forward or not), never the
     // source path — that lives client-side. A bare `-A` to posh-server.
@@ -524,6 +532,25 @@ mod tests {
             real_ssh_agent_forward: None,
         };
         assert_eq!(remote_command(&off, &[], &[]), "posh-server new");
+    }
+
+    #[test]
+    fn server_command_head_quotes_the_override_only() {
+        // #119: the override is the one operator-supplied string in the
+        // bootstrap — quoted, so a path with spaces survives and shell
+        // metacharacters are inert on the remote. The default stays bare for
+        // baseline wire byte-identity.
+        assert_eq!(server_command_head(None), "posh-server");
+        assert_eq!(server_command_head(Some("")), "posh-server");
+        assert_eq!(
+            server_command_head(Some("/nix/store/abc-posh/bin/posh-server")),
+            "'/nix/store/abc-posh/bin/posh-server'"
+        );
+        let q = server_command_head(Some("/tmp/my build/posh-server; rm -rf ~"));
+        assert!(
+            q.starts_with('\'') && q.ends_with('\''),
+            "metacharacters must ride inside quotes: {q}"
+        );
     }
 
     #[test]

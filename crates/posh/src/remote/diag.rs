@@ -339,9 +339,12 @@ pub fn capture_forensics(
     let base = sink_base();
     let stem = format!("posh-forensic-client-{}-{}", report.pid, rx_num);
     let txt = base.join(format!("{stem}.txt"));
-    std::fs::write(&txt, report.format()).ok()?;
-    let _ = std::fs::write(base.join(format!("{stem}.applied")), applied_data);
-    let _ = std::fs::write(base.join(format!("{stem}.diff")), body_bytes);
+    // Private (0600) writes, #118: `.applied`/`.diff` are raw screen bytes —
+    // whatever was on the terminal at capture time — and must not be born
+    // world-readable under a permissive umask.
+    util::write_private(&txt, report.format().as_bytes()).ok()?;
+    let _ = util::write_private(&base.join(format!("{stem}.applied")), applied_data);
+    let _ = util::write_private(&base.join(format!("{stem}.diff")), body_bytes);
     Some(txt)
 }
 
