@@ -83,6 +83,38 @@ pub trait Predictor: Send {
     fn needs_timer(&self) -> bool;
     /// Instantaneous + cumulative display gauges for the stats log.
     fn stats(&self) -> PredictorStats;
+    /// Evolution-loop gauges for the evolved GP species (RFC 0007): generation
+    /// count, champion rank/size, the §7.1 display decision, and the champion
+    /// hyphence-doc record. `None` for the non-evolved models, so the palette's
+    /// prediction-stats view can tell "no evolution running" apart from zeros.
+    fn evolution(&self) -> Option<EvolutionStats> {
+        None
+    }
+}
+
+/// Gauges of the online evolution loop (RFC 0007 §7), sampled from an evolved
+/// predictor for the palette's prediction-stats view and the debug log.
+#[derive(Clone, Debug)]
+pub struct EvolutionStats {
+    /// Generations stepped this session.
+    pub generations: u64,
+    /// Current population size.
+    pub population: usize,
+    /// Outcome samples in the fitness window.
+    pub window: usize,
+    /// The champion's rank at the last evaluation (lower is better; `+inf`
+    /// until the first scored window).
+    pub champion_rank: f64,
+    /// Total nodes across the champion's roots (a bloat/parsimony gauge).
+    pub champion_size: u32,
+    /// Whether the GP champion (vs the adaptive shadow) is displayed (§7.1).
+    pub champion_displayed: bool,
+    /// The §7.1 hysteresis counter (positive = champion winning).
+    pub champion_streak: i32,
+    /// Champion hyphence docs written (deduped) this session (RFC 0007 §8)...
+    pub champion_saves: u64,
+    /// ...and the most recent doc's path under `$XDG_DATA_HOME`.
+    pub last_champion_doc: Option<std::path::PathBuf>,
 }
 
 /// The render UX: how one already-decided-visible prediction is painted.

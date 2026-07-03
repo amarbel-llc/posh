@@ -17,11 +17,14 @@
 // fitness exist and are tested now. Allow until the loop consumes them.
 #![allow(dead_code)]
 
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 
 use mephisto::arena::NodeId;
-use mephisto::domain::{evaluate_population, initial_population, step, Domain, LoopConfig};
-use mephisto::genome::{AlphabetWeights, MutParams, MutationWeights};
+use mephisto::domain::{
+    evaluate_population, initial_population, step, Bred, Domain, LoopConfig, Recombinator, XoverOp,
+};
+use mephisto::gene_pool::content_id;
+use mephisto::genome::{AlphabetWeights, ConstPolicy, MutParams, MutationWeights};
 use mephisto::persist::{load_population, save_population};
 use mephisto::rng::Rng;
 use mephisto::tuple::TupleBreeder;
@@ -31,8 +34,8 @@ use crate::remote::display::Snapshot;
 use super::metric::{MetricVector, TERMINAL_COUNT};
 use super::species::PolicyKnobs;
 use super::{
-    MoshPredictor, OptimisticPredictor, PredictionModel, PredictionRenderer, Predictor,
-    PredictorStats,
+    EvolutionStats, MoshPredictor, OptimisticPredictor, PredictionModel, PredictionRenderer,
+    Predictor, PredictorStats,
 };
 
 /// The schema tag for persisted controller populations (RFC 0007 §8); the
@@ -40,6 +43,12 @@ use super::{
 /// against. On load, a mismatch means cold-start (the leaf indices would mean
 /// something different).
 pub const CONTROLLER_SCHEMA: &str = "mephisto-population-controller-schema_v2";
+
+/// The schema tag for the periodically-persisted single-champion hyphence docs
+/// (RFC 0007 §8): the same leaf-set version guard as the population blob, but a
+/// one-genome document under `$XDG_DATA_HOME` — the durable, content-addressed
+/// record of every distinct champion this host's evolution has produced.
+pub const CHAMPION_SCHEMA: &str = "mephisto-champion-controller-schema_v2";
 
 /// One recorded keystroke outcome the controller's fitness scores against: the
 /// metric vector at that tick, whether the optimistic echo would have been
@@ -102,6 +111,9 @@ impl ControllerDomain {
             macro_depth: 3,
             weights,
             alphabet,
+            // Metric terminals span ms/ratios/ids; the plain Gaussian nudge +
+            // jitter cover them, so no curated constant library is needed.
+            const_policy: ConstPolicy::default(),
         };
         ControllerDomain {
             // init_depth 3, per-root bloat cap 64 — starting points; tune later.
@@ -145,6 +157,42 @@ impl Domain for ControllerDomain {
         _parent: &ControllerFitness,
     ) -> Vec<NodeId> {
         self.breeder.mutate(rng, g)
+    }
+
+    /// Opt in to the engine's self-adaptive recombinator (mephisto #21): each
+    /// individual carries its own crossover strategy (operator + mix + mate
+    /// preference), inherited and mutated like a gene, so the reproductive
+    /// strategy itself evolves alongside the policies.
+    fn uses_recombinator(&self) -> bool {
+        true
+    }
+
+    /// Dispatch the recombinator's chosen operator over the 4-root tuple:
+    /// OnePoint/TwoPoint exchange whole policy roots as segments, Uniform mixes
+    /// subtrees within each root (the classic component-wise operator).
+    fn recombine(
+        &mut self,
+        rng: &mut Rng,
+        op: XoverOp,
+        mix: f64,
+        a: &Vec<NodeId>,
+        b: &Vec<NodeId>,
+    ) -> Vec<NodeId> {
+        self.breeder.recombine(rng, op, mix, a, b)
+    }
+
+    /// Assortative mate-choice signal (mephisto #21 Stage 2): mean per-root
+    /// Jaccard overlap of reachable node sets, 1.0 for identical tuples.
+    fn similarity(&self, a: &Vec<NodeId>, b: &Vec<NodeId>) -> f64 {
+        self.breeder.similarity(a, b)
+    }
+
+    /// Arena GC (mephisto #33): re-express the live tuples in a fresh arena so a
+    /// long-lived session's append-only arena stays bounded. Trajectory-neutral
+    /// (a faithful structural copy, no rng); on the never-expected reintern
+    /// failure the arena is left untouched and the live set returned unchanged.
+    fn gc(&mut self, live: &[Vec<NodeId>]) -> Vec<Vec<NodeId>> {
+        self.breeder.gc(live).unwrap_or_else(|| live.to_vec())
     }
 
     fn serialize(&self, g: &Vec<NodeId>) -> Vec<f64> {
@@ -203,9 +251,16 @@ const MATURITY_FRAMES: usize = 32;
 /// Sustained frames of champion-good (or -bad) before the §7.1 display flips —
 /// the hysteresis that keeps the displayed predictor from flapping.
 const HYSTERESIS_FRAMES: i32 = 16;
+/// Generations between champion hyphence-doc saves (RFC 0007 §8): every N
+/// `step`s the current champion is serialized (content-addressed, deduped) to
+/// `$XDG_DATA_HOME`, so a crash never costs more than N generations of the
+/// champion record. With `STEP_EVERY_N_FRAMES` = 32 this is every ~256 frames.
+const CHAMPION_SAVE_EVERY_N_GENERATIONS: u64 = 8;
 
 /// Starting LoopConfig for a small live population (mild-willow's suggested
-/// values; tune later). `generations` is unused by `step`.
+/// values; tune later). `generations` is unused by `step`; `gc_interval` is
+/// consumed by posh's own tick loop (the online lane drives GC itself, the
+/// same cadence contract `evolve` applies in the batch lane).
 fn loop_config() -> LoopConfig {
     LoopConfig {
         population: 32,
@@ -217,6 +272,9 @@ fn loop_config() -> LoopConfig {
         immigrant_fraction: 0.1,
         local_opt_rate: 0.0,
         opaque_recombine_rate: 0.0,
+        // A session ticks generations for hours; compact the arena every 64
+        // generations (mephisto #33; trajectory-neutral) so it stays bounded.
+        gc_interval: 64,
     }
 }
 
@@ -235,6 +293,40 @@ fn population_path() -> Option<PathBuf> {
     Some(base.join("posh").join("controller-population.hyph"))
 }
 
+/// Where champion hyphence docs accumulate (RFC 0007 §8): champions are user
+/// data — the durable artifacts of the evolution, inspectable and shareable —
+/// so they live under `$XDG_DATA_HOME/posh/predict/champions/`, falling back to
+/// `~/.local/share/...` (the population's working state stays in
+/// `$XDG_STATE_HOME`). `None` when neither env var is set.
+fn champion_dir() -> Option<PathBuf> {
+    // Same test guard as population_path(): never touch the user's real dirs.
+    if cfg!(test) {
+        return None;
+    }
+    let base = std::env::var_os("XDG_DATA_HOME")
+        .map(PathBuf::from)
+        .or_else(|| std::env::var_os("HOME").map(|h| PathBuf::from(h).join(".local/share")))?;
+    Some(base.join("posh").join("predict").join("champions"))
+}
+
+/// Write one champion hyphence doc into `dir`, content-addressed by the doc's
+/// mephisto `content_id` (`<id>.hyph`), so re-saving an unchanged champion —
+/// or the same champion re-evolved in a later session — dedups to one file.
+/// Temp-then-rename so a crash mid-write can't leave a truncated doc. Returns
+/// the doc path, or `None` if the write failed (best-effort, like the
+/// population save).
+fn write_champion_doc(dir: &Path, blob: &[u8]) -> Option<PathBuf> {
+    let path = dir.join(format!("{}.hyph", content_id(blob)));
+    if path.is_file() {
+        return Some(path); // content-addressed: already recorded
+    }
+    std::fs::create_dir_all(dir).ok()?;
+    let tmp = path.with_extension("hyph.tmp");
+    std::fs::write(&tmp, blob).ok()?;
+    std::fs::rename(&tmp, &path).ok()?;
+    Some(path)
+}
+
 /// RFC 0007 §4.1 live controller: an evolved GP population whose champion's
 /// [`PolicyKnobs`] gate a swappable base echo — optimistic by default, adaptive
 /// via `POSH_PREDICTION_CONTROLLER_ECHO=adaptive` for A/B. Each server frame it
@@ -246,17 +338,27 @@ fn population_path() -> Option<PathBuf> {
 /// leak under `ECHO`-off; the fitness additionally penalizes it as lethal (§5.2).
 pub struct ControllerPredictor {
     domain: ControllerDomain,
-    population: Vec<Vec<NodeId>>,
+    /// The engine-held population: each individual is a genome plus its
+    /// self-adaptive recombinator strategy (mephisto #21).
+    population: Vec<Bred<ControllerDomain>>,
     cfg: LoopConfig,
     rng: Rng,
     /// The swappable echo machinery the champion's knobs drive.
     base: Box<dyn Predictor>,
     champion: Vec<NodeId>,
+    /// The champion's rank at the most recent `evaluate_population` pass
+    /// (lower is better; `+inf` until the first scored window).
+    champion_rank: f64,
     metrics: [f64; TERMINAL_COUNT],
     /// The champion's `show` decision for the most recent keystroke.
     show: bool,
     echo_safe: bool,
     frames: u64,
+    /// Generations stepped this session (each `step` call is one generation).
+    generations: u64,
+    /// Champion hyphence docs written (deduped) this session + the last path.
+    champion_saves: u64,
+    last_champion_doc: Option<PathBuf>,
     /// Base outcome counters at the previous frame, to delta the fitness signal.
     last_outcomes: (u64, u64, u64),
     /// RFC 0007 §7.1 adaptive shadow baseline, run in parallel and scored by the
@@ -294,16 +396,28 @@ impl ControllerPredictor {
                 let l = load_population(&mut domain, &bytes).ok()?;
                 (l.schema == CONTROLLER_SCHEMA && !l.genomes.is_empty()).then_some(l.genomes)
             });
-        let mut population = match loaded {
-            Some(p) => p,
+        // The persisted blob carries genomes only; loaded individuals draw a
+        // fresh random recombinator strategy (the engine re-adapts it quickly,
+        // and randomizing preserves strategy diversity across sessions).
+        let mut population: Vec<Bred<ControllerDomain>> = match loaded {
+            Some(p) => p
+                .into_iter()
+                .map(|genome| Bred {
+                    genome,
+                    recomb: Recombinator::random(&mut rng),
+                })
+                .collect(),
             None => initial_population(&mut domain, &cfg, &mut rng),
         };
         // Normalize to the configured population size (a persisted blob may differ).
         while population.len() < cfg.population {
-            population.push(domain.random(&mut rng));
+            population.push(Bred {
+                genome: domain.random(&mut rng),
+                recomb: Recombinator::random(&mut rng),
+            });
         }
         population.truncate(cfg.population.max(1));
-        let champion = population[0].clone();
+        let champion = population[0].genome.clone();
         ControllerPredictor {
             domain,
             population,
@@ -311,10 +425,14 @@ impl ControllerPredictor {
             rng,
             base,
             champion,
+            champion_rank: f64::INFINITY,
             metrics: [f64::NAN; TERMINAL_COUNT],
             show: true,
             echo_safe: false,
             frames: 0,
+            generations: 0,
+            champion_saves: 0,
+            last_champion_doc: None,
             last_outcomes: (0, 0, 0),
             // The §7.1 shadow is always the adaptive model (the floor we must beat).
             shadow: MoshPredictor::new(PredictionModel::Adaptive, predict_overwrite),
@@ -348,6 +466,7 @@ impl ControllerPredictor {
         if !self.domain.window.is_empty() {
             let scored = evaluate_population(&mut self.domain, &self.population);
             self.champion = scored[0].genome.clone();
+            self.champion_rank = scored[0].rank;
             // §7.1 best-of vs the adaptive shadow: the champion is eligible to
             // display only once its window is mature AND its fitness is
             // net-beneficial (rank < 0 means hits outweigh flicker + miss).
@@ -364,7 +483,60 @@ impl ControllerPredictor {
             }
             if self.frames.is_multiple_of(STEP_EVERY_N_FRAMES) {
                 self.population = step(&mut self.domain, &self.cfg, &mut self.rng, &scored);
+                self.generations += 1;
+                // Arena GC (mephisto #33): a session ticks generations for
+                // hours; compact the append-only arena to the live set on the
+                // same cadence contract `evolve` applies in the batch lane.
+                if self.cfg.gc_interval > 0
+                    && self.generations.is_multiple_of(self.cfg.gc_interval as u64)
+                {
+                    self.gc_arena();
+                }
+                // Periodic champion record (RFC 0007 §8): a crash never costs
+                // more than N generations of the champion lineage.
+                if self
+                    .generations
+                    .is_multiple_of(CHAMPION_SAVE_EVERY_N_GENERATIONS)
+                {
+                    self.save_champion();
+                }
             }
+        }
+    }
+
+    /// Compact the domain's arena to the live set (population + champion),
+    /// adopting the re-expressed genomes. Mirrors `evolve`'s defensive posture:
+    /// the compaction is adopted only if it round-tripped the whole set 1:1.
+    fn gc_arena(&mut self) {
+        let mut live: Vec<Vec<NodeId>> =
+            self.population.iter().map(|b| b.genome.clone()).collect();
+        live.push(self.champion.clone());
+        let compacted = self.domain.gc(&live);
+        if compacted.len() == live.len() {
+            for (slot, g) in self.population.iter_mut().zip(&compacted) {
+                slot.genome = g.clone();
+            }
+            self.champion = compacted[self.population.len()].clone();
+        }
+    }
+
+    /// Serialize the current champion as a content-addressed hyphence doc under
+    /// `$XDG_DATA_HOME/posh/predict/champions/` (RFC 0007 §8). Best-effort:
+    /// a failed write costs only this save, never the session.
+    fn save_champion(&mut self) {
+        let Some(dir) = champion_dir() else {
+            return;
+        };
+        let blob = save_population(
+            &self.domain,
+            CHAMPION_SCHEMA,
+            std::slice::from_ref(&self.champion),
+        );
+        if let Some(path) = write_champion_doc(&dir, &blob) {
+            if self.last_champion_doc.as_ref() != Some(&path) {
+                self.champion_saves += 1;
+            }
+            self.last_champion_doc = Some(path);
         }
     }
 }
@@ -377,16 +549,20 @@ impl Default for ControllerPredictor {
 
 impl Drop for ControllerPredictor {
     /// Best-effort persist on graceful exit / model switch (RFC 0007 §8): the
-    /// next session seeds from it (schema-guarded). Errors are swallowed — a
-    /// failed save just costs the accumulated evolution, never the session.
+    /// next session seeds from it (schema-guarded), and the final champion is
+    /// recorded as a hyphence doc. Errors are swallowed — a failed save just
+    /// costs the accumulated evolution, never the session.
     fn drop(&mut self) {
+        self.save_champion();
         let Some(path) = population_path() else {
             return;
         };
         if let Some(dir) = path.parent() {
             let _ = std::fs::create_dir_all(dir);
         }
-        let blob = save_population(&self.domain, CONTROLLER_SCHEMA, &self.population);
+        let genomes: Vec<Vec<NodeId>> =
+            self.population.iter().map(|b| b.genome.clone()).collect();
+        let blob = save_population(&self.domain, CONTROLLER_SCHEMA, &genomes);
         // Write a temp then rename so a crash mid-write can't truncate the blob.
         let tmp = path.with_extension("hyph.tmp");
         if std::fs::write(&tmp, &blob).is_ok() {
@@ -466,6 +642,27 @@ impl Predictor for ControllerPredictor {
             self.shadow.stats()
         }
     }
+
+    fn evolution(&self) -> Option<EvolutionStats> {
+        // Champion size: total nodes across the 4 policy roots (a parsimony /
+        // bloat gauge alongside the fitness rank).
+        let champion_size = self
+            .champion
+            .iter()
+            .map(|&root| self.domain.breeder.arena().measure(root).0)
+            .sum();
+        Some(EvolutionStats {
+            generations: self.generations,
+            population: self.population.len(),
+            window: self.domain.window.len(),
+            champion_rank: self.champion_rank,
+            champion_size,
+            champion_displayed: self.display_champion,
+            champion_streak: self.champion_streak,
+            champion_saves: self.champion_saves,
+            last_champion_doc: self.last_champion_doc.clone(),
+        })
+    }
 }
 
 #[cfg(test)]
@@ -532,7 +729,10 @@ mod tests {
         let mut dom = ControllerDomain::new();
         let cfg = loop_config();
         let mut rng = Rng::new(3);
-        let pop = initial_population(&mut dom, &cfg, &mut rng);
+        let pop: Vec<Vec<NodeId>> = initial_population(&mut dom, &cfg, &mut rng)
+            .into_iter()
+            .map(|b| b.genome)
+            .collect();
 
         let blob = save_population(&dom, CONTROLLER_SCHEMA, &pop);
         let loaded = load_population(&mut dom, &blob).expect("loads a well-formed blob");
@@ -544,5 +744,72 @@ mod tests {
         let stale = save_population(&dom, "mephisto-population-controller-schema_v999", &pop);
         let l2 = load_population(&mut dom, &stale).expect("loads");
         assert_ne!(l2.schema, CONTROLLER_SCHEMA);
+    }
+
+    #[test]
+    fn gc_preserves_the_champion_policy_and_bounds_the_arena() {
+        // The online-lane GC must be trajectory-neutral: the champion's policy
+        // outputs are identical before and after compaction (mephisto #33).
+        let mut dom = ControllerDomain::new();
+        let mut rng = Rng::new(11);
+        // Grow the arena with discarded material, keeping one live genome.
+        let mut live = dom.random(&mut rng);
+        for _ in 0..20 {
+            live = dom.breeder.mutate(&mut rng, &live);
+        }
+        let metrics = [0.25; TERMINAL_COUNT];
+        let before = dom.knobs(&live, &metrics);
+        let arena_before = dom.breeder.arena().len();
+
+        let compacted = dom.gc(std::slice::from_ref(&live));
+        assert_eq!(compacted.len(), 1);
+        assert!(dom.breeder.arena().len() <= arena_before);
+        assert_eq!(dom.knobs(&compacted[0], &metrics), before);
+    }
+
+    #[test]
+    fn champion_doc_round_trips_and_dedups_by_content() {
+        // RFC 0007 §8: a champion is serialized as a schema-tagged hyphence doc,
+        // content-addressed so re-saving the same champion is one file.
+        let mut dom = ControllerDomain::new();
+        let mut rng = Rng::new(19);
+        let champion = dom.random(&mut rng);
+        let blob = save_population(&dom, CHAMPION_SCHEMA, std::slice::from_ref(&champion));
+
+        let dir = std::env::temp_dir().join(format!(
+            "posh-champion-doc-test-{}-{}",
+            std::process::id(),
+            content_id(&blob)
+        ));
+        let p1 = write_champion_doc(&dir, &blob).expect("first write");
+        let p2 = write_champion_doc(&dir, &blob).expect("dedup write");
+        assert_eq!(p1, p2, "same content must address the same doc");
+        assert_eq!(
+            std::fs::read_dir(&dir).unwrap().count(),
+            1,
+            "re-saving an unchanged champion must not add files"
+        );
+
+        let loaded =
+            load_population(&mut dom, &std::fs::read(&p1).unwrap()).expect("doc loads back");
+        assert_eq!(loaded.schema, CHAMPION_SCHEMA);
+        assert_eq!(loaded.genomes, vec![champion]);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn controller_reports_evolution_stats() {
+        // The palette's prediction-stats view reads these gauges; a fresh
+        // controller reports a full population, zero generations, and no
+        // champion doc yet.
+        let c = ControllerPredictor::new(false);
+        let ev = c.evolution().expect("the GP controller exposes evolution");
+        assert_eq!(ev.generations, 0);
+        assert_eq!(ev.population, loop_config().population);
+        assert_eq!(ev.window, 0);
+        assert!(!ev.champion_displayed);
+        assert!(ev.champion_size > 0, "the champion has at least its roots");
+        assert_eq!(ev.champion_saves, 0);
+        assert!(ev.last_champion_doc.is_none());
     }
 }

@@ -28,8 +28,11 @@
     # authenticate). flake = false: we consume the source tree (a root virtual
     # workspace; the `mephisto` crate lives under v2-rust/), bridged into the
     # rust build via a cargo [patch]. See docs/rfcs/0007.
+    # Pinned to the tuple-engine-features rev on the mephisto side of the
+    # evolution-algorithm update (Bred populations, recombinator/similarity/GC
+    # for tuple genomes); re-pin to a master rev once that branch merges.
     mephisto = {
-      url = "git+ssh://git@github.com/amarbel-llc/mephisto?rev=31d496dfd95509b2d48b8fe51179adf1e6f00b84";
+      url = "git+ssh://git@github.com/amarbel-llc/mephisto?ref=refs/heads/claude/mephisto-evolution-algorithm-update-80fyge&rev=ea6dc8b072a74454b85fa9b51acb800ce3b1bae0";
       flake = false;
     };
   };
@@ -213,7 +216,14 @@
           version = poshVersion;
 
           src = ./.;
-          cargoLock.lockFile = ./Cargo.lock;
+          # allowBuiltinFetchGit: mephisto now carries git-sourced cargo deps
+          # (hyphence, rust-crap — public repos), which importCargoLock fetches
+          # via builtins.fetchGit from the lockfile's pinned revs, no per-dep
+          # outputHashes to maintain.
+          cargoLock = {
+            lockFile = ./Cargo.lock;
+            allowBuiltinFetchGit = true;
+          };
 
           # RFC 0007: vendor the private mephisto crate from the flake input
           # before cargo runs (shared with the mosh-ffi check). The dev-loop gets
@@ -467,7 +477,12 @@
             pname = "mosh-ffi-check";
             version = poshVersion;
             src = ./.;
-            cargoLock.lockFile = ./Cargo.lock;
+            # Same posture as .#posh: mephisto's git-sourced cargo deps resolve
+            # via builtins.fetchGit from the lockfile.
+            cargoLock = {
+              lockFile = ./Cargo.lock;
+              allowBuiltinFetchGit = true;
+            };
             # RFC 0007: crates/posh (a workspace member this build loads even
             # though it only compiles -p mosh-ffi) path-deps the private mephisto
             # crate, so vendor it the same way .#posh does or the workspace

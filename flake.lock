@@ -105,16 +105,17 @@
     "mephisto": {
       "flake": false,
       "locked": {
-        "lastModified": 1782481645,
-        "narHash": "sha256-IFvmDwCWEXt4B5xD73ET5ti0JQSmZIjeO9H+49/SDWU=",
-        "ref": "refs/heads/master",
-        "rev": "31d496dfd95509b2d48b8fe51179adf1e6f00b84",
-        "revCount": 235,
+        "lastModified": 1783119835,
+        "narHash": "sha256-gOvQjRi61GWMDG9iKPmxSPPxKoctE1Bt61SRPEnCgCY=",
+        "ref": "refs/heads/claude/mephisto-evolution-algorithm-update-80fyge",
+        "rev": "ea6dc8b072a74454b85fa9b51acb800ce3b1bae0",
+        "revCount": 367,
         "type": "git",
         "url": "ssh://git@github.com/amarbel-llc/mephisto"
       },
       "original": {
-        "rev": "31d496dfd95509b2d48b8fe51179adf1e6f00b84",
+        "ref": "refs/heads/claude/mephisto-evolution-algorithm-update-80fyge",
+        "rev": "ea6dc8b072a74454b85fa9b51acb800ce3b1bae0",
         "type": "git",
         "url": "ssh://git@github.com/amarbel-llc/mephisto"
       }
