@@ -25,7 +25,11 @@ pub enum Error {
 }
 
 impl Error {
-    /// The underlying I/O error kind, when there is one.
+    /// The underlying I/O error kind, when there is one. Production call sites
+    /// mostly match on `Error::Io(e)` directly (e.g. `validate_session_dir`'s
+    /// NotFound gate matches before wrapping); this accessor serves assertions
+    /// and future callers holding an already-wrapped Error.
+    #[allow(dead_code)]
     pub fn kind(&self) -> Option<std::io::ErrorKind> {
         match self {
             Error::Io(e) => Some(e.kind()),
