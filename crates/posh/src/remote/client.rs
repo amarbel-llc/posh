@@ -600,6 +600,13 @@ struct ClientState {
     /// whether any overlay was live then — the idle fast-path key. github #35.
     last_render_state: (u64, u64),
     last_render_overlays: bool,
+    /// #wedge (#83): server_term generation at the last NON-empty tty paint, and
+    /// the last generation a fast-path-skip-while-unpainted line was logged for
+    /// (edge-trigger so the freeze doesn't firehose). A fast-path skip where
+    /// `server_term.generation() != last_painted_gen` means content sits in the
+    /// model that never reached the tty — the render-skip freeze fingerprint.
+    last_painted_gen: u64,
+    last_skip_log_gen: u64,
     /// Scroll-view position (FDR 0005): rows the viewport top sits above the
     /// live bottom. 0 = live view; > 0 freezes the live view and renders a
     /// window of `scrollback` via `compose_scroll_frame`.
@@ -729,6 +736,8 @@ fn client_loop(
         exit_status: 0,
         last_render_state: (u64::MAX, u64::MAX),
         last_render_overlays: false,
+        last_painted_gen: 0,
+        last_skip_log_gen: u64::MAX,
         scroll_offset: 0,
         last_scroll_state: None,
         echo_on: false,
@@ -1628,6 +1637,8 @@ fn render(st: &mut ClientState, now: u64) {
     } else {
         st.stats.record_render(bytes.len());
         let _ = util::write_all_retry(STDOUT, &bytes, 1000);
+        // #wedge (#83): the model generation now actually on the tty.
+        st.last_painted_gen = st.server_term.generation();
     }
 }
 
@@ -1651,6 +1662,25 @@ fn compose_frame(st: &mut ClientState, now: u64) -> Vec<u8> {
         && !overlays_live
         && !st.last_render_overlays
     {
+        // #wedge fast-path skip (#83): we're skipping because the model looks
+        // unchanged since the last compose — but if that generation was never
+        // actually painted (`last_painted_gen` lags), content sits in the model
+        // unpainted and every idle tick re-skips it: the render-skip freeze.
+        // Edge-triggered per generation so a long freeze logs once, not a storm.
+        let gen = st.server_term.generation();
+        if util::log_active() && gen != st.last_painted_gen && gen != st.last_skip_log_gen {
+            st.last_skip_log_gen = gen;
+            util::log_write(
+                "render",
+                &format!(
+                    "fastpath skip while unpainted: frame={} gen={} painted={} alt={}",
+                    st.applied_num,
+                    gen,
+                    st.last_painted_gen,
+                    st.server_term.is_alt_screen() as u8,
+                ),
+            );
+        }
         return Vec::new();
     }
     let prev_render_state = st.last_render_state;
@@ -1730,18 +1760,25 @@ fn compose_frame(st: &mut ClientState, now: u64) -> Vec<u8> {
     );
     st.initialized = true;
     st.last_wheel = wheel;
+    // #wedge (#83): on an empty paint where the generation advanced (the
+    // render-skip suspect), check whether the composited grid ACTUALLY differed
+    // from what we last drew — `grids_differ=1` is the smoking gun (content-blind
+    // new_frame_opt), `=0` is a benign no-op gen bump (cursor move, etc.).
+    // Computed BEFORE last_drawn is overwritten, and only in this rare case so
+    // the full-grid compare stays off the hot path even with default-on logging.
+    let gen_advanced = model_state.1 != prev_render_state.1;
+    let grids_differ = util::log_active() && bytes.is_empty() && gen_advanced && next != st.last_drawn;
     st.last_drawn = next;
-    // #wedge render-skip breadcrumb (#83): the VISIBLE model advanced
-    // (server_term generation bumped) yet the tty diff came out empty — the
-    // content is in the client model but nothing repainted. Keyed on the
-    // generation, not applied_num, so a scrollback-only advance (which carries no
-    // visible change and legitimately paints nothing) does not false-fire.
-    if util::log_active() && bytes.is_empty() && model_state.1 != prev_render_state.1 {
+    if util::log_active() && bytes.is_empty() && gen_advanced {
         util::log_write(
             "render",
             &format!(
-                "model advanced but painted nothing: frame={} gen {}->{}",
-                st.applied_num, prev_render_state.1, model_state.1
+                "empty paint: frame={} gen {}->{} grids_differ={} alt={}",
+                st.applied_num,
+                prev_render_state.1,
+                model_state.1,
+                grids_differ as u8,
+                st.server_term.is_alt_screen() as u8,
             ),
         );
     }
@@ -2499,6 +2536,8 @@ mod tests {
             exit_status: 0,
             last_render_state: (u64::MAX, u64::MAX),
             last_render_overlays: false,
+            last_painted_gen: 0,
+            last_skip_log_gen: u64::MAX,
             scroll_offset: 0,
             last_scroll_state: None,
             echo_on: false,

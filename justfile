@@ -727,16 +727,27 @@ debug-posh-dump pid:
     kill -USR2 "$pid"
     sleep 0.3
     uid="$(id -u)"
-    base="${POSH_DIR:-${XDG_RUNTIME_DIR:-/run/user/$uid}/posh}"
-    # Prefer the deterministic per-pid default file (only present when the
-    # process had no POSH_DEBUG_LOG); fall back to this shell's POSH_DEBUG_LOG
-    # when the process reused that pre-armed sink instead.
-    f="$(ls -t "$base"/posh-*-"$pid".log 2>/dev/null | head -n1 || true)"
+    # Default-on logging (#83) writes the per-pid sink under the LOG dir (the
+    # SIGUSR2 dump reuses it), no longer only the socket-dir. Search the same
+    # precedence as session::resolve_log_base, then the socket-dir (the dump's
+    # own fallback), then an explicit POSH_DEBUG_LOG. A pid's sink is exactly one.
+    dirs=(
+      ${POSH_LOG_DIR:+"$POSH_LOG_DIR"}
+      ${XDG_LOG_HOME:+"$XDG_LOG_HOME/posh"}
+      ${XDG_STATE_HOME:+"$XDG_STATE_HOME/posh/log"}
+      "${POSH_DIR:-${XDG_RUNTIME_DIR:-/run/user/$uid}/posh}"
+    )
+    f=""
+    for d in "${dirs[@]}"; do
+      [ -d "$d" ] || continue
+      cand="$(ls -t "$d"/posh-*-"$pid".log 2>/dev/null | head -n1 || true)"
+      [ -n "$cand" ] && { f="$cand"; break; }
+    done
     if [ -z "${f:-}" ] && [ -n "${POSH_DEBUG_LOG:-}" ] && [ -f "${POSH_DEBUG_LOG}" ]; then
       f="${POSH_DEBUG_LOG}"
     fi
     if [ -z "${f:-}" ] || [ ! -f "$f" ]; then
-      echo "no dump file for pid $pid under $base (POSH_DEBUG_LOG=${POSH_DEBUG_LOG:-unset})" >&2
+      echo "no dump file for pid $pid (searched: ${dirs[*]}; POSH_DEBUG_LOG=${POSH_DEBUG_LOG:-unset})" >&2
       exit 1
     fi
     echo ">> $f"
