@@ -559,7 +559,15 @@ fn start_server(port_range: &str, command: &[&str], envs: &[(&str, &str)]) -> (S
     cmd.args(["server", "-p", port_range, "--"])
         .args(command)
         .env("LC_ALL", "C.UTF-8")
-        .env("POSH_SERVER_NETWORK_TMOUT", "30");
+        .env("POSH_SERVER_NETWORK_TMOUT", "30")
+        // Hermeticity: a fresh test server (and any inner `posh attach` it wraps)
+        // must NOT inherit the developer's own session context. If the test runs
+        // inside a posh session, an inherited POSH_SESSION trips the "cannot attach
+        // to a session from within a session" guard (session/client.rs) and the
+        // inner attach exits nonzero — the composition then reports 1, not the
+        // shell's real code (posh#111). Mirrors the `attach --detach` daemon spawn.
+        .env_remove("POSH_SESSION")
+        .env_remove("POSH_GROUP");
     for (k, v) in envs {
         cmd.env(k, v);
     }
