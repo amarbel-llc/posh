@@ -1516,6 +1516,16 @@ fn apply_frame(st: &mut ClientState, frame: &ServerFrame) -> bool {
         FrameBody::Diff { base, base_sum, .. } | FrameBody::Morph { base, base_sum, .. } => {
             if *base != st.applied_num {
                 st.stats.record_apply_basemis();
+                // #95 recovery: a base BEHIND our applied_num means a scrollback
+                // frame leapt us past this (unapplied) visible frame — our visible
+                // baseline is stale, and the plain re-ack reports an applied_num we
+                // do not truly hold, so the server never falls back to a Full. That
+                // desync self-heals via neither reack nor base_sum, so actively
+                // request a resync. (base > applied_num is the benign we-are-behind
+                // case a retransmit resolves, so it keeps the passive re-ack.)
+                if *base < st.applied_num {
+                    st.flags |= sync::CLIENT_FLAG_RESYNC;
+                }
                 return true;
             }
             // RFC 0006: the base NUMBER matches; when the server stamped a base
@@ -2254,6 +2264,57 @@ mod tests {
         assert!(apply_frame(&mut st, &frame));
         assert!(st.last_reack.is_none(), "advance clears stale reack");
         assert!(!st.forensic_captured, "advance resets the one-shot guard");
+    }
+
+    #[test]
+    fn apply_frame_base_behind_applied_num_requests_resync() {
+        // #95: a scrollback frame can leap applied_num past an unapplied visible
+        // frame; the server then retransmits that (now stale) visible frame with
+        // base < applied_num. A plain re-ack reports an applied_num whose visible
+        // content we don't hold, so the server never falls back to a Full — and
+        // this desync self-heals via neither reack nor base_sum. So a base BEHIND
+        // applied_num must request a resync; a base AHEAD (we're merely behind and
+        // a retransmit fixes it) must keep the passive re-ack.
+        let mut st = test_state(24, 80);
+        st.applied_num = 5;
+        st.flags = 0;
+
+        let behind = ServerFrame {
+            flags: 0,
+            caps: vec![],
+            frame_num: 6,
+            input_ack: 0,
+            echo_ack: 0,
+            body: FrameBody::Diff {
+                base: 3,
+                base_sum: None,
+                diff: vec![0u8; 4],
+            },
+        };
+        assert!(apply_frame(&mut st, &behind), "re-acks (returns true)");
+        assert_eq!(st.applied_num, 5, "model untouched on base mismatch");
+        assert_ne!(
+            st.flags & sync::CLIENT_FLAG_RESYNC,
+            0,
+            "base behind applied_num (the #95 leap) requests a resync"
+        );
+
+        st.flags = 0;
+        let ahead = ServerFrame {
+            frame_num: 9,
+            body: FrameBody::Diff {
+                base: 7,
+                base_sum: None,
+                diff: vec![0u8; 4],
+            },
+            ..behind
+        };
+        assert!(apply_frame(&mut st, &ahead), "re-acks (returns true)");
+        assert_eq!(
+            st.flags & sync::CLIENT_FLAG_RESYNC,
+            0,
+            "base ahead of applied_num keeps the passive re-ack"
+        );
     }
 
     #[test]
