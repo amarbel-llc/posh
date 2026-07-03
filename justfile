@@ -277,8 +277,9 @@ tag $message:
 # refuse off master; generate the changelog (commits since the previous v*
 # tag) BEFORE bumping so the bump commit isn't in its own changelog; bump
 # version.env (the only versioned file — Pattern B, no Cargo.toml resync),
-# commit, sign+push+verify a v<sem> tag, and create the GitHub release with
-# the changelog as the body. The bump+commit is idempotent: skipped when
+# commit, push the branch (so the bump lands on master, not just the tag),
+# sign+push+verify a v<sem> tag, and create the GitHub release with the
+# changelog as the body. The bump+commit is idempotent: skipped when
 # version.env already holds <new>. Usage: just release 0.1.1
 [group("maintenance")]
 release new_version:
@@ -314,6 +315,14 @@ release new_version:
     else
         gum log --level info "version.env already at {{ new_version }}; skipping bump/commit"
     fi
+
+    # Land the release-bump commit on the branch, not just the tag. `just tag`
+    # pushes only the tag; without this, origin/master's version.env never
+    # advances, so the bump lives only on the tag commit (which later worktree
+    # merges orphan) and `posh version` keeps reporting the pre-bump value. Runs
+    # before tagging so a non-fast-forward (origin/master moved) aborts the
+    # release instead of cutting a tag off a stale master.
+    git push origin "$branch"
 
     # The full changelog rides as the tag annotation (safe via tag's $message).
     just tag "$notes"
