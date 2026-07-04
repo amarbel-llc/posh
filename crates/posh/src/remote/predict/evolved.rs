@@ -278,19 +278,28 @@ fn loop_config() -> LoopConfig {
     }
 }
 
+/// Resolve an XDG base dir (`$var`, else `$HOME/<home_fallback>`) under the
+/// `cfg!(test)` guard that keeps `ControllerPredictor`'s load/Drop from touching
+/// the user's real dirs — tests construct predictors freely and cover the
+/// persist logic directly. `None` in tests, or when neither var is set.
+fn xdg_base(var: &str, home_fallback: &str) -> Option<PathBuf> {
+    if cfg!(test) {
+        return None;
+    }
+    std::env::var_os(var)
+        .map(PathBuf::from)
+        .or_else(|| std::env::var_os("HOME").map(|h| PathBuf::from(h).join(home_fallback)))
+}
+
 /// Where the controller population persists across sessions (RFC 0007 §8):
 /// `$XDG_STATE_HOME/posh/controller-population.hyph`, falling back to
 /// `~/.local/state/...`. `None` when neither env var is set.
 fn population_path() -> Option<PathBuf> {
-    // Tests construct ControllerPredictors freely; never let their load/Drop
-    // touch the user's real state dir. The persist logic is covered directly.
-    if cfg!(test) {
-        return None;
-    }
-    let base = std::env::var_os("XDG_STATE_HOME")
-        .map(PathBuf::from)
-        .or_else(|| std::env::var_os("HOME").map(|h| PathBuf::from(h).join(".local/state")))?;
-    Some(base.join("posh").join("controller-population.hyph"))
+    Some(
+        xdg_base("XDG_STATE_HOME", ".local/state")?
+            .join("posh")
+            .join("controller-population.hyph"),
+    )
 }
 
 /// Where champion hyphence docs accumulate (RFC 0007 §8): champions are user
@@ -299,21 +308,26 @@ fn population_path() -> Option<PathBuf> {
 /// `~/.local/share/...` (the population's working state stays in
 /// `$XDG_STATE_HOME`). `None` when neither env var is set.
 fn champion_dir() -> Option<PathBuf> {
-    // Same test guard as population_path(): never touch the user's real dirs.
-    if cfg!(test) {
-        return None;
-    }
-    let base = std::env::var_os("XDG_DATA_HOME")
-        .map(PathBuf::from)
-        .or_else(|| std::env::var_os("HOME").map(|h| PathBuf::from(h).join(".local/share")))?;
-    Some(base.join("posh").join("predict").join("champions"))
+    Some(
+        xdg_base("XDG_DATA_HOME", ".local/share")?
+            .join("posh")
+            .join("predict")
+            .join("champions"),
+    )
+}
+
+/// Write `data` to `path` atomically — temp file then rename, so a crash
+/// mid-write can't leave a truncated `.hyph` doc. `path`'s parent must exist.
+fn write_atomic(path: &Path, data: &[u8]) -> std::io::Result<()> {
+    let tmp = path.with_extension("hyph.tmp");
+    std::fs::write(&tmp, data)?;
+    std::fs::rename(&tmp, path)
 }
 
 /// Write one champion hyphence doc into `dir`, content-addressed by the doc's
 /// mephisto `content_id` (`<id>.hyph`), so re-saving an unchanged champion —
 /// or the same champion re-evolved in a later session — dedups to one file.
-/// Temp-then-rename so a crash mid-write can't leave a truncated doc. Returns
-/// the doc path, or `None` if the write failed (best-effort, like the
+/// Returns the doc path, or `None` if the write failed (best-effort, like the
 /// population save).
 fn write_champion_doc(dir: &Path, blob: &[u8]) -> Option<PathBuf> {
     let path = dir.join(format!("{}.hyph", content_id(blob)));
@@ -321,10 +335,19 @@ fn write_champion_doc(dir: &Path, blob: &[u8]) -> Option<PathBuf> {
         return Some(path); // content-addressed: already recorded
     }
     std::fs::create_dir_all(dir).ok()?;
-    let tmp = path.with_extension("hyph.tmp");
-    std::fs::write(&tmp, blob).ok()?;
-    std::fs::rename(&tmp, &path).ok()?;
+    write_atomic(&path, blob).ok()?;
     Some(path)
+}
+
+/// Pair a genome with a fresh random recombinator strategy (mephisto #21).
+/// Loaded/backfilled individuals carry genomes only, so each draws a new
+/// strategy: the engine re-adapts it quickly, and randomizing preserves
+/// strategy diversity across sessions.
+fn bred_random(genome: Vec<NodeId>, rng: &mut Rng) -> Bred<ControllerDomain> {
+    Bred {
+        genome,
+        recomb: Recombinator::random(rng),
+    }
 }
 
 /// RFC 0007 §4.1 live controller: an evolved GP population whose champion's
@@ -397,24 +420,15 @@ impl ControllerPredictor {
                 (l.schema == CONTROLLER_SCHEMA && !l.genomes.is_empty()).then_some(l.genomes)
             });
         // The persisted blob carries genomes only; loaded individuals draw a
-        // fresh random recombinator strategy (the engine re-adapts it quickly,
-        // and randomizing preserves strategy diversity across sessions).
+        // fresh random recombinator strategy (see `bred_random`).
         let mut population: Vec<Bred<ControllerDomain>> = match loaded {
-            Some(p) => p
-                .into_iter()
-                .map(|genome| Bred {
-                    genome,
-                    recomb: Recombinator::random(&mut rng),
-                })
-                .collect(),
+            Some(p) => p.into_iter().map(|g| bred_random(g, &mut rng)).collect(),
             None => initial_population(&mut domain, &cfg, &mut rng),
         };
         // Normalize to the configured population size (a persisted blob may differ).
         while population.len() < cfg.population {
-            population.push(Bred {
-                genome: domain.random(&mut rng),
-                recomb: Recombinator::random(&mut rng),
-            });
+            let genome = domain.random(&mut rng);
+            population.push(bred_random(genome, &mut rng));
         }
         population.truncate(cfg.population.max(1));
         let champion = population[0].genome.clone();
@@ -504,19 +518,28 @@ impl ControllerPredictor {
         }
     }
 
+    /// The population's genomes, without their recombinator strategies — for the
+    /// persistence and GC lanes, which operate on bare genomes.
+    fn genomes(&self) -> Vec<Vec<NodeId>> {
+        self.population.iter().map(|b| b.genome.clone()).collect()
+    }
+
     /// Compact the domain's arena to the live set (population + champion),
     /// adopting the re-expressed genomes. Mirrors `evolve`'s defensive posture:
     /// the compaction is adopted only if it round-tripped the whole set 1:1.
     fn gc_arena(&mut self) {
-        let mut live: Vec<Vec<NodeId>> =
-            self.population.iter().map(|b| b.genome.clone()).collect();
+        let mut live = self.genomes();
         live.push(self.champion.clone());
         let compacted = self.domain.gc(&live);
-        if compacted.len() == live.len() {
-            for (slot, g) in self.population.iter_mut().zip(&compacted) {
+        if compacted.len() != live.len() {
+            return;
+        }
+        // The champion was pushed last, so it trails the population genomes.
+        if let Some((champion, pop)) = compacted.split_last() {
+            for (slot, g) in self.population.iter_mut().zip(pop) {
                 slot.genome = g.clone();
             }
-            self.champion = compacted[self.population.len()].clone();
+            self.champion = champion.clone();
         }
     }
 
@@ -560,14 +583,8 @@ impl Drop for ControllerPredictor {
         if let Some(dir) = path.parent() {
             let _ = std::fs::create_dir_all(dir);
         }
-        let genomes: Vec<Vec<NodeId>> =
-            self.population.iter().map(|b| b.genome.clone()).collect();
-        let blob = save_population(&self.domain, CONTROLLER_SCHEMA, &genomes);
-        // Write a temp then rename so a crash mid-write can't truncate the blob.
-        let tmp = path.with_extension("hyph.tmp");
-        if std::fs::write(&tmp, &blob).is_ok() {
-            let _ = std::fs::rename(&tmp, &path);
-        }
+        let blob = save_population(&self.domain, CONTROLLER_SCHEMA, &self.genomes());
+        let _ = write_atomic(&path, &blob);
     }
 }
 
