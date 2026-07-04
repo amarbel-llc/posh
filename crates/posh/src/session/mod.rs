@@ -310,7 +310,7 @@ pub fn cmd_list(cfg: &Config, format: ListFormat) -> Result<()> {
     if sessions.is_empty() {
         match format {
             ListFormat::Default if pretty => print!("{}", list_table::render_empty(&cfg.socket_dir)),
-            ListFormat::Default => println!("no sessions found in {}", cfg.socket_dir.display()),
+            ListFormat::Default => println!("{}", list_table::empty_message(&cfg.socket_dir)),
             ListFormat::Json => println!("[]"),
             ListFormat::Short => {}
         }

@@ -13,39 +13,55 @@ const GREEN: &str = "32";
 const CYAN: &str = "36";
 const RED: &str = "31";
 
+/// A dim column separator, constant so per-row lines don't re-allocate it.
+const DIM_BAR: &str = "\x1b[2m\u{2502}\x1b[0m";
+
 fn paint(code: &str, s: &str) -> String {
     format!("\x1b[{code}m{s}{RESET}")
 }
 
-/// Display width of ANSI-free text. Sessions are named in ASCII and the
-/// remaining cells are paths/commands; chars-as-columns is the same
-/// approximation the plain output already lives with.
+/// Display width of ANSI-free text, wcwidth per char (CJK/emoji are two
+/// columns, combining marks zero) so wide chars in paths and commands
+/// keep the grid aligned.
 fn width(s: &str) -> usize {
-    s.chars().count()
+    s.chars().map(|c| posh_term::wcwidth(c) as usize).sum()
 }
 
-/// Truncates to `max` columns with a trailing ellipsis when cut.
-fn truncate(s: &str, max: usize) -> String {
-    if width(s) <= max {
-        return s.to_string();
+/// Truncates to `max` columns with a trailing ellipsis when cut; returns
+/// the (possibly cut) text and its display width.
+fn truncate(s: &str, max: usize) -> (String, usize) {
+    let full = width(s);
+    if full <= max {
+        return (s.to_string(), full);
     }
     let keep = max.saturating_sub(1);
-    let mut out: String = s.chars().take(keep).collect();
+    let mut out = String::new();
+    let mut w = 0;
+    for c in s.chars() {
+        let cw = posh_term::wcwidth(c) as usize;
+        if w + cw > keep {
+            break;
+        }
+        out.push(c);
+        w += cw;
+    }
     out.push('…');
-    out
+    (out, w + 1)
 }
 
 /// Abbreviates a leading $HOME to `~` (display only).
 fn abbrev_home(path: &str, home: Option<&str>) -> String {
-    if let Some(home) = home.filter(|h| !h.is_empty() && *h != "/") {
-        if let Some(rest) = path.strip_prefix(home) {
-            if rest.is_empty() {
-                return "~".to_string();
-            }
-            if rest.starts_with('/') {
-                return format!("~{rest}");
-            }
-        }
+    let Some(home) = home.filter(|h| !h.is_empty() && *h != "/") else {
+        return path.to_string();
+    };
+    let Some(rest) = path.strip_prefix(home) else {
+        return path.to_string();
+    };
+    if rest.is_empty() {
+        return "~".to_string();
+    }
+    if rest.starts_with('/') {
+        return format!("~{rest}");
     }
     path.to_string()
 }
@@ -175,9 +191,9 @@ const DIR_COL: usize = 4;
 /// Narrowest a flexible column shrinks to before we give up and overflow.
 const MIN_FLEX: usize = 8;
 
-/// Content widths per column: the widest cell, headers included.
-fn column_widths(rows: &[Row]) -> [usize; 6] {
-    let mut w = HEADERS.map(width);
+/// Content widths per column: the widest cell, seeded with the header
+/// widths (computed once by the caller, reused for the header line).
+fn column_widths(rows: &[Row], mut w: [usize; 6]) -> [usize; 6] {
     for r in rows {
         w[0] = w[0].max(width(&r.name));
         w[1] = w[1].max(r.status.width);
@@ -231,17 +247,16 @@ fn rule(left: char, mid: char, right: char, cols: &[usize; 6]) -> String {
 /// `widths` are the (possibly shrunk) column widths; `cell_widths` the
 /// actual display widths of the passed texts.
 fn line(cells: &[String; 6], cell_widths: &[usize; 6], cols: &[usize; 6]) -> String {
-    let bar = paint(DIM, "\u{2502}");
     let mut s = String::new();
     for i in 0..6 {
-        s.push_str(&bar);
+        s.push_str(DIM_BAR);
         s.push(' ');
         s.push_str(&cells[i]);
         for _ in 0..cols[i].saturating_sub(cell_widths[i]) + 1 {
             s.push(' ');
         }
     }
-    s.push_str(&bar);
+    s.push_str(DIM_BAR);
     s
 }
 
@@ -255,28 +270,29 @@ pub(super) fn render(
     home: Option<&str>,
 ) -> String {
     let rows: Vec<Row> = sessions.iter().map(|s| row(s, current, home)).collect();
-    let cols = fit(column_widths(&rows), term_cols);
+    let header_widths = HEADERS.map(width);
+    let cols = fit(column_widths(&rows, header_widths), term_cols);
 
     let mut out = String::new();
     out.push_str(&rule('\u{256d}', '\u{252c}', '\u{256e}', &cols));
     out.push('\n');
 
     let headers = HEADERS.map(|h| paint(BOLD, h));
-    out.push_str(&line(&headers, &HEADERS.map(width), &cols));
+    out.push_str(&line(&headers, &header_widths, &cols));
     out.push('\n');
     out.push_str(&rule('\u{251c}', '\u{253c}', '\u{2524}', &cols));
     out.push('\n');
 
     for r in &rows {
-        let dir = truncate(&r.dir, cols[DIR_COL]);
-        let cmd = truncate(&r.cmd, cols[CMD_COL]);
+        let (dir, dir_width) = truncate(&r.dir, cols[DIR_COL]);
+        let (cmd, cmd_width) = truncate(&r.cmd, cols[CMD_COL]);
         let widths = [
             width(&r.name),
             r.status.width,
             width(&r.pid),
             width(&r.clients),
-            width(&dir),
-            width(&cmd),
+            dir_width,
+            cmd_width,
         ];
         let cmd = if r.dim_cmd { paint(DIM, &cmd) } else { cmd };
         let cells = [
@@ -301,11 +317,10 @@ pub(super) fn render(
     if key_width + 2 <= inner {
         out.push_str(&rule('\u{251c}', '\u{2534}', '\u{2524}', &cols));
         out.push('\n');
-        let bar = paint(DIM, "\u{2502}");
         let pad = inner - key_width;
         let (left, right) = (pad / 2, pad - pad / 2);
         out.push_str(&format!(
-            "{bar}{}{key}{}{bar}\n",
+            "{DIM_BAR}{}{key}{}{DIM_BAR}\n",
             " ".repeat(left),
             " ".repeat(right)
         ));
@@ -325,13 +340,16 @@ pub(super) fn render(
     out
 }
 
-/// The dim TTY variant of the empty-group message (same wording as the
-/// plain path, so the two are grep-compatible).
+/// The empty-group message. Single source of truth for the wording: the
+/// plain path prints it bare, [`render_empty`] dims it — the two stay
+/// grep-compatible by construction.
+pub(super) fn empty_message(socket_dir: &std::path::Path) -> String {
+    format!("no sessions found in {}", socket_dir.display())
+}
+
+/// The dim TTY variant of [`empty_message`].
 pub(super) fn render_empty(socket_dir: &std::path::Path) -> String {
-    format!(
-        "{}\n",
-        paint(DIM, &format!("no sessions found in {}", socket_dir.display()))
-    )
+    format!("{}\n", paint(DIM, &empty_message(socket_dir)))
 }
 
 #[cfg(test)]
@@ -452,6 +470,22 @@ mod tests {
         // All lines still align after shrinking.
         for l in narrow.lines().filter(|l| !l.is_empty()) {
             assert_eq!(l.chars().count(), narrow_w, "misaligned: {l:?}");
+        }
+    }
+
+    #[test]
+    fn wide_chars_keep_grid_aligned() {
+        // CJK in a path is two columns per char; the grid must stay
+        // aligned when measured in display columns (wcwidth), which a
+        // chars-as-columns approximation would get wrong.
+        let mut e = entry("dev", 1);
+        e.cwd = Some("/home/u/\u{6587}\u{6863}/\u{9879}\u{76ee}".to_string());
+        let out = render(&[e, entry("other", 0)], None, 0, None);
+        let plain = strip_ansi(&out);
+        let mut lines = plain.lines().filter(|l| !l.is_empty());
+        let first = width(lines.next().unwrap());
+        for l in lines {
+            assert_eq!(width(l), first, "misaligned line: {l:?}");
         }
     }
 
