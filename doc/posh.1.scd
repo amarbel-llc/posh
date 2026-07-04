@@ -126,6 +126,10 @@ Local persistence over Unix sockets.
 
 *list* [*--short*] [*-j*|*--json*] (aliases: *ls*, *l*)
 	List sessions in the group: name, pid, attached client count.
+	When stdout is a terminal the default output is a styled table
+	with a state-colored status dot (attached, detached, or stale)
+	and the working directory and command of each session; when
+	piped it is plain tab-separated lines, unchanged for scripts.
 	*--short* prints names only; *--json* prints a machine-readable
 	array. *posh list* _host_*:* lists sessions on a remote host
 	(over a *BatchMode* ssh), printing each name host-prefixed so it
@@ -163,7 +167,11 @@ Local persistence over Unix sockets.
 	attributes.
 
 *completions* _shell_ (alias: *c*)
-	Print the completion script for _bash_, _zsh_, or _fish_.
+	Print the completion script for _bash_, _zsh_, or _fish_. The
+	nix package also installs these into the shells' vendor
+	completion directories, so an installed *posh* tab-completes
+	(session names for *attach* and the bare target position,
+	remote _host_*:* sessions, ssh hosts) without manual sourcing.
 
 # REMOTE COMMANDS
 

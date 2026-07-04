@@ -4,6 +4,7 @@
 pub mod client;
 pub mod daemon;
 pub mod ipc;
+mod list_table;
 
 use std::io::Read;
 use std::os::unix::fs::{DirBuilderExt, FileTypeExt, MetadataExt};
@@ -301,8 +302,14 @@ pub fn cmd_list(cfg: &Config, format: ListFormat) -> Result<()> {
         }
     }
 
+    // The interactive default is the styled table (the `sc list` look);
+    // a piped default stays the legacy tab-separated lines, and --short/
+    // --json are untouched — scripts and the completion probe parse those.
+    let pretty = format == ListFormat::Default && util::is_tty(libc::STDOUT_FILENO);
+
     if sessions.is_empty() {
         match format {
+            ListFormat::Default if pretty => print!("{}", list_table::render_empty(&cfg.socket_dir)),
             ListFormat::Default => println!("no sessions found in {}", cfg.socket_dir.display()),
             ListFormat::Json => println!("[]"),
             ListFormat::Short => {}
@@ -313,6 +320,19 @@ pub fn cmd_list(cfg: &Config, format: ListFormat) -> Result<()> {
     sessions.sort_by(|a, b| a.name.cmp(&b.name));
     if format == ListFormat::Json {
         println!("{}", json_list(&sessions, current.as_deref()));
+        return Ok(());
+    }
+    if pretty {
+        let (_, cols) = crate::pty::term_size(libc::STDOUT_FILENO);
+        print!(
+            "{}",
+            list_table::render(
+                &sessions,
+                current.as_deref(),
+                cols as usize,
+                std::env::var("HOME").ok().as_deref(),
+            )
+        );
         return Ok(());
     }
     for s in &sessions {

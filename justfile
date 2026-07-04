@@ -845,6 +845,23 @@ debug-posh-server-smoke secs="600":
     # per-pid sink (<runtime>/posh/posh-server-<pid>.log), not a pre-armed file.
     env -u POSH_DEBUG_LOG target/debug/posh server new -4 -- sleep '{{ secs }}'
 
+# Render the styled `posh list` table (the sc-list-style TTY default) against
+# throwaway sessions in an isolated POSH_DIR, under a fake TTY (util-linux
+# `script`) so the pretty path triggers headlessly. Visual dev-loop check for
+# the table renderer; the geometry is unit-tested in session/list_table.rs.
+[group("debug")]
+debug-posh-list-table:
+    #!/usr/bin/env bash
+    set -euo pipefail
+    cd '{{ justfile_directory() }}'
+    nix develop --command cargo build -q -p posh
+    dir=$(mktemp -d)
+    trap 'POSH_DIR=$dir target/debug/posh kill alpha 2>/dev/null; POSH_DIR=$dir target/debug/posh kill beta 2>/dev/null; rm -rf "$dir"' EXIT
+    export POSH_DIR=$dir
+    target/debug/posh attach --detach alpha -- sleep 60 >/dev/null
+    target/debug/posh attach --detach beta -- sleep 60 >/dev/null
+    script -qec "$PWD/target/debug/posh list" /dev/null
+
 # Spin up ONE fresh roaming server for hand-testing the command palette, with NO
 # ambient paths. Kills any lingering posh servers, builds the hermetic toolset
 # (absolute /nix/store paths; posh + posh-palette co-installed so Ctrl-^ finds the

@@ -241,8 +241,12 @@
           POSH_GIT_SHA = poshGitSha;
 
           # scdoc compiles the hand-written man pages in doc/*.scd during
-          # postInstall. See eng-manpages(7) and doc/.
-          nativeBuildInputs = [ pkgs.scdoc ];
+          # postInstall; installShellFiles provides installShellCompletion.
+          # See eng-manpages(7) and doc/.
+          nativeBuildInputs = [
+            pkgs.scdoc
+            pkgs.installShellFiles
+          ];
 
           doCheck = true;
 
@@ -257,6 +261,15 @@
           # See eng-manpages(7).
           postInstall = ''
             ln -s posh $out/bin/posh-server
+            # Shell completions are embedded in the binary (completions.rs,
+            # `posh completions <shell>`); install them into the vendor
+            # completion dirs so bash/zsh/fish auto-load them and
+            # `posh attach <Tab>` / the bare `posh <Tab>` target forms work
+            # without manual sourcing.
+            installShellCompletion --cmd posh \
+              --bash <($out/bin/posh completions bash) \
+              --zsh <($out/bin/posh completions zsh) \
+              --fish <($out/bin/posh completions fish)
             for f in doc/*.scd; do
               stem="$(basename "$f" .scd)"          # e.g. posh.1
               section="''${stem##*.}"               # 1

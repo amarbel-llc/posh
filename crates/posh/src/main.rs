@@ -798,7 +798,9 @@ SESSION COMMANDS (local persistence)
 
     list [--short] [-j|--json]                 (aliases: ls, l)
         List sessions in the group: name, pid, attached client count.
-        --short prints names only; --json prints a machine-readable array.
+        A styled status table on a terminal; plain tab-separated lines
+        when piped. --short prints names only; --json prints a
+        machine-readable array.
 
     run <name> [--] <command...>               (alias: r)
         Send a command to a session (created if needed) without attaching.
