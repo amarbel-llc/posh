@@ -856,7 +856,9 @@ debug-posh-list-table:
     cd '{{ justfile_directory() }}'
     nix develop --command cargo build -q -p posh
     dir=$(mktemp -d)
-    trap 'POSH_DIR=$dir target/debug/posh kill alpha 2>/dev/null; POSH_DIR=$dir target/debug/posh kill beta 2>/dev/null; rm -rf "$dir"' EXIT
+    # `|| true` keeps set -e from aborting the trap mid-way (a dead session
+    # makes `kill` fail), which would leak the temp dir and the other session.
+    trap 'POSH_DIR=$dir target/debug/posh kill alpha 2>/dev/null || true; POSH_DIR=$dir target/debug/posh kill beta 2>/dev/null || true; rm -rf "$dir"' EXIT
     export POSH_DIR=$dir
     target/debug/posh attach --detach alpha -- sleep 60 >/dev/null
     target/debug/posh attach --detach beta -- sleep 60 >/dev/null
