@@ -143,7 +143,17 @@ fn match_kitty_detach(s: &[u8]) -> KittyMatch {
             partial = true;
         }
     }
-    if partial {
+    // A bare `\x1b` is a prefix of every detach sequence, but it is far more
+    // often a real Escape keypress (interrupt/clear in a TUI). Holding it back
+    // to disambiguate stalls Escape until the next keystroke arrives — there is
+    // no flush timer — so a lone Escape is only forwarded when the user presses
+    // another key, and a double-Escape registers as one (posh#126).
+    // Require at least the `\x1b[` CSI introducer before treating the buffer as
+    // a detach-in-progress. The cost is that a detach whose kitty encoding is
+    // split by the tty *between* the `\x1b` and the `[` (vanishingly rare — a
+    // terminal emits a CSI-u sequence atomically) is missed that once; the user
+    // simply presses Ctrl-\ again. Escape latency is the common case, so it wins.
+    if partial && s.len() >= 2 {
         KittyMatch::Partial
     } else {
         KittyMatch::No
@@ -1083,6 +1093,42 @@ mod tests {
         let (fwd, detached) = m.feed(b"7;5u");
         assert!(!detached);
         assert_eq!(fwd, b"\x1b[97;5u");
+    }
+
+    #[test]
+    fn lone_escape_is_forwarded_immediately() {
+        // A bare `\x1b` is a real Escape keypress and must reach the app in the
+        // same read — never held back as a possible detach prefix, or Escape
+        // stalls until the next keystroke (posh#126).
+        let mut m = DetachMatcher::default();
+        assert_eq!(m.feed(b"\x1b"), (vec![0x1b], false));
+        // Nothing was carried, so a following key forwards on its own.
+        assert_eq!(m.feed(b"a"), (b"a".to_vec(), false));
+    }
+
+    #[test]
+    fn double_escape_forwards_both() {
+        // Two Escapes in separate reads must forward two Escapes, not register
+        // as one (the swallow symptom: one held in the carry indefinitely).
+        let mut m = DetachMatcher::default();
+        assert_eq!(m.feed(b"\x1b"), (vec![0x1b], false));
+        assert_eq!(m.feed(b"\x1b"), (vec![0x1b], false));
+    }
+
+    #[test]
+    fn escape_then_key_in_one_read_forwards_both() {
+        // Alt-<key> (ESC prefix) and any ESC-led sequence the terminal delivers
+        // in a single read must pass through intact.
+        let mut m = DetachMatcher::default();
+        assert_eq!(m.feed(b"\x1bb"), (b"\x1bb".to_vec(), false));
+    }
+
+    #[test]
+    fn lone_escape_at_buffer_tail_forwards_leading_input() {
+        // `abc` + a trailing lone Escape: the whole buffer forwards, with no
+        // byte held back (the tail `\x1b` is a real Escape, not a detach head).
+        let mut m = DetachMatcher::default();
+        assert_eq!(m.feed(b"abc\x1b"), (b"abc\x1b".to_vec(), false));
     }
 
     // ---- Task 2.1: local client renders posh-proto ServerFrames (RFC 0008) ----
