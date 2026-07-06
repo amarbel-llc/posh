@@ -37,9 +37,9 @@ const SCROLLBACK_RING_DEPTH: usize = 10_000;
 
 /// Mode resets written on detach before leaving the alternate screen:
 /// mouse reporting (1000/1002/1003/1006), alternate scroll (1007),
-/// bracketed paste (2004), focus events (1004), and the pen.
-const MODES_OFF_SEQ: &[u8] =
-    b"\x1b[?1000l\x1b[?1002l\x1b[?1003l\x1b[?1006l\x1b[?1007l\x1b[?2004l\x1b[?1004l\x1b[0m";
+/// bracketed paste (2004), focus events (1004), the kitty keyboard
+/// protocol (FDR 0013: `\x1b[=0;1u`), and the pen.
+const MODES_OFF_SEQ: &[u8] = b"\x1b[?1000l\x1b[?1002l\x1b[?1003l\x1b[?1006l\x1b[?1007l\x1b[?2004l\x1b[?1004l\x1b[=0;1u\x1b[0m";
 
 /// Takeover sequence written on attach (and SIGCONT resume): terminfo
 /// smcup for $TERM puts the whole attach on the outer terminal's
@@ -1038,6 +1038,9 @@ mod tests {
         let restore = restore_seq(&bracket);
         assert!(restore.starts_with(MODES_OFF_SEQ));
         assert!(restore.ends_with(b"\x1b[?1049l\x1b[?25h"));
+        // FDR 0013: detach must reset the kitty keyboard protocol so it does
+        // not leak into the user's shell.
+        assert!(restore.windows(7).any(|w| w == b"\x1b[=0;1u"));
         // --no-init / no-alt-screen terminal: historical clear-in-place,
         // mode resets still run.
         assert_eq!(enter_seq(&None), b"\x1b[2J\x1b[H");

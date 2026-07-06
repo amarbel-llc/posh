@@ -43,6 +43,12 @@ pub struct Snapshot {
     pub mouse_mode: u16,
     /// 0 = default encoding, else the DECSET number (1005/1006/1016).
     pub mouse_encoding: u16,
+    /// Kitty keyboard protocol flags for the active screen (FDR 0013). 0 = the
+    /// protocol is off (legacy encoding); non-zero = the progressive-enhancement
+    /// flag bits the session app pushed. Mirrored onto the outer terminal so a
+    /// kitty-capable terminal encodes keys (e.g. Escape as `\x1b[27u`) the way
+    /// the app negotiated.
+    pub kitty_keyboard_flags: u8,
     /// OSC 8 hyperlink id -> URI, for the ids carried by `cells`.
     pub hyperlinks: HashMap<u32, String>,
 }
@@ -78,6 +84,7 @@ impl Snapshot {
             app_keypad: false,
             mouse_mode: 0,
             mouse_encoding: 0,
+            kitty_keyboard_flags: 0,
             hyperlinks: HashMap::new(),
         }
     }
@@ -124,6 +131,7 @@ impl Snapshot {
             app_keypad: term.app_keypad(),
             mouse_mode: term.mouse_mode().decset().unwrap_or(0),
             mouse_encoding: term.mouse_protocol().decset().unwrap_or(0),
+            kitty_keyboard_flags: term.kitty_flags().0,
             hyperlinks,
         }
     }
@@ -174,7 +182,8 @@ pub fn open_with(bracket: &Option<(Vec<u8>, Vec<u8>)>) -> Vec<u8> {
 pub fn close_with(bracket: &Option<(Vec<u8>, Vec<u8>)>) -> Vec<u8> {
     let mut out = Vec::from(
         b"\x1b[0m\x1b[?25h\x1b[?1l\x1b>\x1b[?1003l\x1b[?1002l\x1b[?1000l\x1b[?9l\
-          \x1b[?1016l\x1b[?1006l\x1b[?1005l\x1b[?2004l\x1b[?1004l\x1b[?1007l\x1b[r"
+          \x1b[?1016l\x1b[?1006l\x1b[?1005l\x1b[?2004l\x1b[?1004l\x1b[?1007l\
+          \x1b[=0;1u\x1b[r"
             .as_slice(),
     );
     if let Some((_, rmcup)) = bracket {
@@ -565,6 +574,17 @@ pub fn new_frame_opt(
         } else {
             "\x1b[?1007l"
         });
+    }
+
+    // Kitty keyboard protocol (FDR 0013): mirror the session app's negotiated
+    // flags onto the outer terminal so a kitty-capable terminal encodes keys
+    // (notably Escape as `\x1b[27u`, not bare `\x1b`) the way the app asked for.
+    // The absolute set form `CSI = flags ; 1 u` (mode 1 = set) keeps the mirror
+    // stateless — we assert the current flag value, never tracking a parallel
+    // push/pop stack. A terminal without kitty support ignores the unknown CSI,
+    // so this is a safe no-op there. Teardown (close_with / detach) resets to 0.
+    if !init || f.kitty_keyboard_flags != last.kitty_keyboard_flags {
+        let _ = write!(frame.out, "\x1b[={};1u", f.kitty_keyboard_flags);
     }
 
     // Mouse encoding. Fire on a want_wheel transition too, mirroring the mouse-
@@ -1596,6 +1616,37 @@ mod tests {
         assert!(String::from_utf8_lossy(&diff_off).contains("\x1b[?1007l"));
 
         assert!(String::from_utf8_lossy(&close_with(&None)).contains("\x1b[?1007l"));
+    }
+
+    #[test]
+    fn kitty_keyboard_flags_synced_and_reset() {
+        // FDR 0013: when the session app enables the kitty keyboard protocol,
+        // new_frame mirrors the flags onto the outer terminal with the absolute
+        // set form `CSI = flags ; 1 u`; clearing them syncs a `= 0 ; 1 u`; and
+        // teardown resets — or the protocol leaks to the local shell.
+        let mut app = term_with(3, 20, b"");
+        app.process(b"\x1b[>5u"); // push disambiguate+report-events (5)
+        let snap = Snapshot::from_term(&app);
+        assert_eq!(snap.kitty_keyboard_flags, 5, "from_term captures pushed flags");
+
+        // Off -> on: the diff asserts the app's flag value.
+        let diff = new_frame(true, &Snapshot::from_term(&term_with(3, 20, b"")), &snap, false);
+        assert!(
+            String::from_utf8_lossy(&diff).contains("\x1b[=5;1u"),
+            "enabling kitty keyboard must assert the flags: {:?}",
+            String::from_utf8_lossy(&diff)
+        );
+
+        // On -> off: the diff resets to 0.
+        let diff_off = new_frame(true, &snap, &Snapshot::from_term(&term_with(3, 20, b"")), false);
+        assert!(
+            String::from_utf8_lossy(&diff_off).contains("\x1b[=0;1u"),
+            "disabling must reset to 0: {:?}",
+            String::from_utf8_lossy(&diff_off)
+        );
+
+        // Teardown resets regardless of alt-screen bracket.
+        assert!(String::from_utf8_lossy(&close_with(&None)).contains("\x1b[=0;1u"));
     }
 
     #[test]
