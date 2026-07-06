@@ -1788,9 +1788,21 @@ fn render(st: &mut ClientState, now: u64) {
         st.stats.record_render_skip();
     } else {
         st.stats.record_render(bytes.len());
-        let _ = util::write_all_retry(STDOUT, &bytes, 1000);
-        // #wedge (#83): the model generation now actually on the tty.
-        st.last_painted_gen = st.server_term.generation();
+        // compose_frame already committed `last_drawn = next` (it models the tty
+        // as a differential surface). If write_all_retry can't drain the tty
+        // within its budget it DROPS the un-written bytes — so on a failed/partial
+        // write the physical screen no longer matches last_drawn, and because we
+        // only ever emit diffs nothing would ever repaint those cells again (the
+        // permanent top-line desync: a dropped banner-clear leaves stale banner
+        // text under later output). Force a full repaint next tick to resync, and
+        // don't advance last_painted_gen — this generation did NOT reach the tty.
+        match util::write_all_retry(STDOUT, &bytes, 1000) {
+            Ok(()) => {
+                // #wedge (#83): the model generation now actually on the tty.
+                st.last_painted_gen = st.server_term.generation();
+            }
+            Err(_) => st.initialized = false,
+        }
     }
 }
 
@@ -3089,6 +3101,134 @@ mod tests {
             compose_frame(&mut st, 20).is_empty(),
             "and the tick after it is idle again"
         );
+    }
+
+    // Regression guard for the "top line permanently unechoed" bug.
+    //
+    // The renderer is DIFFERENTIAL: compose_frame diffs the model against
+    // st.last_drawn (its belief about the physical tty) and emits only changed
+    // cells, then commits `st.last_drawn = next` unconditionally. render()
+    // writes those bytes via write_all_retry, which DROPS the un-drained bytes
+    // when its budget runs out (a degraded-link stall). So a dropped paint
+    // leaves last_drawn ahead of the real screen, and — because we only ever
+    // emit diffs — nothing would ever repaint those cells again. The fix: when
+    // the write fails, render() forces a full repaint next tick (initialized =
+    // false), resyncing the whole screen.
+    //
+    // This models the git-commit editor case: while the banner is up (link was
+    // late), the app owns row 0; the paint that would clear the banner is
+    // DROPPED; the user then types and the server echoes. Without the fix the
+    // stale banner permanently corrupts the top line; with it, the forced
+    // repaint restores the screen exactly.
+    #[test]
+    fn dropped_paint_resyncs_top_line_via_forced_repaint() {
+        let (rows, cols) = (6u16, 40u16);
+        let mut st = test_state(rows, cols);
+
+        // The physical terminal the user actually sees. `tick` writes into it —
+        // except on the one frame we drop (the degraded-link timeout).
+        let mut tty = Terminal::with_scrollback(rows, cols, 0);
+
+        // One render tick, mirroring render() exactly: compose (which advances
+        // last_drawn), then either paint the bytes into the tty or DROP them the
+        // way write_all_retry does on a budget timeout. On a dropped write,
+        // reproduce render()'s recovery: force a full repaint next tick.
+        // Returns the emitted byte count.
+        fn tick(st: &mut ClientState, tty: &mut Terminal, now: u64, drop_write: bool) -> usize {
+            let bytes = compose_frame(st, now);
+            if !bytes.is_empty() {
+                if drop_write {
+                    st.initialized = false; // render()'s write-failed recovery
+                } else {
+                    tty.process(&bytes);
+                }
+            }
+            bytes.len()
+        }
+
+        // The alt-screen editor: a commit buffer. Row 0 is the message first
+        // line, where the cursor sits.
+        let editor = |line1: &str| {
+            let mut s = String::from("\x1b[?1049h\x1b[2J\x1b[H");
+            s.push_str(line1); // row 0: the message first line
+            s.push_str("\r\n\r\n# Please enter the commit message");
+            s.push_str("\r\n# On branch master\r\n#\r\n# Changes:");
+            // Park the cursor back on row 0, col after line1.
+            s.push_str(&format!("\x1b[1;{}H", line1.chars().count() + 1));
+            s.into_bytes()
+        };
+
+        let push_full = |st: &mut ClientState, num: u64, screen: Vec<u8>| {
+            let frame = ServerFrame {
+                flags: 0,
+                caps: vec![],
+                frame_num: num,
+                input_ack: 0,
+                echo_ack: 0,
+                body: FrameBody::Full(screen),
+            };
+            assert!(apply_frame(st, &frame));
+        };
+
+        // 1. Editor opens; fresh contact. Paint lands.
+        push_full(&mut st, 1, editor(""));
+        tick(&mut st, &mut tty, 0, false);
+
+        // 2. Link goes late (>6.5s): the banner appears on row 0. Paint lands.
+        tick(&mut st, &mut tty, 7000, false);
+        assert!(
+            row_text(&Snapshot::from_term(&tty), 0).starts_with("posh:"),
+            "banner should cover the tty row 0 while late"
+        );
+
+        // 3. Contact resumes: the banner-clear paint is DROPPED (the degraded→
+        //    recovered transition where write_all_retry burns its budget).
+        //    last_drawn advances anyway, so the tty is now stale — BUT the fix
+        //    latched initialized = false for the next tick.
+        st.notify.server_heard(9000);
+        let n = tick(&mut st, &mut tty, 9000, /* drop_write */ true);
+        assert!(n > 0, "the banner-clear frame did emit paint bytes (that we dropped)");
+        assert!(!st.initialized, "a dropped write must force a repaint next tick");
+        // Confirm the drop really did desync the tty (else the scenario is moot).
+        assert!(
+            row_text(&Snapshot::from_term(&tty), 0).contains("Last contact"),
+            "the dropped paint left the stale banner on the physical tty"
+        );
+
+        // 4. The user types "hello"; the server echoes each keystroke. The very
+        //    next tick composes with initialized = false, so it full-repaints
+        //    and resyncs the whole screen onto the tty.
+        for (i, prefix) in ["h", "he", "hel", "hell", "hello"].iter().enumerate() {
+            push_full(&mut st, 2 + i as u64, editor(prefix));
+            tick(&mut st, &mut tty, 9100 + i as u64 * 10, false);
+        }
+
+        // With the fix, the physical tty converges on the model: every row
+        // matches, with the top line showing exactly the typed text and no
+        // banner residue.
+        let tty_snap = Snapshot::from_term(&tty);
+        let model_snap = Snapshot::from_term(&st.server_term);
+        for r in 0..rows as usize {
+            assert_eq!(
+                row_text(&tty_snap, r).trim_end(),
+                row_text(&model_snap, r).trim_end(),
+                "row {r} on the physical tty diverged from the model after recovery"
+            );
+        }
+        assert_eq!(
+            row_text(&tty_snap, 0).trim_end(),
+            "hello",
+            "the typed text echoed onto the physical top line after the repaint"
+        );
+    }
+
+    /// The printable text of one snapshot row, spacer halves elided.
+    fn row_text(s: &Snapshot, row: usize) -> String {
+        s.cells[row]
+            .iter()
+            .filter(|c| c.width > 0)
+            .map(|c| if c.ch == '\0' { ' ' } else { c.ch })
+            .collect()
     }
 
     /// RFC 0002 §3: a `BODY_SCROLLBACK` advances the accumulated ring in row
