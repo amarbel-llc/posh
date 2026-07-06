@@ -93,7 +93,15 @@ pub fn encode_frame(tag: Tag, payload: &[u8]) -> Vec<u8> {
 }
 
 pub fn send(fd: RawFd, tag: Tag, payload: &[u8]) -> std::io::Result<()> {
-    util::write_all_retry(fd, &encode_frame(tag, payload), 5000)
+    // A framed IPC record must go out whole; a partial write would corrupt the
+    // peer's frame stream. write_all_retry now reports bytes written, so a short
+    // write (budget spent) surfaces here as an error rather than silent loss.
+    let frame = encode_frame(tag, payload);
+    let written = util::write_all_retry(fd, &frame, 5000)?;
+    if written < frame.len() {
+        return Err(std::io::ErrorKind::TimedOut.into());
+    }
+    Ok(())
 }
 
 /// Resize payload: rows then cols, both little-endian u16 (zmx packed struct

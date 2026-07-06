@@ -240,15 +240,25 @@ pub fn write_fd(fd: RawFd, buf: &[u8]) -> std::io::Result<usize> {
 /// Write all of `data`, waiting up to `max_wait_ms` for a non-blocking fd to
 /// drain. Bytes that still cannot be written when the budget runs out are
 /// dropped (the daemon must not wedge on a stopped PTY reader).
-pub fn write_all_retry(fd: RawFd, mut data: &[u8], max_wait_ms: u64) -> std::io::Result<()> {
+///
+/// Returns the number of bytes actually written. `Ok(n)` with `n < data.len()`
+/// means the budget expired and `data.len() - n` bytes were DROPPED — callers
+/// that model a differential surface (the render path) must treat a short write
+/// as a desync and force a full repaint (see `remote::client::render_to`).
+/// `Ok(data.len())` means the whole buffer drained. A real I/O error is still
+/// returned as `Err`.
+pub fn write_all_retry(fd: RawFd, data: &[u8], max_wait_ms: u64) -> std::io::Result<usize> {
     let start = now_ms();
-    while !data.is_empty() {
-        match write_fd(fd, data) {
-            Ok(n) => data = &data[n..],
+    let mut rest = data;
+    while !rest.is_empty() {
+        match write_fd(fd, rest) {
+            Ok(n) => rest = &rest[n..],
             Err(e) if e.kind() == std::io::ErrorKind::Interrupted => {}
             Err(e) if e.kind() == std::io::ErrorKind::WouldBlock => {
                 if now_ms().saturating_sub(start) >= max_wait_ms {
-                    return Err(std::io::ErrorKind::TimedOut.into());
+                    // Budget spent: report how much made it out (the rest is
+                    // dropped) rather than an opaque TimedOut that hides the loss.
+                    return Ok(data.len() - rest.len());
                 }
                 let mut fds = [pollfd(fd, libc::POLLOUT)];
                 let _ = poll(&mut fds, 10);
@@ -256,7 +266,7 @@ pub fn write_all_retry(fd: RawFd, mut data: &[u8], max_wait_ms: u64) -> std::io:
             Err(e) => return Err(e),
         }
     }
-    Ok(())
+    Ok(data.len())
 }
 
 // ---------------------------------------------------------------------------

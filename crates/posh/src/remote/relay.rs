@@ -340,9 +340,14 @@ enum FirstRecord {
 /// `FragmentAssembly` switches to any incoming id (no back-rejection, no
 /// completed-id dedup) and single-fragment Empty frames leave no partial state.
 fn first_daemon_record(link: &mut DaemonLink, conn: &mut Connection) -> Result<FirstRecord> {
-    // The daemon will not send anything until it has our Init+Resize.
+    // The daemon will not send anything until it has our Init+Resize. This must
+    // go out whole — a partial write would hand the daemon a corrupt frame — so
+    // a short write (budget spent) is an error, not silent loss.
     if !link.write.is_empty() {
-        util::write_all_retry(link.stream.as_raw_fd(), &link.write, 5000)?;
+        let written = util::write_all_retry(link.stream.as_raw_fd(), &link.write, 5000)?;
+        if written < link.write.len() {
+            return Err(util::Error::Io(std::io::ErrorKind::TimedOut.into()));
+        }
         link.write.clear();
     }
     // Heartbeat machinery for the wait (a throwaway fragmenter/inbox: no client
