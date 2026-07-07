@@ -504,13 +504,16 @@ debug-verify-grab grab="on" *ARGS:
 # using freshly-built worktree binaries. FRAMES is on|0: `0` sets
 # POSH_SESSION_FRAMES=0 on the daemon (raw Tag::Output, stdin forwarded
 # verbatim — the pre-frame-work path), `on` leaves it default (the frame path
-# with FrameRenderer/MouseFilter/mode-sync). Run both and diff the rawkeys
-# receipt to isolate whether the frame path alters key bytes (the Shift+Enter
-# question, posh#126). ARGS go to posht (default: --only rawkeys). Runs in an
-# isolated POSH_DIR, cleaned up on exit; the client takes over your terminal, so
-# run it in the terminal you want to test (e.g. kitty). Quit posht normally,
-# then detach with Ctrl-\ (the local session detach key). Debug-only; the
-# hermetic gate is build-rust.
+# with FrameRenderer/MouseFilter/mode-sync). Run both and diff the printed
+# rawkeys receipts to isolate whether the frame path alters key bytes (the
+# Shift+Enter question, posh#126). ARGS go to posht (default: --only rawkeys).
+# The receipt is written to a stable path and `cat` to your OUTER terminal AFTER
+# the session exits — the in-session summary is wiped when posht's alt-screen
+# tears down, so the file is the durable record. Runs in an isolated POSH_DIR,
+# cleaned up on exit; the client takes over your terminal, so run it in the
+# terminal you want to test (e.g. kitty). Quit posht normally, then detach with
+# Ctrl-\ (the local session detach key). Debug-only; the hermetic gate is
+# build-rust.
 [group("debug")]
 debug-verify-session-frames frames="on" *ARGS:
     #!/usr/bin/env bash
@@ -522,6 +525,10 @@ debug-verify-session-frames frames="on" *ARGS:
     posh="$PWD/target/debug/posh"
     dir=$(mktemp -d); export POSH_DIR="$dir"
     name='rawkeys-{{ frames }}'
+    # Receipt path OUTSIDE POSH_DIR so the trap's rm -rf doesn't take it; posht
+    # writes it to the real filesystem (not through posh's tty), so it survives
+    # the alt-screen teardown that wipes the on-screen summary.
+    receipt="$PWD/.tmp/rawkeys-{{ frames }}.json"; mkdir -p "$PWD/.tmp"
     trap '"$posh" kill "$name" 2>/dev/null || true; rm -rf "$dir"' EXIT
     # POSH_SESSION_FRAMES is read by the double-forked daemon, which inherits
     # this process's env. `0` = legacy raw-output path; unset = frame path.
@@ -532,7 +539,12 @@ debug-verify-session-frames frames="on" *ARGS:
         echo ">> FRAME path: POSH_SESSION_FRAMES unset (default on)" >&2 ;;
     esac
     echo ">> attaching local session '$name' running posht $args" >&2
-    exec "$posh" attach "$name" -- "$PWD/posht/posht" $args
+    echo ">> receipt -> $receipt (printed below after you exit)" >&2
+    # NOT exec: control returns here after the client exits, so we can print the
+    # receipt to the OUTER terminal where it persists in scrollback.
+    "$posh" attach "$name" -- "$PWD/posht/posht" $args --json "$receipt" || true
+    echo >&2; echo ">> ===== rawkeys receipt ({{ frames }}) =====" >&2
+    if [ -s "$receipt" ]; then cat "$receipt"; else echo "(no receipt written)" >&2; fi
 
 # Verify TERM/COLORTERM forwarding (#51) over a LOCAL loopback server+client
 # pair with freshly-built worktree binaries. Runs your $SHELL in the session;

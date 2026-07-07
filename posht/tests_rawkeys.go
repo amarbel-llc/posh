@@ -5,6 +5,7 @@ import (
 	"io"
 	"os"
 	"strings"
+	"syscall"
 	"time"
 
 	tea "github.com/charmbracelet/bubbletea"
@@ -39,9 +40,12 @@ var rawKeyScript = []keyPrompt{
 	{"Enter", "the plain baseline — expect a bare CR (0d) or LF (0a)"},
 	{"Shift+Enter", "the key in question — same byte as Enter unless a distinct sequence is negotiated"},
 	{"Ctrl+J", "Claude's chat:newline default — expect LF (0a)"},
-	{"Alt+Enter", "distinct even in legacy: expect ESC+CR (1b 0d)"},
 	{"Escape", "expect bare ESC (1b), or CSI 27u under kitty disambiguate"},
 	{"Shift+Tab", "a known-distinct control: expect CSI Z (1b 5b 5a) — if THIS is wrong the problem is broad"},
+	// Alt+Enter dropped: on macOS it is commonly intercepted by a global
+	// hotkey daemon (Hammerspoon) before the terminal sees it, so it can't be
+	// captured here. Its reference value (ESC+CR) is documented in the
+	// posh-term encoder test (enter_encoding_matches_kitty_c0_table) instead.
 }
 
 // keyCapture records what one prompt produced.
@@ -136,11 +140,10 @@ func (m *rawKeysModel) Report() any {
 // rather than the Exec-provided reader, writes prompts, decodes the bytes, and
 // stores the results back on the model.
 type rawKeysCmd struct {
-	m     *rawKeysModel
-	in    io.Reader // Exec-provided; unused (we read the raw fd instead), kept for the interface
-	out   io.Writer
-	fd    int
-	bytes chan byte // raw tty bytes from the single reader goroutine
+	m   *rawKeysModel
+	in  io.Reader // Exec-provided; unused (we read the raw fd instead), kept for the interface
+	out io.Writer
+	fd  int
 }
 
 // The out-of-band control keys. Advance is decoupled from byte-arrival timing
@@ -167,7 +170,6 @@ func (c *rawKeysCmd) Run() error {
 	if st, err := term.MakeRaw(c.fd); err == nil {
 		defer func() { _ = term.Restore(c.fd, st) }()
 	}
-	c.startReader()
 
 	fmt.Fprint(c.out, "\x1b[2J\x1b[H")
 	fmt.Fprint(c.out, "  RAW KEY CAPTURE — bytes shown exactly as received.\r\n")
@@ -253,33 +255,25 @@ func (c *rawKeysCmd) drawPending(pending []byte) {
 		hexBytes(pending), caretRender(pending))
 }
 
-// startReader launches the single byte-reader goroutine over the raw tty fd,
-// feeding c.bytes. One reader for the whole run avoids racing multiple
-// per-call goroutines on the same fd.
-func (c *rawKeysCmd) startReader() {
-	c.bytes = make(chan byte, 256)
-	go func() {
-		defer close(c.bytes)
-		var one [1]byte
-		for {
-			n, err := os.Stdin.Read(one[:])
-			if n > 0 {
-				c.bytes <- one[0]
-			}
-			if err != nil {
-				return
-			}
-		}
-	}()
-}
-
-// readByte blocks for the next raw byte; ok is false when the reader closed.
+// readByte blocks for the next raw byte read SYNCHRONOUSLY from the tty fd.
+// There is deliberately no background reader goroutine: one blocked in
+// os.Stdin.Read would survive Run() and steal the next byte from bubbletea when
+// the test returns (eating the post-run keypress). Reading inline means nothing
+// touches stdin once Run() returns. ok is false on EOF/error.
 func (c *rawKeysCmd) readByte() (byte, bool) {
-	b, ok := <-c.bytes
-	return b, ok
+	var one [1]byte
+	for {
+		n, err := os.Stdin.Read(one[:])
+		if n > 0 {
+			return one[0], true
+		}
+		if err != nil {
+			return 0, false
+		}
+	}
 }
 
-// waitForKey drains bytes until the given key is seen (or the reader closes).
+// waitForKey drains bytes until the given key is seen (or the fd closes).
 func (c *rawKeysCmd) waitForKey(key byte) {
 	for {
 		b, ok := c.readByte()
@@ -293,8 +287,9 @@ func (c *rawKeysCmd) waitForKey(key byte) {
 // primary device-attributes request (CSI c) as a sentinel: a terminal that
 // supports the protocol replies CSI ? flags u before the DA reply; one that
 // doesn't answers only the DA. Per the spec's detection method. The reply is a
-// terminal response (not user input), so it IS read on a short timer — the only
-// timed read left in the harness.
+// terminal response (not user input), so it is read on a short timer — the only
+// timed read in the harness. It uses a non-blocking fd + poll rather than a
+// goroutine, so no reader can outlive this call.
 func (c *rawKeysCmd) queryKittyFlags() {
 	fmt.Fprint(c.out, "\x1b[?u\x1b[c")
 	buf := c.readReply(400 * time.Millisecond)
@@ -307,34 +302,37 @@ func (c *rawKeysCmd) queryKittyFlags() {
 	fmt.Fprintf(c.out, "  kitty keyboard flags: %s\r\n\r\n", c.m.kittyFlags)
 }
 
-// readReply collects the terminal's response bytes: it waits up to `total` for
-// the first byte, then drains whatever else is already queued, stopping on a
-// short quiet gap. Used only for the auto-emitted query reply, never for user
-// keystrokes (those advance out-of-band).
+// readReply collects the terminal's auto-emitted query response by temporarily
+// putting the fd in non-blocking mode and polling: it waits up to `total` for
+// the first byte, then drains whatever else arrives, stopping on a short quiet
+// gap. The fd is restored to blocking before returning, so the synchronous
+// readByte path (user input) works normally afterward. Used ONLY for the query
+// reply, never for user keystrokes (those advance out-of-band via readByte).
 func (c *rawKeysCmd) readReply(total time.Duration) []byte {
-	var out []byte
-	first := time.NewTimer(total)
-	defer first.Stop()
-	select {
-	case b, ok := <-c.bytes:
-		if !ok {
-			return out
-		}
-		out = append(out, b)
-	case <-first.C:
-		return out
+	if err := syscall.SetNonblock(c.fd, true); err != nil {
+		return nil // can't poll; skip the query rather than block forever
 	}
+	defer func() { _ = syscall.SetNonblock(c.fd, false) }()
+
+	var out []byte
+	deadline := time.Now().Add(total)
+	quiet := 60 * time.Millisecond
+	var one [1]byte
 	for {
-		t := time.NewTimer(50 * time.Millisecond)
-		select {
-		case b, ok := <-c.bytes:
-			t.Stop()
-			if !ok {
-				return out
+		n, err := os.Stdin.Read(one[:])
+		if n > 0 {
+			out = append(out, one[0])
+			deadline = time.Now().Add(quiet) // reset the quiet window
+			continue
+		}
+		if err != nil { // EAGAIN (no data yet) or real error
+			if len(out) > 0 && time.Now().After(deadline) {
+				return out // got a reply, then quiet
 			}
-			out = append(out, b)
-		case <-t.C:
-			return out
+			if len(out) == 0 && time.Now().After(deadline) {
+				return out // nothing came within the initial window
+			}
+			time.Sleep(5 * time.Millisecond)
 		}
 	}
 }
