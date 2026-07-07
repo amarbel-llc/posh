@@ -79,6 +79,29 @@ pub const CAP_LOSSY: u8 = 9;
 /// change; the client clears its ring and zeroes its count on a bump).
 pub const CAP_SCROLLBACK2: u8 = 10;
 
+/// Kitty keyboard capability of the client's REAL terminal (RFC 0010). Client
+/// entry: 1-byte payload carrying the kitty keyboard progressive-enhancement
+/// flag set the client's outer terminal supports, as the low 5 bits
+/// (disambiguate=1, report-events=2, report-alternate=4, report-all=8,
+/// report-text=16). A `0` payload means "the terminal implements the kitty
+/// keyboard protocol but reports no enhancement flags"; the cap's ABSENCE means
+/// "unknown / not advertised" (a terminal without the protocol MUST NOT
+/// advertise it). The daemon answers the in-session app's `CSI ? u` query from
+/// the effective (conservative-intersection across attached frame clients)
+/// value, since under frame transport the raw query never reaches the real
+/// terminal. Complements FDR 0013 (the outbound flag mirror).
+pub const CAP_KITTY_KEYBOARD: u8 = 11;
+
+/// Mask a received [`CAP_KITTY_KEYBOARD`] payload to the valid low-5-bit flag
+/// range (RFC 0010 Security Considerations): a malformed or oversized payload is
+/// treated as "capability absent" (`None`), never trusted out of range.
+pub fn decode_kitty_keyboard(payload: &[u8]) -> Option<u8> {
+    match payload {
+        [flags] => Some(flags & 0x1f),
+        _ => None,
+    }
+}
+
 /// The client's [`CAP_SCROLLBACK2`] entry, decoded (RFC 0009 §1/§3).
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct Scrollback2Client {
@@ -531,6 +554,18 @@ mod tests {
         let (caps, used) = decode_table(&encode_table(&[])).unwrap();
         assert!(caps.is_empty());
         assert_eq!(used, 1);
+    }
+
+    #[test]
+    fn kitty_keyboard_payload_decodes_and_masks() {
+        // A valid 1-byte payload decodes to its low 5 bits.
+        assert_eq!(decode_kitty_keyboard(&[0]), Some(0));
+        assert_eq!(decode_kitty_keyboard(&[0b1_0001]), Some(0b1_0001));
+        // Out-of-range high bits are masked off (RFC 0010 Security).
+        assert_eq!(decode_kitty_keyboard(&[0xff]), Some(0x1f));
+        // Absent / malformed (wrong length) ⇒ None (treated as unadvertised).
+        assert_eq!(decode_kitty_keyboard(&[]), None);
+        assert_eq!(decode_kitty_keyboard(&[1, 2]), None);
     }
 
     #[test]

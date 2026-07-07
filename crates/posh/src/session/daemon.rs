@@ -462,6 +462,71 @@ fn broadcast_source_swap(clients: &mut [ClientConn], src: &Terminal, bcast: &[u8
     broadcast_output(clients, src, bcast);
 }
 
+/// RFC 0010: the query-answering policy for the app's terminal queries, decided
+/// from the currently attached clients. Returns `Some(effective_kitty_flags)`
+/// when the daemon must answer the app's `CSI ? u`/DA/DSR itself, or `None` when
+/// it must stay silent (a legacy `Tag::Output` client is attached whose real
+/// terminal will answer — answering too would double-reply).
+///
+/// - No clients: `Some(model_flags)` — answer from the model, unchanged
+///   pre-existing no-client behavior (the caller passes the model's own flags).
+/// - All attached clients are frame clients (`producer.is_some()`): `Some(eff)`,
+///   where `eff` is the conservative intersection (bitwise AND) of every frame
+///   client's advertised `CAP_KITTY_KEYBOARD`, or `0` if ANY frame client did
+///   not advertise it (RFC 0010 §3.1). The raw query never reaches their
+///   terminals, so the daemon is the only responder.
+/// - Any legacy (non-frame) client attached: `None` — its terminal answers via
+///   `Tag::Input`, so the daemon stays silent to avoid a duplicate reply.
+fn query_answer_flags(clients: &[ClientConn], model_flags: u8) -> Option<u8> {
+    if clients.is_empty() {
+        return Some(model_flags);
+    }
+    if clients.iter().any(|c| c.producer.is_none()) {
+        return None; // a legacy client's real terminal will answer
+    }
+    // All frame clients: intersect advertised kitty caps; absence ⇒ 0.
+    let mut eff = 0x1fu8;
+    for c in clients {
+        match caps::find(&c.caps, caps::CAP_KITTY_KEYBOARD)
+            .and_then(|cap| caps::decode_kitty_keyboard(&cap.payload))
+        {
+            Some(flags) => eff &= flags,
+            None => return Some(0),
+        }
+    }
+    Some(eff)
+}
+
+/// RFC 0010: rewrite the model's kitty-keyboard query reply (`CSI ? <n> u`)
+/// within a response buffer to carry the effective flags the daemon is
+/// answering with, leaving every other response (DA `…c`, DSR `…R`) untouched.
+/// The model answers `CSI ? u` from its OWN pushed flag stack, which is not the
+/// terminal-capability answer the app's probe wants; this substitutes the
+/// effective client-terminal capability. Only the `\x1b[?<digits>u` form is
+/// rewritten — a conservative, exact match.
+fn rewrite_kitty_reply(responses: &[u8], effective: u8) -> Vec<u8> {
+    const PREFIX: &[u8] = b"\x1b[?";
+    let mut out = Vec::with_capacity(responses.len());
+    let mut i = 0;
+    while i < responses.len() {
+        if responses[i..].starts_with(PREFIX) {
+            // Scan digits after the `\x1b[?`; a `u` terminator ⇒ kitty reply.
+            let mut j = i + PREFIX.len();
+            while j < responses.len() && responses[j].is_ascii_digit() {
+                j += 1;
+            }
+            if j < responses.len() && responses[j] == b'u' && j > i + PREFIX.len() {
+                let _ = write!(out, "\x1b[?{effective}u");
+                i = j + 1;
+                continue;
+            }
+        }
+        out.push(responses[i]);
+        i += 1;
+    }
+    out
+}
+
 /// The terminal a client should render: the escape overlay's screen while one is
 /// up (FDR 0008), else the live session. The broadcast source AND a
 /// (re)attaching client's replay must agree on this — a client that attaches or
@@ -812,15 +877,25 @@ fn daemon_loop(
                             recorder = None; // disable on write error; never kill the session
                         }
                     }
-                    // The model answers the app's queries (DA/DSR/kitty/...)
-                    // only when no real terminal is attached. When clients are
-                    // present, their terminals answer and the answers return
-                    // as Tag::Input, so the model staying silent avoids a
-                    // duplicate (and lets the real terminal's capabilities
-                    // win). github #13.
+                    // The model answers the app's queries (DA/DSR/kitty/...).
+                    // github #13 kept it silent whenever any client was
+                    // attached, on the theory the real terminal answers — true
+                    // only for a legacy Tag::Output client whose terminal sees
+                    // the raw query. A FRAME client never receives the raw query
+                    // (RFC 0008 sends screen state, not the byte stream), so
+                    // under frame transport nobody answers and an app probing
+                    // kitty support (CSI ? u) concludes "unsupported" — the
+                    // Shift+Enter root cause (posh#128). RFC 0010: when every
+                    // attached client is a frame client (or none), the daemon
+                    // answers itself, rewriting the kitty reply to the effective
+                    // client-terminal capability; with any legacy client, it
+                    // stays silent so that terminal answers (no double reply).
                     let responses = term.take_responses();
-                    if !responses.is_empty() && clients.is_empty() {
-                        let _ = util::write_all_retry(pty_fd, &responses, 100);
+                    if !responses.is_empty() {
+                        if let Some(eff) = query_answer_flags(clients, term.kitty_flags().0) {
+                            let out = rewrite_kitty_reply(&responses, eff);
+                            let _ = util::write_all_retry(pty_fd, &out, 100);
+                        }
                     }
                     has_pty_output = true;
                     // While an escape overlay is up it owns the broadcast (FDR
@@ -1402,6 +1477,103 @@ mod tests {
         c.apply_init(&init);
         c.maybe_enable_frames(true);
         (c, peer)
+    }
+
+    /// A frame client advertising `CAP_KITTY_KEYBOARD` with `flags` (RFC 0010).
+    fn kitty_frame_conn(rows: u16, cols: u16, flags: u8) -> (ClientConn, UnixStream) {
+        let (stream, peer) = UnixStream::pair().unwrap();
+        let mut c = ClientConn {
+            stream,
+            read_buf: FrameBuffer::new(),
+            write_buf: Vec::new(),
+            rows: 0,
+            cols: 0,
+            caps: Vec::new(),
+            producer: None,
+            lossy: false,
+            sb_floor: 0,
+            acked_sb_total: 0,
+        };
+        let mut init = ipc::encode_resize(rows, cols).to_vec();
+        init.extend_from_slice(&caps::encode_table(&caps::own_table(&[caps::Cap {
+            id: caps::CAP_KITTY_KEYBOARD,
+            payload: vec![flags],
+        }])));
+        c.apply_init(&init);
+        c.maybe_enable_frames(true);
+        (c, peer)
+    }
+
+    // ---- RFC 0010: terminal query passthrough / kitty keyboard negotiation ----
+
+    #[test]
+    fn query_flags_no_clients_uses_model() {
+        // No clients: answer from the model's own flags (unchanged behavior).
+        assert_eq!(query_answer_flags(&[], 7), Some(7));
+    }
+
+    #[test]
+    fn query_flags_legacy_client_stays_silent() {
+        // A legacy (non-frame) client's real terminal answers the raw query, so
+        // the daemon must NOT answer (None) — no double reply.
+        let legacy = test_client_conn(); // no producer, no caps
+        assert_eq!(query_answer_flags(std::slice::from_ref(&legacy), 7), None);
+    }
+
+    #[test]
+    fn query_flags_frame_client_uses_advertised_cap() {
+        // A single frame client: answer from its advertised kitty flags.
+        let (c, _p) = kitty_frame_conn(24, 80, 0b1);
+        assert_eq!(query_answer_flags(std::slice::from_ref(&c), 99), Some(0b1));
+    }
+
+    #[test]
+    fn query_flags_frame_client_without_cap_is_zero() {
+        // A frame client that did NOT advertise the cap ⇒ legacy-only (0), never
+        // claiming support the terminal did not report (RFC 0010 §3).
+        let (c, _p) = frame_capable_conn(24, 80);
+        assert_eq!(query_answer_flags(std::slice::from_ref(&c), 99), Some(0));
+    }
+
+    #[test]
+    fn query_flags_multiple_frame_clients_intersect() {
+        // Conservative intersection across frame clients (RFC 0010 §3.1).
+        let (a, _pa) = kitty_frame_conn(24, 80, 0b1111);
+        let (b, _pb) = kitty_frame_conn(24, 80, 0b0101);
+        let clients = vec![a, b];
+        assert_eq!(query_answer_flags(&clients, 99), Some(0b0101));
+
+        // Any non-advertising frame client drags the effective set to 0.
+        let (adv, _p1) = kitty_frame_conn(24, 80, 0b1111);
+        let (plain, _p2) = frame_capable_conn(24, 80);
+        let clients = vec![adv, plain];
+        assert_eq!(query_answer_flags(&clients, 99), Some(0));
+    }
+
+    #[test]
+    fn query_flags_mixed_frame_and_legacy_stays_silent() {
+        // A legacy client present ⇒ silent regardless of the frame clients'
+        // advertised caps (the legacy terminal will answer).
+        let (frame, _pf) = kitty_frame_conn(24, 80, 0b1111);
+        let legacy = test_client_conn();
+        let clients = vec![frame, legacy];
+        assert_eq!(query_answer_flags(&clients, 99), None);
+    }
+
+    #[test]
+    fn rewrite_kitty_reply_substitutes_only_the_kitty_reply() {
+        // The model's kitty reply is rewritten to the effective flags; a DA
+        // reply (…c) and a DSR reply (…R) in the same buffer pass untouched.
+        let responses = b"\x1b[?31u\x1b[?62;22c\x1b[5;9R";
+        let out = rewrite_kitty_reply(responses, 1);
+        assert_eq!(out, b"\x1b[?1u\x1b[?62;22c\x1b[5;9R");
+    }
+
+    #[test]
+    fn rewrite_kitty_reply_leaves_non_kitty_untouched() {
+        // No kitty reply present ⇒ buffer is returned verbatim.
+        let responses = b"\x1b[?62;22c";
+        assert_eq!(rewrite_kitty_reply(responses, 5), responses);
     }
 
     /// Fills the screen so a later one-character edit is a clear diff win (a

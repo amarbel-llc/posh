@@ -113,17 +113,37 @@ implements the kitty keyboard protocol but reports no enhancement flags"; the
 
 #### 2.1 Client-side capability determination
 
-A client MUST determine its real terminal's kitty keyboard support by querying
-the terminal directly, before it hands the terminal to the session render loop:
-it writes `CSI ? u` followed by a Primary DA request (`CSI c`) and reads the
-reply. If a `CSI ? <flags> u` reply arrives before the DA reply, the terminal
-implements the protocol and `<flags>` is the supported flag set; if only the DA
-reply arrives, the terminal does not implement it. This probe is local to the
-client and its real terminal; it MUST NOT be proxied through the session.
+A client MUST determine its real terminal's kitty keyboard support by a means
+local to the client and its real terminal; the determination MUST NOT be
+proxied through the session (which is precisely what this specification exists
+to work around). The determination MUST NOT steal application input nor emit
+bytes that violate the client's output-ordering contract (the alternate-screen
+takeover MUST remain the first bytes written).
+
+Candidate mechanisms, in decreasing order of non-interference:
+
+- Read the terminfo database for `$TERM` for a kitty-keyboard capability flag,
+  if one is defined for the entry (no tty I/O at all).
+- Match `$TERM` / a terminal-identifying environment variable against a known
+  allow-list of protocol-supporting terminals.
+- A live `CSI ? u` + Primary-DA (`CSI c`) probe, issued at a point in client
+  startup where it can be done without stealing application input or polluting
+  the takeover output. If a `CSI ? <flags> u` reply precedes the DA reply, the
+  terminal implements the protocol and `<flags>` is the supported set.
+
+The choice of mechanism is left to the implementation; a naive live probe on
+the shared session tty at loop entry is known to violate the input/output
+contracts above and MUST NOT be used.
 
 A client MAY cache this determination for the process lifetime. A client that
-cannot perform the probe (e.g., no controlling terminal) MUST NOT advertise
-`CAP_KITTY_KEYBOARD`.
+cannot determine support MUST NOT advertise `CAP_KITTY_KEYBOARD` (absence ⇒ the
+daemon answers legacy-only, a safe default).
+
+> **Implementation status:** the daemon-side answering (§3, §4) and the
+> `CAP_KITTY_KEYBOARD` capability (§2) are implemented. The client-side
+> determination mechanism is under evaluation (see the candidates above); until
+> a client advertises the capability, the daemon answers legacy-only and the
+> behavior is unchanged from before this specification.
 
 ### 3. Daemon answering of capability-backed queries
 
@@ -154,18 +174,25 @@ advertised a different `CAP_KITTY_KEYBOARD` value (or none). Because the daemon
 drives a single application PTY, it MUST compute a single *effective* kitty flag
 set:
 
-- If any attached client has NOT advertised `CAP_KITTY_KEYBOARD`, the effective
-  set MUST be empty (the daemon MUST answer as legacy-only). Enabling
-  enhancements the app would then encode as `CSI` sequences to a client whose
-  terminal cannot decode them would corrupt that client's input.
-- If every attached client has advertised `CAP_KITTY_KEYBOARD`, the effective
-  flag set MUST be the bitwise AND (intersection) of all advertised flag bytes,
-  so the app enables only enhancements every attached terminal supports.
+- If ANY attached client is a legacy `Tag::Output` client (RFC 0008 — one that
+  did NOT negotiate frame transport), the daemon MUST stay silent and answer
+  nothing. That client forwards the raw query to its real terminal, which
+  answers via `Tag::Input`; a daemon answer as well would deliver two replies to
+  the application. (Frame clients attached alongside it then simply do not get
+  the enhancement — an acceptable degradation for the uncommon mixed case.)
+- Otherwise (every attached client is a frame client): if any frame client has
+  NOT advertised `CAP_KITTY_KEYBOARD`, the effective set MUST be empty (answer
+  legacy-only) — enabling enhancements the app would encode as `CSI` sequences
+  to a terminal that cannot decode them would corrupt that client's input. If
+  every frame client HAS advertised it, the effective flag set MUST be the
+  bitwise AND (intersection) of all advertised flag bytes, so the app enables
+  only enhancements every attached terminal supports.
 - With no clients attached, the daemon MUST answer from its own model (the
   pre-existing no-client behavior), unchanged.
 
-This conservative-intersection rule guarantees that no attached client receives
-key encodings its terminal cannot represent.
+The legacy-silent rule prevents a double reply; the conservative-intersection
+rule guarantees that no attached frame client receives key encodings its
+terminal cannot represent.
 
 #### 3.2 Re-negotiation on attach and detach
 
