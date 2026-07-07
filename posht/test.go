@@ -137,6 +137,15 @@ func registry() []*Test {
 			New:  func() TestModel { return &keysModel{} },
 		},
 		{
+			ID: "rawkeys", Title: "raw key bytes",
+			Desc: "exact bytes per chord (Shift+Enter etc.), bypassing tea's key parser",
+			Notes: "byte-level capture for the Shift+Enter question (posh#126): " +
+				"Shift+Enter has no distinct legacy byte, so it equals Enter (0x0d) " +
+				"unless report-all-keys is negotiated (then CSI 13;2u). Run in each " +
+				"posh substate and diff the --json receipts.",
+			New: newRawKeysModel,
+		},
+		{
 			ID: "paste", Title: "bracketed paste",
 			Desc: "a paste must arrive as one atomic event, not loose keystrokes (mode 2004)",
 			New:  func() TestModel { return &pasteModel{} },

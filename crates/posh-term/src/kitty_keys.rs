@@ -649,6 +649,34 @@ mod tests {
         );
     }
 
+    // The kitty spec's C0-controls table pins Enter's encoding across
+    // modifiers and flag levels. This is the crux of "why doesn't Shift+Enter
+    // insert a newline": Shift+Enter is byte-identical to plain Enter (0x0d) in
+    // both legacy and disambiguate modes — Enter is explicitly EXEMPTED from
+    // disambiguation so `reset` still works at a crashed prompt — and only
+    // becomes a distinct sequence (CSI 13;2u) under REPORT_ALL (0b1000). An app
+    // wanting to tell the two apart must request REPORT_ALL; there is no legacy
+    // byte for Shift+Enter. (Alt+Enter IS distinct even in legacy: ESC + CR,
+    // which is the same `\x1b\r` Claude Code's /terminal-setup keybind sends.)
+    #[test]
+    fn enter_encoding_matches_kitty_c0_table() {
+        // Legacy (no flags): Shift+Enter == Enter == 0x0d.
+        assert_eq!(encode_key(ev(KeyCode::Enter, Modifiers::NONE), NO, false), b"\r");
+        assert_eq!(encode_key(ev(KeyCode::Enter, Modifiers::SHIFT), NO, false), b"\r");
+        // Alt+Enter is the one legacy modifier form that IS distinct: ESC + CR.
+        assert_eq!(encode_key(ev(KeyCode::Enter, Modifiers::ALT), NO, false), b"\x1b\r");
+
+        // Disambiguate (0b1): Enter is exempted, so Shift+Enter is STILL 0x0d.
+        assert_eq!(encode_key(ev(KeyCode::Enter, Modifiers::NONE), DIS, false), b"\r");
+        assert_eq!(encode_key(ev(KeyCode::Enter, Modifiers::SHIFT), DIS, false), b"\r");
+
+        // Report-all-keys (0b1000): Enter is finally reported as CSI u, so
+        // Shift+Enter becomes distinct — modifier value 1 + shift(1) = 2.
+        let all = KittyFlags::REPORT_ALL;
+        assert_eq!(encode_key(ev(KeyCode::Enter, Modifiers::NONE), all, false), b"\x1b[13u");
+        assert_eq!(encode_key(ev(KeyCode::Enter, Modifiers::SHIFT), all, false), b"\x1b[13;2u");
+    }
+
     #[test]
     fn kitty_event_types() {
         let flags = DIS | KittyFlags::REPORT_EVENTS;
