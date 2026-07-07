@@ -50,7 +50,11 @@ type keyCapture struct {
 	Hex   string `json:"hex"`   // space-separated bytes, e.g. "1b 0d"
 	Caret string `json:"caret"` // cat -v style rendering, e.g. "^[^M"
 	Gloss string `json:"gloss"` // decoded meaning of a recognized sequence
+	raw   []byte // the exact bytes, retained for len checks (not serialized)
 }
+
+// rawLen returns the captured bytes (for emptiness checks in the free panel).
+func (k keyCapture) rawLen() []byte { return k.raw }
 
 type rawKeysModel struct {
 	kittyFlags   string       // reply to CSI ? u, or "(no reply / unsupported)"
@@ -59,6 +63,7 @@ type rawKeysModel struct {
 	freeCaptures []keyCapture // free-capture panel, most recent first
 	ran          bool
 	done         bool // scripted phase complete (free capture is optional after)
+	aborted      bool // the user pressed the abort key mid-capture
 }
 
 func newRawKeysModel() TestModel { return &rawKeysModel{} }
@@ -87,7 +92,11 @@ func (m *rawKeysModel) View(int) string {
 	if !m.ran {
 		return "  launching the raw-key capture on the primary screen…\n"
 	}
-	b.WriteString("  Raw key capture complete. Bytes seen (nothing interpreted):\n\n")
+	header := "  Raw key capture complete. Bytes seen (nothing interpreted):\n\n"
+	if m.aborted {
+		header = "  Raw key capture ABORTED (partial results below):\n\n"
+	}
+	b.WriteString(header)
 	fmt.Fprintf(&b, "  kitty keyboard flags (CSI ? u reply): %s\n", m.kittyFlags)
 	if m.kittyRaw != "" {
 		fmt.Fprintf(&b, "    (raw query reply: %s)\n", m.kittyRaw)
@@ -116,6 +125,7 @@ func (m *rawKeysModel) Report() any {
 		"kitty_query_raw": m.kittyRaw,
 		"scripted":        m.captures,
 		"free":            m.freeCaptures,
+		"aborted":         m.aborted,
 	}
 }
 
@@ -126,16 +136,30 @@ func (m *rawKeysModel) Report() any {
 // rather than the Exec-provided reader, writes prompts, decodes the bytes, and
 // stores the results back on the model.
 type rawKeysCmd struct {
-	m   *rawKeysModel
-	in  io.Reader // Exec-provided; unused (we read the raw fd instead), kept for the interface
-	out io.Writer
-	fd  int
+	m     *rawKeysModel
+	in    io.Reader // Exec-provided; unused (we read the raw fd instead), kept for the interface
+	out   io.Writer
+	fd    int
+	bytes chan byte // raw tty bytes from the single reader goroutine
 }
 
+// The out-of-band control keys. Advance is decoupled from byte-arrival timing
+// entirely: the user presses the key under test (taking any amount of time,
+// tolerating multi-byte sequences delivered with gaps), then presses one of
+// these to commit / retry / abort. `n` (0x6e) is safe as the commit key because
+// none of the scripted chords' encodings contain it (they are \r, \n, ESC, [,
+// digits, ;, u, Z). No mouse mode is enabled — that would let posh's own
+// MouseFilter intercept the advance click and confound the substate comparison.
+const (
+	advanceKey = 'n' // commit the pending capture and move to the next prompt
+	retryKey   = 'r' // discard the pending capture and re-capture this prompt
+	abortKey   = 'q' // stop the capture early
+)
+
 func (c *rawKeysCmd) Run() error {
-	// Fresh run: clear prior captures so `r` re-runs cleanly.
 	c.m.captures = c.m.captures[:0]
 	c.m.freeCaptures = c.m.freeCaptures[:0]
+	c.m.aborted = false
 
 	// Raw mode on the real tty: unbuffered, unprocessed bytes. tea.Exec leaves
 	// the terminal cooked, which would line-buffer our per-key reads.
@@ -143,37 +167,137 @@ func (c *rawKeysCmd) Run() error {
 	if st, err := term.MakeRaw(c.fd); err == nil {
 		defer func() { _ = term.Restore(c.fd, st) }()
 	}
+	c.startReader()
 
 	fmt.Fprint(c.out, "\x1b[2J\x1b[H")
-	fmt.Fprint(c.out, "  RAW KEY CAPTURE — bytes are shown exactly as received.\r\n")
-	fmt.Fprint(c.out, "  Press each prompted key ONCE. Do not paste.\r\n\r\n")
+	fmt.Fprint(c.out, "  RAW KEY CAPTURE — bytes shown exactly as received.\r\n")
+	fmt.Fprintf(c.out, "  Press the prompted key, then '%c' to record and advance.\r\n",
+		advanceKey)
+	fmt.Fprintf(c.out, "  '%c' re-captures the current key · '%c' aborts. Do not paste.\r\n\r\n",
+		retryKey, abortKey)
 
 	c.queryKittyFlags()
 
 	for _, p := range rawKeyScript {
-		fmt.Fprintf(c.out, "  Press %s  (%s)\r\n", p.label, p.hint)
-		raw := c.readOneKey()
-		cap := decodeCapture(p.label, raw)
+		cap, ctl := c.captureUntilAdvance(p.label, fmt.Sprintf("Press %s  (%s)", p.label, p.hint))
+		if ctl == abortKey {
+			c.m.aborted = true
+			return nil
+		}
 		c.m.captures = append(c.m.captures, cap)
-		fmt.Fprintf(c.out, "    → %-14s %-10s %s\r\n\r\n", cap.Hex, cap.Caret, cap.Gloss)
+		fmt.Fprintf(c.out, "    recorded → %-14s %-10s %s\r\n\r\n", cap.Hex, cap.Caret, cap.Gloss)
 	}
 
-	fmt.Fprint(c.out, "  Free capture: press any keys to see their bytes; press\r\n"+
-		"  Enter on an empty read (or wait 3s idle) to finish.\r\n\r\n")
-	c.freeCapture()
+	fmt.Fprintf(c.out, "  Free capture: press any key then '%c' to record it; '%c' to finish.\r\n\r\n",
+		advanceKey, abortKey)
+	for i := 0; i < 64; i++ {
+		cap, ctl := c.captureUntilAdvance("", "free capture — press a key")
+		if ctl == abortKey {
+			break
+		}
+		if len(cap.rawLen()) == 0 {
+			continue // committed an empty capture; ignore
+		}
+		fmt.Fprintf(c.out, "    recorded → %-14s %-10s %s\r\n", cap.Hex, cap.Caret, cap.Gloss)
+		c.m.freeCaptures = append([]keyCapture{cap}, c.m.freeCaptures...)
+	}
 
-	fmt.Fprint(c.out, "\r\n  -- capture done; press Enter to return to posht --")
-	c.readOneKey() // swallow the final Enter
+	fmt.Fprintf(c.out, "\r\n  -- capture done; press '%c' to return to posht --", advanceKey)
+	c.waitForKey(advanceKey)
 	return nil
+}
+
+// captureUntilAdvance prompts, then accumulates raw bytes until the user
+// presses a control key. It redraws a live hex preview of the pending bytes on
+// every byte so the user sees exactly what will be recorded before committing.
+// Returns the decoded capture and which control key ended it (advanceKey /
+// retryKey resolve to advanceKey after a re-capture; abortKey propagates).
+func (c *rawKeysCmd) captureUntilAdvance(label, prompt string) (keyCapture, byte) {
+	for {
+		fmt.Fprintf(c.out, "  %s\r\n", prompt)
+		var pending []byte
+		c.drawPending(pending)
+		ctl := byte(0)
+		for {
+			b, ok := c.readByte()
+			if !ok { // reader closed (EOF/error): treat as abort
+				return decodeCapture(label, pending), abortKey
+			}
+			switch b {
+			case advanceKey:
+				ctl = advanceKey
+			case retryKey:
+				ctl = retryKey
+			case abortKey:
+				ctl = abortKey
+			default:
+				pending = append(pending, b)
+				c.drawPending(pending)
+				continue
+			}
+			break
+		}
+		fmt.Fprint(c.out, "\r\n")
+		if ctl == retryKey {
+			fmt.Fprint(c.out, "    (re-capturing)\r\n")
+			continue
+		}
+		return decodeCapture(label, pending), ctl
+	}
+}
+
+// drawPending redraws the live preview line (carriage-return overwrite) showing
+// the bytes accumulated so far for the current prompt.
+func (c *rawKeysCmd) drawPending(pending []byte) {
+	fmt.Fprintf(c.out, "\r    pending: %-20s %-12s\x1b[K",
+		hexBytes(pending), caretRender(pending))
+}
+
+// startReader launches the single byte-reader goroutine over the raw tty fd,
+// feeding c.bytes. One reader for the whole run avoids racing multiple
+// per-call goroutines on the same fd.
+func (c *rawKeysCmd) startReader() {
+	c.bytes = make(chan byte, 256)
+	go func() {
+		defer close(c.bytes)
+		var one [1]byte
+		for {
+			n, err := os.Stdin.Read(one[:])
+			if n > 0 {
+				c.bytes <- one[0]
+			}
+			if err != nil {
+				return
+			}
+		}
+	}()
+}
+
+// readByte blocks for the next raw byte; ok is false when the reader closed.
+func (c *rawKeysCmd) readByte() (byte, bool) {
+	b, ok := <-c.bytes
+	return b, ok
+}
+
+// waitForKey drains bytes until the given key is seen (or the reader closes).
+func (c *rawKeysCmd) waitForKey(key byte) {
+	for {
+		b, ok := c.readByte()
+		if !ok || b == key {
+			return
+		}
+	}
 }
 
 // queryKittyFlags sends the kitty protocol query (CSI ? u) followed by a
 // primary device-attributes request (CSI c) as a sentinel: a terminal that
 // supports the protocol replies CSI ? flags u before the DA reply; one that
-// doesn't answers only the DA. Per the spec's detection method.
+// doesn't answers only the DA. Per the spec's detection method. The reply is a
+// terminal response (not user input), so it IS read on a short timer — the only
+// timed read left in the harness.
 func (c *rawKeysCmd) queryKittyFlags() {
 	fmt.Fprint(c.out, "\x1b[?u\x1b[c")
-	buf := c.readWithTimeout(400 * time.Millisecond)
+	buf := c.readReply(400 * time.Millisecond)
 	c.m.kittyRaw = hexBytes(buf)
 	if flags, ok := parseKittyFlagsReply(buf); ok {
 		c.m.kittyFlags = flags
@@ -183,83 +307,35 @@ func (c *rawKeysCmd) queryKittyFlags() {
 	fmt.Fprintf(c.out, "  kitty keyboard flags: %s\r\n\r\n", c.m.kittyFlags)
 }
 
-// readOneKey reads one keypress worth of bytes: the first read, plus any bytes
-// that arrive within a short quiet window (so a multi-byte escape sequence from
-// a single keypress is captured whole rather than split).
-func (c *rawKeysCmd) readOneKey() []byte {
-	return c.readWithTimeout(60 * time.Millisecond)
-}
-
-// readWithTimeout reads until a quiet gap of `quiet` passes after the first
-// byte, or a hard cap elapses. It relies on the caller's terminal being in raw
-// mode (tea.Exec) so bytes arrive unbuffered. A background goroutine feeds a
-// channel; we assemble until quiet.
-func (c *rawKeysCmd) readWithTimeout(quiet time.Duration) []byte {
-	type readResult struct {
-		b   byte
-		err error
-	}
-	ch := make(chan readResult, 64)
-	go func() {
-		var one [1]byte
-		for {
-			// Read the raw tty fd directly (put in raw mode by Run), not the
-			// cooked Exec-provided reader.
-			n, err := os.Stdin.Read(one[:])
-			if n > 0 {
-				ch <- readResult{b: one[0]}
-			}
-			if err != nil {
-				ch <- readResult{err: err}
-				return
-			}
-		}
-	}()
-
+// readReply collects the terminal's response bytes: it waits up to `total` for
+// the first byte, then drains whatever else is already queued, stopping on a
+// short quiet gap. Used only for the auto-emitted query reply, never for user
+// keystrokes (those advance out-of-band).
+func (c *rawKeysCmd) readReply(total time.Duration) []byte {
 	var out []byte
-	// Wait up to 3s for the FIRST byte (a prompted key the user hasn't
-	// pressed yet), then only `quiet` between subsequent bytes.
-	first := time.NewTimer(3 * time.Second)
+	first := time.NewTimer(total)
 	defer first.Stop()
 	select {
-	case r := <-ch:
-		if r.err != nil {
+	case b, ok := <-c.bytes:
+		if !ok {
 			return out
 		}
-		out = append(out, r.b)
+		out = append(out, b)
 	case <-first.C:
 		return out
 	}
 	for {
-		t := time.NewTimer(quiet)
+		t := time.NewTimer(50 * time.Millisecond)
 		select {
-		case r := <-ch:
+		case b, ok := <-c.bytes:
 			t.Stop()
-			if r.err != nil {
+			if !ok {
 				return out
 			}
-			out = append(out, r.b)
+			out = append(out, b)
 		case <-t.C:
 			return out
 		}
-	}
-}
-
-// freeCapture loops reading keypresses until an empty/idle read or a lone
-// Enter, recording each. Most-recent-first in the model for display.
-func (c *rawKeysCmd) freeCapture() {
-	for i := 0; i < 64; i++ {
-		raw := c.readWithTimeout(60 * time.Millisecond)
-		if len(raw) == 0 {
-			return // idle timeout: done
-		}
-		if len(raw) == 1 && (raw[0] == '\r' || raw[0] == '\n') {
-			return // lone Enter ends free capture
-		}
-		cap := decodeCapture("", raw)
-		fmt.Fprintf(c.out, "    → %-14s %-10s %s\r\n", cap.Hex, cap.Caret, cap.Gloss)
-		// Prepend (most recent first) for the receipt/display.
-		c.m.freeCaptures = append([]keyCapture{cap}, c.m.freeCaptures...)
 	}
 }
 
@@ -308,6 +384,7 @@ func decodeCapture(label string, raw []byte) keyCapture {
 		Hex:   hexBytes(raw),
 		Caret: caretRender(raw),
 		Gloss: glossBytes(raw),
+		raw:   append([]byte(nil), raw...),
 	}
 }
 
