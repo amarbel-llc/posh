@@ -694,10 +694,27 @@ fn client_loop(stream: UnixStream, enter: &[u8], raw: &RawMode) -> Result<i32> {
     // frame-emitting daemon syncs scrolled-off rows to our local ring. The `0`
     // payload requests the server-default ring depth. Harmless when the daemon
     // isn't producing frames (gate off): the cap is parsed and ignored.
-    init_payload.extend_from_slice(&caps::encode_table(&caps::own_table(&[caps::Cap {
+    let mut extra_caps = vec![caps::Cap {
         id: caps::CAP_SCROLLBACK,
         payload: vec![0],
-    }])));
+    }];
+    // RFC 0010: advertise the real terminal's kitty keyboard capability so the
+    // daemon answers the in-session app's `CSI ? u` query on its behalf (the
+    // frame path never carries the raw query to our terminal). posh is
+    // kitty-focused: `TERM=xterm-kitty` means the outer terminal is kitty, which
+    // fully supports the protocol — no probe needed. Other terminals fall
+    // through unadvertised for now (the daemon then answers legacy); reading
+    // their local terminfo to represent partial capability is a later extension.
+    // The `0x1f` payload advertises full kitty support; the value is a gate
+    // (RFC 0010 §3 detection is by reply presence), not a claim of enabled
+    // flags — the app pushes what it wants and posh-term records it.
+    if std::env::var_os("TERM").is_some_and(|t| t == "xterm-kitty") {
+        extra_caps.push(caps::Cap {
+            id: caps::CAP_KITTY_KEYBOARD,
+            payload: vec![0x1f],
+        });
+    }
+    init_payload.extend_from_slice(&caps::encode_table(&caps::own_table(&extra_caps)));
     ipc::append_frame(&mut sock_write_buf, Tag::Init, &init_payload);
     // Re-assert the size via Tag::Resize: a pre-#100 daemon runs the strict
     // decode_resize over the whole Init payload, so the cap-extended Init's

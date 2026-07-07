@@ -91,108 +91,110 @@ mechanism (§2, §3) applies to the kitty query and the device-attribute queries
 ### 2. The `CAP_KITTY_KEYBOARD` capability
 
 A new RFC 0001 §3 capability, `CAP_KITTY_KEYBOARD`, is assigned the next unused
-capability id. Its payload is exactly one byte: the kitty keyboard
-progressive-enhancement flag set the advertising client's real terminal
-supports, as the low 5 bits (`0b00000` … `0b11111`) defined by the kitty
-keyboard protocol (disambiguate=1, report-events=2, report-alternate=4,
-report-all=8, report-text=16). A payload value of `0` means "the terminal
-implements the kitty keyboard protocol but reports no enhancement flags"; the
-*absence* of the capability means "unknown / not advertised."
+capability id (11). Its payload is exactly one byte, the low 5 bits of the kitty
+keyboard progressive-enhancement flags (disambiguate=1, report-events=2,
+report-alternate=4, report-all=8, report-text=16). The capability functions as a
+GATE: its PRESENCE means "the client's real terminal speaks the kitty keyboard
+protocol"; its *absence* means "unknown / not advertised." The daemon does not
+report the payload value back to the app (§3 — the query reply carries the
+model's own current flags, not a capability); advertising `0x1f` (full) is the
+conventional value.
 
-- A client that has determined its real terminal's kitty keyboard support
-  (§2.1) MUST advertise `CAP_KITTY_KEYBOARD` with the supported flag byte.
-- A client whose real terminal does not implement the kitty keyboard protocol
-  MUST NOT advertise `CAP_KITTY_KEYBOARD`.
+- A client whose real terminal supports the kitty keyboard protocol (§2.1) MUST
+  advertise `CAP_KITTY_KEYBOARD`.
+- A client whose real terminal does not support it MUST NOT advertise it.
 - On the socket transport (RFC 0008 §1.1), `CAP_KITTY_KEYBOARD` is an Init-only,
-  per-connection capability: it is carried in the client's `Tag::Init` cap
-  table and is stable for the connection's lifetime.
-- On the roaming transport (RFC 0001 / RFC 0008), `CAP_KITTY_KEYBOARD` is
-  advertised in the client's per-message cap table, exactly as `CAP_SCROLLBACK`
-  and `CAP_MORPH` are, so its loss on any single datagram is self-correcting by
-  repetition.
+  per-connection capability, stable for the connection's lifetime.
+- On the roaming transport (RFC 0001 / RFC 0008), it is advertised in the
+  client's per-message cap table, exactly as `CAP_SCROLLBACK` and `CAP_MORPH`
+  are, so its loss on any single datagram is self-correcting by repetition.
 
 #### 2.1 Client-side capability determination
 
 A client MUST determine its real terminal's kitty keyboard support by a means
-local to the client and its real terminal; the determination MUST NOT be
-proxied through the session (which is precisely what this specification exists
-to work around). The determination MUST NOT steal application input nor emit
-bytes that violate the client's output-ordering contract (the alternate-screen
-takeover MUST remain the first bytes written).
+local to the client and its real terminal; the determination MUST NOT be proxied
+through the session (which is precisely what this specification exists to work
+around), MUST NOT steal application input, and MUST NOT emit bytes that violate
+the client's output-ordering contract (the alternate-screen takeover MUST remain
+the first bytes written).
 
-Candidate mechanisms, in decreasing order of non-interference:
+posh is kitty-focused (see the repository description), so the determination
+keys on `$TERM`:
 
-- Read the terminfo database for `$TERM` for a kitty-keyboard capability flag,
-  if one is defined for the entry (no tty I/O at all).
-- Match `$TERM` / a terminal-identifying environment variable against a known
-  allow-list of protocol-supporting terminals.
-- A live `CSI ? u` + Primary-DA (`CSI c`) probe, issued at a point in client
-  startup where it can be done without stealing application input or polluting
-  the takeover output. If a `CSI ? <flags> u` reply precedes the DA reply, the
-  terminal implements the protocol and `<flags>` is the supported set.
+- `$TERM == "xterm-kitty"` ⇒ the outer terminal is kitty, which fully supports
+  the protocol. The client MUST advertise `CAP_KITTY_KEYBOARD`. This is a plain
+  environment-variable read — no tty I/O, hence no interference — and it is the
+  case posh targets.
+- Any other `$TERM` ⇒ the client SHOULD read that terminal's local terminfo and
+  represent whatever capability it indicates; until that is implemented the
+  client MUST NOT advertise the capability, and the daemon answers legacy-only (a
+  safe default). Reading other terminals' terminfo is a documented future
+  extension.
 
-The choice of mechanism is left to the implementation; a naive live probe on
-the shared session tty at loop entry is known to violate the input/output
-contracts above and MUST NOT be used.
+A naive live `CSI ? u` probe on the shared session tty at loop entry is known to
+steal application input and pollute the takeover-output ordering, and MUST NOT be
+used. (A live probe placed where it provably does neither remains a permitted
+implementation choice for the non-kitty terminfo fallback, but is not required.)
 
-A client MAY cache this determination for the process lifetime. A client that
-cannot determine support MUST NOT advertise `CAP_KITTY_KEYBOARD` (absence ⇒ the
-daemon answers legacy-only, a safe default).
-
-> **Implementation status:** the daemon-side answering (§3, §4) and the
-> `CAP_KITTY_KEYBOARD` capability (§2) are implemented. The client-side
-> determination mechanism is under evaluation (see the candidates above); until
-> a client advertises the capability, the daemon answers legacy-only and the
-> behavior is unchanged from before this specification.
+> **Implementation status:** the daemon-side answering (§3, §4), the
+> `CAP_KITTY_KEYBOARD` gate (§2), and the local client's `$TERM == "xterm-kitty"`
+> advertisement (§2.1) are implemented. The non-kitty terminfo fallback (§2.1)
+> and the roaming/remote client's advertisement (§2, roaming bullet) are future
+> extensions; until a client advertises, the daemon answers legacy-only,
+> unchanged from before this specification.
 
 ### 3. Daemon answering of capability-backed queries
 
-When the application emits a kitty keyboard query (`CSI ? u`) or a device-
-attributes query (DA1/DA2), and at least one client is attached, the daemon MUST
-answer from the *effective* advertised capability (§3.1) rather than discarding
-its model's response:
+Kitty-protocol *detection* is by reply PRESENCE, not value: an application
+enables the protocol iff a `CSI ? <flags> u` reply comes back at all (before the
+DA reply), then pushes the flags it wants. The reply's `<flags>` value is the
+terminal's *current* enabled flags (initially `0`), not a capability. Therefore
+`CAP_KITTY_KEYBOARD` is a GATE — "does the real terminal speak kitty?" — and the
+daemon MUST NOT substitute a value into the reply. When it answers, it MUST
+answer with its own model's current flags (the value `Terminal::take_responses`
+already produces, which reflects what the app has pushed and posh-term records).
 
-- Kitty keyboard query `CSI ? u`: the daemon MUST reply to the application PTY
-  with `CSI ? <effective-flags> u`, where `<effective-flags>` is the effective
-  kitty flag set per §3.1. When no attached client advertises
-  `CAP_KITTY_KEYBOARD`, the daemon MUST reply with the legacy-only indication
-  its own terminal model produces (equivalently, it MUST NOT claim kitty support
-  the clients did not advertise).
-- Device-attributes queries: the daemon MUST answer from its own terminal
-  model's response (the model emulates a fixed, well-known terminal type), as it
-  does today when no client is attached. Device attributes describe the emulated
-  session terminal, not the outer terminal, so the model is authoritative.
+When the application's output produces query replies in the model
+(`Terminal::take_responses` non-empty), the daemon MUST apply the policy from
+§3.1:
+
+- Kitty keyboard query `CSI ? u`: answered (reply passed through verbatim) only
+  when the gate is open (§3.1). When the gate is closed, the daemon MUST NOT emit
+  the kitty reply, so the application concludes the protocol is unsupported and
+  does not enable encodings the real terminal cannot deliver.
+- Device-attributes (DA1/DA2) and device-status (DSR-CPR) queries: the daemon
+  MUST answer from its own terminal model's response whenever it is answering at
+  all, independent of the kitty gate. These describe the emulated session
+  terminal (DA) or the model's authoritative cursor position (DSR), so the model
+  is authoritative.
 
 The reply MUST be written to the application PTY as ordinary PTY input (the
 existing `Terminal::take_responses` → PTY-write path), so the application
 receives it identically to a real terminal's reply.
 
-#### 3.1 Effective capability across multiple clients
+#### 3.1 Policy across attached clients
 
-A session MAY have multiple clients attached simultaneously, each having
-advertised a different `CAP_KITTY_KEYBOARD` value (or none). Because the daemon
-drives a single application PTY, it MUST compute a single *effective* kitty flag
-set:
+The daemon drives a single application PTY but MAY have multiple clients
+attached. It MUST pick one of three policies:
 
-- If ANY attached client is a legacy `Tag::Output` client (RFC 0008 — one that
-  did NOT negotiate frame transport), the daemon MUST stay silent and answer
-  nothing. That client forwards the raw query to its real terminal, which
-  answers via `Tag::Input`; a daemon answer as well would deliver two replies to
-  the application. (Frame clients attached alongside it then simply do not get
-  the enhancement — an acceptable degradation for the uncommon mixed case.)
-- Otherwise (every attached client is a frame client): if any frame client has
-  NOT advertised `CAP_KITTY_KEYBOARD`, the effective set MUST be empty (answer
-  legacy-only) — enabling enhancements the app would encode as `CSI` sequences
-  to a terminal that cannot decode them would corrupt that client's input. If
-  every frame client HAS advertised it, the effective flag set MUST be the
-  bitwise AND (intersection) of all advertised flag bytes, so the app enables
-  only enhancements every attached terminal supports.
-- With no clients attached, the daemon MUST answer from its own model (the
-  pre-existing no-client behavior), unchanged.
+- **Silent** — if ANY attached client is a legacy `Tag::Output` client (RFC 0008
+  — did NOT negotiate frame transport), the daemon MUST answer nothing. That
+  client forwards the raw query to its real terminal, which answers via
+  `Tag::Input`; a daemon answer too would double-reply. (Frame clients attached
+  alongside it then do not get the enhancement — acceptable degradation for the
+  uncommon mixed case.)
+- **Answer** — no clients attached (the model is authoritative), OR every
+  attached client is a frame client whose real terminal supports the kitty
+  keyboard protocol (each advertised `CAP_KITTY_KEYBOARD`). The daemon writes the
+  model's responses verbatim (kitty reply + DA/DSR).
+- **Suppress-kitty** — every attached client is a frame client but at least one's
+  real terminal does NOT support kitty (did not advertise the cap). The daemon
+  answers DA/DSR from the model but strips the kitty reply, so the app concludes
+  unsupported and does not encode keys the terminal cannot send.
 
-The legacy-silent rule prevents a double reply; the conservative-intersection
-rule guarantees that no attached frame client receives key encodings its
-terminal cannot represent.
+The gate is presence-based (advertised or not); the advertised flag *value* is
+not intersected or reported, because §3 establishes that the reply value is the
+model's own flags, not a capability.
 
 #### 3.2 Re-negotiation on attach and detach
 
@@ -209,35 +211,40 @@ that attach.)
 The historical rule "when clients are attached, the model stays silent and the
 real terminal answers" (github #13) is AMENDED by this specification:
 
-- For the capability-backed queries in §1 (kitty, DA1, DA2), the daemon MUST
-  answer from the effective capability / its model per §3, whether or not
-  clients are attached.
-- For DSR-CPR (`CSI 6 n`), the daemon MUST answer from its own model whether or
-  not clients are attached (the model holds the authoritative cursor position).
+- For the kitty query (`CSI ? u`), the daemon MUST apply the §3.1 policy
+  (Answer / Silent / Suppress-kitty), whether or not clients are attached.
+- For DA1/DA2 and DSR-CPR (`CSI 6 n`), the daemon MUST answer from its own model
+  whenever it is not in the Silent policy — including under Suppress-kitty, which
+  strips only the kitty reply — since these describe the emulated terminal / the
+  model's authoritative cursor position.
 - For any other model-generated response not enumerated in §1, the daemon MAY
   retain the existing behavior (answer only when no client is attached).
 
 A daemon MUST NOT both answer a query itself (§3) and forward the raw query
 bytes to a client for the client's terminal to also answer; doing so would
-deliver two replies to the application.
+deliver two replies to the application. (The Silent policy exists precisely to
+avoid this when a legacy client is attached.)
 
 ### 5. Examples
 
-Client probe of a kitty-capable outer terminal (client → real terminal, then
-reply): the client writes `1b 5b 3f 75  1b 5b 63` (`CSI ? u` `CSI c`) and reads
-`1b 5b 3f 31 75  1b 5b 3f 36 32 3b 63` (`CSI ? 1 u` then the DA reply),
-determining flags = `1`. The client advertises `CAP_KITTY_KEYBOARD` with payload
-byte `0x01`.
+Client determination on a kitty terminal: `$TERM == "xterm-kitty"`, so the
+client advertises `CAP_KITTY_KEYBOARD` (payload `0x1f`) in its Init cap table —
+no tty probe.
 
-Application query answered by the daemon (app → daemon → app): the app writes
-`CSI ? u`. A single client is attached advertising flags `0x01`. The daemon
-writes `CSI ? 1 u` (`1b 5b 3f 31 75`) to the application PTY.
+Application query answered by the daemon (app → daemon → app), one kitty frame
+client attached: the app writes `CSI ? u`. The gate is open, so the daemon writes
+its model's reply verbatim — `CSI ? 0 u` (`1b 5b 3f 30 75`) initially, since no
+flags are enabled yet. The reply's *presence* tells the app the protocol is
+supported; the app then pushes the flags it wants (`CSI > 8 u` etc.), posh-term
+records them, and a later `CSI ? u` is answered `CSI ? 8 u` from the model.
 
-Two clients, flags `0x1f` and `0x01`: the effective set is `0x1f AND 0x01 =
-0x01`; the daemon answers `CSI ? 1 u`.
+One frame client whose terminal is NOT kitty (no cap advertised): the app writes
+`CSI ? u` `CSI c`. The daemon is in Suppress-kitty, so it writes only the DA
+reply (`CSI ? 62 ; 22 c`) — no `CSI ? … u` — and the app concludes the kitty
+protocol is unsupported.
 
-Two clients, one advertising `0x1f` and one not advertising the capability: the
-effective set is empty; the daemon answers legacy-only (`CSI ? 0 u`).
+A legacy `Tag::Output` client attached: the daemon is Silent; the raw query
+reached that client's real terminal, which replies via `Tag::Input`.
 
 ### 6. Relationship to FDR 0013
 
@@ -260,35 +267,32 @@ The `CAP_KITTY_KEYBOARD` payload is a single byte constrained to the low 5 bits;
 a daemon MUST mask the received payload to those bits and MUST treat a malformed
 or oversized payload as "capability absent" rather than trusting an
 out-of-range value. A hostile client cannot induce the daemon to emit key
-encodings to *other* clients' terminals that they cannot decode, because the
-effective set is the intersection (§3.1): a client can only ever *reduce* the
-effective capability, never raise it above what another client advertised.
+encodings to *other* clients' terminals that they cannot decode: the gate opens
+only when EVERY attached frame client advertises support (§3.1), so one client
+can only ever *close* the gate (Suppress-kitty), never open it on another's
+behalf.
 
-The client-side probe (§2.1) writes to and reads from the client's own real
-terminal only; it introduces no new trust boundary and no cross-session
-information flow.
+The client-side determination (§2.1) reads the client's own `$TERM` (or, in the
+future, its own terminfo); it does no session-proxied I/O and introduces no new
+trust boundary or cross-session information flow.
 
 ## Conformance Testing
 
-Conformance tests for this specification live in
-`crates/posh/zz-tests_bats/` (the session-daemon bats suite), with the
-capability-determination and effective-set logic additionally unit-tested in
-`crates/posh/src/session/daemon.rs` and the posh-term query recognition in
-`crates/posh-term`.
-
-Tests use binary injection via `bats-emo`:
-
-    require_bin POSH posh
+Conformance tests for this specification are unit tests in
+`crates/posh/src/session/daemon.rs` (the query policy and the kitty-reply strip)
+and `crates/posh-proto/src/caps.rs` (the `CAP_KITTY_KEYBOARD` payload decode).
 
 ### Covered Requirements
 
-| Requirement | Test File | Description |
-|-------------|-----------|-------------|
-| §3 kitty query answered from cap | `daemon.rs` unit | A frame client advertising `CAP_KITTY_KEYBOARD` ⇒ the daemon writes `CSI ? <flags> u` to the PTY on `CSI ? u` |
-| §3 no cap ⇒ legacy answer | `daemon.rs` unit | No advertised cap ⇒ the daemon answers legacy-only, never claiming kitty support |
-| §3.1 conservative intersection | `daemon.rs` unit | Two clients, flags AND; any non-advertising client ⇒ empty effective set |
-| §4 DSR-CPR still answered | `daemon.rs` unit | `CSI 6 n` answered from the model with a client attached |
-| §1 query recognition | `posh-term` unit | Only the enumerated sequences are recognized as queries |
+| Requirement | Test | Description |
+|-------------|------|-------------|
+| §3.1 Answer (kitty frame client) | `query_policy_kitty_frame_client_answers` | Every frame client's terminal kitty-capable ⇒ Answer (model reply verbatim) |
+| §3.1 Suppress-kitty (non-kitty frame client) | `query_policy_non_kitty_frame_client_suppresses_kitty` | A frame client without the cap ⇒ Suppress-kitty |
+| §3.1 gate needs ALL frame clients | `query_policy_all_frame_clients_must_support_kitty` | One non-advertising frame client ⇒ Suppress-kitty; all advertising ⇒ Answer |
+| §3.1 Silent (legacy client) | `query_policy_legacy_client_is_silent`, `..._mixed_frame_and_legacy_is_silent` | Any legacy `Tag::Output` client ⇒ Silent |
+| §3.1 no clients | `query_policy_no_clients_answers` | No clients ⇒ Answer from the model |
+| §3 strip kitty reply, keep DA/DSR | `strip_kitty_reply_removes_only_the_kitty_reply` | Suppress-kitty drops `CSI ? … u` but keeps `…c` / `…R` |
+| §2 payload decode + mask | `kitty_keyboard_payload_decodes_and_masks` (posh-proto) | 1-byte payload masked to low 5 bits; malformed ⇒ absent |
 
 ## Compatibility
 
