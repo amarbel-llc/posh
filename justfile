@@ -500,6 +500,40 @@ debug-verify-grab grab="on" *ARGS:
     echo ">> connecting client (POSH_GRAB_MOUSE={{ grab }}) to 127.0.0.1:$port" >&2
     POSH_KEY="$key" POSH_GRAB_MOUSE='{{ grab }}' exec "$posh" client -4 127.0.0.1 "$port"
 
+# Verify legacy (pre-frame) vs frame posh for a LOCAL `posh attach` session,
+# using freshly-built worktree binaries. FRAMES is on|0: `0` sets
+# POSH_SESSION_FRAMES=0 on the daemon (raw Tag::Output, stdin forwarded
+# verbatim — the pre-frame-work path), `on` leaves it default (the frame path
+# with FrameRenderer/MouseFilter/mode-sync). Run both and diff the rawkeys
+# receipt to isolate whether the frame path alters key bytes (the Shift+Enter
+# question, posh#126). ARGS go to posht (default: --only rawkeys). Runs in an
+# isolated POSH_DIR, cleaned up on exit; the client takes over your terminal, so
+# run it in the terminal you want to test (e.g. kitty). Quit posht normally,
+# then detach with Ctrl-\ (the local session detach key). Debug-only; the
+# hermetic gate is build-rust.
+[group("debug")]
+debug-verify-session-frames frames="on" *ARGS:
+    #!/usr/bin/env bash
+    set -euo pipefail
+    cd '{{ justfile_directory() }}'
+    args='{{ ARGS }}'; [ -n "$args" ] || args='--only rawkeys'
+    nix develop --command cargo build -p posh
+    nix shell nixpkgs#go --command bash -c 'cd posht && go build -o posht .'
+    posh="$PWD/target/debug/posh"
+    dir=$(mktemp -d); export POSH_DIR="$dir"
+    name='rawkeys-{{ frames }}'
+    trap '"$posh" kill "$name" 2>/dev/null || true; rm -rf "$dir"' EXIT
+    # POSH_SESSION_FRAMES is read by the double-forked daemon, which inherits
+    # this process's env. `0` = legacy raw-output path; unset = frame path.
+    case '{{ frames }}' in
+      0|off|false|no) export POSH_SESSION_FRAMES=0
+        echo ">> LEGACY path: POSH_SESSION_FRAMES=0 (raw Tag::Output)" >&2 ;;
+      *) unset POSH_SESSION_FRAMES || true
+        echo ">> FRAME path: POSH_SESSION_FRAMES unset (default on)" >&2 ;;
+    esac
+    echo ">> attaching local session '$name' running posht $args" >&2
+    exec "$posh" attach "$name" -- "$PWD/posht/posht" $args
+
 # Verify TERM/COLORTERM forwarding (#51) over a LOCAL loopback server+client
 # pair with freshly-built worktree binaries. Runs your $SHELL in the session;
 # inside it check `echo $TERM` is non-empty and `git -c color.ui=auto status`
