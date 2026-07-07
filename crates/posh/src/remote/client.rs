@@ -138,6 +138,10 @@ fn palette_commands(server_log_on: bool, scroll_opt: bool) -> Value {
         { "name": "Reset & resync (force redraw)", "action": { "method": "session.resync" } },
         { "name": "Dump wedge forensics", "action": { "method": "session.forensics" } },
         { "name": "Show wedge debug info", "action": { "method": "session.debuginfo" } },
+        // #false-disconnect: the transport-liveness view — why the "Last contact"
+        // banner fired (frame-arrival gaps, heartbeats, retransmits, srtt/rto),
+        // distinct from the apply-stall wedge view above.
+        { "name": "Show connection health", "action": { "method": "session.linkinfo" } },
         // RFC 0007: the local-echo prediction state — outcome gauges for every
         // model, plus the live evolution-loop stats (generations, champion,
         // hyphence champion record) when a GP species is selected.
@@ -194,6 +198,8 @@ fn dump_client_state(st: &ClientState, now: u64) {
         codec: st.framesync.label(),
         title: st.server_term.title().to_string(),
         apply: st.stats.apply_snapshot(),
+        link: st.stats.link_snapshot(),
+        server_late: st.notify.server_late(now),
         server_diag: st.last_server_diag,
     }
     .dump();
@@ -225,6 +231,46 @@ fn wedge_debug_summary(st: &ClientState, now: u64) -> String {
         st.server_term.generation(),
         if st.last_reack.is_some() { "yes" } else { "no" },
         srv,
+    )
+}
+
+/// The connection-health summary for the "Connection health" palette command
+/// (#false-disconnect): the transport-LIVENESS fields, distinct from the
+/// apply-stall wedge view above. It answers "why did posh think the server
+/// disconnected?" — the banner (`late=`) keys purely on the gap since the last
+/// decoded frame (`heard=`) crossing `SERVER_LATE_AFTER`, NOT on measured loss.
+/// So a large `gap_max` / nonzero `late_gaps` on a link with healthy
+/// `retransmits` and steady `heartbeats` (Empty frames, the RFC 0008 §3
+/// keepalive) is the false-disconnect fingerprint: the banner tripped on a
+/// lost/late heartbeat while the session was alive underneath. `srtt`/`rto`
+/// contextualize the pacing; `send_iv` is the client's own send cadence.
+/// Composites over a frozen session like the wedge view — readable in-session
+/// without a second terminal or knowing the pid.
+fn link_debug_summary(st: &ClientState, now: u64) -> String {
+    let l = st.stats.link_snapshot();
+    let heard = now.saturating_sub(st.last_heard);
+    let late = st.notify.server_late(now);
+    format!(
+        "link: pid={} remote={} heard={heard}ms late={} (banner>{}ms)\n\
+         rx: total={} full={} diff={} heartbeats={} scrollback={} retransmits={}\n\
+         gaps: max={}ms late_gaps={} srtt={:.0}ms rto={}ms send_iv={}ms",
+        std::process::id(),
+        st.conn
+            .remote()
+            .map_or_else(|| "none".to_string(), |a| a.to_string()),
+        if late { "yes" } else { "no" },
+        display::SERVER_LATE_AFTER,
+        l.frames_total,
+        l.frames_full,
+        l.frames_diff,
+        l.heartbeats_rx,
+        l.frames_scrollback,
+        l.retransmits,
+        l.frame_gap_ms_max,
+        l.frame_gaps_late,
+        st.conn.srtt(),
+        st.conn.rto(),
+        st.conn.send_interval(),
     )
 }
 
@@ -430,6 +476,16 @@ fn dispatch_palette_action(
             let summary = wedge_debug_summary(st, now);
             dump_client_state(st, now);
             show_debug_info(st, "wedge debug", &summary, now);
+            false
+        }
+        "session.linkinfo" => {
+            // #false-disconnect: show the transport-liveness view (why the "Last
+            // contact" banner fired) and mirror the full snapshot to the sink —
+            // same pattern as session.debuginfo, but the liveness class rather
+            // than the apply-stall class. Readable while frozen; no wire send.
+            let summary = link_debug_summary(st, now);
+            dump_client_state(st, now);
+            show_debug_info(st, "connection health", &summary, now);
             false
         }
         "session.predictinfo" => {
@@ -1446,6 +1502,13 @@ fn consume_agent_caps(st: &mut ClientState, frame: &ServerFrame) {
 /// state application. Returns true when an ack should go out.
 fn process_frame(st: &mut ClientState, frame: &ServerFrame) -> bool {
     let now = now_ms();
+    // Transport-liveness (#false-disconnect): fold the gap since the previous
+    // decoded frame into the max/late-gap gauges before the per-kind counters,
+    // so the connection-health view can distinguish a false-disconnect (a long
+    // arrival gap tripped the banner on a healthy link) from a genuinely dead
+    // peer. Uses the same clock the "Last contact" banner reads (`server_heard`
+    // below), so the counted gaps line up with the banner's own decision.
+    st.stats.record_frame_arrival(now);
     // Classify every received frame by wire body (includes retransmissions and
     // duplicates — that is what arrived on the link).
     match &frame.body {
@@ -2636,6 +2699,10 @@ mod tests {
             names.iter().any(|n| n.to_lowercase().contains("echo prediction stats")),
             "prediction-stats command missing: {names:?}"
         );
+        assert!(
+            names.iter().any(|n| n.to_lowercase().contains("connection health")),
+            "connection-health command missing: {names:?}"
+        );
         // posh#100 scroll-region optimization toggle, with a state-dependent
         // label (Disable when on, Enable when off).
         assert!(
@@ -2652,7 +2719,35 @@ mod tests {
             off.iter().any(|n| n == "Enable scroll-region optimization"),
             "scroll-opt enable command missing when off: {off:?}"
         );
-        assert_eq!(arr.len(), 17, "expected 17 commands, got {names:?}");
+        assert_eq!(arr.len(), 18, "expected 18 commands, got {names:?}");
+    }
+
+    #[test]
+    fn dispatch_linkinfo_is_local_and_reports_liveness_fields() {
+        // The "Show connection health" command is client-local (no wire send)
+        // and surfaces the transport-liveness fields behind the disconnect
+        // banner. Record two frame arrivals with a banner-tripping gap so the
+        // summary reflects a real late-gap, not a fresh session's zeros.
+        let raw = pty_raw_mode();
+        let mut st = test_state(24, 80);
+        // Use nonzero arrival timestamps: 0 is the recorder's "no prior frame"
+        // sentinel (now_ms() is monotonic-from-a-base and never 0 for a live
+        // frame), so the first real arrival must be > 0 to seed the baseline.
+        let t0 = 1_000;
+        st.stats.record_frame_arrival(t0);
+        st.stats
+            .record_frame_arrival(t0 + display::SERVER_LATE_AFTER + 1);
+        st.stats.record_frame_empty();
+        let send = dispatch_palette_action(&mut st, &raw, "session.linkinfo", &json!({}), 0);
+        assert!(!send, "connection health is client-local, no wire send");
+        let summary = link_debug_summary(&st, t0 + display::SERVER_LATE_AFTER + 1);
+        assert!(summary.contains("link:"), "{summary}");
+        assert!(summary.contains("heartbeats=1"), "{summary}");
+        assert!(summary.contains("late_gaps=1"), "{summary}");
+        assert!(
+            summary.contains(&format!("banner>{}ms", display::SERVER_LATE_AFTER)),
+            "{summary}"
+        );
     }
 
     #[test]

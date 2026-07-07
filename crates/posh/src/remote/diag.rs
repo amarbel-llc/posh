@@ -107,6 +107,14 @@ pub struct ClientState {
     /// Client apply-path histogram + last received frame (#wedge): a climbing
     /// `basemis` with a frozen `term_gen` is the apply-stall fingerprint.
     pub apply: crate::remote::stats::ApplySnapshot,
+    /// Transport-liveness gauges (#false-disconnect): the frame-arrival timing
+    /// behind the "Last contact" banner. A nonzero `frame_gaps_late` with a
+    /// healthy `retransmits` and steady `heartbeats_rx` means the banner tripped
+    /// on an arrival gap, not on a genuinely dead peer.
+    pub link: crate::remote::stats::LinkSnapshot,
+    /// Whether the "Last contact" banner is currently showing (server_late): the
+    /// client's live disconnect verdict, paired with `last_heard_age_ms`.
+    pub server_late: bool,
     /// Latest server transport state from CAP_DIAG (#6): the far side of a wedge,
     /// otherwise un-SIGUSR2-able on a remote server. `None` until the server
     /// reports (only in a debug posture, when the client advertised CAP_DIAG).
@@ -121,7 +129,8 @@ impl ClientState {
              send_interval={}ms bytes_rx={} bytes_tx={} predict(active={} shown={} epoch_lag={}) \
              term_gen={} rows={} cols={} echo_on={} codec={} title={:?} \
              apply(adv={} stale={} dup={} basemis={} bsum_mis={} reack={} nochange={} sb_rx={}) \
-             last_rx(num={} base={} body={}) srv={}",
+             last_rx(num={} base={} body={}) srv={} \
+             link(late={} gap_max={}ms late_gaps={} rx_total={} heartbeats={} retransmits={})",
             std::process::id(),
             fmt_addr(self.remote),
             fmt_age(self.last_send_age_ms),
@@ -156,6 +165,12 @@ impl ClientState {
             self.apply.last_rx_base,
             self.apply.last_rx_body.as_str(),
             fmt_server_diag(self.server_diag.as_ref()),
+            self.server_late as u8,
+            self.link.frame_gap_ms_max,
+            self.link.frame_gaps_late,
+            self.link.frames_total,
+            self.link.heartbeats_rx,
+            self.link.retransmits,
         )
     }
 
@@ -449,6 +464,15 @@ mod tests {
                 pid: 4242,
                 agent: None,
             }),
+            link: crate::remote::stats::LinkSnapshot {
+                frames_total: 120,
+                heartbeats_rx: 30,
+                frame_gap_ms_max: 8000,
+                frame_gaps_late: 2,
+                retransmits: 4,
+                ..Default::default()
+            },
+            server_late: true,
         }
         .format();
         for key in [
@@ -469,6 +493,7 @@ mod tests {
             "apply(adv=0 stale=0 dup=0 basemis=7 bsum_mis=0 reack=0 nochange=0 sb_rx=0)",
             "last_rx(num=41 base=40 body=diff)",
             "srv=(pid=4242 num=43 acked=41 gen=90 out=2 pty=1)",
+            "link(late=1 gap_max=8000ms late_gaps=2 rx_total=120 heartbeats=30 retransmits=4)",
         ] {
             assert!(line.contains(key), "missing {key:?} in:\n{line}");
         }
@@ -499,6 +524,8 @@ mod tests {
             codec: "dumpdiff",
             title: String::new(),
             apply: crate::remote::stats::ApplySnapshot::default(),
+            link: crate::remote::stats::LinkSnapshot::default(),
+            server_late: false,
             server_diag: None,
         }
         .format();

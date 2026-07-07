@@ -46,7 +46,12 @@ by the next keystroke.
 	server (FDR 0008, the _POSH_ESCAPE_CMD_ command), reset & resync, dump wedge
 	forensics, show wedge debug info (an on-screen transport-state summary,
 	readable even while the session is frozen, plus a full dump to the
-	diagnostic sink), show echo prediction stats (the local-echo outcome
+	diagnostic sink), show connection health (the transport-liveness view behind
+	the "Last contact" banner — the age since the last frame, whether the banner
+	is showing and its threshold, frame-arrival counts by kind including
+	heartbeats, the largest inter-arrival gap and how many gaps crossed the
+	banner threshold, and SRTT/RTO/send-interval — for diagnosing a *disconnect*
+	that a healthy link should not have reported), show echo prediction stats (the local-echo outcome
 	gauges plus, for the evolved GP models, the live evolution state — RFC
 	0007: generations, population and fitness-window sizes, the champion's
 	rank/size and whether it or the adaptive shadow is displayed, and the
@@ -147,7 +152,13 @@ _POSH_WEDGE_WATCHDOG_
 	sink: peer (server) address, last-send age, applied frame number,
 	input-outbox base and pending bytes, accumulated scrollback depth,
 	smoothed RTT/RTO and send interval, byte counters, prediction gauges,
-	terminal size, and the remote echo state. In a debug posture
+	terminal size, and the remote echo state. A trailing _link=_ group carries
+	the transport-liveness view behind the "Last contact" banner — whether the
+	banner is showing (_late_), the largest frame inter-arrival gap
+	(_gap_max_), how many gaps crossed the banner threshold (_late_gaps_), the
+	received-frame total, the heartbeat count, and the retransmit count — so a
+	*disconnect* a healthy link should not have reported can be told apart from
+	a genuinely dead peer. In a debug posture
 	(_POSH_DEBUG_LOG_ set, or _POSH_WEDGE_WATCHDOG_ *explicitly* on — its
 	default-on state does not count) the client also requests
 	the server's own transport state, which then rides each frame and appears

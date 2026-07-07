@@ -22,6 +22,14 @@ const FLUSH_INTERVAL_MS: u64 = 1000;
 /// arriving is the apply-stall wedge signature the detector self-logs (#wedge).
 const WEDGE_FROZEN_MS: u64 = 3000;
 
+/// Frame inter-arrival gap that trips the client's "Last contact" banner
+/// (#false-disconnect): mirrors `posh_proto::display::SERVER_LATE_AFTER` so the
+/// stats collector counts a "late" arrival gap by the SAME threshold the banner
+/// uses. Kept as a local mirror rather than importing the display constant so
+/// the counter's definition is self-contained; a debug-only asserted equality
+/// in the tests below guards the two against drifting apart.
+const LATE_GAP_MS: u64 = posh_proto::display::SERVER_LATE_AFTER;
+
 #[derive(Default)]
 pub struct Stats {
     enabled: bool,
@@ -53,6 +61,18 @@ pub struct Stats {
     frames_full: u64,
     frames_diff: u64,
     frames_empty: u64,
+
+    // Client transport-liveness (#false-disconnect): frame inter-arrival timing,
+    // the signal behind the "Last contact N ago" banner. `server_late` fires on
+    // a >SERVER_LATE_AFTER gap between DECODED frames, not on measured loss, so a
+    // large `frame_gap_ms_max` on an otherwise reliable link is the fingerprint
+    // of a lost/late heartbeat tripping the banner while the session is healthy.
+    // `frame_gaps_late` counts arrival gaps that crossed the banner threshold —
+    // chronic near-threshold jitter vs a single long stall. `last_frame_arrival`
+    // is the wall-clock ms of the previous decoded frame (0 before the first).
+    last_frame_arrival: u64,
+    frame_gap_ms_max: u64,
+    frame_gaps_late: u64,
 
     // Client render activity.
     render_writes: u64,
@@ -207,6 +227,26 @@ pub struct ApplySnapshot {
     pub last_rx_body: FrameKind,
 }
 
+/// Snapshot of the transport-liveness gauges for the connection-health view
+/// (#false-disconnect): the counters that explain a "Last contact" banner
+/// without a second terminal. A nonzero `frame_gaps_late` with a healthy
+/// `retransmits` and steady `heartbeats_rx` is the false-disconnect fingerprint
+/// — the banner tripped on an arrival gap, not on a genuinely dead peer.
+#[derive(Clone, Copy, Default)]
+pub struct LinkSnapshot {
+    pub frames_total: u64,
+    pub frames_full: u64,
+    pub frames_diff: u64,
+    /// Empty frames received — the on-wire heartbeat count (RFC 0008 §3).
+    pub heartbeats_rx: u64,
+    pub frames_scrollback: u64,
+    /// Largest gap (ms) ever seen between two decoded frames this session.
+    pub frame_gap_ms_max: u64,
+    /// Arrival gaps that exceeded the banner threshold (`LATE_GAP_MS`).
+    pub frame_gaps_late: u64,
+    pub retransmits: u64,
+}
+
 impl Stats {
     /// Reads `$POSH_DEBUG_LOG`; on a non-empty path that `log_init` accepts the
     /// collector is enabled, otherwise it is an inert no-op. Logging is opt-in:
@@ -307,6 +347,42 @@ impl Stats {
     pub fn record_frame_scrollback(&mut self) {
         self.frames_scrollback += 1;
         self.dirty = true;
+    }
+
+    /// Record the wall-clock arrival of a decoded server frame for the
+    /// transport-liveness view (#false-disconnect). Called once per decoded
+    /// frame (before the per-kind counters), it folds the gap since the previous
+    /// arrival into `frame_gap_ms_max` and, when that gap crossed the banner
+    /// threshold, bumps `frame_gaps_late` — the count of moments the "Last
+    /// contact" banner would have appeared. The first frame only seeds the
+    /// baseline (no gap to measure), so `now == 0` and the pre-contact state are
+    /// both ignored. Independent of `enabled`: liveness is cheap and useful even
+    /// with periodic logging off (the palette command reads it live).
+    pub fn record_frame_arrival(&mut self, now: u64) {
+        if self.last_frame_arrival != 0 {
+            let gap = now.saturating_sub(self.last_frame_arrival);
+            self.frame_gap_ms_max = self.frame_gap_ms_max.max(gap);
+            if gap > LATE_GAP_MS {
+                self.frame_gaps_late += 1;
+            }
+        }
+        self.last_frame_arrival = now;
+    }
+
+    /// Snapshot the transport-liveness gauges for the connection-health view.
+    /// `heartbeats_rx` reuses `frames_empty`: an Empty body IS the on-wire
+    /// heartbeat (RFC 0008 §3), so its count is the heartbeat-arrival count.
+    pub fn link_snapshot(&self) -> LinkSnapshot {
+        LinkSnapshot {
+            frames_total: self.frames_total,
+            frames_full: self.frames_full,
+            frames_diff: self.frames_diff,
+            heartbeats_rx: self.frames_empty,
+            frames_scrollback: self.frames_scrollback,
+            frame_gap_ms_max: self.frame_gap_ms_max,
+            frame_gaps_late: self.frame_gaps_late,
+            retransmits: self.retransmits,
+        }
     }
 
     // --- client apply-path histogram (#wedge debuggability) ------------------
@@ -785,6 +861,41 @@ mod tests {
         assert_eq!(s.frames_diff, 2);
         assert_eq!(s.frames_empty, 1);
         assert_eq!(s.frames_scrollback, 1);
+    }
+
+    #[test]
+    fn late_gap_threshold_mirrors_the_banner() {
+        // The stats "late gap" counter must key on the SAME silence threshold the
+        // "Last contact" banner uses, or the two disagree about when a
+        // disconnect was perceived. This guards the local mirror against drift.
+        assert_eq!(LATE_GAP_MS, posh_proto::display::SERVER_LATE_AFTER);
+    }
+
+    #[test]
+    fn frame_arrival_tracks_max_and_late_gaps() {
+        let mut s = enabled_stats();
+        // First arrival only seeds the baseline — no gap to measure.
+        s.record_frame_arrival(1_000);
+        assert_eq!(s.frame_gap_ms_max, 0);
+        assert_eq!(s.frame_gaps_late, 0);
+        // A short gap (heartbeat cadence) updates the max but is not "late".
+        s.record_frame_arrival(4_000); // +3000ms
+        assert_eq!(s.frame_gap_ms_max, 3_000);
+        assert_eq!(s.frame_gaps_late, 0);
+        // A gap past the banner threshold counts as a late (would-be-banner) gap.
+        s.record_frame_arrival(4_000 + LATE_GAP_MS + 1);
+        assert_eq!(s.frame_gap_ms_max, LATE_GAP_MS + 1);
+        assert_eq!(s.frame_gaps_late, 1);
+        // A gap exactly at the threshold does NOT trip it (banner uses strict >).
+        let base = s.last_frame_arrival;
+        s.record_frame_arrival(base + LATE_GAP_MS);
+        assert_eq!(s.frame_gaps_late, 1, "a gap == threshold is not late");
+        // The snapshot reflects the accumulated gauges; heartbeats_rx == empties.
+        s.record_frame_empty();
+        let snap = s.link_snapshot();
+        assert_eq!(snap.frame_gap_ms_max, LATE_GAP_MS + 1);
+        assert_eq!(snap.frame_gaps_late, 1);
+        assert_eq!(snap.heartbeats_rx, 1);
     }
 
     #[test]
