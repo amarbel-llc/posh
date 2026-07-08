@@ -163,6 +163,11 @@ fn open_palette(st: &mut ClientState) -> bool {
     }
     let commands = palette_commands(st.server_log_on, st.scroll_opt);
     if let Some(p) = st.palette.as_mut() {
+        // A persisted (spawned-then-closed) palette is not resized while closed,
+        // so re-sync it to the current tty size before summoning — else it
+        // renders at the size it had when last open, misaligned against a
+        // since-resized screen (posh#135).
+        p.resize(st.rows, st.cols);
         p.open("Commands", commands);
         st.initialized = false; // repaint to show the overlay
         true

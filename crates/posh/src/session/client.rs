@@ -609,6 +609,11 @@ fn open_local_palette(
     let Some(p) = palette.as_mut() else {
         return false;
     };
+    // A persisted (spawned-then-closed) palette is not resized while closed
+    // (the SIGWINCH handler skips a closed palette), so re-sync it to the
+    // current tty size before summoning — else it renders at the size it had
+    // when last open, misaligned against a since-resized screen (posh#135).
+    p.resize(rows, cols);
     p.open("Commands", palette_commands(fr.scroll_opt));
     fr.set_scroll(0);
     fr.invalidate();
@@ -793,10 +798,9 @@ fn client_loop(stream: UnixStream, enter: &[u8], raw: &RawMode) -> Result<i32> {
                 }
                 // Keep the palette renderer sized to the tty while it is up
                 // (mirror remote client.rs). A closed-but-persisted palette is
-                // NOT resized here and is NOT resized on reopen either, so it
-                // renders at a stale size after a resize — pre-existing bug
-                // posh#135 (the fix belongs on the reopen path, out of scope
-                // for the posh#134 SIGWINCH guard).
+                // intentionally NOT resized here — `open_local_palette` re-syncs
+                // it to the current size on the next summon (posh#135), so there
+                // is no need to drive a hidden renderer on every WINCH.
                 if let Some(p) = palette.as_mut().filter(|p| p.is_open()) {
                     p.resize(rows, cols);
                 }
