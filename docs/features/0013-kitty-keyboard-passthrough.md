@@ -14,12 +14,13 @@ negotiates the kitty keyboard protocol on stdin, so the outer terminal keeps
 sending legacy encodings — including a **bare `\x1b` for Escape**. That bare
 Escape is the root of two latency problems:
 
-1. **posh's own detach ambiguity (posh#126).** The `DetachMatcher` recognizes
-   Ctrl-\ as its kitty CSI-u forms (`\x1b[92;5u`), so a lone `\x1b` looked like a
-   possible detach prefix and was held back until the next keystroke. The
-   byte-level fix (require `\x1b[` before treating input as a detach-in-progress)
-   removes the swallow, but the *cause* — Escape arriving bare and ambiguous —
-   remains.
+1. **posh's own detach ambiguity (posh#126).** The `EscapeKeyMatcher` (then
+   named `DetachMatcher`; widened for posh#130 to also recognize the palette
+   key) recognizes Ctrl-\ as its kitty CSI-u forms (`\x1b[92;5u`), so a lone
+   `\x1b` looked like a possible detach prefix and was held back until the next
+   keystroke. The byte-level fix (require `\x1b[` before treating input as a
+   control-key-in-progress) removes the swallow, but the *cause* — Escape
+   arriving bare and ambiguous — remains.
 2. **The inner app's own bare-Escape disambiguation.** A TUI running inside the
    session (Claude Code, vim) that would use the kitty protocol to get an
    unambiguous Escape (`\x1b[27u`, recognized with 0ms) instead receives bare

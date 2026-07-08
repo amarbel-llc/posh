@@ -20,6 +20,15 @@ import (
 // unless the app has negotiated the Report-all-keys enhancement (0b1000), in
 // which case Shift+Enter is CSI 13;2u. See docs/features/0013 and posh#126.
 //
+// It also answers the posh#130 question: Ctrl-^ (the command-palette summon
+// key) is the C0 byte 0x1e in legacy mode, but under the kitty keyboard
+// protocol it is a CSI-u sequence (CSI 54;5u — base key '6'=54, ctrl=5, since
+// Ctrl-^ is Ctrl+Shift+6 on a US layout). posh's palette-open decision matches
+// only the raw 0x1e, so once an app negotiates kitty (which the RFC 0010 daemon
+// now lets it do), Ctrl-^ arrives as CSI-u and the palette becomes unreachable.
+// Capturing the exact bytes OUTSIDE vs INSIDE posh pins down where 0x1e turns
+// into (or stays) a CSI-u sequence.
+//
 // It bypasses tea's key parser entirely: tea.Exec drops us to a raw terminal
 // and we read stdin bytes directly, so nothing normalizes the sequence before
 // we record it. The receipt (via Report) carries the raw hex per prompted key
@@ -42,6 +51,7 @@ var rawKeyScript = []keyPrompt{
 	{"Ctrl+J", "Claude's chat:newline default — expect LF (0a)"},
 	{"Escape", "expect bare ESC (1b), or CSI 27u under kitty disambiguate"},
 	{"Shift+Tab", "a known-distinct control: expect CSI Z (1b 5b 5a) — if THIS is wrong the problem is broad"},
+	{"Ctrl+^", "posh#130 palette key: expect C0 1e in legacy mode, or CSI 54;5u under kitty (the palette only matches 1e)"},
 	// Alt+Enter dropped: on macOS it is commonly intercepted by a global
 	// hotkey daemon (Hammerspoon) before the terminal sees it, so it can't be
 	// captured here. Its reference value (ESC+CR) is documented in the
@@ -117,6 +127,8 @@ func (m *rawKeysModel) View(int) string {
 	}
 	b.WriteString("\n  Compare Enter vs Shift+Enter: identical hex ⇒ the terminal is not\n" +
 		"  sending a distinct sequence (expected in legacy/disambiguate mode).\n" +
+		"  Compare Ctrl+^ across substates: 1e outside but a CSI-u form inside\n" +
+		"  (or vice versa) locates where the palette key changes shape (posh#130).\n" +
 		"  Press r to run the capture again, then record the verdict.\n")
 	return b.String()
 }
@@ -397,6 +409,8 @@ func glossBytes(b []byte) string {
 		return "LF (0x0a) — Ctrl+J / newline"
 	case len(b) == 1 && b[0] == 0x1b:
 		return "bare ESC (0x1b)"
+	case len(b) == 1 && b[0] == 0x1e:
+		return "C0 0x1e — legacy Ctrl-^ (the palette-open byte posh matches)"
 	case len(b) == 2 && b[0] == 0x1b && b[1] == 0x0d:
 		return "ESC+CR (1b 0d) — Alt+Enter form / Claude's /terminal-setup newline"
 	case len(b) == 2 && b[0] == 0x1b && b[1] == 0x0a:
@@ -407,10 +421,14 @@ func glossBytes(b []byte) string {
 		return "CSI 13u — kitty Enter (report-all)"
 	case string(b) == "\x1b[13;2u":
 		return "CSI 13;2u — kitty Shift+Enter (distinct! report-all negotiated)"
+	case string(b) == "\x1b[54;5u":
+		return "CSI 54;5u — kitty Ctrl-^ (report-all; posh does NOT match this, posh#130)"
 	case string(b) == "\x1b[Z":
 		return "CSI Z — Shift+Tab (legacy back-tab)"
 	case string(b) == "\x1b[9;2u":
 		return "CSI 9;2u — kitty Shift+Tab (report-all)"
+	case len(b) >= 3 && b[0] == 0x1b && b[1] == '[' && b[len(b)-1] == 'u':
+		return "a CSI-u sequence (ESC [ … u) — kitty-encoded key"
 	case len(b) >= 3 && b[0] == 0x1b && b[1] == '[':
 		return "a CSI sequence (ESC [ …)"
 	case len(b) >= 2 && b[0] == 0x1b:

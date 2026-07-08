@@ -119,40 +119,54 @@ pub fn cmd_attach(
     }
 }
 
-/// The detach key Ctrl-\ as kitty keyboard CSI-u encodings (92 = backslash,
-/// 5 = ctrl modifier; with and without the explicit `:1` press-event suffix).
+/// The two control keys the client intercepts before the daemon, each in the
+/// raw C0 form the terminal sends in legacy mode AND the kitty keyboard CSI-u
+/// form it sends once an app negotiates the protocol (RFC 0010 made the daemon
+/// answer the kitty query, so apps now do). The CSI-u codepoint is the base
+/// key: Ctrl-\ is `\` (92), Ctrl-^ is Ctrl+Shift+6 → base `6` (54); `;5` is the
+/// ctrl modifier. posh#130: matching only the raw byte left the palette key
+/// unreachable at a kitty-negotiating prompt (Ctrl-^ arrived as `\x1b[54;5u`).
+///
+/// Both CSI-u forms carry an optional `:1` explicit-press-event suffix. We do
+/// NOT match the `:3` (release) or `:2` (repeat) event variants — under the
+/// report-all-events kitty flag every key, bare modifiers included, emits
+/// press+release CSI-u, and a release must not re-trigger the action.
+const DETACH_KEY: u8 = 0x1c; // Ctrl-\ (raw C0)
 const KITTY_DETACH_SEQS: [&[u8]; 2] = [b"\x1b[92;5u", b"\x1b[92;5:1u"];
+const KITTY_PALETTE_SEQS: [&[u8]; 2] = [b"\x1b[54;5u", b"\x1b[54;5:1u"];
 
 enum KittyMatch {
-    /// The slice begins with a full detach sequence.
-    Full,
-    /// The slice is a proper prefix of a detach sequence (need more bytes).
+    /// The slice begins with a full candidate sequence of this many bytes (the
+    /// caller needs the length to route the bytes after the key).
+    Full(usize),
+    /// The slice is a proper prefix of some candidate sequence (need more bytes).
     Partial,
-    /// No detach sequence starts here.
+    /// No candidate sequence starts here.
     No,
 }
 
-fn match_kitty_detach(s: &[u8]) -> KittyMatch {
+/// Match the start of `s` against a set of complete CSI-u sequences.
+fn match_kitty_seqs(s: &[u8], seqs: &[&[u8]]) -> KittyMatch {
     let mut partial = false;
-    for seq in KITTY_DETACH_SEQS {
+    for seq in seqs {
         if s.len() >= seq.len() {
-            if &s[..seq.len()] == seq {
-                return KittyMatch::Full;
+            if &s[..seq.len()] == *seq {
+                return KittyMatch::Full(seq.len());
             }
         } else if seq.starts_with(s) {
             partial = true;
         }
     }
-    // A bare `\x1b` is a prefix of every detach sequence, but it is far more
+    // A bare `\x1b` is a prefix of every CSI-u sequence, but it is far more
     // often a real Escape keypress (interrupt/clear in a TUI). Holding it back
     // to disambiguate stalls Escape until the next keystroke arrives — there is
     // no flush timer — so a lone Escape is only forwarded when the user presses
     // another key, and a double-Escape registers as one (posh#126).
     // Require at least the `\x1b[` CSI introducer before treating the buffer as
-    // a detach-in-progress. The cost is that a detach whose kitty encoding is
-    // split by the tty *between* the `\x1b` and the `[` (vanishingly rare — a
-    // terminal emits a CSI-u sequence atomically) is missed that once; the user
-    // simply presses Ctrl-\ again. Escape latency is the common case, so it wins.
+    // a control-key-in-progress. The cost is that a sequence whose kitty
+    // encoding is split by the tty *between* the `\x1b` and the `[` (vanishingly
+    // rare — a terminal emits a CSI-u sequence atomically) is missed that once;
+    // the user simply presses the key again. Escape latency is the common case.
     if partial && s.len() >= 2 {
         KittyMatch::Partial
     } else {
@@ -160,42 +174,94 @@ fn match_kitty_detach(s: &[u8]) -> KittyMatch {
     }
 }
 
-/// Scans the stdin byte stream for the detach key — raw Ctrl-\ (0x1c) at any
-/// offset, or its kitty CSI-u encodings — surviving splits across reads by
-/// holding back a trailing partial that could still complete the sequence.
+/// What one fed stdin batch resolved to. The matcher intercepts the detach and
+/// palette control keys (raw C0 or kitty CSI-u) before the daemon; everything
+/// else forwards. "First control key in the stream wins": bytes before the key
+/// are always forwarded, and for the palette the bytes after it route to the
+/// palette renderer (the key itself is dropped).
+#[derive(Debug, PartialEq, Eq)]
+enum EscapeEvent {
+    /// No intercepted key this batch: forward these bytes as ordinary input.
+    Forward(Vec<u8>),
+    /// Detach key seen (Ctrl-\): forward the bytes before it, discard the rest,
+    /// ask the daemon to detach.
+    Detach { forward: Vec<u8> },
+    /// Palette key seen (Ctrl-^): forward the bytes before it; route the bytes
+    /// after it to the palette. Only produced when the palette is enabled
+    /// (frames-on); gate-off, the palette key stays in `Forward`.
+    Palette { forward: Vec<u8>, tail: Vec<u8> },
+}
+
+/// Scans the stdin byte stream for the client's intercepted control keys — the
+/// detach key (raw Ctrl-\ `0x1c`, or its kitty CSI-u encodings) always, and the
+/// palette key (raw Ctrl-^ `0x1e`, or its kitty CSI-u encodings) when the
+/// palette is enabled — surviving splits across reads by holding back a
+/// trailing partial that could still complete a sequence. Formerly
+/// `DetachMatcher` (detach only); widened for posh#130 so the palette key is
+/// recognized in its kitty CSI-u form too, sharing the one carry so a
+/// read-torn CSI-u sequence is reassembled for either key.
 #[derive(Default)]
-struct DetachMatcher {
+struct EscapeKeyMatcher {
     carry: Vec<u8>,
 }
 
-impl DetachMatcher {
-    /// Returns the bytes to forward to the daemon as input, and whether the
-    /// detach key was seen (in which case bytes after it are discarded).
-    fn feed(&mut self, input: &[u8]) -> (Vec<u8>, bool) {
+impl EscapeKeyMatcher {
+    /// Feed one stdin batch. `palette_enabled` gates the palette key: when
+    /// false (gate-off, no FrameRenderer) the raw `0x1e` and the palette CSI-u
+    /// forms are treated as ordinary bytes and forwarded, exactly as the legacy
+    /// path did — only the detach key is intercepted.
+    fn feed(&mut self, input: &[u8], palette_enabled: bool) -> EscapeEvent {
         let mut data = std::mem::take(&mut self.carry);
         data.extend_from_slice(input);
         let mut forward = Vec::new();
         let mut i = 0;
         while i < data.len() {
             let b = data[i];
-            if b == 0x1c {
-                return (forward, true);
+            if b == DETACH_KEY {
+                return EscapeEvent::Detach { forward };
+            }
+            if palette_enabled && b == ESCAPE_KEY {
+                return EscapeEvent::Palette {
+                    forward,
+                    tail: data[i + 1..].to_vec(),
+                };
             }
             if b == 0x1b {
-                match match_kitty_detach(&data[i..]) {
-                    KittyMatch::Full => return (forward, true),
+                // A CSI-u sequence could be either control key (or neither).
+                // Detach discards the rest of the batch, so it ignores the key
+                // length; the palette routes the bytes AFTER the key, so it uses
+                // the matched length to skip exactly the key.
+                match match_kitty_seqs(&data[i..], &KITTY_DETACH_SEQS) {
+                    KittyMatch::Full(_) => return EscapeEvent::Detach { forward },
                     KittyMatch::Partial => {
                         // Hold back; the rest may arrive on the next read.
                         self.carry = data[i..].to_vec();
-                        return (forward, false);
+                        return EscapeEvent::Forward(forward);
                     }
                     KittyMatch::No => {}
+                }
+                // Check the palette set only when enabled, so gate-off a palette
+                // CSI-u is forwarded as ordinary bytes (mirrors the raw `0x1e`).
+                if palette_enabled {
+                    match match_kitty_seqs(&data[i..], &KITTY_PALETTE_SEQS) {
+                        KittyMatch::Full(key_len) => {
+                            return EscapeEvent::Palette {
+                                forward,
+                                tail: data[i + key_len..].to_vec(),
+                            };
+                        }
+                        KittyMatch::Partial => {
+                            self.carry = data[i..].to_vec();
+                            return EscapeEvent::Forward(forward);
+                        }
+                        KittyMatch::No => {}
+                    }
                 }
             }
             forward.push(b);
             i += 1;
         }
-        (forward, false)
+        EscapeEvent::Forward(forward)
     }
 }
 
@@ -563,18 +629,6 @@ fn palette_commands(scroll_opt: bool) -> Value {
     ])
 }
 
-/// Split a forwarded stdin batch at the first Ctrl-^ (the frames-on palette-open
-/// key). Returns the bytes before the escape (ordinary input) and, when an
-/// escape was present, the bytes after it (routed to the palette; the `0x1e`
-/// itself is dropped). The caller only consults this when a `FrameRenderer` is
-/// live — gate-off leaves the `0x1e` in the ordinary-input slice.
-fn split_escape(forward: &[u8]) -> (&[u8], Option<&[u8]>) {
-    match forward.iter().position(|&b| b == ESCAPE_KEY) {
-        Some(pos) => (&forward[..pos], Some(&forward[pos + 1..])),
-        None => (forward, None),
-    }
-}
-
 /// Open the command palette over the live session (frames-on only): spawn the
 /// renderer on first use, summon it, drop any scroll-view back to the live bottom
 /// (the palette overlays the live session, not history), force a repaint, and
@@ -681,7 +735,7 @@ fn client_loop(stream: UnixStream, enter: &[u8], raw: &RawMode) -> Result<i32> {
     let mut sock_write_buf: Vec<u8> = Vec::with_capacity(4096);
     let mut stdout_buf: Vec<u8> = Vec::with_capacity(4096);
     let mut read_buf = FrameBuffer::new();
-    let mut detach = DetachMatcher::default();
+    let mut escape_matcher = EscapeKeyMatcher::default();
     let mut stream_writer = &stream;
 
     // Announce our terminal size so the daemon can size the PTY, and append
@@ -837,22 +891,22 @@ fn client_loop(stream: UnixStream, enter: &[u8], raw: &RawMode) -> Result<i32> {
                     if let Some(p) = palette.as_ref().filter(|p| p.is_open()) {
                         p.forward_input(input);
                     } else {
-                        let (forward, detached) = detach.feed(input);
-                        // Frames-on only: a lone Ctrl-^ opens the palette. The
-                        // bytes before it are ordinary input; the bytes after it
-                        // route to the palette (the 0x1e is dropped). Gate-off (no
-                        // renderer) never looks for the escape, so 0x1e stays in
-                        // the ordinary-input slice and reaches the shell.
-                        let (normal, after_escape) = if frame_renderer.is_some() {
-                            split_escape(&forward)
-                        } else {
-                            (&forward[..], None)
-                        };
-                        // Ordinary input: when a FrameRenderer is live it
+                        // The palette key is intercepted only frames-on (a live
+                        // FrameRenderer); gate-off it stays in the forwarded
+                        // stream and reaches the shell, exactly as the legacy
+                        // path did. The detach key is always intercepted.
+                        let event = escape_matcher.feed(input, frame_renderer.is_some());
+                        // Ordinary input to forward this batch (before any
+                        // intercepted key). When a FrameRenderer is live it
                         // intercepts the wheel for the local scroll-view (bare
                         // prompt only) and repaints the tty; the rest forwards as
-                        // input. Gate-off forwards `normal` verbatim — the raw
-                        // wheel reaches the daemon byte for byte, exactly as today.
+                        // input. Gate-off forwards it verbatim — the raw wheel
+                        // reaches the daemon byte for byte, exactly as today.
+                        let normal: &[u8] = match &event {
+                            EscapeEvent::Forward(f) => f,
+                            EscapeEvent::Detach { forward } => forward,
+                            EscapeEvent::Palette { forward, .. } => forward,
+                        };
                         if !normal.is_empty() {
                             let to_daemon = if let Some(fr) = frame_renderer.as_mut() {
                                 let (fwd, repaint) = fr.handle_input(normal);
@@ -867,27 +921,27 @@ fn client_loop(stream: UnixStream, enter: &[u8], raw: &RawMode) -> Result<i32> {
                                 ipc::append_frame(&mut sock_write_buf, Tag::Input, &to_daemon);
                             }
                         }
-                        // Open the palette on the escape byte (frames-on). If the
+                        // Open the palette on the palette key (frames-on). If the
                         // renderer can't be spawned, forward the Ctrl-^ and its
                         // trailing bytes to the shell as ordinary input.
-                        if let Some(after) = after_escape {
+                        if let EscapeEvent::Palette { tail, .. } = &event {
                             let fr = frame_renderer
                                 .as_mut()
-                                .expect("split_escape only fires with a live renderer");
+                                .expect("Palette event only fires with a live renderer");
                             let (rows, cols) = frame_size;
                             if open_local_palette(&mut palette, fr, &mut stdout_buf, rows, cols) {
-                                if !after.is_empty() {
+                                if !tail.is_empty() {
                                     if let Some(p) = palette.as_ref() {
-                                        p.forward_input(after);
+                                        p.forward_input(tail);
                                     }
                                 }
                             } else {
                                 let mut literal = vec![ESCAPE_KEY];
-                                literal.extend_from_slice(after);
+                                literal.extend_from_slice(tail);
                                 ipc::append_frame(&mut sock_write_buf, Tag::Input, &literal);
                             }
                         }
-                        if detached {
+                        if matches!(event, EscapeEvent::Detach { .. }) {
                             ipc::append_frame(&mut sock_write_buf, Tag::Detach, b"");
                         }
                     }
@@ -1067,52 +1121,68 @@ mod tests {
         assert!(!restore.windows(4).any(|w| w == b"1049"));
     }
 
+    // The escape-key matcher tests feed with the palette enabled (frames-on)
+    // unless a test is specifically about the gate-off behaviour. These helpers
+    // keep the assertions terse against the `EscapeEvent` enum.
+    fn fwd(bytes: &[u8]) -> EscapeEvent {
+        EscapeEvent::Forward(bytes.to_vec())
+    }
+    fn detach_after(bytes: &[u8]) -> EscapeEvent {
+        EscapeEvent::Detach {
+            forward: bytes.to_vec(),
+        }
+    }
+    fn palette(before: &[u8], after: &[u8]) -> EscapeEvent {
+        EscapeEvent::Palette {
+            forward: before.to_vec(),
+            tail: after.to_vec(),
+        }
+    }
+
     #[test]
     fn raw_ctrl_backslash_detaches() {
-        let mut m = DetachMatcher::default();
-        assert_eq!(m.feed(b"\x1c"), (vec![], true));
+        let mut m = EscapeKeyMatcher::default();
+        assert_eq!(m.feed(b"\x1c", true), detach_after(b""));
     }
 
     #[test]
     fn bytes_before_detach_are_forwarded() {
         // Ctrl-\ mid-buffer: the preceding keystrokes must still reach the app
         // (the old matcher dropped the whole buffer). github #17.
-        let mut m = DetachMatcher::default();
-        assert_eq!(m.feed(b"abc\x1c"), (b"abc".to_vec(), true));
+        let mut m = EscapeKeyMatcher::default();
+        assert_eq!(m.feed(b"abc\x1c", true), detach_after(b"abc"));
     }
 
     #[test]
     fn plain_input_passes_through() {
-        let mut m = DetachMatcher::default();
-        assert_eq!(m.feed(b"hello"), (b"hello".to_vec(), false));
+        let mut m = EscapeKeyMatcher::default();
+        assert_eq!(m.feed(b"hello", true), fwd(b"hello"));
     }
 
     #[test]
     fn kitty_detach_in_one_read() {
-        let mut m = DetachMatcher::default();
-        assert_eq!(m.feed(b"\x1b[92;5u"), (vec![], true));
-        let mut m2 = DetachMatcher::default();
-        assert_eq!(m2.feed(b"\x1b[92;5:1u"), (vec![], true));
+        let mut m = EscapeKeyMatcher::default();
+        assert_eq!(m.feed(b"\x1b[92;5u", true), detach_after(b""));
+        let mut m2 = EscapeKeyMatcher::default();
+        assert_eq!(m2.feed(b"\x1b[92;5:1u", true), detach_after(b""));
     }
 
     #[test]
     fn kitty_detach_split_across_reads() {
         // The 7-byte CSI-u sequence arriving in two reads must still detach
         // (the old substring scan missed this). github #17.
-        let mut m = DetachMatcher::default();
-        assert_eq!(m.feed(b"\x1b[92"), (vec![], false)); // held back as partial
-        assert_eq!(m.feed(b";5u"), (vec![], true));
+        let mut m = EscapeKeyMatcher::default();
+        assert_eq!(m.feed(b"\x1b[92", true), fwd(b"")); // held back as partial
+        assert_eq!(m.feed(b";5u", true), detach_after(b""));
     }
 
     #[test]
     fn non_detach_kitty_key_is_forwarded_after_split() {
         // A different CSI-u key sharing the `\x1b[9` prefix must be delivered,
         // not swallowed, once disambiguated on the next read.
-        let mut m = DetachMatcher::default();
-        assert_eq!(m.feed(b"\x1b[9"), (vec![], false));
-        let (fwd, detached) = m.feed(b"7;5u");
-        assert!(!detached);
-        assert_eq!(fwd, b"\x1b[97;5u");
+        let mut m = EscapeKeyMatcher::default();
+        assert_eq!(m.feed(b"\x1b[9", true), fwd(b""));
+        assert_eq!(m.feed(b"7;5u", true), fwd(b"\x1b[97;5u"));
     }
 
     #[test]
@@ -1120,35 +1190,127 @@ mod tests {
         // A bare `\x1b` is a real Escape keypress and must reach the app in the
         // same read — never held back as a possible detach prefix, or Escape
         // stalls until the next keystroke (posh#126).
-        let mut m = DetachMatcher::default();
-        assert_eq!(m.feed(b"\x1b"), (vec![0x1b], false));
+        let mut m = EscapeKeyMatcher::default();
+        assert_eq!(m.feed(b"\x1b", true), fwd(b"\x1b"));
         // Nothing was carried, so a following key forwards on its own.
-        assert_eq!(m.feed(b"a"), (b"a".to_vec(), false));
+        assert_eq!(m.feed(b"a", true), fwd(b"a"));
     }
 
     #[test]
     fn double_escape_forwards_both() {
         // Two Escapes in separate reads must forward two Escapes, not register
         // as one (the swallow symptom: one held in the carry indefinitely).
-        let mut m = DetachMatcher::default();
-        assert_eq!(m.feed(b"\x1b"), (vec![0x1b], false));
-        assert_eq!(m.feed(b"\x1b"), (vec![0x1b], false));
+        let mut m = EscapeKeyMatcher::default();
+        assert_eq!(m.feed(b"\x1b", true), fwd(b"\x1b"));
+        assert_eq!(m.feed(b"\x1b", true), fwd(b"\x1b"));
     }
 
     #[test]
     fn escape_then_key_in_one_read_forwards_both() {
         // Alt-<key> (ESC prefix) and any ESC-led sequence the terminal delivers
         // in a single read must pass through intact.
-        let mut m = DetachMatcher::default();
-        assert_eq!(m.feed(b"\x1bb"), (b"\x1bb".to_vec(), false));
+        let mut m = EscapeKeyMatcher::default();
+        assert_eq!(m.feed(b"\x1bb", true), fwd(b"\x1bb"));
     }
 
     #[test]
     fn lone_escape_at_buffer_tail_forwards_leading_input() {
         // `abc` + a trailing lone Escape: the whole buffer forwards, with no
         // byte held back (the tail `\x1b` is a real Escape, not a detach head).
-        let mut m = DetachMatcher::default();
-        assert_eq!(m.feed(b"abc\x1b"), (b"abc\x1b".to_vec(), false));
+        let mut m = EscapeKeyMatcher::default();
+        assert_eq!(m.feed(b"abc\x1b", true), fwd(b"abc\x1b"));
+    }
+
+    // ---- posh#130: the palette key in its raw and kitty CSI-u forms ----
+
+    #[test]
+    fn raw_ctrl_caret_opens_palette() {
+        // The legacy path: a lone raw 0x1e opens the palette, bytes before it
+        // forward and bytes after route to the palette (mirrors the old
+        // split_escape). This is the `cat` case that always worked.
+        let mut m = EscapeKeyMatcher::default();
+        assert_eq!(m.feed(b"ab\x1ecd", true), palette(b"ab", b"cd"));
+        let mut m2 = EscapeKeyMatcher::default();
+        assert_eq!(m2.feed(b"\x1e", true), palette(b"", b""));
+    }
+
+    #[test]
+    fn kitty_ctrl_caret_opens_palette() {
+        // posh#130: under kitty keyboard mode Ctrl-^ arrives as CSI 54;5u (and a
+        // `:1` explicit-press variant), NOT raw 0x1e. Both must open the palette.
+        let mut m = EscapeKeyMatcher::default();
+        assert_eq!(m.feed(b"\x1b[54;5u", true), palette(b"", b""));
+        let mut m2 = EscapeKeyMatcher::default();
+        assert_eq!(m2.feed(b"\x1b[54;5:1u", true), palette(b"", b""));
+    }
+
+    #[test]
+    fn kitty_palette_key_split_across_reads() {
+        // The CSI-u palette key torn across two reads must still open the palette
+        // — the whole point of routing it through the carried matcher rather
+        // than the old stateless split_escape (which could not stitch reads).
+        let mut m = EscapeKeyMatcher::default();
+        assert_eq!(m.feed(b"\x1b[54", true), fwd(b"")); // held back as partial
+        assert_eq!(m.feed(b";5u", true), palette(b"", b""));
+    }
+
+    #[test]
+    fn kitty_palette_key_preserves_surrounding_bytes() {
+        // Bytes before the CSI-u palette key forward as input; bytes after route
+        // to the palette, exactly as for the raw form.
+        let mut m = EscapeKeyMatcher::default();
+        assert_eq!(m.feed(b"hi\x1b[54;5ubye", true), palette(b"hi", b"bye"));
+    }
+
+    #[test]
+    fn kitty_release_event_does_not_open_palette() {
+        // Under report-all-events the terminal also sends a `:3` (release) and
+        // could send `:2` (repeat). Neither is the press; they must NOT open the
+        // palette — they forward as ordinary bytes (the app may want them).
+        let mut m = EscapeKeyMatcher::default();
+        assert_eq!(m.feed(b"\x1b[54;5:3u", true), fwd(b"\x1b[54;5:3u"));
+        let mut m2 = EscapeKeyMatcher::default();
+        assert_eq!(m2.feed(b"\x1b[54;5:2u", true), fwd(b"\x1b[54;5:2u"));
+    }
+
+    #[test]
+    fn bare_modifier_csi_u_does_not_open_palette() {
+        // posh#130 second finding: under report-all-events even bare modifier
+        // keys emit CSI-u (Left Ctrl = 57442;5u, Left Alt = 57443). The match
+        // must be EXACT for the palette codepoint (54), never "any CSI-u with
+        // the ctrl modifier", or a bare Ctrl press would be read as a summon.
+        let mut m = EscapeKeyMatcher::default();
+        assert_eq!(m.feed(b"\x1b[57442;5u", true), fwd(b"\x1b[57442;5u"));
+        let mut m2 = EscapeKeyMatcher::default();
+        assert_eq!(m2.feed(b"\x1b[57443;1:3u", true), fwd(b"\x1b[57443;1:3u"));
+    }
+
+    #[test]
+    fn gate_off_leaves_raw_ctrl_caret_in_the_stream() {
+        // POSH_SESSION_FRAMES off (no FrameRenderer): the palette is disabled, so
+        // the raw 0x1e is ordinary input forwarded to the shell — the legacy
+        // path. (Detach is still intercepted; only the palette is gated.)
+        let mut m = EscapeKeyMatcher::default();
+        assert_eq!(m.feed(b"\x1e", false), fwd(b"\x1e"));
+    }
+
+    #[test]
+    fn gate_off_leaves_kitty_palette_key_in_the_stream() {
+        // Gate-off, the palette CSI-u form is likewise ordinary input: it is not
+        // intercepted and is forwarded verbatim. A detach CSI-u still detaches.
+        let mut m = EscapeKeyMatcher::default();
+        assert_eq!(m.feed(b"\x1b[54;5u", false), fwd(b"\x1b[54;5u"));
+        let mut m2 = EscapeKeyMatcher::default();
+        assert_eq!(m2.feed(b"\x1b[92;5u", false), detach_after(b""));
+    }
+
+    #[test]
+    fn detach_wins_over_a_later_palette_key() {
+        // Both keys in one batch: the first control key in the stream wins. A
+        // detach before a palette key detaches (the palette bytes are discarded
+        // with the rest of the post-detach tail).
+        let mut m = EscapeKeyMatcher::default();
+        assert_eq!(m.feed(b"x\x1c\x1e", true), detach_after(b"x"));
     }
 
     // ---- Task 2.1: local client renders posh-proto ServerFrames (RFC 0008) ----
@@ -1530,53 +1692,24 @@ mod tests {
     /// Gate-off invariant: with `POSH_SESSION_FRAMES=0` (frames now default ON,
     /// so off is explicit) there is no FrameRenderer, so the client_loop stdin
     /// path forwards `forward` verbatim. The only stage between raw stdin and
-    /// `Tag::Input` is the detach matcher, which passes wheel SGR bytes through
-    /// untouched — the daemon receives the raw wheel exactly as on the legacy path.
+    /// `Tag::Input` is the escape-key matcher, which passes wheel SGR bytes
+    /// through untouched — the daemon receives the raw wheel exactly as on the
+    /// legacy path.
     #[test]
     fn gate_off_forwards_wheel_bytes_to_daemon_unchanged() {
-        let mut m = DetachMatcher::default();
+        let mut m = EscapeKeyMatcher::default();
         let wheel = b"\x1b[<64;10;5M";
-        assert_eq!(m.feed(wheel), (wheel.to_vec(), false));
+        assert_eq!(m.feed(wheel, false), fwd(wheel));
     }
 
     // ---- Task 2.4a: command palette on the local session client ------------
-
-    /// `split_escape` is the open decision the loop makes when a FrameRenderer is
-    /// live: a lone Ctrl-^ (0x1e) partitions the batch into the ordinary input
-    /// before it and the palette-bound bytes after it, dropping the escape byte.
-    #[test]
-    fn split_escape_partitions_input_at_ctrl_caret() {
-        assert_eq!(
-            split_escape(b"ab\x1ecd"),
-            (b"ab".as_slice(), Some(b"cd".as_slice())),
-            "bytes before the escape are input; bytes after route to the palette"
-        );
-        assert_eq!(
-            split_escape(b"\x1e"),
-            (b"".as_slice(), Some(b"".as_slice())),
-            "a lone Ctrl-^ opens the palette with no leading input and an empty tail"
-        );
-        assert_eq!(
-            split_escape(b"abc"),
-            (b"abc".as_slice(), None),
-            "no escape: the whole batch is ordinary input"
-        );
-    }
-
-    /// Gate-off invariant: with `POSH_SESSION_FRAMES=0` (frames now default ON, so
-    /// off is explicit) there is no FrameRenderer, so the loop never calls
-    /// `split_escape` and Ctrl-^ is not intercepted. The only stage before
-    /// `Tag::Input` is the detach matcher, which forwards the `0x1e` byte untouched
-    /// — the shell receives it, exactly as on the legacy path (mirror
-    /// `gate_off_forwards_wheel_bytes_...`).
-    #[test]
-    fn gate_off_leaves_ctrl_caret_in_the_forwarded_stream() {
-        let mut m = DetachMatcher::default();
-        assert_eq!(m.feed(b"\x1e"), (vec![0x1e], false));
-    }
+    // The palette-key open decision (raw 0x1e and the kitty CSI-u form) and the
+    // gate-off pass-through are covered by the posh#130 EscapeKeyMatcher tests
+    // above (raw_ctrl_caret_opens_palette, kitty_ctrl_caret_opens_palette,
+    // gate_off_leaves_{raw,kitty}_...).
 
     /// `app.detach` dispatch queues the same `Tag::Detach` wire frame the
-    /// `DetachMatcher` path emits, and reports no further tty-side action.
+    /// `EscapeKeyMatcher` detach path emits, and reports no further tty-side action.
     #[test]
     fn dispatch_detach_appends_a_detach_frame() {
         let mut buf = Vec::new();

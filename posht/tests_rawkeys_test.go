@@ -14,6 +14,7 @@ func TestCaretRender(t *testing.T) {
 		{[]byte{0x7f}, "^?"},
 		{[]byte("abc"), "abc"},
 		{[]byte{0x1b, '[', '1', '3', ';', '2', 'u'}, "^[[13;2u"},
+		{[]byte{0x1e}, "^^"}, // Ctrl-^ (posh#130): 0x1e renders cat -v as ^^
 		{[]byte{0xff}, "\\xff"},
 	}
 	for _, c := range cases {
@@ -36,6 +37,11 @@ func TestGlossBytes(t *testing.T) {
 		{[]byte("\x1b[13u"), "kitty Enter"},
 		{[]byte("\x1b[27u"), "disambiguated Escape"},
 		{[]byte("\x1b[Z"), "Shift+Tab"},
+		// posh#130: the palette key in both encodings.
+		{[]byte{0x1e}, "legacy Ctrl-^"},
+		{[]byte("\x1b[54;5u"), "kitty Ctrl-^"},
+		// A CSI-u form we don't specifically name still reads as kitty-encoded.
+		{[]byte("\x1b[99;5u"), "CSI-u sequence"},
 	}
 	for _, c := range cases {
 		got := glossBytes(c.in)

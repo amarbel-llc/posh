@@ -41,7 +41,7 @@ Two micro-architectures realize it, chosen by the wire format:
 |---|---|---|---|---|
 | `session/ipc.rs` `FrameBuffer` | IPC socket | length prefix in header | accumulate-and-test | `MAX_FRAME_LEN` |
 | `remote/sync.rs` `FragmentAssembly` | UDP payloads | fragment offsets/count | accumulate-and-test | `MAX_FRAGMENTS` |
-| `session/client.rs` `DetachMatcher` | tty input (detach key) | prefix-match vs. fixed key set | accumulate-and-test (`carry`) | keys ≤8 bytes |
+| `session/client.rs` `EscapeKeyMatcher` | tty input (detach + palette keys) | prefix-match vs. fixed key set | accumulate-and-test (`carry`) | keys ≤9 bytes |
 | `session/daemon.rs` `ScreenSwitchFilter` | PTY output (alt-screen/RIS excision) | the VT model's `take_screen_switch` / `mid_escape` | byte-fed (drives `Terminal`) | `MAX_HELD` |
 | `remote/client.rs` `MouseFilter` | tty input (wheel grab) | own SGR grammar reaching `M`/`m` | byte-fed state machine | `MAX_MOUSE_SEQ` |
 
@@ -82,6 +82,6 @@ Each instance carries a regression test asserting split-safety against its forma
 ## More Information
 
 * Prompting bug: posh#52 (split SGR mouse sequence leaked raw); its fix and the byte-fed-vs-buffer-scan decision are ADR-0002, which this ADR generalizes.
-* Instances: `session/ipc.rs` (`FrameBuffer`), `remote/sync.rs` (`FragmentAssembly`), `session/client.rs` (`DetachMatcher`), `session/daemon.rs` (`ScreenSwitchFilter`), `remote/client.rs` (`MouseFilter`).
+* Instances: `session/ipc.rs` (`FrameBuffer`), `remote/sync.rs` (`FragmentAssembly`), `session/client.rs` (`EscapeKeyMatcher`), `session/daemon.rs` (`ScreenSwitchFilter`), `remote/client.rs` (`MouseFilter`).
 * Revisit trigger: if a **third** free-form escape-stream byte-fed filter appears (the `MouseFilter`/`ScreenSwitchFilter` shape — not the length-framed protocols), those share enough mechanism — drive a parser, hold a `Vec` until it settles, bound it — that a small shared helper may then earn its keep. Re-evaluate Option 2 at that point, scoped to just those filters.
 * Lineage: the discipline came in with the mosh/zmx ports (mosh's `Parser`/`UserInput`, zmx's framed IPC); posh#52 was a fresh feature that didn't reach for it, which is the failure mode this ADR addresses.
