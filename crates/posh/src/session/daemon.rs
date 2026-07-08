@@ -145,6 +145,15 @@ struct ClientConn {
     // the daemon total grows past `acked_sb_total.max(sb_floor)`.
     sb_floor: u64,
     acked_sb_total: u64,
+    // Backlog instrumentation (posh#131 sibling — the MAX_CLIENT_BACKLOG drop
+    // diagnosis): distinguish a STALLED reader (write_buf grows while the socket
+    // never drains) from a BURSTY one (draining, but the app outpaces it).
+    // `bytes_drained` is the lifetime total successfully written to the socket;
+    // `last_drain_ms` is when the last non-zero drain happened (util::now_ms);
+    // `hiwater_mb` throttles the growth breadcrumb to one line per new MiB.
+    bytes_drained: u64,
+    last_drain_ms: u64,
+    hiwater_mb: usize,
 }
 
 impl ClientConn {
@@ -787,16 +796,45 @@ fn daemon_loop(
             break;
         }
 
+        // Backlog growth breadcrumb (posh#131 sibling diagnosis): one line per
+        // new whole-MiB high-water above 4 MiB, so a real run shows the GROWTH
+        // shape approaching the drop — and whether the socket is draining while
+        // it climbs (stalled vs bursty). Throttled via `hiwater_mb`; only ever
+        // logs while a client is more than a quarter of the way to the cap.
+        let now = util::now_ms();
+        for c in clients.iter_mut() {
+            let mb = c.write_buf.len() / (1024 * 1024);
+            if mb >= 4 && mb > c.hiwater_mb {
+                c.hiwater_mb = mb;
+                util::log_write(
+                    "warn",
+                    &format!(
+                        "client backlog high-water fd={} backlog={} drained_total={} last_drain_age_ms={}",
+                        c.stream.as_raw_fd(),
+                        c.write_buf.len(),
+                        c.bytes_drained,
+                        now.saturating_sub(c.last_drain_ms),
+                    ),
+                );
+            }
+        }
+
         // Drop stuck readers before building the pollfd set (so the fd<->client
-        // index mapping stays consistent for this iteration). github #11.
+        // index mapping stays consistent for this iteration). github #11. The
+        // drained_total / last_drain_age discriminate the drop cause: a STALLED
+        // reader shows drained_total flat and a large last_drain_age; a BURSTY
+        // one shows recent draining (small age, growing drained_total) yet still
+        // outran the cap.
         clients.retain(|c| {
             if c.write_buf.len() > MAX_CLIENT_BACKLOG {
                 util::log_write(
                     "warn",
                     &format!(
-                        "dropping slow client fd={} backlog={}",
+                        "dropping slow client fd={} backlog={} drained_total={} last_drain_age_ms={}",
                         c.stream.as_raw_fd(),
-                        c.write_buf.len()
+                        c.write_buf.len(),
+                        c.bytes_drained,
+                        now.saturating_sub(c.last_drain_ms),
                     ),
                 );
                 false
@@ -858,6 +896,9 @@ fn daemon_loop(
                     lossy: false,
                     sb_floor: 0,
                     acked_sb_total: 0,
+                    bytes_drained: 0,
+                    last_drain_ms: util::now_ms(),
+                    hiwater_mb: 0,
                 });
             }
         }
@@ -1105,6 +1146,18 @@ fn daemon_loop(
                     match c.stream.write(&c.write_buf) {
                         Ok(n) => {
                             c.write_buf.drain(..n);
+                            // Backlog instrumentation: record the drain so the
+                            // high-water / drop lines can tell stalled from bursty.
+                            if n > 0 {
+                                c.bytes_drained += n as u64;
+                                c.last_drain_ms = util::now_ms();
+                            }
+                            // Recovered below a MiB ⇒ re-arm the high-water log so
+                            // a later climb is reported afresh (not one-shot).
+                            let mb = c.write_buf.len() / (1024 * 1024);
+                            if mb < c.hiwater_mb {
+                                c.hiwater_mb = mb;
+                            }
                         }
                         Err(e) if e.kind() == std::io::ErrorKind::WouldBlock => {}
                         Err(_) => remove = true,
@@ -1386,6 +1439,9 @@ mod tests {
             lossy: false,
             sb_floor: 0,
             acked_sb_total: 0,
+            bytes_drained: 0,
+            last_drain_ms: 0,
+            hiwater_mb: 0,
         }
     }
 
@@ -1486,6 +1542,9 @@ mod tests {
             lossy: false,
             sb_floor: 0,
             acked_sb_total: 0,
+            bytes_drained: 0,
+            last_drain_ms: 0,
+            hiwater_mb: 0,
         };
         let mut init = ipc::encode_resize(rows, cols).to_vec();
         init.extend_from_slice(&caps::encode_table(&caps::own_table(&[])));
@@ -1508,6 +1567,9 @@ mod tests {
             lossy: false,
             sb_floor: 0,
             acked_sb_total: 0,
+            bytes_drained: 0,
+            last_drain_ms: 0,
+            hiwater_mb: 0,
         };
         let mut init = ipc::encode_resize(rows, cols).to_vec();
         init.extend_from_slice(&caps::encode_table(&caps::own_table(&[caps::Cap {
@@ -1679,6 +1741,9 @@ mod tests {
             lossy: false,
             sb_floor: 0,
             acked_sb_total: 0,
+            bytes_drained: 0,
+            last_drain_ms: 0,
+            hiwater_mb: 0,
         };
         let mut init = ipc::encode_resize(24, 80).to_vec();
         init.extend_from_slice(&caps::encode_table(&caps::own_table(&[])));
@@ -1826,6 +1891,9 @@ mod tests {
             lossy: false,
             sb_floor: 0,
             acked_sb_total: 0,
+            bytes_drained: 0,
+            last_drain_ms: 0,
+            hiwater_mb: 0,
         };
         let mut init = ipc::encode_resize(rows, cols).to_vec();
         init.extend_from_slice(&caps::encode_table(&caps::own_table(&[])));
@@ -2033,6 +2101,9 @@ mod tests {
             lossy: false,
             sb_floor: 0,
             acked_sb_total: 0,
+            bytes_drained: 0,
+            last_drain_ms: 0,
+            hiwater_mb: 0,
         };
         let mut init = ipc::encode_resize(rows, cols).to_vec();
         init.extend_from_slice(&caps::encode_table(&caps::own_table(&[caps::Cap {
@@ -2324,6 +2395,9 @@ mod tests {
             lossy: false,
             sb_floor: 0,
             acked_sb_total: 0,
+            bytes_drained: 0,
+            last_drain_ms: 0,
+            hiwater_mb: 0,
         };
         let mut table = vec![caps::Cap {
             id: caps::CAP_LOSSY,
