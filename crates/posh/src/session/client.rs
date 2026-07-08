@@ -12,6 +12,7 @@ use crate::pty::{self, RawMode};
 use crate::remote::caps;
 use crate::remote::display::{self, Snapshot};
 use crate::remote::framesync::{ApplyOutcome, FrameApplier, FrameSync};
+use crate::remote::kittykeys::{match_kitty_seqs, KittyMatch, ESCAPE_KEY, KITTY_PALETTE_SEQS};
 use crate::remote::palette::{composite_palette, Palette, PaletteEvent};
 use crate::remote::scrollview;
 use crate::remote::sync::{FrameBody, ScrollbackRing, ServerFrame};
@@ -22,10 +23,6 @@ use crate::util::{self, Error, Result};
 const STDIN: i32 = libc::STDIN_FILENO;
 const STDOUT: i32 = libc::STDOUT_FILENO;
 
-/// The command-palette summon key, Ctrl-^ (mirrors `remote::client::ESCAPE_KEY`).
-/// On the frames-on local path a lone `0x1e` opens the palette; gate-off it is an
-/// ordinary byte forwarded to the shell.
-const ESCAPE_KEY: u8 = 0x1e;
 
 /// Depth of the local client's scrollback ring (RFC 0002 §3), in rows. Matches
 /// the session daemon's primary ring (`daemon::SCROLLBACK`, 10_000) — the client
@@ -119,60 +116,14 @@ pub fn cmd_attach(
     }
 }
 
-/// The two control keys the client intercepts before the daemon, each in the
-/// raw C0 form the terminal sends in legacy mode AND the kitty keyboard CSI-u
-/// form it sends once an app negotiates the protocol (RFC 0010 made the daemon
-/// answer the kitty query, so apps now do). The CSI-u codepoint is the base
-/// key: Ctrl-\ is `\` (92), Ctrl-^ is Ctrl+Shift+6 → base `6` (54); `;5` is the
-/// ctrl modifier. posh#130: matching only the raw byte left the palette key
-/// unreachable at a kitty-negotiating prompt (Ctrl-^ arrived as `\x1b[54;5u`).
-///
-/// Both CSI-u forms carry an optional `:1` explicit-press-event suffix. We do
-/// NOT match the `:3` (release) or `:2` (repeat) event variants — under the
-/// report-all-events kitty flag every key, bare modifiers included, emits
-/// press+release CSI-u, and a release must not re-trigger the action.
+/// The detach key Ctrl-\ in raw C0 and its kitty keyboard CSI-u forms (base key
+/// `\` = 92, ctrl modifier `;5`, with and without the explicit `:1` press-event
+/// suffix). RFC 0010 made the daemon answer the kitty query so apps enable the
+/// protocol and send the CSI-u form; posh#130 taught the matcher to recognize
+/// it. The palette key's equivalent forms and the `match_kitty_seqs` primitive
+/// live in [`crate::remote::kittykeys`] (shared with the roaming client, #131).
 const DETACH_KEY: u8 = 0x1c; // Ctrl-\ (raw C0)
 const KITTY_DETACH_SEQS: [&[u8]; 2] = [b"\x1b[92;5u", b"\x1b[92;5:1u"];
-const KITTY_PALETTE_SEQS: [&[u8]; 2] = [b"\x1b[54;5u", b"\x1b[54;5:1u"];
-
-enum KittyMatch {
-    /// The slice begins with a full candidate sequence of this many bytes (the
-    /// caller needs the length to route the bytes after the key).
-    Full(usize),
-    /// The slice is a proper prefix of some candidate sequence (need more bytes).
-    Partial,
-    /// No candidate sequence starts here.
-    No,
-}
-
-/// Match the start of `s` against a set of complete CSI-u sequences.
-fn match_kitty_seqs(s: &[u8], seqs: &[&[u8]]) -> KittyMatch {
-    let mut partial = false;
-    for seq in seqs {
-        if s.len() >= seq.len() {
-            if &s[..seq.len()] == *seq {
-                return KittyMatch::Full(seq.len());
-            }
-        } else if seq.starts_with(s) {
-            partial = true;
-        }
-    }
-    // A bare `\x1b` is a prefix of every CSI-u sequence, but it is far more
-    // often a real Escape keypress (interrupt/clear in a TUI). Holding it back
-    // to disambiguate stalls Escape until the next keystroke arrives — there is
-    // no flush timer — so a lone Escape is only forwarded when the user presses
-    // another key, and a double-Escape registers as one (posh#126).
-    // Require at least the `\x1b[` CSI introducer before treating the buffer as
-    // a control-key-in-progress. The cost is that a sequence whose kitty
-    // encoding is split by the tty *between* the `\x1b` and the `[` (vanishingly
-    // rare — a terminal emits a CSI-u sequence atomically) is missed that once;
-    // the user simply presses the key again. Escape latency is the common case.
-    if partial && s.len() >= 2 {
-        KittyMatch::Partial
-    } else {
-        KittyMatch::No
-    }
-}
 
 /// What one fed stdin batch resolved to. The matcher intercepts the detach and
 /// palette control keys (raw C0 or kitty CSI-u) before the daemon; everything

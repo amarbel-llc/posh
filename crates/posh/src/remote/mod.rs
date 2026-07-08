@@ -36,6 +36,10 @@ pub mod framesync {
     pub use posh_proto::framesync::*;
 }
 pub mod hostmetrics;
+/// Kitty keyboard control-key matching shared by both clients (posh#130/#131):
+/// the `match_kitty_seqs` primitive, the palette-key CSI-u sequence set, and the
+/// roaming client's `PaletteKeyNormalizer`.
+pub mod kittykeys;
 /// The command-palette overlay renderer subprocess driver (RFC 0005) and the
 /// `composite_palette` compositor. Shared by both this crate's roaming client
 /// (`remote::client`) and the local session frame client (`session::client`) so

@@ -546,6 +546,49 @@ debug-verify-session-frames frames="on" *ARGS:
     echo >&2; echo ">> ===== rawkeys receipt ({{ frames }}) =====" >&2
     if [ -s "$receipt" ]; then cat "$receipt"; else echo "(no receipt written)" >&2; fi
 
+# The REMOTE analog of debug-verify-session-frames: run posht --only rawkeys as
+# the session command over a LOOPBACK roaming server+client pair (posh server new
+# + posh client on 127.0.0.1), so the ROAMING transport and the remote client's
+# escape loop (remote/client.rs) are in the path — not the local session client.
+# This is the posh#131 probe: (1) does the roaming server ANSWER the kitty query
+# (receipt `kitty_flags` non-"(no reply...)" ⇒ yes, so an in-session app enables
+# kitty and Ctrl-^ arrives as CSI-u 54;5u), and (2) at the Ctrl+^ prompt, does the
+# remote client OPEN THE PALETTE (⇒ no `Ctrl+^` hex line in the receipt, the key
+# was intercepted) or PASS IT THROUGH (⇒ a `\x1b[54;5u` line, the #131 bug). Runs
+# in an isolated POSH_DIR; the client takes over your terminal, so run it in the
+# terminal you want to test (e.g. kitty). Quit posht (q), then detach the client
+# with Ctrl-^ then "." (the mosh quit sequence). Debug-only; the hermetic gate is
+# build-rust.
+[group("debug")]
+debug-verify-remote-rawkeys *ARGS:
+    #!/usr/bin/env bash
+    set -euo pipefail
+    cd '{{ justfile_directory() }}'
+    args='{{ ARGS }}'; [ -n "$args" ] || args='--only rawkeys'
+    nix develop --command cargo build -p posh
+    nix shell nixpkgs#go --command bash -c 'cd posht && go build -o posht .'
+    posh="$PWD/target/debug/posh"
+    dir=$(mktemp -d); export POSH_DIR="$dir"
+    # Receipt OUTSIDE POSH_DIR so the trap's rm -rf leaves it; posht writes it to
+    # the real filesystem, surviving the alt-screen teardown that wipes the
+    # on-screen summary.
+    receipt="$PWD/.tmp/rawkeys-remote.json"; mkdir -p "$PWD/.tmp"
+    fifo=$(mktemp -u); mkfifo "$fifo"
+    trap 'rm -f "$fifo"; pkill -f "[p]osh server new" 2>/dev/null || true; rm -rf "$dir"' EXIT
+    echo ">> starting loopback roaming server running posht $args" >&2
+    # The server runs posht as the session command and double-forks; the CONNECT
+    # line comes back on the fifo. POSH_DEBUG_LOG cleared (irrelevant here).
+    env -u POSH_DEBUG_LOG "$posh" server new -4 -- \
+        "$PWD/posht/posht" $args --json "$receipt" >"$fifo" &
+    read -r _ _ port key < <(grep -m1 '^POSH CONNECT ' "$fifo")
+    echo ">> connecting client to 127.0.0.1:$port over the roaming transport" >&2
+    echo ">> at the Ctrl+^ prompt: palette opens (no hex line) = fixed; a 54;5u" >&2
+    echo ">> hex line = the #131 passthrough bug. receipt -> $receipt" >&2
+    # NOT exec: control returns so we can print the receipt to the OUTER terminal.
+    POSH_KEY="$key" "$posh" client -4 127.0.0.1 "$port" || true
+    echo >&2; echo ">> ===== remote rawkeys receipt =====" >&2
+    if [ -s "$receipt" ]; then cat "$receipt"; else echo "(no receipt written)" >&2; fi
+
 # Verify TERM/COLORTERM forwarding (#51) over a LOCAL loopback server+client
 # pair with freshly-built worktree binaries. Runs your $SHELL in the session;
 # inside it check `echo $TERM` is non-empty and `git -c color.ui=auto status`

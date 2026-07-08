@@ -17,6 +17,7 @@ use crate::remote::datagram::{Connection, Family};
 use crate::remote::diag;
 use crate::remote::display::{self, NotificationEngine, Snapshot};
 use crate::remote::framesync::{self, ApplyOutcome, FrameApplier};
+use crate::remote::kittykeys::{PaletteKeyNormalizer, ESCAPE_KEY};
 use crate::remote::palette::{composite_palette, Palette, PaletteEvent};
 use crate::remote::predict::{
     self, PredictionModel, PredictionRenderer, Predictor, RenderStyle,
@@ -43,8 +44,9 @@ const WEDGE_BANNER: &str = "posh: session stall detected - captured to server lo
 /// hold roughly what the server syncs; bounds client memory.
 const SCROLLBACK_RING_DEPTH: usize = 10_000;
 
-/// The escape (quit-sequence) key: Ctrl-^ (0x1E), as in mosh.
-const ESCAPE_KEY: u8 = 0x1e;
+/// The escape-passthrough key: a literal `^` after Ctrl-^ sends one Ctrl-^ to
+/// the session (mosh parity). The Ctrl-^ summon key itself is
+/// [`crate::remote::kittykeys::ESCAPE_KEY`] (`0x1e`), shared with the local client.
 const ESCAPE_PASS_KEY: u8 = b'^';
 
 /// Banner shown only when Ctrl-^ can't open the palette (renderer missing or
@@ -715,6 +717,11 @@ struct ClientState {
     /// (default) or translates to arrows (grab); its persistent state
     /// reassembles sequences split across reads (posh#52).
     mouse_filter: MouseFilter,
+    /// Rewrites a kitty-CSI-u palette key (`\x1b[54;5u`) to raw `0x1e` before the
+    /// wheel filter and the byte loop, so Ctrl-^ opens the palette under kitty
+    /// keyboard mode too (posh#131). Its carry reassembles a CSI-u split across
+    /// reads. Sibling to `mouse_filter`: both are per-connection input state.
+    palette_keys: PaletteKeyNormalizer,
     quit_pending: bool,
     shutdown_requested: bool,
     shutdown_requested_at: u64,
@@ -859,6 +866,7 @@ fn client_loop(
         notify: NotificationEngine::new(now),
         grab_mouse,
         mouse_filter: MouseFilter::default(),
+        palette_keys: PaletteKeyNormalizer::default(),
         quit_pending: false,
         shutdown_requested: false,
         shutdown_requested_at: 0,
@@ -1317,6 +1325,19 @@ fn process_user_input(st: &mut ClientState, buf: &[u8]) -> bool {
     // keystrokes, so the bytes queued below can be timestamped and their
     // keystroke→consumed round-trip measured when the server acks them.
     let outbox_start = st.outbox.end_offset();
+
+    // posh#131: collapse a kitty-CSI-u palette key (`\x1b[54;5u` / `:1u`) to raw
+    // `0x1e` before the wheel filter and the byte loop, so Ctrl-^ opens the
+    // palette under kitty keyboard mode (over roaming the client terminal enters
+    // kitty mode via the frame mirror, so the key arrives as CSI-u, not `0x1e`).
+    // Raw `0x1e` and every non-palette CSI pass through untouched; the carry
+    // reassembles a CSI-u torn across reads. Placed BEFORE the mouse filter
+    // because that filter forwards a non-mouse CSI scattered (flushes `\x1b[`,
+    // reprocesses the rest — scrollview.rs), which would hide the key from the
+    // byte loop. This runs after the open-palette guard above, so CSI-u typed
+    // INTO an open palette (navigation, not a summon) is forwarded raw, unaltered.
+    let normalized = st.palette_keys.feed(buf);
+    let buf: &[u8] = &normalized;
 
     // When we are intercepting the wheel (bare prompt, primary screen), run
     // input through the mouse filter before the byte loop. The wheel drives the
@@ -2938,6 +2959,7 @@ mod tests {
             notify: NotificationEngine::new(0),
             grab_mouse: GrabMouse::Off,
             mouse_filter: MouseFilter::default(),
+            palette_keys: PaletteKeyNormalizer::default(),
             quit_pending: false,
             shutdown_requested: false,
             shutdown_requested_at: 0,
