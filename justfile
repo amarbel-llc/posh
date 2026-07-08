@@ -700,18 +700,28 @@ debug-record-posht transport host *ARGS:
 # kernel UDP table, and /proc. None of these recipes mutate anything.
 
 # Snapshot every posh/posh-server process for the current user with its state
-# flags (STAT: R/S/D/T, + for foreground), elapsed seconds, CPU%, and kernel
-# wait channel (WCHAN). A wedged server reads as one of: D (stuck in an
+# flags (STAT: R/S/D/T, + for foreground), elapsed time, CPU%, and kernel wait
+# channel (WCHAN). A wedged server reads as one of: D/U (stuck in an
 # uninterruptible syscall), high pcpu (spinning), or S with a poll/recv wchan
 # (idle — waiting on a client whose acks never arrive). Pair with
 # debug-posh-sockets to map pid<->UDP port, then debug-posh-proc-state <pid>.
+# Linux uses the nix-pinned procps ps (etimes/wchan:N); macOS uses the native
+# BSD ps (etime/wchan), since /proc-oriented procps rejects those keywords
+# there (posh#133). Both branches are read-only.
 [group("debug")]
 debug-posh-procs:
     #!/usr/bin/env bash
     set -euo pipefail
-    out="$(nix shell nixpkgs#procps --command \
-      ps -o pid,ppid,stat,etimes,pcpu,wchan:24,args -u "$(id -u)")"
-    echo "$out" | head -n1
+    if [ "$(uname -s)" = Darwin ]; then
+      # BSD ps: `etime` (not etimes), `wchan` (no :width), `command` (not args).
+      out="$(ps -o pid,ppid,stat,etime,pcpu,wchan,command -u "$(id -u)")"
+    else
+      out="$(nix shell nixpkgs#procps --command \
+        ps -o pid,ppid,stat,etimes,pcpu,wchan:24,args -u "$(id -u)")"
+    fi
+    # Header line via parameter expansion, not `| head` — a closed head pipe
+    # trips SIGPIPE under `set -o pipefail` and aborts the recipe (exit 141).
+    printf '%s\n' "${out%%$'\n'*}"
     # Filter ps output captured BEFORE this grep ran, so the grep/nix helpers
     # aren't in the snapshot. Drop our own recipe line defensively.
     echo "$out" | grep -i posh | grep -v -e 'debug-posh' -e 'grep -i' \
@@ -727,12 +737,23 @@ debug-posh-procs:
 debug-posh-sockets:
     #!/usr/bin/env bash
     set -euo pipefail
-    echo "== ss -nap (udp + unix, posh only) =="
-    nix shell nixpkgs#iproute2 --command ss -nap 2>/dev/null \
-      | grep -i posh || echo "(no posh sockets)"
+    uid="$(id -u)"
+    if [ "$(uname -s)" = Darwin ]; then
+      # No `ss` / no /proc on macOS: lsof lists the UDP transport sockets and
+      # unix session-daemon sockets a posh pid holds, with the owning pid
+      # (posh#133). `-nP` skips DNS/port-name lookups; grep to posh commands.
+      echo "== lsof (UDP + unix, posh only) =="
+      lsof -nP -a -u "$uid" -i UDP 2>/dev/null | grep -i posh \
+        || echo "(no posh UDP sockets)"
+      lsof -nP -a -u "$uid" -U 2>/dev/null | grep -i posh \
+        || echo "(no posh unix sockets)"
+    else
+      echo "== ss -nap (udp + unix, posh only) =="
+      nix shell nixpkgs#iproute2 --command ss -nap 2>/dev/null \
+        | grep -i posh || echo "(no posh sockets)"
+    fi
     echo
     echo "== socket-dir candidates =="
-    uid="$(id -u)"
     for base in \
       "${POSH_DIR:-}" \
       "${XDG_RUNTIME_DIR:-/run/user/$uid}/posh" \
@@ -740,8 +761,14 @@ debug-posh-sockets:
       "/tmp/posh-$uid"; do
       [ -n "$base" ] && [ -d "$base" ] || continue
       echo "-- $base"
-      find "$base" -maxdepth 2 \
-        -printf '%M %u %TY-%Tm-%Td %TH:%TM %s %p\n' 2>/dev/null | sort -k6
+      # BSD find has no -printf; `ls -lRA` is portable enough for a dir listing
+      # with mode/owner/size/mtime. (Linux keeps its richer -printf view.)
+      if [ "$(uname -s)" = Darwin ]; then
+        find "$base" -maxdepth 2 -exec ls -ld {} + 2>/dev/null | sort -k9
+      else
+        find "$base" -maxdepth 2 \
+          -printf '%M %u %TY-%Tm-%Td %TH:%TM %s %p\n' 2>/dev/null | sort -k6
+      fi
     done
 
 # Deep read-only kernel state for ONE posh pid (from debug-posh-procs): its
@@ -933,6 +960,91 @@ debug-posh-server-smoke secs="600":
     # POSH_DEBUG_LOG is cleared so the SIGUSR2 dump exercises its own default
     # per-pid sink (<runtime>/posh/posh-server-<pid>.log), not a pre-armed file.
     env -u POSH_DEBUG_LOG target/debug/posh server new -4 -- sleep '{{ secs }}'
+
+# Reproduce the daemon's MAX_CLIENT_BACKLOG (16 MiB) client-drop (github #11):
+# spawn an ISOLATED local session (own POSH_DIR) whose command floods stdout,
+# connect a STALLED reader (a raw unix-socket client that never drains — see
+# below), and watch the daemon's per-client write_buf grow until it drops the
+# "slow client". Answers whether output can reach ~17 MB (the field symptom):
+# run with FRAMES=on (default, coalescing diffs) vs FRAMES=0 (raw Tag::Output,
+# every byte queued) to see which path overflows. FLOOD picks the content:
+# distinct = each line unique (large diffs / raw bytes, overflows either path);
+# static = a repeated line (tiny diffs — should NOT overflow frames-on, the
+# diagnostic contrast). Cleanup on exit. Read-only wrt your real sessions
+# (isolated POSH_DIR). Debug-only; hermetic gate is build-rust.
+# NOTE: via a real shell only — `just debug-posh-backlog-repro on static`. (Some
+# MCP recipe-runners pass the whole arg string as one param, collapsing the two.)
+# Usage: just debug-posh-backlog-repro [on|0] [distinct|static]
+[group("debug")]
+debug-posh-backlog-repro frames="0" flood="distinct":
+    #!/usr/bin/env bash
+    set -euo pipefail
+    cd '{{ justfile_directory() }}'
+    nix develop --command cargo build -q -p posh
+    posh="$PWD/target/debug/posh"
+    # SHORT POSH_DIR under /tmp: a unix socket path is capped at ~107 bytes, so a
+    # deep mktemp -d under the worktree .tmp overflows (MAX_SOCKET_PATH).
+    dir="/tmp/posh-backlog-$$"; mkdir -p "$dir"; export POSH_DIR="$dir"
+    name=bk
+    log="$dir/default/$name.log"
+    client_pid=""
+    cleanup() {
+      [ -n "$client_pid" ] && kill "$client_pid" 2>/dev/null || true
+      POSH_DIR="$dir" "$posh" kill "$name" 2>/dev/null || true
+      rm -rf "$dir"
+    }
+    trap cleanup EXIT INT TERM
+    # The flood command runs as the session program. Fast floods with NO
+    # per-line subshell (a fork-per-line throttles to a trickle). `static` =
+    # `yes` repeating one padded line (coalesces under frames). `distinct` = a
+    # tight loop printing a counter + a precomputed 80-char pad, so each line
+    # differs (defeats diff-coalescing) yet stays fast.
+    case '{{ flood }}' in
+      static) flood_cmd='pad=$(printf "%080d" 0); yes "$pad"' ;;
+      *)      flood_cmd='pad=$(printf "%080d" 0); i=0; while :; do printf "%d %s\n" "$i" "$pad"; i=$((i+1)); done' ;;
+    esac
+    # POSH_SESSION_FRAMES is read by the daemon (inherited by the double-forked
+    # daemon from THIS shell's env); 0 = raw Tag::Output path, unset = frames.
+    frames='{{ frames }}'
+    case "$frames" in
+      0|off|false|no) export POSH_SESSION_FRAMES=0; fmode="raw Tag::Output" ;;
+      *) unset POSH_SESSION_FRAMES 2>/dev/null || true; fmode="frames (coalescing diffs)" ;;
+    esac
+    echo ">> POSH_DIR=$dir  frames=$frames ($fmode)  flood={{ flood }}" >&2
+    # Detached daemon running the flood (no client yet). Inherits the env above.
+    "$posh" attach --detach "$name" -- bash -c "$flood_cmd" >/dev/null
+    sock="$dir/default/$name"
+    # A STALLED reader, WITHOUT posh attach: `posh attach` needs a tty on stdin
+    # (RawMode::enable errors "not a terminal") AND a tty stdin EOFs and exits
+    # before we can stop it — both fight a headless stall. Instead connect to the
+    # daemon's unix socket directly, send a minimal valid Init (Tag::Init=7, a
+    # 4-byte resize payload rows=24 cols=80 — the daemon accepts a bare 4-byte
+    # Init), then NEVER read. The daemon queues PTY output to this client's
+    # write_buf, which grows unbounded until it crosses MAX_CLIENT_BACKLOG and
+    # the daemon drops the "slow client" — the exact github #11 path.
+    python3 -c '
+    import socket, struct, sys, time
+    s = socket.socket(socket.AF_UNIX)
+    s.connect(sys.argv[1])
+    s.sendall(bytes([7]) + struct.pack("<I", 4) + struct.pack("<HH", 24, 80))
+    time.sleep(120)  # hold the socket open; never read -> backlog grows
+    ' "$sock" >/dev/null 2>&1 &
+    client_pid=$!
+    echo ">> stalled raw-socket reader pid=$client_pid connected (never reads)" >&2
+    echo ">> watching daemon log for a backlog drop (<=30s)…" >&2
+    # Poll the daemon log for the drop line; report the observed backlog size.
+    for _ in $(seq 1 60); do
+      if [ -f "$log" ] && grep -q 'dropping slow client' "$log" 2>/dev/null; then
+        echo ">> REPRODUCED — daemon dropped the stalled client:" >&2
+        grep 'dropping slow client' "$log" | tail -n1
+        echo ">> (16 MiB = 16777216; observed backlog above)" >&2
+        exit 0
+      fi
+      sleep 0.5
+    done
+    echo ">> NOT reproduced within 30s. Daemon log tail:" >&2
+    [ -f "$log" ] && tail -n 5 "$log" >&2 || echo "(no daemon log at $log)" >&2
+    echo ">> With frames on + a coalescing flood this is EXPECTED (no overflow)." >&2
 
 # Render the styled `posh list` table (the sc-list-style TTY default) against
 # throwaway sessions in an isolated POSH_DIR, under a fake TTY (util-linux
