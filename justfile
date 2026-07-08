@@ -1046,6 +1046,27 @@ debug-posh-backlog-repro frames="0" flood="distinct":
     [ -f "$log" ] && tail -n 5 "$log" >&2 || echo "(no daemon log at $log)" >&2
     echo ">> With frames on + a coalescing flood this is EXPECTED (no overflow)." >&2
 
+# Kill any leaked `bk` flood daemons from debug-posh-backlog-repro and remove its
+# isolated /tmp/posh-backlog-* POSH_DIRs. The repro's EXIT trap can be skipped
+# when its shell is torn down out from under it (e.g. an MCP recipe-runner
+# killing the process group before the trap runs), orphaning the detached flood
+# daemon — this reaps those. The [b]k class stops pkill matching this recipe's
+# own command line. Safe: matches only the exact repro flood signature.
+[group("debug")]
+debug-posh-backlog-cleanup:
+    #!/usr/bin/env bash
+    set -uo pipefail
+    if pkill -f 'posh attach --detach [b]k -- bash -c'; then
+      echo ">> killed leaked bk flood daemon(s)"
+    else
+      echo ">> no leaked bk flood daemons"
+    fi
+    shopt -s nullglob
+    for d in /tmp/posh-backlog-*; do
+      rm -rf "$d" && echo ">> removed $d"
+    done
+    exit 0
+
 # Render the styled `posh list` table (the sc-list-style TTY default) against
 # throwaway sessions in an isolated POSH_DIR, under a fake TTY (util-linux
 # `script`) so the pretty path triggers headlessly. Visual dev-loop check for
