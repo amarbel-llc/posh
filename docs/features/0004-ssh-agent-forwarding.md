@@ -69,6 +69,18 @@ channels generate zero wire traffic. Direct connection to a specific
 `srv-<pid>.sock` keeps working for anyone who wants a *particular*
 attach's agent.
 
+Ownership tracks the newest connection *with an active client*, not merely
+the newest process: an endpoint whose client has roamed away (peer
+inactive) relinquishes `agent/sock` on its slow tick so a sibling
+connection whose client is still active takes it over, and reclaims it if
+its own client returns. Without this, a roamed-away owner keeps the link
+pinned to its still-bound-but-unserved socket (`socket_is_dead` reports the
+live listener "alive," so no takeover fires) and starves the active
+siblings — requests route to it and fast-fail. posh#136. This narrows the
+window rather than closing it: the handoff waits on the slow-tick cadence,
+and the definitive removal of the election race is the phase-2 mux (see
+More Information), where a single endpoint owns the socket by construction.
+
 **On the wire**, three new RFC 0001 capability ids
 (`6 = AGENT_FORWARD`, `7 = AGENT_DATA`, `8 = AGENT_ACK`) carry a second
 reliable cumulative byte stream in each direction —

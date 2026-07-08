@@ -172,6 +172,19 @@ impl AgentEndpoint {
         }
     }
 
+    /// Give up `agent/sock` if we own it (same unlink as `Drop`, but while the
+    /// endpoint keeps running). Called when OUR peer goes inactive: our
+    /// `srv-<pid>.sock` is still bound, so `socket_is_dead` reports us "alive"
+    /// and no other endpoint would ever take over — starving a sibling
+    /// connection whose client IS active (posh#136). Releasing the link lets the
+    /// next active endpoint's `symlink_needs_takeover()` fire (absent ⇒ true).
+    /// We reclaim it on a later tick once our peer is active again.
+    fn release_symlink(&self) {
+        if self.symlink_points_to_self() {
+            let _ = std::fs::remove_file(&self.well_known);
+        }
+    }
+
     /// A snapshot of this endpoint's state for the server→client agent-forwarding
     /// diagnostic (FDR 0004): the live channel count, the next channel id
     /// to be assigned, and whether we still own the well-known symlink. Rides the
@@ -265,9 +278,22 @@ impl AgentEndpoint {
         }
         self.last_tick = now;
 
-        // Reclaim the endpoint if its owner died or the link went stale.
-        if self.symlink_needs_takeover() {
-            let _ = self.claim_symlink();
+        if peer_active {
+            // Own the endpoint only while OUR client is active. Reclaim a link
+            // whose owner died or went stale — but only when we can actually
+            // serve it (an active peer). Claiming it while our own peer is
+            // inactive is exactly the posh#136 starvation: we'd hold `agent/sock`
+            // pointing at a socket that fast-fails every request.
+            if self.symlink_needs_takeover() {
+                let _ = self.claim_symlink();
+            }
+        } else {
+            // Our peer is gone: relinquish `agent/sock` if we hold it, so a
+            // sibling endpoint whose client IS active can take over (its
+            // `symlink_needs_takeover()` sees the link absent). Without this the
+            // link stays pinned to us — `socket_is_dead` reports our still-bound
+            // listener "alive" — and active siblings are starved (posh#136).
+            self.release_symlink();
         }
         self.gc_dead_sockets();
 
@@ -771,6 +797,49 @@ mod tests {
         ep.tick(true, AGENT_SLOW_TICK_MS + 1);
         let target = std::fs::read_link(ep.sock_path()).unwrap();
         assert_eq!(target.to_str().unwrap(), format!("srv-{}.sock", own_pid()));
+        drop(ep);
+        std::fs::remove_dir_all(&base).ok();
+    }
+
+    // posh#136: an endpoint whose PEER goes inactive must relinquish `agent/sock`
+    // (not keep it pinned to its still-bound-but-unserved socket), so a sibling
+    // endpoint with an active client can take over. Without the release, the
+    // link stays ours (`socket_is_dead` sees our listener "alive") and every
+    // request routed here fast-fails — starving the active sibling.
+    #[test]
+    fn inactive_peer_releases_the_owned_symlink() {
+        let base = temp_base();
+        let mut ep = AgentEndpoint::new(&base).unwrap();
+        assert!(ep.symlink_points_to_self(), "fresh endpoint owns agent/sock");
+        // A tick with peer_active=false relinquishes the link (past the gate).
+        ep.last_tick = 0;
+        ep.tick(false, AGENT_SLOW_TICK_MS + 1);
+        assert!(
+            std::fs::symlink_metadata(ep.sock_path()).is_err(),
+            "an inactive-peer tick must remove the symlink it owned (posh#136)"
+        );
+        assert!(ep.own_sock.exists(), "our listener socket itself stays bound");
+        drop(ep);
+        std::fs::remove_dir_all(&base).ok();
+    }
+
+    // posh#136: once released (or absent), an endpoint whose peer is ACTIVE
+    // reclaims `agent/sock` on the next tick — so the stable path resolves to a
+    // live, active endpoint again.
+    #[test]
+    fn active_peer_reclaims_a_released_symlink() {
+        let base = temp_base();
+        let mut ep = AgentEndpoint::new(&base).unwrap();
+        // Release it (simulate our own earlier inactive-peer tick).
+        ep.release_symlink();
+        assert!(
+            std::fs::symlink_metadata(ep.sock_path()).is_err(),
+            "released link is gone"
+        );
+        // A tick with peer_active=true reclaims it.
+        ep.last_tick = 0;
+        ep.tick(true, AGENT_SLOW_TICK_MS + 1);
+        assert!(ep.symlink_points_to_self(), "active peer reclaims the link");
         drop(ep);
         std::fs::remove_dir_all(&base).ok();
     }
