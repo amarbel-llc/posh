@@ -589,6 +589,31 @@ debug-verify-remote-rawkeys *ARGS:
     echo >&2; echo ">> ===== remote rawkeys receipt =====" >&2
     if [ -s "$receipt" ]; then cat "$receipt"; else echo "(no receipt written)" >&2; fi
 
+# Run the kitty-PUSHING capture (scripts/kittycap.sh) as the session command
+# over a LOOPBACK roaming pair — the posh#131 decider that posht cannot be
+# (posht only QUERIES kitty; kittycap PUSHES `\x1b[>31u`). Proves whether the
+# kitty enable reaches YOUR terminal over the transport (Escape should arrive as
+# `\x1b[27u`, not bare 1b) and, at the Ctrl-^ prompt, whether the palette opens
+# (client intercepted it) or a `54;5u` line reaches the capture (the remote
+# escape loop leaked it). Run in a real kitty terminal, outside clown/posh; press
+# Ctrl-^, then Escape / Shift+Tab to confirm kitty is live, then q to quit, then
+# detach with Ctrl-^ then "." Debug-only; the hermetic gate is build-rust.
+[group("debug")]
+debug-verify-remote-kittycap:
+    #!/usr/bin/env bash
+    set -euo pipefail
+    cd '{{ justfile_directory() }}'
+    nix develop --command cargo build -q -p posh
+    posh="$PWD/target/debug/posh"
+    dir=$(mktemp -d); export POSH_DIR="$dir"
+    fifo=$(mktemp -u); mkfifo "$fifo"
+    trap 'rm -f "$fifo"; pkill -f "[p]osh server new" 2>/dev/null || true; rm -rf "$dir"' EXIT
+    echo ">> loopback roaming server running scripts/kittycap.sh" >&2
+    env -u POSH_DEBUG_LOG "$posh" server new -4 -- bash "$PWD/scripts/kittycap.sh" >"$fifo" &
+    read -r _ _ port key < <(grep -m1 '^POSH CONNECT ' "$fifo")
+    echo ">> connecting client to 127.0.0.1:$port — press Ctrl-^ and report the line" >&2
+    POSH_KEY="$key" "$posh" client -4 127.0.0.1 "$port" || true
+
 # Verify TERM/COLORTERM forwarding (#51) over a LOCAL loopback server+client
 # pair with freshly-built worktree binaries. Runs your $SHELL in the session;
 # inside it check `echo $TERM` is non-empty and `git -c color.ui=auto status`
