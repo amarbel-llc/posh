@@ -1000,27 +1000,44 @@ fn drive_client(st: &mut ClientState, raw: &RawMode, port: u16) -> Result<i32> {
 
         if util::take_flag(&util::SIGWINCH_RECEIVED) {
             let size = pty::term_size(STDOUT);
-            st.rows = size.0;
-            st.cols = size.1;
-            if let Some(p) = st.palette.as_mut() {
-                p.resize(st.rows, st.cols);
+            // A SIGWINCH does not guarantee the geometry changed; terminals and
+            // multiplexers deliver redundant same-size WINCHes. Acting on those
+            // dropped the scrollback ring and forced a resync for no reason (the
+            // no-detach backscroll reset, posh#134). Skip the whole body when the
+            // size is unchanged; only a real resize reflows/repaints/re-syncs.
+            let changed = size != (st.rows, st.cols);
+            if util::log_active() {
+                util::log_write(
+                    "winch",
+                    &format!(
+                        "SIGWINCH {}x{} -> {}x{} changed={changed}",
+                        st.rows, st.cols, size.0, size.1,
+                    ),
+                );
             }
-            st.predict.reset();
-            st.initialized = false; // full repaint at the new size
-            // RFC 0002 §4: a width change rewraps the server's ring, so
-            // absolute row continuity ends. Drop the accumulated ring,
-            // discard the (not-yet-built) scroll view by virtue of the
-            // repaint, and stop advertising SCROLLBACK for the resize
-            // message so the server restarts appended-row counting afresh.
-            st.scrollback.clear();
-            st.scroll_offset = 0; // FDR 0005: a resize returns to the live view
-            st.suppress_scrollback_once = true;
-            // v2 (RFC 0009): expect a fresh epoch — the server, seeing our new
-            // size, bumps it; until its ack arrives, in-flight v2 bodies from
-            // the superseded row space are discarded (unknown epoch).
-            st.sb2_epoch = None;
-            st.sb2_rows = 0;
-            send_now = true;
+            if changed {
+                st.rows = size.0;
+                st.cols = size.1;
+                if let Some(p) = st.palette.as_mut() {
+                    p.resize(st.rows, st.cols);
+                }
+                st.predict.reset();
+                st.initialized = false; // full repaint at the new size
+                // RFC 0002 §4: a width change rewraps the server's ring, so
+                // absolute row continuity ends. Drop the accumulated ring,
+                // discard the (not-yet-built) scroll view by virtue of the
+                // repaint, and stop advertising SCROLLBACK for the resize
+                // message so the server restarts appended-row counting afresh.
+                st.scrollback.clear();
+                st.scroll_offset = 0; // FDR 0005: a resize returns to the live view
+                st.suppress_scrollback_once = true;
+                // v2 (RFC 0009): expect a fresh epoch — the server, seeing our
+                // new size, bumps it; until its ack arrives, in-flight v2 bodies
+                // from the superseded row space are discarded (unknown epoch).
+                st.sb2_epoch = None;
+                st.sb2_rows = 0;
+                send_now = true;
+            }
         }
 
         if util::take_flag(&util::SIGTERM_RECEIVED) {

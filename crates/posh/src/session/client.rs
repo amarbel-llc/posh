@@ -312,10 +312,20 @@ impl FrameRenderer {
     /// Track a tty resize (SIGWINCH): the daemon re-encodes at the new size, so
     /// the model must apply subsequent frames at the same dimensions (DumpDiff's
     /// reparse clamps to these). Forces the next frame to fully repaint at the
-    /// new size.
-    fn resize(&mut self, rows: u16, cols: u16) {
-        self.rows = rows.max(1);
-        self.cols = cols.max(1);
+    /// new size. Returns whether the dimensions actually changed.
+    ///
+    /// A SIGWINCH does NOT guarantee the geometry changed — terminals and
+    /// multiplexers deliver spurious/redundant WINCHes with identical dimensions.
+    /// Guard against that: a no-change resize must NOT clear the scrollback ring
+    /// (which would wipe the user's backscroll for no reason — posh#134), nor
+    /// force a repaint. Only a real size change reflows and re-accumulates.
+    fn resize(&mut self, rows: u16, cols: u16) -> bool {
+        let (rows, cols) = (rows.max(1), cols.max(1));
+        if rows == self.rows && cols == self.cols {
+            return false; // spurious/redundant WINCH: keep the ring and view
+        }
+        self.rows = rows;
+        self.cols = cols;
         self.initialized = false;
         // A resize returns to the live view (FDR 0005): the frozen viewport was
         // measured against the old geometry and the ring is about to be cleared.
@@ -340,6 +350,7 @@ impl FrameRenderer {
         // there; remote's per-message cap-suppression lever does not port to the
         // once-negotiated local socket.
         self.scrollback.clear();
+        true
     }
 
     /// Force the next rendered frame to clear + fully repaint — used after the
@@ -683,6 +694,14 @@ fn client_loop(stream: UnixStream, enter: &[u8], raw: &RawMode) -> Result<i32> {
     let sock_fd = stream.as_raw_fd();
     util::set_nonblocking(STDIN)?;
 
+    // Opt-in diagnostics: the local attach client is silent by default (unlike
+    // the daemon, which always logs). `$POSH_DEBUG_LOG` arms the shared file
+    // sink so the SIGWINCH breadcrumb below can confirm whether spurious
+    // same-size WINCHes are firing (posh#134).
+    if let Some(p) = std::env::var_os("POSH_DEBUG_LOG").filter(|p| !p.is_empty()) {
+        let _ = util::log_init(std::path::Path::new(&p));
+    }
+
     let mut sock_write_buf: Vec<u8> = Vec::with_capacity(4096);
     let mut stdout_buf: Vec<u8> = Vec::with_capacity(4096);
     let mut read_buf = FrameBuffer::new();
@@ -751,20 +770,42 @@ fn client_loop(stream: UnixStream, enter: &[u8], raw: &RawMode) -> Result<i32> {
     let result: Result<i32> = 'client: loop {
         if util::take_flag(&util::SIGWINCH_RECEIVED) {
             let (rows, cols) = pty::term_size(STDOUT);
-            frame_size = (rows, cols);
-            if let Some(fr) = frame_renderer.as_mut() {
-                fr.resize(rows, cols);
+            // A SIGWINCH does not guarantee the geometry changed; terminals and
+            // multiplexers deliver redundant same-size WINCHes. Acting on those
+            // wiped the scrollback ring and spammed a redundant Tag::Resize to
+            // the daemon (which restarts per-client scrollback counting) — the
+            // no-detach backscroll reset (posh#134). Skip the whole body when the
+            // size is unchanged; only a real resize reflows/repaints/re-syncs.
+            let changed = (rows, cols) != frame_size;
+            if util::log_active() {
+                util::log_write(
+                    "winch",
+                    &format!(
+                        "SIGWINCH {}x{} -> {rows}x{cols} changed={changed}",
+                        frame_size.0, frame_size.1,
+                    ),
+                );
             }
-            // Keep the palette renderer sized to the tty while it is up (mirror
-            // remote client.rs); a closed renderer is resized when next opened.
-            if let Some(p) = palette.as_mut().filter(|p| p.is_open()) {
-                p.resize(rows, cols);
+            if changed {
+                frame_size = (rows, cols);
+                if let Some(fr) = frame_renderer.as_mut() {
+                    fr.resize(rows, cols);
+                }
+                // Keep the palette renderer sized to the tty while it is up
+                // (mirror remote client.rs). A closed-but-persisted palette is
+                // NOT resized here and is NOT resized on reopen either, so it
+                // renders at a stale size after a resize — pre-existing bug
+                // posh#135 (the fix belongs on the reopen path, out of scope
+                // for the posh#134 SIGWINCH guard).
+                if let Some(p) = palette.as_mut().filter(|p| p.is_open()) {
+                    p.resize(rows, cols);
+                }
+                ipc::append_frame(
+                    &mut sock_write_buf,
+                    Tag::Resize,
+                    &ipc::encode_resize(rows, cols),
+                );
             }
-            ipc::append_frame(
-                &mut sock_write_buf,
-                Tag::Resize,
-                &ipc::encode_resize(rows, cols),
-            );
         }
 
         if util::take_flag(&util::SIGTERM_RECEIVED) {
@@ -1530,10 +1571,36 @@ mod tests {
             .append(&[b"old width row\r\n".to_vec()]);
         assert_eq!(renderer.scrollback.len(), 1);
 
-        renderer.resize(rows, 100);
+        assert!(renderer.resize(rows, 100), "a real size change reports changed");
         assert!(
             renderer.scrollback.is_empty(),
             "a resize must clear the ring so the new width re-accumulates cleanly"
+        );
+    }
+
+    /// posh#134: a SIGWINCH that reports the SAME dimensions (spurious/redundant
+    /// WINCH, as terminals and multiplexers deliver) must NOT clear the ring —
+    /// that wiped the user's backscroll for no reason, with no detach. `resize`
+    /// no-ops and reports unchanged so the caller skips the resync too.
+    #[test]
+    fn resize_to_same_dimensions_keeps_the_scrollback_ring() {
+        let (rows, cols) = (24u16, 80u16);
+        let mut renderer = FrameRenderer::new(rows, cols);
+        renderer.scrollback.append(&[b"kept row\r\n".to_vec()]);
+        renderer.scroll_offset = 3; // a frozen scroll-view position
+
+        assert!(
+            !renderer.resize(rows, cols),
+            "a same-size resize must report unchanged"
+        );
+        assert_eq!(
+            renderer.scrollback.len(),
+            1,
+            "a same-size WINCH must not clear the ring (posh#134)"
+        );
+        assert_eq!(
+            renderer.scroll_offset, 3,
+            "a same-size WINCH must not disturb the scroll-view position"
         );
     }
 
