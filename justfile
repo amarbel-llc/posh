@@ -796,61 +796,110 @@ debug-posh-sockets:
       fi
     done
 
-# Deep read-only kernel state for ONE posh pid (from debug-posh-procs): its
-# wait channel + stack (blocked in which syscall?), state, voluntary vs
-# nonvoluntary context-switch counters (parked vs spinning), and fd table
-# (which UDP socket + which PTY master it holds). This is how you localize
-# *where* a wedged roaming server is stuck. Pure /proc reads — the stack may be
-# empty if kptr/yama restricts it, but wchan/status/fd are always readable for
-# your own process. Usage: just debug-posh-proc-state 12345
+# Deep read-only state for ONE posh pid (from debug-posh-procs): its wait
+# channel + stack (blocked in which syscall?), state, and fd table (which UDP
+# socket + which PTY master it holds). This is how you localize *where* a wedged
+# roaming server is stuck. Linux reads /proc (kernel wchan/stack, ctxt-switch
+# counters, Sig* masks); macOS uses ps + lsof + `sample` (posh#133). macOS has
+# no readable KERNEL stack and BSD ps exposes no ctxt-switch/Sig* counters, so
+# those are approximated (userspace `sample`) or omitted — noted inline.
 [group("debug")]
 debug-posh-proc-state pid:
     #!/usr/bin/env bash
     set -euo pipefail
     p='{{ pid }}'
-    [ -d "/proc/$p" ] || { echo "no such pid: $p" >&2; exit 1; }
-    echo "== cmdline =="; tr '\0' ' ' < "/proc/$p/cmdline" 2>/dev/null; echo
-    echo "== wchan =="; cat "/proc/$p/wchan" 2>/dev/null; echo
-    echo "== stack =="; cat "/proc/$p/stack" 2>/dev/null || echo "(stack unreadable)"
-    echo "== status =="
-    grep -E '^(State|Threads|VmRSS|voluntary_ctxt_switches|nonvoluntary_ctxt_switches|SigQ|SigPnd|SigBlk):' \
-      "/proc/$p/status" 2>/dev/null || true
-    echo "== fds (sockets, ptys, pipes) =="
-    ls -l "/proc/$p/fd" 2>/dev/null || echo "(fd dir unreadable)"
+    if [ "$(uname -s)" = Darwin ]; then
+      kill -0 "$p" 2>/dev/null || { echo "no such pid: $p" >&2; exit 1; }
+      echo "== cmdline =="; ps -o command= -p "$p"
+      # BSD ps: wchan = kernel wait channel; state (STAT); rss in KiB.
+      echo "== wchan / state / rss =="; ps -o wchan=,state=,rss= -p "$p"
+      # No /proc/$p/stack on macOS: `sample` captures a USERSPACE call-stack
+      # profile (not the kernel syscall stack Linux shows), which still localizes
+      # a spin. 1s sample; needs no privileges for your own process.
+      echo "== sample (1s userspace stacks) =="
+      sample "$p" 1 2>/dev/null | sed -n '1,40p' || echo "(sample failed)"
+      # BSD ps exposes no voluntary/nonvoluntary ctxt-switch counters or Sig*
+      # masks; use debug-posh-proc-sample for the CPU-time liveness probe instead.
+      echo "== fds (sockets, ptys, pipes) =="
+      lsof -nP -p "$p" 2>/dev/null || echo "(lsof failed)"
+    else
+      [ -d "/proc/$p" ] || { echo "no such pid: $p" >&2; exit 1; }
+      echo "== cmdline =="; tr '\0' ' ' < "/proc/$p/cmdline" 2>/dev/null; echo
+      echo "== wchan =="; cat "/proc/$p/wchan" 2>/dev/null; echo
+      echo "== stack =="; cat "/proc/$p/stack" 2>/dev/null || echo "(stack unreadable)"
+      echo "== status =="
+      grep -E '^(State|Threads|VmRSS|voluntary_ctxt_switches|nonvoluntary_ctxt_switches|SigQ|SigPnd|SigBlk):' \
+        "/proc/$p/status" 2>/dev/null || true
+      echo "== fds (sockets, ptys, pipes) =="
+      ls -l "/proc/$p/fd" 2>/dev/null || echo "(fd dir unreadable)"
+    fi
 
 # Liveness probe for ONE posh pid: is its poll loop still cycling, or frozen?
-# Samples the context-switch counters and WCHAN/State twice across SECS (default
-# 3s) and prints the delta. A live-but-idle roaming server still wakes on its
-# heartbeat/poll timeout, so dvol > 0 means the event loop is alive (the wedge
-# is then on the network/peer side — acks not arriving, peer forgotten, sends
-# stopped); dvol == 0 with State S means genuinely parked (nothing to do — no
-# PTY output, no datagrams). Also lists child processes (the session shell): a
-# live shell child confirms the session itself is intact. Read-only.
+# Samples twice across SECS (default 3s) and prints the delta. A live-but-idle
+# roaming server still wakes on its heartbeat/poll timeout, so a nonzero delta
+# means the event loop is alive (the wedge is then on the network/peer side —
+# acks not arriving, peer forgotten, sends stopped); a zero delta with a
+# sleeping state means genuinely parked (nothing to do — no PTY output, no
+# datagrams). Linux uses the ctxt-switch counters (/proc/$p/status); macOS has
+# no such counter in ps, so it uses the CPU-TIME delta + WCHAN change as the
+# liveness signal instead (a cycling loop burns a little CPU / changes wait
+# channel each wakeup; posh#133). Also lists child processes (the session
+# shell): a live child confirms the session is intact. Read-only.
 # Usage: just debug-posh-proc-sample 12345 [secs]
 [group("debug")]
 debug-posh-proc-sample pid secs="3":
     #!/usr/bin/env bash
     set -euo pipefail
     p='{{ pid }}'
-    [ -d "/proc/$p" ] || { echo "no such pid: $p" >&2; exit 1; }
-    read_vol() { awk -F'\t' '/^voluntary_ctxt_switches:/{print $2}' "/proc/$p/status"; }
-    read_nonvol() { awk -F'\t' '/^nonvoluntary_ctxt_switches:/{print $2}' "/proc/$p/status"; }
-    v0="$(read_vol)"; n0="$(read_nonvol)"; w0="$(cat /proc/$p/wchan)"
-    sleep '{{ secs }}'
-    v1="$(read_vol)"; n1="$(read_nonvol)"; w1="$(cat /proc/$p/wchan)"
-    st="$(awk -F'\t' '/^State:/{print $2}' /proc/$p/status)"
-    echo "pid $p  State=$st"
-    echo "  voluntary_ctxt_switches:    $v0 -> $v1   (delta $((v1 - v0)) over {{ secs }}s)"
-    echo "  nonvoluntary_ctxt_switches: $n0 -> $n1   (delta $((n1 - n0)))"
-    echo "  wchan: $w0 -> $w1"
-    if [ "$((v1 - v0))" -gt 0 ]; then
-      echo "  => event loop ALIVE (waking on heartbeat/poll); wedge is peer/network-side"
+    if [ "$(uname -s)" = Darwin ]; then
+      kill -0 "$p" 2>/dev/null || { echo "no such pid: $p" >&2; exit 1; }
+      # BSD ps: cputime (accumulated CPU time) + wchan. A cycling poll loop
+      # advances cputime and/or flips wchan between wakeups; a parked one holds
+      # both steady. cputime string compare is enough (we only need changed/not).
+      t0="$(ps -o cputime= -p "$p" | tr -d ' ')"; w0="$(ps -o wchan= -p "$p" | tr -d ' ')"
+      sleep '{{ secs }}'
+      t1="$(ps -o cputime= -p "$p" | tr -d ' ')"; w1="$(ps -o wchan= -p "$p" | tr -d ' ')"
+      st="$(ps -o state= -p "$p" | tr -d ' ')"
+      echo "pid $p  State=$st"
+      echo "  cputime: $t0 -> $t1"
+      echo "  wchan:   $w0 -> $w1"
+      if [ "$t0" != "$t1" ] || [ "$w0" != "$w1" ]; then
+        echo "  => event loop ALIVE (CPU advanced / wchan moved); wedge is peer/network-side"
+      else
+        echo "  => parked: no CPU progress or wchan change in {{ secs }}s (idle, or stuck)"
+      fi
+      echo "== child processes (session shell) =="
+      # BSD ps has no --ppid; pgrep -P is the correct ppid filter. Feed the
+      # child pids back through ps for state/time/command (a substring match on
+      # the full listing would spuriously match the pid anywhere in argv).
+      kids="$(pgrep -P "$p" 2>/dev/null || true)"
+      if [ -n "$kids" ]; then
+        # shellcheck disable=SC2086
+        ps -o pid=,state=,time=,command= -p $(echo "$kids" | tr '\n' ',')
+      else
+        echo "(no children — shell may have exited)"
+      fi
     else
-      echo "  => parked: no wakeups in {{ secs }}s (idle, or genuinely stuck)"
+      [ -d "/proc/$p" ] || { echo "no such pid: $p" >&2; exit 1; }
+      read_vol() { awk -F'\t' '/^voluntary_ctxt_switches:/{print $2}' "/proc/$p/status"; }
+      read_nonvol() { awk -F'\t' '/^nonvoluntary_ctxt_switches:/{print $2}' "/proc/$p/status"; }
+      v0="$(read_vol)"; n0="$(read_nonvol)"; w0="$(cat /proc/$p/wchan)"
+      sleep '{{ secs }}'
+      v1="$(read_vol)"; n1="$(read_nonvol)"; w1="$(cat /proc/$p/wchan)"
+      st="$(awk -F'\t' '/^State:/{print $2}' /proc/$p/status)"
+      echo "pid $p  State=$st"
+      echo "  voluntary_ctxt_switches:    $v0 -> $v1   (delta $((v1 - v0)) over {{ secs }}s)"
+      echo "  nonvoluntary_ctxt_switches: $n0 -> $n1   (delta $((n1 - n0)))"
+      echo "  wchan: $w0 -> $w1"
+      if [ "$((v1 - v0))" -gt 0 ]; then
+        echo "  => event loop ALIVE (waking on heartbeat/poll); wedge is peer/network-side"
+      else
+        echo "  => parked: no wakeups in {{ secs }}s (idle, or genuinely stuck)"
+      fi
+      echo "== child processes (session shell) =="
+      nix shell nixpkgs#procps --command ps --ppid "$p" -o pid,stat,etimes,wchan:20,args \
+        || echo "(no children — shell may have exited)"
     fi
-    echo "== child processes (session shell) =="
-    nix shell nixpkgs#procps --command ps --ppid "$p" -o pid,stat,etimes,wchan:20,args \
-      || echo "(no children — shell may have exited)"
 
 # Trigger a one-shot SIGUSR2 transport-state dump from a running roaming posh
 # server OR client (pid from debug-posh-procs) and print the new line. The
@@ -864,7 +913,8 @@ debug-posh-dump pid:
     #!/usr/bin/env bash
     set -euo pipefail
     pid='{{ pid }}'
-    [ -d "/proc/$pid" ] || { echo "no such pid: $pid" >&2; exit 1; }
+    # kill -0 is the portable pid-existence check (no /proc on macOS; posh#133).
+    kill -0 "$pid" 2>/dev/null || { echo "no such pid: $pid" >&2; exit 1; }
     kill -USR2 "$pid"
     sleep 0.3
     uid="$(id -u)"
@@ -893,6 +943,44 @@ debug-posh-dump pid:
     fi
     echo ">> $f"
     tail -n1 "$f"
+
+# macOS ONLY: search the kernel/system log for what killed a posh daemon that
+# vanished with no clean-shutdown line. A signal/OOM death logs NOTHING in the
+# posh log (every internal exit path logs first), so the evidence lives in the
+# unified log: jetsam (memory-pressure) kills, low-swap warnings, and explicit
+# terminations of posh/clown. Read-only, no sudo (own-uid process events).
+# BOUND the scan tightly with a START..END window — `log show` scans the WHOLE
+# window across all subsystems before filtering, so `--last 4h` is
+# pathologically slow (it will time out); a ~15min window around a known death
+# time is the paved path. WINDOW is one arg 'START..END' (the MCP recipe runner
+# passes a single positional arg, so the two times are joined with '..' and
+# split here). Times are `log show` format ('YYYY-MM-DD HH:MM:SS', local).
+# Usage: just debug-posh-killlog '2026-07-08 17:05:00..2026-07-08 17:20:00'
+[group("debug")]
+debug-posh-killlog window:
+    #!/usr/bin/env bash
+    set -euo pipefail
+    if [ "$(uname -s)" != Darwin ]; then
+      echo "macOS-only: on Linux use dmesg / journalctl -k for OOM-killer records" >&2
+      exit 2
+    fi
+    window='{{ window }}'
+    start="${window%%..*}"; end="${window##*..}"
+    if [ "$start" = "$window" ] || [ -z "$end" ]; then
+      echo "window must be 'START..END' (e.g. '2026-07-08 17:05:00..2026-07-08 17:20:00')" >&2
+      exit 2
+    fi
+    echo "== jetsam / memory-pressure kills ($start .. $end) =="
+    # jetsam is the macOS memory-pressure killer; it names the victim process
+    # and pid. This is the record that confirms an OOM death.
+    log show --start "$start" --end "$end" --style compact \
+      --predicate 'eventMessage CONTAINS[c] "jetsam" OR eventMessage CONTAINS[c] "memorystatus" OR eventMessage CONTAINS[c] "lowswap"' \
+      2>/dev/null | grep -iE 'posh|clown|jetsam|kill|memorystatus' || echo "(no jetsam/memory-pressure records)"
+    echo
+    echo "== termination / signal records mentioning posh or clown =="
+    log show --start "$start" --end "$end" --style compact \
+      --predicate '(eventMessage CONTAINS[c] "posh" OR eventMessage CONTAINS[c] "clown") AND (eventMessage CONTAINS[c] "kill" OR eventMessage CONTAINS[c] "signal" OR eventMessage CONTAINS[c] "exit" OR eventMessage CONTAINS[c] "terminat")' \
+      2>/dev/null || echo "(no matching termination records)"
 
 # Fetch a remote roaming server's posh-server log to this host for correlation
 # with a client wedge. With `pid=` (read off the client's `srv=(pid=…)`), fetch
