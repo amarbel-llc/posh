@@ -693,7 +693,18 @@ fn daemon_main(
 ) -> ! {
     util::redirect_stdio_devnull();
     let _ = util::log_init(&cfg.log_path(name));
-    util::install_sigterm_handler();
+    // A daemon panic used to abort with no trace in the posh log (only the exit
+    // paths that log first are visible), so a panic-death was indistinguishable
+    // from a signal-kill. Record it before the default hook unwinds/aborts.
+    // The hook only touches the already-initialized file logger (no unwinding
+    // across the FFI boundary), so it is panic-safe.
+    std::panic::set_hook(Box::new(|info| {
+        util::log_write("error", &format!("daemon panic: {info}"));
+    }));
+    // Catch SIGTERM/SIGHUP/SIGINT and record which one fired: a terminating
+    // signal now names itself in the teardown log instead of killing the daemon
+    // silently under the default disposition (posh#136 silent-death diagnosis).
+    util::install_daemon_signal_handlers();
     let socket_path = cfg.socket_path(name).expect("socket path");
     let cwd = std::env::current_dir()
         .map(|p| p.display().to_string())
@@ -792,7 +803,14 @@ fn daemon_loop(
 
     'daemon: loop {
         if util::take_flag(&util::SIGTERM_RECEIVED) {
-            util::log_write("info", "SIGTERM received, shutting down gracefully");
+            let signo = util::LAST_SIGNAL.load(std::sync::atomic::Ordering::Acquire);
+            util::log_write(
+                "info",
+                &format!(
+                    "{} received, shutting down gracefully",
+                    util::signal_name(signo)
+                ),
+            );
             break;
         }
 

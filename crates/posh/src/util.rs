@@ -6,7 +6,7 @@ use std::fs::{File, OpenOptions};
 use std::io::Write;
 use std::os::fd::RawFd;
 use std::path::{Path, PathBuf};
-use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicI32, Ordering};
 use std::sync::{Mutex, OnceLock};
 use std::time::Instant;
 
@@ -355,11 +355,28 @@ pub static SIGUSR1_RECEIVED: AtomicBool = AtomicBool::new(false);
 pub static SIGUSR2_RECEIVED: AtomicBool = AtomicBool::new(false);
 pub static SIGCONT_RECEIVED: AtomicBool = AtomicBool::new(false);
 
+/// The signal number that last requested a terminating shutdown, or 0 if the
+/// terminate flag was set by something other than a caught signal. The daemon
+/// reads this when `SIGTERM_RECEIVED` fires so its teardown log can name the
+/// actual signal (SIGTERM vs SIGHUP vs SIGINT) — the difference between the
+/// three was invisible before, which made a daemon that vanished on an uncaught
+/// SIGHUP/SIGINT indistinguishable from one killed by SIGKILL (posh#136-adjacent
+/// silent-death investigation).
+pub static LAST_SIGNAL: AtomicI32 = AtomicI32::new(0);
+
 extern "C" fn on_sigwinch(_: libc::c_int) {
     SIGWINCH_RECEIVED.store(true, Ordering::Release);
 }
 
 extern "C" fn on_sigterm(_: libc::c_int) {
+    SIGTERM_RECEIVED.store(true, Ordering::Release);
+}
+
+/// Terminating-signal handler that also records WHICH signal fired, so the
+/// consumer can log it. Routes SIGTERM/SIGHUP/SIGINT to the same terminate
+/// flag (all three mean "wind down") while preserving the signo in LAST_SIGNAL.
+extern "C" fn on_terminating_signal(signo: libc::c_int) {
+    LAST_SIGNAL.store(signo, Ordering::Release);
     SIGTERM_RECEIVED.store(true, Ordering::Release);
 }
 
@@ -388,11 +405,30 @@ fn install_handler(signo: libc::c_int, handler: usize) {
     }
 }
 
-pub fn install_sigterm_handler() {
-    install_handler(
-        libc::SIGTERM,
-        on_sigterm as extern "C" fn(libc::c_int) as usize,
-    );
+/// Daemon-side terminating-signal wiring: catches SIGTERM, SIGHUP, and SIGINT,
+/// routing all three to `SIGTERM_RECEIVED` (they all mean "wind down") while
+/// recording WHICH signal fired in `LAST_SIGNAL`, so a daemon that winds down
+/// names the cause in its teardown log instead of dying silently under the
+/// default disposition. The daemon is a `setsid` session leader with no
+/// controlling terminal, so it should never legitimately receive SIGHUP/SIGINT
+/// — catching them here does not change that a terminating signal shuts the
+/// daemon down (posh#136 chose to make the death VISIBLE before deciding whether
+/// to make it survivable), it only makes the event observable.
+pub fn install_daemon_signal_handlers() {
+    let handler = on_terminating_signal as extern "C" fn(libc::c_int) as usize;
+    for signo in [libc::SIGTERM, libc::SIGHUP, libc::SIGINT] {
+        install_handler(signo, handler);
+    }
+}
+
+/// Human-readable name for a terminating signal number, for log lines.
+pub fn signal_name(signo: libc::c_int) -> &'static str {
+    match signo {
+        libc::SIGTERM => "SIGTERM",
+        libc::SIGHUP => "SIGHUP",
+        libc::SIGINT => "SIGINT",
+        _ => "signal",
+    }
 }
 
 pub fn install_sigusr1_handler() {
