@@ -982,6 +982,51 @@ debug-posh-killlog window:
       --predicate '(eventMessage CONTAINS[c] "posh" OR eventMessage CONTAINS[c] "clown") AND (eventMessage CONTAINS[c] "kill" OR eventMessage CONTAINS[c] "signal" OR eventMessage CONTAINS[c] "exit" OR eventMessage CONTAINS[c] "terminat")' \
       2>/dev/null || echo "(no matching termination records)"
 
+# Verify the DEPLOYED posh daemon installs the signal instrumentation (posh#136):
+# spawn a throwaway detached daemon on the profile binary (NOT the worktree
+# build — this checks what is actually deployed), send it the given SIGNAL, and
+# confirm its log names the signal ("SIGHUP received, shutting down gracefully")
+# instead of dying silently under the default disposition. A PASS proves the
+# handler is live in a running daemon; a silent death (no named line) means the
+# running binary predates the fix or the handler is not wired. Isolated POSH_DIR,
+# cleaned on exit. Usage: just debug-posh-verify-signal [HUP|INT|TERM]
+[group("debug")]
+debug-posh-verify-signal signal="HUP":
+    #!/usr/bin/env bash
+    set -euo pipefail
+    posh="$(command -v posh)"
+    echo ">> deployed binary: $posh ($($posh version))" >&2
+    dir="$(mktemp -d /tmp/posh-verifysig-XXXXXX)"
+    name="vsig"
+    trap 'POSH_DIR=$dir "$posh" kill "$name" 2>/dev/null || true; rm -rf "$dir"' EXIT
+    export POSH_DIR=$dir
+    # Detached daemon running a long sleep so the shell never exits on its own —
+    # the ONLY way this daemon leaves its loop is the signal we send.
+    "$posh" attach --detach "$name" -- sleep 60 >/dev/null
+    log="$dir/default/$name.log"
+    # Wait for the daemon to come up and log its start line.
+    for _ in $(seq 1 50); do [ -s "$log" ] && break; sleep 0.1; done
+    # The `daemon started ... pid=N` line logs the SHELL CHILD pid (child.pid),
+    # not the daemon itself. The daemon is that child's PARENT — resolve it via
+    # ps, or we'd signal the sleep and trip the `shell exited` path instead of
+    # the signal handler we are trying to verify.
+    shell_pid="$(awk -F'pid=' '/daemon started/{print $2; exit}' "$log" 2>/dev/null | tr -d ' ' || true)"
+    if [ -z "${shell_pid:-}" ]; then echo "FAIL: daemon never logged a start line" >&2; exit 1; fi
+    daemon_pid="$(ps -o ppid= -p "$shell_pid" 2>/dev/null | tr -d ' ' || true)"
+    if [ -z "${daemon_pid:-}" ]; then echo "FAIL: could not resolve daemon (parent of shell $shell_pid)" >&2; exit 1; fi
+    echo ">> shell pid=$shell_pid, daemon pid=$daemon_pid; sending SIG{{ signal }} to daemon" >&2
+    kill -{{ signal }} "$daemon_pid"
+    # Give the loop a beat to notice the flag and write the teardown lines.
+    for _ in $(seq 1 50); do grep -q 'shutting down daemon' "$log" 2>/dev/null && break; sleep 0.1; done
+    echo "== daemon log ==" >&2
+    cat "$log" >&2
+    if grep -q "SIG{{ signal }} received, shutting down gracefully" "$log"; then
+      echo ">> PASS: daemon named the signal (instrumentation is live)" >&2
+    else
+      echo ">> FAIL: no named-signal line — running binary predates posh#136 or handler not wired" >&2
+      exit 1
+    fi
+
 # Fetch a remote roaming server's posh-server log to this host for correlation
 # with a client wedge. With `pid=` (read off the client's `srv=(pid=…)`), fetch
 # that EXACT server; without it, the newest. The remote logs to its
