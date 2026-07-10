@@ -384,52 +384,68 @@ impl FrameRenderer {
 
     /// Decode, apply, and render one `Tag::Frame` payload, returning the escape
     /// stream to write to the tty (empty when the frame produced no visible
-    /// change). Over the reliable Unix socket a frame always applies against the
-    /// last one, so an inability to apply (`ReackAndWait`) is a genuine protocol
-    /// bug — surfaced as an error rather than silently retried, since the local
-    /// client has no resync/keyframe-request path yet (a later task).
-    /// Test-only convenience over [`render_frame_acking`](Self::render_frame_acking)
-    /// that drops the ack number. The production client loop calls
-    /// `render_frame_acking` directly so it can ack the received frame (posh#137).
+    /// change). Test-only convenience over
+    /// [`render_frame_acking`](Self::render_frame_acking) that drops the ack
+    /// directive; the production client loop calls `render_frame_acking` directly
+    /// so it can send the `Tag::FrameAck` (posh#137). A base mismatch or apply-stall
+    /// is NOT an error here — it re-acks and waits for the daemon to re-base/resync,
+    /// converged onto the UDP client's state machine (#87) — so the `Result` is
+    /// only `Err` on a decode failure.
     #[cfg(test)]
     fn render_frame(&mut self, payload: &[u8], palette: Option<&Terminal>) -> Result<Vec<u8>> {
         self.render_frame_acking(payload, palette).0
     }
 
-    /// Like [`render_frame`](Self::render_frame) but also reports the RECEIVED
-    /// frame number the client must ack back (posh#137). The ack is the received
-    /// `frame.frame_num` — NOT `self.applied_num` — so a frame that applies as
-    /// `NoChange` (or a skipped scrollback body) is still acked, keeping a
-    /// coalescing daemon's base (which advances only on this ack, and advanced its
-    /// own `current_num` for that frame) in lockstep with the client. Acking the
-    /// lagging `applied_num` instead desyncs the base and wedges a later Diff into
-    /// `ReackAndWait`. `None` is returned only when the payload fails to decode or
-    /// the frame could not be applied (an `Err`) — there is nothing to ack.
+    /// Like [`render_frame`](Self::render_frame) but also reports the `Tag::FrameAck`
+    /// the client must send back: `(acked_frame, flags)`. Converged onto the UDP
+    /// client's `apply_frame` state machine (posh#137 / #87) — the local socket
+    /// and the roaming link speak the same posh-proto frames, so they must apply
+    /// them the same way:
+    ///
+    /// - A base-anchored body (`Diff`/`Morph`) applies ONLY when its `base ==
+    ///   applied_num`. On a mismatch the model is left untouched and the client
+    ///   re-acks its REAL `applied_num` so the daemon re-bases the next frame
+    ///   against a state the client actually holds. `base < applied_num` (the
+    ///   daemon base fell behind — the coalescing burst desync) additionally
+    ///   requests a `FRAME_ACK_RESYNC` so the daemon drops its base and sends a
+    ///   `Full`; `base > applied_num` (we are merely behind) is the benign case a
+    ///   re-ack resolves.
+    /// - `ReackAndWait` (an undecodable diff against a matching base) re-acks +
+    ///   requests RESYNC instead of being a fatal error — it must NEVER kill the
+    ///   session (the pre-#137 behavior that turned every desync into a
+    ///   respawn loop).
+    /// - Stale (`frame_num < applied_num`) and duplicate (`== applied_num`) frames
+    ///   are re-acked without reapplying.
+    ///
+    /// The ack frame is `applied_num` (our true state) on every mismatch/stale/dup
+    /// path and the freshly-advanced `applied_num` on a clean apply — so a
+    /// `NoChange` still re-acks our real state. Returns a `None` ack only on a
+    /// decode failure (nothing coherent to ack); the render `Result` is only `Err`
+    /// on that decode failure, never on an apply mismatch.
     fn render_frame_acking(
         &mut self,
         payload: &[u8],
         palette: Option<&Terminal>,
-    ) -> (Result<Vec<u8>>, Option<u64>) {
+    ) -> (Result<Vec<u8>>, Option<(u64, u8)>) {
         let frame = match ServerFrame::decode(payload) {
             Ok(f) => f,
             Err(e) => return (Err(e.into()), None),
         };
-        // The number to ack: the received frame, regardless of apply outcome.
-        let received = frame.frame_num;
-        // Scrollback growth (RFC 0002 §3): intercept BEFORE the applier — a
-        // scrollback frame appends scrolled-off rows to the local ring and
-        // leaves the visible model (and thus the tty) untouched, so it produces
-        // no render bytes. Mirrors the remote client's pre-applier intercept.
-        // The dup (`frame_num == applied_num`) and base (`base != applied_num`)
-        // guards are degenerate on the reliable socket — frames arrive once, in
-        // order — but kept for parity so a retransmit or superseding body never
-        // double-appends. Either way the frame is still acked (it was received).
+        // Stale retransmission: a frame older than what we hold. Re-ack our newer
+        // state, do not reapply. (Degenerate on a reliable socket, kept for parity
+        // and so a superseded retransmit can never regress the model.)
+        if frame.frame_num < self.applied_num {
+            return (Ok(Vec::new()), Some((self.applied_num, 0)));
+        }
+        // Scrollback growth (RFC 0002 §3): append rows to the local ring without
+        // disturbing the visible model. Applied only when we are exactly at its
+        // base; otherwise re-ack our state (never a fatal path).
         if let FrameBody::Scrollback { base, rows } = &frame.body {
             if frame.frame_num == self.applied_num {
-                return (Ok(Vec::new()), Some(received));
+                return (Ok(Vec::new()), Some((self.applied_num, 0)));
             }
             if *base != self.applied_num {
-                return (Ok(Vec::new()), Some(received));
+                return (Ok(Vec::new()), Some((self.applied_num, 0)));
             }
             let grew = rows.len();
             self.scrollback.append(rows);
@@ -440,9 +456,43 @@ impl FrameRenderer {
             // client has no periodic render tick, so the repaint happens here.
             if self.scroll_offset > 0 {
                 self.set_scroll(self.scroll_offset + grew);
-                return (Ok(self.compose_scroll()), Some(received));
+                return (Ok(self.compose_scroll()), Some((self.applied_num, 0)));
             }
-            return (Ok(Vec::new()), Some(received));
+            return (Ok(Vec::new()), Some((self.applied_num, 0)));
+        }
+        // Base-anchored bodies (Diff/Morph) apply ONLY at their base. This is the
+        // guard the local path was missing (posh#137): a coalescing burst emits
+        // several distinct Diffs all anchored at the same stale base, so applying
+        // one against an already-advanced model corrupts or short-bases. Re-ack our
+        // true applied_num and let the daemon re-base; RESYNC when the base is
+        // BEHIND us (the daemon base fell behind — will not self-heal by re-ack
+        // alone, so force a Full).
+        if let FrameBody::Diff { base, .. } | FrameBody::Morph { base, .. } = &frame.body {
+            if *base != self.applied_num {
+                if util::log_active() {
+                    util::log_write(
+                        "wedge",
+                        &format!(
+                            "base-mismatch frame={} body={} applied_num={} applied_len={} (re-ack{})",
+                            frame.frame_num,
+                            describe_body(&frame.body),
+                            self.applied_num,
+                            self.applied_data.len(),
+                            if *base < self.applied_num { "+resync" } else { "" },
+                        ),
+                    );
+                }
+                let flags = if *base < self.applied_num {
+                    ipc::FRAME_ACK_RESYNC
+                } else {
+                    0
+                };
+                return (Ok(Vec::new()), Some((self.applied_num, flags)));
+            }
+        }
+        // Duplicate of the frame we already hold: re-ack, do not reapply.
+        if frame.frame_num == self.applied_num {
+            return (Ok(Vec::new()), Some((self.applied_num, 0)));
         }
         match self.applier.apply(
             self.rows,
@@ -464,39 +514,26 @@ impl FrameRenderer {
                 self.applied_num = frame.frame_num;
             }
             // NoChange: the frame reproduced the current screen (applied_num does
-            // NOT advance), but it was still received and MUST be acked (posh#137).
-            ApplyOutcome::NoChange => return (Ok(Vec::new()), Some(received)),
+            // NOT advance); re-ack our true state.
+            ApplyOutcome::NoChange => return (Ok(Vec::new()), Some((self.applied_num, 0))),
+            // Undecodable diff against a MATCHING base (base == applied_num but the
+            // prefix/suffix overruns our dump — the #94 short-base class). Do NOT
+            // die: re-ack + request a Full, exactly like the UDP client. Leave a
+            // forensic breadcrumb (posh#137); lazily open the default per-pid sink
+            // since clown launches us without POSH_DEBUG_LOG.
             ApplyOutcome::ReackAndWait => {
-                // Forensic breadcrumb for the coalescing base-desync (posh#137):
-                // a reliable-socket frame that can't apply means the diff base the
-                // daemon encoded against is NOT the frame this client holds. Log
-                // the received frame, its body's declared base + kind, and our
-                // applied_num — `base != applied_num` on a Diff/Morph is the
-                // desync signature (base>applied_num ⇒ our acks lagged the daemon;
-                // base<applied_num ⇒ the daemon base fell behind). This is a fatal,
-                // session-ending error, and clown launches us without
-                // POSH_DEBUG_LOG, so lazily open the default per-pid sink
-                // (`$XDG_RUNTIME_DIR/posh/posh-client-<pid>.log`, discoverable via
-                // `just debug-posh-sockets`) rather than staying silent — the wedge
-                // must leave an on-disk trace or it cannot be root-caused.
                 crate::remote::diag::enable_logging("client");
                 util::log_write(
                     "wedge",
                     &format!(
-                        "apply-stall frame={} body={} applied_num={} applied_len={}",
+                        "apply-stall frame={} body={} applied_num={} applied_len={} (re-ack+resync)",
                         frame.frame_num,
                         describe_body(&frame.body),
                         self.applied_num,
                         self.applied_data.len(),
                     ),
                 );
-                return (
-                    Err(Error::Msg(format!(
-                        "session frame {} could not be applied on the reliable socket",
-                        frame.frame_num
-                    ))),
-                    None,
-                );
+                return (Ok(Vec::new()), Some((self.applied_num, ipc::FRAME_ACK_RESYNC)));
             }
         }
         // While scrolled up, the live model advanced underneath but the viewport
@@ -504,9 +541,9 @@ impl FrameRenderer {
         // generation, so an out-of-window change diffs to nothing) rather than
         // yanking to the live bottom.
         if self.scroll_offset > 0 {
-            return (Ok(self.compose_scroll()), Some(received));
+            return (Ok(self.compose_scroll()), Some((self.applied_num, 0)));
         }
-        (Ok(self.compose_live(palette)), Some(received))
+        (Ok(self.compose_live(palette)), Some((self.applied_num, 0)))
     }
 
     /// The live visible compose: non-prediction, palette-aware. When `palette` is
@@ -1132,29 +1169,29 @@ fn client_loop(stream: UnixStream, enter: &[u8], raw: &RawMode) -> Result<i32> {
                                 let fr = frame_renderer.get_or_insert_with(|| {
                                     FrameRenderer::new(frame_size.0, frame_size.1)
                                 });
-                                let (result, acked) =
+                                let (result, ack) =
                                     fr.render_frame_acking(&frame.payload, screen);
                                 let bytes = match result {
                                     Ok(bytes) => bytes,
                                     Err(e) => break 'client Err(e),
                                 };
                                 stdout_buf.extend_from_slice(&bytes);
-                                // posh#137: ack the RECEIVED frame so the daemon
-                                // advances our diff base and coalesces its queue
-                                // (it withholds the self-ack for a CAP_COALESCE
-                                // client). `render_frame_acking` reports the
-                                // received number (so a NoChange / skipped frame is
-                                // still acked — acking the lagging `applied_num`
-                                // desyncs the base and wedges a later Diff) without
-                                // a second decode of the (possibly multi-MB)
-                                // payload. Skipped while toggled off — then the
-                                // daemon self-acks and this ack would be redundant.
+                                // posh#137/#87: ack our TRUE applied_num (+ any
+                                // RESYNC flag) so a coalescing daemon (which
+                                // withholds the self-ack for a CAP_COALESCE client)
+                                // re-bases the next frame against the state we
+                                // actually hold — the converged re-ack/resync path
+                                // the UDP client uses. On a base mismatch or
+                                // apply-stall `render_frame_acking` re-acks without
+                                // advancing (never a fatal error). Skipped while
+                                // toggled off — then the daemon self-acks and this
+                                // ack would be redundant.
                                 if coalesce_on {
-                                    if let Some(frame_num) = acked {
+                                    if let Some((frame_num, flags)) = ack {
                                         ipc::append_frame(
                                             &mut sock_write_buf,
                                             Tag::FrameAck,
-                                            &ipc::encode_frame_ack(frame_num, 0),
+                                            &ipc::encode_frame_ack(frame_num, flags),
                                         );
                                     }
                                 }
@@ -1650,21 +1687,22 @@ mod tests {
         }
     }
 
-    /// Regression (posh#137 coalescing desync): a coalescing client acks the
-    /// RECEIVED frame number after every frame — INCLUDING a frame that applies as
-    /// `NoChange` (a repaint whose dump equals the acked base). The daemon advances
-    /// a coalescing client's base only on that ack, and it advanced `current_num`
-    /// for the NoChange frame too, so an ack that lagged (the pre-fix bug: acking
-    /// `applied_num`, which does NOT advance on NoChange) would leave the daemon's
-    /// base behind the client and desync a later Diff into `ReackAndWait`.
+    /// Regression (posh#137 / #87): the coalescing burst desync and its recovery.
+    /// A coalescing daemon withholds the self-ack, so during a burst it emits
+    /// several DISTINCT Diffs all anchored at the same stale acked base before any
+    /// ack round-trips. The pre-fix local client applied each blindly (no
+    /// base==applied_num guard) and died on the eventual `ReackAndWait`. The
+    /// converged client instead applies only the frame at its base, then re-acks
+    /// its TRUE applied_num on the mismatch (+ RESYNC when the base is behind), so
+    /// the daemon re-bases and the client recovers — never a fatal error.
     ///
-    /// This drives daemon frames through a real `FrameRenderer` and confirms the
-    /// number the client would ack tracks the received frame across a NoChange,
-    /// then that a subsequent Diff (encoded by the daemon against the ack it got)
-    /// still applies. `render_frame` must report the received number so the caller
-    /// acks it; keying the ack off `applied_num` reproduces the wedge.
+    /// Models the burst by producing frames WITHOUT feeding the client's acks back
+    /// until after the burst (the daemon base stays stale), then delivers them and
+    /// checks: the first applies, the rest re-ack applied_num without dying, a
+    /// base-behind mismatch sets RESYNC, and a Full (the daemon's RESYNC response)
+    /// recovers.
     #[test]
-    fn coalescing_ack_tracks_received_frame_across_a_nochange() {
+    fn coalescing_burst_desync_reacks_and_recovers() {
         let (rows, cols) = (24u16, 80u16);
         let mut daemon = Terminal::with_scrollback(rows, cols, 1000);
         fill_screen(&mut daemon);
@@ -1672,16 +1710,10 @@ mod tests {
         let mut producer = FrameProducer::new(rows, cols);
         let mut renderer = FrameRenderer::new(rows, cols);
 
-        // A coalescing daemon advances its base ONLY on the client's ack, so model
-        // that: emit a frame against the last ACKED base, hand it to the client,
-        // ack back the number `render_frame_acking` reports (an `Option`, so a
-        // NoChange still reports the received number — the crux of the fix), and
-        // return the body, the render result, the acked number, and the daemon's
-        // resulting acked base.
-        let round = |producer: &mut FrameProducer,
-                     renderer: &mut FrameRenderer,
-                     term: &Terminal|
-         -> (FrameBody, Result<Vec<u8>>, Option<u64>, u64) {
+        // Produce one frame against the daemon's CURRENT (un-updated) acked base
+        // and return its wire bytes — WITHOUT applying any client ack, so the base
+        // stays stale across the burst (the coalescing-withhold scenario).
+        let produce = |producer: &mut FrameProducer, term: &Terminal| -> (Vec<u8>, u64) {
             producer.advance_visible(
                 term.dump_vt(),
                 Snapshot::from_term(term),
@@ -1697,49 +1729,67 @@ mod tests {
                 frame_num,
                 input_ack: 0,
                 echo_ack: 0,
-                body: body.clone(),
+                body,
             }
             .encode();
-            let (out, acked) = renderer.render_frame_acking(&bytes, None);
-            if let Some(a) = acked {
-                producer.ack(a);
-            }
-            (body, out, acked, producer.acked_num())
+            (bytes, frame_num)
         };
 
-        // Frame 1: the attach Full. Client applies it, acks 1.
-        let (b1, r1, a1, base1) = round(&mut producer, &mut renderer, &daemon);
-        assert!(matches!(b1, FrameBody::Full(_)), "attach Full");
-        assert!(r1.is_ok());
-        assert_eq!(a1, Some(1), "client acks the received keyframe number");
-        assert_eq!(base1, 1);
+        // Frame 1: the attach Full. The client applies it and acks 1; feed that
+        // ack back so the daemon base is 1 (the last thing the client confirmed).
+        let (f1, n1) = produce(&mut producer, &daemon);
+        let (r1, ack1) = renderer.render_frame_acking(&f1, None);
+        assert!(r1.is_ok() && matches!(ServerFrame::decode(&f1).unwrap().body, FrameBody::Full(_)));
+        assert_eq!(ack1, Some((n1, 0)), "clean Full apply acks frame 1, no resync");
+        producer.ack(1);
+        assert_eq!(producer.acked_num(), 1);
 
-        // Frame 2: NO visible change — the daemon still advances current_num to 2
-        // and emits a frame, but the client applies it as NoChange. The ack MUST
-        // still be 2 (the received number), or the daemon base stalls at 1.
-        let (_b2, r2, a2, base2) = round(&mut producer, &mut renderer, &daemon);
-        assert!(r2.is_ok(), "a NoChange frame is not an error");
+        // Burst: frames 2 and 3 are edits, each a Diff the daemon anchors at its
+        // STALE acked base 1 (no ack fed back between them). The client applies
+        // frame 2 (base 1 == applied_num 1) and advances to 2.
+        daemon.process(b"burst edit one ");
+        let (f2, _n2) = produce(&mut producer, &daemon);
+        daemon.process(b"burst edit two ");
+        let (f3, _n3) = produce(&mut producer, &daemon);
+        assert!(matches!(ServerFrame::decode(&f2).unwrap().body, FrameBody::Diff { base: 1, .. }));
+        assert!(matches!(ServerFrame::decode(&f3).unwrap().body, FrameBody::Diff { base: 1, .. }));
+
+        let (r2, ack2) = renderer.render_frame_acking(&f2, None);
+        assert!(r2.is_ok(), "frame 2 (base 1 == applied 1) applies");
+        assert_eq!(ack2, Some((2, 0)), "clean apply acks the advanced applied_num 2");
+
+        // Frame 3 is ALSO anchored at base 1, but the client is now at applied_num
+        // 2 — the pre-fix wedge. The converged client must NOT apply it and must
+        // NOT error: it re-acks its true applied_num 2. base(1) < applied(2) ⇒ the
+        // daemon base is behind ⇒ request a RESYNC so it drops the base.
+        let (r3, ack3) = renderer.render_frame_acking(&f3, None);
+        assert!(r3.is_ok(), "a base mismatch is NOT a fatal error (was the wedge)");
         assert_eq!(
-            a2,
-            Some(2),
-            "the client must ack the RECEIVED frame number (2) even on NoChange — \
-             acking applied_num (still 1) is the regression that desyncs the base"
+            ack3,
+            Some((2, ipc::FRAME_ACK_RESYNC)),
+            "re-ack true applied_num 2 + RESYNC (base 1 is behind us)"
         );
-        assert_eq!(base2, 2, "the daemon base advances to the acked 2");
 
-        // Frame 3: a real edit => a Diff the daemon encodes against its acked base.
-        // With the ack tracking correctly, the base is 2 and frame 3 is a Diff vs 2
-        // that the client (model post-frame-2) applies cleanly. Had the ack lagged
-        // at 1, the daemon base would stall and later Diffs eventually wedge.
-        daemon.process(b"a real visible edit");
-        let (b3, r3, a3, _base3) = round(&mut producer, &mut renderer, &daemon);
-        assert!(matches!(b3, FrameBody::Diff { base: 2, .. }), "Diff against acked base 2");
+        // The daemon honors the re-ack (re-base to 2) and the RESYNC (drop base ⇒
+        // next frame is a Full). Feed the ack: producer.ack(2) advances the base,
+        // and RESYNC drops it, so the next encode is a Full the client can always
+        // apply.
+        producer.ack(2);
+        producer.drop_acked_base();
+        daemon.process(b"post-resync ");
+        let (f4, n4) = produce(&mut producer, &daemon);
         assert!(
-            r3.is_ok(),
-            "frame 3 must apply: {:?}",
-            r3.err().map(|e| e.to_string())
+            matches!(ServerFrame::decode(&f4).unwrap().body, FrameBody::Full(_)),
+            "RESYNC ⇒ the daemon's next frame is a Full keyframe"
         );
-        assert_eq!(a3, Some(3));
+        let (r4, ack4) = renderer.render_frame_acking(&f4, None);
+        assert!(r4.is_ok(), "the Full recovers the client");
+        assert_eq!(ack4, Some((n4, 0)), "recovered: clean apply, no resync");
+        assert_eq!(
+            Snapshot::from_term(&renderer.server_term),
+            Snapshot::from_term(&daemon),
+            "after recovery the client model equals the daemon screen"
+        );
     }
 
     /// The first `Full` keyframe overwrites any leading raw `Tag::Output` (#17):
