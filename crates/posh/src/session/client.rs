@@ -754,6 +754,30 @@ fn suspend(raw: &RawMode) {
 /// left our alternate screen while we were stopped. `raw` is the tty's raw-mode
 /// guard, borrowed for the palette's Suspend command (temporary restore + re-arm
 /// around `SIGSTOP`).
+/// Whether the local client advertises `CAP_COALESCE` (posh#137). Default OFF
+/// (opt-IN) — the kill-switch after coalescing was found to wedge live sessions
+/// (base desync -> `ReackAndWait`). Enable with `POSH_COALESCE=1`/`on`/`true`
+/// (case-insensitive, trimmed); anything else, including unset, leaves it off so
+/// the client runs today's self-ack+append path. Distinct from
+/// `POSH_SESSION_FRAMES` (which gates frames at all) — this gates only the
+/// write-buffer coalescing on top of frames. Kept an opt-in until the desync is
+/// root-caused; flip the default back to on only once it is trusted.
+fn coalesce_enabled() -> bool {
+    parse_coalesce_gate(std::env::var("POSH_COALESCE").ok().as_deref())
+}
+
+/// Parses the `POSH_COALESCE` opt-IN gate: `1`/`true`/`on`/`yes`
+/// (case-insensitive, trimmed) turn coalescing ON; anything else, including
+/// unset/empty and any unrecognized value, leaves it OFF (the default). The
+/// mirror-image of `parse_frames_gate` (which is opt-OUT): coalescing must be
+/// explicitly requested until the desync is root-caused.
+fn parse_coalesce_gate(value: Option<&str>) -> bool {
+    matches!(
+        value.map(|v| v.trim().to_ascii_lowercase()).as_deref(),
+        Some("1" | "true" | "on" | "yes")
+    )
+}
+
 fn client_loop(stream: UnixStream, enter: &[u8], raw: &RawMode) -> Result<i32> {
     stream.set_nonblocking(true)?;
     let sock_fd = stream.as_raw_fd();
@@ -787,15 +811,19 @@ fn client_loop(stream: UnixStream, enter: &[u8], raw: &RawMode) -> Result<i32> {
         id: caps::CAP_SCROLLBACK,
         payload: vec![0],
     }];
-    // Advertise CAP_COALESCE unconditionally (posh#137): coalescing bounds the
-    // daemon's per-client `write_buf` so an output burst can't grow it past
-    // MAX_CLIENT_BACKLOG and get us dropped (the spontaneous-detach bug). It's on
-    // by default for every local attach; the daemon falls back to today's
-    // self-ack+append if we toggle it off (FRAME_ACK_COALESCE_OFF).
-    extra_caps.push(caps::Cap {
-        id: caps::CAP_COALESCE,
-        payload: vec![],
-    });
+    // Advertise CAP_COALESCE only when opted in (posh#137, `POSH_COALESCE=1`):
+    // coalescing bounds the daemon's per-client `write_buf` so an output burst
+    // can't grow it past MAX_CLIENT_BACKLOG and get us dropped (the
+    // spontaneous-detach bug). DEFAULT OFF — it wedged live sessions (base desync
+    // -> ReackAndWait) and stays opt-in until root-caused. When unadvertised the
+    // daemon self-acks + appends exactly as today.
+    let coalesce = coalesce_enabled();
+    if coalesce {
+        extra_caps.push(caps::Cap {
+            id: caps::CAP_COALESCE,
+            payload: vec![],
+        });
+    }
     // RFC 0010: advertise the real terminal's kitty keyboard capability so the
     // daemon answers the in-session app's `CSI ? u` query on its behalf (the
     // frame path never carries the raw query to our terminal). posh is
@@ -841,10 +869,12 @@ fn client_loop(stream: UnixStream, enter: &[u8], raw: &RawMode) -> Result<i32> {
     let mut palette: Option<Palette> = None;
 
     // Whether we ack applied frames to drive the daemon's coalescing (posh#137).
-    // On by default (we advertised CAP_COALESCE); the palette's coalescing toggle
-    // flips it, sending a FRAME_ACK_COALESCE_OFF ack so the daemon reverts to
+    // Mirrors whether we advertised CAP_COALESCE (`POSH_COALESCE`, default off):
+    // if we did not advertise it, the daemon self-acks and an ack from us would be
+    // spurious, so start `false`. When on, the palette's coalescing toggle flips
+    // it, sending a FRAME_ACK_COALESCE_OFF ack so the daemon reverts to
     // self-ack+append.
-    let mut coalesce_on = true;
+    let mut coalesce_on = coalesce;
 
     let err_events = libc::POLLHUP | libc::POLLERR | libc::POLLNVAL;
     let result: Result<i32> = 'client: loop {
@@ -1546,6 +1576,23 @@ mod tests {
             "the applier model must track the daemon screen across a Diff"
         );
         assert_screens_match(&outer, &daemon);
+    }
+
+    /// The `POSH_COALESCE` gate is opt-IN (default off, the kill-switch): only
+    /// the explicit truthy spellings enable it; unset/empty/unrecognized stay off.
+    #[test]
+    fn coalesce_gate_is_opt_in() {
+        // Default OFF: unset, empty, and unrecognized values leave it off.
+        assert!(!parse_coalesce_gate(None));
+        assert!(!parse_coalesce_gate(Some("")));
+        assert!(!parse_coalesce_gate(Some("0")));
+        assert!(!parse_coalesce_gate(Some("off")));
+        assert!(!parse_coalesce_gate(Some("false")));
+        assert!(!parse_coalesce_gate(Some("morph")));
+        // Truthy spellings (case-insensitive, trimmed) turn it on.
+        for on in ["1", "true", "on", "yes", "  ON  ", "True"] {
+            assert!(parse_coalesce_gate(Some(on)), "{on:?} must enable coalescing");
+        }
     }
 
     /// Regression (posh#137 coalescing desync): a coalescing client acks the
