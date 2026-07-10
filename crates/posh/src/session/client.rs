@@ -366,8 +366,34 @@ impl FrameRenderer {
     /// last one, so an inability to apply (`ReackAndWait`) is a genuine protocol
     /// bug — surfaced as an error rather than silently retried, since the local
     /// client has no resync/keyframe-request path yet (a later task).
+    /// Test-only convenience over [`render_frame_acking`](Self::render_frame_acking)
+    /// that drops the ack number. The production client loop calls
+    /// `render_frame_acking` directly so it can ack the received frame (posh#137).
+    #[cfg(test)]
     fn render_frame(&mut self, payload: &[u8], palette: Option<&Terminal>) -> Result<Vec<u8>> {
-        let frame = ServerFrame::decode(payload)?;
+        self.render_frame_acking(payload, palette).0
+    }
+
+    /// Like [`render_frame`](Self::render_frame) but also reports the RECEIVED
+    /// frame number the client must ack back (posh#137). The ack is the received
+    /// `frame.frame_num` — NOT `self.applied_num` — so a frame that applies as
+    /// `NoChange` (or a skipped scrollback body) is still acked, keeping a
+    /// coalescing daemon's base (which advances only on this ack, and advanced its
+    /// own `current_num` for that frame) in lockstep with the client. Acking the
+    /// lagging `applied_num` instead desyncs the base and wedges a later Diff into
+    /// `ReackAndWait`. `None` is returned only when the payload fails to decode or
+    /// the frame could not be applied (an `Err`) — there is nothing to ack.
+    fn render_frame_acking(
+        &mut self,
+        payload: &[u8],
+        palette: Option<&Terminal>,
+    ) -> (Result<Vec<u8>>, Option<u64>) {
+        let frame = match ServerFrame::decode(payload) {
+            Ok(f) => f,
+            Err(e) => return (Err(e.into()), None),
+        };
+        // The number to ack: the received frame, regardless of apply outcome.
+        let received = frame.frame_num;
         // Scrollback growth (RFC 0002 §3): intercept BEFORE the applier — a
         // scrollback frame appends scrolled-off rows to the local ring and
         // leaves the visible model (and thus the tty) untouched, so it produces
@@ -375,13 +401,13 @@ impl FrameRenderer {
         // The dup (`frame_num == applied_num`) and base (`base != applied_num`)
         // guards are degenerate on the reliable socket — frames arrive once, in
         // order — but kept for parity so a retransmit or superseding body never
-        // double-appends.
+        // double-appends. Either way the frame is still acked (it was received).
         if let FrameBody::Scrollback { base, rows } = &frame.body {
             if frame.frame_num == self.applied_num {
-                return Ok(Vec::new());
+                return (Ok(Vec::new()), Some(received));
             }
             if *base != self.applied_num {
-                return Ok(Vec::new());
+                return (Ok(Vec::new()), Some(received));
             }
             let grew = rows.len();
             self.scrollback.append(rows);
@@ -392,9 +418,9 @@ impl FrameRenderer {
             // client has no periodic render tick, so the repaint happens here.
             if self.scroll_offset > 0 {
                 self.set_scroll(self.scroll_offset + grew);
-                return Ok(self.compose_scroll());
+                return (Ok(self.compose_scroll()), Some(received));
             }
-            return Ok(Vec::new());
+            return (Ok(Vec::new()), Some(received));
         }
         match self.applier.apply(
             self.rows,
@@ -415,12 +441,17 @@ impl FrameRenderer {
                 // handle it generically so a later codec swap is inert here.
                 self.applied_num = frame.frame_num;
             }
-            ApplyOutcome::NoChange => return Ok(Vec::new()),
+            // NoChange: the frame reproduced the current screen (applied_num does
+            // NOT advance), but it was still received and MUST be acked (posh#137).
+            ApplyOutcome::NoChange => return (Ok(Vec::new()), Some(received)),
             ApplyOutcome::ReackAndWait => {
-                return Err(Error::Msg(format!(
-                    "session frame {} could not be applied on the reliable socket",
-                    frame.frame_num
-                )));
+                return (
+                    Err(Error::Msg(format!(
+                        "session frame {} could not be applied on the reliable socket",
+                        frame.frame_num
+                    ))),
+                    None,
+                );
             }
         }
         // While scrolled up, the live model advanced underneath but the viewport
@@ -428,9 +459,9 @@ impl FrameRenderer {
         // generation, so an out-of-window change diffs to nothing) rather than
         // yanking to the live bottom.
         if self.scroll_offset > 0 {
-            return Ok(self.compose_scroll());
+            return (Ok(self.compose_scroll()), Some(received));
         }
-        Ok(self.compose_live(palette))
+        (Ok(self.compose_live(palette)), Some(received))
     }
 
     /// The live visible compose: non-prediction, palette-aware. When `palette` is
@@ -1016,26 +1047,31 @@ fn client_loop(stream: UnixStream, enter: &[u8], raw: &RawMode) -> Result<i32> {
                                 let fr = frame_renderer.get_or_insert_with(|| {
                                     FrameRenderer::new(frame_size.0, frame_size.1)
                                 });
-                                let bytes = match fr.render_frame(&frame.payload, screen) {
+                                let (result, acked) =
+                                    fr.render_frame_acking(&frame.payload, screen);
+                                let bytes = match result {
                                     Ok(bytes) => bytes,
                                     Err(e) => break 'client Err(e),
                                 };
                                 stdout_buf.extend_from_slice(&bytes);
-                                // posh#137: ack the applied frame so the daemon
+                                // posh#137: ack the RECEIVED frame so the daemon
                                 // advances our diff base and coalesces its queue
                                 // (it withholds the self-ack for a CAP_COALESCE
-                                // client). Skipped while toggled off — then the
+                                // client). `render_frame_acking` reports the
+                                // received number (so a NoChange / skipped frame is
+                                // still acked — acking the lagging `applied_num`
+                                // desyncs the base and wedges a later Diff) without
+                                // a second decode of the (possibly multi-MB)
+                                // payload. Skipped while toggled off — then the
                                 // daemon self-acks and this ack would be redundant.
-                                // `render_frame` already decoded the payload and
-                                // recorded the applied frame number, so read it
-                                // back rather than decoding the (possibly multi-MB)
-                                // payload a second time.
                                 if coalesce_on {
-                                    ipc::append_frame(
-                                        &mut sock_write_buf,
-                                        Tag::FrameAck,
-                                        &ipc::encode_frame_ack(fr.applied_num, 0),
-                                    );
+                                    if let Some(frame_num) = acked {
+                                        ipc::append_frame(
+                                            &mut sock_write_buf,
+                                            Tag::FrameAck,
+                                            &ipc::encode_frame_ack(frame_num, 0),
+                                        );
+                                    }
                                 }
                             }
                             Tag::Exit => {
@@ -1510,6 +1546,98 @@ mod tests {
             "the applier model must track the daemon screen across a Diff"
         );
         assert_screens_match(&outer, &daemon);
+    }
+
+    /// Regression (posh#137 coalescing desync): a coalescing client acks the
+    /// RECEIVED frame number after every frame — INCLUDING a frame that applies as
+    /// `NoChange` (a repaint whose dump equals the acked base). The daemon advances
+    /// a coalescing client's base only on that ack, and it advanced `current_num`
+    /// for the NoChange frame too, so an ack that lagged (the pre-fix bug: acking
+    /// `applied_num`, which does NOT advance on NoChange) would leave the daemon's
+    /// base behind the client and desync a later Diff into `ReackAndWait`.
+    ///
+    /// This drives daemon frames through a real `FrameRenderer` and confirms the
+    /// number the client would ack tracks the received frame across a NoChange,
+    /// then that a subsequent Diff (encoded by the daemon against the ack it got)
+    /// still applies. `render_frame` must report the received number so the caller
+    /// acks it; keying the ack off `applied_num` reproduces the wedge.
+    #[test]
+    fn coalescing_ack_tracks_received_frame_across_a_nochange() {
+        let (rows, cols) = (24u16, 80u16);
+        let mut daemon = Terminal::with_scrollback(rows, cols, 1000);
+        fill_screen(&mut daemon);
+
+        let mut producer = FrameProducer::new(rows, cols);
+        let mut renderer = FrameRenderer::new(rows, cols);
+
+        // A coalescing daemon advances its base ONLY on the client's ack, so model
+        // that: emit a frame against the last ACKED base, hand it to the client,
+        // ack back the number `render_frame_acking` reports (an `Option`, so a
+        // NoChange still reports the received number — the crux of the fix), and
+        // return the body, the render result, the acked number, and the daemon's
+        // resulting acked base.
+        let round = |producer: &mut FrameProducer,
+                     renderer: &mut FrameRenderer,
+                     term: &Terminal|
+         -> (FrameBody, Result<Vec<u8>>, Option<u64>, u64) {
+            producer.advance_visible(
+                term.dump_vt(),
+                Snapshot::from_term(term),
+                term.is_alt_screen(),
+                (term.rows(), term.cols()),
+                0,
+            );
+            let body = producer.encode_visible(false);
+            let frame_num = producer.current_num();
+            let bytes = ServerFrame {
+                flags: 0,
+                caps: caps::own_table(&[]),
+                frame_num,
+                input_ack: 0,
+                echo_ack: 0,
+                body: body.clone(),
+            }
+            .encode();
+            let (out, acked) = renderer.render_frame_acking(&bytes, None);
+            if let Some(a) = acked {
+                producer.ack(a);
+            }
+            (body, out, acked, producer.acked_num())
+        };
+
+        // Frame 1: the attach Full. Client applies it, acks 1.
+        let (b1, r1, a1, base1) = round(&mut producer, &mut renderer, &daemon);
+        assert!(matches!(b1, FrameBody::Full(_)), "attach Full");
+        assert!(r1.is_ok());
+        assert_eq!(a1, Some(1), "client acks the received keyframe number");
+        assert_eq!(base1, 1);
+
+        // Frame 2: NO visible change — the daemon still advances current_num to 2
+        // and emits a frame, but the client applies it as NoChange. The ack MUST
+        // still be 2 (the received number), or the daemon base stalls at 1.
+        let (_b2, r2, a2, base2) = round(&mut producer, &mut renderer, &daemon);
+        assert!(r2.is_ok(), "a NoChange frame is not an error");
+        assert_eq!(
+            a2,
+            Some(2),
+            "the client must ack the RECEIVED frame number (2) even on NoChange — \
+             acking applied_num (still 1) is the regression that desyncs the base"
+        );
+        assert_eq!(base2, 2, "the daemon base advances to the acked 2");
+
+        // Frame 3: a real edit => a Diff the daemon encodes against its acked base.
+        // With the ack tracking correctly, the base is 2 and frame 3 is a Diff vs 2
+        // that the client (model post-frame-2) applies cleanly. Had the ack lagged
+        // at 1, the daemon base would stall and later Diffs eventually wedge.
+        daemon.process(b"a real visible edit");
+        let (b3, r3, a3, _base3) = round(&mut producer, &mut renderer, &daemon);
+        assert!(matches!(b3, FrameBody::Diff { base: 2, .. }), "Diff against acked base 2");
+        assert!(
+            r3.is_ok(),
+            "frame 3 must apply: {:?}",
+            r3.err().map(|e| e.to_string())
+        );
+        assert_eq!(a3, Some(3));
     }
 
     /// The first `Full` keyframe overwrites any leading raw `Tag::Output` (#17):
