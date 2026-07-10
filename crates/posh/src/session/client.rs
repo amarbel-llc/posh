@@ -575,7 +575,7 @@ impl FrameRenderer {
 /// label reflecting the current `scroll_opt` state), and Detach (leave the
 /// session running). The remote client's echo/prediction/resync/forensics/agent/
 /// server-log commands are UDP/prediction-only and intentionally omitted.
-fn palette_commands(scroll_opt: bool) -> Value {
+fn palette_commands(scroll_opt: bool, coalesce_on: bool) -> Value {
     // Imperative label (the verb is the action), matching the remote palette:
     // enabled now => offer "Disable"; disabled now => offer "Enable".
     let (scroll_opt_name, scroll_opt_enabled) = if scroll_opt {
@@ -583,10 +583,18 @@ fn palette_commands(scroll_opt: bool) -> Value {
     } else {
         ("Enable scroll-region optimization", true)
     };
+    // Frame coalescing (posh#137): the state-reflecting label names what turning
+    // it off/on does. `enabled` is the desired NEW state, mirroring scroll_opt.
+    let (coalesce_name, coalesce_enabled) = if coalesce_on {
+        ("Frame coalescing: on (disable)", false)
+    } else {
+        ("Frame coalescing: off (enable)", true)
+    };
     json!([
         { "name": "Suspend client", "action": { "method": "client.suspend" } },
         { "name": "Shell out", "action": { "method": "shell.open" } },
         { "name": scroll_opt_name, "action": { "method": "render.scroll_opt", "params": { "enabled": scroll_opt_enabled } } },
+        { "name": coalesce_name, "action": { "method": "render.coalesce", "params": { "enabled": coalesce_enabled } } },
         { "name": "Detach", "action": { "method": "app.detach" } },
     ])
 }
@@ -602,6 +610,7 @@ fn open_local_palette(
     stdout_buf: &mut Vec<u8>,
     rows: u16,
     cols: u16,
+    coalesce_on: bool,
 ) -> bool {
     if palette.is_none() {
         *palette = Palette::spawn(rows, cols);
@@ -614,7 +623,7 @@ fn open_local_palette(
     // current tty size before summoning — else it renders at the size it had
     // when last open, misaligned against a since-resized screen (posh#135).
     p.resize(rows, cols);
-    p.open("Commands", palette_commands(fr.scroll_opt));
+    p.open("Commands", palette_commands(fr.scroll_opt, coalesce_on));
     fr.set_scroll(0);
     fr.invalidate();
     stdout_buf.extend_from_slice(&fr.recompose(p.screen()));
@@ -633,6 +642,11 @@ enum LocalAction {
     /// Set the renderer's scroll-region optimization (posh#100 toggle). Applied
     /// to the `FrameRenderer` at the call site (dispatch holds no renderer).
     SetScrollOpt(bool),
+    /// Set frame coalescing on/off (posh#137 toggle). The FRAME_ACK_COALESCE_OFF
+    /// ack is emitted in dispatch (it holds `sock_write_buf`); the bool is the
+    /// desired new state, applied to the loop's `coalesce_on` flag at the call
+    /// site (dispatch holds no loop state).
+    SetCoalesce(bool),
 }
 
 /// Dispatch a palette selection on the local client. Wire-only effects (Detach,
@@ -666,6 +680,21 @@ fn dispatch_local_action(method: &str, params: &Value, sock_write_buf: &mut Vec<
                 .and_then(Value::as_bool)
                 .unwrap_or(true);
             LocalAction::SetScrollOpt(on)
+        }
+        "render.coalesce" => {
+            // posh#137 escape hatch: flip write-buffer coalescing. `enabled` is
+            // the desired new state (the command labels itself from the current
+            // one). Default to on if the param is malformed. Emit a pure-toggle
+            // FrameAck now: acked_frame 0 so the daemon's `ack(0)` is a no-op (it
+            // ignores acked_frame <= acked_num) — this must NOT spuriously advance
+            // the diff base, only carry the FRAME_ACK_COALESCE_OFF toggle bit.
+            let on = params
+                .get("enabled")
+                .and_then(Value::as_bool)
+                .unwrap_or(true);
+            let flags = if on { 0 } else { ipc::FRAME_ACK_COALESCE_OFF };
+            ipc::append_frame(sock_write_buf, Tag::FrameAck, &ipc::encode_frame_ack(0, flags));
+            LocalAction::SetCoalesce(on)
         }
         _ => LocalAction::None, // unknown method: the renderer already closed
     }
@@ -727,6 +756,15 @@ fn client_loop(stream: UnixStream, enter: &[u8], raw: &RawMode) -> Result<i32> {
         id: caps::CAP_SCROLLBACK,
         payload: vec![0],
     }];
+    // Advertise CAP_COALESCE unconditionally (posh#137): coalescing bounds the
+    // daemon's per-client `write_buf` so an output burst can't grow it past
+    // MAX_CLIENT_BACKLOG and get us dropped (the spontaneous-detach bug). It's on
+    // by default for every local attach; the daemon falls back to today's
+    // self-ack+append if we toggle it off (FRAME_ACK_COALESCE_OFF).
+    extra_caps.push(caps::Cap {
+        id: caps::CAP_COALESCE,
+        payload: vec![],
+    });
     // RFC 0010: advertise the real terminal's kitty keyboard capability so the
     // daemon answers the in-session app's `CSI ? u` query on its behalf (the
     // frame path never carries the raw query to our terminal). posh is
@@ -770,6 +808,12 @@ fn client_loop(stream: UnixStream, enter: &[u8], raw: &RawMode) -> Result<i32> {
     // session never builds a FrameRenderer, so Ctrl-^ is never intercepted and
     // this stays None — the palette is a frames-on feature.
     let mut palette: Option<Palette> = None;
+
+    // Whether we ack applied frames to drive the daemon's coalescing (posh#137).
+    // On by default (we advertised CAP_COALESCE); the palette's coalescing toggle
+    // flips it, sending a FRAME_ACK_COALESCE_OFF ack so the daemon reverts to
+    // self-ack+append.
+    let mut coalesce_on = true;
 
     let err_events = libc::POLLHUP | libc::POLLERR | libc::POLLNVAL;
     let result: Result<i32> = 'client: loop {
@@ -925,7 +969,7 @@ fn client_loop(stream: UnixStream, enter: &[u8], raw: &RawMode) -> Result<i32> {
                                 .as_mut()
                                 .expect("Palette event only fires with a live renderer");
                             let (rows, cols) = frame_size;
-                            if open_local_palette(&mut palette, fr, &mut stdout_buf, rows, cols) {
+                            if open_local_palette(&mut palette, fr, &mut stdout_buf, rows, cols, coalesce_on) {
                                 if !tail.is_empty() {
                                     if let Some(p) = palette.as_ref() {
                                         p.forward_input(tail);
@@ -977,6 +1021,22 @@ fn client_loop(stream: UnixStream, enter: &[u8], raw: &RawMode) -> Result<i32> {
                                     Err(e) => break 'client Err(e),
                                 };
                                 stdout_buf.extend_from_slice(&bytes);
+                                // posh#137: ack the applied frame so the daemon
+                                // advances our diff base and coalesces its queue
+                                // (it withholds the self-ack for a CAP_COALESCE
+                                // client). Skipped while toggled off — then the
+                                // daemon self-acks and this ack would be redundant.
+                                // `render_frame` already decoded the payload and
+                                // recorded the applied frame number, so read it
+                                // back rather than decoding the (possibly multi-MB)
+                                // payload a second time.
+                                if coalesce_on {
+                                    ipc::append_frame(
+                                        &mut sock_write_buf,
+                                        Tag::FrameAck,
+                                        &ipc::encode_frame_ack(fr.applied_num, 0),
+                                    );
+                                }
                             }
                             Tag::Exit => {
                                 // Session over: flush the final output and
@@ -1029,6 +1089,13 @@ fn client_loop(stream: UnixStream, enter: &[u8], raw: &RawMode) -> Result<i32> {
                                 if let Some(fr) = frame_renderer.as_mut() {
                                     fr.set_scroll_opt(on);
                                 }
+                            }
+                            LocalAction::SetCoalesce(on) => {
+                                // posh#137: the FRAME_ACK_COALESCE_OFF ack was
+                                // queued in dispatch; flip our own ack-sending
+                                // state so `Tag::FrameAck` matches the daemon's
+                                // reverted self-ack+append behavior when off.
+                                coalesce_on = on;
                             }
                             LocalAction::None => {}
                         }
@@ -1802,18 +1869,71 @@ mod tests {
     #[test]
     fn palette_commands_labels_the_scroll_opt_toggle_by_state() {
         let text = |cmds: &Value| serde_json::to_string(cmds).unwrap();
-        let on = palette_commands(true);
+        let on = palette_commands(true, true);
         assert!(
             text(&on).contains("Disable scroll-region optimization"),
             "enabled now => offer Disable: {}",
             text(&on)
         );
-        let off = palette_commands(false);
+        let off = palette_commands(false, true);
         assert!(
             text(&off).contains("Enable scroll-region optimization"),
             "disabled now => offer Enable: {}",
             text(&off)
         );
+    }
+
+    /// The palette's coalescing toggle (posh#137) labels itself from the CURRENT
+    /// state and carries the desired new state in its params, like scroll_opt.
+    #[test]
+    fn palette_commands_labels_the_coalesce_toggle_by_state() {
+        let text = |cmds: &Value| serde_json::to_string(cmds).unwrap();
+        let on = palette_commands(true, true);
+        assert!(
+            text(&on).contains("Frame coalescing: on (disable)"),
+            "coalescing on now => offer disable: {}",
+            text(&on)
+        );
+        let off = palette_commands(true, false);
+        assert!(
+            text(&off).contains("Frame coalescing: off (enable)"),
+            "coalescing off now => offer enable: {}",
+            text(&off)
+        );
+    }
+
+    /// The coalescing toggle (posh#137) queues a FRAME_ACK_COALESCE_OFF ack when
+    /// turning OFF and a clear ack when turning ON, both acking frame 0 (a
+    /// pure-toggle no-op ack that must not advance the daemon's diff base), and
+    /// returns the desired new state for the loop's `coalesce_on` flag.
+    #[test]
+    fn coalesce_toggle_queues_frame_ack_with_toggle_flag() {
+        let mut buf = Vec::new();
+        // Turn OFF: FRAME_ACK_COALESCE_OFF set, acked_frame 0.
+        assert!(matches!(
+            dispatch_local_action("render.coalesce", &json!({ "enabled": false }), &mut buf),
+            LocalAction::SetCoalesce(false)
+        ));
+        let mut fb = FrameBuffer::new();
+        fb.feed(&buf);
+        let f = fb.next().unwrap().unwrap();
+        assert_eq!(f.tag, Tag::FrameAck);
+        assert_eq!(
+            ipc::decode_frame_ack(&f.payload),
+            Some((0, ipc::FRAME_ACK_COALESCE_OFF)),
+            "turning off sets the toggle bit and acks frame 0 (no base advance)"
+        );
+
+        // Turn ON: the toggle bit is clear.
+        let mut buf2 = Vec::new();
+        assert!(matches!(
+            dispatch_local_action("render.coalesce", &json!({ "enabled": true }), &mut buf2),
+            LocalAction::SetCoalesce(true)
+        ));
+        let mut fb2 = FrameBuffer::new();
+        fb2.feed(&buf2);
+        let f2 = fb2.next().unwrap().unwrap();
+        assert_eq!(ipc::decode_frame_ack(&f2.payload), Some((0, 0)));
     }
 
     /// The toggle is wired end to end: a renderer with the scroll-region

@@ -133,6 +133,22 @@ struct ClientConn {
     // reliable local client never sets this, so `lossy` stays false and its frame
     // stream is byte-identical to today (self-acked, DumpDiff, no base_sum).
     lossy: bool,
+    // Local write-buffer coalescing (posh#137). `coalesce` is set from
+    // `CAP_COALESCE` on Init (like `lossy`, but independent — a client is one or
+    // the other): the local stream client opts in so its diff base advances only
+    // on its own `Tag::FrameAck` and the daemon replaces a still-un-sent trailing
+    // visible frame in `write_buf` rather than appending a second, bounding a
+    // burst below `MAX_CLIENT_BACKLOG` (the spontaneous-detach bug). `coalesce_off`
+    // is a runtime toggle (via `FRAME_ACK_COALESCE_OFF`, the command palette): when
+    // true the client reverts to today's self-ack+append even though it advertised
+    // the cap. `pending_frame_start` is the byte offset in `write_buf` where the
+    // last-queued, still-fully-un-sent visible `Tag::Frame` begins — the frame the
+    // next visible frame may truncate-and-replace; `None` when there is no clean
+    // coalescable trailing frame (any non-visible append clears it, and the drain
+    // loop clears/shifts it as bytes go on the wire).
+    coalesce: bool,
+    coalesce_off: bool,
+    pending_frame_start: Option<usize>,
     // Per-client scrollback-sync bookkeeping (RFC 0002 §2/§3), the session-socket
     // analog of the roaming server's per-connection `sb_floor`/`acked_sb_total`.
     // `sb_floor` is the daemon terminal's monotonic scrollback total at which
@@ -158,7 +174,20 @@ struct ClientConn {
 
 impl ClientConn {
     fn queue(&mut self, tag: Tag, payload: &[u8]) {
+        // Any append other than the coalescable visible frame `queue_frame` is
+        // about to (re)establish breaks the "pending frame is a clean tail"
+        // invariant, so drop the coalesce anchor here (posh#137). A `Tag::Output`,
+        // `Tag::Exit`, or scrollback `Tag::Frame` landing after a visible frame
+        // must not be truncated away; `queue_frame` re-sets the anchor AFTER its
+        // own `self.queue(Tag::Frame, ..)` call, so the visible frame keeps it.
+        self.pending_frame_start = None;
         ipc::append_frame(&mut self.write_buf, tag, payload);
+    }
+
+    /// Whether this client's frames should be coalesced right now: it advertised
+    /// `CAP_COALESCE` AND the runtime toggle has not turned it off (posh#137).
+    fn coalescing(&self) -> bool {
+        self.coalesce && !self.coalesce_off
     }
 
     /// Applies a `Tag::Init` payload: a 4-byte resize prefix that sizes the
@@ -189,6 +218,11 @@ impl ClientConn {
                     // negotiated table, so a bare re-Init (which skips this block)
                     // preserves it exactly like `self.caps`.
                     self.lossy = caps::find(&advertised, caps::CAP_LOSSY).is_some();
+                    // A local stream client advertises `CAP_COALESCE` (posh#137):
+                    // like lossy it is NOT self-acked, but it keeps plain local
+                    // semantics (DumpDiff, no base_sum). Independent of `lossy` — a
+                    // client is one or the other. Preserved across a bare re-Init.
+                    self.coalesce = caps::find(&advertised, caps::CAP_COALESCE).is_some();
                     self.caps = advertised;
                 }
                 Err(e) => util::log_write(
@@ -240,6 +274,11 @@ impl ClientConn {
         // Read the lossy-mode inputs before borrowing `producer` mutably. A
         // reliable client leaves all three false ⇒ today's exact behavior.
         let lossy = self.lossy;
+        // Withhold the immediate self-ack for a lossy client OR a coalescing local
+        // client (posh#137): both advance their diff base only on a `Tag::FrameAck`.
+        // But `use_morph`/`stamp_base_sum` stay gated on `lossy` ONLY — a coalescing
+        // client keeps DumpDiff + no base_sum (plain local semantics).
+        let withhold = self.lossy || self.coalescing();
         let use_morph = lossy && caps::find(&self.caps, caps::CAP_MORPH).is_some();
         let stamp_base_sum = lossy && caps::find(&self.caps, caps::CAP_BASE_SUM).is_some();
         let encoded = match self.producer.as_mut() {
@@ -270,34 +309,73 @@ impl ClientConn {
                 }
                 .encode();
                 // Reliable client: self-ack now (degenerate loss machinery). Lossy
-                // client: withhold — its base advances only on `Tag::FrameAck`.
-                if !lossy {
+                // or coalescing client: withhold — its base advances only on
+                // `Tag::FrameAck` (posh#137).
+                if !withhold {
                     producer.ack(frame_num);
                 }
                 bytes
             }
         };
-        self.queue(Tag::Frame, &encoded);
+        // Coalesce the queued bytes for a coalescing client (posh#137): if the
+        // previously-queued visible frame is still fully un-sent at the tail of
+        // `write_buf`, truncate it and append the freshly-encoded latest frame in
+        // its place (it re-encodes against the same acked base, so it is a complete
+        // superset — no lost content). Otherwise (not coalescing, no pending frame,
+        // or the tail is not a clean pending frame) append normally. `self.queue`
+        // clears `pending_frame_start`, so compute the anchor offset BEFORE the
+        // append and (re)set it AFTER — that keeps the anchor pointing only at THIS
+        // visible frame, never across an intervening non-visible append.
+        if self.coalescing() {
+            if let Some(start) = self.pending_frame_start {
+                if start <= self.write_buf.len() {
+                    self.write_buf.truncate(start);
+                }
+            }
+            let start = self.write_buf.len();
+            self.queue(Tag::Frame, &encoded);
+            self.pending_frame_start = Some(start);
+        } else {
+            self.queue(Tag::Frame, &encoded);
+        }
         true
     }
 
-    /// Apply a `Tag::FrameAck` from a lossy relay client (RFC 0008 §3): advance
-    /// this client's producer base to the acked frame — the base-advance a
-    /// reliable client gets from the immediate self-ack in `queue_frame`. The
-    /// `FRAME_ACK_RESYNC` flag additionally drops the base so the next frame is a
-    /// forced `Full` keyframe (base-sum divergence recovery). A non-lossy client,
-    /// a malformed payload, or a producerless client is a no-op. Extracted (like
-    /// `apply_init`) so the daemon-loop arm and the inline tests drive one path.
+    /// Apply a `Tag::FrameAck` from a client whose frames the daemon does NOT
+    /// self-ack: a lossy relay client (RFC 0008 §3) OR a `CAP_COALESCE` local
+    /// client (posh#137). Advances this client's producer base to the acked frame —
+    /// the base-advance a reliable client gets from the immediate self-ack in
+    /// `queue_frame`. The `FRAME_ACK_RESYNC` flag additionally drops the base so
+    /// the next frame is a forced `Full` keyframe (base-sum divergence recovery).
+    /// The `FRAME_ACK_COALESCE_OFF` flag (coalescing clients only) toggles
+    /// write-buffer coalescing off/on at runtime, reverting the client to today's
+    /// self-ack+append path — so a wedged coalescing client can be escaped from the
+    /// command palette without dropping the session. A reliable (neither lossy nor
+    /// coalescing) client, a malformed payload, or a producerless client is a
+    /// no-op. Extracted (like `apply_init`) so the daemon-loop arm and the inline
+    /// tests drive one path.
     fn apply_frame_ack(&mut self, payload: &[u8]) {
-        // `Tag::FrameAck` is a lossy-relay verb: a reliable client self-acks in
+        // `Tag::FrameAck` is a not-self-acked verb: a reliable client self-acks in
         // `queue_frame` and never sends it, so ignore it here — that keeps a
-        // reliable client's producer state provably untouched by this path.
-        if !self.lossy {
+        // reliable client's producer state provably untouched by this path. Gated
+        // on the ADVERTISED cap (`self.coalesce`, not `coalescing()`): a toggle-OFF
+        // ack must still be processed to flip the runtime state back.
+        if !self.lossy && !self.coalesce {
             return;
         }
         let Some((acked, flags)) = ipc::decode_frame_ack(payload) else {
             return;
         };
+        // Runtime coalescing toggle (posh#137). Only a `CAP_COALESCE` client can
+        // flip it — a lossy relay ack must never touch it. Clearing the anchor on
+        // turn-OFF keeps the drain/queue bookkeeping consistent with the client's
+        // reverted self-ack+append behavior.
+        if self.coalesce {
+            self.coalesce_off = flags & ipc::FRAME_ACK_COALESCE_OFF != 0;
+            if self.coalesce_off {
+                self.pending_frame_start = None;
+            }
+        }
         let Some(producer) = self.producer.as_mut() else {
             return;
         };
@@ -348,6 +426,11 @@ impl ClientConn {
         if !has_base {
             return false;
         }
+        // Whether to withhold the scrollback frame's self-ack, read BEFORE the
+        // mutable `producer` borrow below (posh#137). A lossy OR coalescing client
+        // is NOT self-acked — its base advances only on the client's
+        // `Tag::FrameAck`, mirroring the visible-frame path in `queue_frame`.
+        let withhold = self.lossy || self.coalescing();
         let producer = self.producer.as_mut().expect("has_base implies Some");
         producer.advance_scrollback(cur_sb_total);
         // The rows that entered scrollback since this client's floor/ack, bounded
@@ -385,9 +468,12 @@ impl ClientConn {
         }
         .encode();
         // Reliable client self-acks the scrollback frame at once (produced ==
-        // acked); a lossy client is NOT self-acked — its base advances only on a
-        // forwarded `Tag::FrameAck`, mirroring the visible-frame path.
-        if !self.lossy {
+        // acked); a lossy OR coalescing client is NOT self-acked (see `withhold`
+        // above, computed before the `producer` borrow). Missing the coalescing
+        // case here would advance the base server-side without the client's ack,
+        // defeating the CAP_COALESCE invariant. The scrollback bytes still go
+        // through `self.queue` (never coalesced away — they carry unique history).
+        if !withhold {
             if let Some(sb_total) = producer.ack(frame_num) {
                 self.acked_sb_total = self.acked_sb_total.max(sb_total);
             }
@@ -912,6 +998,9 @@ fn daemon_loop(
                     caps: Vec::new(),
                     producer: None,
                     lossy: false,
+                    coalesce: false,
+                    coalesce_off: false,
+                    pending_frame_start: None,
                     sb_floor: 0,
                     acked_sb_total: 0,
                     bytes_drained: 0,
@@ -1146,9 +1235,11 @@ fn daemon_loop(
                                     // a retransmitted request idempotent.
                                     open_shell = true;
                                 }
-                                // A lossy relay client (RFC 0008 §3) acking one of
-                                // its `Tag::Frame`s — the base-advance a reliable
-                                // client gets from the immediate self-ack. Shared
+                                // A lossy relay client (RFC 0008 §3) OR a
+                                // coalescing local client (CAP_COALESCE, posh#137)
+                                // acking one of its `Tag::Frame`s — the base-advance
+                                // a reliable client gets from the immediate self-ack;
+                                // also carries the runtime coalescing toggle. Shared
                                 // with the tests via `apply_frame_ack` (like
                                 // `apply_init`).
                                 Tag::FrameAck => c.apply_frame_ack(&frame.payload),
@@ -1164,6 +1255,15 @@ fn daemon_loop(
                     match c.stream.write(&c.write_buf) {
                         Ok(n) => {
                             c.write_buf.drain(..n);
+                            // Coalesce-anchor bookkeeping (posh#137): the drain
+                            // shifts the anchor left by `n`. `checked_sub` yields
+                            // `None` exactly when `n > start` — the pending frame
+                            // has begun going on the wire, so it can no longer be
+                            // truncated — and `Some(start - n)` otherwise (including
+                            // `Some(0)` at `n == start`, still fully un-sent).
+                            if let Some(start) = c.pending_frame_start {
+                                c.pending_frame_start = start.checked_sub(n);
+                            }
                             // Backlog instrumentation: record the drain so the
                             // high-water / drop lines can tell stalled from bursty.
                             if n > 0 {
@@ -1455,6 +1555,9 @@ mod tests {
             caps: Vec::new(),
             producer: None,
             lossy: false,
+            coalesce: false,
+            coalesce_off: false,
+            pending_frame_start: None,
             sb_floor: 0,
             acked_sb_total: 0,
             bytes_drained: 0,
@@ -1558,6 +1661,9 @@ mod tests {
             caps: Vec::new(),
             producer: None,
             lossy: false,
+            coalesce: false,
+            coalesce_off: false,
+            pending_frame_start: None,
             sb_floor: 0,
             acked_sb_total: 0,
             bytes_drained: 0,
@@ -1583,6 +1689,9 @@ mod tests {
             caps: Vec::new(),
             producer: None,
             lossy: false,
+            coalesce: false,
+            coalesce_off: false,
+            pending_frame_start: None,
             sb_floor: 0,
             acked_sb_total: 0,
             bytes_drained: 0,
@@ -1704,11 +1813,29 @@ mod tests {
     /// equality against the daemon's own `Snapshot` is a genuine round-trip, not
     /// a tautology.
     fn reconstruct(write_buf: &[u8], rows: u16, cols: u16) -> Snapshot {
+        reconstruct_seeded(write_buf, rows, cols, &[])
+    }
+
+    /// Reconstruct a coalescing client's view when its `write_buf` holds a diff
+    /// whose base was already applied+acked and coalesced OUT of the buffer
+    /// (posh#137): call with `base_dump` = the acked base the client still holds
+    /// locally, and the applier is seeded with it (and its rendered screen) before
+    /// the queued frame(s) apply — the real client state after acking a frame the
+    /// daemon then coalesced away.
+    fn reconstruct_coalesced(write_buf: &[u8], rows: u16, cols: u16, base_dump: &[u8]) -> Snapshot {
+        reconstruct_seeded(write_buf, rows, cols, base_dump)
+    }
+
+    /// Apply a `write_buf`'s queued frames onto a scratch terminal seeded with
+    /// `base_dump` (empty = a fresh blank screen, the plain [`reconstruct`] case;
+    /// non-empty = the coalesced case, [`reconstruct_coalesced`]).
+    fn reconstruct_seeded(write_buf: &[u8], rows: u16, cols: u16, base_dump: &[u8]) -> Snapshot {
         let mut fb = FrameBuffer::new();
         fb.feed(write_buf);
         let mut term = Terminal::with_scrollback(rows, cols, 0);
+        term.process(base_dump);
         let mut applier = DumpDiff;
-        let mut applied: Vec<u8> = Vec::new();
+        let mut applied: Vec<u8> = base_dump.to_vec();
         while let Some(frame) = fb.next().unwrap() {
             let body = ServerFrame::decode(&frame.payload).unwrap().body;
             match applier.apply(rows, cols, &applied, &mut term, &body) {
@@ -1757,6 +1884,9 @@ mod tests {
             caps: Vec::new(),
             producer: None,
             lossy: false,
+            coalesce: false,
+            coalesce_off: false,
+            pending_frame_start: None,
             sb_floor: 0,
             acked_sb_total: 0,
             bytes_drained: 0,
@@ -1907,6 +2037,9 @@ mod tests {
             caps: Vec::new(),
             producer: None,
             lossy: false,
+            coalesce: false,
+            coalesce_off: false,
+            pending_frame_start: None,
             sb_floor: 0,
             acked_sb_total: 0,
             bytes_drained: 0,
@@ -2117,6 +2250,9 @@ mod tests {
             caps: Vec::new(),
             producer: None,
             lossy: false,
+            coalesce: false,
+            coalesce_off: false,
+            pending_frame_start: None,
             sb_floor: 0,
             acked_sb_total: 0,
             bytes_drained: 0,
@@ -2411,6 +2547,9 @@ mod tests {
             caps: Vec::new(),
             producer: None,
             lossy: false,
+            coalesce: false,
+            coalesce_off: false,
+            pending_frame_start: None,
             sb_floor: 0,
             acked_sb_total: 0,
             bytes_drained: 0,
@@ -2713,5 +2852,277 @@ mod tests {
             "a reliable client's FrameAck is ignored: its base is not dropped"
         );
         assert_eq!(c.producer.as_ref().unwrap().acked_num(), 1);
+    }
+
+    // ---- posh#137: local write-buffer coalescing (CAP_COALESCE) ----
+
+    /// A COALESCING local client: `Tag::Init` advertises `CAP_COALESCE`. Like a
+    /// lossy client it is NOT self-acked (its base advances only on
+    /// `apply_frame_ack`), but it keeps plain local semantics (DumpDiff, no
+    /// base_sum) and its queued visible frames coalesce in `write_buf`.
+    fn coalesce_conn(rows: u16, cols: u16) -> (ClientConn, UnixStream) {
+        let (stream, peer) = UnixStream::pair().unwrap();
+        let mut c = ClientConn {
+            stream,
+            read_buf: FrameBuffer::new(),
+            write_buf: Vec::new(),
+            rows: 0,
+            cols: 0,
+            caps: Vec::new(),
+            producer: None,
+            lossy: false,
+            coalesce: false,
+            coalesce_off: false,
+            pending_frame_start: None,
+            sb_floor: 0,
+            acked_sb_total: 0,
+            bytes_drained: 0,
+            last_drain_ms: 0,
+            hiwater_mb: 0,
+        };
+        let mut init = ipc::encode_resize(rows, cols).to_vec();
+        init.extend_from_slice(&caps::encode_table(&caps::own_table(&[caps::Cap {
+            id: caps::CAP_COALESCE,
+            payload: vec![],
+        }])));
+        c.apply_init(&init);
+        c.maybe_enable_frames(true);
+        (c, peer)
+    }
+
+    /// A CAP_COALESCE client is NOT self-acked: two queued frames without a
+    /// `Tag::FrameAck` leave the diff base lagging at the first frame, exactly like
+    /// the lossy client (the withhold condition now covers coalescing too).
+    #[test]
+    fn coalesce_client_is_not_self_acked_and_base_lags() {
+        let (rows, cols) = (24u16, 80u16);
+        let mut term = Terminal::with_scrollback(rows, cols, 1000);
+        fill_screen(&mut term);
+        let (mut c, _peer) = coalesce_conn(rows, cols);
+        assert!(c.coalesce && !c.lossy && c.producer.is_some());
+
+        // Frame 1 (the attach Full) is NOT self-acked: the base stays at 0.
+        assert!(c.queue_frame(term.dump_vt(), Snapshot::from_term(&term), false, (rows, cols)));
+        assert_eq!(c.producer.as_ref().unwrap().current_num(), 1);
+        assert_eq!(
+            c.producer.as_ref().unwrap().acked_num(),
+            0,
+            "a coalescing client must NOT self-ack: the base stays at frame 0"
+        );
+
+        // A relay-style ack advances the base to 1, mirroring the lossy path.
+        c.apply_frame_ack(&ipc::encode_frame_ack(1, 0));
+        assert_eq!(c.producer.as_ref().unwrap().acked_num(), 1);
+    }
+
+    /// The coalesce step replaces a still-un-sent trailing visible frame in
+    /// `write_buf` rather than appending a second: two frames queued with no drain
+    /// leave exactly ONE visible frame in the buffer, and it reconstructs the
+    /// LATEST screen (frame B) — the bound that keeps a burst under
+    /// MAX_CLIENT_BACKLOG.
+    #[test]
+    fn coalesce_replaces_unsent_trailing_frame_in_write_buf() {
+        let (rows, cols) = (24u16, 80u16);
+        let mut term = Terminal::with_scrollback(rows, cols, 1000);
+        fill_screen(&mut term);
+        let (mut c, _peer) = coalesce_conn(rows, cols);
+
+        // Frame A (attach Full), then ack it so B diffs against the confirmed base.
+        // The ack advances the diff base but does NOT drain write_buf, so A's bytes
+        // are still un-sent at the tail with the anchor at offset 0.
+        let base_dump = term.dump_vt();
+        assert!(c.queue_frame(base_dump.clone(), Snapshot::from_term(&term), false, (rows, cols)));
+        c.apply_frame_ack(&ipc::encode_frame_ack(1, 0));
+        assert_eq!(c.pending_frame_start, Some(0), "A is the un-sent trailing frame");
+        assert_eq!(decode_server_frames(&c.write_buf).len(), 1, "just A so far");
+
+        // Frame B (an edit) queued with NO drain in between: it truncates A's still
+        // un-sent slot and takes its place, so the buffer holds exactly ONE visible
+        // frame — the LATEST — instead of growing by a second one.
+        term.process(b"coalesced edit ");
+        assert!(c.queue_frame(term.dump_vt(), Snapshot::from_term(&term), false, (rows, cols)));
+
+        let frames = decode_server_frames(&c.write_buf);
+        assert_eq!(
+            frames.len(),
+            1,
+            "the un-sent trailing frame was replaced, not appended: {} records",
+            frames.len()
+        );
+        // The single surviving frame reconstructs frame B's (latest) screen. It
+        // diffs against the acked base A (base 1), which the daemon coalesced OUT
+        // of the buffer because the client already holds it — so seed the applier
+        // with A's dump (what the real client has) before applying B.
+        assert_eq!(
+            reconstruct_coalesced(&c.write_buf, rows, cols, &base_dump),
+            Snapshot::from_term(&term),
+            "the coalesced buffer reconstructs the LATEST screen"
+        );
+    }
+
+    /// The coalesce step never truncates a partially-sent frame: with the anchor
+    /// cleared (as the drain loop does once bytes go on the wire), a new frame
+    /// APPENDS rather than replacing — the buffer grows, preserving the in-flight
+    /// frame's bytes.
+    #[test]
+    fn coalesce_does_not_truncate_a_partially_sent_frame() {
+        let (rows, cols) = (24u16, 80u16);
+        let mut term = Terminal::with_scrollback(rows, cols, 1000);
+        fill_screen(&mut term);
+        let (mut c, _peer) = coalesce_conn(rows, cols);
+
+        assert!(c.queue_frame(term.dump_vt(), Snapshot::from_term(&term), false, (rows, cols)));
+        c.apply_frame_ack(&ipc::encode_frame_ack(1, 0));
+        // Simulate a drain that crossed the pending frame: the anchor is cleared.
+        c.pending_frame_start = None;
+        let before = c.write_buf.len();
+
+        term.process(b"next edit ");
+        assert!(c.queue_frame(term.dump_vt(), Snapshot::from_term(&term), false, (rows, cols)));
+        assert!(
+            c.write_buf.len() > before,
+            "with no clean anchor the new frame appends (grows the buffer), not truncates"
+        );
+    }
+
+    /// `FRAME_ACK_COALESCE_OFF` reverts a coalescing client to today's behavior:
+    /// `coalesce_off` flips true, a subsequent `queue_frame` self-acks (base
+    /// advances with no FrameAck) and appends without truncation.
+    #[test]
+    fn frame_ack_coalesce_off_reverts_to_self_ack() {
+        let (rows, cols) = (24u16, 80u16);
+        let mut term = Terminal::with_scrollback(rows, cols, 1000);
+        fill_screen(&mut term);
+        let (mut c, _peer) = coalesce_conn(rows, cols);
+
+        // Toggle coalescing OFF (frame 0, pure toggle — no base advance).
+        c.apply_frame_ack(&ipc::encode_frame_ack(0, ipc::FRAME_ACK_COALESCE_OFF));
+        assert!(c.coalesce_off, "the toggle bit sets coalesce_off");
+        assert!(!c.coalescing(), "coalesce_off ⇒ not coalescing");
+        assert_eq!(c.pending_frame_start, None, "turning off clears the anchor");
+
+        // Now queue_frame self-acks (base advances to 1 with no FrameAck).
+        assert!(c.queue_frame(term.dump_vt(), Snapshot::from_term(&term), false, (rows, cols)));
+        assert_eq!(
+            c.producer.as_ref().unwrap().acked_num(),
+            1,
+            "toggled-off ⇒ self-ack, the base advances like a reliable client"
+        );
+        let after_one = c.write_buf.len();
+
+        // A second frame APPENDS (no coalescing) — the buffer grows.
+        term.process(b"more ");
+        assert!(c.queue_frame(term.dump_vt(), Snapshot::from_term(&term), false, (rows, cols)));
+        assert!(
+            c.write_buf.len() > after_one,
+            "toggled-off ⇒ append, not truncate"
+        );
+
+        // Toggling back ON clears coalesce_off.
+        c.apply_frame_ack(&ipc::encode_frame_ack(0, 0));
+        assert!(!c.coalesce_off, "clearing the bit re-enables coalescing");
+        assert!(c.coalescing());
+    }
+
+    /// Regression guard: a client that did NOT advertise `CAP_COALESCE` still
+    /// self-acks and appends exactly as before — neither the withhold condition nor
+    /// the coalesce step touches it.
+    #[test]
+    fn reliable_client_unaffected() {
+        let (rows, cols) = (24u16, 80u16);
+        let mut term = Terminal::with_scrollback(rows, cols, 1000);
+        fill_screen(&mut term);
+        let (mut c, _peer) = frame_capable_conn(rows, cols);
+        assert!(!c.coalesce && !c.lossy, "no CAP_COALESCE / CAP_LOSSY ⇒ reliable");
+        assert!(!c.coalescing());
+
+        // Self-ack advances the base to 1 with NO FrameAck, and the anchor is never
+        // set (coalescing is off for this client).
+        assert!(c.queue_frame(term.dump_vt(), Snapshot::from_term(&term), false, (rows, cols)));
+        assert_eq!(c.producer.as_ref().unwrap().acked_num(), 1);
+        assert_eq!(c.pending_frame_start, None, "no anchor for a non-coalescing client");
+        let after_one = c.write_buf.len();
+
+        // A second frame APPENDS (no truncation) — today's byte-for-byte behavior.
+        term.process(b"appended");
+        assert!(c.queue_frame(term.dump_vt(), Snapshot::from_term(&term), false, (rows, cols)));
+        assert!(c.write_buf.len() > after_one, "a reliable client appends every frame");
+        assert_eq!(decode_server_frames(&c.write_buf).len(), 2, "both frames present");
+    }
+
+    /// A COALESCING client that ALSO advertises `CAP_SCROLLBACK` (as the real
+    /// local client does): its scrollback frames must NOT be self-acked either.
+    /// `maybe_queue_scrollback` self-acks only a reliable client (`!withhold`); a
+    /// coalescing client's base advances solely on its own `Tag::FrameAck`.
+    fn coalesce_scrollback_conn(rows: u16, cols: u16) -> (ClientConn, UnixStream) {
+        let (stream, peer) = UnixStream::pair().unwrap();
+        let mut c = ClientConn {
+            stream,
+            read_buf: FrameBuffer::new(),
+            write_buf: Vec::new(),
+            rows: 0,
+            cols: 0,
+            caps: Vec::new(),
+            producer: None,
+            lossy: false,
+            coalesce: false,
+            coalesce_off: false,
+            pending_frame_start: None,
+            sb_floor: 0,
+            acked_sb_total: 0,
+            bytes_drained: 0,
+            last_drain_ms: 0,
+            hiwater_mb: 0,
+        };
+        let mut init = ipc::encode_resize(rows, cols).to_vec();
+        init.extend_from_slice(&caps::encode_table(&caps::own_table(&[
+            caps::Cap { id: caps::CAP_COALESCE, payload: vec![] },
+            caps::Cap { id: caps::CAP_SCROLLBACK, payload: vec![0] },
+        ])));
+        c.apply_init(&init);
+        c.maybe_enable_frames(true);
+        (c, peer)
+    }
+
+    /// Regression guard (the review finding): `maybe_queue_scrollback` must
+    /// withhold the self-ack for a COALESCING client, not just a lossy one. If it
+    /// self-acked (the pre-fix `!self.lossy`), the producer base would advance
+    /// server-side without the client's `Tag::FrameAck`, defeating CAP_COALESCE.
+    #[test]
+    fn coalesce_scrollback_frame_is_not_self_acked() {
+        let (rows, cols) = (5u16, 24u16);
+        let mut term = Terminal::with_scrollback(rows, cols, 1000);
+        let (mut c, _peer) = coalesce_scrollback_conn(rows, cols);
+        assert!(c.coalesce && !c.lossy && c.wants_scrollback());
+
+        // Attach Full (frame 1), acked by the client so a scrollback frame has a
+        // confirmed base to thread off (maybe_queue_scrollback gates on has_base).
+        assert!(c.queue_frame(
+            term.dump_vt(),
+            Snapshot::from_term(&term),
+            term.is_alt_screen(),
+            (rows, cols),
+        ));
+        c.apply_frame_ack(&ipc::encode_frame_ack(1, 0));
+        assert_eq!(c.producer.as_ref().unwrap().acked_num(), 1);
+
+        // Scroll rows off, then broadcast: this queues a visible frame (2) plus a
+        // scrollback frame. Neither is self-acked for a coalescing client, so the
+        // acked base stays at the client-confirmed frame 1.
+        scroll_off(&mut term, 12);
+        broadcast_output(std::slice::from_mut(&mut c), &term, b"<raw ignored>");
+
+        assert!(
+            decode_frame_bodies(&c.write_buf)
+                .iter()
+                .any(|b| matches!(b, FrameBody::Scrollback { .. })),
+            "a scrollback frame must have been queued for this test to be meaningful"
+        );
+        assert_eq!(
+            c.producer.as_ref().unwrap().acked_num(),
+            1,
+            "a coalescing client's scrollback frame must NOT self-ack: base stays at \
+             the client-acked frame 1"
+        );
     }
 }

@@ -138,12 +138,19 @@ pub fn decode_exit(payload: &[u8]) -> Option<i32> {
 /// `CLIENT_FLAG_RESYNC`.
 pub const FRAME_ACK_RESYNC: u8 = 0x01;
 
+/// `Tag::FrameAck` flags bit: turn OFF local write-buffer coalescing
+/// (`caps::CAP_COALESCE`, posh#137) for this client at runtime. When set, the
+/// daemon reverts the client to today's behavior — self-ack every frame in
+/// `queue_frame` and append it to `write_buf` — so a wedged coalescing path can
+/// be escaped from the command palette without dropping the session. Absent
+/// (bit clear) means coalescing stays on (the default for a `CAP_COALESCE`
+/// client). Orthogonal to [`FRAME_ACK_RESYNC`]; both may be set.
+pub const FRAME_ACK_COALESCE_OFF: u8 = 0x02;
+
 /// `Tag::FrameAck` payload: the acked frame number (u64 little-endian) then a
-/// single flags byte ([`FRAME_ACK_RESYNC`]). Client -> daemon on the relay path.
-/// `#[allow(dead_code)]` until the relay (Phase 3.1) lands as its caller — the
-/// daemon only decodes; the encode side is the relay's, mirroring the agent
-/// chunk helpers in `caps.rs`.
-#[allow(dead_code)]
+/// single flags byte ([`FRAME_ACK_RESYNC`] / [`FRAME_ACK_COALESCE_OFF`]).
+/// Client -> daemon. Sent by a `caps::CAP_COALESCE` local client after each
+/// applied `Tag::Frame` (posh#137), and by the relay on the UDP path.
 pub fn encode_frame_ack(acked_frame: u64, flags: u8) -> [u8; 9] {
     let mut out = [0u8; 9];
     out[..8].copy_from_slice(&acked_frame.to_le_bytes());

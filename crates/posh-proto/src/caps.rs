@@ -92,6 +92,23 @@ pub const CAP_SCROLLBACK2: u8 = 10;
 /// terminal. Complements FDR 0013 (the outbound flag mirror).
 pub const CAP_KITTY_KEYBOARD: u8 = 11;
 
+/// Local write-buffer coalescing (posh#137). Client entry (empty payload): "I am
+/// a local stream-socket client — do NOT self-ack me; advance my diff base only
+/// on my `Tag::FrameAck`, and coalesce my queued visible frames so a burst
+/// cannot grow `write_buf` past `MAX_CLIENT_BACKLOG` and get me dropped." Unlike
+/// [`CAP_LOSSY`] (the UDP relay, which also selects MorphDelta, stamps
+/// `base_sum`, and runs lossy scrollback), a coalescing client keeps the plain
+/// local semantics: DumpDiff, no `base_sum`, reliable in-order scrollback. It
+/// exists so the local client gets the mosh-style latest-state-only bound
+/// WITHOUT inheriting the relay's wire-negotiated behaviors. The daemon
+/// truncates a still-un-sent trailing visible frame and re-encodes the latest
+/// against the acked base rather than appending a second (never touching a
+/// partially-sent frame). Runtime-toggleable via [`FRAME_ACK_COALESCE_OFF`], so
+/// a wedged coalescing path can fall back to today's self-ack+append behavior
+/// without dropping the session. Id 12 — next free after
+/// [`CAP_KITTY_KEYBOARD`]. See auto-memory posh-client-backlog-disconnect.
+pub const CAP_COALESCE: u8 = 12;
+
 /// Mask a received [`CAP_KITTY_KEYBOARD`] payload to the valid low-5-bit flag
 /// range (RFC 0010 Security Considerations): a malformed or oversized payload is
 /// treated as "capability absent" (`None`), never trusted out of range.
