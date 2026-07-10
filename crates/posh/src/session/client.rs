@@ -282,6 +282,28 @@ struct FrameRenderer {
     cols: u16,
 }
 
+/// A one-line human label for a frame body, for the apply-stall breadcrumb
+/// (posh#137): the kind plus the diff base a Diff/Morph is anchored at, which is
+/// what desyncs from the client's `applied_num` in the coalescing wedge.
+fn describe_body(body: &FrameBody) -> String {
+    match body {
+        FrameBody::Full(b) => format!("Full(len={})", b.len()),
+        FrameBody::Diff { base, base_sum, diff } => {
+            format!("Diff(base={base} sum={base_sum:?} len={})", diff.len())
+        }
+        FrameBody::Morph { base, base_sum, escapes } => {
+            format!("Morph(base={base} sum={base_sum:?} len={})", escapes.len())
+        }
+        FrameBody::Scrollback { base, rows } => {
+            format!("Scrollback(base={base} rows={})", rows.len())
+        }
+        FrameBody::Scrollback2 { epoch, row_offset, rows } => {
+            format!("Scrollback2(epoch={epoch} off={row_offset} rows={})", rows.len())
+        }
+        FrameBody::Empty => "Empty".to_string(),
+    }
+}
+
 impl FrameRenderer {
     fn new(rows: u16, cols: u16) -> FrameRenderer {
         let rows = rows.max(1);
@@ -445,6 +467,29 @@ impl FrameRenderer {
             // NOT advance), but it was still received and MUST be acked (posh#137).
             ApplyOutcome::NoChange => return (Ok(Vec::new()), Some(received)),
             ApplyOutcome::ReackAndWait => {
+                // Forensic breadcrumb for the coalescing base-desync (posh#137):
+                // a reliable-socket frame that can't apply means the diff base the
+                // daemon encoded against is NOT the frame this client holds. Log
+                // the received frame, its body's declared base + kind, and our
+                // applied_num — `base != applied_num` on a Diff/Morph is the
+                // desync signature (base>applied_num ⇒ our acks lagged the daemon;
+                // base<applied_num ⇒ the daemon base fell behind). This is a fatal,
+                // session-ending error, and clown launches us without
+                // POSH_DEBUG_LOG, so lazily open the default per-pid sink
+                // (`$XDG_RUNTIME_DIR/posh/posh-client-<pid>.log`, discoverable via
+                // `just debug-posh-sockets`) rather than staying silent — the wedge
+                // must leave an on-disk trace or it cannot be root-caused.
+                crate::remote::diag::enable_logging("client");
+                util::log_write(
+                    "wedge",
+                    &format!(
+                        "apply-stall frame={} body={} applied_num={} applied_len={}",
+                        frame.frame_num,
+                        describe_body(&frame.body),
+                        self.applied_num,
+                        self.applied_data.len(),
+                    ),
+                );
                 return (
                     Err(Error::Msg(format!(
                         "session frame {} could not be applied on the reliable socket",
