@@ -651,7 +651,7 @@ impl FrameRenderer {
 /// label reflecting the current `scroll_opt` state), and Detach (leave the
 /// session running). The remote client's echo/prediction/resync/forensics/agent/
 /// server-log commands are UDP/prediction-only and intentionally omitted.
-fn palette_commands(scroll_opt: bool, coalesce_on: bool) -> Value {
+fn palette_commands(scroll_opt: bool, coalesce_on: bool, coalesce_available: bool) -> Value {
     // Imperative label (the verb is the action), matching the remote palette:
     // enabled now => offer "Disable"; disabled now => offer "Enable".
     let (scroll_opt_name, scroll_opt_enabled) = if scroll_opt {
@@ -659,20 +659,29 @@ fn palette_commands(scroll_opt: bool, coalesce_on: bool) -> Value {
     } else {
         ("Enable scroll-region optimization", true)
     };
-    // Frame coalescing (posh#137): the state-reflecting label names what turning
-    // it off/on does. `enabled` is the desired NEW state, mirroring scroll_opt.
-    let (coalesce_name, coalesce_enabled) = if coalesce_on {
-        ("Frame coalescing: on (disable)", false)
-    } else {
-        ("Frame coalescing: off (enable)", true)
-    };
-    json!([
-        { "name": "Suspend client", "action": { "method": "client.suspend" } },
-        { "name": "Shell out", "action": { "method": "shell.open" } },
-        { "name": scroll_opt_name, "action": { "method": "render.scroll_opt", "params": { "enabled": scroll_opt_enabled } } },
-        { "name": coalesce_name, "action": { "method": "render.coalesce", "params": { "enabled": coalesce_enabled } } },
-        { "name": "Detach", "action": { "method": "app.detach" } },
-    ])
+    let mut commands = vec![
+        json!({ "name": "Suspend client", "action": { "method": "client.suspend" } }),
+        json!({ "name": "Shell out", "action": { "method": "shell.open" } }),
+        json!({ "name": scroll_opt_name, "action": { "method": "render.scroll_opt", "params": { "enabled": scroll_opt_enabled } } }),
+    ];
+    // Frame coalescing (posh#137): offer the toggle ONLY when coalescing was
+    // negotiated for this connection (`POSH_COALESCE=1`). Under the default-off
+    // kill-switch the cap is never advertised and the daemon ignores the toggle,
+    // so showing the command would be a control that lies — omit it entirely.
+    // When available, the state-reflecting label names what toggling does;
+    // `enabled` is the desired NEW state, mirroring scroll_opt.
+    if coalesce_available {
+        let (coalesce_name, coalesce_enabled) = if coalesce_on {
+            ("Frame coalescing: on (disable)", false)
+        } else {
+            ("Frame coalescing: off (enable)", true)
+        };
+        commands.push(
+            json!({ "name": coalesce_name, "action": { "method": "render.coalesce", "params": { "enabled": coalesce_enabled } } }),
+        );
+    }
+    commands.push(json!({ "name": "Detach", "action": { "method": "app.detach" } }));
+    Value::Array(commands)
 }
 
 /// Open the command palette over the live session (frames-on only): spawn the
@@ -687,6 +696,7 @@ fn open_local_palette(
     rows: u16,
     cols: u16,
     coalesce_on: bool,
+    coalesce_available: bool,
 ) -> bool {
     if palette.is_none() {
         *palette = Palette::spawn(rows, cols);
@@ -699,7 +709,7 @@ fn open_local_palette(
     // current tty size before summoning — else it renders at the size it had
     // when last open, misaligned against a since-resized screen (posh#135).
     p.resize(rows, cols);
-    p.open("Commands", palette_commands(fr.scroll_opt, coalesce_on));
+    p.open("Commands", palette_commands(fr.scroll_opt, coalesce_on, coalesce_available));
     fr.set_scroll(0);
     fr.invalidate();
     stdout_buf.extend_from_slice(&fr.recompose(p.screen()));
@@ -1075,7 +1085,7 @@ fn client_loop(stream: UnixStream, enter: &[u8], raw: &RawMode) -> Result<i32> {
                                 .as_mut()
                                 .expect("Palette event only fires with a live renderer");
                             let (rows, cols) = frame_size;
-                            if open_local_palette(&mut palette, fr, &mut stdout_buf, rows, cols, coalesce_on) {
+                            if open_local_palette(&mut palette, fr, &mut stdout_buf, rows, cols, coalesce_on, coalesce) {
                                 if !tail.is_empty() {
                                     if let Some(p) = palette.as_ref() {
                                         p.forward_input(tail);
@@ -2089,13 +2099,13 @@ mod tests {
     #[test]
     fn palette_commands_labels_the_scroll_opt_toggle_by_state() {
         let text = |cmds: &Value| serde_json::to_string(cmds).unwrap();
-        let on = palette_commands(true, true);
+        let on = palette_commands(true, true, true);
         assert!(
             text(&on).contains("Disable scroll-region optimization"),
             "enabled now => offer Disable: {}",
             text(&on)
         );
-        let off = palette_commands(false, true);
+        let off = palette_commands(false, true, true);
         assert!(
             text(&off).contains("Enable scroll-region optimization"),
             "disabled now => offer Enable: {}",
@@ -2104,21 +2114,30 @@ mod tests {
     }
 
     /// The palette's coalescing toggle (posh#137) labels itself from the CURRENT
-    /// state and carries the desired new state in its params, like scroll_opt.
+    /// state and carries the desired new state in its params, like scroll_opt —
+    /// but ONLY when coalescing is available (advertised); otherwise the command
+    /// is omitted entirely so the kill-switch doesn't show a control that lies.
     #[test]
     fn palette_commands_labels_the_coalesce_toggle_by_state() {
         let text = |cmds: &Value| serde_json::to_string(cmds).unwrap();
-        let on = palette_commands(true, true);
+        let on = palette_commands(true, true, true);
         assert!(
             text(&on).contains("Frame coalescing: on (disable)"),
             "coalescing on now => offer disable: {}",
             text(&on)
         );
-        let off = palette_commands(true, false);
+        let off = palette_commands(true, false, true);
         assert!(
             text(&off).contains("Frame coalescing: off (enable)"),
             "coalescing off now => offer enable: {}",
             text(&off)
+        );
+        // Unavailable (POSH_COALESCE unset ⇒ cap not advertised): no toggle at all.
+        let unavailable = palette_commands(true, false, false);
+        assert!(
+            !text(&unavailable).contains("Frame coalescing"),
+            "no coalescing command when unavailable: {}",
+            text(&unavailable)
         );
     }
 
