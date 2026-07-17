@@ -100,6 +100,17 @@ struct EmitState {
     hyperlink: u32,
 }
 
+/// How [`Terminal::dump_cursor`] positions the cursor: `Absolute` (a CUP from
+/// home, for paths that redraw the grid from `\x1b[H`) or `Relative` (anchored to
+/// the bottom of a continuous content flow, for the scrollback-replay path — so a
+/// replay into a taller target lands the cursor consistently, not offset by the
+/// height difference).
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum CursorAnchor {
+    Absolute,
+    Relative,
+}
+
 /// Emits the DECSCA toggle reaching `protected`.
 fn emit_protect(out: &mut String, protected: bool) {
     out.push_str(if protected { "\x1b[1\"q" } else { "\x1b[0\"q" });
@@ -251,12 +262,13 @@ impl Terminal {
         }
 
         if flat {
-            // Single-screen target: just the active grid from home.
+            // Single-screen target: just the active grid from home. Drawn from
+            // `\x1b[H`, so absolute positioning is height-independent here.
             out.push_str("\x1b[H");
             self.draw_grid(&mut out, self.scr(), &mut st);
             self.dump_graphics(&mut out);
             self.dump_modes(&mut out);
-            self.dump_cursor(&mut out, &mut st);
+            self.dump_cursor(&mut out, &mut st, CursorAnchor::Absolute);
             return out.into_bytes();
         }
 
@@ -270,6 +282,17 @@ impl Terminal {
         // newline because scrolled-in blank lines inherit the pen's
         // background (BCE). github #22.
         let sb_len = self.primary.scrollback_len();
+        // The scrollback-flow branch places the grid by a continuous newline
+        // flow that lands at the target's BOTTOM (height-dependent), so its
+        // cursor must be anchored relative to that flow, not by an absolute CUP
+        // (the multi-client taller-target offset bug). The `\x1b[H`-homed
+        // else-branch, and the alt path below (which re-homes + redraws the alt
+        // grid), stay absolute.
+        let cursor_anchor = if sb_len > 0 && !self.alt_active {
+            CursorAnchor::Relative
+        } else {
+            CursorAnchor::Absolute
+        };
         if sb_len > 0 {
             for i in 0..sb_len {
                 let row = self.primary.scrollback_row(i).unwrap();
@@ -310,7 +333,7 @@ impl Terminal {
 
         self.dump_graphics(&mut out);
         self.dump_modes(&mut out);
-        self.dump_cursor(&mut out, &mut st);
+        self.dump_cursor(&mut out, &mut st, cursor_anchor);
         out.into_bytes()
     }
 
@@ -370,7 +393,8 @@ impl Terminal {
         // re-place from the model (image data already lives in the target
         // from the original raw transmission).
         self.dump_placements(&mut out);
-        self.dump_cursor(&mut out, &mut st);
+        // Drawn from `\x1b[2J\x1b[H`, so absolute positioning is correct.
+        self.dump_cursor(&mut out, &mut st, CursorAnchor::Absolute);
         if self.modes.cursor_visible {
             out.push_str("\x1b[?25h");
         }
@@ -678,7 +702,17 @@ impl Terminal {
         }
     }
 
-    fn dump_cursor(&self, out: &mut String, st: &mut EmitState) {
+    /// `CursorAnchor::Absolute` positions the cursor with an absolute CUP —
+    /// correct for every path that homes (`\x1b[H`) and redraws the grid from the
+    /// top, so the target row is height-independent by construction. `Relative`
+    /// positions it relative to the BOTTOM of the just-flowed content — for the
+    /// scrollback-flow path, where the grid was replayed as a continuous
+    /// newline flow that lands at the target terminal's bottom regardless of its
+    /// height. An absolute CUP there assumes the SOURCE height and lands the
+    /// cursor too high when the target is taller (the multi-client cursor-offset
+    /// bug); the relative move anchors to where the flow actually left the
+    /// content, so it is correct at any replay height.
+    fn dump_cursor(&self, out: &mut String, st: &mut EmitState, anchor: CursorAnchor) {
         if self.cursor_style_raw != 0 {
             let _ = write!(out, "\x1b[{} q", self.cursor_style_raw);
         }
@@ -716,12 +750,33 @@ impl Terminal {
         } else {
             self.cursor.col
         };
-        let _ = write!(
-            out,
-            "\x1b[{};{}H",
-            self.cursor.row.saturating_sub(top) + 1,
-            print_col + 1
-        );
+        match anchor {
+            CursorAnchor::Absolute => {
+                let _ = write!(
+                    out,
+                    "\x1b[{};{}H",
+                    self.cursor.row.saturating_sub(top) + 1,
+                    print_col + 1
+                );
+            }
+            CursorAnchor::Relative => {
+                // The flow left the cursor at the end of the last grid row
+                // (row `rows-1` in the target, wherever the flow landed it).
+                // Move up to the cursor's grid row and to its column — both
+                // height-independent, so the replay is consistent whether the
+                // target is the source height or taller. Origin mode does not
+                // affect a CUU/CHA the way it affects an absolute CUP, so `top`
+                // is intentionally not applied here.
+                let up = (self.rows().saturating_sub(1)).saturating_sub(self.cursor.row);
+                out.push('\r');
+                if up > 0 {
+                    let _ = write!(out, "\x1b[{up}A");
+                }
+                if print_col > 0 {
+                    let _ = write!(out, "\x1b[{}G", print_col + 1);
+                }
+            }
+        }
         if self.cursor.pending_wrap {
             // Re-print the final cell (a width-1 cell, or a width-2 head whose
             // spacer regenerates) to regenerate pending-wrap, restoring the
@@ -777,5 +832,205 @@ fn emit_apc_chunks(out: &mut String, keys: &str, data: &[u8]) {
         let more = u8::from(chunks.peek().is_some());
         let chunk = std::str::from_utf8(chunk).unwrap();
         let _ = write!(out, "\x1b_Gm={more};{chunk}\x1b\\");
+    }
+}
+
+#[cfg(test)]
+mod cursor_mismatch_tests {
+    use crate::terminal::Terminal;
+
+    /// Dump `session` and replay it into a fresh `target_rows x target_cols`
+    /// terminal — the DumpDiff-into-a-client-sized-terminal path (posh cursor
+    /// offset). Returns the replay terminal so a test can inspect where the
+    /// cursor and content landed.
+    fn replay_into(session: &Terminal, target_rows: u16, target_cols: u16) -> Terminal {
+        let dump = session.dump_vt();
+        let mut t = Terminal::with_scrollback(target_rows, target_cols, 1000);
+        t.process(&dump);
+        t
+    }
+
+    /// The text on the row the cursor is on, trailing blanks trimmed.
+    fn cursor_row_text(t: &Terminal) -> String {
+        let c = t.cursor();
+        t.screen()
+            .row(c.row)
+            .map(|r| r.text(false).trim_end().to_string())
+            .unwrap_or_default()
+    }
+
+    /// The core invariant of the fix: whatever content the SOURCE cursor sat on,
+    /// the REPLAYED cursor must sit on the same content at any replay height —
+    /// the cursor tracks the content, never an absolute source row. `marker` is a
+    /// unique substring on the source cursor's row.
+    fn assert_cursor_on_marker(session: &Terminal, rows: u16, cols: u16, marker: &str) {
+        let src = cursor_row_text(session);
+        assert!(
+            src.contains(marker),
+            "test setup: source cursor row {src:?} must contain marker {marker:?}"
+        );
+        let replay = replay_into(session, rows, cols);
+        let got = cursor_row_text(&replay);
+        assert!(
+            got.contains(marker),
+            "cursor landed on {got:?} at {rows}x{cols}, expected the row with \
+             {marker:?} (source cursor row was {src:?})",
+        );
+    }
+
+    /// A scrolled 24-row session with the cursor at the bottom prompt.
+    fn scrolled_session() -> Terminal {
+        let mut s = Terminal::with_scrollback(24, 80, 1000);
+        for i in 0..40u16 {
+            s.process(format!("line {i:02}\r\n").as_bytes());
+        }
+        s.process(b"prompt$ ");
+        assert!(s.primary_scrollback_len() > 0, "must have scrollback");
+        s
+    }
+
+    /// The original repro: scrollback + bottom cursor, replayed into a TALLER
+    /// terminal, the cursor must stay on the prompt (was: offset up by the
+    /// height difference).
+    #[test]
+    fn taller_replay_keeps_cursor_on_the_bottom_prompt() {
+        let s = scrolled_session();
+        assert_eq!(s.cursor().row, 23, "source cursor on the bottom row");
+        assert_cursor_on_marker(&s, 24, 80, "prompt$"); // same size (baseline)
+        assert_cursor_on_marker(&s, 32, 80, "prompt$"); // taller (the bug)
+        assert_cursor_on_marker(&s, 50, 80, "prompt$"); // much taller
+    }
+
+    /// A scrolled session whose cursor is MID-SCREEN (not the bottom row): the
+    /// cursor must still land on its own content in a taller replay, not an
+    /// absolute row. Exercises the up>0-but-not-max relative move.
+    #[test]
+    fn taller_replay_keeps_cursor_on_a_mid_screen_row() {
+        let mut s = Terminal::with_scrollback(24, 80, 1000);
+        for i in 0..40u16 {
+            s.process(format!("line {i:02}\r\n").as_bytes());
+        }
+        // Land the cursor on a mid-screen row with a unique marker, no trailing
+        // newline so it stays put.
+        s.process(b"MIDROW-MARK");
+        s.process(b"\x1b[10;1H"); // move up into the middle of the grid
+        s.process(b"X"); // mark the mid row too so it's addressable
+        let c = s.cursor();
+        assert!(c.row > 0 && c.row < 23, "cursor is mid-screen at row {}", c.row);
+        let marker = cursor_row_text(&s);
+        let marker = marker.trim_end();
+        assert_cursor_on_marker(&s, 24, 80, marker);
+        assert_cursor_on_marker(&s, 32, 80, marker);
+    }
+
+    /// Cursor on the TOP row (row 0) of a scrolled session: the relative move is
+    /// the maximum (up = rows-1). Must land on row 0's content in any replay.
+    #[test]
+    fn taller_replay_keeps_cursor_on_the_top_row() {
+        let mut s = Terminal::with_scrollback(24, 80, 1000);
+        for i in 0..40u16 {
+            s.process(format!("line {i:02}\r\n").as_bytes());
+        }
+        s.process(b"\x1b[1;1HTOPMARK"); // home, write a marker on row 0
+        s.process(b"\x1b[1;1H"); // cursor back to row 0
+        assert_eq!(s.cursor().row, 0, "cursor on the top row");
+        assert_cursor_on_marker(&s, 24, 80, "TOPMARK");
+        assert_cursor_on_marker(&s, 32, 80, "TOPMARK");
+    }
+
+    /// SHORTER target than the source (24 dump -> 20 rows): the reverse of the
+    /// bug. The relative move must not underflow, and the cursor must stay on the
+    /// prompt content (which the shorter terminal keeps at its bottom).
+    #[test]
+    fn shorter_replay_keeps_cursor_on_the_prompt() {
+        let s = scrolled_session();
+        assert_cursor_on_marker(&s, 20, 80, "prompt$");
+        assert_cursor_on_marker(&s, 10, 80, "prompt$");
+    }
+
+    /// WIDER target (cols mismatch) at a taller height: the horizontal dimension
+    /// must not disturb the vertical anchoring. The prompt row's column position
+    /// is preserved (col unchanged by the row-relative move).
+    #[test]
+    fn wider_and_taller_replay_keeps_cursor_on_the_prompt() {
+        let s = scrolled_session();
+        let src_col = s.cursor().col;
+        let replay = replay_into(&s, 32, 120);
+        assert!(
+            cursor_row_text(&replay).contains("prompt$"),
+            "wider+taller: cursor must stay on the prompt row"
+        );
+        assert_eq!(
+            replay.cursor().col,
+            src_col,
+            "the row-relative move must not shift the column"
+        );
+    }
+
+    /// NO scrollback (the session never scrolled): dump takes the absolute
+    /// `\x1b[H`-home branch, NOT the relative one. A taller replay puts the
+    /// content at the TOP (home) and the cursor stays on its absolute row — this
+    /// documents that the absolute branch is intentionally height-preserving
+    /// (top-anchored), the complement of the scrollback branch's bottom anchor.
+    #[test]
+    fn no_scrollback_replay_is_top_anchored_and_consistent() {
+        let mut s = Terminal::with_scrollback(24, 80, 1000);
+        s.process(b"\x1b[H"); // home
+        s.process(b"first line top"); // row 0
+        s.process(b"\x1b[3;1Hthird row PROMPT"); // row 2, leave cursor here
+        assert_eq!(s.primary_scrollback_len(), 0, "no scrollback for this case");
+        assert_eq!(s.cursor().row, 2);
+        // Absolute branch: content homed at top, cursor on its own content row,
+        // consistent at same size and taller.
+        assert_cursor_on_marker(&s, 24, 80, "PROMPT");
+        assert_cursor_on_marker(&s, 32, 80, "PROMPT");
+    }
+
+    /// Pending-wrap at the cursor, in a scrolled session, replayed TALLER: the
+    /// relative-anchor path emits its own column positioning (CHA) and then the
+    /// pending-wrap reprint. The reprinted cell + the armed pending-wrap state
+    /// must survive a taller replay exactly as at same size (the reprint runs
+    /// after positioning in both anchors, but the relative path is new).
+    #[test]
+    fn taller_replay_preserves_pending_wrap_at_cursor() {
+        let mut s = Terminal::with_scrollback(24, 80, 1000);
+        for i in 0..40u16 {
+            s.process(format!("line {i:02}\r\n").as_bytes());
+        }
+        // Fill the last grid row to the final column so the cursor is left in
+        // the pending-wrap state (armed, but not yet wrapped). `pending_wrap` is
+        // internal, so assert its OBSERVABLE effect: the cursor rests on the
+        // final column of the filled row (not wrapped to the next line).
+        s.process(&[b'W'; 80]);
+        let sc = s.cursor();
+        assert_eq!(sc.col, 79, "source cursor armed at the last column");
+
+        let replay = replay_into(&s, 32, 80);
+        let rc = replay.cursor();
+        // The cursor sits on the row whose content is the run of 'W's, at the
+        // same final column — the reprint landed at the same cell across the
+        // taller replay, and the cursor did not spuriously wrap to a new row.
+        assert!(
+            cursor_row_text(&replay).contains("WWWW"),
+            "cursor on the filled row, got {:?}",
+            cursor_row_text(&replay)
+        );
+        assert_eq!(rc.col, sc.col, "pending-wrap column preserved across the taller replay");
+    }
+
+    /// Same-size round-trip: the fix must not change the common case. The cursor
+    /// lands on the exact source row AND content when replayed at the source
+    /// size (the guard that the relative move is a no-op at source height).
+    #[test]
+    fn same_size_roundtrip_is_unchanged() {
+        let s = scrolled_session();
+        let replay = replay_into(&s, 24, 80);
+        assert_eq!(
+            replay.cursor().row,
+            s.cursor().row,
+            "same-size replay preserves the absolute cursor row"
+        );
+        assert_eq!(replay.cursor().col, s.cursor().col, "and the column");
+        assert!(cursor_row_text(&replay).contains("prompt$"));
     }
 }
