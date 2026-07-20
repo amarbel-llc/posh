@@ -155,7 +155,15 @@ agent:
   |---|---|---|
   | `SSH_AGENTC_SIGN_REQUEST` | `<host> SIGNED with your forwarded ssh key` | **none — every signature is announced** |
   | `SSH_AGENTC_REQUEST_IDENTITIES` | `<host> listed your forwarded ssh keys` | one per minute |
-  | anything else | as a listing | one per minute |
+  | anything else | `<host> made an unrecognised ssh-agent request (type N) — this may modify your agent` | **none** |
+
+  The unrecognised case is announced rather than folded in with listings
+  because the request types posh does not name include ones that *mutate*
+  the local agent — add/remove identity, remove-all, lock/unlock. Calling a
+  key deletion "listed your keys" would understate it as a passive read.
+  Announcing every one is affordable precisely because ordinary traffic is
+  only listings and signatures, so it is rare by construction; and if it
+  stops being rare, that is itself worth seeing.
 
   Three properties are deliberate, and each was a defect before posh#147:
 

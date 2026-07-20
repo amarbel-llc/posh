@@ -509,14 +509,13 @@ impl AgentClient {
                     }
                     apply_data_or_close(&mut self.channels, rec);
                 }
-                _ => {
-                    self.sniffers.retain(|(id, _)| *id != rec.channel);
-                    apply_data_or_close(&mut self.channels, rec);
-                }
+                _ => apply_data_or_close(&mut self.channels, rec),
             }
         }
         reap_closed(&mut self.channels);
-        // A channel torn down locally leaves no sniffer behind.
+        // A channel torn down leaves no sniffer behind. One sweep covers every
+        // way a channel can end — a Close/Fail record, or a local write error in
+        // `apply_data_or_close` — so no per-record removal is needed.
         self.sniffers
             .retain(|(id, _)| self.channels.iter().any(|c| c.id == *id && !c.closed));
         out
@@ -794,7 +793,20 @@ impl AgentNotice {
             // Never rate-limited: each signature is a distinct use of a key. If
             // something signs in a loop, the user especially wants to know.
             AgentOp::Sign => Some(format!("{} SIGNED with your forwarded ssh key", self.host)),
-            AgentOp::ListKeys | AgentOp::Other(_) => {
+            // Also never rate-limited, and never described as a listing. The
+            // request types posh does not name include ones that MUTATE the
+            // local agent — add/remove identity, remove-all, lock/unlock — which
+            // are more notable than a listing, not less. Reporting them as "listed
+            // your keys" would understate a key deletion. Announcing every one is
+            // affordable precisely because ordinary traffic is only listings and
+            // signatures, so this is rare by construction; and if it stops being
+            // rare, that is itself worth seeing.
+            AgentOp::Other(kind) => Some(format!(
+                "{} made an unrecognised ssh-agent request (type {kind}) — \
+                 this may modify your agent",
+                self.host
+            )),
+            AgentOp::ListKeys => {
                 let due = match self.last_shown {
                     Some(t) => now.saturating_sub(t) >= AGENT_NOTICE_INTERVAL_MS,
                     None => true,
@@ -1633,6 +1645,27 @@ mod tests {
         // of a private key is its own event worth reporting.
         assert!(n.on_request(AgentOp::Sign, 5_002).is_some());
         assert!(n.on_request(AgentOp::Sign, 5_003).is_some());
+    }
+
+    // An unnamed request type must not be described as a listing. The types posh
+    // does not name include ones that MUTATE the local agent (add/remove
+    // identity, remove-all, lock), so "listed your keys" would understate a key
+    // deletion as a passive read.
+    #[test]
+    fn an_unrecognised_request_is_not_reported_as_a_listing() {
+        let mut n = AgentNotice::new(false, "box");
+        let msg = n
+            .on_request(AgentOp::Other(19), 0)
+            .expect("an unrecognised request is always announced");
+        assert!(
+            !msg.contains("listed"),
+            "must not claim it was a listing: {msg}"
+        );
+        assert!(msg.contains("19"), "names the type so it can be looked up: {msg}");
+        assert!(msg.contains("box"), "names the host: {msg}");
+        // Not rate-limited: a possible agent mutation is not something to drop
+        // on the floor because a listing happened in the same minute.
+        assert!(n.on_request(AgentOp::Other(19), 1).is_some());
     }
 
     // Per ADR-0003 the 5-byte header may arrive split across records.
