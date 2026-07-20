@@ -231,8 +231,24 @@ impl Terminal {
     }
 
     /// VT escape stream that reproduces the terminal state (contents,
-    /// attributes, cursor, modes, title, scroll region) on a fresh
-    /// terminal of the same size.
+    /// attributes, cursor, modes, title, scroll region) on a fresh terminal.
+    ///
+    /// **The target may be LARGER than this terminal, and the replay must still
+    /// be correct.** This is not a corner case: the session daemon sizes the pty
+    /// to the SMALLEST attached client (tmux `window-size smallest`), so every
+    /// other client permanently replays a smaller session into a bigger
+    /// terminal. A client-sized model is built and fed these bytes on every
+    /// frame (`framesync::DumpDiff`), so any dependence on the target's height
+    /// is a live bug, not a theoretical one.
+    ///
+    /// Concretely, that forbids deriving a position from an assumed geometry.
+    /// Two bugs came from exactly that and both put the cursor above its own
+    /// content on the larger client: an absolute CUP emitted after a
+    /// bottom-landing scrollback flow (fixed by [`CursorAnchor::Relative`]), and
+    /// an alt grid drawn from wherever the preceding flow parked the cursor
+    /// instead of from home (fixed by homing inside `draw_grid`). When adding to
+    /// this serializer, place content and cursor by the same anchor, and assume
+    /// nothing about how many rows the target has.
     pub fn dump_vt(&self) -> Vec<u8> {
         self.dump_vt_impl(false)
     }
