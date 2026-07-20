@@ -613,6 +613,11 @@ pub struct AgentStream {
     outbox: InputOutbox,
     inbox: InputInbox,
     decoder: RecordDecoder,
+    /// Cumulative bytes handed to the wire, INCLUDING re-sends. Fed by
+    /// [`mark_sent`](Self::mark_sent) at each encode site, because only the
+    /// caller knows what it actually emitted — `pending()` is a `&self` view and
+    /// may be read without sending. See [`resent_bytes`](Self::resent_bytes).
+    sent_bytes: u64,
 }
 
 #[allow(dead_code)]
@@ -640,6 +645,33 @@ impl AgentStream {
 
     pub fn has_pending(&self) -> bool {
         !self.outbox.is_empty()
+    }
+
+    /// Records that `len` bytes of [`pending`](Self::pending) were actually
+    /// emitted. Call once per `AGENT_DATA` encode; re-sends of the same tail
+    /// count each time, which is the whole point.
+    pub fn mark_sent(&mut self, len: usize) {
+        self.sent_bytes = self.sent_bytes.saturating_add(len as u64);
+    }
+
+    /// Cumulative bytes emitted, including re-sends (posh#142 telemetry).
+    pub fn sent_bytes(&self) -> u64 {
+        self.sent_bytes
+    }
+
+    /// Cumulative DISTINCT bytes ever queued — the outbox's monotonic end
+    /// offset, unaffected by acking (which only drops the acked prefix).
+    pub fn queued_bytes(&self) -> u64 {
+        self.outbox.end_offset()
+    }
+
+    /// What cumulative-only acknowledgement has cost so far: bytes put on the
+    /// wire that the peer had already been sent. The unacked tail rides EVERY
+    /// message until acked, so on a lossy path this grows as the square of the
+    /// stall — it is the quantity a selective ack would eliminate, and the
+    /// evidence posh#142 should be decided on rather than first principles.
+    pub fn resent_bytes(&self) -> u64 {
+        self.sent_bytes.saturating_sub(self.queued_bytes())
     }
 
     /// Offset to advertise in `AGENT_ACK`: one past the last byte handed to
@@ -824,6 +856,52 @@ mod tests {
             posh_proto::frame::ServerFrame::decode(&wire[9..]).unwrap(),
             sf,
             "ServerFrame must decode unchanged from behind the envelope"
+        );
+    }
+
+    // posh#142 telemetry. The agent outbox re-sends its whole unacked tail on
+    // every message until the peer acks, so cumulative-only acknowledgement's
+    // cost is exactly "bytes emitted minus distinct bytes queued". These counters
+    // exist so that cost can be read off a real connection instead of argued
+    // about from first principles.
+    #[test]
+    fn agent_stream_counts_resent_bytes_until_acked() {
+        let mut s = AgentStream::new();
+        s.send(&AgentRecord {
+            channel: 1,
+            kind: RecordKind::Data,
+            payload: vec![0xab; 10],
+        });
+        let queued = s.queued_bytes();
+        assert!(queued > 0, "the record framed some bytes");
+        assert_eq!(s.sent_bytes(), 0, "nothing emitted yet");
+        assert_eq!(s.resent_bytes(), 0);
+
+        // First emission: all new, nothing re-sent.
+        let n = s.pending().len();
+        s.mark_sent(n);
+        assert_eq!(s.sent_bytes(), queued);
+        assert_eq!(s.resent_bytes(), 0, "a first send is not a re-send");
+
+        // Peer did not ack, so the same tail rides the next two messages.
+        s.mark_sent(s.pending().len());
+        s.mark_sent(s.pending().len());
+        assert_eq!(
+            s.resent_bytes(),
+            queued * 2,
+            "each unacked repeat is counted as overhead"
+        );
+
+        // Once acked the tail drops, so further messages carry nothing and the
+        // overhead stops growing.
+        s.ack(queued);
+        assert_eq!(s.pending().len(), 0);
+        s.mark_sent(s.pending().len());
+        assert_eq!(s.resent_bytes(), queued * 2, "acking halts the bleeding");
+        assert_eq!(
+            s.queued_bytes(),
+            queued,
+            "queued is cumulative-distinct and unaffected by acking"
         );
     }
 

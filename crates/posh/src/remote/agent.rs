@@ -245,11 +245,16 @@ impl AgentEndpoint {
     /// to be assigned, and whether we still own the well-known symlink. Rides the
     /// `CAP_DIAG` `ServerDiag` v2 payload; only built in a debug/agent posture on
     /// a paced frame stream, so its one `read_link` is not a hot path.
-    pub fn diag(&self) -> crate::remote::caps::AgentDiag {
+    /// `bytes_sent`/`bytes_queued` come from the connection's `AgentStream`,
+    /// which `server_loop` owns separately from the endpoint — the endpoint knows
+    /// about channels, the stream about bytes, and the diagnostic joins them.
+    pub fn diag(&self, bytes_sent: u64, bytes_queued: u64) -> crate::remote::caps::AgentDiag {
         crate::remote::caps::AgentDiag {
             live_channels: self.live_channel_count() as u32,
             next_channel_id: self.next_channel_id,
             symlink_ok: self.symlink_points_to_self(),
+            bytes_sent,
+            bytes_queued,
         }
     }
 

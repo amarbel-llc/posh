@@ -295,23 +295,41 @@ fn agent_debug_summary(st: &ClientState) -> String {
         return "agent-fwd: off (no local SSH agent, or disabled by policy)".to_string();
     };
     let client = format!(
-        "agent-fwd: on sock={} peer-advertised={} channels={} out_base={} pending={}B in_ack={}",
+        "agent-fwd: on sock={} peer-advertised={} channels={} out_base={} pending={}B in_ack={}\n\
+         stream: sent={}B queued={}B resent={}B ({})",
         agent.source().display(),
         if st.agent_seen { "yes" } else { "no" },
         agent.live_channel_count(),
         st.agent_stream.send_base(),
         st.agent_stream.pending().len(),
         st.agent_stream.recv_ack(),
+        st.agent_stream.sent_bytes(),
+        st.agent_stream.queued_bytes(),
+        st.agent_stream.resent_bytes(),
+        // The posh#142 headline: what fraction of agent bytes on the wire were
+        // re-sends of an unacked tail. 0% means cumulative-only ack has cost
+        // nothing on this connection.
+        match st.agent_stream.sent_bytes() {
+            0 => "0%".to_string(),
+            sent => format!(
+                "{:.0}% resent",
+                100.0 * st.agent_stream.resent_bytes() as f64 / sent as f64
+            ),
+        },
     );
     // The server endpoint's own state, forwarded over CAP_DIAG (FDR 0004).
     // Absent until the first diag frame arrives; `agent: None` means the
     // server is not forwarding (or predates this extension).
     let server = match st.last_server_diag.and_then(|d| d.agent) {
         Some(a) => format!(
-            "server: endpoint=up channels={} next_chan={} symlink={}",
+            "server: endpoint=up channels={} next_chan={} symlink={} \
+             sent={}B queued={}B resent={}B",
             a.live_channels,
             a.next_channel_id,
             if a.symlink_ok { "ok" } else { "broken" },
+            a.bytes_sent,
+            a.bytes_queued,
+            a.bytes_sent.saturating_sub(a.bytes_queued),
         ),
         None if st.last_server_diag.is_some() => {
             "server: endpoint=down (no server-side forwarding, or an older server)".to_string()
@@ -2235,10 +2253,14 @@ fn outgoing_caps(st: &mut ClientState) -> Vec<caps::Cap> {
             payload: vec![],
         });
         if st.agent_seen {
-            extra.extend(caps::encode_agent_data(
+            let data = caps::encode_agent_data(
                 st.agent_stream.send_base(),
                 st.agent_stream.pending(),
-            ));
+            );
+            // Count what was ACTUALLY encoded, not what was pending (#142).
+            st.agent_stream
+                .mark_sent(data.iter().map(|c| c.payload.len() - 8).sum::<usize>());
+            extra.extend(data);
             extra.push(caps::encode_agent_ack(st.agent_stream.recv_ack()));
         }
     }
@@ -2868,6 +2890,10 @@ mod tests {
                 live_channels: 2,
                 next_channel_id: 3,
                 symlink_ok: true,
+                // 1500 emitted for 1000 distinct: 500 bytes of the unacked tail
+                // re-sent, the posh#142 cost.
+                bytes_sent: 1500,
+                bytes_queued: 1000,
             }),
         });
         let s = agent_debug_summary(&st);

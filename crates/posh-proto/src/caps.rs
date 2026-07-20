@@ -392,18 +392,37 @@ pub struct ServerDiag {
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct AgentDiag {
     pub live_channels: u32,
+    /// Also the cumulative count of channels ever opened, plus one (ids start at
+    /// 1 and never repeat). On an idle connection this MUST stay put — a steadily
+    /// climbing value with no agent use is the shipped signal for a spurious-open
+    /// regression like posh#147, which went unnoticed only because nobody read it.
     pub next_channel_id: u32,
     pub symlink_ok: bool,
+    /// Cumulative agent-stream bytes handed to the wire, **including re-sends**.
+    pub bytes_sent: u64,
+    /// Cumulative DISTINCT agent-stream bytes ever queued. `bytes_sent` minus
+    /// this is what cumulative-only acknowledgement costs: the unacked tail is
+    /// re-encoded onto every message until the peer acks it, so on a lossy path
+    /// the difference is the retransmission overhead a selective ack would avoid
+    /// (posh#142). Equal values mean nothing was ever re-sent.
+    pub bytes_queued: u64,
 }
 
 /// Versioned by length. The 29-byte transport core is current_num | acked_num |
 /// term_gen (u64 BE each) | outstanding (u32 BE) | pty_open (u8). A u32 BE `pid`
 /// (#83) appends 4 bytes; the [`AgentDiag`] (FDR 0004, when `d.agent` is `Some`)
-/// appends 9. This encoder always writes the pid, so it emits 33 bytes (no
-/// agent) or 42 (with agent); the decoder still accepts the old pid-less 29/38.
-/// Well under the 255-byte cap budget.
+/// appends 9, and its stream counters (posh#142) a further 16 (two u64 BE). This
+/// encoder always writes the pid and, with an agent, always the counters — so it
+/// emits 33 bytes (no agent) or 58 (with agent); the decoder still accepts the
+/// older 29/38/42. Well under the 255-byte cap budget.
+///
+/// A peer too old to know length 58 drops the whole record rather than the two
+/// new fields — the same trade the agent block itself made when it introduced
+/// 38/42. Acceptable for `CAP_DIAG` specifically: it is an experimental-range id
+/// (224) carrying diagnostics, so losing a report on version skew costs
+/// visibility, never correctness.
 pub fn encode_server_diag(d: &ServerDiag) -> Cap {
-    let mut payload = Vec::with_capacity(42);
+    let mut payload = Vec::with_capacity(58);
     payload.extend_from_slice(&d.current_num.to_be_bytes());
     payload.extend_from_slice(&d.acked_num.to_be_bytes());
     payload.extend_from_slice(&d.term_gen.to_be_bytes());
@@ -414,6 +433,8 @@ pub fn encode_server_diag(d: &ServerDiag) -> Cap {
         payload.extend_from_slice(&a.live_channels.to_be_bytes());
         payload.extend_from_slice(&a.next_channel_id.to_be_bytes());
         payload.push(a.symlink_ok as u8);
+        payload.extend_from_slice(&a.bytes_sent.to_be_bytes());
+        payload.extend_from_slice(&a.bytes_queued.to_be_bytes());
     }
     Cap {
         id: CAP_DIAG,
@@ -421,26 +442,32 @@ pub fn encode_server_diag(d: &ServerDiag) -> Cap {
     }
 }
 
-/// Reads a [`ServerDiag`] payload. Four valid shapes (by length): 29 = core
+/// Reads a [`ServerDiag`] payload. Five valid shapes (by length): 29 = core
 /// only (pre-pid); 33 = core + pid; 38 = core + agent (pre-pid); 42 = core +
-/// pid + agent. A pid-less peer decodes with `pid = 0`. Any other length is
-/// malformed (the peer is authenticated, so this is corruption or an unknown
-/// future version, not an attack to absorb) and is dropped by the consumer.
+/// pid + agent (pre-counters); 58 = core + pid + agent + stream counters. A
+/// pid-less peer decodes with `pid = 0`; a counter-less peer decodes with zeroed
+/// byte counters, which read as "nothing sent, nothing re-sent" and so cannot be
+/// mistaken for a measurement. Any other length is malformed (the peer is
+/// authenticated, so this is corruption or an unknown future version, not an
+/// attack to absorb) and is dropped by the consumer.
 pub fn decode_server_diag(payload: &[u8]) -> Result<ServerDiag> {
     let u64_at = |o: usize| u64::from_be_bytes(payload[o..o + 8].try_into().unwrap());
     let u32_at = |o: usize| u32::from_be_bytes(payload[o..o + 4].try_into().unwrap());
-    // (pid, agent-block offset) keyed on the payload length.
-    let (pid, agent_off) = match payload.len() {
-        29 => (0u32, None),
-        33 => (u32_at(29), None),
-        38 => (0u32, Some(29usize)),
-        42 => (u32_at(29), Some(33usize)),
-        _ => return Err(Error::from("CAP_DIAG payload is not 29/33/38/42 bytes")),
+    // (pid, agent-block offset, counters present) keyed on the payload length.
+    let (pid, agent_off, counters) = match payload.len() {
+        29 => (0u32, None, false),
+        33 => (u32_at(29), None, false),
+        38 => (0u32, Some(29usize), false),
+        42 => (u32_at(29), Some(33usize), false),
+        58 => (u32_at(29), Some(33usize), true),
+        _ => return Err(Error::from("CAP_DIAG payload is not 29/33/38/42/58 bytes")),
     };
     let agent = agent_off.map(|o| AgentDiag {
         live_channels: u32_at(o),
         next_channel_id: u32_at(o + 4),
         symlink_ok: payload[o + 8] != 0,
+        bytes_sent: if counters { u64_at(o + 9) } else { 0 },
+        bytes_queued: if counters { u64_at(o + 17) } else { 0 },
     });
     Ok(ServerDiag {
         current_num: u64_at(0),
@@ -724,11 +751,20 @@ mod tests {
                 live_channels: 4,
                 next_channel_id: 9,
                 symlink_ok: true,
+                bytes_sent: 4096,
+                bytes_queued: 3000,
             }),
         };
         let cap = encode_server_diag(&d);
-        assert_eq!(cap.payload.len(), 42);
+        assert_eq!(cap.payload.len(), 58);
         assert_eq!(decode_server_diag(&cap.payload).unwrap(), d);
+        // A pre-counter (42-byte) peer still decodes; the counters read zero,
+        // which is "nothing sent, nothing re-sent" and cannot be mistaken for a
+        // measurement of zero overhead on a busy stream (posh#142).
+        let old = decode_server_diag(&cap.payload[..42]).unwrap();
+        let a = old.agent.unwrap();
+        assert_eq!(a.live_channels, 4);
+        assert_eq!((a.bytes_sent, a.bytes_queued), (0, 0));
         // The same diag without agent state encodes as a 33-byte payload (core +
         // pid) and decodes with `agent = None`.
         let no_agent = ServerDiag { agent: None, ..d };
@@ -757,14 +793,15 @@ mod tests {
 
     #[test]
     fn server_diag_rejects_wrong_length() {
-        // Valid lengths are 29/33/38/42 (core, +pid, +agent, +pid+agent).
-        for bad in [0usize, 28, 30, 34, 37, 39, 41, 43] {
+        // Valid lengths are 29/33/38/42/58 (core, +pid, +agent, +pid+agent,
+        // +stream counters).
+        for bad in [0usize, 28, 30, 34, 37, 39, 41, 43, 50, 57, 59] {
             assert!(
                 decode_server_diag(&vec![0u8; bad]).is_err(),
                 "len {bad} should be rejected"
             );
         }
-        for ok in [29usize, 33, 38, 42] {
+        for ok in [29usize, 33, 38, 42, 58] {
             assert!(
                 decode_server_diag(&vec![0u8; ok]).is_ok(),
                 "len {ok} should decode"

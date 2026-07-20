@@ -1149,7 +1149,9 @@ pub(crate) fn server_loop(
                         pid: std::process::id(),
                         // FDR 0004: forward the agent endpoint's state too
                         // when forwarding is active server-side (None == none).
-                        agent: agent_endpoint.as_ref().map(|ep| ep.diag()),
+                        agent: agent_endpoint.as_ref().map(|ep| {
+                            ep.diag(agent_stream.sent_bytes(), agent_stream.queued_bytes())
+                        }),
                     }));
                 }
                 // Evolved-predictor remote metrics (RFC 0007 §3): sample the
@@ -1211,10 +1213,16 @@ pub(crate) fn server_loop(
                         payload: vec![],
                     });
                     if agent_seen {
-                        extras.extend(caps::encode_agent_data(
+                        let data = caps::encode_agent_data(
                             agent_stream.send_base(),
                             agent_stream.pending(),
-                        ));
+                        );
+                        // Count what was ACTUALLY encoded, not what was pending:
+                        // `encode_agent_data` truncates at MAX_AGENT_DATA_CAPS,
+                        // and each entry carries an 8-byte offset prefix (#142).
+                        agent_stream
+                            .mark_sent(data.iter().map(|c| c.payload.len() - 8).sum::<usize>());
+                        extras.extend(data);
                         extras.push(caps::encode_agent_ack(agent_stream.recv_ack()));
                     }
                 }
