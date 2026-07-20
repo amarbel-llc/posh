@@ -501,13 +501,11 @@ impl AgentClient {
                     }
                 }
                 RecordKind::Data => {
-                    // Classify the channel's first request before proxying it on
+                    // Classify the channel's requests before proxying them on
                     // (read-only; the bytes are forwarded unchanged either way).
-                    if let Some(slot) = self.sniffers.iter_mut().find(|(id, _)| *id == rec.channel)
-                    {
-                        if let Some(op) = slot.1.push(&rec.payload) {
-                            self.ops.push(op);
-                        }
+                    if let Some(i) = self.sniffers.iter().position(|(id, _)| *id == rec.channel) {
+                        let ops = self.sniffers[i].1.push(&rec.payload);
+                        self.ops.extend(ops);
                     }
                     apply_data_or_close(&mut self.channels, rec);
                 }
@@ -673,17 +671,24 @@ pub enum AgentOp {
     Other(u8),
 }
 
-/// Classifies the FIRST request on one agent channel.
+/// Classifies EVERY request on one agent channel.
 ///
-/// Per ADR-0003 the header may be split across records, so bytes accumulate
-/// until [`AGENT_REQUEST_HEADER`] have arrived; only the first request on a
-/// channel is classified (a channel is one agent connection, and its opening
-/// request is what characterises it), after which this goes inert and copies
-/// nothing further.
+/// Deliberately not just the first. One agent connection commonly carries a
+/// `REQUEST_IDENTITIES` to discover the available keys followed by a
+/// `SIGN_REQUEST` to use one, so classifying only the opening request would
+/// label such a channel a harmless listing and never report the signature —
+/// reintroducing posh#147's "real key use goes unannounced" by another route.
+///
+/// It is a skipping parser, not a buffering one: it accumulates the 5-byte
+/// header (per ADR-0003, which may be split across records), reads the type,
+/// then *counts down* the request body without copying it. Payloads — which is
+/// where key blobs and signed data live — are never retained.
 #[derive(Default)]
 pub struct OpSniffer {
+    /// Partial `[u32 BE length][u8 type]` header being accumulated.
     head: Vec<u8>,
-    done: bool,
+    /// Bytes of the current request's body still to be skipped.
+    skip: u64,
 }
 
 impl OpSniffer {
@@ -691,26 +696,40 @@ impl OpSniffer {
         OpSniffer::default()
     }
 
-    /// Feeds channel bytes; returns the classification exactly once, on the
-    /// record that completes the header.
-    pub fn push(&mut self, bytes: &[u8]) -> Option<AgentOp> {
-        if self.done {
-            return None;
+    /// Feeds channel bytes, returning one classification per complete request
+    /// header seen. Usually empty or a single entry; a record carrying several
+    /// small requests yields several.
+    pub fn push(&mut self, bytes: &[u8]) -> Vec<AgentOp> {
+        let mut out = Vec::new();
+        let mut rest = bytes;
+        while !rest.is_empty() {
+            // Mid-body: discard as much of it as this record carries.
+            if self.skip > 0 {
+                let n = self.skip.min(rest.len() as u64) as usize;
+                self.skip -= n as u64;
+                rest = &rest[n..];
+                continue;
+            }
+            let want = AGENT_REQUEST_HEADER - self.head.len();
+            let take = want.min(rest.len());
+            self.head.extend_from_slice(&rest[..take]);
+            rest = &rest[take..];
+            if self.head.len() < AGENT_REQUEST_HEADER {
+                break; // header split across records; resume next time
+            }
+            let len = u32::from_be_bytes([self.head[0], self.head[1], self.head[2], self.head[3]]);
+            let kind = self.head[4];
+            self.head.clear();
+            // `len` covers the type byte plus the body; a zero length is
+            // malformed, and saturating keeps it from wrapping into a huge skip.
+            self.skip = (len as u64).saturating_sub(1);
+            out.push(match kind {
+                AGENTC_REQUEST_IDENTITIES => AgentOp::ListKeys,
+                AGENTC_SIGN_REQUEST => AgentOp::Sign,
+                other => AgentOp::Other(other),
+            });
         }
-        let want = AGENT_REQUEST_HEADER - self.head.len();
-        self.head.extend_from_slice(&bytes[..want.min(bytes.len())]);
-        if self.head.len() < AGENT_REQUEST_HEADER {
-            return None;
-        }
-        self.done = true;
-        // Release the buffer: this sniffer never looks at another byte.
-        let kind = self.head[4];
-        self.head = Vec::new();
-        Some(match kind {
-            AGENTC_REQUEST_IDENTITIES => AgentOp::ListKeys,
-            AGENTC_SIGN_REQUEST => AgentOp::Sign,
-            other => AgentOp::Other(other),
-        })
+        out
     }
 }
 
@@ -1616,27 +1635,70 @@ mod tests {
         assert!(n.on_request(AgentOp::Sign, 5_003).is_some());
     }
 
-    // The sniffer classifies a channel's first request, and per ADR-0003 must
-    // tolerate the header arriving split across records.
+    // Per ADR-0003 the 5-byte header may arrive split across records.
     #[test]
     fn op_sniffer_classifies_across_split_reads() {
+        // [u32 BE len][type][body…]: len covers the type byte plus 4 body bytes.
         let wire = [0u8, 0, 0, 5, AGENTC_SIGN_REQUEST];
         let mut s = OpSniffer::new();
         for b in &wire[..4] {
-            assert_eq!(s.push(&[*b]), None, "no verdict before the header completes");
+            assert!(
+                s.push(&[*b]).is_empty(),
+                "no verdict before the header completes"
+            );
         }
-        assert_eq!(s.push(&[wire[4]]), Some(AgentOp::Sign));
-        // Classifies once only; later payload bytes are not re-examined.
-        assert_eq!(s.push(b"signature payload"), None);
+        assert_eq!(s.push(&[wire[4]]), vec![AgentOp::Sign]);
+        // The body is skipped, not classified and not retained.
+        assert!(s.push(b"body").is_empty());
     }
 
     #[test]
     fn op_sniffer_distinguishes_listing_from_signing() {
         let classify = |t: u8| OpSniffer::new().push(&[0, 0, 0, 1, t]);
-        assert_eq!(classify(AGENTC_REQUEST_IDENTITIES), Some(AgentOp::ListKeys));
-        assert_eq!(classify(AGENTC_SIGN_REQUEST), Some(AgentOp::Sign));
+        assert_eq!(classify(AGENTC_REQUEST_IDENTITIES), vec![AgentOp::ListKeys]);
+        assert_eq!(classify(AGENTC_SIGN_REQUEST), vec![AgentOp::Sign]);
         // An unrecognised type is reported, not guessed at or dropped.
-        assert_eq!(classify(200), Some(AgentOp::Other(200)));
+        assert_eq!(classify(200), vec![AgentOp::Other(200)]);
+    }
+
+    // The defect this parser exists to avoid: one agent connection commonly
+    // lists the available keys and THEN signs with one. Classifying only the
+    // channel's opening request would call that channel a harmless listing and
+    // never report the signature — posh#147's "a real key use goes unannounced",
+    // reintroduced by another route.
+    #[test]
+    fn op_sniffer_reports_a_signature_that_follows_a_listing() {
+        let mut s = OpSniffer::new();
+        // REQUEST_IDENTITIES with no body, then SIGN_REQUEST with a 3-byte body.
+        let listing = [0u8, 0, 0, 1, AGENTC_REQUEST_IDENTITIES];
+        let signing = [0u8, 0, 0, 4, AGENTC_SIGN_REQUEST, 0xaa, 0xbb, 0xcc];
+
+        assert_eq!(s.push(&listing), vec![AgentOp::ListKeys]);
+        assert_eq!(
+            s.push(&signing),
+            vec![AgentOp::Sign],
+            "the signature after a listing must still be classified"
+        );
+
+        // And the same stream delivered as ONE record yields both, in order.
+        let mut s = OpSniffer::new();
+        let mut both = listing.to_vec();
+        both.extend_from_slice(&signing);
+        assert_eq!(s.push(&both), vec![AgentOp::ListKeys, AgentOp::Sign]);
+    }
+
+    // A hostile or corrupt length must not wrap the skip counter or stall the
+    // parser: the peer is authenticated, so this is corruption, not an attack to
+    // absorb — but it must degrade, never panic.
+    #[test]
+    fn op_sniffer_tolerates_a_zero_length_request() {
+        let mut s = OpSniffer::new();
+        assert_eq!(s.push(&[0, 0, 0, 0, AGENTC_SIGN_REQUEST]), vec![AgentOp::Sign]);
+        // Zero length saturates to a zero skip, so the next header still parses.
+        assert_eq!(
+            s.push(&[0, 0, 0, 1, AGENTC_REQUEST_IDENTITIES]),
+            vec![AgentOp::ListKeys]
+        );
     }
 
     #[test]

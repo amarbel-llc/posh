@@ -248,6 +248,17 @@ The payload of an `agent` channel instruction is:
 - FAIL signals that the far end could not service the connection (no reachable
   agent, refused, or a limit from §3.4). A receiver MUST surface it to the local
   agent client as a closed socket, so the request fails rather than hangs.
+- **An OPEN carries no intent, and MUST NOT be reported to the user as agent
+  use.** It means something connected to the forwarded socket, not that anything
+  asked for a key — a channel may open and close having requested nothing. A
+  consumer presenting agent activity (FDR 0004's per-request notice) MUST derive
+  it from the channel's first *request*, classified from the agent protocol's
+  `[u32 BE length][u8 type]` header, and MUST distinguish a signature
+  (`SSH_AGENTC_SIGN_REQUEST`) from a key listing
+  (`SSH_AGENTC_REQUEST_IDENTITIES`). Notifying on OPEN instead is what let a
+  liveness probe masquerade as a real key use, and let an uninteresting event
+  consume a shared rate-limit slot so genuine signatures went unreported
+  (posh#147).
 
 Consequences (informative): agent data is now fragmented like any other payload
 rather than chunked into 247-byte capability entries (`AGENT_DATA_MAX`), which
