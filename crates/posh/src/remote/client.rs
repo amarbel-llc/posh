@@ -1495,9 +1495,11 @@ fn consume_agent_caps(st: &mut ClientState, frame: &ServerFrame) {
         st.agent_seen = true;
     }
     let mut decode_failed = false;
-    // A channel OPEN from the server means a remote process started using the
-    // forwarded agent — the event the notice (#96) reports.
-    let mut saw_open = false;
+    // What the remote actually ASKED the agent to do — the event the notice
+    // (#96) reports. Deliberately not the channel OPEN: an open carries no
+    // intent, so notifying on it reported agent use for channels that never
+    // carried a request at all (posh#147).
+    let mut ops: Vec<crate::remote::agent::AgentOp> = Vec::new();
     for cap in caps::find_all(&frame.caps, caps::CAP_AGENT_DATA) {
         let Ok((offset, bytes)) = caps::decode_agent_data(&cap.payload) else {
             decode_failed = true;
@@ -1505,12 +1507,11 @@ fn consume_agent_caps(st: &mut ClientState, frame: &ServerFrame) {
         };
         match st.agent_stream.recv(offset, bytes) {
             Ok(records) => {
-                saw_open |= records
-                    .iter()
-                    .any(|r| r.kind == crate::remote::sync::RecordKind::Open);
                 // The proxy borrow is scoped tight so the notice below can
                 // touch other ClientState fields.
-                let replies = st.agent.as_mut().unwrap().apply_records(&records);
+                let proxy = st.agent.as_mut().unwrap();
+                let replies = proxy.apply_records(&records);
+                ops.extend(proxy.take_ops());
                 for reply in replies {
                     st.agent_stream.send(&reply);
                 }
@@ -1526,12 +1527,15 @@ fn consume_agent_caps(st: &mut ClientState, frame: &ServerFrame) {
             st.agent_stream.ack(upto);
         }
     }
-    // Surface the rate-limited agent-use notice (FDR 0004; #96) on a new
-    // channel — but not when the stream just went corrupt (we're tearing down).
-    if saw_open && !decode_failed {
-        if let Some(notice) = st.agent_notice.as_mut() {
-            if let Some(msg) = notice.on_channel_open(now_ms()) {
-                st.notify.set_message(&msg, false, now_ms());
+    // Surface the agent-use notice (FDR 0004; #96) per classified request — but
+    // not when the stream just went corrupt (we're tearing down). A signature is
+    // always announced; key listings stay rate-limited.
+    if !decode_failed {
+        for op in ops {
+            if let Some(notice) = st.agent_notice.as_mut() {
+                if let Some(msg) = notice.on_request(op, now_ms()) {
+                    st.notify.set_message(&msg, false, now_ms());
+                }
             }
         }
     }
@@ -2913,7 +2917,71 @@ mod tests {
         st.agent_notice = Some(AgentNotice::new(false, "box"));
 
         // Build the server's agent caps the way the server would: frame an OPEN
-        // record onto an AgentStream and encode its pending bytes as AGENT_DATA.
+        // plus the channel's first REQUEST onto an AgentStream and encode its
+        // pending bytes as AGENT_DATA. The request is what triggers the notice —
+        // an OPEN alone carries no intent and must stay silent (posh#147), which
+        // `open_without_a_request_is_not_reported_as_agent_use` covers.
+        let mut server_stream = AgentStream::new();
+        server_stream.send(&AgentRecord {
+            channel: 1,
+            kind: RecordKind::Open,
+            payload: Vec::new(),
+        });
+        // SSH agent wire: [u32 BE len][type]. 13 = SSH_AGENTC_SIGN_REQUEST.
+        server_stream.send(&AgentRecord {
+            channel: 1,
+            kind: RecordKind::Data,
+            payload: vec![0, 0, 0, 5, 13],
+        });
+        let mut server_caps = vec![caps::Cap {
+            id: caps::CAP_AGENT_FORWARD,
+            payload: vec![],
+        }];
+        server_caps.extend(caps::encode_agent_data(
+            server_stream.send_base(),
+            server_stream.pending(),
+        ));
+
+        let frame = ServerFrame {
+            flags: 0,
+            caps: caps::own_table(&server_caps),
+            frame_num: 0,
+            input_ack: 0,
+            echo_ack: 0,
+            body: FrameBody::Empty,
+        };
+        consume_agent_caps(&mut st, &frame);
+
+        let msg = st.notify.message();
+        assert!(
+            msg.contains("box") && msg.contains("SIGNED"),
+            "expected a signature notice naming the host, got {msg:?}"
+        );
+        std::fs::remove_file(&sock).ok();
+    }
+
+    // posh#147, at the level that actually protects the user. A channel OPEN
+    // carries no intent — it says a connection was made to the forwarded socket,
+    // not that anything asked for a key. Reporting it as agent use is what let a
+    // liveness probe masquerade as a `git push`, and what saturated the notice's
+    // rate limit so REAL uses went unannounced. An open with no request must be
+    // silent.
+    #[test]
+    fn open_without_a_request_is_not_reported_as_agent_use() {
+        use crate::remote::agent::{AgentClient, AgentNotice};
+        use crate::remote::sync::{AgentRecord, AgentStream, RecordKind};
+        use std::os::unix::net::UnixListener;
+        use std::path::PathBuf;
+
+        let sock = PathBuf::from(format!("/tmp/posh-notice-silent-{}.sock", std::process::id()));
+        std::fs::remove_file(&sock).ok();
+        let _listener = UnixListener::bind(&sock).unwrap();
+
+        let mut st = test_state(24, 80);
+        st.agent = Some(AgentClient::new(sock.clone()));
+        st.agent_notice = Some(AgentNotice::new(false, "box"));
+
+        // An OPEN and nothing else — exactly what the #147 probe produced.
         let mut server_stream = AgentStream::new();
         server_stream.send(&AgentRecord {
             channel: 1,
@@ -2939,10 +3007,10 @@ mod tests {
         };
         consume_agent_caps(&mut st, &frame);
 
-        let msg = st.notify.message();
-        assert!(
-            msg.contains("box") && msg.contains("agent"),
-            "expected an agent-use notice naming the host, got {msg:?}"
+        assert_eq!(
+            st.notify.message(),
+            "",
+            "an open with no request must not be reported as agent use (posh#147)"
         );
         std::fs::remove_file(&sock).ok();
     }

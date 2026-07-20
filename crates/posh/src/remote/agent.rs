@@ -425,6 +425,14 @@ pub struct AgentClient {
     /// a path that dies mid-session degrades to per-`Open` `Fail` (design §1).
     source: PathBuf,
     channels: Vec<Channel>,
+    /// Per-channel first-request classifiers, keyed by channel id. An entry is
+    /// created on `Open`, drained once the header completes, and dropped on
+    /// close — so this holds at most `MAX_AGENT_CHANNELS` short-lived buffers.
+    sniffers: Vec<(u32, OpSniffer)>,
+    /// Classifications produced since the last [`take_ops`](Self::take_ops).
+    /// Returned out-of-band rather than through `apply_records`, whose return
+    /// value is the outbound record stream and should stay that.
+    ops: Vec<AgentOp>,
 }
 
 impl AgentClient {
@@ -435,7 +443,19 @@ impl AgentClient {
         AgentClient {
             source,
             channels: Vec::new(),
+            sniffers: Vec::new(),
+            ops: Vec::new(),
         }
+    }
+
+    /// Drains the agent operations classified since the last call — what the
+    /// remote actually asked for, for the use-notice (FDR 0004). Empty until a
+    /// channel's first request header has fully arrived, which is deliberately
+    /// LATER than its `Open`: an open alone says nothing about intent, and
+    /// notifying on it is what let a channel that never carried a request
+    /// masquerade as agent use (posh#147).
+    pub fn take_ops(&mut self) -> Vec<AgentOp> {
+        std::mem::take(&mut self.ops)
     }
 
     /// The local agent socket every channel dials (FDR 0004 diagnostics).
@@ -476,14 +496,31 @@ impl AgentClient {
                         continue;
                     }
                     match self.connect_channel(rec.channel) {
-                        Ok(()) => {}
+                        Ok(()) => self.sniffers.push((rec.channel, OpSniffer::new())),
                         Err(_) => out.push(fail_record(rec.channel)),
                     }
                 }
-                _ => apply_data_or_close(&mut self.channels, rec),
+                RecordKind::Data => {
+                    // Classify the channel's first request before proxying it on
+                    // (read-only; the bytes are forwarded unchanged either way).
+                    if let Some(slot) = self.sniffers.iter_mut().find(|(id, _)| *id == rec.channel)
+                    {
+                        if let Some(op) = slot.1.push(&rec.payload) {
+                            self.ops.push(op);
+                        }
+                    }
+                    apply_data_or_close(&mut self.channels, rec);
+                }
+                _ => {
+                    self.sniffers.retain(|(id, _)| *id != rec.channel);
+                    apply_data_or_close(&mut self.channels, rec);
+                }
             }
         }
         reap_closed(&mut self.channels);
+        // A channel torn down locally leaves no sniffer behind.
+        self.sniffers
+            .retain(|(id, _)| self.channels.iter().any(|c| c.id == *id && !c.closed));
         out
     }
 
@@ -605,6 +642,78 @@ pub fn resolve_forward_policy(
 /// roaming client has a single peer, so this is effectively one timestamp gate.
 const AGENT_NOTICE_INTERVAL_MS: u64 = 60_000;
 
+// ---------------------------------------------------------------------------
+// Agent-request classification (FDR 0004 notice context).
+//
+// The forwarded stream is the SSH agent protocol: `[u32 BE length][u8 type][…]`.
+// posh proxies it opaquely and MUST keep doing so — but the client end peeks at
+// the first request's TYPE byte, because the difference between "listed your
+// keys" and "signed with your key" is the whole point of the notice. The peek is
+// read-only, happens on the client (where the user's own agent lives), and
+// touches no key material, so RFC 0008's "the daemon never brokers keys"
+// boundary is untouched.
+
+/// `SSH_AGENTC_REQUEST_IDENTITIES` — "list my keys". Low sensitivity: every ssh
+/// connection issues one before it does anything interesting.
+const AGENTC_REQUEST_IDENTITIES: u8 = 11;
+/// `SSH_AGENTC_SIGN_REQUEST` — the private key is actually being USED. This is
+/// the event worth interrupting the user for.
+const AGENTC_SIGN_REQUEST: u8 = 13;
+/// Bytes needed to classify: the 4-byte length prefix plus the type byte.
+const AGENT_REQUEST_HEADER: usize = 5;
+
+/// What the remote asked the forwarded agent to do.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum AgentOp {
+    /// Enumerate the available public keys.
+    ListKeys,
+    /// Sign with a private key — a real use of the user's credential.
+    Sign,
+    /// Anything else in the agent protocol (add/remove/lock/extension).
+    Other(u8),
+}
+
+/// Classifies the FIRST request on one agent channel.
+///
+/// Per ADR-0003 the header may be split across records, so bytes accumulate
+/// until [`AGENT_REQUEST_HEADER`] have arrived; only the first request on a
+/// channel is classified (a channel is one agent connection, and its opening
+/// request is what characterises it), after which this goes inert and copies
+/// nothing further.
+#[derive(Default)]
+pub struct OpSniffer {
+    head: Vec<u8>,
+    done: bool,
+}
+
+impl OpSniffer {
+    pub fn new() -> OpSniffer {
+        OpSniffer::default()
+    }
+
+    /// Feeds channel bytes; returns the classification exactly once, on the
+    /// record that completes the header.
+    pub fn push(&mut self, bytes: &[u8]) -> Option<AgentOp> {
+        if self.done {
+            return None;
+        }
+        let want = AGENT_REQUEST_HEADER - self.head.len();
+        self.head.extend_from_slice(&bytes[..want.min(bytes.len())]);
+        if self.head.len() < AGENT_REQUEST_HEADER {
+            return None;
+        }
+        self.done = true;
+        // Release the buffer: this sniffer never looks at another byte.
+        let kind = self.head[4];
+        self.head = Vec::new();
+        Some(match kind {
+            AGENTC_REQUEST_IDENTITIES => AgentOp::ListKeys,
+            AGENTC_SIGN_REQUEST => AgentOp::Sign,
+            other => AgentOp::Other(other),
+        })
+    }
+}
+
 /// Client-side rate limiter for the agent-use notice. Owns the silence flag,
 /// the last-fired timestamp, and the host it names — the host is only
 /// meaningful together with the notice, so they live and die as one (the
@@ -643,22 +752,41 @@ impl AgentNotice {
         }
     }
 
-    /// Called when a forwarded-agent channel opens. Returns the banner text to
-    /// show, or `None` when silenced or still inside the rate-limit window.
-    /// Advances the rate-limit clock only when it actually returns a message.
-    pub fn on_channel_open(&mut self, now: u64) -> Option<String> {
+    /// Called when a classified request arrives on a forwarded-agent channel.
+    /// Returns the banner text, or `None` when silenced or rate-limited.
+    ///
+    /// The two cases are limited SEPARATELY, and that separation is the point.
+    /// A signature is a real use of the user's private key and is **always**
+    /// announced — no window, no sharing a slot with anything else. Key listings
+    /// (which every ssh connection issues, and which reveal no secret) keep the
+    /// old one-per-minute limit.
+    ///
+    /// Before this split, a single shared limiter meant an uninteresting open
+    /// could spend the window and a genuine signature seconds later went
+    /// unreported — which under posh#147 happened routinely, since a liveness
+    /// probe opened a channel every 5s against a 60s window. A notice that can
+    /// silently miss the event it exists to report is not a control at all, and
+    /// FDR 0004 forwards by default *because* the notice exists.
+    pub fn on_request(&mut self, op: AgentOp, now: u64) -> Option<String> {
         if self.silenced {
             return None;
         }
-        let due = match self.last_shown {
-            Some(t) => now.saturating_sub(t) >= AGENT_NOTICE_INTERVAL_MS,
-            None => true,
-        };
-        if !due {
-            return None;
+        match op {
+            // Never rate-limited: each signature is a distinct use of a key. If
+            // something signs in a loop, the user especially wants to know.
+            AgentOp::Sign => Some(format!("{} SIGNED with your forwarded ssh key", self.host)),
+            AgentOp::ListKeys | AgentOp::Other(_) => {
+                let due = match self.last_shown {
+                    Some(t) => now.saturating_sub(t) >= AGENT_NOTICE_INTERVAL_MS,
+                    None => true,
+                };
+                if !due {
+                    return None;
+                }
+                self.last_shown = Some(now);
+                Some(format!("{} listed your forwarded ssh keys", self.host))
+            }
         }
-        self.last_shown = Some(now);
-        Some(format!("agent forwarding requested by {}", self.host))
     }
 }
 
@@ -1424,26 +1552,34 @@ mod tests {
     // --- AgentNotice (per-request agent-use banner, github #96) -------------
 
     #[test]
-    fn notice_fires_on_first_open_with_host() {
+    fn notice_fires_on_first_request_naming_host_and_operation() {
         let mut n = AgentNotice::new(false, "box");
-        let msg = n.on_channel_open(1_000).expect("first open notifies");
+        let msg = n
+            .on_request(AgentOp::ListKeys, 1_000)
+            .expect("the first request notifies");
         assert!(msg.contains("box"), "names the host: {msg}");
-        assert!(msg.contains("agent"), "mentions the agent: {msg}");
+        // The operation, not just "the agent was used" — telling a key listing
+        // apart from a signature is the whole point of the notice.
+        assert!(msg.contains("listed"), "names the operation: {msg}");
+        assert!(
+            !msg.contains("SIGNED"),
+            "a listing must not read as a key use: {msg}"
+        );
     }
 
     #[test]
     fn notice_rate_limited_to_one_per_minute() {
         let mut n = AgentNotice::new(false, "box");
-        assert!(n.on_channel_open(0).is_some(), "first fires");
+        assert!(n.on_request(AgentOp::ListKeys,0).is_some(), "first fires");
         // Within the window: suppressed.
-        assert!(n.on_channel_open(30_000).is_none(), "30s later suppressed");
+        assert!(n.on_request(AgentOp::ListKeys,30_000).is_none(), "30s later suppressed");
         assert!(
-            n.on_channel_open(59_999).is_none(),
+            n.on_request(AgentOp::ListKeys,59_999).is_none(),
             "just under a minute suppressed"
         );
         // At/after the window: fires again, and the clock advances from there.
-        assert!(n.on_channel_open(60_000).is_some(), "a minute later fires");
-        assert!(n.on_channel_open(75_000).is_none(), "window restarts");
+        assert!(n.on_request(AgentOp::ListKeys,60_000).is_some(), "a minute later fires");
+        assert!(n.on_request(AgentOp::ListKeys,75_000).is_none(), "window restarts");
     }
 
     // posh#147, the half that was security-relevant rather than merely noisy.
@@ -1453,30 +1589,61 @@ mod tests {
     // spurious open recurred every 5s against a 60s window, so real uses
     // routinely went unreported.
     //
-    // This pins the hazard rather than a bug: the behaviour below is what the
-    // current design does, and it is only SAFE while no spurious opens exist —
-    // which is why `an_idle_endpoint_opens_no_channels_over_many_ticks` guards
-    // that precondition. Giving the notice enough context to tell a real key use
-    // from an uninteresting one would let this assertion be inverted.
+    // Splitting the limits fixes that at the root: a signature is a distinct use
+    // of the user's private key and is never rate-limited, so nothing else can
+    // consume its slot. This assertion is the exact opposite of what the shared
+    // limiter did, which is the point.
     #[test]
-    fn a_spurious_open_suppresses_a_real_one_for_a_full_window() {
+    fn a_listing_never_suppresses_a_real_signature() {
         let mut n = AgentNotice::new(false, "box");
-        // A spurious open (under #147: a liveness probe) fires and takes the slot.
-        assert!(n.on_channel_open(0).is_some(), "the spurious open is announced");
-        // A real `git push` 5s later — the user's key genuinely being used.
         assert!(
-            n.on_channel_open(5_000).is_none(),
-            "REAL agent use goes unannounced because the spurious open spent the slot"
+            n.on_request(AgentOp::ListKeys, 0).is_some(),
+            "the first listing is announced"
         );
-        // It stays unannounced for the rest of the window.
-        assert!(n.on_channel_open(59_999).is_none());
+        assert!(
+            n.on_request(AgentOp::ListKeys, 5_000).is_none(),
+            "a second listing inside the window stays rate-limited"
+        );
+        // ...but a REAL signature moments later is still announced.
+        let msg = n
+            .on_request(AgentOp::Sign, 5_001)
+            .expect("a signature is never suppressed by an unrelated event");
+        assert!(msg.contains("SIGNED"), "and it says so plainly: {msg}");
+        assert!(msg.contains("box"), "naming the host: {msg}");
+        // Signatures are not rate-limited against each other either: every use
+        // of a private key is its own event worth reporting.
+        assert!(n.on_request(AgentOp::Sign, 5_002).is_some());
+        assert!(n.on_request(AgentOp::Sign, 5_003).is_some());
+    }
+
+    // The sniffer classifies a channel's first request, and per ADR-0003 must
+    // tolerate the header arriving split across records.
+    #[test]
+    fn op_sniffer_classifies_across_split_reads() {
+        let wire = [0u8, 0, 0, 5, AGENTC_SIGN_REQUEST];
+        let mut s = OpSniffer::new();
+        for b in &wire[..4] {
+            assert_eq!(s.push(&[*b]), None, "no verdict before the header completes");
+        }
+        assert_eq!(s.push(&[wire[4]]), Some(AgentOp::Sign));
+        // Classifies once only; later payload bytes are not re-examined.
+        assert_eq!(s.push(b"signature payload"), None);
+    }
+
+    #[test]
+    fn op_sniffer_distinguishes_listing_from_signing() {
+        let classify = |t: u8| OpSniffer::new().push(&[0, 0, 0, 1, t]);
+        assert_eq!(classify(AGENTC_REQUEST_IDENTITIES), Some(AgentOp::ListKeys));
+        assert_eq!(classify(AGENTC_SIGN_REQUEST), Some(AgentOp::Sign));
+        // An unrecognised type is reported, not guessed at or dropped.
+        assert_eq!(classify(200), Some(AgentOp::Other(200)));
     }
 
     #[test]
     fn notice_silenced_never_fires() {
         let mut n = AgentNotice::new(true, "box");
-        assert!(n.on_channel_open(0).is_none());
-        assert!(n.on_channel_open(120_000).is_none(), "still silent past the window");
+        assert!(n.on_request(AgentOp::ListKeys,0).is_none());
+        assert!(n.on_request(AgentOp::ListKeys,120_000).is_none(), "still silent past the window");
     }
 
     #[test]
@@ -1485,10 +1652,10 @@ mod tests {
         // leaves last_shown at the first fire, so the next fire is still exactly
         // one window later, not pushed out by the calls between.
         let mut n = AgentNotice::new(false, "box");
-        assert!(n.on_channel_open(0).is_some());
-        assert!(n.on_channel_open(10_000).is_none());
-        assert!(n.on_channel_open(20_000).is_none());
+        assert!(n.on_request(AgentOp::ListKeys,0).is_some());
+        assert!(n.on_request(AgentOp::ListKeys,10_000).is_none());
+        assert!(n.on_request(AgentOp::ListKeys,20_000).is_none());
         // 60s after the FIRST fire (not after the last suppressed call) fires.
-        assert!(n.on_channel_open(60_000).is_some());
+        assert!(n.on_request(AgentOp::ListKeys,60_000).is_some());
     }
 }
