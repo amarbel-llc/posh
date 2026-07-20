@@ -386,6 +386,10 @@ value or on reserved channel identifier 0 (§3.1). Both are reserved by this
 document partly for that purpose, so the mechanism can be added without a wire
 break.
 
+Tracked as posh#145, which is in turn gated on posh#146: while the session key
+arrives from the ssh bootstrap there is nothing to rekey *with*, so a key-update
+mechanism is best designed against whatever handshake replaces it.
+
 ## Security Considerations
 
 - **Trust boundary is unchanged.** Channels ride inside the existing AEAD seal;
@@ -483,4 +487,7 @@ Informative:
   enables, closed as a decision without an implementation.
 - github #103: host-global agent rendezvous — out of scope here; §8 is the
   nearest boundary.
-- posh#142, posh#143, posh#144: the §9.1 / §9.2 / §9.3 open decisions.
+- posh#142, posh#143, posh#144, posh#145: the §9.1 / §9.2 / §9.3 / §9.4
+  deferred mechanisms.
+- posh#146: a 0-RTT handshake fastpath — not a concern of this document, but
+  the prerequisite for §9.4's key update.

@@ -99,18 +99,30 @@ impl AgentEndpoint {
     }
 
     /// Builds the endpoint under an explicit base dir (the seam the tests use
-    /// with a tempdir). Creates `<base>/agent/` 0700, hardens it with the
-    /// shared #7 check, binds `srv-<pid>.sock`, and claims `agent/sock`.
+    /// with a tempdir), keyed by this process's pid.
     pub fn new(base: &Path) -> Result<AgentEndpoint> {
-        AgentEndpoint::new_with_id(base, own_pid())
+        AgentEndpoint::build(base, own_pid())
     }
 
     /// [`new`](Self::new) with an explicit socket identity instead of this
-    /// process's pid. Production always passes `own_pid()`; the seam exists so a
-    /// test can build two coexisting endpoints under one base dir (see the `id`
-    /// field). A caller passing an id that is not a live pid will have its
-    /// socket reaped by a sibling's `gc_dead_sockets`.
+    /// process's pid, so a test can build two COEXISTING endpoints under one
+    /// base dir — otherwise both bind `srv-<own_pid()>.sock` and the second
+    /// clobbers the first (see the `id` field).
+    ///
+    /// Test-only, and gated so it cannot be reached from production: the id is
+    /// not free-form. `gc_dead_sockets` reaps any `srv-<id>.sock` whose `id` is
+    /// not a live pid, so a caller passing an arbitrary integer has its own
+    /// socket unlinked by the next sibling sweep. Callers MUST pass a live pid;
+    /// the handoff test uses `1` (init) for exactly this reason.
+    #[cfg(test)]
     pub fn new_with_id(base: &Path, id: i32) -> Result<AgentEndpoint> {
+        AgentEndpoint::build(base, id)
+    }
+
+    /// The real constructor behind [`new`](Self::new): creates `<base>/agent/`
+    /// 0700, hardens it with the shared #7 check, binds `srv-<id>.sock`, and
+    /// claims `agent/sock`.
+    fn build(base: &Path, id: i32) -> Result<AgentEndpoint> {
         use std::os::unix::fs::DirBuilderExt;
 
         let uid = util::uid();
@@ -909,7 +921,7 @@ mod tests {
             // Each server_loop ticks its own endpoint with its own peer state.
             a.tick(true, t);
             b.tick(false, t);
-            match std::fs::read_link(&agent_dir.join("sock")) {
+            match std::fs::read_link(agent_dir.join("sock")) {
                 Err(_) => absent_ms += STEP_MS,
                 Ok(target) if target == b_target => stale_ms += STEP_MS,
                 Ok(_) => served_ms += STEP_MS,
