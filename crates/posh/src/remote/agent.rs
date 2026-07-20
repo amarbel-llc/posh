@@ -64,6 +64,14 @@ struct Channel {
 pub struct AgentEndpoint {
     /// `<base>/agent/` — created 0700, validated self-owned + no-symlink.
     dir: PathBuf,
+    /// The identity this endpoint's socket is keyed by. In production it is the
+    /// server process's pid (`srv-<pid>.sock`), which is what makes the
+    /// `gc_dead_sockets` / `socket_is_dead` liveness probes meaningful. It is a
+    /// field rather than a re-read of `own_pid()` so tests can stand up two
+    /// COEXISTING endpoints in one process — otherwise both bind the same path
+    /// and the second silently clobbers the first, which is why the multi-
+    /// connection handoff (posh#136 / FDR 0014) had no in-process coverage.
+    id: i32,
     /// `<base>/agent/srv-<pid>.sock` — this server's own socket.
     own_sock: PathBuf,
     /// `<base>/agent/sock` — the stable, symlinked `SSH_AUTH_SOCK` target.
@@ -94,6 +102,15 @@ impl AgentEndpoint {
     /// with a tempdir). Creates `<base>/agent/` 0700, hardens it with the
     /// shared #7 check, binds `srv-<pid>.sock`, and claims `agent/sock`.
     pub fn new(base: &Path) -> Result<AgentEndpoint> {
+        AgentEndpoint::new_with_id(base, own_pid())
+    }
+
+    /// [`new`](Self::new) with an explicit socket identity instead of this
+    /// process's pid. Production always passes `own_pid()`; the seam exists so a
+    /// test can build two coexisting endpoints under one base dir (see the `id`
+    /// field). A caller passing an id that is not a live pid will have its
+    /// socket reaped by a sibling's `gc_dead_sockets`.
+    pub fn new_with_id(base: &Path, id: i32) -> Result<AgentEndpoint> {
         use std::os::unix::fs::DirBuilderExt;
 
         let uid = util::uid();
@@ -109,8 +126,7 @@ impl AgentEndpoint {
         // reject an attacker-planted dir or a symlink. github #7.
         crate::session::validate_session_dir(&dir, uid, true)?;
 
-        let pid = own_pid();
-        let own_sock = dir.join(format!("srv-{pid}.sock"));
+        let own_sock = dir.join(format!("srv-{id}.sock"));
         // A stale socket for our own pid (pid reuse after an unclean exit)
         // would make bind fail with EADDRINUSE; clear it first.
         let _ = std::fs::remove_file(&own_sock);
@@ -119,6 +135,7 @@ impl AgentEndpoint {
 
         let endpoint = AgentEndpoint {
             dir: dir.clone(),
+            id,
             own_sock,
             well_known: dir.join("sock"),
             listener,
@@ -140,8 +157,8 @@ impl AgentEndpoint {
     /// `rename` it over the well-known name. rename(2) is atomic, so a
     /// concurrent reader never sees a missing or half-written link.
     fn claim_symlink(&self) -> Result<()> {
-        let target = format!("srv-{}.sock", own_pid());
-        let tmp = self.dir.join(format!(".sock.{}.tmp", own_pid()));
+        let target = format!("srv-{}.sock", self.id);
+        let tmp = self.dir.join(format!(".sock.{}.tmp", self.id));
         let _ = std::fs::remove_file(&tmp);
         std::os::unix::fs::symlink(&target, &tmp)?;
         std::fs::rename(&tmp, &self.well_known)?;
@@ -841,6 +858,90 @@ mod tests {
         ep.tick(true, AGENT_SLOW_TICK_MS + 1);
         assert!(ep.symlink_points_to_self(), "active peer reclaims the link");
         drop(ep);
+        std::fs::remove_dir_all(&base).ok();
+    }
+
+    // posh#136 / FDR 0014: the shipped relinquish-on-inactive fix (option 1)
+    // removed the STARVATION — a roamed-away owner no longer pins `agent/sock`
+    // forever — but it did not close the window, and this is the first test with
+    // two COEXISTING endpoints, so it is the first to show the handoff at all.
+    //
+    // The handoff costs TWO independent slow ticks: the owner releases on its
+    // own next tick, and the active sibling claims on ITS next tick after that.
+    // Across the whole interval `agent/sock` is unusable in two distinct ways,
+    // measured separately here because they fail differently for a `git push`:
+    //
+    //   - STALE: the link still resolves to the inactive owner, whose listener is
+    //     bound (so `socket_is_dead` is false and no sibling takes over) but whose
+    //     `tick(peer_active=false)` fast-fails every channel => SSH_AGENT_FAILURE.
+    //   - ABSENT: the owner has released and nobody has claimed yet => the
+    //     connect(2) itself fails with ENOENT.
+    //
+    // This is the residual defect FDR 0014 exists to close by construction.
+    #[test]
+    fn handoff_between_two_endpoints_leaves_a_multi_tick_outage() {
+        const STEP_MS: u64 = 100;
+        let base = temp_base();
+        let agent_dir = base.join("agent");
+
+        // Two coexisting endpoints under one base. `a` is the sibling whose
+        // client stays ACTIVE; `b` is the newest connection, so it owns the link,
+        // and its client is INACTIVE for the whole run (roamed away). `b`'s id is
+        // pid 1, which is always a live process — otherwise `a`'s
+        // `gc_dead_sockets` would reap `b`'s socket and confound the measurement.
+        let mut a = AgentEndpoint::new_with_id(&base, own_pid()).unwrap();
+        let mut b = AgentEndpoint::new_with_id(&base, 1).unwrap();
+        let b_target = PathBuf::from("srv-1.sock");
+        assert_eq!(
+            std::fs::read_link(a.sock_path()).unwrap(),
+            b_target,
+            "the newest endpoint owns agent/sock"
+        );
+
+        // Both endpoints last ticked at t=0; the clock advances from there.
+        a.last_tick = 0;
+        b.last_tick = 0;
+
+        let (mut stale_ms, mut absent_ms, mut served_ms) = (0u64, 0u64, 0u64);
+        let mut t = 0;
+        while t < AGENT_SLOW_TICK_MS * 4 {
+            t += STEP_MS;
+            // Each server_loop ticks its own endpoint with its own peer state.
+            a.tick(true, t);
+            b.tick(false, t);
+            match std::fs::read_link(&agent_dir.join("sock")) {
+                Err(_) => absent_ms += STEP_MS,
+                Ok(target) if target == b_target => stale_ms += STEP_MS,
+                Ok(_) => served_ms += STEP_MS,
+            }
+        }
+
+        println!(
+            "posh#136 handoff: stale={stale_ms}ms absent={absent_ms}ms \
+             (unusable={}ms) served={served_ms}ms over {t}ms",
+            stale_ms + absent_ms
+        );
+
+        assert!(
+            stale_ms > 0,
+            "agent/sock resolves to the inactive owner, which fast-fails requests"
+        );
+        assert!(
+            absent_ms > 0,
+            "and then vanishes entirely before the active sibling reclaims it"
+        );
+        assert!(
+            stale_ms + absent_ms >= AGENT_SLOW_TICK_MS,
+            "the outage spans more than a single slow tick: stale={stale_ms}ms \
+             absent={absent_ms}ms"
+        );
+        assert!(
+            served_ms > 0,
+            "the active sibling does eventually take over (option 1 shipped)"
+        );
+
+        drop(b);
+        drop(a);
         std::fs::remove_dir_all(&base).ok();
     }
 
