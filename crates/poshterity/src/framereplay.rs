@@ -41,28 +41,20 @@ fn encoder_for(sync: FrameSync) -> Box<dyn FrameEncoder> {
     }
 }
 
-/// The server end: a `Terminal` advanced by fed bytes, a frame encoder, and the
-/// retained baselines its incremental bodies anchor against.
+/// The server end: the authoritative `Terminal` advanced by fed bytes.
+///
+/// Deliberately holds NO per-client encoder state. Production gives every
+/// attached client its own `FrameProducer`, because each diffs against its OWN
+/// acked base (`daemon.rs`'s per-`ClientConn` producer); that state lives on
+/// [`ClientLane`] here for the same reason.
 pub struct ServerSide {
     term: Terminal,
-    enc: Box<dyn FrameEncoder>,
-    next_num: u64,
-    /// The client-acked baseline the encoder diffs against (`None` until the
-    /// first frame is acked → that frame is a `Full`).
-    acked: Option<Baseline>,
-    /// Every produced-but-not-yet-superseded frame's baseline, so an ack for
-    /// any of them can become the new `acked` base.
-    produced: VecDeque<Baseline>,
 }
 
 impl ServerSide {
-    fn new(rows: u16, cols: u16, sync: FrameSync) -> ServerSide {
+    fn new(rows: u16, cols: u16) -> ServerSide {
         ServerSide {
             term: Terminal::with_scrollback(rows, cols, 0),
-            enc: encoder_for(sync),
-            next_num: 1,
-            acked: None,
-            produced: VecDeque::new(),
         }
     }
 
@@ -77,14 +69,11 @@ impl ServerSide {
         }
     }
 
-    /// Advance the server terminal by `bytes` and enqueue one frame toward the
-    /// client, encoded against the currently-acked baseline.
-    fn feed(&mut self, bytes: &[u8], channel: &mut impl FrameChannel) {
-        self.term.process(bytes);
-        let _ = self.term.take_responses();
-
-        let num = self.next_num;
-        self.next_num += 1;
+    /// Encode one frame of the server's CURRENT state for `lane`, anchored at
+    /// that lane's own acked baseline, and enqueue it on the lane's queue.
+    fn encode_for(&self, lane: &mut ClientLane) {
+        let num = lane.next_num;
+        lane.next_num += 1;
         let dump = self.term.dump_vt();
         let snapshot = Snapshot::from_term(&self.term);
         let cur = CurrentFrame {
@@ -94,9 +83,9 @@ impl ServerSide {
             rows: self.term.rows(),
             cols: self.term.cols(),
         };
-        let body = self.enc.encode(self.acked.as_ref(), &cur);
-        self.produced.push_back(self.baseline_now(num));
-        channel.send_frame(ServerFrame {
+        let body = lane.enc.encode(lane.acked.as_ref(), &cur);
+        lane.produced.push_back(self.baseline_now(num));
+        lane.send_frame(ServerFrame {
             flags: 0,
             caps: vec![],
             frame_num: num,
@@ -104,19 +93,6 @@ impl ServerSide {
             echo_ack: 0,
             body,
         });
-    }
-
-    /// Drain every ack the channel has delivered, advancing the acked baseline
-    /// to the highest acknowledged frame the server still retains.
-    fn drain_acks(&mut self, channel: &mut impl FrameChannel) {
-        while let Some(ack) = channel.recv_ack() {
-            if let Some(base) = self.produced.iter().find(|b| b.num == ack.acked_frame) {
-                self.acked = Some(base.clone());
-            }
-            while self.produced.front().is_some_and(|b| b.num < ack.acked_frame) {
-                self.produced.pop_front();
-            }
-        }
     }
 }
 
@@ -132,7 +108,11 @@ pub struct ClientSide {
 }
 
 impl ClientSide {
-    fn new(rows: u16, cols: u16, sync: FrameSync) -> ClientSide {
+    /// A mirror at `rows` x `cols` — which need NOT match the server's. In
+    /// production they routinely don't: the daemon sizes the pty to the
+    /// SMALLEST attached client (tmux `window-size smallest`), so every larger
+    /// client permanently renders a grid smaller than its own terminal.
+    pub fn new(rows: u16, cols: u16, sync: FrameSync) -> ClientSide {
         ClientSide {
             term: Terminal::with_scrollback(rows, cols, 0),
             applier: sync.applier(),
@@ -195,17 +175,39 @@ impl ClientSide {
     }
 }
 
-/// The in-memory network between the two ends. The server talks to it as a
-/// [`FrameChannel`]; the harness drives delivery scheduling through the
-/// inherent `deliver`/`drop_next` knobs. Owns the [`ClientSide`] because
-/// delivering a frame is what makes the client apply it and produce an ack.
-pub struct TestChannel {
-    to_client: VecDeque<ServerFrame>,
-    to_server: VecDeque<ClientAck>,
-    client: ClientSide,
+/// Identifies one attached client on a [`FrameHarness`].
+///
+/// The index is private: ids come from [`FrameHarness::add_client`] or
+/// [`ClientId::PRIMARY`], so one cannot be fabricated (or carried over from a
+/// different harness) and silently index the wrong lane.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub struct ClientId(usize);
+
+impl ClientId {
+    /// The client every harness starts with, at the server's own size.
+    pub const PRIMARY: ClientId = ClientId(0);
 }
 
-impl FrameChannel for TestChannel {
+/// One client and the in-memory network to it: its own frame queue, its own ack
+/// queue, and — mirroring production — its own encoder and acked baseline, so
+/// frames for this client are diffed against what THIS client last acked.
+///
+/// Independent queues are what make loss expressible per client: a frame can be
+/// dropped toward one client while another receives it, leaving the two at
+/// different bases. A single shared queue would move every client in lockstep.
+pub struct ClientLane {
+    client: ClientSide,
+    enc: Box<dyn FrameEncoder>,
+    next_num: u64,
+    /// The baseline THIS client acked (`None` until its first ack → `Full`).
+    acked: Option<Baseline>,
+    /// Produced-but-not-yet-superseded baselines for this client.
+    produced: VecDeque<Baseline>,
+    to_client: VecDeque<ServerFrame>,
+    to_server: VecDeque<ClientAck>,
+}
+
+impl FrameChannel for ClientLane {
     fn send_frame(&mut self, frame: ServerFrame) {
         self.to_client.push_back(frame);
     }
@@ -215,9 +217,21 @@ impl FrameChannel for TestChannel {
     }
 }
 
-impl TestChannel {
-    /// Deliver the next pending frame to the client; the client applies it and
-    /// queues its ack. Returns false when nothing is pending.
+impl ClientLane {
+    fn new(rows: u16, cols: u16, sync: FrameSync) -> ClientLane {
+        ClientLane {
+            client: ClientSide::new(rows, cols, sync),
+            enc: encoder_for(sync),
+            next_num: 1,
+            acked: None,
+            produced: VecDeque::new(),
+            to_client: VecDeque::new(),
+            to_server: VecDeque::new(),
+        }
+    }
+
+    /// Deliver this lane's next pending frame; the client applies it and queues
+    /// its ack. False when nothing is pending.
     fn deliver(&mut self) -> bool {
         match self.to_client.pop_front() {
             Some(frame) => {
@@ -229,11 +243,60 @@ impl TestChannel {
         }
     }
 
-    /// Drop the next pending frame (UDP loss). Returns false when nothing is
-    /// pending.
+    /// Drop this lane's next pending frame (UDP loss). False when none pending.
     fn drop_next(&mut self) -> bool {
         self.to_client.pop_front().is_some()
     }
+
+    /// Advance this lane's acked baseline to the highest frame the client has
+    /// acknowledged and the lane still retains.
+    fn drain_acks(&mut self) {
+        while let Some(ack) = self.recv_ack() {
+            if let Some(base) = self.produced.iter().find(|b| b.num == ack.acked_frame) {
+                self.acked = Some(base.clone());
+            }
+            while self.produced.front().is_some_and(|b| b.num < ack.acked_frame) {
+                self.produced.pop_front();
+            }
+        }
+    }
+}
+
+/// A terminal's rows as text with leading and trailing BLANK rows removed —
+/// the anchor-agnostic view of its content.
+///
+/// Anchor-agnostic on purpose: `dump_vt` legitimately places a smaller session
+/// at either end of a larger client. A session with no scrollback homes and
+/// draws downward (content at the top, blanks below); a scrolled session
+/// replays as a continuous newline flow that lands at the target's BOTTOM
+/// (blanks above). Both are correct, so the invariant is that the content is
+/// present and in order — not which row number it starts on. Interior blank
+/// rows are preserved, so a hole punched in the middle still fails.
+fn content_rows(term: &Terminal) -> Vec<String> {
+    let rows: Vec<String> = (0..term.rows())
+        .map(|r| {
+            term.screen()
+                .row(r)
+                .map(|row| row.text(false).trim_end().to_string())
+                .unwrap_or_default()
+        })
+        .collect();
+    match (
+        rows.iter().position(|r| !r.is_empty()),
+        rows.iter().rposition(|r| !r.is_empty()),
+    ) {
+        (Some(start), Some(end)) => rows[start..=end].to_vec(),
+        _ => Vec::new(),
+    }
+}
+
+/// The text of the row the cursor is on, trailing blanks trimmed.
+fn cursor_row_text(term: &Terminal) -> String {
+    let c = term.cursor();
+    term.screen()
+        .row(c.row)
+        .map(|r| r.text(false).trim_end().to_string())
+        .unwrap_or_default()
 }
 
 /// Drives a deterministic server↔client frame round-trip over [`TestChannel`].
@@ -247,45 +310,94 @@ impl TestChannel {
 /// ```
 pub struct FrameHarness {
     server: ServerSide,
-    channel: TestChannel,
+    lanes: Vec<ClientLane>,
+    sync: FrameSync,
 }
 
 impl FrameHarness {
+    /// A harness with one client at the server's own size — the same-geometry
+    /// case. Use [`FrameHarness::add_client`] for a differently-sized one.
     pub fn new(rows: u16, cols: u16, sync: FrameSync) -> FrameHarness {
         FrameHarness {
-            server: ServerSide::new(rows, cols, sync),
-            channel: TestChannel {
-                to_client: VecDeque::new(),
-                to_server: VecDeque::new(),
-                client: ClientSide::new(rows, cols, sync),
-            },
+            server: ServerSide::new(rows, cols),
+            lanes: vec![ClientLane::new(rows, cols, sync)],
+            sync,
         }
     }
 
-    /// Advance the server by `bytes` and enqueue one frame toward the client.
+    /// Attach another client at ITS OWN geometry, which need not match the
+    /// server's. It starts with no acked base, so its first frame is a `Full`.
+    pub fn add_client(&mut self, rows: u16, cols: u16) -> ClientId {
+        self.lanes.push(ClientLane::new(rows, cols, self.sync));
+        ClientId(self.lanes.len() - 1)
+    }
+
+    fn lane(&self, id: ClientId) -> &ClientLane {
+        &self.lanes[id.0]
+    }
+
+    fn lane_mut(&mut self, id: ClientId) -> &mut ClientLane {
+        &mut self.lanes[id.0]
+    }
+
+    /// Advance the server by `bytes` and enqueue one frame toward EVERY client,
+    /// each encoded against that client's own acked base.
     pub fn feed(&mut self, bytes: &[u8]) {
-        self.server.feed(bytes, &mut self.channel);
+        self.server.term.process(bytes);
+        let _ = self.server.term.take_responses();
+        for lane in &mut self.lanes {
+            self.server.encode_for(lane);
+        }
     }
 
-    /// Deliver the next pending frame to the client (it applies + acks).
+    /// Deliver the next pending frame to client 0 (it applies + acks).
     pub fn deliver(&mut self) -> bool {
-        self.channel.deliver()
+        self.deliver_for(ClientId::PRIMARY)
     }
 
-    /// Drop the next pending frame, modelling UDP loss.
+    /// Deliver `id`'s next pending frame, leaving other clients untouched.
+    pub fn deliver_for(&mut self, id: ClientId) -> bool {
+        self.lane_mut(id).deliver()
+    }
+
+    /// Deliver every pending frame to every client, then let the server learn
+    /// all their acks — the "no loss, no lag" shortcut.
+    pub fn deliver_all(&mut self) {
+        for lane in &mut self.lanes {
+            while lane.deliver() {}
+            lane.drain_acks();
+        }
+    }
+
+    /// Drop the next pending frame to client 0, modelling UDP loss.
     pub fn drop_next(&mut self) -> bool {
-        self.channel.drop_next()
+        self.drop_next_for(ClientId::PRIMARY)
     }
 
-    /// Let the server learn every ack the client has made available. Withhold
+    /// Drop `id`'s next pending frame only — other clients still receive theirs.
+    pub fn drop_next_for(&mut self, id: ClientId) -> bool {
+        self.lane_mut(id).drop_next()
+    }
+
+    /// Let the server learn every ack client 0 has made available. Withhold
     /// this between feeds to model ack-lag.
     pub fn ack(&mut self) {
-        self.server.drain_acks(&mut self.channel);
+        self.ack_for(ClientId::PRIMARY);
     }
 
-    /// Number of frames sent but not yet delivered or dropped.
+    /// Let the server learn `id`'s acks only.
+    pub fn ack_for(&mut self, id: ClientId) {
+        self.lane_mut(id).drain_acks();
+    }
+
+    /// Number of frames sent to client 0 but not yet delivered or dropped.
     pub fn pending_frames(&self) -> usize {
-        self.channel.to_client.len()
+        self.pending_frames_for(ClientId::PRIMARY)
+    }
+
+    /// Frames pending toward `id`.
+    pub fn pending_frames_for(&self, id: ClientId) -> usize {
+        self.lane(id).to_client.len()
     }
 
     /// The server's authoritative visible screen state (cells, cursor, modes).
@@ -293,9 +405,49 @@ impl FrameHarness {
         Snapshot::from_term(&self.server.term)
     }
 
-    /// The client mirror's visible screen state.
+    /// Client 0's mirror's visible screen state.
     pub fn client_snapshot(&self) -> Snapshot {
-        Snapshot::from_term(&self.channel.client.term)
+        self.client_snapshot_for(ClientId::PRIMARY)
+    }
+
+    /// `id`'s mirror's visible screen state.
+    pub fn client_snapshot_for(&self, id: ClientId) -> Snapshot {
+        Snapshot::from_term(&self.lane(id).client.term)
+    }
+
+    /// The content invariant for a client whose geometry may DIFFER from the
+    /// server's: the server's rows appear on the client, in order, and the
+    /// client's cursor sits on the same row CONTENT as the server's.
+    ///
+    /// Deliberately not "compare the client against a fresh terminal fed the
+    /// server's `dump_vt`". That reference would run through the same
+    /// serializer under test, so a height-dependence bug in `dump_vt` yields
+    /// the same wrong answer on both sides and the check passes — it would have
+    /// caught neither of the mismatched-size cursor bugs this harness exists to
+    /// prevent. Anchoring on content instead keeps the oracle independent.
+    pub fn mirrors_content(&self, id: ClientId) -> bool {
+        let client = &self.lane(id).client.term;
+        content_rows(client) == content_rows(&self.server.term)
+            && cursor_row_text(client) == cursor_row_text(&self.server.term)
+    }
+
+    /// [`FrameHarness::mirrors_content`] with a readable diff on failure.
+    pub fn assert_mirrors_content(&self, id: ClientId) {
+        let client = &self.lane(id).client.term;
+        assert!(
+            self.mirrors_content(id),
+            "client {id:?} ({}x{}) diverged from server ({}x{}):\n  \
+             server rows: {:?}\n  client rows: {:?}\n  \
+             server cursor row: {:?}\n  client cursor row: {:?}",
+            client.rows(),
+            client.cols(),
+            self.server.term.rows(),
+            self.server.term.cols(),
+            content_rows(&self.server.term),
+            content_rows(client),
+            cursor_row_text(&self.server.term),
+            cursor_row_text(client),
+        );
     }
 
     /// The client mirror reproduces the server's *visible* screen exactly. A
@@ -319,8 +471,102 @@ impl FrameHarness {
             self.converged(),
             "client mirror diverged from server (visible screen):\n  server: {:?}\n  client: {:?}",
             String::from_utf8_lossy(&self.server.term.dump_vt()),
-            String::from_utf8_lossy(&self.channel.client.term.dump_vt()),
+            String::from_utf8_lossy(&self.lane(ClientId::PRIMARY).client.term.dump_vt()),
         );
+    }
+}
+
+#[cfg(test)]
+mod mismatched_size_tests {
+    use super::*;
+
+    /// The production shape (posh#139): the daemon sizes the pty to the
+    /// SMALLEST attached client, so a larger client permanently renders a grid
+    /// smaller than its own terminal. Both clients consume the SAME frame
+    /// stream and both must end up showing the session's content with their
+    /// cursor on the right line — the invariant two separate `dump_vt` bugs
+    /// violated (the scrollback path's absolute CUP, and the alt path's
+    /// unhomed grid), neither of which this harness could previously express.
+    #[test]
+    fn a_taller_client_mirrors_the_session_content() {
+        for sync in [FrameSync::DumpDiff, FrameSync::Morph] {
+            let mut h = FrameHarness::new(24, 80, sync); // client 0 == server
+            let tall = h.add_client(50, 80); // client 1 is taller
+
+            h.feed(b"line A\r\nline B\r\nprompt$ ");
+            h.deliver_all();
+
+            h.assert_mirrors_content(ClientId::PRIMARY);
+            h.assert_mirrors_content(tall);
+            assert!(
+                h.converged(),
+                "the same-size client must still converge exactly ({sync:?})"
+            );
+        }
+    }
+
+    /// Scrolled far enough to fill scrollback, which routes `dump_vt` down its
+    /// bottom-landing flow instead of the homed draw — the case where the
+    /// content sits at the taller client's BOTTOM rather than its top. The
+    /// content assertion is anchor-agnostic precisely so both are accepted.
+    #[test]
+    fn a_taller_client_mirrors_a_scrolled_session() {
+        let mut h = FrameHarness::new(24, 80, FrameSync::DumpDiff);
+        let tall = h.add_client(50, 80);
+
+        for i in 0..40u16 {
+            h.feed(format!("line {i:02}\r\n").as_bytes());
+        }
+        h.feed(b"prompt$ ");
+        h.deliver_all();
+
+        h.assert_mirrors_content(ClientId::PRIMARY);
+        h.assert_mirrors_content(tall);
+        h.assert_converged(); // the same-size client still matches exactly
+    }
+
+    /// A full-screen app on the alt screen, mirrored onto a taller client. This
+    /// is the exact shape of the alt-path cursor bug: the grid was drawn from
+    /// wherever the preceding flow parked the cursor, so on a taller target the
+    /// cursor landed above its content.
+    #[test]
+    fn a_taller_client_mirrors_an_alt_screen_session() {
+        let mut h = FrameHarness::new(24, 80, FrameSync::DumpDiff);
+        let tall = h.add_client(50, 80);
+
+        for i in 0..40u16 {
+            h.feed(format!("line {i:02}\r\n").as_bytes());
+        }
+        h.feed(b"\x1b[?1049h"); // enter the alt screen
+        h.feed(b"\x1b[5;1HALTMARK");
+        h.deliver_all();
+
+        h.assert_mirrors_content(ClientId::PRIMARY);
+        h.assert_mirrors_content(tall);
+        h.assert_converged(); // the same-size client still matches exactly
+    }
+
+    /// Independent queues: a frame lost toward ONE client must not disturb the
+    /// other, and the straggler must recover on the next frame — encoded
+    /// against ITS OWN stale base, not the other client's.
+    #[test]
+    fn loss_toward_one_client_leaves_the_other_untouched() {
+        let mut h = FrameHarness::new(24, 80, FrameSync::DumpDiff);
+        let tall = h.add_client(50, 80);
+
+        h.feed(b"first\r\n");
+        assert!(h.drop_next_for(ClientId::PRIMARY), "client 0 loses frame 1");
+        assert!(h.deliver_for(tall), "the taller client receives it");
+        h.ack_for(tall);
+        h.assert_mirrors_content(tall);
+
+        // The straggler catches up on the next frame without the other
+        // client's progress being rolled back.
+        h.feed(b"second\r\n");
+        h.deliver_all();
+        h.assert_mirrors_content(ClientId::PRIMARY);
+        h.assert_mirrors_content(tall);
+        h.assert_converged(); // the straggler recovered exactly, not approximately
     }
 }
 
