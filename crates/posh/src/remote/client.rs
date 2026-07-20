@@ -1531,6 +1531,17 @@ fn consume_agent_caps(st: &mut ClientState, frame: &ServerFrame) {
     // not when the stream just went corrupt (we're tearing down). A signature is
     // always announced; key listings stay rate-limited.
     if !decode_failed {
+        // One frame can carry several requests, and `set_message` REPLACES the
+        // banner — so whichever notice fires last is the one the user sees.
+        // Order by ascending significance so a signature is never overwritten by
+        // a routine listing that happened to arrive after it in the same frame.
+        // Listings are constant traffic, so without this the most important
+        // notice is the one most likely to be clobbered.
+        ops.sort_by_key(|op| match op {
+            crate::remote::agent::AgentOp::ListKeys => 0,
+            crate::remote::agent::AgentOp::Other(_) => 1,
+            crate::remote::agent::AgentOp::Sign => 2,
+        });
         for op in ops {
             if let Some(notice) = st.agent_notice.as_mut() {
                 if let Some(msg) = notice.on_request(op, now_ms()) {
@@ -3011,6 +3022,65 @@ mod tests {
             st.notify.message(),
             "",
             "an open with no request must not be reported as agent use (posh#147)"
+        );
+        std::fs::remove_file(&sock).ok();
+    }
+
+    // `set_message` replaces rather than queues, so within one frame the LAST
+    // notice wins the banner. A routine key listing must not be the thing that
+    // wins when the same frame also carried a signature — listings are constant
+    // traffic, so the most important notice would be the most likely to be lost.
+    #[test]
+    fn a_listing_in_the_same_frame_does_not_overwrite_a_signature_banner() {
+        use crate::remote::agent::{AgentClient, AgentNotice};
+        use crate::remote::sync::{AgentRecord, AgentStream, RecordKind};
+        use std::os::unix::net::UnixListener;
+        use std::path::PathBuf;
+
+        let sock = PathBuf::from(format!("/tmp/posh-notice-order-{}.sock", std::process::id()));
+        std::fs::remove_file(&sock).ok();
+        let _listener = UnixListener::bind(&sock).unwrap();
+
+        let mut st = test_state(24, 80);
+        st.agent = Some(AgentClient::new(sock.clone()));
+        st.agent_notice = Some(AgentNotice::new(false, "box"));
+
+        // One frame: a SIGN_REQUEST (13) then a REQUEST_IDENTITIES (11) — the
+        // order that loses the signature if notices fire as they arrive.
+        let mut server_stream = AgentStream::new();
+        server_stream.send(&AgentRecord {
+            channel: 1,
+            kind: RecordKind::Open,
+            payload: Vec::new(),
+        });
+        server_stream.send(&AgentRecord {
+            channel: 1,
+            kind: RecordKind::Data,
+            payload: vec![0, 0, 0, 1, 13, 0, 0, 0, 1, 11],
+        });
+        let mut server_caps = vec![caps::Cap {
+            id: caps::CAP_AGENT_FORWARD,
+            payload: vec![],
+        }];
+        server_caps.extend(caps::encode_agent_data(
+            server_stream.send_base(),
+            server_stream.pending(),
+        ));
+
+        let frame = ServerFrame {
+            flags: 0,
+            caps: caps::own_table(&server_caps),
+            frame_num: 0,
+            input_ack: 0,
+            echo_ack: 0,
+            body: FrameBody::Empty,
+        };
+        consume_agent_caps(&mut st, &frame);
+
+        let msg = st.notify.message();
+        assert!(
+            msg.contains("SIGNED"),
+            "the signature must win the banner over a same-frame listing, got {msg:?}"
         );
         std::fs::remove_file(&sock).ok();
     }
