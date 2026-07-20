@@ -328,6 +328,17 @@ impl Terminal {
                 let _ = write!(out, "\x1b[>{f}u");
             }
             out.push_str("\x1b[?1049h");
+            // `draw_grid`'s "from the home position" contract is a CALLER
+            // precondition (cf. the explicit \x1b[H at the other two call
+            // sites), and 1049 does not home the cursor — it only saves it.
+            // Without this home the alt grid paints from wherever the primary
+            // scrollback flow parked us, which lands at the TARGET's bottom and
+            // is therefore height-dependent: on a taller client the grid drops
+            // below the absolute CUP that dump_cursor then emits, leaving the
+            // cursor offset ABOVE its content (the multi-client offset bug, on
+            // the alt path this time). Homing here is safe for the park: 1049
+            // has already snapshotted it on the line above.
+            out.push_str("\x1b[H");
             self.draw_grid(&mut out, &self.alt, &mut st);
         }
 
@@ -984,6 +995,77 @@ mod cursor_mismatch_tests {
         // consistent at same size and taller.
         assert_cursor_on_marker(&s, 24, 80, "PROMPT");
         assert_cursor_on_marker(&s, 32, 80, "PROMPT");
+    }
+
+    /// ALT SCREEN with scrollback, replayed TALLER. `dump_vt` routes this to
+    /// `CursorAnchor::Absolute` (the relative anchor is gated on
+    /// `sb_len > 0 && !alt_active`), because the alt branch re-homes and redraws
+    /// the alt grid rather than placing it by a bottom-landing flow. This test
+    /// pins that the absolute anchor really is height-independent here: a
+    /// full-screen app's cursor must land on its own content at any replay
+    /// height, both mid-screen and on the bottom row (the height-difference-
+    /// sensitive case).
+    #[test]
+    fn taller_replay_keeps_alt_screen_cursor_on_its_content() {
+        // Primary has scrollback, so only `alt_active` keeps this off the
+        // relative path — the exact gate under test.
+        let mut s = Terminal::with_scrollback(24, 80, 1000);
+        for i in 0..40u16 {
+            s.process(format!("line {i:02}\r\n").as_bytes());
+        }
+        assert!(s.primary_scrollback_len() > 0, "must have primary scrollback");
+
+        s.process(b"\x1b[?1049h"); // enter the alt screen
+        s.process(b"\x1b[5;1HALTMARK"); // mid-screen content, cursor left on it
+        assert_eq!(s.cursor().row, 4, "alt cursor mid-screen");
+        assert_cursor_on_marker(&s, 24, 80, "ALTMARK"); // same size (baseline)
+        assert_cursor_on_marker(&s, 32, 80, "ALTMARK"); // taller
+        assert_cursor_on_marker(&s, 50, 80, "ALTMARK"); // much taller
+
+        // Bottom row of the alt grid: an absolute CUP computed against the
+        // SOURCE height would land this short of the content on a taller target.
+        s.process(b"\x1b[24;1HALTBOTTOM");
+        assert_eq!(s.cursor().row, 23, "alt cursor on the bottom row");
+        assert_cursor_on_marker(&s, 24, 80, "ALTBOTTOM");
+        assert_cursor_on_marker(&s, 32, 80, "ALTBOTTOM");
+        assert_cursor_on_marker(&s, 50, 80, "ALTBOTTOM");
+    }
+
+    /// Attempt to construct a consumer that DEPENDS on the cursor landing at the
+    /// parked primary position when the alt grid is drawn — i.e. something the
+    /// post-`?1049h` home would break. Loads the alt path with everything in the
+    /// dump interval that could plausibly inherit a cursor: non-default tab stops
+    /// (whose HTS replay itself moves the cursor), a DECSTBM scroll region, and
+    /// content on the region's edges. If any of it inherited the parked position,
+    /// a same-size round trip would diverge from the source.
+    #[test]
+    fn alt_dump_interval_does_not_inherit_the_parked_cursor() {
+        let mut s = Terminal::with_scrollback(24, 80, 1000);
+        for i in 0..40u16 {
+            s.process(format!("line {i:02}\r\n").as_bytes());
+        }
+        // Park the primary cursor somewhere distinctive and NOT home, so an
+        // inherited position would be unmistakable.
+        s.process(b"\x1b[12;40H");
+        s.process(b"\x1b[?1049h"); // enter alt; 1049 saves the parked position
+        s.process(b"\x1b[3g"); // clear tab stops
+        s.process(b"\x1b[1;5H\x1bH"); // HTS at col 5
+        s.process(b"\x1b[1;33H\x1bH"); // HTS at col 33
+        s.process(b"\x1b[4;20r"); // DECSTBM scroll region
+        s.process(b"\x1b[6;1HREGION-MARK");
+        assert_eq!(s.cursor().row, 5, "alt cursor inside the scroll region");
+
+        // Same size: the round trip must reproduce the source exactly.
+        let same = replay_into(&s, 24, 80);
+        assert_eq!(
+            same.dump_text(),
+            s.dump_text(),
+            "same-size alt round trip must be content-identical"
+        );
+        assert_cursor_on_marker(&s, 24, 80, "REGION-MARK");
+        // Taller: content must still land on its own rows, cursor with it.
+        assert_cursor_on_marker(&s, 32, 80, "REGION-MARK");
+        assert_cursor_on_marker(&s, 50, 80, "REGION-MARK");
     }
 
     /// Pending-wrap at the cursor, in a scrolled session, replayed TALLER: the
