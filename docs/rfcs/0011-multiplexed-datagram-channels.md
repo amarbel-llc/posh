@@ -312,6 +312,72 @@ proceed without forwarding. Resolving the multi-client-host case — by
 per-client-host sub-paths, an explicit policy, or an election among long-lived
 mux endpoints — is deferred to FDR 0014.
 
+### 9. Deferred transport mechanisms
+
+This document specifies multiplexing. It deliberately does not specify four
+transport mechanisms a multi-stream connection would ordinarily carry. Each is
+recorded here because this document changes how much they matter, and because
+retrofitting any of them MUST NOT require a second flag day.
+
+#### 9.1 Selective acknowledgement
+
+Acknowledgement in posh is cumulative throughout — `acked_frame`, `input_base`,
+and the `recv_ack` of §5. That is correct for the `session` kind, whose payload
+is a state synchronization rather than a stream: loss is repaired by sending a
+newer diff against the last acked base, never by retransmitting stale content.
+
+It is not obviously correct for the `agent` kind, which IS a byte stream: a
+single lost datagram costs retransmission from the cumulative base. QUIC
+addresses this with acknowledgement ranges.
+
+A future revision MAY define range-based acknowledgement for stream-shaped
+kinds. It MUST do so behind a `ver` bump or a new kind rather than redefining
+§5's payload in place. Until then, implementations MUST NOT assume `recv_ack`
+carries anything other than cumulative semantics.
+
+#### 9.2 Congestion control
+
+posh paces sending off its RTT estimate and applies an RTO; it has no congestion
+window, no slow start, and no loss response beyond retransmission. That is a
+deliberate inheritance from mosh, and sound on mosh's premise: a screen diff is
+bounded-rate, so there is little to control.
+
+This document weakens that premise. One connection now carries agent traffic,
+scrollback, and an arbitrary number of sessions — materially more bulk-shaped
+than one terminal.
+
+This document does not specify congestion control. Implementations MUST NOT read
+that silence as a determination that none is required; the question is open, and
+"deliberately none, because ..." is a valid resolution that has not yet been
+made.
+
+#### 9.3 Flow control
+
+§3.4 and §4 REQUIRE hard bounds on concurrent channels, buffered bytes, and
+concurrent reassemblies, enforced by refusal. Those bounds exist for the
+allocation-exhaustion reason given under Security Considerations and are
+REQUIRED for it.
+
+They are not backpressure. There is no credit or window mechanism at either the
+channel or the connection level, so a sender that outpaces a receiver has its
+channel refused rather than slowed. Whether the multiplexed connection needs
+real flow control, or whether hard bounds plus the existing coalescing
+capability suffice, is an open decision coupled to §9.2.
+
+#### 9.4 Key update
+
+Not introduced by this document, and recorded only because this document changes
+its significance. posh holds one AEAD key for a connection's lifetime, with a
+deterministic counter nonce; there is no nonce-reuse exposure. There is also no
+rekey and no forward secrecy, which mattered less when a connection died with
+its session and matters more for a connection intended to outlive every session
+on it.
+
+A future revision adding key update SHOULD carry the key phase either in a `ver`
+value or on reserved channel identifier 0 (§3.1). Both are reserved by this
+document partly for that purpose, so the mechanism can be added without a wire
+break.
+
 ## Security Considerations
 
 - **Trust boundary is unchanged.** Channels ride inside the existing AEAD seal;
