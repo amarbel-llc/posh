@@ -113,10 +113,13 @@ the `eng-*(7)` manpages — read them with `man eng-versioning`,
   recipe. Add release/maintenance recipes to the `maintenance` group.
 - **Docs:** significant designs get a record under `docs/` — ADR for
   architecture decisions, RFC for wire/file-format contracts, FDR for
-  user-facing features. The target grammar + capability table is RFC 0001;
-  the FDRs (0001-0010) cover the namespace, takeover, mosh-parity, ssh agent
-  forwarding, scrollback sync, optimistic echo, the SIGUSR2 transport-state
-  dump, escape-to-shell, the command palette, and remote detached spawn.
+  user-facing features. The records are deliberately NOT enumerated here: an
+  inline list goes stale on every new record, and the current set with statuses
+  is supplied to agent sessions automatically. Browse `docs/rfcs/`,
+  `docs/features/`, and `docs/decisions/` for the live set. The target grammar
+  + capability registry is RFC 0001, and that registry is maintained IN PLACE —
+  a new or retired capability id updates its table, citing the RFC that changed
+  it.
 
 ## Key design facts (load-bearing, verified)
 
