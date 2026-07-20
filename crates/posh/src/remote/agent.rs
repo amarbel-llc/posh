@@ -1019,6 +1019,39 @@ mod tests {
         std::fs::remove_dir_all(&base).ok();
     }
 
+    // The general invariant behind posh#147, and the one worth guarding: an idle
+    // forwarding connection — one whose peer is active but where nothing is
+    // actually asking for the agent — MUST produce no agent channels at all,
+    // ever. #147 violated it via the takeover probe, but the reason it mattered
+    // was generic: every channel open is announced to the user as agent use, and
+    // consumes the notice's rate-limit slot (see
+    // `a_spurious_open_suppresses_a_real_one_for_a_full_window`). Any FUTURE
+    // source of spurious opens would be just as harmful, so guard the property
+    // rather than the one bug.
+    #[test]
+    fn an_idle_endpoint_opens_no_channels_over_many_ticks() {
+        let base = temp_base();
+        let mut ep = AgentEndpoint::new(&base).unwrap();
+
+        // Ten minutes of virtual time at the slow-tick cadence, peer active
+        // throughout, no agent client ever connecting.
+        let mut now = 0u64;
+        for _ in 0..120 {
+            now += AGENT_SLOW_TICK_MS;
+            ep.tick(true, now);
+            assert_eq!(
+                ep.accept_pending().len(),
+                0,
+                "an idle forwarding connection must open no agent channels (posh#147); \
+                 every open is reported to the user as agent use"
+            );
+        }
+        assert_eq!(ep.live_channel_count(), 0, "and none accumulated");
+
+        drop(ep);
+        std::fs::remove_dir_all(&base).ok();
+    }
+
     #[test]
     fn channel_open_data_close_lifecycle() {
         let base = temp_base();
@@ -1411,6 +1444,32 @@ mod tests {
         // At/after the window: fires again, and the clock advances from there.
         assert!(n.on_channel_open(60_000).is_some(), "a minute later fires");
         assert!(n.on_channel_open(75_000).is_none(), "window restarts");
+    }
+
+    // posh#147, the half that was security-relevant rather than merely noisy.
+    // The limiter is shared across ALL channel opens and cannot tell them apart,
+    // so an open the user does not care about spends the window's single slot and
+    // a GENUINE agent use moments later is never announced. Under #147 the
+    // spurious open recurred every 5s against a 60s window, so real uses
+    // routinely went unreported.
+    //
+    // This pins the hazard rather than a bug: the behaviour below is what the
+    // current design does, and it is only SAFE while no spurious opens exist —
+    // which is why `an_idle_endpoint_opens_no_channels_over_many_ticks` guards
+    // that precondition. Giving the notice enough context to tell a real key use
+    // from an uninteresting one would let this assertion be inverted.
+    #[test]
+    fn a_spurious_open_suppresses_a_real_one_for_a_full_window() {
+        let mut n = AgentNotice::new(false, "box");
+        // A spurious open (under #147: a liveness probe) fires and takes the slot.
+        assert!(n.on_channel_open(0).is_some(), "the spurious open is announced");
+        // A real `git push` 5s later — the user's key genuinely being used.
+        assert!(
+            n.on_channel_open(5_000).is_none(),
+            "REAL agent use goes unannounced because the spurious open spent the slot"
+        );
+        // It stays unannounced for the rest of the window.
+        assert!(n.on_channel_open(59_999).is_none());
     }
 
     #[test]
