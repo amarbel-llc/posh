@@ -180,13 +180,39 @@ impl AgentEndpoint {
     /// True when `agent/sock` is absent, dangling, or points at a dead
     /// `srv-*.sock` — i.e. nobody live owns the endpoint and we should claim
     /// it. A live link pointing at *another* live server is left alone.
+    ///
+    /// Liveness is decided by the target's OWNING PID (`kill(pid, 0)`), never by
+    /// connecting to it. The obvious probe — `session::socket_is_dead`, which
+    /// dials the socket — is wrong here in a way it is not for session sockets:
+    /// an `AgentEndpoint` listener treats every accepted connection as an agent
+    /// request, so probing by connect opens a phantom channel. In the ordinary
+    /// single-connection case the link points at OUR OWN socket, so the endpoint
+    /// probed itself every slow tick, emitted an `Open`, made the client dial the
+    /// user's real `$SSH_AUTH_SOCK`, and saturated the once-a-minute agent-use
+    /// notice with a request that never happened (posh#147).
+    ///
+    /// That last part was security-relevant, not cosmetic. `AgentNotice` advances
+    /// its rate-limit clock only when it fires, so a phantom at t=0 spent the
+    /// minute's slot and a GENUINE agent use at t=30s was silently suppressed —
+    /// with a 5 s probe against a 60 s window, real uses routinely went
+    /// unannounced. The notice is what justifies FDR 0004 forwarding by default,
+    /// so it has to mean something.
+    ///
+    /// A pid check is also strictly cheaper, and it is what `gc_dead_sockets`
+    /// already uses to reap the same files — the two now agree by construction.
     fn symlink_needs_takeover(&self) -> bool {
         match std::fs::read_link(&self.well_known) {
             Err(_) => true, // absent or not a symlink
             Ok(target) => {
                 // Targets are stored relative to `dir` (e.g. "srv-123.sock").
                 let resolved = self.dir.join(&target);
-                crate::session::socket_is_dead(&resolved)
+                match srv_sock_pid(&resolved) {
+                    // A name we do not recognise as `srv-<pid>.sock` is not
+                    // something we can prove live, and nothing we wrote. Treat
+                    // it as takeable rather than deferring to it forever.
+                    None => true,
+                    Some(pid) => !pid_alive(pid),
+                }
             }
         }
     }
@@ -954,6 +980,42 @@ mod tests {
 
         drop(b);
         drop(a);
+        std::fs::remove_dir_all(&base).ok();
+    }
+
+    // posh#147: the takeover check MUST NOT probe by connecting. An
+    // `AgentEndpoint` listener treats every accepted connection as an agent
+    // request, and in the ordinary single-connection case `agent/sock` points at
+    // our OWN socket — so a connecting probe made the endpoint open a phantom
+    // channel against itself on every slow tick, which then made the client dial
+    // the user's real `$SSH_AUTH_SOCK` and saturated the once-a-minute agent-use
+    // notice with a request that never happened.
+    //
+    // Before the fix this test found exactly 1 channel; it is the regression
+    // guard for using a pid check instead of a connect.
+    #[test]
+    fn takeover_check_does_not_open_a_channel_against_itself() {
+        let base = temp_base();
+        let mut ep = AgentEndpoint::new(&base).unwrap();
+        assert!(ep.symlink_points_to_self(), "we own the link, so we are the probe target");
+        assert_eq!(ep.accept_pending().len(), 0, "no channels before the tick");
+
+        // A full slow tick with an active peer: runs the takeover check against
+        // a link pointing at our own live socket.
+        ep.last_tick = 0;
+        ep.tick(true, AGENT_SLOW_TICK_MS + 1);
+
+        assert_eq!(
+            ep.accept_pending().len(),
+            0,
+            "the liveness probe must not land on our listener as an agent channel (posh#147)"
+        );
+        assert!(
+            ep.symlink_points_to_self(),
+            "and we must still own the link — a live owner is not taken over from"
+        );
+
+        drop(ep);
         std::fs::remove_dir_all(&base).ok();
     }
 
