@@ -262,9 +262,8 @@ impl Terminal {
         }
 
         if flat {
-            // Single-screen target: just the active grid from home. Drawn from
-            // `\x1b[H`, so absolute positioning is height-independent here.
-            out.push_str("\x1b[H");
+            // Single-screen target: just the active grid from home. `draw_grid`
+            // homes, so absolute positioning is height-independent here.
             self.draw_grid(&mut out, self.scr(), &mut st);
             self.dump_graphics(&mut out);
             self.dump_modes(&mut out);
@@ -307,7 +306,6 @@ impl Terminal {
                 }
             }
         } else {
-            out.push_str("\x1b[H");
             self.draw_grid(&mut out, &self.primary, &mut st);
         }
 
@@ -328,17 +326,9 @@ impl Terminal {
                 let _ = write!(out, "\x1b[>{f}u");
             }
             out.push_str("\x1b[?1049h");
-            // `draw_grid`'s "from the home position" contract is a CALLER
-            // precondition (cf. the explicit \x1b[H at the other two call
-            // sites), and 1049 does not home the cursor — it only saves it.
-            // Without this home the alt grid paints from wherever the primary
-            // scrollback flow parked us, which lands at the TARGET's bottom and
-            // is therefore height-dependent: on a taller client the grid drops
-            // below the absolute CUP that dump_cursor then emits, leaving the
-            // cursor offset ABOVE its content (the multi-client offset bug, on
-            // the alt path this time). Homing here is safe for the park: 1049
-            // has already snapshotted it on the line above.
-            out.push_str("\x1b[H");
+            // 1049 only SAVES the cursor, it does not home it — so the park
+            // above is already snapshotted by this point, and `draw_grid`'s own
+            // home is free to move it.
             self.draw_grid(&mut out, &self.alt, &mut st);
         }
 
@@ -371,7 +361,7 @@ impl Terminal {
         // G0 shifted in, replace mode, autowrap on (draw_grid regenerates
         // soft-wrap flags by autowrapping), default pen, no open link.
         out.push_str("\x1b[?25l\x1b[r\x1b[?6l\x1b(B\x0f\x1b[4l\x1b[?7h\x1b[0m\x1b[0\"q\x1b]8;;\x1b\\");
-        out.push_str("\x1b[2J\x1b[H");
+        out.push_str("\x1b[2J");
         self.draw_grid(&mut out, self.scr(), &mut st);
         // Re-assert what normalization may have pushed away from the model.
         let (top, bot) = self.region();
@@ -404,7 +394,8 @@ impl Terminal {
         // re-place from the model (image data already lives in the target
         // from the original raw transmission).
         self.dump_placements(&mut out);
-        // Drawn from `\x1b[2J\x1b[H`, so absolute positioning is correct.
+        // Cleared, then drawn from `draw_grid`'s home, so absolute positioning
+        // is correct.
         self.dump_cursor(&mut out, &mut st, CursorAnchor::Absolute);
         if self.modes.cursor_visible {
             out.push_str("\x1b[?25h");
@@ -527,7 +518,15 @@ impl Terminal {
 
     /// Draws a grid from the home position in flow order so that soft
     /// wrap flags regenerate naturally.
+    ///
+    /// Homes the cursor itself rather than trusting callers to: every caller
+    /// wants a full-screen repaint from row 0, and the one that forgot the
+    /// `\x1b[H` painted the alt grid from wherever the preceding primary flow
+    /// had parked the cursor — a target-height-dependent origin, which put the
+    /// cursor above its content on a taller client (the multi-client offset
+    /// bug). Self-enforcing the precondition makes that bug class unreachable.
     fn draw_grid(&self, out: &mut String, grid: &Screen, st: &mut EmitState) {
+        out.push_str("\x1b[H");
         for r in 0..grid.rows() {
             let row = grid.row(r).unwrap();
             self.emit_row(out, row, st);
@@ -889,14 +888,22 @@ mod cursor_mismatch_tests {
         );
     }
 
-    /// A scrolled 24-row session with the cursor at the bottom prompt.
-    fn scrolled_session() -> Terminal {
+    /// A 24-row session scrolled far enough to fill scrollback, cursor left at
+    /// the start of the row below the last line. The base for tests that then
+    /// position the cursor themselves; `scrolled_session` adds a prompt.
+    fn primed_session() -> Terminal {
         let mut s = Terminal::with_scrollback(24, 80, 1000);
         for i in 0..40u16 {
             s.process(format!("line {i:02}\r\n").as_bytes());
         }
-        s.process(b"prompt$ ");
         assert!(s.primary_scrollback_len() > 0, "must have scrollback");
+        s
+    }
+
+    /// A scrolled 24-row session with the cursor at the bottom prompt.
+    fn scrolled_session() -> Terminal {
+        let mut s = primed_session();
+        s.process(b"prompt$ ");
         s
     }
 
@@ -917,10 +924,7 @@ mod cursor_mismatch_tests {
     /// absolute row. Exercises the up>0-but-not-max relative move.
     #[test]
     fn taller_replay_keeps_cursor_on_a_mid_screen_row() {
-        let mut s = Terminal::with_scrollback(24, 80, 1000);
-        for i in 0..40u16 {
-            s.process(format!("line {i:02}\r\n").as_bytes());
-        }
+        let mut s = primed_session();
         // Land the cursor on a mid-screen row with a unique marker, no trailing
         // newline so it stays put.
         s.process(b"MIDROW-MARK");
@@ -938,10 +942,7 @@ mod cursor_mismatch_tests {
     /// the maximum (up = rows-1). Must land on row 0's content in any replay.
     #[test]
     fn taller_replay_keeps_cursor_on_the_top_row() {
-        let mut s = Terminal::with_scrollback(24, 80, 1000);
-        for i in 0..40u16 {
-            s.process(format!("line {i:02}\r\n").as_bytes());
-        }
+        let mut s = primed_session();
         s.process(b"\x1b[1;1HTOPMARK"); // home, write a marker on row 0
         s.process(b"\x1b[1;1H"); // cursor back to row 0
         assert_eq!(s.cursor().row, 0, "cursor on the top row");
@@ -1009,12 +1010,7 @@ mod cursor_mismatch_tests {
     fn taller_replay_keeps_alt_screen_cursor_on_its_content() {
         // Primary has scrollback, so only `alt_active` keeps this off the
         // relative path — the exact gate under test.
-        let mut s = Terminal::with_scrollback(24, 80, 1000);
-        for i in 0..40u16 {
-            s.process(format!("line {i:02}\r\n").as_bytes());
-        }
-        assert!(s.primary_scrollback_len() > 0, "must have primary scrollback");
-
+        let mut s = primed_session();
         s.process(b"\x1b[?1049h"); // enter the alt screen
         s.process(b"\x1b[5;1HALTMARK"); // mid-screen content, cursor left on it
         assert_eq!(s.cursor().row, 4, "alt cursor mid-screen");
@@ -1040,10 +1036,7 @@ mod cursor_mismatch_tests {
     /// a same-size round trip would diverge from the source.
     #[test]
     fn alt_dump_interval_does_not_inherit_the_parked_cursor() {
-        let mut s = Terminal::with_scrollback(24, 80, 1000);
-        for i in 0..40u16 {
-            s.process(format!("line {i:02}\r\n").as_bytes());
-        }
+        let mut s = primed_session();
         // Park the primary cursor somewhere distinctive and NOT home, so an
         // inherited position would be unmistakable.
         s.process(b"\x1b[12;40H");
@@ -1075,10 +1068,7 @@ mod cursor_mismatch_tests {
     /// after positioning in both anchors, but the relative path is new).
     #[test]
     fn taller_replay_preserves_pending_wrap_at_cursor() {
-        let mut s = Terminal::with_scrollback(24, 80, 1000);
-        for i in 0..40u16 {
-            s.process(format!("line {i:02}\r\n").as_bytes());
-        }
+        let mut s = primed_session();
         // Fill the last grid row to the final column so the cursor is left in
         // the pending-wrap state (armed, but not yet wrapped). `pending_wrap` is
         // internal, so assert its OBSERVABLE effect: the cursor rests on the
