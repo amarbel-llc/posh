@@ -178,6 +178,18 @@ agent:
 
 ## More Information
 
+- **RFC 0011** (`docs/rfcs/0011-multiplexed-datagram-channels.md`) — **the
+  mechanism this record describes is superseded there.** RFC 0011 §5 makes each
+  forwarded agent connection its own mux channel, retiring the `AgentRecord`
+  framing and the `CAP_AGENT_DATA`/`CAP_AGENT_ACK` carriage (RFC 0001 ids 6/7/8,
+  now permanently reserved); §7 removes the `agent/sock` symlink election in
+  favour of a bound socket owned by the single endpoint one connection per
+  client-host pair implies. This record remains the account of WHY posh forwards
+  an agent over its own transport and of the user-facing behaviour (on-by-default
+  policy, roam survival, the tuning levers) — that part is unchanged. What is
+  superseded is the wire carriage and the endpoint-ownership scheme. See also
+  FDR 0014 (the stable-endpoint record) and posh#136 (the 9.9 s handoff outage
+  the election produces).
 - **github #55** — phase-1 implementation tracking issue (the sizing
   table as a checklist, the resolved open questions).
 - **github #53** — follow-up: `Setenv` IPC + `posh setenv` to retrofit

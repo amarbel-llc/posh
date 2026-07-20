@@ -144,9 +144,9 @@ Each id is classified by scope:
 | 3 | `SCROLLBACK` | content (daemon owns the ring) | end-to-end | yes |
 | 4 | `MORPH` | content (frame producer) | end-to-end | yes |
 | 5 | `BASE_SUM` | content (checksummed bodies) | end-to-end | dormant (no divergence) |
-| 6 | `AGENT_FORWARD` | transport (relay) | relay↔client | absent |
-| 7 | `AGENT_DATA` | transport (relay) | relay↔client | absent |
-| 8 | `AGENT_ACK` | transport (relay) | relay↔client | absent |
+| 6 | `AGENT_FORWARD` | transport (relay) | relay↔client | absent — RETIRED, see below |
+| 7 | `AGENT_DATA` | transport (relay) | relay↔client | absent — RETIRED, see below |
+| 8 | `AGENT_ACK` | transport (relay) | relay↔client | absent — RETIRED, see below |
 
 - **Content** capabilities MUST be negotiated between the consuming client and
   the producing daemon, end-to-end; the relay forwards their table entries and
@@ -158,6 +158,16 @@ Each id is classified by scope:
   unchanged by this document. Agent forwarding for sessions whose shell was
   spawned without a forwarding connection is out of scope (FDR 0011
   Limitations; #103).
+
+  **AMENDED by RFC 0011 §7.** The two sentences above are superseded for any
+  connection speaking the RFC 0011 envelope. Ids 6/7/8 are RETIRED (permanently
+  reserved, never reassigned); agent forwarding rides `agent` channels (RFC 0011
+  §5); and the symlink election is REMOVED — `<base>/agent/sock` becomes a bound
+  socket owned by the single endpoint that a one-connection-per-client-host mux
+  implies, with no takeover or liveness probing (RFC 0011 §7, and §8 for the
+  residual two-client-host case). What is NOT amended: the relay still terminates
+  agent traffic rather than passing it to the daemon, so this section's security
+  boundary — the daemon never brokers key material — stands unchanged.
 - Because a frame-consuming client repaints the visible screen in place on
   BOTH transports, it does NOT stream the session's scrolled-off lines into the
   outer terminal's native scrollback. The daemon is therefore the authoritative
@@ -288,6 +298,8 @@ gating frame emission.
 - FDR 0012: Session layer collapse (`docs/features/`) — the relay-retarget
   extension anticipated by §3, exploring layer collapse for posh-in-posh.
 - RFC 0001: Target grammar and capability table — amended by §5.
+- RFC 0011: Multiplexed datagram channels — amends §3 and §4 of this document
+  (agent forwarding moves to `agent` channels; capability ids 6/7/8 retired).
 - RFC 0004: Incremental frame sync (`MORPH`); RFC 0002: scrollback sync;
   RFC 0006: base-integrity checksums — the content-capability bodies re-homed
   here.
