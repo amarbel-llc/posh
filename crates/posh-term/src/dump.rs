@@ -100,6 +100,29 @@ struct EmitState {
     hyperlink: u32,
 }
 
+/// Resets the target's **rendering** state to defaults, so a replay onto a
+/// terminal carrying leftovers from whatever ran before it lands correctly.
+///
+/// Needed because a dump re-emits only the modes that are NON-DEFAULT IN THE
+/// SOURCE ([`Terminal::dump_modes`]): a non-default mode stranded on the TARGET
+/// that the source holds at its default would otherwise never be corrected, and
+/// erasing the screen clears CELLS, not MODES. Margins and origin mode come
+/// first, since every later position depends on how `\x1b[H` is interpreted.
+///
+/// Scoped deliberately to state that affects how the replay is DRAWN — margins,
+/// origin, reverse video, autowrap, cursor blink/style, synchronized output,
+/// LNM, insert mode, both charsets, the shift state, the pen, DECSCA, and an
+/// open hyperlink. Excluded:
+///
+/// * **Input encoding** (cursor-keys, keypad, mouse, bracketed paste, focus,
+///   the kitty stack) — it cannot corrupt a repaint, and the session client
+///   already resets it on detach.
+/// * **The DECCOLM family** (`?3`/`?40`/`?95`) — resetting it would resize the
+///   user's terminal, which posh does not own.
+/// * **Tab stops** — there is no portable "restore the default every-8 stops"
+///   sequence; `\x1b[3g` alone clears them all, which is worse than inheriting.
+pub const DRAWABLE_STATE_RESET: &str = "\x1b[r\x1b[?6l\x1b[?5l\x1b[?7h\x1b[?12l\x1b[?2026l\x1b[20l\x1b[4l\x1b(B\x1b)B\x0f\x1b[0m\x1b[0\"q\x1b]8;;\x1b\\";
+
 /// How [`Terminal::dump_cursor`] positions the cursor: `Absolute` (a CUP from
 /// home, for paths that redraw the grid from `\x1b[H`) or `Relative` (anchored to
 /// the bottom of a continuous content flow, for the scrollback-replay path — so a
@@ -219,9 +242,18 @@ impl Terminal {
     /// replay, no 1049 enter/exit, no inactive-screen kitty seeding). For
     /// attach clients that pin the outer terminal to its own alternate
     /// screen, where the target's primary buffer belongs to the user's
-    /// shell. Assumes a fresh, cleared target screen like `dump_vt`.
+    /// shell.
+    ///
+    /// Unlike [`Terminal::dump_vt`] — whose consumers replay into a freshly
+    /// constructed [`Terminal`] — every consumer of this writes to a REAL tty
+    /// that may carry mode leftovers from whatever ran before. So it opens with
+    /// [`DRAWABLE_STATE_RESET`] rather than delegating that to callers: the
+    /// attach takeover, the daemon's initial replay, and the escape-to-shell
+    /// overlay source swap all get it, and none of them can forget it.
     pub fn dump_vt_flat(&self) -> Vec<u8> {
-        self.dump_vt_impl(true)
+        let mut out = Vec::from(DRAWABLE_STATE_RESET);
+        out.extend_from_slice(&self.dump_vt_impl(true));
+        out
     }
 
     fn dump_vt_impl(&self, flat: bool) -> Vec<u8> {
@@ -360,7 +392,8 @@ impl Terminal {
         // drawable state: full-screen region, absolute addressing, ASCII
         // G0 shifted in, replace mode, autowrap on (draw_grid regenerates
         // soft-wrap flags by autowrapping), default pen, no open link.
-        out.push_str("\x1b[?25l\x1b[r\x1b[?6l\x1b(B\x0f\x1b[4l\x1b[?7h\x1b[0m\x1b[0\"q\x1b]8;;\x1b\\");
+        out.push_str("\x1b[?25l");
+        out.push_str(DRAWABLE_STATE_RESET);
         out.push_str("\x1b[2J");
         self.draw_grid(&mut out, self.scr(), &mut st);
         // Re-assert what normalization may have pushed away from the model.
@@ -1059,6 +1092,46 @@ mod cursor_mismatch_tests {
         // Taller: content must still land on its own rows, cursor with it.
         assert_cursor_on_marker(&s, 32, 80, "REGION-MARK");
         assert_cursor_on_marker(&s, 50, 80, "REGION-MARK");
+    }
+
+    /// `dump_vt_flat` replays onto a REAL tty, which may carry mode leftovers
+    /// from whatever ran before it. Strand every mode `DRAWABLE_STATE_RESET`
+    /// claims to reset — each one non-default on the TARGET and default in the
+    /// SOURCE, the asymmetry `dump_modes` cannot correct — and assert the
+    /// replay still reproduces the source exactly. posh#141.
+    #[test]
+    fn flat_replay_normalizes_a_dirty_target() {
+        let mut source = Terminal::with_scrollback(24, 80, 100);
+        source.process(b"first row content");
+        source.process(b"\x1b[3;1Hthird row MARKER");
+
+        let mut target = Terminal::with_scrollback(24, 80, 100);
+        target.process(b"\x1b[5;15r"); // DECSTBM margins
+        target.process(b"\x1b[?6h"); // DECOM origin mode
+        target.process(b"\x1b[?5h"); // reverse video
+        target.process(b"\x1b[?7l"); // autowrap off
+        target.process(b"\x1b[?12h"); // cursor blink
+        target.process(b"\x1b[?2026h"); // synchronized output
+        target.process(b"\x1b[20h"); // LNM
+        target.process(b"\x1b[4h"); // insert mode
+        target.process(b"\x1b(0"); // G0 = DEC special graphics
+        target.process(b"\x1b)0"); // G1 = DEC special graphics
+        target.process(b"\x0e"); // SO: shift G1 in
+        target.process(b"\x1b[31;1;4m"); // dirty pen
+        target.process(b"\x1b[1\"q"); // DECSCA protected
+        target.process(b"\x1b]8;;http://example.invalid\x1b\\"); // open hyperlink
+
+        target.process(&source.dump_vt_flat());
+
+        for r in 0..source.rows() {
+            assert_eq!(
+                target.screen().row(r).unwrap().text(true),
+                source.screen().row(r).unwrap().text(true),
+                "row {r} diverged replaying onto a dirty target"
+            );
+        }
+        assert_eq!(target.cursor().row, source.cursor().row, "cursor row");
+        assert_eq!(target.cursor().col, source.cursor().col, "cursor col");
     }
 
     /// Pending-wrap at the cursor, in a scrolled session, replayed TALLER: the

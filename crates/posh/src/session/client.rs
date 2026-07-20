@@ -1342,6 +1342,40 @@ mod tests {
         assert!(!restore.windows(4).any(|w| w == b"1049"));
     }
 
+    /// End-to-end for the attach path: a target carrying non-default modes from
+    /// a previous application must still replay the session correctly. The
+    /// takeover only clears CELLS (`\x1b[2J\x1b[H`), so the mode reset comes
+    /// from `dump_vt_flat` itself (`posh_term::DRAWABLE_STATE_RESET`) — this
+    /// pins that the two compose. posh#141.
+    #[test]
+    fn enter_seq_normalizes_a_dirty_target_before_replay() {
+        let mut source = Terminal::with_scrollback(24, 80, 100);
+        source.process(b"hello from the session");
+        source.process(b"\x1b[3;1Hsecond marker line");
+
+        let mut target = Terminal::with_scrollback(24, 80, 100);
+        // Leftovers a crashed full-screen app can plausibly strand on the tty.
+        target.process(b"\x1b[5;15r"); // DECSTBM scroll region
+        target.process(b"\x1b[?6h"); // DECOM origin mode
+        target.process(b"\x1b[?7l"); // autowrap OFF
+        target.process(b"\x1b[4h"); // insert mode
+        target.process(b"\x1b(0"); // G0 = DEC special graphics
+        target.process(b"\x1b[31;1m"); // dirty pen
+
+        target.process(&enter_seq(&None));
+        target.process(&source.dump_vt_flat());
+
+        for r in 0..source.rows() {
+            assert_eq!(
+                target.screen().row(r).unwrap().text(true),
+                source.screen().row(r).unwrap().text(true),
+                "row {r} diverged replaying onto a dirty target"
+            );
+        }
+        assert_eq!(target.cursor().row, source.cursor().row, "cursor row");
+        assert_eq!(target.cursor().col, source.cursor().col, "cursor col");
+    }
+
     // The escape-key matcher tests feed with the palette enabled (frames-on)
     // unless a test is specifically about the gate-off behaviour. These helpers
     // keep the assertions terse against the `EscapeEvent` enum.

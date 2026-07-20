@@ -75,7 +75,7 @@ mod terminal;
 mod wcwidth;
 
 pub use cell::{Cell, Color, Style, UnderlineStyle};
-pub use dump::sgr_params;
+pub use dump::{sgr_params, DRAWABLE_STATE_RESET};
 pub use graphics::{AnimationState, Frame, Image, ImageFormat, Placement};
 pub use kitty_keys::{encode_key, KeyCode, KeyEvent, KeyEventType, KittyFlags, Modifiers};
 pub use modes::{MouseMode, MouseProtocol};
