@@ -141,12 +141,40 @@ agent:
   signatures at will while connected. Mitigated three ways: the
   profile-level `POSH_FORWARD_AGENT=no` kill switch plus per-connection
   `-a`; the man page recommending confirm-constrained keys
-  (`ssh-add -c`) for semi-trusted hosts; and a rate-limited per-request
-  client notice (shipping enabled in v1, `POSH_AGENT_NOTICE=no` to
-  silence — default-on forwarding is what makes that banner the only
-  ambient signal a remote is using the agent). The agent only ever
-  *signs* — keys never leave the local machine — and nothing is
-  reachable once the connection's client goes inactive.
+  (`ssh-add -c`) for semi-trusted hosts; and the per-request client
+  notice below. The agent only ever *signs* — keys never leave the local
+  machine — and nothing is reachable once the connection's client goes
+  inactive.
+- **The per-request notice is a load-bearing control, not a convenience.**
+  Default-on forwarding is what makes that banner the only ambient signal
+  that a remote is using the agent, so its contract is part of the
+  security posture (enabled in v1; `POSH_AGENT_NOTICE=no` silences it).
+  It reports **what was asked for**, on the channel's first request:
+
+  | Agent request | Notice | Rate limit |
+  |---|---|---|
+  | `SSH_AGENTC_SIGN_REQUEST` | `<host> SIGNED with your forwarded ssh key` | **none — every signature is announced** |
+  | `SSH_AGENTC_REQUEST_IDENTITIES` | `<host> listed your forwarded ssh keys` | one per minute |
+  | anything else | as a listing | one per minute |
+
+  Three properties are deliberate, and each was a defect before posh#147:
+
+  - **It fires on a REQUEST, never on a channel open.** An open means
+    something connected to the forwarded socket, not that anything wanted
+    a key. Reporting opens let a liveness probe read as a `git push`.
+  - **Signatures are never rate-limited.** A signature is an actual use of
+    a private key, so nothing may consume its slot. Previously one shared
+    limiter meant an uninteresting event could spend the window and a real
+    signature seconds later went unreported — the notice silently failing
+    at the one job it exists for.
+  - **Listings and signatures are distinguished.** Every ssh connection
+    lists keys; almost all traffic is listings, and treating them as
+    equivalent to a key use trains the user to ignore the signal.
+
+  Classification is a read-only peek at the first request's type byte,
+  performed **client-side** where the user's own agent already lives. It
+  touches no key material and forwards bytes unchanged, so RFC 0008's
+  boundary — the daemon never brokers keys — is unaffected.
 - **Sessions created while forwarding was off** (opt-out, or no local
   agent at the time) and attached later with forwarding on have no
   `SSH_AUTH_SOCK` in their shell environment, because session env is
@@ -171,7 +199,8 @@ agent:
 |---|---|---|---|
 | `AGENT_PEER_ACTIVE` | 15 s | Fast-fail `SSH_AGENT_FAILURE` rather than hang a `git push` when the peer is gone; stricter than the 60 s `PEER_TIMEOUT`. | Spurious failures on flaky links → raise; hung-push complaints → lower. |
 | `AGENT_REQUEST_TMOUT` | 10 s | A single outstanding request that exceeds this returns `SSH_AGENT_FAILURE`. | Slow real agents (HSM, confirm prompts) time out legitimately. |
-| slow tick | 5 s | Symlink liveness/takeover check + dead-`srv-*.sock` GC cadence. | Takeover after an owner quits feels sluggish → lower. |
+| slow tick | 5 s | Symlink liveness/takeover check + dead-`srv-*.sock` GC cadence. | Takeover after an owner quits feels sluggish → lower. Note the handoff between endpoints costs TWO of these (owner releases on its tick, sibling claims on its own), a measured 9.9 s of unusable `agent/sock` — posh#136, closed by construction under RFC 0011 §7 rather than by tuning this. |
+| `AGENT_NOTICE_INTERVAL_MS` | 60 s | Rate limit for the key-**listing** notice only. Signatures are never limited, so this cannot suppress a real key use. | Listing banners feel spammy → raise. Lowering it does not make signatures more visible; they are already unconditional. |
 | flow-control window | 64 KB / direction | Backpressure point: stop `poll()`ing the feeding unix fds when the outbox exceeds it. No new wire mechanism. | Large identity lists stall. |
 | `MAX_AGENT_CHANNELS` | 8 / connection | Bounds concurrent agent clients and memory. | Legitimate parallel agent use (many concurrent `git` ops) hits the cap. |
 | per-channel buffer | 256 KB | OpenSSH's max agent message; bounds memory per channel. | A real agent message exceeds it. |
