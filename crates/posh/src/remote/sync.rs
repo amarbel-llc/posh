@@ -735,6 +735,98 @@ mod tests {
         );
     }
 
+    // RFC 0011 §4, verification. The RFC's normative reassembly requirement
+    // rests on a claim about TODAY's behaviour: that two instructions in flight
+    // together destroy each other, because `FragmentAssembly` keeps one
+    // `current_id` and clears the partial assembly whenever a fragment bearing a
+    // different id arrives.
+    //
+    // `fragment_duplicate_tolerated_and_new_id_resets` above shows the reset in
+    // the sequential case (all of A, then all of B) and treats it as intended —
+    // which it is, while only one instruction is ever in flight. This test shows
+    // the INTERLEAVED case that multiplexing introduces: neither instruction
+    // completes, no matter how many times its fragments arrive. That is the
+    // corruption §4 forbids an implementation from shipping into.
+    #[test]
+    fn interleaved_instructions_destroy_each_other_today() {
+        let mut fr = Fragmenter::new();
+        let mut asm = FragmentAssembly::new();
+        let a = fr.make_fragments(&[0xaa; 300], 100); // 3 fragments, id 1
+        let b = fr.make_fragments(&[0xbb; 300], 100); // 3 fragments, id 2
+        assert_eq!(a.len(), 3);
+        assert_eq!(b.len(), 3);
+
+        // Perfectly interleaved delivery — no loss, no reordering within an
+        // instruction. Every fragment of both instructions is delivered.
+        let mut completed = Vec::new();
+        for i in 0..3 {
+            if let Some(p) = asm.add(a[i].clone()) {
+                completed.push(p);
+            }
+            if let Some(p) = asm.add(b[i].clone()) {
+                completed.push(p);
+            }
+        }
+
+        assert!(
+            completed.is_empty(),
+            "with the current single-`current_id` buffer, interleaving must lose \
+             BOTH instructions despite every fragment arriving; got {} completion(s). \
+             If this now passes, RFC 0011 §4 has been implemented and this test \
+             should be inverted.",
+            completed.len()
+        );
+    }
+
+    // RFC 0011 §1/§2, verification. The RFC asserts that `ClientMessage` and
+    // `ServerFrame` become the `session` channel's payload "verbatim" — i.e.
+    // prepending a 9-byte envelope and decoding from an offset needs no change
+    // to either codec. Both decoders take `&[u8]`, so this should hold; assert
+    // it rather than assume, since the whole compatibility argument rests on it.
+    #[test]
+    fn a_nine_byte_envelope_prefix_leaves_both_codecs_verbatim() {
+        // RFC 0011 §2: ver:u8 + channel:u64 LE.
+        let envelope = |channel: u64| {
+            let mut e = vec![0x01u8];
+            e.extend_from_slice(&channel.to_le_bytes());
+            e
+        };
+        assert_eq!(envelope(0).len(), 9, "the §2 envelope is 9 bytes");
+
+        let cm = ClientMessage {
+            flags: 0,
+            caps: caps::own_table(&[]),
+            acked_frame: 42,
+            rows: 24,
+            cols: 80,
+            input_base: 7,
+            input: b"hello".to_vec(),
+        };
+        let mut wire = envelope(0x0102_0304_0506_0708);
+        wire.extend_from_slice(&cm.encode());
+        assert_eq!(
+            ClientMessage::decode(&wire[9..]).unwrap(),
+            cm,
+            "ClientMessage must decode unchanged from behind the envelope"
+        );
+
+        let sf = posh_proto::frame::ServerFrame {
+            flags: 0,
+            caps: caps::own_table(&[]),
+            frame_num: 9,
+            input_ack: 5,
+            echo_ack: 4,
+            body: posh_proto::frame::FrameBody::Full(b"screen".to_vec()),
+        };
+        let mut wire = envelope(1);
+        wire.extend_from_slice(&sf.encode());
+        assert_eq!(
+            posh_proto::frame::ServerFrame::decode(&wire[9..]).unwrap(),
+            sf,
+            "ServerFrame must decode unchanged from behind the envelope"
+        );
+    }
+
     #[test]
     fn fragment_count_capped() {
         let mut asm = FragmentAssembly::new();

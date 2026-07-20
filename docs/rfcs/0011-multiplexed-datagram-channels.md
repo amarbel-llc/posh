@@ -250,10 +250,12 @@ The payload of an `agent` channel instruction is:
   agent client as a closed socket, so the request fails rather than hangs.
 
 Consequences (informative): agent data is now fragmented like any other payload
-rather than chunked into 247-byte capability entries, which removes a
-per-message entry-count ceiling on agent throughput; and an agent channel no
-longer depends on a session existing, so forwarding is not bound to any
-particular session's lifetime.
+rather than chunked into 247-byte capability entries (`AGENT_DATA_MAX`), which
+removes the per-message ceiling those entries impose — the table's `count: u8`
+caps one message at `MAX_AGENT_DATA_CAPS` entries, about 59 KB of agent bytes,
+with the remainder deferred to a later message. An agent channel also no longer
+depends on a session existing, so forwarding is not bound to any particular
+session's lifetime.
 
 ### 6. Negotiation
 
@@ -335,6 +337,8 @@ kinds. It MUST do so behind a `ver` bump or a new kind rather than redefining
 §5's payload in place. Until then, implementations MUST NOT assume `recv_ack`
 carries anything other than cumulative semantics.
 
+Tracked as posh#142.
+
 #### 9.2 Congestion control
 
 posh paces sending off its RTT estimate and applies an RTO; it has no congestion
@@ -351,6 +355,8 @@ that silence as a determination that none is required; the question is open, and
 "deliberately none, because ..." is a valid resolution that has not yet been
 made.
 
+Tracked as posh#143.
+
 #### 9.3 Flow control
 
 §3.4 and §4 REQUIRE hard bounds on concurrent channels, buffered bytes, and
@@ -363,6 +369,8 @@ channel or the connection level, so a sender that outpaces a receiver has its
 channel refused rather than slowed. Whether the multiplexed connection needs
 real flow control, or whether hard bounds plus the existing coalescing
 capability suffice, is an open decision coupled to §9.2.
+
+Tracked as posh#144.
 
 #### 9.4 Key update
 
@@ -413,7 +421,10 @@ break.
   closed rather than treated as a connection error.
 - Concurrent reassembly (§4): interleaved fragments of two instructions both
   complete — the direct regression test for the discard-on-different-id
-  behaviour this document forbids. Plus eviction under the byte bound.
+  behaviour this document forbids. Plus eviction under the byte bound. The
+  inverse of `remote::sync::tests::interleaved_instructions_destroy_each_other_today`,
+  which pins the pre-implementation behaviour and MUST be inverted, not deleted,
+  when §4 lands.
 - Agent channel (§5): OPEN/data/CLOSE lifecycle over the envelope, cumulative
   retransmission across a simulated loss, FAIL surfacing as a closed socket, and
   a payload larger than the retired 247-byte capability budget completing in one
@@ -436,7 +447,10 @@ break.
   invoked with the selector; there is no mixed-mode connection.
 - The `ServerFrame` and `ClientMessage` encodings are unchanged — they become the
   `session` channel's payload verbatim, so the frame codecs, the capability
-  table, and the posh-proto contracts are untouched.
+  table, and the posh-proto contracts are untouched. Verified, not assumed:
+  `remote::sync::tests::a_nine_byte_envelope_prefix_leaves_both_codecs_verbatim`
+  decodes both message types unaltered from behind a §2 envelope. Both decoders
+  take a `&[u8]`, so decoding from an offset needs no codec change.
 - RFC 0001 capability ids 6/7/8 are retired, not reused (§7). A baseline peer
   that still sends them remains unambiguous.
 - Migration is incremental: the `agent` kind and a single `session` channel are
@@ -469,3 +483,4 @@ Informative:
   enables, closed as a decision without an implementation.
 - github #103: host-global agent rendezvous — out of scope here; §8 is the
   nearest boundary.
+- posh#142, posh#143, posh#144: the §9.1 / §9.2 / §9.3 open decisions.
