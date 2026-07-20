@@ -127,6 +127,33 @@ the `eng-*(7)` manpages — read them with `man eng-versioning`,
   any client. Detach/disconnect/roam leave it running; the daemon exits
   (killing its process group, propagating the shell's exit code) only when
   the shell itself exits. `crates/posh/src/session/daemon.rs`.
+- **Multi-client sizing is smallest-wins, and the DAEMON owns it:** the
+  session daemon sizes the pty to the elementwise MINIMUM across all attached
+  clients (`min_client_size`/`apply_client_size`, `session/daemon.rs`; tmux
+  `window-size smallest`). So every client but the smallest permanently
+  renders a session smaller than its own terminal — a steady state, not a
+  transient. The roaming server (`remote/server.rs`) is by contrast
+  **single-peer**: its `client_size` is one peer's size, not an arbitration.
+- **Geometry travels UP only:** a client reports its size (`Tag::Init` /
+  `Tag::Resize`); nothing ever tells a client the resulting session size.
+  `ServerFrame` carries no dimensions, and `Snapshot` has `rows`/`cols` but is
+  encode-side only, never serialized. So a client sizes its mirror `Terminal`
+  to its own tty — which, with smallest-wins above, is the wrong size. This is
+  the root of the mismatched-size cursor bugs; ADR 0006 + RFC 0012 propose
+  carrying the geometry on the frame.
+- **Two serializers, two contracts** (`posh-term/src/dump.rs`): `dump_vt()`
+  targets a freshly built `Terminal` that MAY BE LARGER than the source, so it
+  must never derive a position from an assumed height; `dump_vt_flat()`
+  targets a REAL tty that may carry mode leftovers, so it emits
+  `DRAWABLE_STATE_RESET` first. Swapping one for the other at a call site is a
+  bug, not a refactor.
+- **Frames are default-on but NOT universal:** frames require BOTH the daemon
+  gate (`POSH_SESSION_FRAMES`, default on; `=0` disables them outright) AND the
+  client advertising `CAP_PROTOCOL_VERSION` in its `Tag::Init` capability table
+  — `is_frame_capable` tests for that specific id, not merely for a table being
+  present. A client without it stays on raw `Tag::Output` even with the gate on
+  (the old-client skew case). `daemon.rs`'s four-way matrix pins all four
+  combinations of daemon-gate × client-caps.
 - **posh-term is pure state:** feed PTY bytes via `Terminal::process`, read
   the screen via `screen()`/`dump_vt()`/`dump_text()`, drain query replies
   via `take_responses()`. `generation()` bumps on every visible change;

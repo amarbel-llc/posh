@@ -66,12 +66,21 @@ relies on fully supported:
   RGB/RGBA/PNG formats, chunked transmission, 320 MB quota, spec ACKs.
 - DCS: DECRQSS, XTGETTCAP; queries: DA1/DA2, DSR, DECRQM, XTVERSION,
   XTWINOPS 14/16/18.
-- Serialization: `dump_text()` (plain text including scrollback) and
-  `dump_vt()` (an escape stream that reconstructs contents, attributes,
-  cursor, modes, title, scroll region, and kitty graphics — images,
-  placements, animation frames — on a real terminal, verified by roundtrip
-  tests). This is what powers session replay on attach and remote state
-  sync.
+- Serialization: `dump_text()` (plain text including scrollback) and two
+  escape-stream forms that reconstruct contents, attributes, cursor, modes,
+  title, scroll region, and kitty graphics — images, placements, animation
+  frames — verified by roundtrip tests. They have **different contracts and
+  are not interchangeable**:
+  - `dump_vt()` targets a freshly constructed `posh_term::Terminal` — the
+    frame codecs build one per apply. That target may be **larger** than the
+    source (see the sizing note under Sessions), so the replay must not
+    depend on the target's height.
+  - `dump_vt_flat()` targets a **real tty** carrying whatever mode state the
+    previous application left behind, so it opens by resetting that state
+    (`DRAWABLE_STATE_RESET`). It draws only the active grid and never
+    switches the target's screen buffers.
+
+  Together these power session replay on attach and remote state sync.
 
 Also implemented: reflow on resize (logical lines rewrap via wrap flags,
 wide-char aware, scrollback included; alt screen truncates/pads like kitty),
