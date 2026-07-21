@@ -164,7 +164,14 @@ _POSH_WEDGE_WATCHDOG_
 	the server's own transport state, which then rides each frame and appears
 	as a trailing _srv=_ field — the server's pid (so a wedged client maps to
 	the exact remote posh-server log), frame number, ack, frames outstanding,
-	terminal generation, and pty-open flag. This is the far side
+	terminal generation, pty-open flag, and an _agent=_ block: _off_ when the
+	server is not forwarding, else its live channel count, the CUMULATIVE
+	channels-opened count, symlink health, and the agent stream's
+	sent/queued/resent byte totals. Two things read out of that block:
+	channels-opened climbing on an idle connection means something is opening
+	agent channels nobody asked for, and _resent_ is what cumulative-only
+	acknowledgement costs — the unacked tail rides every message until acked.
+	*just debug-posh-agent* parses exactly this. This is the far side
 	of a wedge that a remote *posh-server*(1) cannot be *SIGUSR2*'d for
 	directly: server _num_ climbing while the client's _applied_num_ is frozen
 	is an apply-stall, both frozen points at the server or the path. Written

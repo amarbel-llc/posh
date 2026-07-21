@@ -329,7 +329,7 @@ fn agent_debug_summary(st: &ClientState) -> String {
             if a.symlink_ok { "ok" } else { "broken" },
             a.bytes_sent,
             a.bytes_queued,
-            a.bytes_sent.saturating_sub(a.bytes_queued),
+            a.resent(),
         ),
         None if st.last_server_diag.is_some() => {
             "server: endpoint=down (no server-side forwarding, or an older server)".to_string()
@@ -2258,8 +2258,11 @@ fn outgoing_caps(st: &mut ClientState) -> Vec<caps::Cap> {
                 st.agent_stream.pending(),
             );
             // Count what was ACTUALLY encoded, not what was pending (#142).
-            st.agent_stream
-                .mark_sent(data.iter().map(|c| c.payload.len() - 8).sum::<usize>());
+            st.agent_stream.mark_sent(
+                data.iter()
+                    .map(|c| c.payload.len() - caps::AGENT_DATA_OFFSET_LEN)
+                    .sum::<usize>(),
+            );
             extra.extend(data);
             extra.push(caps::encode_agent_ack(st.agent_stream.recv_ack()));
         }

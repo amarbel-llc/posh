@@ -232,7 +232,7 @@ fn fmt_agent_diag(a: Option<&crate::remote::caps::AgentDiag>) -> String {
             a.symlink_ok as u8,
             a.bytes_sent,
             a.bytes_queued,
-            a.bytes_sent.saturating_sub(a.bytes_queued),
+            a.resent(),
         ),
     }
 }

@@ -177,7 +177,13 @@ pub fn decode_scrollback2_ack(payload: &[u8]) -> Result<u8> {
 /// change) leaves the message bodies byte-identical in every negotiation
 /// state, at ~1.2% framing overhead.
 #[allow(dead_code)]
-pub const AGENT_DATA_MAX: usize = u8::MAX as usize - 8; // 247
+pub const AGENT_DATA_MAX: usize = u8::MAX as usize - AGENT_DATA_OFFSET_LEN; // 247
+
+/// Bytes of `u64` big-endian stream offset prefixing every [`CAP_AGENT_DATA`]
+/// payload. Subtract it from an entry's payload length to get the agent bytes
+/// it carries — which is how the senders count what they actually emitted for
+/// the posh#142 telemetry, since a payload is never shorter than this prefix.
+pub const AGENT_DATA_OFFSET_LEN: usize = 8;
 
 /// Max [`CAP_AGENT_DATA`] entries one message carries. The table length is a
 /// `count: u8`, so the whole table (agent data + protocol version + scrollback +
@@ -406,6 +412,19 @@ pub struct AgentDiag {
     /// the difference is the retransmission overhead a selective ack would avoid
     /// (posh#142). Equal values mean nothing was ever re-sent.
     pub bytes_queued: u64,
+}
+
+impl AgentDiag {
+    /// Agent bytes put on the wire that the peer had already been sent — what
+    /// cumulative-only acknowledgement has cost (posh#142).
+    ///
+    /// The saturation is load-bearing, not defensive dressing: bytes can be
+    /// QUEUED and never emitted (a connection that dies before its next
+    /// message), which makes `queued` exceed `sent`. Nothing was re-sent in that
+    /// case, and zero is the honest answer.
+    pub fn resent(&self) -> u64 {
+        self.bytes_sent.saturating_sub(self.bytes_queued)
+    }
 }
 
 /// Versioned by length. The 29-byte transport core is current_num | acked_num |

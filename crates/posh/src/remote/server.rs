@@ -1218,10 +1218,12 @@ pub(crate) fn server_loop(
                             agent_stream.pending(),
                         );
                         // Count what was ACTUALLY encoded, not what was pending:
-                        // `encode_agent_data` truncates at MAX_AGENT_DATA_CAPS,
-                        // and each entry carries an 8-byte offset prefix (#142).
-                        agent_stream
-                            .mark_sent(data.iter().map(|c| c.payload.len() - 8).sum::<usize>());
+                        // `encode_agent_data` truncates at MAX_AGENT_DATA_CAPS (#142).
+                        agent_stream.mark_sent(
+                            data.iter()
+                                .map(|c| c.payload.len() - caps::AGENT_DATA_OFFSET_LEN)
+                                .sum::<usize>(),
+                        );
                         extras.extend(data);
                         extras.push(caps::encode_agent_ack(agent_stream.recv_ack()));
                     }
