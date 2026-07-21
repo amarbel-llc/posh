@@ -5,8 +5,10 @@
     # Fork of upstream nixpkgs with the amarbel-llc package additions
     # (the eng fleet's cached overlay). See eng-nix(7) THE NIXPKGS-MASTER
     # INPUT and eng-versioning(7).
-    igloo.url = "github:amarbel-llc/igloo";
+    igloo.url = "https://code.linenisgreat.com/igloo/archive/master.tar.gz";
+    igloo.inputs.nixpkgs-master.follows = "nixpkgs-master";
     utils.url = "https://flakehub.com/f/numtide/flake-utils/0.1.102";
+    utils.inputs.systems.follows = "igloo/systems";
     nixpkgs-master.url = "github:NixOS/nixpkgs/567a49d1913ce81ac6e9582e3553dd90a955875f";
 
     # conformist — the linter+formatter multiplexer (treefmt successor, RFC
@@ -15,7 +17,7 @@
     # its igloo/nixpkgs-master/utils pins keeps this flake's closure shared
     # with conformist's. See conformist(7), conformist-nix(7).
     conformist = {
-      url = "github:amarbel-llc/conformist";
+      url = "https://code.linenisgreat.com/conformist/archive/master.tar.gz";
       inputs.igloo.follows = "igloo";
       inputs.nixpkgs-master.follows = "nixpkgs-master";
       inputs.utils.follows = "utils";
