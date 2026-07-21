@@ -1357,6 +1357,78 @@ debug-posh-log-loss target rt="40" out="8":
       END { printf "(max retransmit jump = +%d at line %d, ts %d)\n", maxdr+0, maxln+0, maxts+0 }
     ' "$f"
 
+# Read the forwarded-agent health out of a posh CLIENT log: the two things the
+# agent telemetry answers that nothing else does.
+#
+#   1. SPURIOUS CHANNELS (posh#147). `opened` is cumulative — every agent channel
+#      ever accepted. On an idle connection it MUST NOT move. Growth with no
+#      `git push`/`ssh` in that window means something is opening channels that
+#      nobody asked for, which reports to the user as agent use and eats the
+#      notice's rate limit. This is exactly the bug that ran for months in
+#      shipped telemetry because nothing printed it.
+#   2. RETRANSMISSION COST (posh#142). `resent` is agent bytes put on the wire
+#      that the peer had already been sent: the unacked tail rides EVERY message
+#      until acked, so cumulative-only acknowledgement's real cost is this
+#      number, not an argument from first principles. A resent share near 0%
+#      says selective acks would buy nothing on this path; a large one is the
+#      evidence for adding them.
+#
+# Needs records carrying the server's agent block, i.e. client dumps (SIGUSR2 /
+# `just debug-posh-dump`, or the palette's agent info) taken while forwarding was
+# active. Read-only.
+# Usage: just debug-posh-agent 12345 [idle_open_warn]
+[group("debug")]
+debug-posh-agent target warn="1":
+    #!/usr/bin/env bash
+    set -euo pipefail
+    t='{{ target }}'
+    if [ -f "$t" ]; then
+      f="$t"
+    else
+      uid="$(id -u)"
+      base="${POSH_DIR:-${XDG_RUNTIME_DIR:-/run/user/$uid}/posh}"
+      f="$base/posh-client-$t.log"
+      [ -f "$f" ] || f="$base/posh-server-$t.log"
+    fi
+    [ -f "$f" ] || { echo "no log for '$t' (tried it as a path, then posh-{client,server}-$t.log under $base)" >&2; exit 1; }
+    echo ">> $f"
+    awk -v warn='{{ warn }}' '
+      substr($0,1,1) == "[" && /agent=\(/ {
+        rb = index($0, "]"); ts = substr($0, 2, rb-2) + 0
+        ch=""; op=""; sent=""; queued=""; res=""
+        for (i=1;i<=NF;i++) {
+          g = $i; gsub(/[()]/, "", g)
+          if (g ~ /^agent=chans=/) ch = substr(g,13)+0
+          else if (g ~ /^opened=/)  op = substr(g,8)+0
+          else if (g ~ /^sent=/)    sent = substr(g,6)+0
+          else if (g ~ /^queued=/)  queued = substr(g,8)+0
+          else if (g ~ /^resent=/)  res = substr(g,8)+0
+        }
+        if (op == "") next
+        n++
+        if (!have) { firstTs=ts; firstOp=op; have=1 }
+        # prevSet, not have: the first record has nothing to diff against, and
+        # comparing against an unset prevOp reports the whole count as a jump.
+        if (prevSet && op - prevOp >= warn && prevCh == 0 && ch == 0) {
+          printf "L%d ts=%d opened +%d with NO live channel either side -- spurious?\n", \
+                 NR, ts, op - prevOp
+        }
+        prevOp=op; prevCh=ch; prevSet=1
+        lastTs=ts; lastOp=op; lastSent=sent; lastQ=queued; lastRes=res
+      }
+      END {
+        if (!have) { print "(no agent records -- forwarding off, or the log predates the agent block)"; exit }
+        span = lastTs - firstTs
+        printf "records=%d span=%dms channels_opened=%d (+%d over the log)\n", \
+               n, span, lastOp+0, lastOp-firstOp
+        if (span > 0) printf "  open rate = %.2f/min\n", (lastOp-firstOp) * 60000.0 / span
+        printf "agent bytes: sent=%d queued=%d resent=%d", lastSent+0, lastQ+0, lastRes+0
+        if (lastSent+0 > 0) printf "  (%.1f%% resent)", 100.0 * lastRes / lastSent
+        printf "\n"
+        if (lastRes+0 == 0) print "  => cumulative-only ack has cost this connection NOTHING (posh#142)"
+      }
+    ' "$f"
+
 # Explain a high posh retransmit rate by probing the underlying network path: is
 # the Tailscale link to a roaming peer DIRECT or DERP-relayed, and what's its real
 # latency/loss? `tailscale ping` reports `via DERP(region)` vs `via <ip>:<port>`

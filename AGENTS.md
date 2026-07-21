@@ -218,6 +218,14 @@ read-only, `debug` group):
   jumps between records = a wedge/no-paint freeze); `-loss` finds transport
   BLACKOUTS (bursts in the cumulative `retransmit` counter + `outstanding`
   pile-up). Use these to triage a freeze AFTER the fact from the log alone.
+- `just debug-posh-agent <pid|log>` — read forwarded-agent health out of a
+  client log. Two things nothing else surfaces: `channels_opened` is cumulative,
+  so growth on an IDLE connection means something is opening agent channels
+  nobody asked for (posh#147 — which ran unnoticed in shipped telemetry because
+  nothing printed it); and `resent` is agent bytes re-sent because the unacked
+  tail rides every message until acked, i.e. what cumulative-only ack actually
+  costs (posh#142). Needs client dumps taken while forwarding was active
+  (`debug-posh-dump`, or the palette's agent info).
 - `just debug-posh-net <peer-100.x>` / `debug-posh-pathloss <peer-100.x>` —
   explain a high `retransmit` rate by probing the network path: direct vs
   DERP-relayed Tailscale link, real ICMP loss/latency, socket drop counters,

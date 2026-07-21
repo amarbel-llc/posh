@@ -199,8 +199,40 @@ fn fmt_server_diag(d: Option<&crate::remote::caps::ServerDiag>) -> String {
     match d {
         None => "none".to_string(),
         Some(d) => format!(
-            "(pid={} num={} acked={} gen={} out={} pty={})",
-            d.pid, d.current_num, d.acked_num, d.term_gen, d.outstanding, d.pty_open as u8,
+            "(pid={} num={} acked={} gen={} out={} pty={} agent={})",
+            d.pid,
+            d.current_num,
+            d.acked_num,
+            d.term_gen,
+            d.outstanding,
+            d.pty_open as u8,
+            fmt_agent_diag(d.agent.as_ref()),
+        ),
+    }
+}
+
+/// The server's agent-forwarding state for the dump (FDR 0004, posh#142). Two
+/// things are readable here that nothing else exposes outside the process:
+///
+/// - `opened` is the CUMULATIVE channel count. On an idle connection it must not
+///   move; a value climbing with no agent use is a spurious-open regression
+///   (posh#147, which was visible in this very telemetry the whole time and went
+///   unread for want of anyone printing it).
+/// - `resent` is what cumulative-only acknowledgement has cost: bytes put on the
+///   wire that the peer had already been sent (posh#142). Zero means it has cost
+///   this connection nothing.
+fn fmt_agent_diag(a: Option<&crate::remote::caps::AgentDiag>) -> String {
+    match a {
+        None => "off".to_string(),
+        Some(a) => format!(
+            "(chans={} opened={} symlink={} sent={} queued={} resent={})",
+            a.live_channels,
+            // ids start at 1 and never repeat, so next-1 is "ever opened".
+            a.next_channel_id.saturating_sub(1),
+            a.symlink_ok as u8,
+            a.bytes_sent,
+            a.bytes_queued,
+            a.bytes_sent.saturating_sub(a.bytes_queued),
         ),
     }
 }
@@ -492,11 +524,70 @@ mod tests {
             "title=\"user@host: ~/work\"",
             "apply(adv=0 stale=0 dup=0 basemis=7 bsum_mis=0 reack=0 nochange=0 sb_rx=0)",
             "last_rx(num=41 base=40 body=diff)",
-            "srv=(pid=4242 num=43 acked=41 gen=90 out=2 pty=1)",
+            // `agent=off` is the forwarding-disabled rendering; see
+            // `client_format_renders_the_agent_counters` for the live shape.
+            "srv=(pid=4242 num=43 acked=41 gen=90 out=2 pty=1 agent=off)",
             "link(late=1 gap_max=8000ms late_gaps=2 rx_total=120 heartbeats=30 retransmits=4)",
         ] {
             assert!(line.contains(key), "missing {key:?} in:\n{line}");
         }
+    }
+
+    // posh#142/#147: the dump is the only way to read the forwarded-agent
+    // counters from outside a running process, and `just debug-posh-agent`
+    // parses exactly this shape. `opened` is next_channel_id - 1 (ids start at
+    // 1), so it reads as "channels ever opened" — the number whose growth on an
+    // idle connection is the #147 signature. `resent` is sent - queued, the
+    // cost of cumulative-only acknowledgement.
+    #[test]
+    fn client_format_renders_the_agent_counters() {
+        let mut st = ClientState {
+            remote: None,
+            last_send_age_ms: None,
+            last_heard_age_ms: 0,
+            applied_num: 0,
+            outbox_base: 0,
+            outbox_pending: 0,
+            scrollback_len: 0,
+            srtt: 0.0,
+            rto: 0,
+            send_interval: 0,
+            bytes_rx: 0,
+            bytes_tx: 0,
+            predict_active: false,
+            predict_shown: 0,
+            predict_epoch_lag: 0,
+            term_gen: 0,
+            rows: 24,
+            cols: 80,
+            echo_on: false,
+            codec: "dumpdiff",
+            title: String::new(),
+            apply: crate::remote::stats::ApplySnapshot::default(),
+            link: crate::remote::stats::LinkSnapshot::default(),
+            server_late: false,
+            server_diag: None,
+        };
+        st.server_diag = Some(crate::remote::caps::ServerDiag {
+            current_num: 43,
+            acked_num: 41,
+            term_gen: 90,
+            outstanding: 2,
+            pty_open: true,
+            pid: 4242,
+            agent: Some(crate::remote::caps::AgentDiag {
+                live_channels: 2,
+                next_channel_id: 8,
+                symlink_ok: true,
+                bytes_sent: 900,
+                bytes_queued: 600,
+            }),
+        });
+        let line = st.format();
+        assert!(
+            line.contains("agent=(chans=2 opened=7 symlink=1 sent=900 queued=600 resent=300)"),
+            "agent block not rendered as debug-posh-agent expects:\n{line}"
+        );
     }
 
     #[test]
