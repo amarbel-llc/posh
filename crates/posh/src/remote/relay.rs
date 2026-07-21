@@ -111,7 +111,12 @@ fn content_caps(client_caps: &[Cap]) -> Vec<Cap> {
 /// advertises the endpoint so the client may begin; the `CAP_AGENT_DATA` chunks +
 /// `CAP_AGENT_ACK` are emitted only once the client has advertised back
 /// (`agent_seen`), never before (RFC 0001). Empty when forwarding is inactive.
-fn agent_caps(stream: &AgentStream, agent_seen: bool, has_endpoint: bool) -> Vec<Cap> {
+/// Takes `&mut` solely to record what it emitted into the stream's posh#142
+/// counters — the relay is a third encode site beside `server.rs` and
+/// `client.rs`, and an uninstrumented one would report `sent=0` while `queued`
+/// grew, i.e. "nothing on the wire" for a connection actively carrying agent
+/// traffic. Wrong in the safe direction, but still wrong.
+fn agent_caps(stream: &mut AgentStream, agent_seen: bool, has_endpoint: bool) -> Vec<Cap> {
     let mut extras = Vec::new();
     if has_endpoint {
         extras.push(Cap {
@@ -119,7 +124,13 @@ fn agent_caps(stream: &AgentStream, agent_seen: bool, has_endpoint: bool) -> Vec
             payload: vec![],
         });
         if agent_seen {
-            extras.extend(caps::encode_agent_data(stream.send_base(), stream.pending()));
+            let data = caps::encode_agent_data(stream.send_base(), stream.pending());
+            stream.mark_sent(
+                data.iter()
+                    .map(|c| c.payload.len() - caps::AGENT_DATA_OFFSET_LEN)
+                    .sum::<usize>(),
+            );
+            extras.extend(data);
             extras.push(caps::encode_agent_ack(stream.recv_ack()));
         }
     }
@@ -564,7 +575,7 @@ fn relay_loop(
             &mut fragmenter,
             link.frame_offset,
             &inbox,
-            &agent_stream,
+            &mut agent_stream,
             agent_seen,
             agent.is_some(),
             &mut held,
@@ -789,7 +800,7 @@ fn relay_loop(
                                     &mut fragmenter,
                                     link.frame_offset,
                                     &inbox,
-                                    &agent_stream,
+                                    &mut agent_stream,
                                     agent_seen,
                                     agent.is_some(),
                                     &mut held,
@@ -863,7 +874,7 @@ fn relay_loop(
         // current agent caps (Task 3.2) so AGENT_FORWARD stays advertised and pending
         // AGENT_DATA/ACK flow even while the screen is idle. A fresh daemon frame this
         // iteration already stamped both clocks to `now`.
-        let out_agent_caps = agent_caps(&agent_stream, agent_seen, agent.is_some());
+        let out_agent_caps = agent_caps(&mut agent_stream, agent_seen, agent.is_some());
         if conn.has_remote() {
             // Recompute the pending flag LIVE here (like `held.is_held()`), not from
             // the pre-poll snapshot used to size the timeout: this iteration's
@@ -947,7 +958,8 @@ fn forward_daemon_frame(
     fragmenter: &mut Fragmenter,
     frame_offset: u64,
     inbox: &InputInbox,
-    agent_stream: &AgentStream,
+    // `&mut` for the posh#142 send counters; see `agent_caps`.
+    agent_stream: &mut AgentStream,
     agent_seen: bool,
     has_agent: bool,
     held: &mut HeldFrame,
@@ -2092,10 +2104,10 @@ mod tests {
         });
 
         // No endpoint: no agent caps at all, even if the peer was seen.
-        assert!(agent_caps(&stream, true, false).is_empty());
+        assert!(agent_caps(&mut stream, true, false).is_empty());
 
         // Endpoint up, peer not yet seen: advertise FORWARD, withhold DATA/ACK.
-        let before = agent_caps(&stream, false, true);
+        let before = agent_caps(&mut stream, false, true);
         assert!(caps::find(&before, CAP_AGENT_FORWARD).is_some());
         assert!(
             caps::find(&before, CAP_AGENT_DATA).is_none(),
@@ -2104,7 +2116,7 @@ mod tests {
         assert!(caps::find(&before, CAP_AGENT_ACK).is_none());
 
         // Peer seen: FORWARD + the pending DATA + the ACK.
-        let after = agent_caps(&stream, true, true);
+        let after = agent_caps(&mut stream, true, true);
         assert!(caps::find(&after, CAP_AGENT_FORWARD).is_some());
         assert!(
             caps::find(&after, CAP_AGENT_DATA).is_some(),
