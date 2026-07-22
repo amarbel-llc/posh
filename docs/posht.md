@@ -14,7 +14,7 @@ pipeline — remote pty → posh-term emulation → transport sync → attach
 replay → your local terminal → your eyes. That last hop is exactly what
 the manual smoke pass in [`manual-testing.md`](manual-testing.md) covers
 today with ad-hoc shell probes, and what gates closing
-[#34](https://github.com/amarbel-llc/posh/issues/34).
+[#34](https://code.linenisgreat.com/posh/issues/34).
 
 POSHT turns that ad-hoc pass into a guided, repeatable checklist with a
 machine-readable verdict at the end. Because it's a single static binary,
@@ -46,7 +46,7 @@ requested) maps to the capability inventory of `crates/posh-term`:
 | wide | CJK/emoji double-width alignment | `wcwidth.rs` |
 | combining | combining marks stack onto one cell | `cell.rs` extras |
 | boxdraw | DEC special graphics ESC ( 0 | `terminal.rs` charsets |
-| wrap | deferred wrap / pending-wrap at last column | `terminal.rs` pending_wrap; cf. [#2](https://github.com/amarbel-llc/posh/issues/2) |
+| wrap | deferred wrap / pending-wrap at last column | `terminal.rs` pending_wrap; cf. [#2](https://code.linenisgreat.com/posh/issues/2) |
 | scrollregion | DECSTBM margins | `csi.rs` DECSTBM |
 | cursor | DECSCUSR six shapes | `csi.rs` cursor styles |
 | mouse | all-motion + SGR reporting, wheel | `mouse.rs`, modes 1000–1006 |
@@ -55,9 +55,9 @@ requested) maps to the capability inventory of `crates/posh-term`:
 | resize | SIGWINCH propagation | winsize plumbing |
 | title | OSC 0/2 | `osc.rs` |
 | hyperlink | OSC 8 | `osc.rs` |
-| clipboard | OSC 52 | `osc.rs`; known remote gap [#27](https://github.com/amarbel-llc/posh/issues/27) |
-| bell | BEL | known remote gap [#27](https://github.com/amarbel-llc/posh/issues/27) |
-| graphics | kitty APC G inline image | `graphics.rs`; known remote gap [#29](https://github.com/amarbel-llc/posh/issues/29) |
+| clipboard | OSC 52 | `osc.rs`; known remote gap [#27](https://code.linenisgreat.com/posh/issues/27) |
+| bell | BEL | known remote gap [#27](https://code.linenisgreat.com/posh/issues/27) |
+| graphics | kitty APC G inline image | `graphics.rs`; known remote gap [#29](https://code.linenisgreat.com/posh/issues/29) |
 
 Tests carrying a known posh gap say so on screen, so a fail there is
 recorded but not mistaken for a new bug (mirrors the "known gaps — do not
@@ -157,5 +157,5 @@ not be the thing rendering the test.
 - **Kitty keyboard protocol coverage**: posh-term implements the
   progressive-enhancement stack (`kitty_keys.rs`), but Bubble Tea v1
   doesn't enable it; the `keys` test exercises legacy encoding only.
-- **zsh-style session/host completion tie-in** ([#37](https://github.com/amarbel-llc/posh/issues/37))
+- **zsh-style session/host completion tie-in** ([#37](https://code.linenisgreat.com/posh/issues/37))
   is unrelated plumbing but shares the "cheap remote query" question.

@@ -1,13 +1,13 @@
 # Manual test plan: posh (Rust rewrite)
 
 Hands-on smoke pass for the merged rewrite (Waves A–C of the
-[#34](https://github.com/amarbel-llc/posh/issues/34) campaign). Follow
+[#34](https://code.linenisgreat.com/posh/issues/34) campaign). Follow
 top-to-bottom on a fresh clone; each section ends with what you should see.
 
 ## 0. Build
 
 posh is the flake's default package
-([#33](https://github.com/amarbel-llc/posh/issues/33)):
+([#33](https://code.linenisgreat.com/posh/issues/33)):
 
 ```sh
 nix build                 # or: just build-rust
@@ -203,7 +203,7 @@ just debug-posh-procs            # or: pgrep -af posh-server; pgrep -af 'posh at
 None currently. The Wave D/E gaps that used to live here — wheel scroll
 (#28), remote suspend (#30), BEL/OSC 52 forwarding (#27), kitty graphics
 over remote (#29), connect diagnostics (#31) — were all fixed as of
-2026-06-10 ([#34](https://github.com/amarbel-llc/posh/issues/34)). A
+2026-06-10 ([#34](https://code.linenisgreat.com/posh/issues/34)). A
 failure in any of those areas is a regression: file it.
 
 For a guided capability pass (instead of ad-hoc probes), run
