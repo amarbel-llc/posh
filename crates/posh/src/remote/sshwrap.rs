@@ -197,7 +197,19 @@ fn forwarded_env_vars() -> Vec<(String, String)> {
         .collect()
 }
 
-pub fn run(target: &str, remote_cmd: &[String], opts: &SshOptions) -> Result<()> {
+/// Drives the ssh bootstrap for a `posh-server` invocation and parses its
+/// `POSH IP`/`POSH CONNECT` report: returns `(host, port, key)` for the
+/// caller to stand up its own UDP connection. Factored from [`run`] so the
+/// mux daemon (M1 Task 3) can bootstrap the agent-only remote
+/// (`posh-server agent`, via a `["agent", "--client-id", ..]` tail with
+/// `channels: true`) without inheriting the foreground client that `run`
+/// chains into. The key is returned, never exported — only `run`'s
+/// foreground path uses the `POSH_KEY` env convention.
+pub fn bootstrap(
+    target: &str,
+    remote_cmd: &[String],
+    opts: &SshOptions,
+) -> Result<(String, u16, String)> {
     let server_cmd = remote_command(opts, remote_cmd, &forwarded_env_vars());
 
     let mut ssh = Command::new("ssh");
@@ -255,6 +267,11 @@ pub fn run(target: &str, remote_cmd: &[String], opts: &SshOptions) -> Result<()>
     // resolving the hostname we dialed, as mosh.pl does.
     let fallback = target.rsplit('@').next().unwrap_or(target).to_string();
     let host = report.ip.unwrap_or(fallback);
+    Ok((host, port, key))
+}
+
+pub fn run(target: &str, remote_cmd: &[String], opts: &SshOptions) -> Result<()> {
+    let (host, port, key) = bootstrap(target, remote_cmd, opts)?;
     std::env::set_var("POSH_KEY", key);
     crate::remote::client::run(&host, port, opts.family, opts.agent_source.clone(), opts.channels)
 }

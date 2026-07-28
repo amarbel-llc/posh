@@ -637,7 +637,9 @@ pub fn run(
     }
 }
 
-fn resolve(host: &str, port: u16, family: Family) -> Result<SocketAddr> {
+/// `pub(crate)` so the mux daemon (remote::mux, M1 Task 3) resolves its
+/// bootstrap-reported host through the same system-then-tailnet path.
+pub(crate) fn resolve(host: &str, port: u16, family: Family) -> Result<SocketAddr> {
     // System resolver first — this honors Tailscale MagicDNS when tailscaled
     // has wired it into the resolver (the default on most hosts).
     let addrs: Vec<SocketAddr> = (host, port)

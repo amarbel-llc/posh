@@ -191,7 +191,7 @@ pub fn run_agent_only(
 /// keeps the session, an agent-only connection with a never-returning peer
 /// has nothing left to serve) or on a terminating signal — both paths return
 /// normally so the endpoint's Drop runs.
-fn agent_only_loop(
+pub(crate) fn agent_only_loop(
     mut conn: Connection,
     mut endpoint: crate::remote::agent::AgentEndpoint,
     peer_timeout: u64,
