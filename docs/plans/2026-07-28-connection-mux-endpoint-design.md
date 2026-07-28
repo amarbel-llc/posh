@@ -105,7 +105,8 @@ new tags in the mux socket's own tag space:
   the ssh bootstrap and holds the connection. Invocations proceed against
   their own connections (M1) as today, minus agent forwarding.
 - Linger: after the last `MuxSessionRef` drops, the endpoint keeps the
-  connection `POSH_MUX_PERSIST` (default 60 s) for fast re-attach, with agent
+  connection `POSH_MUX_PERSIST` (proposed default 60 s — open question 2) for
+  fast re-attach, with agent
   service OFF during the window (the FDR 0014 M1 policy). Then it closes the
   connection and exits. `POSH_MUX_PERSIST=0` disables lingering.
 - Crash/blast radius: an M1 mux crash loses agent forwarding to that
@@ -148,8 +149,9 @@ new tags in the mux socket's own tag space:
   directions.
 - Key lifetime: the mux connection lives longer than any session connection
   today, which is what elevates the rekey/forward-secrecy gap (posh#145,
-  gated on posh#146). M1 does not wait on it, but the linger default stays
-  conservative (minutes, not days) until rekey exists.
+  gated on posh#146). M1 does not wait on it, but whatever linger default
+  open question 2 settles on stays conservative (minutes, not days) until
+  rekey exists.
 
 ## Open questions (for review, not blockers to M1 build-out)
 
