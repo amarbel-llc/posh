@@ -638,11 +638,6 @@ struct Tombstone {
 /// out as records ([`on_instruction`](Self::on_instruction)), and
 /// [`outgoing`](Self::outgoing) drains what is due — fresh state promptly,
 /// unacked tails on the caller's RTO cadence.
-// The `#[allow(dead_code)]` markers below follow the module's established
-// pattern (see the sync.rs record codec): the type lands fully
-// conformance-tested ahead of its non-test callers — the server/client loop
-// wiring in this same task's later commits.
-#[allow(dead_code)]
 pub struct AgentChannelMux {
     role: Role,
     alloc: ChannelAllocator,
@@ -652,7 +647,6 @@ pub struct AgentChannelMux {
     closed: Vec<Tombstone>,
 }
 
-#[allow(dead_code)]
 impl AgentChannelMux {
     /// The opener end (§3.2: `agent` channels are server-initiated).
     pub fn new_server() -> AgentChannelMux {
@@ -921,7 +915,6 @@ impl AgentChannelMux {
 /// `session` instruction (if any) precedes bulk `agent` data, so a keystroke
 /// frame never waits behind an agent burst. Payloads are unsealed; the
 /// caller wraps each in the §2 envelope for its channel and fragments.
-#[allow(dead_code)] // consumers land with the loop wiring (same task, later commit)
 pub fn iteration_sends(
     session: Option<Vec<u8>>,
     mux: Option<&mut AgentChannelMux>,

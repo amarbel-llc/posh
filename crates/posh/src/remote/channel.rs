@@ -18,8 +18,6 @@ pub const ENVELOPE_LEN: usize = 9;
 
 /// §3.2: channel kinds.
 pub const KIND_SESSION: u8 = 0;
-// Consumed by the wire-increment plan's Task 5 (agent channels).
-#[allow(dead_code)]
 pub const KIND_AGENT: u8 = 1;
 
 /// §3.2/§3.3: the single client-initiated `session` channel this increment
@@ -34,12 +32,11 @@ pub const SESSION_CHANNEL: ChannelId = ChannelId::new(false, KIND_SESSION, 1);
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
 pub struct ChannelId(pub u64);
 
-// The accessors and CONTROL gain their non-test consumers with the agent
-// channels (wire-increment plan Task 5); Task 4 needs only `new` (via
-// SESSION_CHANNEL) and whole-identifier equality.
-#[allow(dead_code)]
 impl ChannelId {
-    /// §3.1: reserved for connection-level control; never carries data.
+    /// §3.1: reserved for connection-level control; never carries data. No
+    /// control messages are defined yet, so only the conformance tests name
+    /// it — the receive gates reject it via `is_data()`.
+    #[allow(dead_code)]
     pub const CONTROL: ChannelId = ChannelId(0);
 
     pub const fn new(server_initiated: bool, kind: u8, ordinal: u64) -> ChannelId {
@@ -65,9 +62,6 @@ impl ChannelId {
 }
 
 /// The role a peer allocates identifiers for (§3.1: only its own space).
-// Task 5 consumer (agent channels): this increment's single session channel
-// is a fixed identifier, so nothing allocates yet.
-#[allow(dead_code)]
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
 pub enum Role {
     Client,
@@ -75,13 +69,11 @@ pub enum Role {
 }
 
 /// §3.1: per-(initiator, kind) monotonic ordinal allocation starting at 1.
-#[allow(dead_code)] // Task 5 consumer (agent channels)
 pub struct ChannelAllocator {
     role: Role,
     next_ordinal: [u64; 128],
 }
 
-#[allow(dead_code)] // Task 5 consumer (agent channels)
 impl ChannelAllocator {
     pub fn new(role: Role) -> ChannelAllocator {
         ChannelAllocator {
@@ -200,19 +192,12 @@ pub fn open_instruction(enveloped: bool, payload: &[u8]) -> Option<&[u8]> {
     }
 }
 
-// The §5 agent payload codec below gains its non-test consumers with the
-// agent channels (wire-increment plan Task 5).
 /// §5 agent-channel payload flag bits.
-#[allow(dead_code)]
 pub const AGENT_FLAG_OPEN: u8 = 0x01;
-#[allow(dead_code)]
 pub const AGENT_FLAG_CLOSE: u8 = 0x02;
-#[allow(dead_code)]
 pub const AGENT_FLAG_FAIL: u8 = 0x04;
-#[allow(dead_code)]
 const AGENT_FLAGS_KNOWN: u8 = AGENT_FLAG_OPEN | AGENT_FLAG_CLOSE | AGENT_FLAG_FAIL;
 /// §5 header: flags u8 + send_base u64 LE + recv_ack u64 LE.
-#[allow(dead_code)]
 pub const AGENT_PAYLOAD_HEADER_LEN: usize = 17;
 
 /// §4.1 sender discipline: cap one `agent` instruction's data so no session
@@ -225,7 +210,6 @@ pub const AGENT_INSTRUCTION_DATA_MAX: usize = 32 * 1024;
 /// §5: the payload of one `agent` channel instruction. `send_base` is the
 /// offset of `data`'s first byte in this channel's cumulative outbound
 /// stream; `recv_ack` cumulatively acknowledges the peer's stream.
-#[allow(dead_code)] // Task 5 consumer (agent channels)
 #[derive(Clone, PartialEq, Eq, Debug)]
 pub struct AgentPayload {
     pub flags: u8,
@@ -234,7 +218,6 @@ pub struct AgentPayload {
     pub data: Vec<u8>,
 }
 
-#[allow(dead_code)] // Task 5 consumer (agent channels)
 impl AgentPayload {
     pub fn encode(&self) -> Vec<u8> {
         let mut out = Vec::with_capacity(AGENT_PAYLOAD_HEADER_LEN + self.data.len());

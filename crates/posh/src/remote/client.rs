@@ -830,6 +830,11 @@ struct ClientState {
     agent: Option<crate::remote::agent::AgentClient>,
     agent_stream: sync::AgentStream,
     agent_seen: bool,
+    /// RFC 0011 §5: on ENVELOPED connections agent traffic rides per-channel
+    /// `agent`-kind instructions through this adapter instead of the retired
+    /// CAP_AGENT_* entries (§7). `Some` iff enveloped AND forwarding is on;
+    /// baseline connections keep the capability path bit-for-bit.
+    agent_mux: Option<crate::remote::agent::AgentChannelMux>,
     /// Per-request agent-use notice (FDR 0004; #96): the rate-limited banner
     /// shown when a forwarded-agent channel opens. `Some` only when forwarding
     /// is active (it rides on the proxy and owns the host name it reports).
@@ -930,6 +935,9 @@ fn client_loop(
         agent_notice: agent_source
             .as_ref()
             .map(|_| crate::remote::agent::AgentNotice::from_env(host)),
+        // RFC 0011 §5: the enveloped carriage for the proxy's channels.
+        agent_mux: (enveloped && agent_source.is_some())
+            .then(crate::remote::agent::AgentChannelMux::new_client),
         agent: agent_source.map(crate::remote::agent::AgentClient::new),
         agent_stream: sync::AgentStream::new(),
         agent_seen: false,
@@ -995,6 +1003,15 @@ fn drive_client(st: &mut ClientState, raw: &RawMode, port: u16) -> Result<i32> {
         if !heard {
             // Pre-contact: tick for the 250ms hint / connect timeout.
             deadline = deadline.min(now + 250);
+        }
+        // RFC 0011 §5: wake in time for the agent mux's fresh sends and RTO
+        // retransmissions even with no fd activity.
+        if let Some(d) = st
+            .agent_mux
+            .as_ref()
+            .and_then(|m| m.next_deadline(st.conn.rto()))
+        {
+            deadline = deadline.min(d.max(now));
         }
         let timeout = deadline.saturating_sub(now).min(1000) as i32;
 
@@ -1125,8 +1142,10 @@ fn drive_client(st: &mut ClientState, raw: &RawMode, port: u16) -> Result<i32> {
                         };
                         // RFC 0011 §2/§3.2 (enveloped mode only): a malformed
                         // envelope or a foreign channel discards the
-                        // instruction, never the connection.
-                        let Some(message) = channel::open_instruction(st.enveloped, &assembled)
+                        // instruction, never the connection. Admitted
+                        // instructions dispatch by channel kind.
+                        let Some((chan, message)) =
+                            channel::open_any_instruction(st.enveloped, &assembled)
                         else {
                             util::log_write(
                                 "warn",
@@ -1134,6 +1153,10 @@ fn drive_client(st: &mut ClientState, raw: &RawMode, port: u16) -> Result<i32> {
                             );
                             continue;
                         };
+                        if chan.kind() == channel::KIND_AGENT {
+                            handle_agent_instruction(st, chan, message);
+                            continue;
+                        }
                         let Ok(frame) = ServerFrame::decode(message) else {
                             continue;
                         };
@@ -1156,16 +1179,25 @@ fn drive_client(st: &mut ClientState, raw: &RawMode, port: u16) -> Result<i32> {
         }
 
         // Agent-forwarding channels (FDR 0004): read local-agent reply bytes
-        // and frame them onto the outbound agent stream. `read_channels` scans
+        // and frame them onto the outbound carriage. `read_channels` scans
         // every channel, so a single signalled agent fd drives it.
         if agent_base != usize::MAX {
             if let Some(agent) = st.agent.as_mut() {
                 let readable = (agent_base..agent_base + agent_count)
                     .any(|i| fds[i].revents & (libc::POLLIN | libc::POLLHUP | libc::POLLERR) != 0);
                 if readable {
-                    for rec in agent.read_channels() {
-                        st.agent_stream.send(&rec);
-                        send_now = true; // flush agent chunks promptly (design §2)
+                    let recs = agent.read_channels();
+                    match st.agent_mux.as_mut() {
+                        // Enveloped (RFC 0011 §5): onto the per-channel
+                        // outboxes; the §4.1-ordered send below ships them
+                        // this iteration.
+                        Some(mux) => mux.queue_records(&recs),
+                        None => {
+                            for rec in recs {
+                                st.agent_stream.send(&rec);
+                                send_now = true; // flush agent chunks promptly (design §2)
+                            }
+                        }
                     }
                 }
             }
@@ -1264,12 +1296,28 @@ fn drive_client(st: &mut ClientState, raw: &RawMode, port: u16) -> Result<i32> {
             st.conn.bytes_tx(),
         );
 
-        if send_now
+        let session_due = send_now
             || ((!st.outbox.is_empty() || st.flags != 0)
                 && now.saturating_sub(st.last_send) >= st.conn.rto())
-            || now.saturating_sub(st.last_send) >= HEARTBEAT_INTERVAL
-        {
-            send_message(st);
+            || now.saturating_sub(st.last_send) >= HEARTBEAT_INTERVAL;
+        // RFC 0011 §4.1 sender discipline: the pending session message (if
+        // one is due) goes first, then the agent mux's instructions — which
+        // also flow on message-less iterations. Baseline mode has no mux, so
+        // this reduces to exactly the old send_message call.
+        let session = session_due.then(|| encode_message(st));
+        for (chan, payload) in crate::remote::agent::iteration_sends(
+            session,
+            st.agent_mux.as_mut(),
+            now,
+            st.conn.rto(),
+        ) {
+            let wire = channel::seal_on(st.enveloped, chan, &payload);
+            for frag in st
+                .fragmenter
+                .make_fragments(&wire, sync::FRAGMENT_CONTENTS_MAX)
+            {
+                let _ = st.conn.send(&frag.to_bytes());
+            }
         }
 
         if st.shutdown_seen {
@@ -1520,13 +1568,61 @@ fn process_user_input(st: &mut ClientState, buf: &[u8]) -> bool {
     dirty
 }
 
+/// Applies one inbound `agent`-channel instruction (RFC 0011 §5): the mux
+/// turns it into records for the local-agent proxy, the proxy's FAIL replies
+/// queue back onto the channel, and any classified requests surface through
+/// the same use-notice the capability path feeds.
+fn handle_agent_instruction(
+    st: &mut ClientState,
+    chan: crate::remote::channel::ChannelId,
+    payload: &[u8],
+) {
+    st.last_heard = now_ms();
+    let Some(mux) = st.agent_mux.as_mut() else {
+        // Forwarding is off this connection: nothing dials the local agent,
+        // and with no mux there is no channel state to answer from. The
+        // server's own serviceability machinery fails the consumer.
+        return;
+    };
+    let recs = mux.on_instruction(chan, payload);
+    let mut ops = Vec::new();
+    if let Some(proxy) = st.agent.as_mut() {
+        let replies = proxy.apply_records(&recs);
+        ops.extend(proxy.take_ops());
+        mux.queue_records(&replies);
+    }
+    surface_agent_ops(st, ops);
+}
+
+/// Surfaces classified agent requests (FDR 0004 #96) through the notice.
+/// One batch can carry several requests and `set_message` REPLACES the
+/// banner, so order by ascending significance — a signature is never
+/// overwritten by a routine listing that arrived after it in the same batch.
+fn surface_agent_ops(st: &mut ClientState, mut ops: Vec<crate::remote::agent::AgentOp>) {
+    ops.sort_by_key(|op| match op {
+        crate::remote::agent::AgentOp::ListKeys => 0,
+        crate::remote::agent::AgentOp::Other(_) => 1,
+        crate::remote::agent::AgentOp::Sign => 2,
+    });
+    for op in ops {
+        if let Some(notice) = st.agent_notice.as_mut() {
+            if let Some(msg) = notice.on_request(op, now_ms()) {
+                st.notify.set_message(&msg, false, now_ms());
+            }
+        }
+    }
+}
+
 /// Consumes the server's agent-forwarding caps from a frame (FDR 0004): latch
 /// AGENT_FORWARD, feed AGENT_DATA chunks through the stream into the local-agent
 /// proxy (any FAIL replies the proxy produces — unreachable agent, channel cap
 /// — go back onto our outbound stream), and drain our outbox on AGENT_ACK. A
 /// decoder error means the authenticated stream is corrupt; drop the proxy.
+/// BASELINE ONLY: ids 6/7/8 are retired on enveloped connections (RFC 0011
+/// §7) — agent traffic arrives on its own channels there, and a conforming
+/// peer never sends the retired entries.
 fn consume_agent_caps(st: &mut ClientState, frame: &ServerFrame) {
-    if st.agent.is_none() {
+    if st.agent.is_none() || st.enveloped {
         return;
     }
     if caps::find(&frame.caps, caps::CAP_AGENT_FORWARD).is_some() {
@@ -1569,24 +1665,7 @@ fn consume_agent_caps(st: &mut ClientState, frame: &ServerFrame) {
     // not when the stream just went corrupt (we're tearing down). A signature is
     // always announced; key listings stay rate-limited.
     if !decode_failed {
-        // One frame can carry several requests, and `set_message` REPLACES the
-        // banner — so whichever notice fires last is the one the user sees.
-        // Order by ascending significance so a signature is never overwritten by
-        // a routine listing that happened to arrive after it in the same frame.
-        // Listings are constant traffic, so without this the most important
-        // notice is the one most likely to be clobbered.
-        ops.sort_by_key(|op| match op {
-            crate::remote::agent::AgentOp::ListKeys => 0,
-            crate::remote::agent::AgentOp::Other(_) => 1,
-            crate::remote::agent::AgentOp::Sign => 2,
-        });
-        for op in ops {
-            if let Some(notice) = st.agent_notice.as_mut() {
-                if let Some(msg) = notice.on_request(op, now_ms()) {
-                    st.notify.set_message(&msg, false, now_ms());
-                }
-            }
-        }
+        surface_agent_ops(st, ops);
     }
     if decode_failed {
         st.agent = None;
@@ -2266,8 +2345,11 @@ fn outgoing_caps(st: &mut ClientState) -> Vec<caps::Cap> {
     // Agent forwarding (FDR 0004): advertise AGENT_FORWARD whenever the proxy
     // is active so the server may begin opening channels; emit AGENT_DATA
     // chunks + AGENT_ACK only once the server has advertised back (RFC 0001:
-    // not before seeing the peer's AGENT_FORWARD).
-    if st.agent.is_some() {
+    // not before seeing the peer's AGENT_FORWARD). BASELINE ONLY: on
+    // enveloped connections ids 6/7/8 are retired (RFC 0011 §7) — agent
+    // traffic rides its own channels, and the server needs no capability to
+    // know forwarding is on (the -A bootstrap flag already told it).
+    if st.agent.is_some() && !st.enveloped {
         extra.push(caps::Cap {
             id: caps::CAP_AGENT_FORWARD,
             payload: vec![],
@@ -2289,7 +2371,10 @@ fn outgoing_caps(st: &mut ClientState) -> Vec<caps::Cap> {
     }
     caps::own_table(&extra)
 }
-fn send_message(st: &mut ClientState) {
+/// Encodes this iteration's `ClientMessage`, consuming the one-shot flags
+/// and stamping `last_send` — the session half of the RFC 0011 §4.1-ordered
+/// send in `drive_client` (which seals and fragments the returned bytes).
+fn encode_message(st: &mut ClientState) -> Vec<u8> {
     let msg = ClientMessage {
         flags: st.flags,
         caps: outgoing_caps(st),
@@ -2307,10 +2392,15 @@ fn send_message(st: &mut ClientState) {
         | sync::CLIENT_FLAG_LOG_ON
         | sync::CLIENT_FLAG_LOG_OFF
         | sync::CLIENT_FLAG_RESYNC);
+    st.last_send = now_ms();
+    msg.encode()
+}
+
+fn send_message(st: &mut ClientState) {
     // RFC 0011 §1/§2 (enveloped mode only): the session-channel envelope is
     // prepended ABOVE fragmentation, once per instruction. Baseline mode
     // sends the encoded message byte-identically.
-    let encoded = msg.encode();
+    let encoded = encode_message(st);
     let wire = channel::seal_instruction(st.enveloped, &encoded);
     for frag in st
         .fragmenter
@@ -2318,7 +2408,6 @@ fn send_message(st: &mut ClientState) {
     {
         let _ = st.conn.send(&frag.to_bytes());
     }
-    st.last_send = now_ms();
 }
 
 #[cfg(test)]
@@ -2961,6 +3050,52 @@ mod tests {
         assert_eq!(off.flags & sync::CLIENT_FLAG_LOG_ON, 0);
     }
 
+    /// RFC 0011 §7: the retired agent capability ids 6/7/8 MUST NOT be sent
+    /// on enveloped connections — agent traffic rides its own `agent`-kind
+    /// channels there. The same state on a BASELINE connection keeps
+    /// advertising them (the FDR 0004 path is untouched).
+    #[test]
+    fn enveloped_outgoing_caps_carry_no_retired_agent_cap_ids() {
+        use crate::remote::sync::{AgentRecord, RecordKind};
+        let mut st = test_state(24, 80);
+        st.agent = Some(crate::remote::agent::AgentClient::new(
+            "/tmp/posh-noretired-client.sock".into(),
+        ));
+        // The state in which the baseline path emits ALL THREE ids: the peer
+        // has advertised back, and agent bytes are pending.
+        st.agent_seen = true;
+        st.agent_stream.send(&AgentRecord {
+            channel: 1,
+            kind: RecordKind::Data,
+            payload: b"agent bytes".to_vec(),
+        });
+
+        let baseline = outgoing_caps(&mut st);
+        for id in [
+            caps::CAP_AGENT_FORWARD,
+            caps::CAP_AGENT_DATA,
+            caps::CAP_AGENT_ACK,
+        ] {
+            assert!(
+                caps::find(&baseline, id).is_some(),
+                "baseline must keep the FDR 0004 carriage (id {id})"
+            );
+        }
+
+        st.enveloped = true;
+        let enveloped = outgoing_caps(&mut st);
+        for id in [
+            caps::CAP_AGENT_FORWARD,
+            caps::CAP_AGENT_DATA,
+            caps::CAP_AGENT_ACK,
+        ] {
+            assert!(
+                caps::find(&enveloped, id).is_none(),
+                "retired cap id {id} rode an enveloped client message (RFC 0011 §7)"
+            );
+        }
+    }
+
     // Integration of the agent-use notice (#96) with consume_agent_caps: a
     // server frame carrying an OPEN record must surface the rate-limited
     // banner via the NotificationEngine. Exercises the real hook, not just the
@@ -3201,6 +3336,7 @@ mod tests {
             agent: None,
             agent_stream: sync::AgentStream::new(),
             agent_seen: false,
+            agent_mux: None,
             agent_notice: None,
             wedge_seen: false,
         }
