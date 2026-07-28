@@ -268,6 +268,15 @@ _POSH_FORWARD_AGENT_
 	value is a socket path to forward instead of _$SSH_AUTH_SOCK_. Unset
 	means the best-effort default (forward _$SSH_AUTH_SOCK_ when set).
 
+_POSH_CHANNELS_
+	Opt in to the RFC 0011 channel-envelope protocol for roaming
+	connections (*1*, *true*, *on*, or *yes*): the ssh bootstrap then
+	invokes the remote server with *--channels*, and the session stream
+	and forwarded agent connections ride multiplexed channels on one
+	sealed datagram flow. Default off; the baseline wire is unchanged
+	without it. Experimental until the per-destination connection mux
+	lands.
+
 _POSH_AGENT_NOTICE_
 	When agent forwarding is active, a rate-limited banner (at most one
 	per minute) reports when the remote host opens a connection to your

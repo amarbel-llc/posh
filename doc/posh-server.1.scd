@@ -6,9 +6,9 @@ posh-server - remote endpoint of a posh roaming session
 
 # SYNOPSIS
 
-*posh-server* *new* [*-p* _PORT_[*:*_PORT2_]] [*-4*|*-6*] [*-A*] [*--* _command_...]
+*posh-server* *new* [*-p* _PORT_[*:*_PORT2_]] [*-4*|*-6*] [*-A*] [*--channels*] [*--* _command_...]
 
-*posh server* [*new*] [*-p* _PORT_[*:*_PORT2_]] [*-4*|*-6*] [*-A*] [*--* _command_...]
+*posh server* [*new*] [*-p* _PORT_[*:*_PORT2_]] [*-4*|*-6*] [*-A*] [*--channels*] [*--* _command_...]
 
 # DESCRIPTION
 
@@ -47,6 +47,15 @@ non-interactive PATH.
 	exports _SSH_AUTH_SOCK_ into the session shell. The forwarding
 	*policy* (which socket, opt-out) lives entirely in the client; the
 	server only learns the outcome.
+
+*--channels*
+	Speak the RFC 0011 channel-envelope protocol on the datagram
+	transport: the session stream and each forwarded agent connection
+	ride their own multiplexed channels. Appended by the *posh*(1) ssh
+	bootstrap exactly when the client selected the protocol
+	(_$POSH_CHANNELS_); not normally typed by hand. Without it the
+	server speaks the baseline (unenveloped) protocol, byte-identical
+	to prior releases.
 
 *--* _command_...
 	Run _command_ in the PTY instead of the default _$SHELL_.
