@@ -544,6 +544,401 @@ impl AgentClient {
 }
 
 // ---------------------------------------------------------------------------
+// RFC 0011 §5 agent channels: the enveloped wire carriage. On enveloped
+// connections each forwarded agent connection is its own `agent`-kind mux
+// channel with per-channel cumulative offsets, replacing the retired
+// CAP_AGENT_DATA/CAP_AGENT_ACK record stream. The endpoint/proxy machinery
+// above is REUSED underneath, untouched: `AgentChannelMux` is a thin adapter
+// between its `u32` `AgentRecord` event model and the per-channel
+// `AgentPayload` instructions, holding one cumulative outbox/inbox pair per
+// channel. Baseline connections keep the CAP_AGENT_* path bit-for-bit.
+
+/// §3.3: how many times a terminal (CLOSE/FAIL) instruction is (re)sent from
+/// a live channel before the channel retires to a tombstone. The flag itself
+/// has no acknowledgement, so delivery is best-effort-with-retries here plus
+/// the tombstone re-answer below (a peer still sending on the identifier is
+/// re-answered with the terminal, which closes the 2-generals gap whenever
+/// the peer has anything in flight).
+const TERM_RETRANSMITS: u32 = 4;
+
+/// §3.3 closed-identifier memory: "a receiver MUST discard instructions on a
+/// closed identifier". Identifiers are never reused (§3.1), so tombstones
+/// only ever answer stragglers of their own channel; the cap bounds memory
+/// on a long-lived connection (oldest first — by then its stragglers are
+/// long gone).
+const CLOSED_CHANNEL_MEMORY: usize = 256;
+
+use crate::remote::channel::{
+    AgentPayload, ChannelAllocator, ChannelId, Role, AGENT_FLAG_CLOSE, AGENT_FLAG_FAIL,
+    AGENT_FLAG_OPEN, AGENT_INSTRUCTION_DATA_MAX, KIND_AGENT, SESSION_CHANNEL,
+};
+use crate::remote::sync::{InputInbox, InputOutbox};
+
+/// One live mux channel: the identifier ↔ `u32` record-id mapping and the §5
+/// per-direction cumulative streams.
+struct MuxChannel {
+    id: ChannelId,
+    /// The `u32` the endpoint/proxy machinery addresses this channel by: on
+    /// the server it is the `AgentEndpoint`'s own record id; on the client a
+    /// locally-assigned one (the wire never carries it — the mux identifier
+    /// replaced it, RFC 0011 §5).
+    rec_id: u32,
+    outbox: InputOutbox,
+    inbox: InputInbox,
+    /// §3.3: we opened this channel and no instruction from the peer has
+    /// confirmed it yet. Every instruction we send carries FLAG_OPEN until
+    /// one does — the peer can only have learned the identifier from an
+    /// OPEN-bearing instruction, so its first reply IS the confirmation, and
+    /// a duplicate OPEN is by definition a retransmission on its side.
+    open_unconfirmed: bool,
+    /// Locally-queued terminal flag (AGENT_FLAG_CLOSE or AGENT_FLAG_FAIL).
+    term_flag: Option<u8>,
+    /// How often the terminal flag has ridden an instruction (TERM_RETRANSMITS).
+    term_sends: u32,
+    /// Fresh state to emit now (new data / a due ack / the OPEN / a terminal),
+    /// as opposed to the RTO-paced retransmission of old state.
+    send_due: bool,
+    last_send: u64,
+}
+
+impl MuxChannel {
+    fn new(id: ChannelId, rec_id: u32, opener: bool) -> MuxChannel {
+        MuxChannel {
+            id,
+            rec_id,
+            outbox: InputOutbox::new(),
+            inbox: InputInbox::new(),
+            open_unconfirmed: opener,
+            term_flag: None,
+            term_sends: 0,
+            send_due: true,
+            last_send: 0,
+        }
+    }
+}
+
+/// §3.3 tombstone for a closed identifier: subsequent instructions are
+/// discarded, and a peer still SENDING on the identifier (it missed our
+/// terminal) is re-answered with it so it stops.
+struct Tombstone {
+    id: ChannelId,
+    /// The terminal flag this channel closed with (what a re-answer carries).
+    flag: u8,
+    /// One terminal instruction owed to the peer.
+    echo_due: bool,
+    /// Final stream offsets, so re-answers stay well-formed §5 payloads.
+    final_base: u64,
+    final_ack: u64,
+}
+
+/// The RFC 0011 §5 adapter between the `u32` `AgentRecord` event model
+/// (AgentEndpoint / AgentClient above) and per-channel `agent` instructions:
+/// local records queue onto per-channel cumulative outboxes
+/// ([`queue_records`](Self::queue_records)), inbound instructions come back
+/// out as records ([`on_instruction`](Self::on_instruction)), and
+/// [`outgoing`](Self::outgoing) drains what is due — fresh state promptly,
+/// unacked tails on the caller's RTO cadence.
+// The `#[allow(dead_code)]` markers below follow the module's established
+// pattern (see the sync.rs record codec): the type lands fully
+// conformance-tested ahead of its non-test callers — the server/client loop
+// wiring in this same task's later commits.
+#[allow(dead_code)]
+pub struct AgentChannelMux {
+    role: Role,
+    alloc: ChannelAllocator,
+    /// Client-side record ids handed to the AgentClient machinery.
+    next_rec_id: u32,
+    channels: Vec<MuxChannel>,
+    closed: Vec<Tombstone>,
+}
+
+#[allow(dead_code)]
+impl AgentChannelMux {
+    /// The opener end (§3.2: `agent` channels are server-initiated).
+    pub fn new_server() -> AgentChannelMux {
+        AgentChannelMux::new(Role::Server)
+    }
+
+    /// The adopter end: channels open on inbound OPEN-flagged instructions.
+    pub fn new_client() -> AgentChannelMux {
+        AgentChannelMux::new(Role::Client)
+    }
+
+    fn new(role: Role) -> AgentChannelMux {
+        AgentChannelMux {
+            role,
+            alloc: ChannelAllocator::new(role),
+            next_rec_id: 1,
+            channels: Vec::new(),
+            closed: Vec::new(),
+        }
+    }
+
+    /// Routes records produced by the LOCAL machinery (the endpoint's
+    /// accepts/reads, the proxy's reads and FAIL replies) onto per-channel
+    /// outboxes. Only the server end sees `Open` records — an accepted
+    /// connection allocates the channel identifier here (§3.1).
+    pub fn queue_records(&mut self, records: &[AgentRecord]) {
+        for rec in records {
+            match rec.kind {
+                RecordKind::Open => {
+                    debug_assert_eq!(
+                        self.role,
+                        Role::Server,
+                        "only the server opens agent channels (§3.2)"
+                    );
+                    if self.role != Role::Server || self.by_rec(rec.channel).is_some() {
+                        continue;
+                    }
+                    self.channels
+                        .push(MuxChannel::new(self.alloc.next(KIND_AGENT), rec.channel, true));
+                }
+                RecordKind::Data => {
+                    if let Some(ch) = self.by_rec(rec.channel) {
+                        ch.outbox.push(&rec.payload);
+                        ch.send_due = true;
+                    }
+                }
+                RecordKind::Close | RecordKind::Fail => {
+                    if let Some(ch) = self.by_rec(rec.channel) {
+                        if ch.term_flag.is_none() {
+                            ch.term_flag = Some(match rec.kind {
+                                RecordKind::Fail => AGENT_FLAG_FAIL,
+                                _ => AGENT_FLAG_CLOSE,
+                            });
+                            ch.send_due = true;
+                        }
+                    }
+                }
+            }
+        }
+    }
+
+    /// Applies one inbound `agent` instruction (already envelope-validated by
+    /// `channel::open_any_instruction`), returning the records to feed the
+    /// local machinery. Malformed or unknown-flag payloads are discarded (§5:
+    /// ignore, don't guess); instructions on closed identifiers are discarded
+    /// with a terminal re-answer when the peer is clearly still sending.
+    pub fn on_instruction(&mut self, id: ChannelId, payload: &[u8]) -> Vec<AgentRecord> {
+        let Ok(p) = AgentPayload::decode(payload) else {
+            return Vec::new();
+        };
+        if p.has_unknown_flags() {
+            return Vec::new();
+        }
+        let peer_term = p.flags & (AGENT_FLAG_CLOSE | AGENT_FLAG_FAIL) != 0;
+        if let Some(t) = self.closed.iter_mut().find(|t| t.id == id) {
+            if !peer_term {
+                t.echo_due = true;
+            }
+            return Vec::new();
+        }
+        let mut out = Vec::new();
+        let idx = match self.channels.iter().position(|c| c.id == id) {
+            Some(i) => i,
+            None => {
+                // §3.3: the first instruction on a not-yet-seen identifier
+                // from the peer's space opens the channel — but only toward
+                // the adopter end, and only OPEN-flagged (the opener keeps
+                // FLAG_OPEN on everything until confirmed, so a bare data
+                // instruction on an unknown identifier is a post-close
+                // straggler, not an open).
+                if self.role != Role::Client || p.flags & AGENT_FLAG_OPEN == 0 {
+                    return Vec::new();
+                }
+                // §3.4: MAX_AGENT_CHANNELS is the `agent` kind's
+                // per-connection bound — refuse with FAIL, never allocate
+                // past it. (The AgentClient enforces the same bound on its
+                // socket table; refusing here keeps the wire object bounded
+                // even before the records reach it.)
+                if self.channels.len() >= MAX_AGENT_CHANNELS {
+                    self.tombstone(id, AGENT_FLAG_FAIL, 0, 0, true);
+                    return Vec::new();
+                }
+                let rec_id = self.next_rec_id;
+                self.next_rec_id += 1;
+                self.channels.push(MuxChannel::new(id, rec_id, false));
+                out.push(AgentRecord {
+                    channel: rec_id,
+                    kind: RecordKind::Open,
+                    payload: Vec::new(),
+                });
+                self.channels.len() - 1
+            }
+        };
+        let ch = &mut self.channels[idx];
+        // Any instruction from the peer on this identifier proves our OPEN
+        // arrived (§3.3): it could only know the identifier from it.
+        ch.open_unconfirmed = false;
+        ch.outbox.ack(p.recv_ack);
+        if !ch.outbox.is_empty() {
+            // A partially-acked tail (e.g. past the §4.1 per-instruction
+            // bound): keep pumping promptly rather than waiting out the RTO.
+            ch.send_due = true;
+        }
+        if let Some(fresh) = ch.inbox.accept(p.send_base, &p.data) {
+            out.push(AgentRecord {
+                channel: ch.rec_id,
+                kind: RecordKind::Data,
+                payload: fresh.to_vec(),
+            });
+            ch.send_due = true; // ack the delivery promptly
+        }
+        if peer_term {
+            // §5: CLOSE and FAIL are terminal — surface to the local socket,
+            // discard the channel, and owe the peer one terminal echo (its
+            // own terminal retransmits until something confirms).
+            out.push(AgentRecord {
+                channel: ch.rec_id,
+                kind: if p.flags & AGENT_FLAG_FAIL != 0 {
+                    RecordKind::Fail
+                } else {
+                    RecordKind::Close
+                },
+                payload: Vec::new(),
+            });
+            let flag = ch.term_flag.unwrap_or(AGENT_FLAG_CLOSE);
+            let (fb, fa) = (ch.outbox.end_offset(), ch.inbox.next_offset());
+            self.channels.remove(idx);
+            self.tombstone(id, flag, fb, fa, true);
+        }
+        out
+    }
+
+    /// Drains every instruction due now: fresh state (`send_due`) at once,
+    /// unacked tails / unconfirmed OPENs / unsettled terminals on the
+    /// caller's RTO cadence. Each instruction carries at most
+    /// [`AGENT_INSTRUCTION_DATA_MAX`] data bytes (§4.1); a terminal flag
+    /// rides only an instruction carrying the entire remaining tail, so the
+    /// receiver never closes the socket with bytes still owed.
+    pub fn outgoing(&mut self, now: u64, rto: u64) -> Vec<(ChannelId, Vec<u8>)> {
+        let mut out = Vec::new();
+        for t in &mut self.closed {
+            if std::mem::take(&mut t.echo_due) {
+                out.push((
+                    t.id,
+                    AgentPayload {
+                        flags: t.flag,
+                        send_base: t.final_base,
+                        recv_ack: t.final_ack,
+                        data: Vec::new(),
+                    }
+                    .encode(),
+                ));
+            }
+        }
+        let mut i = 0;
+        while i < self.channels.len() {
+            let ch = &mut self.channels[i];
+            let unacked = !ch.outbox.is_empty();
+            let term_unsettled = ch.term_flag.is_some() && ch.term_sends < TERM_RETRANSMITS;
+            let wants_retx = unacked || ch.open_unconfirmed || term_unsettled;
+            if ch.send_due || (wants_retx && now.saturating_sub(ch.last_send) >= rto) {
+                let pending = ch.outbox.pending();
+                let take = pending.len().min(AGENT_INSTRUCTION_DATA_MAX);
+                let mut flags = 0u8;
+                if ch.open_unconfirmed {
+                    flags |= AGENT_FLAG_OPEN;
+                }
+                if let Some(f) = ch.term_flag {
+                    if take == pending.len() {
+                        flags |= f;
+                        ch.term_sends += 1;
+                    }
+                }
+                out.push((
+                    ch.id,
+                    AgentPayload {
+                        flags,
+                        send_base: ch.outbox.base(),
+                        recv_ack: ch.inbox.next_offset(),
+                        data: pending[..take].to_vec(),
+                    }
+                    .encode(),
+                ));
+                ch.send_due = false;
+                ch.last_send = now;
+            }
+            // Terminal settled (all data acked, the flag sent its quota):
+            // retire to a tombstone. No echo owed — the close was ours.
+            if let Some(flag) = ch.term_flag {
+                if ch.outbox.is_empty() && ch.term_sends >= TERM_RETRANSMITS {
+                    let id = ch.id;
+                    let (fb, fa) = (ch.outbox.end_offset(), ch.inbox.next_offset());
+                    self.channels.remove(i);
+                    self.tombstone(id, flag, fb, fa, false);
+                    continue;
+                }
+            }
+            i += 1;
+        }
+        out
+    }
+
+    /// Earliest moment [`outgoing`](Self::outgoing) would emit — the loops
+    /// fold this into their poll deadline so retransmissions fire without fd
+    /// activity. `None` when fully idle.
+    pub fn next_deadline(&self, rto: u64) -> Option<u64> {
+        let mut due: Option<u64> = None;
+        let mut fold = |t: u64| due = Some(due.map_or(t, |d| d.min(t)));
+        if self.closed.iter().any(|t| t.echo_due) {
+            fold(0);
+        }
+        for ch in &self.channels {
+            if ch.send_due {
+                fold(0);
+                continue;
+            }
+            let wants = !ch.outbox.is_empty()
+                || ch.open_unconfirmed
+                || (ch.term_flag.is_some() && ch.term_sends < TERM_RETRANSMITS);
+            if wants {
+                fold(ch.last_send + rto);
+            }
+        }
+        due
+    }
+
+    fn by_rec(&mut self, rec_id: u32) -> Option<&mut MuxChannel> {
+        self.channels.iter_mut().find(|c| c.rec_id == rec_id)
+    }
+
+    fn tombstone(&mut self, id: ChannelId, flag: u8, final_base: u64, final_ack: u64, echo_due: bool) {
+        if self.closed.len() >= CLOSED_CHANNEL_MEMORY {
+            self.closed.remove(0);
+        }
+        self.closed.push(Tombstone {
+            id,
+            flag,
+            echo_due,
+            final_base,
+            final_ack,
+        });
+    }
+}
+
+/// One poll iteration's enveloped sends in RFC 0011 §4.1 order: the pending
+/// `session` instruction (if any) precedes bulk `agent` data, so a keystroke
+/// frame never waits behind an agent burst. Payloads are unsealed; the
+/// caller wraps each in the §2 envelope for its channel and fragments.
+#[allow(dead_code)] // consumers land with the loop wiring (same task, later commit)
+pub fn iteration_sends(
+    session: Option<Vec<u8>>,
+    mux: Option<&mut AgentChannelMux>,
+    now: u64,
+    rto: u64,
+) -> Vec<(ChannelId, Vec<u8>)> {
+    let mut out = Vec::new();
+    if let Some(s) = session {
+        out.push((SESSION_CHANNEL, s));
+    }
+    if let Some(m) = mux {
+        out.extend(m.outgoing(now, rto));
+    }
+    out
+}
+
+// ---------------------------------------------------------------------------
 // Forwarding-policy resolution (FDR 0004 §Interface). Pure: maps the CLI flag,
 // $POSH_FORWARD_AGENT, and $SSH_AUTH_SOCK to a decision, so the precedence is
 // unit-tested without touching the environment or spawning anything. The CLI
@@ -1470,6 +1865,275 @@ mod tests {
         assert_eq!(over[0].kind, RecordKind::Fail);
         assert_eq!(client.live_channel_count(), MAX_AGENT_CHANNELS);
         std::fs::remove_file(&sock).ok();
+    }
+
+    // --- AgentChannelMux (RFC 0011 §5 agent channels over the envelope) -----
+
+    use crate::remote::channel::{
+        AgentPayload, ChannelId, AGENT_FLAG_FAIL, AGENT_FLAG_OPEN, AGENT_INSTRUCTION_DATA_MAX,
+        KIND_AGENT, SESSION_CHANNEL,
+    };
+
+    fn rec(channel: u32, kind: RecordKind, payload: &[u8]) -> AgentRecord {
+        AgentRecord {
+            channel,
+            kind,
+            payload: payload.to_vec(),
+        }
+    }
+
+    /// Ferries every instruction `from` has due across to `to` (a lossless
+    /// in-memory wire), returning the records `to` surfaced for its local
+    /// machinery.
+    fn ferry(from: &mut AgentChannelMux, to: &mut AgentChannelMux, now: u64) -> Vec<AgentRecord> {
+        let mut out = Vec::new();
+        for (id, wire) in from.outgoing(now, 50) {
+            assert!(id.server_initiated(), "agent channels live in the server space");
+            assert_eq!(id.kind(), KIND_AGENT);
+            out.extend(to.on_instruction(id, &wire));
+        }
+        out
+    }
+
+    /// The §5 mirror of `channel_open_data_close_lifecycle`: the same
+    /// endpoint + proxy machinery underneath, but the wire carriage is
+    /// per-channel `AgentPayload` instructions on server-allocated kind-1
+    /// identifiers instead of the retired CAP_AGENT_* record stream.
+    #[test]
+    fn enveloped_agent_channel_open_data_close_lifecycle() {
+        let base = temp_base();
+        let mut ep = AgentEndpoint::new(&base).unwrap();
+        let mut mux_s = AgentChannelMux::new_server();
+
+        let sock = temp_sock();
+        std::fs::remove_file(&sock).ok();
+        let listener = UnixListener::bind(&sock).unwrap();
+        let mut proxy = AgentClient::new(sock.clone());
+        let mut mux_c = AgentChannelMux::new_client();
+
+        // A consumer connects on the remote end; the accepted channel and its
+        // request become ONE instruction: OPEN-flagged (§3.3), offset 0.
+        let mut consumer = UnixStream::connect(&ep.own_sock).unwrap();
+        mux_s.queue_records(&ep.accept_pending());
+        consumer.write_all(b"ssh-agent-request").unwrap();
+        std::thread::sleep(std::time::Duration::from_millis(20));
+        mux_s.queue_records(&ep.read_channels());
+
+        let sends = mux_s.outgoing(1_000, 50);
+        assert_eq!(sends.len(), 1, "one channel, one instruction");
+        let (id, wire) = &sends[0];
+        assert!(id.server_initiated());
+        assert_eq!(id.kind(), KIND_AGENT);
+        assert_eq!(id.ordinal(), 1, "§3.1: ordinals start at 1");
+        let p = AgentPayload::decode(wire).unwrap();
+        assert_ne!(p.flags & AGENT_FLAG_OPEN, 0, "first instruction carries OPEN");
+        assert_eq!(p.send_base, 0);
+        assert_eq!(p.data, b"ssh-agent-request");
+
+        // Client side: the OPEN dials the local agent, the data writes through.
+        let recs = mux_c.on_instruction(*id, wire);
+        assert!(recs.iter().any(|r| r.kind == RecordKind::Open));
+        let replies = proxy.apply_records(&recs);
+        assert!(replies.is_empty(), "reachable agent: no FAIL");
+        let (mut agent_side, _) = listener.accept().unwrap();
+        let mut got = [0u8; 17];
+        agent_side.read_exact(&mut got).unwrap();
+        assert_eq!(&got, b"ssh-agent-request");
+
+        // Agent reply -> a data instruction back -> written to the consumer.
+        agent_side.write_all(b"signature").unwrap();
+        std::thread::sleep(std::time::Duration::from_millis(20));
+        mux_c.queue_records(&proxy.read_channels());
+        let back = ferry(&mut mux_c, &mut mux_s, 1_100);
+        ep.apply_records(&back);
+        let mut sig = [0u8; 9];
+        consumer.read_exact(&mut sig).unwrap();
+        assert_eq!(&sig, b"signature");
+
+        // Consumer closes -> a CLOSE-flagged terminal instruction -> the
+        // proxy tears its side down (§5: CLOSE is terminal).
+        drop(consumer);
+        std::thread::sleep(std::time::Duration::from_millis(20));
+        mux_s.queue_records(&ep.read_channels());
+        let closes = ferry(&mut mux_s, &mut mux_c, 1_200);
+        assert!(closes.iter().any(|r| r.kind == RecordKind::Close));
+        proxy.apply_records(&closes);
+        assert_eq!(proxy.live_channel_count(), 0);
+        assert_eq!(ep.live_channel_count(), 0);
+
+        drop(ep);
+        std::fs::remove_dir_all(&base).ok();
+        std::fs::remove_file(&sock).ok();
+    }
+
+    /// §5 reliability: after a lost instruction, the sender's next emission
+    /// carries the whole unacked tail from its cumulative base, the receiver
+    /// delivers in offset order exactly once, and the peer's cumulative
+    /// `recv_ack` finally drains the outbox.
+    #[test]
+    fn enveloped_agent_retransmits_unacked_tail_across_loss() {
+        let mut mux_s = AgentChannelMux::new_server();
+        mux_s.queue_records(&[rec(1, RecordKind::Open, b"")]);
+        mux_s.queue_records(&[rec(1, RecordKind::Data, b"first-chunk|")]);
+        let lost = mux_s.outgoing(0, 50);
+        assert_eq!(lost.len(), 1);
+        // ...dropped on the floor (never delivered).
+
+        mux_s.queue_records(&[rec(1, RecordKind::Data, b"second-chunk")]);
+        let sends = mux_s.outgoing(10, 50);
+        assert_eq!(sends.len(), 1);
+        let p = AgentPayload::decode(&sends[0].1).unwrap();
+        assert_eq!(p.send_base, 0, "retransmission restarts at the acked base");
+        assert_eq!(p.data, b"first-chunk|second-chunk");
+        assert_ne!(
+            p.flags & AGENT_FLAG_OPEN,
+            0,
+            "§3.3: the OPEN retransmits until the peer confirms it"
+        );
+
+        let mut mux_c = AgentChannelMux::new_client();
+        let recs = mux_c.on_instruction(sends[0].0, &sends[0].1);
+        let delivered: Vec<u8> = recs
+            .iter()
+            .filter(|r| r.kind == RecordKind::Data)
+            .flat_map(|r| r.payload.clone())
+            .collect();
+        assert_eq!(delivered, b"first-chunk|second-chunk", "offset order, once");
+        // A duplicate retransmission delivers nothing new (§3.3: dup OPEN is
+        // a retransmission, not an error).
+        assert!(mux_c.on_instruction(sends[0].0, &sends[0].1).is_empty());
+
+        // The receiver's ack instruction drains the sender's outbox: nothing
+        // further to send even far past the RTO.
+        for (id, wire) in mux_c.outgoing(20, 50) {
+            mux_s.on_instruction(id, &wire);
+        }
+        assert!(mux_s.outgoing(10_000, 50).is_empty());
+    }
+
+    /// §5: FAIL surfaces to the far end's agent client as a CLOSED socket —
+    /// a `git push` against an unreachable agent fails, it never hangs.
+    #[test]
+    fn enveloped_agent_fail_surfaces_as_closed_socket() {
+        let base = temp_base();
+        let mut ep = AgentEndpoint::new(&base).unwrap();
+        let mut mux_s = AgentChannelMux::new_server();
+        // No listener behind the client proxy: every OPEN fails to connect.
+        let sock = temp_sock();
+        std::fs::remove_file(&sock).ok();
+        let mut proxy = AgentClient::new(sock);
+        let mut mux_c = AgentChannelMux::new_client();
+
+        let mut consumer = UnixStream::connect(&ep.own_sock).unwrap();
+        consumer
+            .set_read_timeout(Some(std::time::Duration::from_secs(5)))
+            .unwrap();
+        mux_s.queue_records(&ep.accept_pending());
+
+        // OPEN travels over; the dead agent turns it into a FAIL reply.
+        let recs = ferry(&mut mux_s, &mut mux_c, 1_000);
+        let fails = proxy.apply_records(&recs);
+        assert!(fails.iter().any(|r| r.kind == RecordKind::Fail));
+        mux_c.queue_records(&fails);
+
+        // The FAIL instruction reaches the server end and closes the
+        // consumer's socket: read returns EOF, not a block/timeout.
+        let back = ferry(&mut mux_c, &mut mux_s, 1_100);
+        assert!(back.iter().any(|r| r.kind == RecordKind::Fail));
+        ep.apply_records(&back);
+        let mut buf = [0u8; 8];
+        use std::io::Read as _;
+        assert_eq!(
+            consumer.read(&mut buf).expect("EOF, never a hang"),
+            0,
+            "FAIL must surface as a closed socket"
+        );
+        assert_eq!(ep.live_channel_count(), 0);
+
+        drop(ep);
+        std::fs::remove_dir_all(&base).ok();
+    }
+
+    /// One instruction carries what the retired 247-byte CAP_AGENT_DATA
+    /// entry budget never could: a ~4 KB payload delivered whole.
+    #[test]
+    fn enveloped_agent_instruction_exceeds_retired_cap_budget() {
+        let mut mux_s = AgentChannelMux::new_server();
+        let blob = vec![0x5a; 4096];
+        mux_s.queue_records(&[rec(1, RecordKind::Open, b"")]);
+        mux_s.queue_records(&[rec(1, RecordKind::Data, &blob)]);
+        let sends = mux_s.outgoing(0, 50);
+        assert_eq!(sends.len(), 1, "one instruction, no 247-byte chunking");
+        let p = AgentPayload::decode(&sends[0].1).unwrap();
+        assert_eq!(p.data.len(), 4096);
+
+        let mut mux_c = AgentChannelMux::new_client();
+        let recs = mux_c.on_instruction(sends[0].0, &sends[0].1);
+        let delivered: Vec<u8> = recs
+            .iter()
+            .filter(|r| r.kind == RecordKind::Data)
+            .flat_map(|r| r.payload.clone())
+            .collect();
+        assert_eq!(delivered, blob, "delivered whole in one instruction");
+    }
+
+    /// §3.4: MAX_AGENT_CHANNELS is the `agent` kind's per-connection bound —
+    /// the receiver refuses the 9th concurrent channel with FAIL instead of
+    /// allocating past it.
+    #[test]
+    fn enveloped_agent_channel_bound_refused_with_fail() {
+        let mut mux_c = AgentChannelMux::new_client();
+        let open = AgentPayload {
+            flags: AGENT_FLAG_OPEN,
+            send_base: 0,
+            recv_ack: 0,
+            data: Vec::new(),
+        }
+        .encode();
+        for ord in 1..=MAX_AGENT_CHANNELS as u64 {
+            let recs = mux_c.on_instruction(ChannelId::new(true, KIND_AGENT, ord), &open);
+            assert!(recs.iter().any(|r| r.kind == RecordKind::Open));
+        }
+        let ninth = ChannelId::new(true, KIND_AGENT, MAX_AGENT_CHANNELS as u64 + 1);
+        assert!(
+            mux_c.on_instruction(ninth, &open).is_empty(),
+            "the 9th concurrent channel must not open"
+        );
+        let refusal = mux_c
+            .outgoing(0, 50)
+            .into_iter()
+            .find(|(id, _)| *id == ninth)
+            .expect("a FAIL instruction must answer the refused OPEN");
+        let p = AgentPayload::decode(&refusal.1).unwrap();
+        assert_ne!(p.flags & AGENT_FLAG_FAIL, 0, "§3.4: refuse with FAIL");
+    }
+
+    /// §4.1 sender discipline at the send-scheduling seam: a pending session
+    /// instruction precedes bulk agent data, and one agent instruction never
+    /// carries more than AGENT_INSTRUCTION_DATA_MAX bytes, so a keystroke
+    /// frame waits behind at most one maximal agent instruction.
+    #[test]
+    fn session_instructions_precede_bulk_agent_data() {
+        let mut mux = AgentChannelMux::new_server();
+        mux.queue_records(&[rec(1, RecordKind::Open, b"")]);
+        mux.queue_records(&[rec(1, RecordKind::Data, &vec![0xab; 100 * 1024])]);
+
+        let sends = iteration_sends(Some(b"session frame".to_vec()), Some(&mut mux), 0, 50);
+        assert!(sends.len() >= 2);
+        assert_eq!(sends[0].0, SESSION_CHANNEL, "session first (§4.1)");
+        assert_eq!(sends[0].1, b"session frame");
+        for (id, wire) in &sends[1..] {
+            assert_eq!(id.kind(), KIND_AGENT);
+            let p = AgentPayload::decode(wire).unwrap();
+            assert!(
+                p.data.len() <= AGENT_INSTRUCTION_DATA_MAX,
+                "§4.1: one agent instruction's data stays within the bound"
+            );
+        }
+        // And with nothing pending on the session channel, agent data flows
+        // without inventing an empty session instruction.
+        let follow_up = iteration_sends(None, Some(&mut mux), 1_000, 50);
+        assert!(follow_up.iter().all(|(id, _)| id.kind() == KIND_AGENT));
     }
 
     // --- ForwardPolicy resolution (FDR 0004 Interface precedence table) -----

@@ -215,6 +215,13 @@ const AGENT_FLAGS_KNOWN: u8 = AGENT_FLAG_OPEN | AGENT_FLAG_CLOSE | AGENT_FLAG_FA
 #[allow(dead_code)]
 pub const AGENT_PAYLOAD_HEADER_LEN: usize = 17;
 
+/// §4.1 sender discipline: cap one `agent` instruction's data so no session
+/// frame ever waits behind more than one maximal agent instruction — "a
+/// bound in the low tens of kilobytes preserves the pre-envelope latency
+/// profile". The unacked remainder of a larger tail rides later
+/// instructions (the stream is cumulative, so a prefix is always valid).
+pub const AGENT_INSTRUCTION_DATA_MAX: usize = 32 * 1024;
+
 /// §5: the payload of one `agent` channel instruction. `send_base` is the
 /// offset of `data`'s first byte in this channel's cumulative outbound
 /// stream; `recv_ack` cumulatively acknowledges the peer's stream.
