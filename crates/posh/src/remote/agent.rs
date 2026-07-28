@@ -144,7 +144,6 @@ impl AgentEndpoint {
     /// [`from_env`](Self::from_env) for a MUX-NAMED endpoint — the
     /// `posh-server agent` verb's production path (M1 Task 2,
     /// docs/plans/2026-07-28-mux-endpoint-m1-impl.md).
-    #[allow(dead_code)] // consumed by run_agent_only in the next green step (M1 Task 2)
     pub fn from_env_mux(client_id: &str) -> Result<AgentEndpoint> {
         let env = |k: &str| std::env::var(k).ok();
         let uid = util::uid();

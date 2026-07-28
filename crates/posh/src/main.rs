@@ -306,6 +306,14 @@ fn cmd_server(args: &[String]) -> Result<()> {
             "relay" => {
                 return cmd_server_relay(&rest[i + 1..], port_range, family, agent_forward, channels);
             }
+            // The agent-only mux remote (M1 Task 2 of
+            // docs/plans/2026-07-28-mux-endpoint-m1-impl.md): like `relay`,
+            // flags precede the verb; everything after `agent` is the verb's
+            // own. Pre-verb `--channels`/`-A` are accepted-and-ignored — the
+            // verb IS agent forwarding and the envelope is its only wire.
+            "agent" => {
+                return cmd_server_agent(&rest[i + 1..], port_range, family);
+            }
             "--" => {
                 let cmd: Vec<String> = rest[i + 1..].to_vec();
                 command = (!cmd.is_empty()).then_some(cmd);
@@ -366,6 +374,42 @@ fn cmd_server_relay(
     };
     let cfg = Config::new(&group)?;
     remote::relay::run(conn, &cfg, &session, command, agent_forward, channels)
+}
+
+/// The `agent` server verb (M1 of
+/// docs/plans/2026-07-28-connection-mux-endpoint-design.md): the agent-only
+/// remote for the per-destination mux endpoint — no PTY, no shell, no
+/// session; agent channels + the FDR 0014 election only, always enveloped.
+/// `--client-id <id>` is required: it names the remote endpoint socket
+/// (`agent/mux-<id>.sock`) and is what the election identifies this client
+/// host by. `--channels` is IMPLIED — agent channels do not exist unenveloped
+/// (RFC 0011 §5), so the flag carries no information here — and is
+/// accepted-and-ignored rather than rejected, so the client can build one
+/// uniform bootstrap tail. `args` starts AFTER the `agent` token.
+fn cmd_server_agent(
+    args: &[String],
+    port_range: Option<(u16, u16)>,
+    family: Family,
+) -> Result<()> {
+    let mut client_id: Option<String> = None;
+    let mut i = 0;
+    while i < args.len() {
+        match args[i].as_str() {
+            "--client-id" => {
+                client_id = Some(
+                    args.get(i + 1)
+                        .ok_or_else(|| Error::from("agent --client-id requires an id"))?
+                        .clone(),
+                );
+                i += 2;
+            }
+            "--channels" => i += 1, // implied; tolerated for a uniform tail
+            other => return Err(Error::Msg(format!("unknown agent option {other}"))),
+        }
+    }
+    let client_id =
+        client_id.ok_or_else(|| Error::from("agent requires --client-id <id>"))?;
+    remote::server::run_agent_only(port_range, family, &client_id)
 }
 
 fn parse_port_range(s: &str) -> Result<(u16, u16)> {
@@ -1048,6 +1092,29 @@ mod tests {
             remote_relay_argv(Some("work"), "w1", &[]),
             ["relay", "-g", "work", "w1"].map(String::from)
         );
+    }
+
+    #[test]
+    fn server_agent_verb_requires_client_id_and_tolerates_channels() {
+        // M1 Task 2 (docs/plans/2026-07-28-mux-endpoint-m1-impl.md): the
+        // agent verb's argument contract, all rejected before any transport
+        // is stood up. --client-id is required (it names the remote
+        // agent/mux-<id>.sock).
+        let v = |xs: &[&str]| -> Vec<String> { xs.iter().map(|s| s.to_string()).collect() };
+        let err = cmd_server(&v(&["agent"])).unwrap_err();
+        assert!(err.to_string().contains("--client-id"), "got: {err}");
+        let err = cmd_server(&v(&["agent", "--client-id"])).unwrap_err();
+        assert!(err.to_string().contains("--client-id"), "got: {err}");
+        // Unknown options after the verb are rejected...
+        let err = cmd_server(&v(&["agent", "--bogus"])).unwrap_err();
+        assert!(err.to_string().contains("--bogus"), "got: {err}");
+        // ...but `--channels` is tolerated on either side of the verb
+        // (implied — the envelope is the only wire the agent verb speaks —
+        // and accepted rather than rejected so the client builds one uniform
+        // bootstrap tail): with it present and no id, parsing still reaches
+        // the required-id check rather than tripping on the flag.
+        let err = cmd_server(&v(&["--channels", "agent", "--channels"])).unwrap_err();
+        assert!(err.to_string().contains("--client-id"), "got: {err}");
     }
 
     #[test]

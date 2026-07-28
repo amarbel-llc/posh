@@ -160,7 +160,6 @@ pub fn run(
 /// stream here to carry anything else. Unlike [`run`]'s best-effort
 /// endpoint, a failure to stand the endpoint up is fatal — an agent-only
 /// server without it serves nothing.
-#[allow(dead_code)] // wired to main's `agent` verb in the next green step (M1 Task 2)
 pub fn run_agent_only(
     port_range: Option<(u16, u16)>,
     family: Family,
