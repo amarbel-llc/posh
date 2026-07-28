@@ -15,6 +15,14 @@
 //! the proven tmux pattern, no lock and no election protocol. `SSH_AUTH_SOCK`
 //! is always the stable `agent/sock`, valid across detach/reattach.
 //!
+//! posh#152 interim, layered on that election (throwaway once the mux
+//! endpoint — M1 of docs/plans/2026-07-28-connection-mux-endpoint-design.md —
+//! makes ownership structural): each endpoint keeps a `srv-<pid>.active`
+//! activity marker fresh while its peer is active, notices its peer's
+//! activity edges on every `tick` call (not just the slow tick), and on
+//! release REPOINTS `agent/sock` at the freshest active sibling instead of
+//! unlinking — closing FDR 0014's measured 9.9 s handoff outage.
+//!
 //! Everything here is `poll`/unix-socket/`rename` (ADR 0001): no async
 //! runtime, no new dependency. The `server_loop` splices this endpoint's fds
 //! into its existing poll set; this module owns no event loop of its own.
@@ -40,6 +48,13 @@ const MAX_AGENT_CHANNELS: usize = 8;
 const CHANNEL_READ_BUF: usize = 16 * 1024;
 /// Cadence for the symlink-liveness / takeover check and dead-`srv-*.sock` GC.
 const AGENT_SLOW_TICK_MS: u64 = 5_000;
+/// posh#152 interim (throwaway once the mux endpoint — M1 of
+/// docs/plans/2026-07-28-connection-mux-endpoint-design.md — lands): how fresh
+/// a sibling's `srv-<pid>.active` activity marker must be for
+/// repoint-on-release to hand it `agent/sock`. Three slow ticks: an active
+/// endpoint refreshes its marker every slow tick, so anything older has missed
+/// two refreshes and its "active" claim is not current.
+const AGENT_MARKER_FRESH_MS: u64 = 3 * AGENT_SLOW_TICK_MS;
 /// Peer-silence window after which the endpoint fast-fails outstanding agent
 /// requests (stricter than the loop's 60 s `PEER_TIMEOUT`): a `git push` gets
 /// `SSH_AGENT_FAILURE` rather than hanging when the peer has roamed away. The
@@ -74,12 +89,24 @@ pub struct AgentEndpoint {
     id: i32,
     /// `<base>/agent/srv-<pid>.sock` — this server's own socket.
     own_sock: PathBuf,
+    /// `<base>/agent/srv-<pid>.active` — this endpoint's peer-activity marker
+    /// (posh#152 interim): its mtime is refreshed while OUR peer is active, so
+    /// a sibling releasing `agent/sock` can repoint it at someone who can
+    /// actually serve. Best-effort throughout; throwaway once the mux
+    /// endpoint (M1 of docs/plans/2026-07-28-connection-mux-endpoint-design.md)
+    /// makes ownership structural.
+    own_marker: PathBuf,
     /// `<base>/agent/sock` — the stable, symlinked `SSH_AUTH_SOCK` target.
     well_known: PathBuf,
     listener: UnixListener,
     channels: Vec<Channel>,
     next_channel_id: u32,
     last_tick: u64,
+    /// The `peer_active` value the previous [`tick`](Self::tick) call saw —
+    /// the state behind the every-call ACTIVE⇄INACTIVE edge detection
+    /// (posh#152 interim). `None` until the first call, so the first call is
+    /// itself an edge and settles the link/marker into the right state.
+    last_peer_active: Option<bool>,
 }
 
 impl AgentEndpoint {
@@ -144,16 +171,22 @@ impl AgentEndpoint {
         let _ = std::fs::remove_file(&own_sock);
         let listener = UnixListener::bind(&own_sock)?;
         listener.set_nonblocking(true)?;
+        // Same pid-reuse hygiene for the activity marker (posh#152): a
+        // leftover from a previous life must not advertise us active.
+        let own_marker = dir.join(format!("srv-{id}.active"));
+        let _ = std::fs::remove_file(&own_marker);
 
         let endpoint = AgentEndpoint {
             dir: dir.clone(),
             id,
             own_sock,
+            own_marker,
             well_known: dir.join("sock"),
             listener,
             channels: Vec::new(),
             next_channel_id: 1,
             last_tick: 0,
+            last_peer_active: None,
         };
         endpoint.claim_symlink()?;
         Ok(endpoint)
@@ -164,17 +197,79 @@ impl AgentEndpoint {
         &self.well_known
     }
 
-    /// Atomically points `agent/sock` at our own `srv-<pid>.sock`: create a
-    /// uniquely-named temp symlink in the (validated, private) dir and
-    /// `rename` it over the well-known name. rename(2) is atomic, so a
-    /// concurrent reader never sees a missing or half-written link.
+    /// Atomically points `agent/sock` at our own `srv-<pid>.sock`.
     fn claim_symlink(&self) -> Result<()> {
-        let target = format!("srv-{}.sock", self.id);
+        self.point_symlink_at(&format!("srv-{}.sock", self.id))
+    }
+
+    /// Atomically points `agent/sock` at `target` (a dir-relative socket
+    /// name): create a uniquely-named temp symlink in the (validated,
+    /// private) dir and `rename` it over the well-known name. rename(2) is
+    /// atomic, so a concurrent reader never sees a missing or half-written
+    /// link. Shared by the self-claim and the posh#152 repoint-on-release.
+    fn point_symlink_at(&self, target: &str) -> Result<()> {
         let tmp = self.dir.join(format!(".sock.{}.tmp", self.id));
         let _ = std::fs::remove_file(&tmp);
-        std::os::unix::fs::symlink(&target, &tmp)?;
+        std::os::unix::fs::symlink(target, &tmp)?;
         std::fs::rename(&tmp, &self.well_known)?;
         Ok(())
+    }
+
+    /// Refreshes our `srv-<pid>.active` marker's mtime (posh#152 interim).
+    /// A one-byte write is the cheapest portable touch on the ADR 0001
+    /// poll/unix-only budget. Best-effort: a failure only degrades sibling
+    /// repoint selection, never the endpoint itself.
+    fn touch_active_marker(&self) {
+        let _ = std::fs::write(&self.own_marker, b"1");
+    }
+
+    /// Drops our activity marker (posh#152 interim): called on the
+    /// ACTIVE→INACTIVE edge (and at exit) so a sibling's repoint-on-release
+    /// stops considering us the moment we can no longer serve. Best-effort.
+    fn remove_active_marker(&self) {
+        let _ = std::fs::remove_file(&self.own_marker);
+    }
+
+    /// The dir-relative socket name of the best repoint target (posh#152
+    /// interim): the sibling (pid != ours) with the FRESHEST
+    /// `srv-<pid>.active` marker whose pid is alive (the same `kill(pid, 0)`
+    /// probe as `gc_dead_sockets` — never a connect, posh#147), whose marker
+    /// mtime is within [`AGENT_MARKER_FRESH_MS`] of the wall clock, and whose
+    /// `srv-<pid>.sock` actually exists. `None` when nobody qualifies.
+    fn freshest_active_sibling(&self) -> Option<String> {
+        let entries = std::fs::read_dir(&self.dir).ok()?;
+        let now = std::time::SystemTime::now();
+        let mut best: Option<(std::time::SystemTime, i32)> = None;
+        for entry in entries.flatten() {
+            let path = entry.path();
+            let Some(pid) = srv_marker_pid(&path) else {
+                continue;
+            };
+            if pid == self.id || !pid_alive(pid) {
+                continue;
+            }
+            let Ok(mtime) = std::fs::metadata(&path).and_then(|m| m.modified()) else {
+                continue;
+            };
+            // An mtime in the future (clock step) errors here; treat it as
+            // fresh rather than discarding a viable sibling.
+            if let Ok(age) = now.duration_since(mtime) {
+                if age.as_millis() as u64 > AGENT_MARKER_FRESH_MS {
+                    continue;
+                }
+            }
+            if !self.dir.join(format!("srv-{pid}.sock")).exists() {
+                continue;
+            }
+            let fresher = match best {
+                None => true,
+                Some((t, _)) => mtime > t,
+            };
+            if fresher {
+                best = Some((mtime, pid));
+            }
+        }
+        best.map(|(_, pid)| format!("srv-{pid}.sock"))
     }
 
     /// True when `agent/sock` is absent, dangling, or points at a dead
@@ -227,16 +322,39 @@ impl AgentEndpoint {
         }
     }
 
-    /// Give up `agent/sock` if we own it (same unlink as `Drop`, but while the
-    /// endpoint keeps running). Called when OUR peer goes inactive: our
-    /// `srv-<pid>.sock` is still bound, so `socket_is_dead` reports us "alive"
-    /// and no other endpoint would ever take over — starving a sibling
-    /// connection whose client IS active (posh#136). Releasing the link lets the
-    /// next active endpoint's `symlink_needs_takeover()` fire (absent ⇒ true).
-    /// We reclaim it on a later tick once our peer is active again.
+    /// Give up `agent/sock` if we own it. Called when OUR peer goes inactive:
+    /// our `srv-<pid>.sock` is still bound, so `socket_is_dead` reports us
+    /// "alive" and no other endpoint would ever take over — starving a sibling
+    /// connection whose client IS active (posh#136). We reclaim the link once
+    /// our peer is active again (the reclaim edge in [`tick`](Self::tick)).
+    ///
+    /// posh#152 interim (throwaway once the mux endpoint — M1 of
+    /// docs/plans/2026-07-28-connection-mux-endpoint-design.md — makes
+    /// ownership structural): prefer HANDING THE LINK OFF over dropping it.
+    /// When a qualifying sibling exists (fresh `srv-<pid>.active`, live pid,
+    /// bound socket — [`freshest_active_sibling`](Self::freshest_active_sibling))
+    /// the link is atomically REPOINTED at that sibling's socket with the same
+    /// temp+rename as `claim_symlink`, so the stable path is never stale or
+    /// absent across the handoff. Only when nobody qualifies does this fall
+    /// back to the plain unlink, which lets the next active endpoint's
+    /// `symlink_needs_takeover()` fire (absent ⇒ true).
+    ///
+    /// The repointed-to sibling never "claimed" the link itself; that is fine
+    /// by construction: ownership is always re-derived from `read_link`
+    /// (`symlink_points_to_self` / `symlink_needs_takeover`), never cached, so
+    /// discovering it owns the link is indistinguishable from having claimed
+    /// it.
     fn release_symlink(&self) {
-        if self.symlink_points_to_self() {
-            let _ = std::fs::remove_file(&self.well_known);
+        if !self.symlink_points_to_self() {
+            return;
+        }
+        match self.freshest_active_sibling() {
+            Some(target) => {
+                let _ = self.point_symlink_at(&target);
+            }
+            None => {
+                let _ = std::fs::remove_file(&self.well_known);
+            }
         }
     }
 
@@ -329,16 +447,49 @@ impl AgentEndpoint {
         reap_closed(&mut self.channels);
     }
 
-    /// Periodic maintenance, gated to `AGENT_SLOW_TICK_MS`. Returns any
-    /// `Close` records produced (e.g. by the peer-inactive fast-fail) for the
-    /// caller to forward. `peer_active` is the loop's existing liveness gate.
+    /// Periodic maintenance, gated to `AGENT_SLOW_TICK_MS` — plus the posh#152
+    /// interim edge logic, which runs on EVERY call: `server_loop` invokes
+    /// tick each iteration, so an ACTIVE⇄INACTIVE flip of our peer is acted on
+    /// within one poll wake instead of waiting out the slow tick (the measured
+    /// 9.9 s handoff outage of FDR 0014's Limitations). Throwaway once the mux
+    /// endpoint (M1 of docs/plans/2026-07-28-connection-mux-endpoint-design.md)
+    /// makes ownership structural. Returns any `Close` records produced (e.g.
+    /// by the peer-inactive fast-fail) for the caller to forward. `peer_active`
+    /// is the loop's existing liveness gate.
     pub fn tick(&mut self, peer_active: bool, now: u64) -> Vec<AgentRecord> {
+        // posh#152 edge check, deliberately BEFORE the slow gate. On the
+        // ACTIVE→INACTIVE edge the release below repoints `agent/sock` at the
+        // freshest active sibling (or unlinks when nobody qualifies); on the
+        // →ACTIVE edge we reclaim without the old one-tick claim latency and
+        // stand our marker up so siblings' releases can pick us. The initial
+        // None→inactive transition is NOT an activity edge: a fresh endpoint
+        // keeps its construction-time claim through the startup window where
+        // its client has yet to send a datagram, and the slow tick below
+        // still releases if the peer never shows up (the pre-#152 behavior).
+        let prev = self.last_peer_active;
+        self.last_peer_active = Some(peer_active);
+        if prev != Some(peer_active) {
+            if peer_active {
+                self.touch_active_marker();
+                if self.symlink_needs_takeover() {
+                    let _ = self.claim_symlink();
+                }
+            } else if prev == Some(true) {
+                self.remove_active_marker();
+                self.release_symlink();
+            }
+        }
+
         if now.saturating_sub(self.last_tick) < AGENT_SLOW_TICK_MS {
             return Vec::new();
         }
         self.last_tick = now;
 
         if peer_active {
+            // Keep the posh#152 activity marker fresh: a releasing sibling
+            // judges us serviceable by its mtime staying within
+            // AGENT_MARKER_FRESH_MS.
+            self.touch_active_marker();
             // Own the endpoint only while OUR client is active. Reclaim a link
             // whose owner died or went stale — but only when we can actually
             // serve it (an active peer). Claiming it while our own peer is
@@ -349,7 +500,8 @@ impl AgentEndpoint {
             }
         } else {
             // Our peer is gone: relinquish `agent/sock` if we hold it, so a
-            // sibling endpoint whose client IS active can take over (its
+            // sibling endpoint whose client IS active can take over (repointed
+            // directly at it when its posh#152 marker qualifies, else its
             // `symlink_needs_takeover()` sees the link absent). Without this the
             // link stays pinned to us — `socket_is_dead` reports our still-bound
             // listener "alive" — and active siblings are starved (posh#136).
@@ -381,18 +533,20 @@ impl AgentEndpoint {
         reap_closed(&mut self.channels);
     }
 
-    /// Unlinks `srv-*.sock` files in `agent/` whose owning pid is dead. A
-    /// server unlinks its own socket on exit, so these are crash leftovers.
+    /// Unlinks `srv-*.sock` files — and their posh#152 `srv-*.active`
+    /// activity markers — in `agent/` whose owning pid is dead. A server
+    /// unlinks its own socket (and marker) on exit, so these are crash
+    /// leftovers.
     fn gc_dead_sockets(&self) {
         let Ok(entries) = std::fs::read_dir(&self.dir) else {
             return;
         };
         for entry in entries.flatten() {
             let path = entry.path();
-            if path == self.own_sock {
+            if path == self.own_sock || path == self.own_marker {
                 continue;
             }
-            let Some(pid) = srv_sock_pid(&path) else {
+            let Some(pid) = srv_sock_pid(&path).or_else(|| srv_marker_pid(&path)) else {
                 continue;
             };
             if !pid_alive(pid) {
@@ -414,6 +568,9 @@ impl Drop for AgentEndpoint {
             }
         }
         let _ = std::fs::remove_file(&self.own_sock);
+        // The posh#152 activity marker goes with the socket: a dead endpoint
+        // must not advertise itself as a repoint target.
+        self.remove_active_marker();
     }
 }
 
@@ -1327,6 +1484,12 @@ fn srv_sock_pid(path: &Path) -> Option<i32> {
     name.strip_prefix("srv-")?.strip_suffix(".sock")?.parse().ok()
 }
 
+/// [`srv_sock_pid`] for the posh#152 `srv-<pid>.active` activity markers.
+fn srv_marker_pid(path: &Path) -> Option<i32> {
+    let name = path.file_name()?.to_str()?;
+    name.strip_prefix("srv-")?.strip_suffix(".active")?.parse().ok()
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -1451,36 +1614,65 @@ mod tests {
         std::fs::remove_dir_all(&base).ok();
     }
 
-    // posh#136 / FDR 0014: the shipped relinquish-on-inactive fix (option 1)
-    // removed the STARVATION — a roamed-away owner no longer pins `agent/sock`
-    // forever — but it did not close the window, and this is the first test with
-    // two COEXISTING endpoints, so it is the first to show the handoff at all.
+    /// Sets a file's mtime `ago_ms` (plus a second of slack) into the past, so
+    /// a test can construct a STALE activity marker without waiting real time
+    /// (marker freshness is judged against the wall clock, not the loops'
+    /// virtual `now`).
+    fn set_mtime_ago(path: &Path, ago_ms: u64) {
+        use std::os::unix::ffi::OsStrExt;
+        let c = std::ffi::CString::new(path.as_os_str().as_bytes()).unwrap();
+        let now = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap();
+        let then = now.as_secs() - ago_ms.div_ceil(1000) - 1;
+        let tv = libc::timeval {
+            tv_sec: then as libc::time_t,
+            tv_usec: 0,
+        };
+        let times = [tv, tv];
+        // SAFETY: utimes(2) with a valid NUL-terminated path and a 2-element
+        // timeval array; touches no memory beyond its arguments.
+        let rc = unsafe { libc::utimes(c.as_ptr(), times.as_ptr()) };
+        assert_eq!(rc, 0, "utimes failed: {}", std::io::Error::last_os_error());
+    }
+
+    // posh#136 / posh#152 / FDR 0014: the interim repoint-on-release. The
+    // previous interim (relinquish-on-inactive alone) left a measured ~9.9 s
+    // outage per handoff — two independent slow ticks: the owner released on
+    // ITS next tick (the link STALE, fast-failing requests, until then), and
+    // the active sibling claimed on ITS next tick after that (the link ABSENT
+    // in between). Pinned by this test's predecessor,
+    // `handoff_between_two_endpoints_leaves_a_multi_tick_outage`, whose bound
+    // this supersedes. Two mechanics close it:
     //
-    // The handoff costs TWO independent slow ticks: the owner releases on its
-    // own next tick, and the active sibling claims on ITS next tick after that.
-    // Across the whole interval `agent/sock` is unusable in two distinct ways,
-    // measured separately here because they fail differently for a `git push`:
+    //   - activity markers: an endpoint with an ACTIVE peer keeps a fresh
+    //     `srv-<pid>.active` beside its socket, so a releasing owner can see
+    //     which siblings could actually serve;
+    //   - event-driven release: the owner notices its peer's ACTIVE→INACTIVE
+    //     edge on the very next `tick` CALL (the slow gate applies only to
+    //     maintenance), and instead of unlinking, atomically REPOINTS
+    //     `agent/sock` at the freshest active sibling.
     //
-    //   - STALE: the link still resolves to the inactive owner, whose listener is
-    //     bound (so `socket_is_dead` is false and no sibling takes over) but whose
-    //     `tick(peer_active=false)` fast-fails every channel => SSH_AGENT_FAILURE.
-    //   - ABSENT: the owner has released and nobody has claimed yet => the
-    //     connect(2) itself fails with ENOENT.
-    //
-    // This is the residual defect FDR 0014 exists to close by construction.
+    // The honest bound the mechanics give: the repoint happens synchronously
+    // inside the owner's first `tick` call after the edge, and the temp+rename
+    // is atomic — so measured at ANY granularity after that call the link is
+    // neither stale nor absent (asserted as exactly 0 ms below). In production
+    // the residual is `server_loop`'s latency in making that call (at most one
+    // poll wake, which the heartbeat cadence bounds), not a slow tick.
     #[test]
-    fn handoff_between_two_endpoints_leaves_a_multi_tick_outage() {
+    fn handoff_repoints_to_the_active_sibling_on_the_inactivity_edge() {
         const STEP_MS: u64 = 100;
         let base = temp_base();
         let agent_dir = base.join("agent");
 
         // Two coexisting endpoints under one base. `a` is the sibling whose
-        // client stays ACTIVE; `b` is the newest connection, so it owns the link,
-        // and its client is INACTIVE for the whole run (roamed away). `b`'s id is
-        // pid 1, which is always a live process — otherwise `a`'s
-        // `gc_dead_sockets` would reap `b`'s socket and confound the measurement.
+        // client stays ACTIVE; `b` is the newest connection, so it owns the
+        // link. `b`'s id is pid 1, which is always a live process — otherwise
+        // `a`'s `gc_dead_sockets` would reap `b`'s socket and confound the
+        // measurement.
         let mut a = AgentEndpoint::new_with_id(&base, own_pid()).unwrap();
         let mut b = AgentEndpoint::new_with_id(&base, 1).unwrap();
+        let a_target = PathBuf::from(format!("srv-{}.sock", own_pid()));
         let b_target = PathBuf::from("srv-1.sock");
         assert_eq!(
             std::fs::read_link(a.sock_path()).unwrap(),
@@ -1492,9 +1684,27 @@ mod tests {
         a.last_tick = 0;
         b.last_tick = 0;
 
-        let (mut stale_ms, mut absent_ms, mut served_ms) = (0u64, 0u64, 0u64);
+        // Warm-up: both peers active across two slow ticks. Both endpoints
+        // stand up (and refresh) their activity markers; b keeps the link.
         let mut t = 0;
-        while t < AGENT_SLOW_TICK_MS * 4 {
+        while t < AGENT_SLOW_TICK_MS * 2 {
+            t += STEP_MS;
+            a.tick(true, t);
+            b.tick(true, t);
+        }
+        assert!(
+            agent_dir.join(format!("srv-{}.active", own_pid())).exists(),
+            "an active endpoint maintains its srv-<pid>.active marker (posh#152)"
+        );
+        assert!(agent_dir.join("srv-1.active").exists());
+        assert_eq!(std::fs::read_link(agent_dir.join("sock")).unwrap(), b_target);
+
+        // b's peer roams away. The flip lands mid-slow-tick (b's gate is not
+        // due for another ~AGENT_SLOW_TICK_MS), so any handoff observed below
+        // is the EDGE logic, not tick-paced maintenance.
+        let flip = t;
+        let (mut stale_ms, mut absent_ms, mut served_ms) = (0u64, 0u64, 0u64);
+        while t < flip + AGENT_SLOW_TICK_MS * 2 {
             t += STEP_MS;
             // Each server_loop ticks its own endpoint with its own peer state.
             a.tick(true, t);
@@ -1507,27 +1717,121 @@ mod tests {
         }
 
         println!(
-            "posh#136 handoff: stale={stale_ms}ms absent={absent_ms}ms \
-             (unusable={}ms) served={served_ms}ms over {t}ms",
+            "posh#152 handoff: stale={stale_ms}ms absent={absent_ms}ms \
+             (unusable={}ms) served={served_ms}ms after the edge",
             stale_ms + absent_ms
         );
 
-        assert!(
-            stale_ms > 0,
-            "agent/sock resolves to the inactive owner, which fast-fails requests"
+        assert_eq!(
+            stale_ms, 0,
+            "the owner hands the link off within the tick call that sees the \
+             inactivity edge — it never lingers on the fast-failing owner"
+        );
+        assert_eq!(
+            absent_ms, 0,
+            "the handoff is an atomic repoint, never an unlink-then-reclaim — \
+             agent/sock never goes absent while a qualifying sibling exists"
+        );
+        assert_eq!(
+            served_ms,
+            AGENT_SLOW_TICK_MS * 2,
+            "the active sibling serves for the entire post-edge window"
+        );
+        assert_eq!(
+            std::fs::read_link(agent_dir.join("sock")).unwrap(),
+            a_target,
+            "and the link points at the active sibling's socket"
         );
         assert!(
-            absent_ms > 0,
-            "and then vanishes entirely before the active sibling reclaims it"
+            !agent_dir.join("srv-1.active").exists(),
+            "the roamed-away owner drops its own marker on the edge, so \
+             siblings' releases stop considering it"
         );
+
+        drop(b);
+        drop(a);
+        std::fs::remove_dir_all(&base).ok();
+    }
+
+    // posh#152: a release with NO qualifying sibling falls back to today's
+    // plain unlink — a dead sibling pid disqualifies its marker even when the
+    // marker is fresh and its socket file is present. Also pins that the
+    // release is EVENT-driven: both tick calls land far inside the slow gate
+    // (now=1, 2), so only the ACTIVE→INACTIVE edge logic can have released.
+    #[test]
+    fn release_with_no_qualifying_sibling_falls_back_to_unlink() {
+        let base = temp_base();
+        let agent_dir = base.join("agent");
+        let mut ep = AgentEndpoint::new_with_id(&base, 1).unwrap();
+        assert!(ep.symlink_points_to_self(), "fresh endpoint owns agent/sock");
+
+        // A dead "sibling": fresh marker + socket file, but pid 999999 is not
+        // a live process, so it must not be chosen.
+        std::fs::write(agent_dir.join("srv-999999.active"), b"1").unwrap();
+        std::fs::write(agent_dir.join("srv-999999.sock"), b"").unwrap();
+
+        ep.tick(true, 1); // peer attaches…
+        ep.tick(false, 2); // …then roams away: the edge, mid-slow-tick
         assert!(
-            stale_ms + absent_ms >= AGENT_SLOW_TICK_MS,
-            "the outage spans more than a single slow tick: stale={stale_ms}ms \
-             absent={absent_ms}ms"
+            std::fs::symlink_metadata(ep.sock_path()).is_err(),
+            "no qualifying sibling: the inactivity edge unlinks agent/sock \
+             (the pre-posh#152 fallback), rather than repointing at a dead pid"
         );
+
+        drop(ep);
+        std::fs::remove_dir_all(&base).ok();
+    }
+
+    // posh#152: the initial None→inactive transition is NOT an activity edge.
+    // A fresh endpoint keeps its construction-time claim through the startup
+    // window where its client has yet to send a datagram (the relay/server
+    // loops tick with peer_active=false until the first datagram arrives);
+    // only the slow tick may release it, exactly as before posh#152.
+    #[test]
+    fn startup_inactive_ticks_keep_the_construction_claim() {
+        let base = temp_base();
+        let mut ep = AgentEndpoint::new_with_id(&base, 1).unwrap();
+        ep.last_tick = 0;
+        // Fast (gated) ticks before any client has ever been heard from.
+        for t in 1..10 {
+            ep.tick(false, t);
+        }
         assert!(
-            served_ms > 0,
-            "the active sibling does eventually take over (option 1 shipped)"
+            ep.symlink_points_to_self(),
+            "a never-yet-active endpoint holds its claim until the slow tick"
+        );
+        // The slow tick still applies the pre-#152 inactive release.
+        ep.tick(false, AGENT_SLOW_TICK_MS + 1);
+        assert!(
+            std::fs::symlink_metadata(ep.sock_path()).is_err(),
+            "the slow tick releases a peer that never appeared"
+        );
+        drop(ep);
+        std::fs::remove_dir_all(&base).ok();
+    }
+
+    // posh#152: a sibling whose activity marker has gone STALE (older than
+    // AGENT_MARKER_FRESH_MS) is not chosen for the repoint, even though its
+    // process is alive and its socket is bound — a marker that stopped being
+    // refreshed means that endpoint's peer went quiet too.
+    #[test]
+    fn a_stale_sibling_marker_is_not_chosen_for_repoint() {
+        let base = temp_base();
+        let agent_dir = base.join("agent");
+        // A live sibling with a bound socket…
+        let a = AgentEndpoint::new_with_id(&base, own_pid()).unwrap();
+        let mut b = AgentEndpoint::new_with_id(&base, 1).unwrap();
+        // …whose marker exists but is well past the freshness window.
+        let marker = agent_dir.join(format!("srv-{}.active", own_pid()));
+        std::fs::write(&marker, b"1").unwrap();
+        set_mtime_ago(&marker, AGENT_MARKER_FRESH_MS + AGENT_SLOW_TICK_MS);
+
+        b.tick(true, 1); // b's peer attaches…
+        b.tick(false, 2); // …then roams away: the edge, mid-slow-tick
+        assert!(
+            std::fs::symlink_metadata(b.sock_path()).is_err(),
+            "a stale marker must not attract the repoint — the release falls \
+             back to the unlink so takeover liveness rules stay in charge"
         );
 
         drop(b);
