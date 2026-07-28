@@ -24,6 +24,8 @@ lint: lint-fmt lint-doc lint-impure
 
 # Read-only formatting + eng-convention gate (fails if conformist would change
 # anything, or an eng linter finds a violation).
+#
+# run the read-only formatting + eng-convention gate
 [group("pre-build")]
 lint-fmt:
     #!/usr/bin/env bash
@@ -42,6 +44,8 @@ lint-fmt:
 # postInstall does. Runs scdoc through `nix develop` so it works
 # whether or not the devShell is already active (the pre-merge hook
 # runs `just` outside it). See eng-manpages(7).
+#
+# compile every doc/*.scd man page and fail on any scdoc parse error
 [group("pre-build")]
 lint-doc:
     #!/usr/bin/env bash
@@ -69,6 +73,8 @@ lint-impure: lint-worktree
 # sandboxed checks.formatting / `lint-fmt`. Builds the impure config in
 # /nix/store, then runs `conformist check` rooted at the worktree. See
 # conformist-nix(7) and the eng-impure preset.
+#
+# run the impure eng convention checks against the working tree
 [group("pre-build")]
 lint-worktree:
     #!/usr/bin/env bash
@@ -116,6 +122,8 @@ build-palette:
 # `nix build` yields the whole set. Also realizes the standalone .#poshterity
 # output (`nix run .#poshterity`) so the merge gate exercises it. Cheap once
 # build-rust/build-go realized the inputs.
+#
+# build the full posh toolset into ./result
 [group("build")]
 build-toolset:
     nix build -L --show-trace -o result
@@ -136,6 +144,8 @@ test-nix:
 
 # Hermetic Rust test signal (posh checkPhase; mosh-ffi is gated separately by
 # test-mosh-ffi via workspace default-members).
+#
+# run the hermetic Rust test signal (the .#posh checkPhase)
 [group("post-build")]
 test-rust:
     # Cheap once build-rust has realized the derivation. github #33.
@@ -150,6 +160,8 @@ test-go:
 # 0004). mosh-ffi is excluded from .#posh (workspace default-members), so this
 # builds the dedicated .#checks.<system>.mosh-ffi derivation, which runs
 # cargo test -p mosh-ffi (compiling the zz-mosh C++ slice via cc).
+#
+# run the mosh-ffi C++ FFI characterization tests
 [group("post-build")]
 test-mosh-ffi:
     #!/usr/bin/env bash
@@ -168,6 +180,8 @@ run-nix *ARGS:
 # compile + scp + run via `posh ssh` — the posh#3 plain-SSH path) when a
 # host is given. Extra args go to posht; for local args pass an empty
 # host: `just run-posht '' --list`.
+#
+# build and run posht locally, or on <host>
 [group("operational")]
 run-posht host="" *ARGS:
     #!/usr/bin/env bash
@@ -185,6 +199,8 @@ run-posht host="" *ARGS:
 # (posh#3/#28) that the plain-ssh `run-posht` path does not. SESSION
 # defaults to "posht". To run only the relevant test:
 #   just run-posht-session box -- --only altscroll,mouse
+#
+# run posht inside a persistent roaming session on <host>
 [group("operational")]
 run-posht-session host session="posht" *ARGS:
     #!/usr/bin/env bash
@@ -224,6 +240,8 @@ update-nix:
 # is shared across worktrees via $GIT_COMMON_DIR). posh's sweatfile [hooks]
 # create also runs this at `sc start`, so a fresh spinclass worktree is wired
 # automatically; this recipe is the manual / non-spinclass path. Idempotent.
+#
+# register the version.env merge driver in this clone's git config
 [group("maintenance")]
 install-merge-driver:
     #!/usr/bin/env bash
@@ -247,6 +265,8 @@ install-merge-driver:
 # (version.workspace = true) that build.rs overrides at compile time, so
 # there is no Cargo.toml or Cargo.lock version to resync here. Touches no
 # other file — committing is `release`'s job. Usage: just bump-version 0.1.1
+#
+# rewrite POSH_VERSION in version.env
 [group("maintenance")]
 bump-version new_version:
     #!/usr/bin/env bash
@@ -260,6 +280,8 @@ bump-version new_version:
 # the script — a changelog body with backticks or $(...) would otherwise be
 # re-parsed by bash into the annotation (eng-versioning(7) § tag recipe).
 # Usage: just tag "posh v0.1.1"
+#
+# sign, push, and verify the tag named after version.env
 [group("maintenance")]
 tag $message:
     #!/usr/bin/env bash
@@ -281,6 +303,8 @@ tag $message:
 # sign+push+verify a v<sem> tag, and create the GitHub release with the
 # changelog as the body. The bump+commit is idempotent: skipped when
 # version.env already holds <new>. Usage: just release 0.1.1
+#
+# cut a release from master: changelog, bump, tag, GitHub release
 [group("maintenance")]
 release new_version:
     #!/usr/bin/env bash
@@ -334,6 +358,8 @@ release new_version:
 # synthetic %O/%A/%B blobs and assert the higher POSH_VERSION wins, in both
 # orderings, plus the fail-safe (non-zero exit when a side lacks a parseable
 # version). Debug-only; the driver's real exercise is a rebase conflict.
+#
+# exercise scripts/version-merge on synthetic %O/%A/%B blobs
 [group("debug")]
 debug-version-merge:
     #!/usr/bin/env bash
@@ -381,6 +407,8 @@ debug-version-merge:
 # version.env conflict, merge, and assert the higher semver landed with NO
 # conflict markers. Exercises the git plumbing the unit test (debug-version-
 # merge) cannot. Debug-only.
+#
+# prove git invokes the keep-higher-semver driver, in a throwaway repo
 [group("debug")]
 debug-merge-driver-e2e:
     #!/usr/bin/env bash
@@ -420,6 +448,8 @@ debug-merge-driver-e2e:
 
 # Run cargo against the Rust workspace in the devShell — the fast dev-loop
 # (incremental, in-worktree). The hermetic gate is build-rust/test-rust.
+#
+# run cargo against the Rust workspace in the devShell
 [group("debug")]
 debug-cargo *ARGS:
     nix develop --command cargo {{ ARGS }}
@@ -428,6 +458,8 @@ debug-cargo *ARGS:
 # the mosh-ffi C++ FFI shim, so a fixed VT script always renders the same grid
 # (no clock, no network). Assert with the normal loop: `just debug-cargo test
 # -p mosh-ffi`. Debug-only; the hermetic gate is build-rust.
+#
+# (re)bless the mosh terminal characterization goldens
 [group("debug")]
 debug-mosh-bless:
     nix develop --command env MOSH_FFI_BLESS=1 cargo test -p mosh-ffi -- --nocapture
@@ -440,6 +472,8 @@ debug-mosh-bless:
 # round-trips through the forwarded socket. Needs the posh binary plus
 # ssh-keygen/ssh-agent/ssh-add, absent from the hermetic sandbox (hence
 # #[ignore]). Debug-only; the hermetic gate is build-rust.
+#
+# run the ignored SSH agent-forwarding end-to-end tests
 [group("debug")]
 debug-agent-e2e:
     nix develop --command cargo test -p posh --bin posh -- --ignored agent_forward --nocapture
@@ -450,6 +484,8 @@ debug-agent-e2e:
 # and the #15 MorphDelta incremental apply (process(escapes)) vs DumpDiff
 # reparse comparison. Drives the measure-first perf work so optimization isn't
 # speculative. Debug-only; the hermetic gate is build-rust.
+#
+# time the per-frame client apply costs in release
 [group("debug")]
 debug-perf-compose:
     nix develop --command cargo test -p posh --release remote::perf_probe -- --ignored --nocapture
@@ -458,6 +494,8 @@ debug-perf-compose:
 # the committed VT100 emulation fixture against its golden N times (default 50)
 # and fail loudly on the first mismatch. Zero flakes is the headline of the
 # deterministic replacement for the mosh tests' tmux capture-pane + sleep race.
+#
+# assert poshterity replay determinism over N runs
 [group("debug")]
 debug-replay-loop n="50":
     nix develop --command bash -c ' \
@@ -472,6 +510,8 @@ debug-replay-loop n="50":
 
 # Run go against the posht tool via nixpkgs (no Go in the devShell yet —
 # posht is a standalone static TUI, see docs/posht.md / PR #38).
+#
+# run go against the posht tool via nixpkgs
 [group("debug")]
 debug-go *ARGS:
     nix shell nixpkgs#go --command bash -c 'cd posht && go {{ ARGS }}'
@@ -483,6 +523,8 @@ debug-go *ARGS:
 # run both and compare the altscroll receipt in ~/.local/log/posht/. ARGS go
 # to posht (default: --only altscroll). Quit posht normally; detach the client
 # with Ctrl-^ then "." . Debug-only; the hermetic gate is build-rust.
+#
+# verify POSH_GRAB_MOUSE over a local loopback server+client pair
 [group("debug")]
 debug-verify-grab grab="on" *ARGS:
     #!/usr/bin/env bash
@@ -514,6 +556,8 @@ debug-verify-grab grab="on" *ARGS:
 # terminal you want to test (e.g. kitty). Quit posht normally, then detach with
 # Ctrl-\ (the local session detach key). Debug-only; the hermetic gate is
 # build-rust.
+#
+# compare the legacy and frame paths for a local posh attach session
 [group("debug")]
 debug-verify-session-frames frames="on" *ARGS:
     #!/usr/bin/env bash
@@ -559,6 +603,8 @@ debug-verify-session-frames frames="on" *ARGS:
 # terminal you want to test (e.g. kitty). Quit posht (q), then detach the client
 # with Ctrl-^ then "." (the mosh quit sequence). Debug-only; the hermetic gate is
 # build-rust.
+#
+# run the posht rawkeys probe over a loopback roaming pair
 [group("debug")]
 debug-verify-remote-rawkeys *ARGS:
     #!/usr/bin/env bash
@@ -598,6 +644,8 @@ debug-verify-remote-rawkeys *ARGS:
 # escape loop leaked it). Run in a real kitty terminal, outside clown/posh; press
 # Ctrl-^, then Escape / Shift+Tab to confirm kitty is live, then q to quit, then
 # detach with Ctrl-^ then "." Debug-only; the hermetic gate is build-rust.
+#
+# run the kitty-pushing capture over a loopback roaming pair
 [group("debug")]
 debug-verify-remote-kittycap:
     #!/usr/bin/env bash
@@ -622,6 +670,8 @@ debug-verify-remote-kittycap:
 # TERM the recipe runs under — the resolution still proves the spawn_shell
 # extra_env path; for the true ssh-strips-TERM case test over a real host.
 # Debug-only; the hermetic gate is build-rust.
+#
+# verify TERM/COLORTERM forwarding over a local loopback pair
 [group("debug")]
 debug-verify-term:
     #!/usr/bin/env bash
@@ -645,6 +695,8 @@ debug-verify-term:
 # reads POSH_ESCAPE_KEY; on a loopback pair both inherit this recipe's env.
 # Run it in the terminal you want to test; detach with Ctrl-^ then "." .
 # Debug-only; the hermetic gate is build-rust.
+#
+# verify the escape-to-shell overlay over a local loopback pair
 [group("debug")]
 debug-verify-escape cmd="" esckey="":
     #!/usr/bin/env bash
@@ -672,6 +724,8 @@ debug-verify-escape cmd="" esckey="":
 # Usage: just debug-record-posht posh box   /   just debug-record-posht ssh box
 # Then diff the two .castx (e.g. `poshterity` replay/dump). Debug-only; the
 # hermetic gate is build-rust/build-go.
+#
+# record an interactive posht session over posh or ssh to a .castx
 [group("debug")]
 debug-record-posht transport host *ARGS:
     #!/usr/bin/env bash
@@ -733,6 +787,8 @@ debug-record-posht transport host *ARGS:
 # Linux uses the nix-pinned procps ps (etimes/wchan:N); macOS uses the native
 # BSD ps (etime/wchan), since /proc-oriented procps rejects those keywords
 # there (posh#133). Both branches are read-only.
+#
+# snapshot every posh process with its state flags and wait channel
 [group("debug")]
 debug-posh-procs:
     #!/usr/bin/env bash
@@ -758,6 +814,8 @@ debug-posh-procs:
 # {TMPDIR,/tmp}/posh-<uid>) with the daemon .log files. The ss view is
 # env-independent (it reads the kernel); the dir listing reflects THIS shell's
 # env, which may differ from the daemons'. Read-only; pair with debug-posh-procs.
+#
+# map posh sockets to pids and list the socket-dir candidates
 [group("debug")]
 debug-posh-sockets:
     #!/usr/bin/env bash
@@ -803,6 +861,8 @@ debug-posh-sockets:
 # counters, Sig* masks); macOS uses ps + lsof + `sample` (posh#133). macOS has
 # no readable KERNEL stack and BSD ps exposes no ctxt-switch/Sig* counters, so
 # those are approximated (userspace `sample`) or omitted — noted inline.
+#
+# dump deep read-only state for ONE posh pid
 [group("debug")]
 debug-posh-proc-state pid:
     #!/usr/bin/env bash
@@ -846,6 +906,8 @@ debug-posh-proc-state pid:
 # channel each wakeup; posh#133). Also lists child processes (the session
 # shell): a live child confirms the session is intact. Read-only.
 # Usage: just debug-posh-proc-sample 12345 [secs]
+#
+# probe whether ONE posh pid's event loop is still cycling
 [group("debug")]
 debug-posh-proc-sample pid secs="3":
     #!/usr/bin/env bash
@@ -908,6 +970,8 @@ debug-posh-proc-sample pid secs="3":
 # was set, else <runtime>/posh/posh-<role>-<pid>.log. Own process, no sudo. This
 # is the on-demand introspection a wedged session needs (remote/diag.rs; see the
 # SIGNALS section of posh-server(1)/posh-client(1)). Usage: just debug-posh-dump 12345
+#
+# trigger a SIGUSR2 transport-state dump and print the new line
 [group("debug")]
 debug-posh-dump pid:
     #!/usr/bin/env bash
@@ -956,6 +1020,8 @@ debug-posh-dump pid:
 # passes a single positional arg, so the two times are joined with '..' and
 # split here). Times are `log show` format ('YYYY-MM-DD HH:MM:SS', local).
 # Usage: just debug-posh-killlog '2026-07-08 17:05:00..2026-07-08 17:20:00'
+#
+# search the macOS system log for what killed a posh daemon
 [group("debug")]
 debug-posh-killlog window:
     #!/usr/bin/env bash
@@ -990,6 +1056,8 @@ debug-posh-killlog window:
 # handler is live in a running daemon; a silent death (no named line) means the
 # running binary predates the fix or the handler is not wired. Isolated POSH_DIR,
 # cleaned on exit. Usage: just debug-posh-verify-signal [HUP|INT|TERM]
+#
+# verify the DEPLOYED posh daemon's signal instrumentation
 [group("debug")]
 debug-posh-verify-signal signal="HUP":
     #!/usr/bin/env bash
@@ -1031,6 +1099,8 @@ debug-posh-verify-signal signal="HUP":
 # with a client wedge. With `pid=` (read off the client's `srv=(pid=…)`), fetch
 # that EXACT server; without it, the newest. The remote logs to its
 # XDG_RUNTIME_DIR/posh or ~/.local/log/posh. Part of the #83 instrumented setup.
+#
+# fetch a remote roaming server's log to this host
 [group("debug")]
 debug-posh-fetch-server host="posh-remote" pid="" dest="/tmp/posh-remote-server.log":
     #!/usr/bin/env bash
@@ -1054,6 +1124,8 @@ debug-posh-fetch-server host="posh-remote" pid="" dest="/tmp/posh-remote-server.
 # after a code change; prints the store path. Non-interactive (no launch).
 # `posh-remote` is an ssh alias — map it to your host in ~/.ssh/config, or pass
 # host=<your-host>.
+#
+# build .#posh and copy its closure to a remote host
 [group("debug")]
 debug-posh-copy-server host="posh-remote":
     #!/usr/bin/env bash
@@ -1068,6 +1140,8 @@ debug-posh-copy-server host="posh-remote":
 # .#posh, copy the closure to the remote, then exec the client with
 # POSH_SERVER_CMD pointed at the copied server's binary. Keeps the #83
 # instrumented client+server in lockstep. Interactive — run from your terminal.
+#
+# run the locally-built posh client against a remote serving the same build
 [group("debug")]
 debug-posh-run host="posh-remote" target="posh-remote" *args:
     #!/usr/bin/env bash
@@ -1085,6 +1159,8 @@ debug-posh-run host="posh-remote" target="posh-remote" *args:
 # content divergence); the sibling .applied/.diff hold the raw bytes for an
 # offline apply_diff re-run. See remote/diag.rs::capture_forensics.
 # Usage: just debug-posh-forensics 12345
+#
+# print the most recent wedge-forensics bundle for a client pid
 [group("debug")]
 debug-posh-forensics pid:
     #!/usr/bin/env bash
@@ -1107,6 +1183,8 @@ debug-posh-forensics pid:
 # debug-posh-dump without a tty. Prints the server's CONNECT line, then the
 # server double-forks and detaches; find its pid with debug-posh-procs and tear
 # it down with `kill`. Debug-only; the hermetic gate is build-rust.
+#
+# start a detached loopback roaming server running a long sleep
 [group("debug")]
 debug-posh-server-smoke secs="600":
     #!/usr/bin/env bash
@@ -1133,6 +1211,8 @@ debug-posh-server-smoke secs="600":
 # NOTE: via a real shell only — `just debug-posh-backlog-repro on static`. (Some
 # MCP recipe-runners pass the whole arg string as one param, collapsing the two.)
 # Usage: just debug-posh-backlog-repro [on|0] [distinct|static]
+#
+# reproduce the daemon's MAX_CLIENT_BACKLOG slow-client drop
 [group("debug")]
 debug-posh-backlog-repro frames="0" flood="distinct":
     #!/usr/bin/env bash
@@ -1210,6 +1290,8 @@ debug-posh-backlog-repro frames="0" flood="distinct":
 # killing the process group before the trap runs), orphaning the detached flood
 # daemon — this reaps those. The [b]k class stops pkill matching this recipe's
 # own command line. Safe: matches only the exact repro flood signature.
+#
+# reap leaked bk flood daemons and their isolated POSH_DIRs
 [group("debug")]
 debug-posh-backlog-cleanup:
     #!/usr/bin/env bash
@@ -1229,6 +1311,8 @@ debug-posh-backlog-cleanup:
 # throwaway sessions in an isolated POSH_DIR, under a fake TTY (util-linux
 # `script`) so the pretty path triggers headlessly. Visual dev-loop check for
 # the table renderer; the geometry is unit-tested in session/list_table.rs.
+#
+# render the styled posh list table under a fake TTY
 [group("debug")]
 debug-posh-list-table:
     #!/usr/bin/env bash
@@ -1251,6 +1335,8 @@ debug-posh-list-table:
 # prints the exact client command to paste — eliminating the stale-binary and
 # port-race confusion of leaning on target/debug or ./result. Tear down later
 # with: pkill -f '[p]osh server new'. Debug-only; the hermetic gate is build-rust.
+#
+# start one fresh roaming server for hand-testing the command palette
 [group("debug")]
 debug-posh-palette-demo:
     #!/usr/bin/env bash
@@ -1278,6 +1364,8 @@ debug-posh-palette-demo:
 # explicit log path. Prints each gap with its two boundary records (last srtt /
 # outstanding / retransmit before the freeze are right there). Read-only.
 # Usage: just debug-posh-log-gaps 12345 [thresh_ms]   or   ... /path/to.log [thresh_ms]
+#
+# scan a posh debug log for event-loop stalls
 [group("debug")]
 debug-posh-log-gaps target thresh="5000":
     #!/usr/bin/env bash
@@ -1321,6 +1409,8 @@ debug-posh-log-gaps target thresh="5000":
 # (default 40) since the prior record, or whose outstanding is >=OUT (default 8),
 # and the single worst retransmit jump. Read-only.
 # Usage: just debug-posh-log-loss 12345 [retransmit_delta] [outstanding_min]
+#
+# pinpoint a transport blackout in a posh server log
 [group("debug")]
 debug-posh-log-loss target rt="40" out="8":
     #!/usr/bin/env bash
@@ -1377,6 +1467,8 @@ debug-posh-log-loss target rt="40" out="8":
 # `just debug-posh-dump`, or the palette's agent info) taken while forwarding was
 # active. Read-only.
 # Usage: just debug-posh-agent 12345 [idle_open_warn]
+#
+# report forwarded-agent health from a posh client log
 [group("debug")]
 debug-posh-agent target warn="1":
     #!/usr/bin/env bash
@@ -1438,6 +1530,8 @@ debug-posh-agent target warn="1":
 # socket-level receive drops (RcvbufErrors) are distinguished from path loss.
 # Read-only. PEER is the roaming client's 100.x address (from debug-posh-dump's
 # `remote=`); PORT defaults to the server's 60001. Usage: just debug-posh-net 100.x.y.z
+#
+# probe the Tailscale path to a roaming peer (direct vs DERP)
 [group("debug")]
 debug-posh-net peer port="60001":
     #!/usr/bin/env bash
@@ -1462,6 +1556,8 @@ debug-posh-net peer port="60001":
 # is available. Hard NAT + no port-mapping == fragile, loss-prone direct paths —
 # the usual root cause of a high posh retransmit rate even when the link reports
 # "direct". Read-only. Usage: just debug-posh-pathloss 100.x.y.z [count]
+#
+# measure path loss/latency to a roaming peer and this host's NAT posture
 [group("debug")]
 debug-posh-pathloss peer count="20":
     #!/usr/bin/env bash
@@ -1486,6 +1582,8 @@ debug-posh-pathloss peer count="20":
 # Prediction: pure kitty shows BOTH clean; through posh, E1's scrolled-in line
 # (row 9) is steel-blue and E2's (row 19) is not. That difference IS #100.
 # Cat .tmp/bleedscroll.raw once in a raw kitty and once inside posh; report each.
+#
+# write the posh#100 BCE-on-scroll synthetic to .tmp/bleedscroll.raw
 [group("debug")]
 debug-posh-bleed-scroll:
     #!/usr/bin/env bash
@@ -1517,6 +1615,8 @@ debug-posh-bleed-scroll:
 # xterm lineage has it. mosh's renderer gates its erase optimization on the
 # CLIENT's bce (Display::can_use_erase = has_bce || default-pen); posh-term's
 # model BCEs unconditionally. Read-only. Usage: just debug-term-bce xterm-kitty
+#
+# report a terminal's bce terminfo capability
 [group("debug")]
 debug-term-bce term:
     #!/usr/bin/env bash
@@ -1538,6 +1638,8 @@ debug-term-bce term:
 # would paint — so #100 reproduces in a PURE kitty with NO live posh session, and
 # (post-fix) this same file must render clean. Writes .tmp/bleedscroll-client.raw.
 # SIZE is the client width (default 80x24). Rebuild-free: uses debug cargo.
+#
+# render the BCE-on-scroll synthetic into the client tty bytes
 [group("debug")]
 debug-posh-bleed-render size="80x24":
     #!/usr/bin/env bash
