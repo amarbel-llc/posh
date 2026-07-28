@@ -74,7 +74,7 @@ use crate::remote::agent::AgentEndpoint;
 use crate::remote::caps::{self, Cap};
 use crate::remote::channel;
 use crate::remote::datagram::{Connection, SEND_INTERVAL_MIN};
-use crate::remote::server::{send_payload, server_loop};
+use crate::remote::server::{send_on_channel, send_payload, server_loop};
 use crate::remote::sync::{
     self, AgentStream, ClientMessage, FragmentAssembly, Fragmenter, FrameBody, InputInbox,
     ServerFrame, FLAG_SHUTDOWN,
@@ -117,9 +117,17 @@ fn content_caps(client_caps: &[Cap]) -> Vec<Cap> {
 /// `client.rs`, and an uninstrumented one would report `sent=0` while `queued`
 /// grew, i.e. "nothing on the wire" for a connection actively carrying agent
 /// traffic. Wrong in the safe direction, but still wrong.
-fn agent_caps(stream: &mut AgentStream, agent_seen: bool, has_endpoint: bool) -> Vec<Cap> {
+/// BASELINE ONLY: on enveloped connections ids 6/7/8 are retired (RFC 0011
+/// §7) — agent traffic rides its own `agent`-kind channels — so `enveloped`
+/// empties this unconditionally.
+fn agent_caps(
+    stream: &mut AgentStream,
+    agent_seen: bool,
+    has_endpoint: bool,
+    enveloped: bool,
+) -> Vec<Cap> {
     let mut extras = Vec::new();
-    if has_endpoint {
+    if has_endpoint && !enveloped {
         extras.push(Cap {
             id: caps::CAP_AGENT_FORWARD,
             payload: vec![],
@@ -557,6 +565,12 @@ fn relay_loop(
     // seeing the peer's AGENT_FORWARD). Both inert unless `agent` is Some.
     let mut agent_stream = AgentStream::new();
     let mut agent_seen = false;
+    // RFC 0011 §5: on ENVELOPED connections the relay terminates agent
+    // traffic on per-channel `agent`-kind instructions instead of the
+    // retired CAP_AGENT_* entries (§7); baseline keeps the capability path
+    // bit-for-bit. Mirrors `server_loop`'s wiring.
+    let mut agent_mux = (enveloped && agent.is_some())
+        .then(crate::remote::agent::AgentChannelMux::new_server);
     // Last authentic client datagram (ms), for the agent endpoint's stricter
     // peer-liveness gate (AGENT_PEER_ACTIVE) — a roamed-away peer fast-fails a
     // blocked `git push` rather than hanging it.
@@ -622,8 +636,16 @@ fn relay_loop(
         if let Some(ep) = agent.as_mut() {
             let agent_peer_active = conn.has_remote()
                 && now.saturating_sub(last_heard) < crate::remote::agent::AGENT_PEER_ACTIVE;
-            for rec in ep.tick(agent_peer_active, now) {
-                agent_stream.send(&rec);
+            let recs = ep.tick(agent_peer_active, now);
+            match agent_mux.as_mut() {
+                // Enveloped: the tick's Close records become terminal
+                // instructions on their own channels (RFC 0011 §5).
+                Some(mux) => mux.queue_records(&recs),
+                None => {
+                    for rec in recs {
+                        agent_stream.send(&rec);
+                    }
+                }
             }
         }
         // Pending outbound agent bytes must be ferried promptly (like `server.rs`'s
@@ -640,6 +662,11 @@ fn relay_loop(
             }
             if agent_out_pending {
                 deadline = deadline.min(last_agent_send + SEND_INTERVAL_MIN);
+            }
+            // RFC 0011 §5: wake in time for the agent mux's fresh sends and
+            // RTO retransmissions even with no fd activity.
+            if let Some(d) = agent_mux.as_ref().and_then(|m| m.next_deadline(conn.rto())) {
+                deadline = deadline.min(d.max(now));
             }
             deadline.saturating_sub(now).min(1000) as i32
         } else {
@@ -694,8 +721,10 @@ fn relay_loop(
                         };
                         // RFC 0011 §2/§3.2 (enveloped mode only): a malformed
                         // envelope or a foreign channel discards the
-                        // instruction, never the connection.
-                        let Some(message) = channel::open_instruction(enveloped, &assembled)
+                        // instruction, never the connection. Admitted
+                        // instructions dispatch by channel kind.
+                        let Some((chan, message)) =
+                            channel::open_any_instruction(enveloped, &assembled)
                         else {
                             util::log_write(
                                 "warn",
@@ -703,6 +732,19 @@ fn relay_loop(
                             );
                             continue;
                         };
+                        if chan.kind() == channel::KIND_AGENT {
+                            // RFC 0011 §5: an agent-channel instruction —
+                            // relay-terminated like the caps it replaces
+                            // (never forwarded to the daemon).
+                            last_heard = now;
+                            if let Some(mux) = agent_mux.as_mut() {
+                                let recs = mux.on_instruction(chan, message);
+                                if let Some(ep) = agent.as_mut() {
+                                    ep.apply_records(&recs);
+                                }
+                            }
+                            continue;
+                        }
                         let Ok(msg) = ClientMessage::decode(message) else {
                             continue;
                         };
@@ -715,7 +757,10 @@ fn relay_loop(
                         // AGENT_ACK drains our outbox. A decoder error tears the
                         // endpoint down (a corrupt authenticated stream is
                         // unrecoverable). These caps NEVER go to the daemon.
-                        if let Some(ep) = agent.as_mut() {
+                        // BASELINE ONLY: ids 6/7/8 are retired on enveloped
+                        // connections (RFC 0011 §7) — agent traffic arrived on
+                        // its own channels above.
+                        if let Some(ep) = agent.as_mut().filter(|_| !enveloped) {
                             if caps::find(&msg.caps, caps::CAP_AGENT_FORWARD).is_some() {
                                 agent_seen = true;
                             }
@@ -808,11 +853,23 @@ fn relay_loop(
                 let agent_revents = (agent_fd_base..agent_fd_base + agent_fd_count)
                     .any(|i| fds[i].revents & (libc::POLLIN | err_events) != 0);
                 if agent_revents {
-                    for rec in ep.accept_pending() {
-                        agent_stream.send(&rec);
-                    }
-                    for rec in ep.read_channels() {
-                        agent_stream.send(&rec);
+                    match agent_mux.as_mut() {
+                        // Enveloped (RFC 0011 §5): accepts open agent
+                        // channels, reads queue onto their outboxes; the
+                        // drain below ships them this iteration, after the
+                        // session sends (§4.1).
+                        Some(mux) => {
+                            mux.queue_records(&ep.accept_pending());
+                            mux.queue_records(&ep.read_channels());
+                        }
+                        None => {
+                            for rec in ep.accept_pending() {
+                                agent_stream.send(&rec);
+                            }
+                            for rec in ep.read_channels() {
+                                agent_stream.send(&rec);
+                            }
+                        }
                     }
                 }
             }
@@ -909,7 +966,7 @@ fn relay_loop(
         // current agent caps (Task 3.2) so AGENT_FORWARD stays advertised and pending
         // AGENT_DATA/ACK flow even while the screen is idle. A fresh daemon frame this
         // iteration already stamped both clocks to `now`.
-        let out_agent_caps = agent_caps(&mut agent_stream, agent_seen, agent.is_some());
+        let out_agent_caps = agent_caps(&mut agent_stream, agent_seen, agent.is_some(), enveloped);
         if conn.has_remote() {
             // Recompute the pending flag LIVE here (like `held.is_held()`), not from
             // the pre-poll snapshot used to size the timeout: this iteration's
@@ -957,6 +1014,18 @@ fn relay_loop(
                     enveloped,
                 );
                 last_agent_send = now;
+            }
+            // RFC 0011 §4.1 sender discipline: the agent mux's instructions
+            // drain AFTER this iteration's session sends (frame forward /
+            // retransmit / heartbeat above) — fresh channel data at once,
+            // unacked tails on the RTO. Baseline mode has no mux (inert).
+            for (chan, payload) in crate::remote::agent::iteration_sends(
+                None,
+                agent_mux.as_mut(),
+                now,
+                conn.rto(),
+            ) {
+                send_on_channel(&mut conn, &mut fragmenter, chan, &payload, enveloped);
             }
         }
 
@@ -1008,7 +1077,7 @@ fn forward_daemon_frame(
 ) {
     let ack = inbox.next_offset();
     let mut out = rewrap(daemon_frame, frame_offset, ack, ack);
-    out.caps.extend(agent_caps(agent_stream, agent_seen, has_agent));
+    out.caps.extend(agent_caps(agent_stream, agent_seen, has_agent, enveloped));
     *last_frame_num = out.frame_num;
     held.hold(out.frame_num, out.encode());
     if conn.has_remote() {
@@ -2134,6 +2203,24 @@ mod tests {
     /// endpoint-but-peer-unseen ⇒ advertise CAP_AGENT_FORWARD only (RFC 0001: no
     /// DATA/ACK before the peer's own AGENT_FORWARD); peer seen ⇒ FORWARD plus the
     /// pending DATA + ACK. The mirror of `content_caps`'s daemon-facing split.
+    /// RFC 0011 §7: the relay MUST NOT stamp the retired agent capability
+    /// ids onto enveloped frames — agent traffic rides its own `agent`-kind
+    /// channels there. The same state on a baseline connection emits all
+    /// three (the test below).
+    #[test]
+    fn agent_caps_are_retired_on_enveloped_connections() {
+        let mut stream = AgentStream::new();
+        stream.send(&AgentRecord {
+            channel: 1,
+            kind: RecordKind::Data,
+            payload: b"pending agent bytes".to_vec(),
+        });
+        assert!(
+            agent_caps(&mut stream, true, true, true).is_empty(),
+            "ids 6/7/8 are retired on enveloped connections (RFC 0011 §7)"
+        );
+    }
+
     #[test]
     fn agent_caps_advertises_forward_and_gates_data_on_seen() {
         let mut stream = AgentStream::new();
@@ -2144,10 +2231,10 @@ mod tests {
         });
 
         // No endpoint: no agent caps at all, even if the peer was seen.
-        assert!(agent_caps(&mut stream, true, false).is_empty());
+        assert!(agent_caps(&mut stream, true, false, false).is_empty());
 
         // Endpoint up, peer not yet seen: advertise FORWARD, withhold DATA/ACK.
-        let before = agent_caps(&mut stream, false, true);
+        let before = agent_caps(&mut stream, false, true, false);
         assert!(caps::find(&before, CAP_AGENT_FORWARD).is_some());
         assert!(
             caps::find(&before, CAP_AGENT_DATA).is_none(),
@@ -2156,7 +2243,7 @@ mod tests {
         assert!(caps::find(&before, CAP_AGENT_ACK).is_none());
 
         // Peer seen: FORWARD + the pending DATA + the ACK.
-        let after = agent_caps(&mut stream, true, true);
+        let after = agent_caps(&mut stream, true, true, false);
         assert!(caps::find(&after, CAP_AGENT_FORWARD).is_some());
         assert!(
             caps::find(&after, CAP_AGENT_DATA).is_some(),
