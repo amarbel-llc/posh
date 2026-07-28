@@ -117,6 +117,101 @@ fn mux_dir_at(base: &Path) -> Result<PathBuf> {
     Ok(dir)
 }
 
+// ---------------------------------------------------------------------------
+// The refcount/linger state machine (M1 Task 3 of
+// docs/plans/2026-07-28-mux-endpoint-m1-impl.md). Pure and virtual-time
+// (`now: u64` ms), so ref/unref/linger transitions are unit-tested without a
+// daemon, a socket, or a clock.
+
+/// Default linger after the last session unref (design doc "Lifecycle",
+/// decided 2026-07-28): 60 s, ControlMaster-ish, conservative until rekey
+/// (posh#145) lands.
+pub const DEFAULT_LINGER_MS: u64 = 60_000;
+
+/// `POSH_MUX_PERSIST` in SECONDS (the `POSH_SERVER_*_TMOUT` / ssh
+/// ControlPersist convention), converted to the internal ms clock. `0`
+/// disables lingering; unset/unparsable falls back to the 60 s default.
+#[allow(dead_code)] // consumed by run_daemon (M1 Task 3) + client integration (Task 4)
+pub fn linger_ms_from_env() -> u64 {
+    parse_linger_ms(std::env::var("POSH_MUX_PERSIST").ok().as_deref())
+}
+
+/// The pure predicate behind [`linger_ms_from_env`], testable without env
+/// mutation.
+fn parse_linger_ms(value: Option<&str>) -> u64 {
+    match value.map(str::trim).and_then(|v| v.parse::<u64>().ok()) {
+        Some(secs) => secs.saturating_mul(1000),
+        None => DEFAULT_LINGER_MS,
+    }
+}
+
+/// The FDR 0014 M1 policy machine: the count of live local session
+/// invocations holding a `MuxSessionRef` gates agent serviceability
+/// (`refs > 0`), and unref-to-zero arms the linger clock — the endpoint keeps
+/// the connection (agent service OFF) for `linger_ms`, then
+/// [`should_exit`](Self::should_exit) signals shutdown. Construction arms the
+/// same clock, so a daemon whose spawner dies before its first ref exits
+/// instead of idling forever; the normal first ref cancels it.
+pub struct MuxState {
+    refs: usize,
+    linger_ms: u64,
+    /// `Some(deadline)` exactly while `refs == 0` (the linger window).
+    linger_deadline: Option<u64>,
+}
+
+#[allow(dead_code)] // consumed by the mux daemon loop (M1 Task 3, docs/plans/2026-07-28-mux-endpoint-m1-impl.md)
+impl MuxState {
+    pub fn new(linger_ms: u64, now: u64) -> MuxState {
+        MuxState {
+            refs: 0,
+            linger_ms,
+            linger_deadline: Some(now.saturating_add(linger_ms)),
+        }
+    }
+
+    /// A `MuxSessionRef` landed: agent service on, linger cancelled.
+    pub fn add_ref(&mut self) {
+        self.refs += 1;
+        self.linger_deadline = None;
+    }
+
+    /// A ref dropped (explicitly or by its IPC connection closing). Reaching
+    /// zero turns agent service off and starts the linger window from `now`.
+    pub fn unref(&mut self, now: u64) {
+        self.refs = self.refs.saturating_sub(1);
+        if self.refs == 0 {
+            self.linger_deadline = Some(now.saturating_add(self.linger_ms));
+        }
+    }
+
+    pub fn refs(&self) -> usize {
+        self.refs
+    }
+
+    /// The FDR 0014 M1 gate: agent channels are serviced iff a session ref is
+    /// held. Enforced client-side — the side whose agent is exposed.
+    pub fn serviceable(&self) -> bool {
+        self.refs > 0
+    }
+
+    /// Whether the linger clock is armed (refs == 0, window not yet checked).
+    pub fn lingering(&self) -> bool {
+        self.linger_deadline.is_some()
+    }
+
+    /// The shutdown signal: unreferenced and the linger window has elapsed.
+    /// With `linger_ms == 0` this is true the moment the last ref drops.
+    pub fn should_exit(&self, now: u64) -> bool {
+        self.linger_deadline.is_some_and(|d| now >= d)
+    }
+
+    /// The next wall-clock moment the daemon loop must wake for (the linger
+    /// expiry), for folding into its poll deadline. `None` while referenced.
+    pub fn next_deadline(&self) -> Option<u64> {
+        self.linger_deadline
+    }
+}
+
 /// The local hostname via gethostname(2); `"unknown"` when the call fails or
 /// reports an empty name, so [`client_id`] never yields an empty id.
 fn hostname() -> String {
@@ -142,6 +237,101 @@ fn hostname() -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    // --- MuxState: the refcount/linger machine (M1 Task 3.1), virtual time ---
+
+    #[test]
+    fn refs_gate_serviceability_exactly() {
+        let mut st = MuxState::new(60_000, 0);
+        assert!(!st.serviceable(), "no refs at spawn: agent service off");
+        st.add_ref();
+        assert!(st.serviceable(), "first ref turns agent service on");
+        st.add_ref();
+        assert!(st.serviceable());
+        st.unref(10);
+        assert!(st.serviceable(), "one of two refs dropped: still serviceable");
+        st.unref(20);
+        assert!(!st.serviceable(), "last ref dropped: service off at once");
+        st.add_ref();
+        assert!(st.serviceable(), "re-ref re-enables");
+    }
+
+    #[test]
+    fn unref_to_zero_starts_linger_and_expiry_signals_shutdown() {
+        let mut st = MuxState::new(60_000, 0);
+        st.add_ref();
+        assert!(!st.should_exit(u64::MAX), "a held ref never expires");
+        assert_eq!(st.next_deadline(), None, "no linger clock while referenced");
+        st.unref(1_000);
+        assert_eq!(st.next_deadline(), Some(61_000));
+        assert!(!st.should_exit(60_999), "inside the linger window");
+        assert!(st.should_exit(61_000), "linger expiry is the shutdown signal");
+    }
+
+    #[test]
+    fn re_ref_during_linger_cancels_it() {
+        let mut st = MuxState::new(60_000, 0);
+        st.add_ref();
+        st.unref(1_000);
+        assert!(st.lingering());
+        st.add_ref();
+        assert!(!st.lingering(), "a fresh ref cancels the linger clock");
+        assert!(!st.should_exit(u64::MAX));
+        // The next unref restarts the window from ITS moment, not the old one.
+        st.unref(500_000);
+        assert!(!st.should_exit(559_999));
+        assert!(st.should_exit(560_000));
+    }
+
+    #[test]
+    fn zero_linger_exits_immediately_on_unref() {
+        let mut st = MuxState::new(0, 7);
+        assert!(st.should_exit(7), "unreferenced at spawn with no linger");
+        st.add_ref();
+        assert!(!st.should_exit(u64::MAX));
+        st.unref(42);
+        assert!(st.should_exit(42), "POSH_MUX_PERSIST=0: no linger window at all");
+    }
+
+    #[test]
+    fn spawn_starts_an_orphan_linger_clock() {
+        // A daemon whose spawner dies before ever connecting must not idle
+        // forever: the linger clock is armed from construction, and the first
+        // ref (the spawner's, in the normal path) cancels it.
+        let st = MuxState::new(60_000, 100);
+        assert!(!st.should_exit(60_099));
+        assert!(st.should_exit(60_100));
+    }
+
+    #[test]
+    fn ref_unref_cycles_track_refs() {
+        let mut st = MuxState::new(60_000, 0);
+        for round in 0..3u64 {
+            st.add_ref();
+            st.add_ref();
+            st.unref(round);
+            st.unref(round);
+            assert!(!st.serviceable());
+            assert!(st.lingering(), "round {round}: linger armed after each cycle");
+        }
+        // Unref below zero saturates rather than wrapping.
+        st.unref(99);
+        assert_eq!(st.refs(), 0);
+    }
+
+    #[test]
+    fn linger_env_parses_seconds_with_default() {
+        // POSH_MUX_PERSIST is seconds (the POSH_SERVER_*_TMOUT / ssh
+        // ControlPersist convention); internal time is ms. Tested via the pure
+        // predicate, never the process environment.
+        assert_eq!(parse_linger_ms(None), DEFAULT_LINGER_MS);
+        assert_eq!(parse_linger_ms(Some("")), DEFAULT_LINGER_MS);
+        assert_eq!(parse_linger_ms(Some("junk")), DEFAULT_LINGER_MS);
+        assert_eq!(parse_linger_ms(Some("-3")), DEFAULT_LINGER_MS);
+        assert_eq!(parse_linger_ms(Some("0")), 0);
+        assert_eq!(parse_linger_ms(Some("5")), 5_000);
+        assert_eq!(parse_linger_ms(Some(" 120 ")), 120_000);
+    }
 
     /// A private 0700 base dir with a SHORT path (the `agent.rs` `temp_base`
     /// pattern): the scratch `$TMPDIR` is too deep for sun_path, so anchor at
