@@ -946,6 +946,221 @@ fn mux_loop(
     }
 }
 
+// ---------------------------------------------------------------------------
+// The client half (M1 Task 4, design doc "Lifecycle" spawn): ensure the
+// endpoint for a destination — connect-or-spawn, the §6 hello handshake with
+// the variant-socket retry, then hold the invocation's session ref.
+
+/// How long the client waits for the daemon's `MuxHelloAck`. A freshly
+/// spawned daemon answers only after its ssh bootstrap completes, so this
+/// bounds the stall a cold spawn can impose on an invocation before the
+/// per-connection fallback kicks in; a warm endpoint answers at once.
+const HELLO_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(30);
+
+/// Bounded connect-retry budget after a spawn. The socket is bound before
+/// [`run_daemon`] forks (and a lost race means the winner's bind already
+/// happened or is imminent), so the endpoint is normally connectable at
+/// once — the retries cover the narrow window where a racing winner is a
+/// beat away from `bind`, or has just reclaimed a stale socket.
+const CONNECT_ATTEMPTS: u32 = 20;
+const CONNECT_RETRY_DELAY: std::time::Duration = std::time::Duration::from_millis(25);
+
+/// The client's live claim on a mux endpoint: holds the IPC connection
+/// carrying this invocation's `MuxSessionRef` open for the invocation's
+/// lifetime. Drop closes the socket, which IS the unref (daemon-side
+/// auto-unref on disconnect) — there is no explicit release verb, so a
+/// crashed client can never pin the refcount.
+pub struct MuxHandle {
+    /// Held, never read after the handshake: closing it is the unref.
+    _conn: UnixStream,
+    state: MuxConnState,
+    key: String,
+}
+
+#[allow(dead_code)] // consumed by the main.rs invocation seam (M1 Task 4, docs/plans/2026-07-28-mux-endpoint-m1-impl.md)
+impl MuxHandle {
+    /// The endpoint's connection state as reported by its `MuxHelloAck`.
+    pub fn state(&self) -> MuxConnState {
+        self.state
+    }
+
+    /// The destination key the endpoint reported (the variant key when the
+    /// §6 mismatch path was taken).
+    pub fn key(&self) -> &str {
+        &self.key
+    }
+}
+
+/// `[user@]host` split at the LAST `@` (ssh's rule — the same byte
+/// [`bootstrap`](crate::remote::sshwrap::bootstrap)'s fallback host uses).
+/// An empty user (`@host`) counts as absent.
+fn split_dest(dest: &str) -> (Option<&str>, &str) {
+    match dest.rsplit_once('@') {
+        Some(("", host)) => (None, host),
+        Some((user, host)) => (Some(user), host),
+        None => (None, dest),
+    }
+}
+
+/// The §6 stamp-mismatch socket variant: `<key>.<ver>`, with the stamp
+/// rendered slug-safe so the variant stays a single path component. A client
+/// finding an endpoint on a different stamp starts a fresh daemon here and
+/// leaves the old one to drain — never negotiates down.
+fn variant_key(key: &str) -> String {
+    format!("{key}.{}", sanitize_id(MUX_PROTO_STAMP))
+}
+
+/// Ensure a live, stamp-matching mux endpoint for ssh destination `dest`
+/// (`[user@]host`) and claim a session ref on it: computes the destination
+/// key, connects to `mux/<key>.sock` (spawning [`run_daemon`] when absent or
+/// stale; a lost spawn race defers to the winner), performs the hello
+/// handshake — a stamp mismatch retries once on the `<key>.<ver>` variant
+/// socket — and sends `MuxSessionRef`. The returned [`MuxHandle`] must be
+/// held for the invocation's lifetime; dropping it is the unref.
+///
+/// `agent_source` is the invocation's FDR 0004-resolved local agent socket,
+/// inherited by a daemon this call spawns (design doc "Security").
+#[allow(dead_code)] // consumed by the main.rs invocation seam (M1 Task 4, docs/plans/2026-07-28-mux-endpoint-m1-impl.md)
+pub fn ensure_mux(
+    dest: &str,
+    family: Family,
+    port_range: Option<&str>,
+    agent_source: &Path,
+) -> Result<MuxHandle> {
+    let (user, host) = split_dest(dest);
+    let key = dest_key(user, host, family, port_range);
+    let dir = mux_dir()?;
+    let mut spawn = |k: &str| {
+        run_daemon(
+            k,
+            dest,
+            family,
+            port_range.map(str::to_string),
+            agent_source.to_path_buf(),
+        )
+    };
+    ensure_mux_conn(&dir, &key, &mut spawn, HELLO_TIMEOUT)
+}
+
+/// The seam behind [`ensure_mux`]: explicit mux dir and spawn action, so the
+/// whole connect/spawn/hello/variant/ref ladder is tested in-process against
+/// a [`mux_loop`] thread instead of a forked daemon.
+fn ensure_mux_conn(
+    dir: &Path,
+    key: &str,
+    spawn: &mut dyn FnMut(&str) -> Result<MuxSpawn>,
+    hello_timeout: std::time::Duration,
+) -> Result<MuxHandle> {
+    let (stream, ack) = connect_and_hello(dir, key, spawn, hello_timeout)?;
+    if ack.stamp == MUX_PROTO_STAMP {
+        return claim_ref(stream, ack);
+    }
+    // RFC 0011 §6: never negotiate down. The endpoint told us ITS stamp; we
+    // start a fresh daemon on the variant socket and let the old one drain.
+    let variant = variant_key(key);
+    util::log_write(
+        "warn",
+        &format!(
+            "mux endpoint {key} speaks {:?} (ours: {MUX_PROTO_STAMP}); starting variant {variant}",
+            ack.stamp
+        ),
+    );
+    let (stream, ack) = connect_and_hello(dir, &variant, spawn, hello_timeout)?;
+    if ack.stamp != MUX_PROTO_STAMP {
+        return Err(util::Error::Msg(format!(
+            "mux variant endpoint {variant} still speaks {:?} (ours: {MUX_PROTO_STAMP})",
+            ack.stamp
+        )));
+    }
+    claim_ref(stream, ack)
+}
+
+/// One connect-or-spawn + hello round for a single socket name. A failed
+/// connect (absent, refused, stale) triggers exactly one spawn — whose
+/// `AlreadyRunning`/`Spawned` outcomes both mean "a live endpoint is
+/// imminent" — followed by the bounded retry-connect.
+fn connect_and_hello(
+    dir: &Path,
+    key: &str,
+    spawn: &mut dyn FnMut(&str) -> Result<MuxSpawn>,
+    hello_timeout: std::time::Duration,
+) -> Result<(UnixStream, MuxHelloAck)> {
+    let path = mux_socket_path_in(dir, key);
+    let mut stream = match UnixStream::connect(&path) {
+        Ok(s) => s,
+        Err(_) => {
+            spawn(key)?;
+            retry_connect(&path)?
+        }
+    };
+    let ack = hello_handshake(&mut stream, hello_timeout)?;
+    Ok((stream, ack))
+}
+
+/// The bounded post-spawn backoff: [`CONNECT_ATTEMPTS`] tries,
+/// [`CONNECT_RETRY_DELAY`] apart.
+fn retry_connect(path: &Path) -> Result<UnixStream> {
+    let mut last = None;
+    for _ in 0..CONNECT_ATTEMPTS {
+        match UnixStream::connect(path) {
+            Ok(s) => return Ok(s),
+            Err(e) => {
+                last = Some(e);
+                std::thread::sleep(CONNECT_RETRY_DELAY);
+            }
+        }
+    }
+    Err(util::Error::Msg(format!(
+        "mux endpoint never became connectable at {}: {}",
+        path.display(),
+        last.expect("CONNECT_ATTEMPTS > 0")
+    )))
+}
+
+/// Sends `MuxHello` and reads frames (blocking, deadline via the socket read
+/// timeout) until the `MuxHelloAck` arrives. Frames other than the ack are
+/// skipped, mirroring the daemon's forward-compatibility posture.
+fn hello_handshake(
+    stream: &mut UnixStream,
+    timeout: std::time::Duration,
+) -> Result<MuxHelloAck> {
+    use std::io::{Read, Write};
+    let hello = MuxHello {
+        pid: std::process::id(),
+        stamp: MUX_PROTO_STAMP.to_string(),
+    };
+    stream.write_all(&encode_mux_frame(MuxTag::Hello, &hello.encode()))?;
+    stream.set_read_timeout(Some(timeout))?;
+    let mut buf = MuxFrameBuffer::default();
+    loop {
+        while let Some(frame) = buf.next()? {
+            if frame.tag == MuxTag::HelloAck {
+                return MuxHelloAck::decode(&frame.payload)
+                    .ok_or_else(|| util::Error::from("malformed mux hello ack"));
+            }
+        }
+        let mut tmp = [0u8; 256];
+        match stream.read(&mut tmp) {
+            Ok(0) => return Err(util::Error::from("mux endpoint closed during hello")),
+            Ok(n) => buf.feed(&tmp[..n]),
+            Err(e) if e.kind() == std::io::ErrorKind::Interrupted => {}
+            Err(e) => return Err(util::Error::Msg(format!("mux hello read: {e}"))),
+        }
+    }
+}
+
+/// Sends the invocation's `MuxSessionRef` and wraps the connection: from
+/// here the open socket IS the ref.
+fn claim_ref(mut stream: UnixStream, ack: MuxHelloAck) -> Result<MuxHandle> {
+    use std::io::Write;
+    stream.write_all(&encode_mux_frame(MuxTag::SessionRef, b""))?;
+    Ok(MuxHandle {
+        _conn: stream,
+        state: ack.state,
+        key: ack.key,
+    })
+}
+
 /// The local hostname via gethostname(2); `"unknown"` when the call fails or
 /// reports an empty name, so [`client_id`] never yields an empty id.
 fn hostname() -> String {
@@ -1565,6 +1780,193 @@ mod tests {
         let path = mux_socket_path_in(&dir, "example.com-4");
         assert_eq!(path, base.join("mux").join("example.com-4.sock"));
         std::fs::remove_dir_all(&base).ok();
+    }
+
+    // --- The client half (M1 Task 4): ensure_mux over the in-process Task 3
+    // daemon loop — no forking; the spawn seam stands in for run_daemon. ---
+
+    /// Binds `<dir>/<key>.sock` and runs the REAL [`mux_loop`] on a thread
+    /// over a loopback UDP pair whose server half is merely held (the
+    /// daemon's heartbeats go unanswered, which the loop tolerates) — the
+    /// in-process stand-in for [`run_daemon`]'s grandchild.
+    fn start_inprocess_daemon(
+        dir: &Path,
+        key: &str,
+        linger_ms: u64,
+        ports: (u16, u16),
+    ) -> (std::thread::JoinHandle<()>, Connection) {
+        let ukey = crate::remote::crypto::Key::random();
+        let (server_conn, port) = Connection::server(ports, &ukey, Family::Inet).unwrap();
+        let listener = UnixListener::bind(mux_socket_path_in(dir, key)).unwrap();
+        let addr = format!("127.0.0.1:{port}").parse().unwrap();
+        let conn = Connection::client(addr, &ukey).unwrap();
+        let agent = dir.join("no-agent.sock");
+        let key = key.to_string();
+        let handle = std::thread::spawn(move || mux_loop(listener, conn, &agent, linger_ms, &key));
+        (handle, server_conn)
+    }
+
+    /// A hello-completed observer conn for `MuxStatus` queries (holds no ref).
+    fn ipc_observer(path: &Path) -> std::os::unix::net::UnixStream {
+        use std::io::Write;
+        let mut s = std::os::unix::net::UnixStream::connect(path).unwrap();
+        s.set_read_timeout(Some(std::time::Duration::from_secs(8))).unwrap();
+        let hello = MuxHello {
+            pid: 1,
+            stamp: MUX_PROTO_STAMP.to_string(),
+        };
+        s.write_all(&encode_mux_frame(MuxTag::Hello, &hello.encode())).unwrap();
+        assert_eq!(read_client_frame(&mut s).tag, MuxTag::HelloAck);
+        s
+    }
+
+    fn ipc_status(s: &mut std::os::unix::net::UnixStream) -> String {
+        use std::io::Write;
+        s.write_all(&encode_mux_frame(MuxTag::Status, b"")).unwrap();
+        let f = read_client_frame(s);
+        assert_eq!(f.tag, MuxTag::StatusReply);
+        String::from_utf8(f.payload).unwrap()
+    }
+
+    /// Polls `MuxStatus` until the summary contains `needle` (bounded).
+    fn wait_status_contains(s: &mut std::os::unix::net::UnixStream, needle: &str) {
+        let deadline = util::now_ms() + 8_000;
+        loop {
+            let line = ipc_status(s);
+            if line.contains(needle) {
+                return;
+            }
+            assert!(util::now_ms() < deadline, "status never showed {needle:?}: {line:?}");
+            std::thread::sleep(std::time::Duration::from_millis(10));
+        }
+    }
+
+    #[test]
+    fn split_dest_separates_the_optional_user() {
+        assert_eq!(split_dest("example.com"), (None, "example.com"));
+        assert_eq!(split_dest("me@example.com"), (Some("me"), "example.com"));
+        // The LAST @ splits, ssh-style (matches bootstrap's fallback host).
+        assert_eq!(split_dest("u@v@host"), (Some("u@v"), "host"));
+        assert_eq!(split_dest("@host"), (None, "host"));
+    }
+
+    #[test]
+    fn variant_key_appends_the_sanitized_stamp() {
+        // The §6 mismatch path lands on `<key>.<ver>.sock`; the stamp's `/`
+        // renders slug-safe so the variant stays a single path component.
+        assert_eq!(variant_key("example.com-4"), "example.com-4.mux1-1");
+    }
+
+    #[test]
+    fn ensure_mux_spawns_hellos_refs_and_drop_auto_unrefs() {
+        let dir = temp_base();
+        let spawned = std::cell::Cell::new(0u32);
+        let mut daemon = None;
+        let mut server_hold = None;
+        let mut spawn = |k: &str| {
+            spawned.set(spawned.get() + 1);
+            let (h, sc) = start_inprocess_daemon(&dir, k, 2_000, (63450, 63459));
+            daemon = Some(h);
+            server_hold = Some(sc);
+            Ok(MuxSpawn::Spawned)
+        };
+        let timeout = std::time::Duration::from_secs(8);
+
+        // Absent socket: exactly one spawn, then connect + hello + ref.
+        let handle = ensure_mux_conn(&dir, "dest", &mut spawn, timeout).unwrap();
+        assert_eq!(handle.key(), "dest");
+        assert_eq!(handle.state(), MuxConnState::Connected);
+        assert_eq!(spawned.get(), 1, "absent socket: exactly one spawn");
+
+        let mut obs = ipc_observer(&mux_socket_path_in(&dir, "dest"));
+        wait_status_contains(&mut obs, "refs=1 ");
+
+        // A second invocation reuses the live daemon: no new spawn, 2nd ref.
+        let handle2 = ensure_mux_conn(&dir, "dest", &mut spawn, timeout).unwrap();
+        assert_eq!(spawned.get(), 1, "a live daemon is reused, never respawned");
+        wait_status_contains(&mut obs, "refs=2 ");
+
+        // Drop = auto-unref, one handle at a time, observable via MuxStatus.
+        drop(handle2);
+        wait_status_contains(&mut obs, "refs=1 ");
+        drop(handle);
+        wait_status_contains(&mut obs, "refs=0 ");
+
+        drop(obs);
+        daemon.take().unwrap().join().unwrap(); // the 2 s linger expiry exits
+        drop(server_hold);
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    #[test]
+    fn ensure_mux_retries_connect_after_losing_the_spawn_race() {
+        let dir = temp_base();
+        // The spawn seam reports AlreadyRunning (another spawner's bind won)
+        // while the winner is still a beat away from `bind`: the client must
+        // keep retrying within its bounded budget instead of failing on the
+        // first refused connect.
+        let mut pending = None;
+        let mut spawn = |k: &str| {
+            let dir = dir.clone();
+            let k = k.to_string();
+            pending = Some(std::thread::spawn(move || {
+                std::thread::sleep(std::time::Duration::from_millis(120));
+                start_inprocess_daemon(&dir, &k, 1_000, (63460, 63469))
+            }));
+            Ok(MuxSpawn::AlreadyRunning)
+        };
+        let handle =
+            ensure_mux_conn(&dir, "raced", &mut spawn, std::time::Duration::from_secs(8)).unwrap();
+        assert_eq!(handle.key(), "raced");
+        assert_eq!(handle.state(), MuxConnState::Connected);
+        drop(handle);
+        let (daemon, _server) = pending.take().unwrap().join().unwrap();
+        daemon.join().unwrap();
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    #[test]
+    fn stamp_mismatch_starts_the_variant_endpoint() {
+        use std::io::Write;
+        let dir = temp_base();
+        // A live OLD-generation daemon owns the base-key socket: it answers
+        // hello with a foreign stamp and closes, exactly as process_ipc_conn
+        // does on mismatch (answered, then rejected).
+        let old = UnixListener::bind(mux_socket_path_in(&dir, "dest")).unwrap();
+        let old_thread = std::thread::spawn(move || {
+            let (mut s, _) = old.accept().unwrap();
+            s.set_read_timeout(Some(std::time::Duration::from_secs(8))).unwrap();
+            let frame = read_client_frame(&mut s);
+            assert_eq!(frame.tag, MuxTag::Hello);
+            let ack = MuxHelloAck {
+                state: MuxConnState::Draining,
+                stamp: "mux0/9".to_string(),
+                key: "dest".to_string(),
+            };
+            s.write_all(&encode_mux_frame(MuxTag::HelloAck, &ack.encode())).unwrap();
+        });
+        let mut spawned_keys = Vec::new();
+        let mut hold = None;
+        let mut spawn = |k: &str| {
+            spawned_keys.push(k.to_string());
+            hold = Some(start_inprocess_daemon(&dir, k, 1_000, (63470, 63479)));
+            Ok(MuxSpawn::Spawned)
+        };
+        let handle =
+            ensure_mux_conn(&dir, "dest", &mut spawn, std::time::Duration::from_secs(8)).unwrap();
+        // §6: never negotiate down — the fresh endpoint lives on the variant
+        // socket; the old one is left to drain.
+        assert_eq!(spawned_keys, vec![variant_key("dest")], "only the variant spawns");
+        assert_eq!(handle.key(), variant_key("dest"));
+        assert_eq!(handle.state(), MuxConnState::Connected);
+        let mut obs = ipc_observer(&mux_socket_path_in(&dir, &variant_key("dest")));
+        wait_status_contains(&mut obs, "refs=1 ");
+        old_thread.join().unwrap();
+        drop(handle);
+        drop(obs);
+        let (daemon, _server) = hold.take().unwrap();
+        daemon.join().unwrap();
+        std::fs::remove_dir_all(&dir).ok();
     }
 
     #[test]
