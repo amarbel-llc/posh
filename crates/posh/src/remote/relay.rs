@@ -233,6 +233,7 @@ pub(crate) fn run(
     name: &str,
     command: Option<Vec<String>>,
     agent_forward: bool,
+    channels: bool,
 ) -> Result<()> {
     // 1. Handshake: learn the UDP client's terminal size + advertised caps from
     //    its first datagram BEFORE connecting to the daemon, so the daemon Init
@@ -299,10 +300,15 @@ pub(crate) fn run(
     //    server against a FRESH `posh attach` client of the same daemon, reusing
     //    the already-peered `conn`. No flag day — either daemon works.
     match first_daemon_record(&mut link, &mut conn)? {
-        FirstRecord::Frame(frame) => relay_loop(conn, link, (rows, cols), agent, Some(frame)),
+        FirstRecord::Frame(frame) => {
+            // RFC 0011 §6: envelope selected; consumed by the wire-increment
+            // plan's Task 4. Purely additive plumbing until then.
+            let _ = channels;
+            relay_loop(conn, link, (rows, cols), agent, Some(frame))
+        }
         FirstRecord::Output => {
             drop(link); // shed the dead frame-client before the fresh attach
-            fallback_to_server(conn, cfg, name, command, agent, rows, cols)
+            fallback_to_server(conn, cfg, name, command, agent, rows, cols, channels)
         }
         FirstRecord::Closed => Ok(()), // daemon vanished before any content
     }
@@ -447,6 +453,7 @@ fn fallback_to_server(
     agent: Option<AgentEndpoint>,
     rows: u16,
     cols: u16,
+    channels: bool,
 ) -> Result<()> {
     // Inner client argv: attach to the session (already created by
     // connect_or_create). `-g` is omitted for the default group, matching
@@ -476,7 +483,7 @@ fn fallback_to_server(
     }
     let child = pty::spawn_shell(Some(&inner), rows, cols, &shell_env, None)?;
     util::set_nonblocking(child.master)?;
-    server_loop(conn, child, rows, cols, agent);
+    server_loop(conn, child, rows, cols, agent, channels);
     Ok(())
 }
 

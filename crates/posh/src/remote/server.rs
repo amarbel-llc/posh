@@ -103,6 +103,7 @@ pub fn run(
     family: Family,
     command: Option<Vec<String>>,
     agent_forward: bool,
+    channels: bool,
 ) -> Result<()> {
     let Some(conn) = bootstrap_transport(port_range, family)? else {
         return Ok(()); // the detached parent
@@ -142,7 +143,7 @@ pub fn run(
     let child = pty::spawn_shell(command.as_deref(), rows, cols, &shell_env, None)?;
     util::set_nonblocking(child.master)?;
 
-    server_loop(conn, child, rows, cols, agent_endpoint);
+    server_loop(conn, child, rows, cols, agent_endpoint, channels);
     std::process::exit(0);
 }
 
@@ -152,7 +153,12 @@ pub(crate) fn server_loop(
     rows: u16,
     cols: u16,
     mut agent_endpoint: Option<crate::remote::agent::AgentEndpoint>,
+    enveloped: bool,
 ) {
+    // RFC 0011 §6: envelope selected; consumed by the wire-increment plan's
+    // Task 4. Purely additive plumbing until then — a server invoked without
+    // `--channels` is byte-identical to baseline.
+    let _ = enveloped;
     // Optional perf instrumentation (POSH_DEBUG_LOG). run() has already
     // double-forked and redirected stdio to /dev/null, so this file fd is the
     // server's only viable diagnostic sink; inert when the env var is unset.
@@ -1405,7 +1411,7 @@ mod tests {
         let cmd: Vec<String> = vec!["/bin/sh".into(), "-c".into(), "read x; exit 0".into()];
         let child = crate::pty::spawn_shell(Some(&cmd), 24, 80, &[], None).unwrap();
         util::set_nonblocking(child.master).unwrap();
-        let server = std::thread::spawn(move || server_loop(server_conn, child, 24, 80, None));
+        let server = std::thread::spawn(move || server_loop(server_conn, child, 24, 80, None, false));
 
         let addr = format!("127.0.0.1:{port}").parse().unwrap();
         let mut conn = Connection::client(addr, &key).unwrap();
@@ -1476,7 +1482,7 @@ mod tests {
         let cmd: Vec<String> = vec!["/bin/sh".into(), "-c".into(), "sleep 600".into()];
         let child = crate::pty::spawn_shell(Some(&cmd), 24, 80, &[], None).unwrap();
         util::set_nonblocking(child.master).unwrap();
-        let server = std::thread::spawn(move || server_loop(server_conn, child, 24, 80, None));
+        let server = std::thread::spawn(move || server_loop(server_conn, child, 24, 80, None, false));
 
         let addr = format!("127.0.0.1:{port}").parse().unwrap();
         let mut conn = Connection::client(addr, &key).unwrap();
@@ -1544,7 +1550,7 @@ mod tests {
         let cmd: Vec<String> = vec!["/bin/sh".into(), "-c".into(), "sleep 600".into()];
         let child = crate::pty::spawn_shell(Some(&cmd), 24, 80, &[], None).unwrap();
         util::set_nonblocking(child.master).unwrap();
-        let server = std::thread::spawn(move || server_loop(server_conn, child, 24, 80, None));
+        let server = std::thread::spawn(move || server_loop(server_conn, child, 24, 80, None, false));
 
         let addr = format!("127.0.0.1:{port}").parse().unwrap();
         let mut conn = Connection::client(addr, &key).unwrap();
@@ -1638,7 +1644,7 @@ mod tests {
         let cmd: Vec<String> = vec!["/bin/sh".into(), "-c".into(), "sleep 600".into()];
         let child = crate::pty::spawn_shell(Some(&cmd), 24, 80, &[], None).unwrap();
         util::set_nonblocking(child.master).unwrap();
-        let server = std::thread::spawn(move || server_loop(server_conn, child, 24, 80, None));
+        let server = std::thread::spawn(move || server_loop(server_conn, child, 24, 80, None, false));
 
         let addr = format!("127.0.0.1:{port}").parse().unwrap();
         let mut conn = Connection::client(addr, &key).unwrap();
@@ -1739,7 +1745,7 @@ mod tests {
         let cmd: Vec<String> = vec!["/bin/sh".into(), "-c".into(), "echo resync; sleep 600".into()];
         let child = crate::pty::spawn_shell(Some(&cmd), 24, 80, &[], None).unwrap();
         util::set_nonblocking(child.master).unwrap();
-        let server = std::thread::spawn(move || server_loop(server_conn, child, 24, 80, None));
+        let server = std::thread::spawn(move || server_loop(server_conn, child, 24, 80, None, false));
 
         let addr = format!("127.0.0.1:{port}").parse().unwrap();
         let mut conn = Connection::client(addr, &key).unwrap();
@@ -1835,7 +1841,7 @@ mod tests {
         ];
         let child = crate::pty::spawn_shell(Some(&cmd), 24, 80, &[], None).unwrap();
         util::set_nonblocking(child.master).unwrap();
-        let server = std::thread::spawn(move || server_loop(server_conn, child, 24, 80, None));
+        let server = std::thread::spawn(move || server_loop(server_conn, child, 24, 80, None, false));
 
         let addr = format!("127.0.0.1:{port}").parse().unwrap();
         let mut conn = Connection::client(addr, &key).unwrap();
@@ -1997,7 +2003,7 @@ mod tests {
             vec!["/bin/sh".into(), "-c".into(), "stty -echo; exec cat".into()];
         let child = crate::pty::spawn_shell(Some(&cmd), 24, 80, &[], None).unwrap();
         util::set_nonblocking(child.master).unwrap();
-        let server = std::thread::spawn(move || server_loop(server_conn, child, 24, 80, None));
+        let server = std::thread::spawn(move || server_loop(server_conn, child, 24, 80, None, false));
 
         let addr = format!("127.0.0.1:{port}").parse().unwrap();
         let mut conn = Connection::client(addr, &key).unwrap();
@@ -2302,7 +2308,7 @@ mod tests {
         let child = crate::pty::spawn_shell(Some(&cmd), 24, 80, &[], None).unwrap();
         util::set_nonblocking(child.master).unwrap();
         let server = std::thread::spawn(move || {
-            server_loop(server_conn, child, 24, 80, Some(endpoint));
+            server_loop(server_conn, child, 24, 80, Some(endpoint), false);
         });
 
         // (3) Test-as-client: pump the transport + the agent proxy until the
@@ -2537,7 +2543,7 @@ mod tests {
         let child = crate::pty::spawn_shell(Some(&cmd), 24, 80, &[], None).unwrap();
         util::set_nonblocking(child.master).unwrap();
         let server = std::thread::spawn(move || {
-            server_loop(server_conn, child, 24, 80, Some(endpoint));
+            server_loop(server_conn, child, 24, 80, Some(endpoint), false);
         });
 
         // (4) Client transport pump whose proxy dials the REAL ssh-agent.
@@ -2838,7 +2844,7 @@ mod tests {
         let child = crate::pty::spawn_shell(Some(&cmd), 24, 80, &[], None).unwrap();
         util::set_nonblocking(child.master).unwrap();
         let server = std::thread::spawn(move || {
-            server_loop(server_conn, child, 24, 80, Some(endpoint));
+            server_loop(server_conn, child, 24, 80, Some(endpoint), false);
         });
 
         // The pump, with a roam trigger wired in.

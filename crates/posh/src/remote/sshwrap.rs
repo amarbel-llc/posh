@@ -24,6 +24,9 @@ pub struct SshOptions {
     /// ssh use its own default/config. Orthogonal to `agent_source`, which is
     /// posh's own transport-level forwarding to the roaming session.
     pub real_ssh_agent_forward: Option<bool>,
+    /// RFC 0011 §6 — selects the channel-envelope protocol on the remote
+    /// invocation; default off until the mux endpoint exists.
+    pub channels: bool,
 }
 
 /// What the wrapped server reported on stdout.
@@ -108,6 +111,11 @@ pub fn remote_command(
     if opts.agent_source.is_some() {
         cmd.push_str(" -A");
     }
+    // RFC 0011 §6: the envelope is selected out of band, by explicit argument
+    // on the bootstrap invocation; a server invoked without it speaks baseline.
+    if opts.channels {
+        cmd.push_str(" --channels");
+    }
     match opts.family {
         Family::Inet => cmd.push_str(" -4"),
         Family::Inet6 => cmd.push_str(" -6"),
@@ -126,6 +134,23 @@ pub fn remote_command(
         }
     }
     cmd
+}
+
+/// RFC 0011 §6 local selection: the client opts into the channel-envelope
+/// protocol via `POSH_CHANNELS` ("1"/"true"/"on"/"yes", case-insensitive);
+/// absent or anything else means baseline. Default OFF until the mux endpoint
+/// exists.
+pub fn channels_selected() -> bool {
+    std::env::var("POSH_CHANNELS")
+        .map(|v| channels_value_on(&v))
+        .unwrap_or(false)
+}
+
+/// The `POSH_CHANNELS` value predicate, factored out of [`channels_selected`]
+/// so it can be unit-tested without touching the (global, test-racy) process
+/// environment.
+fn channels_value_on(v: &str) -> bool {
+    matches!(v.to_ascii_lowercase().as_str(), "1" | "true" | "on" | "yes")
 }
 
 /// True for an env-var name safe to splice into a POSIX-sh assignment: only
@@ -231,7 +256,7 @@ pub fn run(target: &str, remote_cmd: &[String], opts: &SshOptions) -> Result<()>
     let fallback = target.rsplit('@').next().unwrap_or(target).to_string();
     let host = report.ip.unwrap_or(fallback);
     std::env::set_var("POSH_KEY", key);
-    crate::remote::client::run(&host, port, opts.family, opts.agent_source.clone())
+    crate::remote::client::run(&host, port, opts.family, opts.agent_source.clone(), opts.channels)
 }
 
 /// #67: create-or-ensure a DETACHED session on the remote host and return,
@@ -379,6 +404,7 @@ mod tests {
             port_range: None,
             agent_source: None,
             real_ssh_agent_forward: None,
+            channels: false,
         };
         // New contract (RFC 0008 §3): the caller owns the `--`; the legacy tail
         // leads with it, then the shell-quoted inner argv. Byte-identical output.
@@ -425,6 +451,7 @@ mod tests {
             port_range: Some("60100:60200".to_string()),
             agent_source: None,
             real_ssh_agent_forward: None,
+            channels: false,
         };
         let locale = vec![("LANG".to_string(), "en_US.UTF-8".to_string())];
         // The bare-host tail now carries its own leading `--` (caller-owned).
@@ -444,6 +471,7 @@ mod tests {
                 port_range: None,
                 agent_source: None,
                 real_ssh_agent_forward: None,
+                channels: false,
             },
             &[],
             &[],
@@ -463,6 +491,7 @@ mod tests {
             port_range: None,
             agent_source: None,
             real_ssh_agent_forward: None,
+            channels: false,
         };
         let tail: Vec<String> = ["relay", "-g", "grp", "dev", "--", "htop"]
             .iter()
@@ -482,6 +511,7 @@ mod tests {
             port_range: None,
             agent_source: None,
             real_ssh_agent_forward: None,
+            channels: false,
         };
         let tail: Vec<String> = ["relay", "dev"].iter().map(|s| s.to_string()).collect();
         assert_eq!(remote_command(&opts, &tail, &[]), "posh-server new 'relay' 'dev'");
@@ -496,6 +526,7 @@ mod tests {
             port_range: Some("60001:60999".to_string()),
             agent_source: Some("/run/user/1000/agent.sock".into()),
             real_ssh_agent_forward: None,
+            channels: false,
         };
         let tail: Vec<String> = ["relay", "-g", "grp", "dev"]
             .iter()
@@ -519,6 +550,7 @@ mod tests {
             port_range: Some("60001:60999".to_string()),
             agent_source: Some("/run/user/1000/agent.sock".into()),
             real_ssh_agent_forward: None,
+            channels: false,
         };
         let cmd = remote_command(&opts, &[], &[]);
         assert_eq!(cmd, "posh-server new -A -4 -p 60001:60999");
@@ -530,8 +562,56 @@ mod tests {
             port_range: None,
             agent_source: None,
             real_ssh_agent_forward: None,
+            channels: false,
         };
         assert_eq!(remote_command(&off, &[], &[]), "posh-server new");
+    }
+
+    #[test]
+    fn remote_command_carries_channels_flag_only_when_selected() {
+        // RFC 0011 §6: the client selects the channel-envelope protocol out of
+        // band by appending `--channels` to the bootstrap invocation; a server
+        // invoked without it speaks the baseline protocol.
+        let on = SshOptions {
+            family: Family::Auto,
+            port_range: None,
+            agent_source: None,
+            real_ssh_agent_forward: None,
+            channels: true,
+        };
+        let cmd = remote_command(&on, &[], &[]);
+        assert!(cmd.contains(" --channels"), "flag missing: {cmd}");
+        assert_eq!(cmd, "posh-server new --channels");
+
+        let off = SshOptions {
+            family: Family::Auto,
+            port_range: None,
+            agent_source: None,
+            real_ssh_agent_forward: None,
+            channels: false,
+        };
+        let cmd = remote_command(&off, &[], &[]);
+        assert!(!cmd.contains("--channels"), "flag must be absent: {cmd}");
+    }
+
+    #[test]
+    fn channels_value_predicate_parses_opt_in_values() {
+        // POSH_CHANNELS opt-in values (RFC 0011 §6 local selection). The string
+        // predicate is tested directly — not via process env, which is global
+        // and racy under parallel tests.
+        assert!(channels_value_on("1"));
+        assert!(channels_value_on("true"));
+        assert!(channels_value_on("TRUE"));
+        assert!(channels_value_on("on"));
+        assert!(channels_value_on("On"));
+        assert!(channels_value_on("yes"));
+        assert!(channels_value_on("YES"));
+        assert!(!channels_value_on(""));
+        assert!(!channels_value_on("0"));
+        assert!(!channels_value_on("false"));
+        assert!(!channels_value_on("off"));
+        assert!(!channels_value_on("no"));
+        assert!(!channels_value_on("maybe"));
     }
 
     #[test]
@@ -563,6 +643,7 @@ mod tests {
             port_range: None,
             agent_source: None,
             real_ssh_agent_forward: None,
+            channels: false,
         };
         let env = vec![
             ("TERM".to_string(), "xterm-kitty".to_string()),

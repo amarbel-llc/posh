@@ -571,6 +571,7 @@ pub fn run(
     port: u16,
     family: Family,
     agent_source: Option<std::path::PathBuf>,
+    channels: bool,
 ) -> Result<()> {
     util::check_utf8_locale("posh-client")?;
 
@@ -621,6 +622,7 @@ pub fn run(
         addr.port(),
         agent_source,
         host,
+        channels,
     );
     write_display_control("rmcup (exit)", &display::close());
     drop(raw);
@@ -844,7 +846,12 @@ fn client_loop(
     port: u16,
     agent_source: Option<std::path::PathBuf>,
     host: &str,
+    enveloped: bool,
 ) -> Result<i32> {
+    // RFC 0011 §6: envelope selected; consumed by the wire-increment plan's
+    // Task 4. Purely additive plumbing until then — a connection without the
+    // selection is byte-identical to baseline.
+    let _ = enveloped;
     util::set_nonblocking(STDIN)?;
 
     let (rows, cols) = pty::term_size(STDOUT);
@@ -3210,7 +3217,7 @@ mod tests {
         let child = crate::pty::spawn_shell(Some(&cmd), 24, 80, &[], None).unwrap();
         util::set_nonblocking(child.master).unwrap();
         let server = std::thread::spawn(move || {
-            crate::remote::server::server_loop(server_conn, child, 24, 80, None)
+            crate::remote::server::server_loop(server_conn, child, 24, 80, None, false)
         });
 
         let addr = format!("127.0.0.1:{port}").parse().unwrap();

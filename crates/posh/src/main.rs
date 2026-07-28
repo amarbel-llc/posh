@@ -272,6 +272,8 @@ fn cmd_server(args: &[String]) -> Result<()> {
     // the policy stays client-side; the server only learns the outcome). The
     // server then stands up the agent endpoint and exports SSH_AUTH_SOCK.
     let mut agent_forward = false;
+    // RFC 0011 §6: `--channels` selects the channel-envelope protocol.
+    let mut channels = false;
     let mut i = 0;
     while i < rest.len() {
         match rest[i].as_str() {
@@ -290,12 +292,19 @@ fn cmd_server(args: &[String]) -> Result<()> {
                 agent_forward = true;
                 i += 1;
             }
+            // RFC 0011 §6: the client selected the channel-envelope protocol
+            // out of band on the bootstrap invocation. Without this flag the
+            // server speaks the baseline (unenveloped) protocol.
+            "--channels" => {
+                channels = true;
+                i += 1;
+            }
             // The single-model frame relay bootstrap (RFC 0008 §3): flags
             // always precede the `relay` verb, so port_range/family/agent_forward
             // are fully parsed by the time we branch. Everything after `relay` is
             // the relay verb's own `-g GROUP SESSION [-- cmd]`.
             "relay" => {
-                return cmd_server_relay(&rest[i + 1..], port_range, family, agent_forward);
+                return cmd_server_relay(&rest[i + 1..], port_range, family, agent_forward, channels);
             }
             "--" => {
                 let cmd: Vec<String> = rest[i + 1..].to_vec();
@@ -305,7 +314,7 @@ fn cmd_server(args: &[String]) -> Result<()> {
             other => return Err(Error::Msg(format!("unknown server option {other}"))),
         }
     }
-    remote::server::run(port_range, family, command, agent_forward)
+    remote::server::run(port_range, family, command, agent_forward, channels)
 }
 
 /// The `relay` server verb (RFC 0008 §3): the single-model frame relay. Parses
@@ -319,6 +328,7 @@ fn cmd_server_relay(
     port_range: Option<(u16, u16)>,
     family: Family,
     agent_forward: bool,
+    channels: bool,
 ) -> Result<()> {
     let mut group = "default".to_string();
     let mut session: Option<String> = None;
@@ -355,7 +365,7 @@ fn cmd_server_relay(
         return Ok(()); // the detached parent
     };
     let cfg = Config::new(&group)?;
-    remote::relay::run(conn, &cfg, &session, command, agent_forward)
+    remote::relay::run(conn, &cfg, &session, command, agent_forward, channels)
 }
 
 fn parse_port_range(s: &str) -> Result<(u16, u16)> {
@@ -396,8 +406,9 @@ fn cmd_client(args: &[String]) -> Result<()> {
     };
     // The raw `posh client` subcommand carries no forwarding policy (it's the
     // low-level transport entrypoint); agent forwarding is resolved on the
-    // `posh host:session` path. Off here.
-    remote::client::run(host, port, family, None)
+    // `posh host:session` path. Off here. No bootstrap either, so no channel
+    // selection (RFC 0011 §6) — baseline.
+    remote::client::run(host, port, family, None, false)
 }
 
 /// `posh [user@]host:[group/]session` (RFC 0001 §2): attach to (creating
@@ -445,6 +456,7 @@ fn cmd_ssh_session(
             port_range: None,
             agent_source: None,
             real_ssh_agent_forward: None,
+            channels: remote::sshwrap::channels_selected(),
         };
         return remote::sshwrap::run_detached(&dest, &inner, &opts);
     }
@@ -455,6 +467,7 @@ fn cmd_ssh_session(
         port_range: None,
         agent_source: resolve_agent_source(forward_flag),
         real_ssh_agent_forward: None,
+        channels: remote::sshwrap::channels_selected(),
     };
     // Bootstrap selection (RFC 0008 §3): the single-model relay by default;
     // `POSH_RELAY=0` forces the legacy Architecture-A inner-`posh attach`
@@ -722,6 +735,7 @@ fn cmd_ssh(args: &[String], forward: Option<&remote::agent::ForwardFlag>) -> Res
         port_range,
         agent_source: forward.and_then(resolve_agent_source),
         real_ssh_agent_forward: Some(resolve_real_ssh_agent_forward(real_ssh_agent_forward)),
+        channels: remote::sshwrap::channels_selected(),
     };
     // The server tail is caller-owned now (RFC 0008 §3): a bare host runs
     // `posh-server new [flags]` with `-- command...` only when a command was
