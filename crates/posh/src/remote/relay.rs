@@ -1780,6 +1780,298 @@ mod tests {
         relay.join().unwrap().unwrap();
     }
 
+    /// The ENVELOPED mirror of `relay_bridges_frames_acks_and_input_over_udp`
+    /// (RFC 0011 conformance for the relay lane): the same real `relay_loop`
+    /// between a synthetic lossy daemon and a synthetic UDP client, but with
+    /// `enveloped: true` and a LIVE agent endpoint. Asserts the frame/ack/
+    /// input bridge works behind the §2 envelope, that a forwarded agent
+    /// connection round-trips request→reply through the relay on an
+    /// `agent`-kind channel (§5), and that no relay frame carries the retired
+    /// capability ids 6/7/8 (§7).
+    #[test]
+    fn enveloped_relay_bridges_frames_input_and_agent_channels() {
+        use crate::remote::agent::{AgentChannelMux, AgentClient};
+        use std::io::Read as _;
+        use std::os::unix::net::UnixListener;
+        use std::path::PathBuf;
+
+        let (rows, cols) = (24u16, 80u16);
+        const AGENT_REQUEST: &[u8] = b"AGENT-REQUEST-PING";
+        const AGENT_REPLY: &[u8] = b"AGENT-REPLY-PONG";
+
+        // A live agent endpoint under a SHORT /tmp base (SUN_LEN); the
+        // test-as-consumer dials its well-known agent/sock, exactly what a
+        // forwarded `git push` would use as SSH_AUTH_SOCK.
+        let pid = std::process::id();
+        let base = PathBuf::from(format!("/tmp/posh-envrelay-{pid}"));
+        std::fs::remove_dir_all(&base).ok();
+        std::os::unix::fs::DirBuilderExt::mode(std::fs::DirBuilder::new().recursive(true), 0o700)
+            .create(&base)
+            .unwrap();
+        let endpoint = AgentEndpoint::new(&base).unwrap();
+        let agent_sock = endpoint.sock_path().to_path_buf();
+        // The fake LOCAL agent behind the client-side proxy.
+        let fake_sock = PathBuf::from(format!("/tmp/posh-envrelay-agt-{pid}.sock"));
+        std::fs::remove_file(&fake_sock).ok();
+        let fake_listener = UnixListener::bind(&fake_sock).unwrap();
+        fake_listener.set_nonblocking(true).unwrap();
+
+        // UDP loopback transport.
+        let key = Key::random();
+        let (relay_conn, port) = Connection::server((62700, 62799), &key, Family::Inet).unwrap();
+        let addr = format!("127.0.0.1:{port}").parse().unwrap();
+        let mut client_conn = Connection::client(addr, &key).unwrap();
+
+        let (relay_end, daemon_end) = UnixStream::pair().unwrap();
+        relay_end.set_nonblocking(true).unwrap();
+        daemon_end.set_nonblocking(true).unwrap();
+        let mut link = DaemonLink {
+            stream: relay_end,
+            read: FrameBuffer::new(),
+            write: Vec::new(),
+            frame_offset: 0,
+        };
+        ipc::append_frame(
+            &mut link.write,
+            Tag::Init,
+            &init_payload(rows, cols, &content_caps(&[])),
+        );
+        ipc::append_frame(&mut link.write, Tag::Resize, &ipc::encode_resize(rows, cols));
+
+        let relay = std::thread::spawn(move || {
+            relay_loop(relay_conn, link, (rows, cols), Some(endpoint), None, true)
+        });
+
+        // --- synthetic UDP client state (drive_client's enveloped mirror) ---
+        let mut client_term = Terminal::with_scrollback(rows, cols, 0);
+        let mut applier = FrameSync::DumpDiff.applier();
+        let mut applied_data: Vec<u8> = Vec::new();
+        let mut applied_num = 0u64;
+        let mut acked_frame = 0u64;
+        let mut input_acked = 0u64;
+        let mut outbox = InputOutbox::new();
+        outbox.push(b"hi\n");
+        let mut saw_full = false;
+        let mut saw_diff = false;
+        let mut seen_cap_ids: Vec<u8> = Vec::new();
+        let mut agent_mux = AgentChannelMux::new_client();
+        let mut proxy = AgentClient::new(fake_sock.clone());
+
+        // --- synthetic daemon state ---
+        let mut dterm = Terminal::with_scrollback(rows, cols, 1000);
+        fill_screen(&mut dterm);
+        let mut dprod = FrameProducer::new(rows, cols);
+        let mut dread = FrameBuffer::new();
+        let mut daemon_input: Vec<u8> = Vec::new();
+        let mut sent_full = false;
+        let mut sent_diff = false;
+
+        let mut fragmenter = Fragmenter::new();
+        let mut assembly = FragmentAssembly::new();
+
+        // The agent consumer dials the endpoint's well-known sock (claimed at
+        // construction, so connectable as soon as the listener backlog is up)
+        // and sends its request; the reply must come back through the whole
+        // enveloped path.
+        let consumer_deadline = now_ms() + 5_000;
+        let mut consumer = loop {
+            if let Ok(s) = UnixStream::connect(&agent_sock) {
+                break s;
+            }
+            assert!(now_ms() < consumer_deadline, "agent/sock never became connectable");
+            std::thread::sleep(Duration::from_millis(20));
+        };
+        consumer.write_all(AGENT_REQUEST).unwrap();
+        consumer.set_nonblocking(true).unwrap();
+        let mut fake_agent_side: Option<UnixStream> = None;
+        let mut fake_request: Vec<u8> = Vec::new();
+        let mut fake_replied = false;
+        let mut agent_reply: Vec<u8> = Vec::new();
+
+        let mut shutting = false;
+        let mut done = false;
+        let deadline = now_ms() + 15_000;
+        while now_ms() < deadline {
+            // client -> relay: the session message, sealed on its channel.
+            let flags = if shutting { sync::CLIENT_FLAG_SHUTDOWN } else { 0 };
+            let msg = ClientMessage {
+                flags,
+                caps: caps::own_table(&[]),
+                acked_frame,
+                rows,
+                cols,
+                input_base: outbox.base(),
+                input: outbox.pending().to_vec(),
+            };
+            let encoded = msg.encode();
+            let wire = channel::seal_instruction(true, &encoded);
+            for frag in fragmenter.make_fragments(&wire, sync::FRAGMENT_CONTENTS_MAX) {
+                client_conn.send(&frag.to_bytes()).unwrap();
+            }
+            // The client half of the agent path (mirrors drive_client):
+            // local-agent reads onto the mux, then drain its due instructions.
+            agent_mux.queue_records(&proxy.read_channels());
+            for (chan, payload) in agent_mux.outgoing(now_ms(), 50) {
+                let awire = channel::seal_on(true, chan, &payload);
+                for frag in fragmenter.make_fragments(&awire, sync::FRAGMENT_CONTENTS_MAX) {
+                    client_conn.send(&frag.to_bytes()).unwrap();
+                }
+            }
+
+            std::thread::sleep(Duration::from_millis(20));
+
+            // relay -> client: dispatch instructions by channel kind.
+            loop {
+                match client_conn.recv() {
+                    Ok(Some(payload)) => {
+                        let Ok(frag) = sync::Fragment::from_bytes(&payload) else {
+                            continue;
+                        };
+                        let Some(assembled) = assembly.add(frag) else {
+                            continue;
+                        };
+                        let Some((chan, message)) =
+                            channel::open_any_instruction(true, &assembled)
+                        else {
+                            continue;
+                        };
+                        if chan.kind() == channel::KIND_AGENT {
+                            let recs = agent_mux.on_instruction(chan, message);
+                            let replies = proxy.apply_records(&recs);
+                            agent_mux.queue_records(&replies);
+                            continue;
+                        }
+                        let Ok(frame) = ServerFrame::decode(message) else {
+                            continue;
+                        };
+                        for cap in &frame.caps {
+                            if !seen_cap_ids.contains(&cap.id) {
+                                seen_cap_ids.push(cap.id);
+                            }
+                        }
+                        input_acked = input_acked.max(frame.input_ack);
+                        outbox.ack(input_acked);
+                        match &frame.body {
+                            FrameBody::Full(_) => saw_full = true,
+                            FrameBody::Diff { .. } => saw_diff = true,
+                            _ => {}
+                        }
+                        match applier.apply(
+                            rows,
+                            cols,
+                            &applied_data,
+                            &mut client_term,
+                            &frame.body,
+                        ) {
+                            ApplyOutcome::Advanced { dump } => {
+                                applied_data = dump;
+                                applied_num = frame.frame_num;
+                            }
+                            ApplyOutcome::AdvancedNoDump => applied_num = frame.frame_num,
+                            ApplyOutcome::NoChange | ApplyOutcome::ReackAndWait => {}
+                        }
+                        acked_frame = acked_frame.max(applied_num);
+                    }
+                    Ok(None) => continue,
+                    Err(e) if e.kind() == std::io::ErrorKind::WouldBlock => break,
+                    Err(_) => break,
+                }
+            }
+
+            // The fake local agent: accept the proxy's dial, then answer the
+            // forwarded request with the canned reply.
+            if fake_agent_side.is_none() {
+                if let Ok((s, _)) = fake_listener.accept() {
+                    s.set_nonblocking(true).unwrap();
+                    fake_agent_side = Some(s);
+                }
+            }
+            if let Some(s) = fake_agent_side.as_mut() {
+                let mut buf = [0u8; 256];
+                if let Ok(n) = s.read(&mut buf) {
+                    fake_request.extend_from_slice(&buf[..n]);
+                }
+                if !fake_replied && fake_request == AGENT_REQUEST {
+                    s.write_all(AGENT_REPLY).unwrap();
+                    fake_replied = true;
+                }
+            }
+            // The consumer end: collect the reply relayed back through the
+            // endpoint's socket.
+            {
+                let mut buf = [0u8; 256];
+                if let Ok(n) = consumer.read(&mut buf) {
+                    agent_reply.extend_from_slice(&buf[..n]);
+                }
+            }
+
+            // daemon side: read what the relay forwarded to us.
+            let _ = dread.read_from(daemon_end.as_raw_fd());
+            while let Ok(Some(frame)) = dread.next() {
+                match frame.tag {
+                    Tag::Input => daemon_input.extend_from_slice(&frame.payload),
+                    Tag::FrameAck => {
+                        if let Some((acked, _flags)) = ipc::decode_frame_ack(&frame.payload) {
+                            dprod.ack(acked);
+                        }
+                    }
+                    _ => {}
+                }
+            }
+            if !sent_full && !daemon_input.is_empty() {
+                write_daemon_frame(&daemon_end, &mut dprod, &dterm);
+                sent_full = true;
+            }
+            if sent_full && !sent_diff && dprod.acked_num() >= 1 {
+                dterm.process(b"edit ");
+                write_daemon_frame(&daemon_end, &mut dprod, &dterm);
+                sent_diff = true;
+            }
+
+            let converged = Snapshot::from_term(&client_term) == Snapshot::from_term(&dterm);
+            if sent_diff
+                && applied_num >= 2
+                && saw_full
+                && saw_diff
+                && converged
+                && daemon_input == b"hi\n"
+                && agent_reply == AGENT_REPLY
+            {
+                if shutting {
+                    done = true;
+                    break;
+                }
+                // Fully converged: request shutdown, then loop once more so
+                // the relay sees the flag and winds down.
+                shutting = true;
+            }
+        }
+
+        assert!(
+            done,
+            "enveloped relay did not converge: saw_full={saw_full} saw_diff={saw_diff} \
+             applied_num={applied_num} daemon_input={daemon_input:?} \
+             agent_reply={agent_reply:?} converged={}",
+            Snapshot::from_term(&client_term) == Snapshot::from_term(&dterm)
+        );
+        assert_eq!(daemon_input, b"hi\n", "typed input must reach the daemon");
+        assert_eq!(
+            agent_reply, AGENT_REPLY,
+            "the agent reply must round-trip through the relay's agent channel"
+        );
+        for id in [CAP_AGENT_FORWARD, CAP_AGENT_DATA, CAP_AGENT_ACK] {
+            assert!(
+                !seen_cap_ids.contains(&id),
+                "retired cap id {id} rode an enveloped relay frame (RFC 0011 §7); \
+                 saw {seen_cap_ids:?}"
+            );
+        }
+
+        relay.join().unwrap().unwrap();
+        std::fs::remove_dir_all(&base).ok();
+        std::fs::remove_file(&fake_sock).ok();
+    }
+
     // ---- 3.1b reliability: loss / roam / resync / heartbeat ----------------
 
     /// A loopback rig for the reliability tests: a real `relay_loop` thread
