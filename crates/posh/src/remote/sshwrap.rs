@@ -142,14 +142,16 @@ pub fn remote_command(
 /// exists.
 pub fn channels_selected() -> bool {
     std::env::var("POSH_CHANNELS")
-        .map(|v| channels_value_on(&v))
+        .map(|v| env_value_on(&v))
         .unwrap_or(false)
 }
 
-/// The `POSH_CHANNELS` value predicate, factored out of [`channels_selected`]
+/// The shared truthy-env predicate ("1"/"true"/"on"/"yes", case-insensitive)
+/// behind [`channels_selected`] (`POSH_CHANNELS`) and
+/// [`mux_selected`](crate::remote::mux::mux_selected) (`POSH_MUX`), factored
 /// so it can be unit-tested without touching the (global, test-racy) process
 /// environment.
-fn channels_value_on(v: &str) -> bool {
+pub(crate) fn env_value_on(v: &str) -> bool {
     matches!(v.to_ascii_lowercase().as_str(), "1" | "true" | "on" | "yes")
 }
 
@@ -613,22 +615,22 @@ mod tests {
 
     #[test]
     fn channels_value_predicate_parses_opt_in_values() {
-        // POSH_CHANNELS opt-in values (RFC 0011 §6 local selection). The string
-        // predicate is tested directly — not via process env, which is global
-        // and racy under parallel tests.
-        assert!(channels_value_on("1"));
-        assert!(channels_value_on("true"));
-        assert!(channels_value_on("TRUE"));
-        assert!(channels_value_on("on"));
-        assert!(channels_value_on("On"));
-        assert!(channels_value_on("yes"));
-        assert!(channels_value_on("YES"));
-        assert!(!channels_value_on(""));
-        assert!(!channels_value_on("0"));
-        assert!(!channels_value_on("false"));
-        assert!(!channels_value_on("off"));
-        assert!(!channels_value_on("no"));
-        assert!(!channels_value_on("maybe"));
+        // POSH_CHANNELS opt-in values (RFC 0011 §6 local selection), via the
+        // shared truthy predicate. The string predicate is tested directly —
+        // not via process env, which is global and racy under parallel tests.
+        assert!(env_value_on("1"));
+        assert!(env_value_on("true"));
+        assert!(env_value_on("TRUE"));
+        assert!(env_value_on("on"));
+        assert!(env_value_on("On"));
+        assert!(env_value_on("yes"));
+        assert!(env_value_on("YES"));
+        assert!(!env_value_on(""));
+        assert!(!env_value_on("0"));
+        assert!(!env_value_on("false"));
+        assert!(!env_value_on("off"));
+        assert!(!env_value_on("no"));
+        assert!(!env_value_on("maybe"));
     }
 
     #[test]

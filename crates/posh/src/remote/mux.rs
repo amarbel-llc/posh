@@ -90,6 +90,19 @@ pub fn client_id() -> String {
     }
 }
 
+/// The M1 rollout gate (impl plan "Rollback"): `POSH_MUX` opts an invocation
+/// into the per-destination mux endpoint; default OFF until promotion, and
+/// the single switch — off means no mux spawn and sessions keep their own
+/// forwarding. Truthy values are the shared
+/// [`env_value_on`](crate::remote::sshwrap::env_value_on) set, the same
+/// spellings `POSH_CHANNELS` accepts.
+#[allow(dead_code)] // consumed by the main.rs invocation seam (M1 Task 4, docs/plans/2026-07-28-mux-endpoint-m1-impl.md)
+pub fn mux_selected() -> bool {
+    std::env::var("POSH_MUX")
+        .map(|v| crate::remote::sshwrap::env_value_on(&v))
+        .unwrap_or(false)
+}
+
 /// Maps every byte outside `[A-Za-z0-9._-]` to `-`. The one sanitizer behind
 /// both [`dest_key`] and [`client_id`], pure so it is testable without env
 /// mutation.
@@ -1545,6 +1558,20 @@ mod tests {
         let path = mux_socket_path_in(&dir, "example.com-4");
         assert_eq!(path, base.join("mux").join("example.com-4.sock"));
         std::fs::remove_dir_all(&base).ok();
+    }
+
+    #[test]
+    fn posh_mux_accepts_the_shared_truthy_values() {
+        use crate::remote::sshwrap::env_value_on;
+        // POSH_MUX rides the same factored predicate as POSH_CHANNELS (no env
+        // mutation: the string predicate is pinned directly); the gate is
+        // default-off, so everything outside the truthy set stays off.
+        for v in ["1", "true", "TRUE", "on", "On", "yes", "YES"] {
+            assert!(env_value_on(v), "{v:?} must select the mux");
+        }
+        for v in ["", "0", "false", "off", "no", "2", "enable"] {
+            assert!(!env_value_on(v), "{v:?} must leave the default-off gate off");
+        }
     }
 
     #[test]
