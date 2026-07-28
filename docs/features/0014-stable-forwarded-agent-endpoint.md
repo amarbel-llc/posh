@@ -5,8 +5,9 @@ promotion-criteria: a working implementation of a connection-independent
   forwarded-agent endpoint (no per-connection symlink election) exists, with the
   posh#136 multi-connection starvation reproduced-then-fixed E2E — a `git push`
   from an idle-owner's sibling connection succeeds with zero handoff window. The
-  interim relinquish-on-inactive refinement (already shipped) is NOT this bar; it
-  narrows the race to a measured 9.9 s, this record closes it. The mechanism is
+  interim refinements (already shipped: relinquish-on-inactive, then the posh#152
+  repoint-on-release that closed its measured 9.9 s window) are NOT this bar —
+  they are still an election among per-connection processes. The mechanism is
   now settled: RFC 0011 (multiplexed datagram channels), under which one
   connection per client-host pair makes single ownership structural. What remains
   for this record is the RFC 0011 §8 policy question (two client hosts reaching
@@ -149,15 +150,23 @@ the wire increment.
 
 ## Limitations
 
-- **The shipped interim fix (option 1) does not satisfy this record.** It narrows
-  the window to the slow-tick cadence; it does not make the endpoint stable by
-  construction. This FDR tracks closing the window entirely. The residual is now
-  measured rather than estimated: **9.9 s of unusable `agent/sock` per handoff**
-  — 4.9 s resolving to the inactive owner (which fast-fails, `SSH_AGENT_FAILURE`)
-  then 5.0 s absent entirely (`ENOENT` on connect), being two independent
-  `AGENT_SLOW_TICK_MS` periods, since the owner releases on its own next tick and
-  the active sibling claims on its next tick after that. See
-  `remote::agent::tests::handoff_between_two_endpoints_leaves_a_multi_tick_outage`.
+- **The shipped interim fix (option 1) does not satisfy this record.** It does
+  not make the endpoint stable by construction; this FDR tracks removing the
+  election entirely. The interim's own window has since been closed in place:
+  the original relinquish-on-inactive left a measured **9.9 s of unusable
+  `agent/sock` per handoff** — 4.9 s resolving to the inactive owner
+  (fast-failing, `SSH_AGENT_FAILURE`) then 5.0 s absent (`ENOENT` on connect),
+  two independent `AGENT_SLOW_TICK_MS` periods. The posh#152 interim
+  (repoint-on-release: per-endpoint `srv-<pid>.active` activity markers,
+  edge-driven release/reclaim on every `tick` call, and an atomic repoint at
+  the freshest active sibling instead of an unlink) scales the ratified
+  election philosophy above down to today's per-connection endpoints, and the
+  measured handoff is now zero stale/absent time at the releasing endpoint's
+  edge (residual: one `server_loop` poll wake). See
+  `remote::agent::tests::handoff_repoints_to_the_active_sibling_on_the_inactivity_edge`.
+  The mechanism is explicitly throwaway once the mux endpoint (M1 of
+  `docs/plans/2026-07-28-connection-mux-endpoint-design.md`) makes ownership
+  structural.
 - **Broker blast radius (option 2/3).** A single long-lived endpoint (broker or
   mux) that owns `agent/sock` becomes a shared failure point: if it dies, agent
   forwarding for every connection to that host drops until it is respawned —
