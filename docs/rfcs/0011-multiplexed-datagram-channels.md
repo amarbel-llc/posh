@@ -184,6 +184,10 @@ envelope — is deliberate. It keeps full addressing expressible in the existing
 grammar while keeping the steady-state envelope compact. A future revision that
 needs relay-routable datagrams can extend §2 without changing §3.
 
+Roaming is connection-level (informative): the peer-address re-pin adopts the
+source of the newest authentic datagram for the whole connection, so every
+channel roams together and no per-channel address state exists.
+
 #### 3.4 Limits
 
 - An implementation MUST bound the number of concurrent channels per kind and
@@ -214,6 +218,26 @@ This requirement is independent of the envelope: instruction ids are already
 unique per instruction, so the fix is in the receiver's bookkeeping alone. It is
 nonetheless NORMATIVE here, because an implementation that adopts the envelope
 without it will corrupt reassembly rather than degrade.
+
+#### 4.1 Sender interleaving
+
+§1 bounds head-of-line blocking *within* one instruction; nothing above bounds
+how long a sender's queue discipline can starve a channel. Keystroke-to-paint
+latency is the transport's core deliverable, and §5 removes the retired
+capability entries' ~59 KB per-message ceiling on agent data, so an
+unconstrained sender could park a session frame behind an arbitrarily large
+agent burst.
+
+- A sender with instructions pending on more than one channel SHOULD interleave
+  them rather than drain one channel's queue first, and SHOULD send pending
+  `session`-kind instructions before bulk `agent` data.
+- A sender SHOULD bound the encoded size of a single `agent` instruction so
+  that no session frame waits behind more than one maximal instruction; a bound
+  in the low tens of kilobytes preserves the pre-envelope latency profile.
+
+These are SHOULDs, not MUSTs: violating them degrades latency, never
+correctness, and the right discipline may become congestion-control policy
+(§9.2) rather than a fixed rule here.
 
 ### 5. Agent channels
 
@@ -260,13 +284,24 @@ The payload of an `agent` channel instruction is:
   consume a shared rate-limit slot so genuine signatures went unreported
   (posh#147).
 
+- **Agent serviceability is bound to live sessions.** Decoupling agent
+  channels from any *particular* session MUST NOT extend agent exposure beyond
+  *every* session: while a connection carries no open `session` channel, an
+  endpoint MUST NOT open new `agent` channels (it MUST answer attempts with
+  FAIL) and MUST close any still open. This holds exposure to the union of
+  session lifetimes — no worse than the pre-envelope contract, where the agent
+  stream died with its session. An explicitly opt-in standing connection MAY
+  relax this; that policy and its surface belong to FDR 0014, and until it is
+  specified the session-bound behaviour is the only conforming one.
+
 Consequences (informative): agent data is now fragmented like any other payload
 rather than chunked into 247-byte capability entries (`AGENT_DATA_MAX`), which
 removes the per-message ceiling those entries impose — the table's `count: u8`
 caps one message at `MAX_AGENT_DATA_CAPS` entries, about 59 KB of agent bytes,
-with the remainder deferred to a later message. An agent channel also no longer
-depends on a session existing, so forwarding is not bound to any particular
-session's lifetime.
+with the remainder deferred to a later message. An agent channel no longer
+depends on any *particular* session's lifetime — it survives a session
+detaching and reattaching — but not on no session at all (the serviceability
+bound above).
 
 ### 6. Negotiation
 
@@ -301,6 +336,16 @@ capabilities terminated by the relay. Both are amended:
   host serves the forwarded agent. `<base>/agent/sock` MUST therefore be a bound
   socket owned by that endpoint, NOT a symlink to a per-process socket. Neither
   peer performs takeover, liveness probing of a sibling, or election.
+- The bound-socket ownership above is conditional on the one-connection
+  property actually holding — which the envelope alone does not provide; it is
+  the per-destination mux endpoint's (github #54) job to make invocations from
+  one client host share a connection. An implementation MUST NOT adopt the
+  bound-socket/no-election behaviour while multiple enveloped connections from
+  one client host can still contest the path: without the election, the first
+  binder would own `agent/sock` until process death, and an owner whose client
+  roamed away would turn today's bounded handoff outage into an unbounded one.
+  Until connections are shared, an enveloped connection MUST keep the FDR 0004
+  election (with the `agent` channels of §5 as its wire carriage).
 - The relay MUST still terminate agent traffic rather than pass it to the
   session daemon; the RFC 0008 security boundary (the daemon never brokers key
   material) is unchanged.
@@ -417,11 +462,12 @@ mechanism is best designed against whatever handshake replaces it.
   directory hardening FDR 0004 applies to `<base>/agent/` — 0700, self-owned,
   symlink-rejecting — MUST continue to apply, and an implementation MUST NOT
   adopt a pre-existing socket at that path it did not create.
-- **Agent reachability outlives any one session** (§5). Because an agent channel
-  no longer depends on a session, a connection can expose the user's agent to
-  the remote host while no session is attached. An implementation MUST bound
-  that exposure by a defined connection lifetime; the policy belongs to FDR
-  0014, but the absence of one is a security defect, not a missing convenience.
+- **Agent reachability outlives any one session, not every session** (§5). A
+  connection with no open `session` channel MUST NOT service agent channels —
+  the §5 serviceability bound — so exposure never exceeds the union of session
+  lifetimes. A standing (session-less) connection is expressible only as the
+  explicit opt-in FDR 0014 may later define; an implementation MUST NOT default
+  to one.
 - **Malformed payloads are corruption, not attack surface**, since the peer is
   authenticated — but they MUST cause the instruction to be discarded, never a
   panic or an over-read. This restates the RFC 0001 §3 and RFC 0008 rule for the
@@ -436,10 +482,12 @@ mechanism is best designed against whatever handshake replaces it.
   closed rather than treated as a connection error.
 - Concurrent reassembly (§4): interleaved fragments of two instructions both
   complete — the direct regression test for the discard-on-different-id
-  behaviour this document forbids. Plus eviction under the byte bound. The
-  inverse of `remote::sync::tests::interleaved_instructions_destroy_each_other_today`,
-  which pins the pre-implementation behaviour and MUST be inverted, not deleted,
-  when §4 lands.
+  behaviour this document forbids. Plus eviction under the byte bound.
+  IMPLEMENTED: `remote::sync::tests::interleaved_instructions_both_complete`
+  (the required inversion — not deletion — of the pre-implementation pin
+  `interleaved_instructions_destroy_each_other_today`),
+  `four_concurrent_assemblies_all_complete` (the §4 floor), and
+  `byte_bound_evicts_least_recently_updated_assembly`.
 - Agent channel (§5): OPEN/data/CLOSE lifecycle over the envelope, cumulative
   retransmission across a simulated loss, FAIL surfacing as a closed socket, and
   a payload larger than the retired 247-byte capability budget completing in one
@@ -468,10 +516,16 @@ mechanism is best designed against whatever handshake replaces it.
   take a `&[u8]`, so decoding from an offset needs no codec change.
 - RFC 0001 capability ids 6/7/8 are retired, not reused (§7). A baseline peer
   that still sends them remains unambiguous.
-- Migration is incremental: the `agent` kind and a single `session` channel are
-  sufficient to close posh#136, and additional `session` channels (the github #54
-  connection sharing) require no further wire change. That sequencing is why the
-  envelope is specified before the mux daemon exists.
+- Migration is incremental, with two explicit gates. The first increment is the
+  `agent` kind plus a single `session` channel — the complete wire change; no
+  later increment touches the envelope again. Closing posh#136, however, takes
+  the first increment AND the one-connection-per-client-host property, i.e. the
+  #54 mux endpoint: until connections are shared, enveloped connections keep the
+  FDR 0004 election (§7) and the posh#136 window persists. And additional
+  `session` channels (the #54 connection sharing itself) MUST NOT ship before
+  the §9.2/§9.3 congestion and flow-control decisions (posh#143, posh#144) are
+  resolved — one session plus agent traffic matches today's load; N sessions on
+  one connection is the shape that voids the no-congestion-control premise.
 - Future channel kinds MUST use a RESERVED kind value; future envelope fields
   MUST use a `ver` bump. Neither may be added ad hoc.
 
@@ -488,7 +542,8 @@ Informative:
 - FDR 0004: SSH agent forwarding over the posh transport — the mechanism §5
   replaces.
 - FDR 0014: Stable forwarded-agent endpoint — the feature record this contract
-  serves; owner of the §8 multi-client-host policy and the §5 lifetime bound.
+  serves; owner of the §8 multi-client-host policy and of any future
+  standing-connection opt-in relaxing the §5 serviceability bound.
 - FDR 0012: Session layer collapse — the relay-retarget extension; its v1
   explicitly scopes cross-host chaining out, which is why §3.3 binds identity at
   OPEN rather than per datagram.

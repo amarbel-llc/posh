@@ -126,12 +126,13 @@ process model remains #54's job; nothing in RFC 0011 waits on it.
   an election among long-lived mux endpoints — the last being far more tractable
   than today's, since a mux endpoint's liveness is meaningful where a
   per-connection process's is not.
-- **The agent-channel lifetime bound is unspecified and is a security item.**
-  RFC 0011 §5 decouples agent channels from sessions, so a connection can expose
-  the user's agent to a remote host with no session attached; the RFC requires a
-  bound but assigns the policy here. The decision taken this session: tie the
-  connection to at least one live frame-shaped session to start (exposure no
-  worse than today), with an opt-in standing connection later.
+- **The agent-channel lifetime bound is normative in RFC 0011 §5.** A
+  connection with no open `session` channel does not service agent channels, so
+  exposure is held to the union of session lifetimes — no worse than today,
+  where the agent stream dies with its session. What remains owned here is the
+  opt-in *standing* connection (its flag surface and consent semantics), should
+  one ever be wanted; until this record specifies it, the session-bound
+  behaviour is the only conforming one.
 - **Scope is still the agent path only.** Session transport, roaming, and the ssh
   bootstrap are untouched by *this record*; RFC 0011's envelope is shared
   machinery, and the broader transport consolidation remains #54's job.
