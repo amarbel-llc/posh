@@ -1,6 +1,8 @@
 # The per-destination mux endpoint (github #54 phase 2) — design
 
-Status: DRAFT for review, 2026-07-28. This is the design doc #54's closing note
+Status: ACCEPTED 2026-07-28 (M1-first sequencing approved; open questions 1
+and 2 resolved — `posh-server agent` subcommand, 60 s linger default).
+Originally: DRAFT for review, 2026-07-28. This is the design doc #54's closing note
 demanded ("next step before code: write the phase-2 design doc") and which the
 2026-07-28 architecture review found missing: RFC 0011 specifies the wire
 (channel envelope) and §6 already presupposes a local mux endpoint's IPC
@@ -105,7 +107,7 @@ new tags in the mux socket's own tag space:
   the ssh bootstrap and holds the connection. Invocations proceed against
   their own connections (M1) as today, minus agent forwarding.
 - Linger: after the last `MuxSessionRef` drops, the endpoint keeps the
-  connection `POSH_MUX_PERSIST` (proposed default 60 s — open question 2) for
+  connection `POSH_MUX_PERSIST` (default 60 s — decided 2026-07-28) for
   fast re-attach, with agent
   service OFF during the window (the FDR 0014 M1 policy). Then it closes the
   connection and exits. `POSH_MUX_PERSIST=0` disables lingering.
@@ -149,18 +151,17 @@ new tags in the mux socket's own tag space:
   directions.
 - Key lifetime: the mux connection lives longer than any session connection
   today, which is what elevates the rekey/forward-secrecy gap (posh#145,
-  gated on posh#146). M1 does not wait on it, but whatever linger default
-  open question 2 settles on stays conservative (minutes, not days) until
-  rekey exists.
+  gated on posh#146). M1 does not wait on it, and the decided 60 s linger
+  default stays conservative (seconds, not days) until rekey exists.
 
 ## Open questions (for review, not blockers to M1 build-out)
 
-1. Should M1's agent-only remote process be `posh-server agent` (a new
-   subcommand) or a flag on `new`? Leaning subcommand: no PTY, no relay, no
-   session — different enough to name.
-2. `POSH_MUX_PERSIST` default: 60 s (ControlMaster-ish) vs 0 (no linger)
-   until rekey lands. Leaning 60 s; the agent gate already covers the
-   sensitive surface during linger.
+1. RESOLVED 2026-07-28: M1's agent-only remote process is a new
+   `posh-server agent` subcommand — no PTY, no relay, no session; different
+   enough to name, and it keeps `new`'s spawn-a-shell contract unconditional.
+2. RESOLVED 2026-07-28: `POSH_MUX_PERSIST` defaults to 60 s
+   (ControlMaster-ish); the agent gate covers the sensitive surface during
+   linger, and the window stays conservative until rekey (#145) lands.
 3. Does `posh list`/diagnostics enumerate mux endpoints? (FDR 0007's dump
    covers the transport; a `posh mux ls` is cheap once the socket dir
    exists.) Deferred to implementation.
@@ -171,7 +172,7 @@ new tags in the mux socket's own tag space:
 - RFC 0011 — the wire contract; §6 (selector, version stamp), §7 (ownership,
   conditional-adoption rule), §5 (lifetime bound; the M1 policy above is the
   FDR 0014-delegated variant it anticipates).
-- FDR 0014 — the feature record; the 2026-07-28 proposed two-client-host
+- FDR 0014 — the feature record; the 2026-07-28 ratified two-client-host
   election this doc's remote side mechanizes.
 - FDR 0004 — agent-forwarding policy surface, unchanged.
 - RFC 0008 §3 — the relay contract M2 composes with.

@@ -100,10 +100,10 @@ closing posh#136 waits on BOTH (RFC 0011 §7's conditional-adoption rule, added
 by the 2026-07-28 review). The wire increment itself — envelope, session
 channel, agent channels, behind `POSH_CHANNELS`/`--channels` — landed
 2026-07-28; what remains for this record is the mux endpoint (M1 of
-`docs/plans/2026-07-28-connection-mux-endpoint-design.md`) and the §8 policy
-ratification below.
+`docs/plans/2026-07-28-connection-mux-endpoint-design.md`, approved M1-first
+2026-07-28) — the §8 policy below is ratified.
 
-### Decision (2026-07-28, PROPOSED — awaiting ratification): the two-client-host policy
+### Decision (2026-07-28, RATIFIED): the two-client-host policy
 
 RFC 0011 §8 defers to this record the case single ownership does not cover: the
 same remote account reached from two different client hosts, two mux endpoints,
@@ -143,9 +143,9 @@ to, per #103), and a broker process owning `agent/sock` (reintroduces the
 blast-radius and respawn machinery this record's option 2 died of, for no
 routing power the election lacks).
 
-Ratifying this closes the §8 question; the mechanism lands with the #54 mux
-endpoint (its design doc specifies the claim/release IPC), not with the wire
-increment.
+Ratified 2026-07-28, closing the §8 question; the mechanism lands with the
+#54 mux endpoint (its design doc specifies the claim/release IPC), not with
+the wire increment.
 
 ## Limitations
 
@@ -172,11 +172,11 @@ increment.
   connections and two endpoints contesting one path again, and which agent should
   answer is a policy question. RFC 0011 §8 specifies the safe behaviour (an
   endpoint MUST NOT take over a live peer's bound socket) and explicitly defers
-  the policy here. A policy is now PROPOSED (the 2026-07-28 decision above): a
-  most-recently-active election among mux endpoints on stable per-client-host
-  sockets — far more tractable than today's election, since a mux endpoint's
-  liveness is meaningful where a per-connection process's is not. Awaiting
-  ratification.
+  the policy here. The policy is DECIDED (the ratified 2026-07-28 decision
+  above): a most-recently-active election among mux endpoints on stable
+  per-client-host sockets — far more tractable than today's election, since a
+  mux endpoint's liveness is meaningful where a per-connection process's is
+  not. The mechanism lands with the mux endpoint.
 - **The agent-channel lifetime bound is normative in RFC 0011 §5.** A
   connection with no open `session` channel does not service agent channels, so
   exposure is held to the union of session lifetimes — no worse than today,

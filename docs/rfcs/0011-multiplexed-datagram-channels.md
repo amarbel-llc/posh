@@ -371,7 +371,10 @@ implementation encountering a bound `<base>/agent/sock` owned by a live peer
 endpoint MUST NOT unlink or take it over; it SHOULD report the condition and
 proceed without forwarding. Resolving the multi-client-host case — by
 per-client-host sub-paths, an explicit policy, or an election among long-lived
-mux endpoints — is deferred to FDR 0014.
+mux endpoints — is deferred to FDR 0014, and is DECIDED there (ratified
+2026-07-28): a most-recently-active election among mux endpoints on stable
+per-client-host sockets, with event-driven handoff. The safe behaviour above
+remains the rule for any implementation not participating in that election.
 
 ### 9. Deferred transport mechanisms
 
