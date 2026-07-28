@@ -41,6 +41,10 @@ pub mod hostmetrics;
 /// the `match_kitty_seqs` primitive, the palette-key CSI-u sequence set, and the
 /// roaming client's `PaletteKeyNormalizer`.
 pub mod kittykeys;
+/// The per-destination local mux endpoint (M1, agent-only): destination keys,
+/// the hardened `<base>/mux/` socket dir, and the client id
+/// (docs/plans/2026-07-28-connection-mux-endpoint-design.md).
+pub mod mux;
 /// The command-palette overlay renderer subprocess driver (RFC 0005) and the
 /// `composite_palette` compositor. Shared by both this crate's roaming client
 /// (`remote::client`) and the local session frame client (`session::client`) so
