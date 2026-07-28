@@ -226,24 +226,24 @@ impl FragmentAssembly {
     pub fn add(&mut self, frag: Fragment) -> Option<Vec<u8>> {
         self.clock += 1;
 
-        if !self.assemblies.iter().any(|(id, _)| *id == frag.id) {
-            while self.assemblies.len() >= self.max_assemblies {
-                if !self.evict_least_recently_updated(frag.id) {
-                    return None; // max_assemblies == 0
+        let pos = match self.assemblies.iter().position(|(id, _)| *id == frag.id) {
+            Some(pos) => pos,
+            None => {
+                while self.assemblies.len() >= self.max_assemblies {
+                    if !self.evict_least_recently_updated(frag.id) {
+                        return None; // max_assemblies == 0
+                    }
                 }
+                self.assemblies.push((frag.id, Partial::default()));
+                self.assemblies.len() - 1
             }
-            self.assemblies.push((frag.id, Partial::default()));
-        }
-
-        let pos = self
-            .assemblies
-            .iter()
-            .position(|(id, _)| *id == frag.id)
-            .unwrap();
-        self.assemblies[pos].1.touched = self.clock;
+        };
         if self.assemblies[pos].1.rejects(&frag) {
             return None;
         }
+        // Stamped only for accepted fragments, so a peer's malformed
+        // fragments cannot keep an assembly fresh against eviction.
+        self.assemblies[pos].1.touched = self.clock;
 
         if !self.assemblies[pos].1.is_duplicate(&frag) {
             let incoming = frag.contents.len();

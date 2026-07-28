@@ -290,9 +290,12 @@ The payload of an `agent` channel instruction is:
   endpoint MUST NOT open new `agent` channels (it MUST answer attempts with
   FAIL) and MUST close any still open. This holds exposure to the union of
   session lifetimes — no worse than the pre-envelope contract, where the agent
-  stream died with its session. An explicitly opt-in standing connection MAY
-  relax this; that policy and its surface belong to FDR 0014, and until it is
-  specified the session-bound behaviour is the only conforming one.
+  stream died with its session. FDR 0014 MAY define alternative
+  session-association policies with an equivalent exposure bound (a connection
+  whose associated sessions ride adjacent connections, as in the mux design's
+  M1 shape; or an explicitly opt-in standing connection); until one is
+  specified there, the session-channel-bound behaviour is the only conforming
+  one.
 
 Consequences (informative): agent data is now fragmented like any other payload
 rather than chunked into 247-byte capability entries (`AGENT_DATA_MAX`), which
@@ -337,15 +340,15 @@ capabilities terminated by the relay. Both are amended:
   socket owned by that endpoint, NOT a symlink to a per-process socket. Neither
   peer performs takeover, liveness probing of a sibling, or election.
 - The bound-socket ownership above is conditional on the one-connection
-  property actually holding — which the envelope alone does not provide; it is
-  the per-destination mux endpoint's (github #54) job to make invocations from
-  one client host share a connection. An implementation MUST NOT adopt the
-  bound-socket/no-election behaviour while multiple enveloped connections from
-  one client host can still contest the path: without the election, the first
-  binder would own `agent/sock` until process death, and an owner whose client
-  roamed away would turn today's bounded handoff outage into an unbounded one.
-  Until connections are shared, an enveloped connection MUST keep the FDR 0004
-  election (with the `agent` channels of §5 as its wire carriage).
+  property, which the envelope alone does not provide. An implementation that
+  guarantees sole agent-capable ownership of the client-host-to-destination
+  relationship — a per-destination mux endpoint (github #54) or equivalent —
+  MAY bind `agent/sock` directly and MUST then perform no election. Any other
+  implementation MUST retain the FDR 0004 election (with the `agent` channels
+  of §5 as its wire carriage): binding without the guarantee would hand
+  `agent/sock` to the first binder until process death, turning today's
+  bounded handoff outage into an unbounded one when that binder's client
+  roams away.
 - The relay MUST still terminate agent traffic rather than pass it to the
   session daemon; the RFC 0008 security boundary (the daemon never brokers key
   material) is unchanged.

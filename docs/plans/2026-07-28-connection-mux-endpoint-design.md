@@ -58,21 +58,21 @@ The review's sequencing conclusion, restated: the wire increment (envelope +
 agent kind + single session channel) is necessary for both milestones but
 closes nothing by itself; M1 is the shortest path to closing posh#136.
 
-### The §5 refinement M1 needs
+### The FDR 0014 policy M1 needs
 
 RFC 0011 §5 binds agent serviceability to "an open `session` channel on the
-connection" — which an agent-only connection never has. The bound's security
-intent (agent exposure never exceeds the union of session lifetimes) is
-enforced meaningfully on the CLIENT side — the client answers server-opened
-agent channels, and it is the client's agent being exposed; remote-side
-enforcement is advisory against a compromised remote. Amend §5 so the
-serviceability condition is: an open `session` channel on the connection, OR
-a live session to the same destination through the same local endpoint (the
-M1 shape, asserted by the client). The client MUST FAIL agent opens and close
-open agent channels when its endpoint's last local session to the destination
-ends; the linger window (below) keeps the connection but not agent service.
-Exposure is identical to today's. This amendment should land with M1, not
-silently.
+connection" — which an agent-only connection never has — and delegates
+alternative session-association policies with an equivalent exposure bound to
+FDR 0014. M1 is exactly such a policy, and it MUST be recorded in FDR 0014
+when M1 lands (the RFC's wire rule stays untouched): the client associates
+the mux connection with its live local sessions to the destination (the
+`MuxSessionRef` count), FAILs agent opens and closes open agent channels when
+the count reaches zero, and re-enables on the next ref. Enforcement is
+client-side, which is the side that matters — the client answers
+server-opened agent channels, and it is the client's agent being exposed;
+remote-side enforcement is advisory against a compromised remote. The linger
+window (below) keeps the connection but never agent service. Exposure is
+identical to today's.
 
 ## IPC
 
@@ -90,7 +90,8 @@ new tags in the mux socket's own tag space:
   the FDR 0007 dump surface) rides along for diagnostics.
 - M1 session accounting: `MuxSessionRef` / `MuxSessionUnref` (client→mux) —
   each local posh invocation targeting the destination registers while alive;
-  the count gates agent serviceability (§5 refinement) and the linger clock.
+  the count gates agent serviceability (the FDR 0014 M1 policy) and the
+  linger clock.
   Registration is by open IPC connection, so a crashed client auto-unrefs on
   socket close — no pid probing.
 - M2 adds the session-channel tags (open-with-target, input, resize, frame
@@ -105,7 +106,7 @@ new tags in the mux socket's own tag space:
   their own connections (M1) as today, minus agent forwarding.
 - Linger: after the last `MuxSessionRef` drops, the endpoint keeps the
   connection `POSH_MUX_PERSIST` (default 60 s) for fast re-attach, with agent
-  service OFF during the window (§5 refinement). Then it closes the
+  service OFF during the window (the FDR 0014 M1 policy). Then it closes the
   connection and exits. `POSH_MUX_PERSIST=0` disables lingering.
 - Crash/blast radius: an M1 mux crash loses agent forwarding to that
   destination until the next invocation respawns it (sessions are untouched —
@@ -137,7 +138,7 @@ new tags in the mux socket's own tag space:
 
 - The mux socket is same-uid IPC under a hardened directory; version stamps
   are parsed bounds-checked like all session IPC (RFC 0008 security rules).
-- Agent exposure: bounded by the §5 refinement above, client-enforced;
+- Agent exposure: bounded by the FDR 0014 M1 policy above, client-enforced;
   default-on forwarding policy, notices, and opt-outs are FDR 0004's and are
   unchanged — the mux endpoint inherits the resolved agent source
   (`--forward-agent=PATH` etc.) from the invocation that spawns it. A later
@@ -166,7 +167,8 @@ new tags in the mux socket's own tag space:
 
 - github #54 — the decision this doc implements; its sketch is the M2 shape.
 - RFC 0011 — the wire contract; §6 (selector, version stamp), §7 (ownership,
-  conditional-adoption rule), §5 (lifetime bound; refinement above).
+  conditional-adoption rule), §5 (lifetime bound; the M1 policy above is the
+  FDR 0014-delegated variant it anticipates).
 - FDR 0014 — the feature record; the 2026-07-28 proposed two-client-host
   election this doc's remote side mechanizes.
 - FDR 0004 — agent-forwarding policy surface, unchanged.
