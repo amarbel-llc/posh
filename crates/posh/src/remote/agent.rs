@@ -23,6 +23,12 @@
 //! release REPOINTS `agent/sock` at the freshest active sibling instead of
 //! unlinking — closing FDR 0014's measured 9.9 s handoff outage.
 //!
+//! M1 of that mux plan adds a second endpoint NAMING: the agent-only
+//! `posh-server agent` remote binds `mux-<client-id>.sock` (+
+//! `mux-<client-id>.active`, + a `mux-<client-id>.pid` liveness record — see
+//! [`endpoint_pid`]) and participates in the same election as a full sibling
+//! of the srv-named endpoints. One election, two name shapes.
+//!
 //! Everything here is `poll`/unix-socket/`rename` (ADR 0001): no async
 //! runtime, no new dependency. The `server_loop` splices this endpoint's fds
 //! into its existing poll set; this module owns no event loop of its own.
@@ -79,23 +85,33 @@ struct Channel {
 pub struct AgentEndpoint {
     /// `<base>/agent/` — created 0700, validated self-owned + no-symlink.
     dir: PathBuf,
-    /// The identity this endpoint's socket is keyed by. In production it is the
-    /// server process's pid (`srv-<pid>.sock`), which is what makes the
-    /// `gc_dead_sockets` / `socket_is_dead` liveness probes meaningful. It is a
-    /// field rather than a re-read of `own_pid()` so tests can stand up two
-    /// COEXISTING endpoints in one process — otherwise both bind the same path
-    /// and the second silently clobbers the first, which is why the multi-
-    /// connection handoff (posh#136 / FDR 0014) had no in-process coverage.
-    id: i32,
-    /// `<base>/agent/srv-<pid>.sock` — this server's own socket.
+    /// The file-name stem this endpoint's socket, marker (and pid file) are
+    /// keyed by: `srv-<pid>` for a per-connection session server (FDR 0004,
+    /// where the owning pid is derivable from the name itself and what makes
+    /// the `gc_dead_sockets` liveness probes meaningful), or
+    /// `mux-<client-id>` for the M1 agent-only mux remote
+    /// (docs/plans/2026-07-28-mux-endpoint-m1-impl.md), whose deterministic,
+    /// respawn-surviving name carries its owning pid in `<stem>.pid` instead
+    /// — see [`endpoint_pid`]. A field rather than a re-derivation so tests
+    /// can stand up COEXISTING endpoints in one process (see
+    /// [`new_with_id`](Self::new_with_id)).
+    stem: String,
+    /// `<base>/agent/<stem>.sock` — this server's own socket.
     own_sock: PathBuf,
-    /// `<base>/agent/srv-<pid>.active` — this endpoint's peer-activity marker
+    /// `<base>/agent/<stem>.active` — this endpoint's peer-activity marker
     /// (posh#152 interim): its mtime is refreshed while OUR peer is active, so
     /// a sibling releasing `agent/sock` can repoint it at someone who can
     /// actually serve. Best-effort throughout; throwaway once the mux
     /// endpoint (M1 of docs/plans/2026-07-28-connection-mux-endpoint-design.md)
     /// makes ownership structural.
     own_marker: PathBuf,
+    /// `<base>/agent/<stem>.pid` for a mux-named endpoint: the owning pid
+    /// the liveness probes (`kill(pid, 0)` in takeover/GC/repoint) read,
+    /// since a `mux-<client-id>` name carries none. Written BEFORE the
+    /// socket binds and removed AFTER it unlinks, so a mux socket without a
+    /// readable pid file is always a crash leftover. `None` for srv-named
+    /// endpoints.
+    own_pidfile: Option<PathBuf>,
     /// `<base>/agent/sock` — the stable, symlinked `SSH_AUTH_SOCK` target.
     well_known: PathBuf,
     listener: UnixListener,
@@ -125,10 +141,54 @@ impl AgentEndpoint {
         AgentEndpoint::new(&base)
     }
 
+    /// [`from_env`](Self::from_env) for a MUX-NAMED endpoint — the
+    /// `posh-server agent` verb's production path (M1 Task 2,
+    /// docs/plans/2026-07-28-mux-endpoint-m1-impl.md).
+    #[allow(dead_code)] // consumed by run_agent_only in the next green step (M1 Task 2)
+    pub fn from_env_mux(client_id: &str) -> Result<AgentEndpoint> {
+        let env = |k: &str| std::env::var(k).ok();
+        let uid = util::uid();
+        let base = crate::session::resolve_socket_base(
+            env("POSH_DIR").as_deref(),
+            env("XDG_RUNTIME_DIR").as_deref(),
+            env("TMPDIR").as_deref(),
+            uid,
+        );
+        AgentEndpoint::new_mux(&base, client_id)
+    }
+
     /// Builds the endpoint under an explicit base dir (the seam the tests use
     /// with a tempdir), keyed by this process's pid.
     pub fn new(base: &Path) -> Result<AgentEndpoint> {
         AgentEndpoint::build(base, own_pid())
+    }
+
+    /// The mux-named endpoint variant (M1, FDR 0014 election): binds
+    /// `agent/mux-<client-id>.sock` with marker `mux-<client-id>.active` —
+    /// deterministic and respawn-surviving, unlike the pid-keyed srv names —
+    /// plus a `mux-<client-id>.pid` liveness record (see the field docs). A
+    /// full #152 election sibling: it claims, releases, repoints, and is
+    /// repointed-at exactly like an srv endpoint. The id must already be
+    /// sanitized (the client's `mux::client_id()` guarantees `[A-Za-z0-9._-]`);
+    /// anything else is REJECTED rather than rewritten — the id lands in a
+    /// socket file name, and a silent rewrite would desync the name the
+    /// election reports from the id the client asked for.
+    ///
+    /// A same-name collision (a second endpoint for one client id — the
+    /// pathological shared-client-id case) gets no new arbitration: a DEAD
+    /// recorded owner's leftovers are taken over exactly like a stale srv
+    /// socket, and a LIVE owner keeps the name (the bind fails EADDRINUSE).
+    pub fn new_mux(base: &Path, client_id: &str) -> Result<AgentEndpoint> {
+        let safe = !client_id.is_empty()
+            && client_id
+                .bytes()
+                .all(|b| matches!(b, b'A'..=b'Z' | b'a'..=b'z' | b'0'..=b'9' | b'.' | b'_' | b'-'));
+        if !safe {
+            return Err(util::Error::Msg(format!(
+                "invalid mux client id ({client_id}): must be non-empty [A-Za-z0-9._-]"
+            )));
+        }
+        AgentEndpoint::build_named(base, format!("mux-{client_id}"), Some(own_pid()))
     }
 
     /// [`new`](Self::new) with an explicit socket identity instead of this
@@ -146,10 +206,18 @@ impl AgentEndpoint {
         AgentEndpoint::build(base, id)
     }
 
-    /// The real constructor behind [`new`](Self::new): creates `<base>/agent/`
-    /// 0700, hardens it with the shared #7 check, binds `srv-<id>.sock`, and
-    /// claims `agent/sock`.
+    /// The srv-named constructor behind [`new`](Self::new): keyed by `id`,
+    /// which callers MUST pass as a live pid (see [`new_with_id`](Self::new_with_id)).
     fn build(base: &Path, id: i32) -> Result<AgentEndpoint> {
+        AgentEndpoint::build_named(base, format!("srv-{id}"), None)
+    }
+
+    /// The real constructor: creates `<base>/agent/` 0700, hardens it with
+    /// the shared #7 check, binds `<stem>.sock`, and claims `agent/sock`.
+    /// `mux_pid` is `Some(owning pid)` for mux-named endpoints — recorded in
+    /// `<stem>.pid` BEFORE the bind so a concurrently GC'ing sibling never
+    /// sees a live mux socket without its liveness record.
+    fn build_named(base: &Path, stem: String, mux_pid: Option<i32>) -> Result<AgentEndpoint> {
         use std::os::unix::fs::DirBuilderExt;
 
         let uid = util::uid();
@@ -165,22 +233,48 @@ impl AgentEndpoint {
         // reject an attacker-planted dir or a symlink. github #7.
         crate::session::validate_session_dir(&dir, uid, true)?;
 
-        let own_sock = dir.join(format!("srv-{id}.sock"));
-        // A stale socket for our own pid (pid reuse after an unclean exit)
-        // would make bind fail with EADDRINUSE; clear it first.
-        let _ = std::fs::remove_file(&own_sock);
+        let own_sock = dir.join(format!("{stem}.sock"));
+        let own_pidfile = mux_pid.map(|_| dir.join(format!("{stem}.pid")));
+        match mux_pid {
+            // srv names embed the pid, so a same-name leftover is a previous
+            // life of OUR pid (pid reuse after an unclean exit) — dead by
+            // construction. Clear it, or bind fails with EADDRINUSE.
+            None => {
+                let _ = std::fs::remove_file(&own_sock);
+            }
+            // A mux name is deterministic, so the same name may belong to a
+            // LIVE sibling (two client hosts sharing a client id — the
+            // pathological case). The existing takeover-if-dead gate applies,
+            // no new arbitration: clear only a dead (or self-pid-recorded,
+            // i.e. previous-life) owner's leftovers; a live foreign owner
+            // keeps the name and our bind fails EADDRINUSE below.
+            Some(pid) => {
+                let dead_or_previous_life = match endpoint_pid(&dir, &stem) {
+                    Some(recorded) => recorded == pid || !pid_alive(recorded),
+                    None => true, // no liveness record ⇒ crash leftover
+                };
+                if dead_or_previous_life {
+                    let _ = std::fs::remove_file(&own_sock);
+                    std::fs::write(
+                        own_pidfile.as_ref().expect("mux_pid implies pidfile"),
+                        pid.to_string(),
+                    )?;
+                }
+            }
+        }
         let listener = UnixListener::bind(&own_sock)?;
         listener.set_nonblocking(true)?;
-        // Same pid-reuse hygiene for the activity marker (posh#152): a
-        // leftover from a previous life must not advertise us active.
-        let own_marker = dir.join(format!("srv-{id}.active"));
+        // Same reuse hygiene for the activity marker (posh#152): a leftover
+        // from a previous life must not advertise us active.
+        let own_marker = dir.join(format!("{stem}.active"));
         let _ = std::fs::remove_file(&own_marker);
 
         let endpoint = AgentEndpoint {
             dir: dir.clone(),
-            id,
+            stem,
             own_sock,
             own_marker,
+            own_pidfile,
             well_known: dir.join("sock"),
             listener,
             channels: Vec::new(),
@@ -197,9 +291,9 @@ impl AgentEndpoint {
         &self.well_known
     }
 
-    /// Atomically points `agent/sock` at our own `srv-<pid>.sock`.
+    /// Atomically points `agent/sock` at our own `<stem>.sock`.
     fn claim_symlink(&self) -> Result<()> {
-        self.point_symlink_at(&format!("srv-{}.sock", self.id))
+        self.point_symlink_at(&format!("{}.sock", self.stem))
     }
 
     /// Atomically points `agent/sock` at `target` (a dir-relative socket
@@ -208,7 +302,7 @@ impl AgentEndpoint {
     /// atomic, so a concurrent reader never sees a missing or half-written
     /// link. Shared by the self-claim and the posh#152 repoint-on-release.
     fn point_symlink_at(&self, target: &str) -> Result<()> {
-        let tmp = self.dir.join(format!(".sock.{}.tmp", self.id));
+        let tmp = self.dir.join(format!(".sock.{}.tmp", self.stem));
         let _ = std::fs::remove_file(&tmp);
         std::os::unix::fs::symlink(target, &tmp)?;
         std::fs::rename(&tmp, &self.well_known)?;
@@ -231,22 +325,30 @@ impl AgentEndpoint {
     }
 
     /// The dir-relative socket name of the best repoint target (posh#152
-    /// interim): the sibling (pid != ours) with the FRESHEST
-    /// `srv-<pid>.active` marker whose pid is alive (the same `kill(pid, 0)`
-    /// probe as `gc_dead_sockets` — never a connect, posh#147), whose marker
-    /// mtime is within [`AGENT_MARKER_FRESH_MS`] of the wall clock, and whose
-    /// `srv-<pid>.sock` actually exists. `None` when nobody qualifies.
+    /// interim): the sibling — srv- or mux-named, the two are full election
+    /// peers — with the FRESHEST `.active` marker whose owning pid is alive
+    /// (the same `kill(pid, 0)` probe as `gc_dead_sockets` — never a
+    /// connect, posh#147), whose marker mtime is within
+    /// [`AGENT_MARKER_FRESH_MS`] of the wall clock, and whose `<stem>.sock`
+    /// actually exists. Self is skipped by marker-path identity, not pid —
+    /// an srv and a mux endpoint in one process share a pid, and a pid
+    /// comparison could not tell self from that sibling. `None` when nobody
+    /// qualifies.
     fn freshest_active_sibling(&self) -> Option<String> {
         let entries = std::fs::read_dir(&self.dir).ok()?;
         let now = std::time::SystemTime::now();
-        let mut best: Option<(std::time::SystemTime, i32)> = None;
+        let mut best: Option<(std::time::SystemTime, String)> = None;
         for entry in entries.flatten() {
             let path = entry.path();
-            let Some(pid) = srv_marker_pid(&path) else {
+            if path == self.own_marker {
+                continue;
+            }
+            let Some(stem) = marker_stem(&path) else {
                 continue;
             };
-            if pid == self.id || !pid_alive(pid) {
-                continue;
+            match endpoint_pid(&self.dir, &stem) {
+                Some(pid) if pid_alive(pid) => {}
+                _ => continue,
             }
             let Ok(mtime) = std::fs::metadata(&path).and_then(|m| m.modified()) else {
                 continue;
@@ -258,18 +360,18 @@ impl AgentEndpoint {
                     continue;
                 }
             }
-            if !self.dir.join(format!("srv-{pid}.sock")).exists() {
+            if !self.dir.join(format!("{stem}.sock")).exists() {
                 continue;
             }
-            let fresher = match best {
+            let fresher = match &best {
                 None => true,
-                Some((t, _)) => mtime > t,
+                Some((t, _)) => mtime > *t,
             };
             if fresher {
-                best = Some((mtime, pid));
+                best = Some((mtime, stem));
             }
         }
-        best.map(|(_, pid)| format!("srv-{pid}.sock"))
+        best.map(|(_, stem)| format!("{stem}.sock"))
     }
 
     /// True when `agent/sock` is absent, dangling, or points at a dead
@@ -299,12 +401,14 @@ impl AgentEndpoint {
         match std::fs::read_link(&self.well_known) {
             Err(_) => true, // absent or not a symlink
             Ok(target) => {
-                // Targets are stored relative to `dir` (e.g. "srv-123.sock").
+                // Targets are stored relative to `dir` (e.g. "srv-123.sock",
+                // "mux-<client-id>.sock").
                 let resolved = self.dir.join(&target);
-                match srv_sock_pid(&resolved) {
-                    // A name we do not recognise as `srv-<pid>.sock` is not
-                    // something we can prove live, and nothing we wrote. Treat
-                    // it as takeable rather than deferring to it forever.
+                match sock_stem(&resolved).and_then(|stem| endpoint_pid(&self.dir, &stem)) {
+                    // A name we cannot resolve to an owning pid — an
+                    // unrecognised target, or a mux socket whose pid file is
+                    // gone — is not something we can prove live. Treat it as
+                    // takeable rather than deferring to it forever.
                     None => true,
                     Some(pid) => !pid_alive(pid),
                 }
@@ -533,23 +637,36 @@ impl AgentEndpoint {
         reap_closed(&mut self.channels);
     }
 
-    /// Unlinks `srv-*.sock` files — and their posh#152 `srv-*.active`
-    /// activity markers — in `agent/` whose owning pid is dead. A server
-    /// unlinks its own socket (and marker) on exit, so these are crash
-    /// leftovers.
+    /// Unlinks endpoint files — `srv-*`/`mux-*` sockets, their posh#152
+    /// `.active` activity markers, and mux `.pid` liveness records — in
+    /// `agent/` whose owning pid is dead. A server unlinks its own files on
+    /// exit, so these are crash leftovers.
     fn gc_dead_sockets(&self) {
         let Ok(entries) = std::fs::read_dir(&self.dir) else {
             return;
         };
         for entry in entries.flatten() {
             let path = entry.path();
-            if path == self.own_sock || path == self.own_marker {
+            if path == self.own_sock
+                || path == self.own_marker
+                || Some(&path) == self.own_pidfile.as_ref()
+            {
                 continue;
             }
-            let Some(pid) = srv_sock_pid(&path).or_else(|| srv_marker_pid(&path)) else {
+            let Some(stem) = sock_stem(&path)
+                .or_else(|| marker_stem(&path))
+                .or_else(|| stem_with_suffix(&path, ".pid").filter(|s| s.starts_with("mux-")))
+            else {
                 continue;
             };
-            if !pid_alive(pid) {
+            let dead = match endpoint_pid(&self.dir, &stem) {
+                Some(pid) => !pid_alive(pid),
+                // An unparseable srv name is not ours to reap (unrelated
+                // files are never GC'd); a mux stem with no readable pid
+                // file is a crash leftover by the write-before-bind ordering.
+                None => stem.starts_with("mux-"),
+            };
+            if dead {
                 let _ = std::fs::remove_file(&path);
             }
         }
@@ -571,6 +688,11 @@ impl Drop for AgentEndpoint {
         // The posh#152 activity marker goes with the socket: a dead endpoint
         // must not advertise itself as a repoint target.
         self.remove_active_marker();
+        // The mux pid file goes LAST: while the socket exists its liveness
+        // record must too (write-before-bind, remove-after-unlink).
+        if let Some(pf) = &self.own_pidfile {
+            let _ = std::fs::remove_file(pf);
+        }
     }
 }
 
@@ -1477,17 +1599,40 @@ fn pid_alive(pid: i32) -> bool {
     std::io::Error::last_os_error().raw_os_error() != Some(libc::ESRCH)
 }
 
-/// Extracts the pid from a `srv-<pid>.sock` file name, or `None` if the name
-/// does not match (so unrelated files in `agent/` are never GC'd).
-fn srv_sock_pid(path: &Path) -> Option<i32> {
+/// The endpoint stem (`srv-<pid>` / `mux-<client-id>`) behind an
+/// endpoint-owned file name with the given suffix, or `None` for anything
+/// else in `agent/` (so unrelated files are never GC'd or trusted).
+fn stem_with_suffix(path: &Path, suffix: &str) -> Option<String> {
     let name = path.file_name()?.to_str()?;
-    name.strip_prefix("srv-")?.strip_suffix(".sock")?.parse().ok()
+    let stem = name.strip_suffix(suffix)?;
+    (stem.starts_with("srv-") || stem.starts_with("mux-")).then(|| stem.to_string())
 }
 
-/// [`srv_sock_pid`] for the posh#152 `srv-<pid>.active` activity markers.
-fn srv_marker_pid(path: &Path) -> Option<i32> {
-    let name = path.file_name()?.to_str()?;
-    name.strip_prefix("srv-")?.strip_suffix(".active")?.parse().ok()
+/// [`stem_with_suffix`] for the socket files themselves.
+fn sock_stem(path: &Path) -> Option<String> {
+    stem_with_suffix(path, ".sock")
+}
+
+/// [`stem_with_suffix`] for the posh#152 `.active` activity markers.
+fn marker_stem(path: &Path) -> Option<String> {
+    stem_with_suffix(path, ".active")
+}
+
+/// The liveness pid of the endpoint owning `stem`: parsed from the name for
+/// `srv-<pid>`, read from `<stem>.pid` for `mux-<client-id>` — either way
+/// the #152 takeover/GC/repoint probes reduce to the same `kill(pid, 0)`.
+/// `None` when undeterminable: an unparseable srv name, or a mux stem whose
+/// pid file is missing or garbled (which, by the write-before-bind /
+/// remove-after-unlink ordering, marks a crash leftover).
+fn endpoint_pid(dir: &Path, stem: &str) -> Option<i32> {
+    if let Some(pid) = stem.strip_prefix("srv-") {
+        return pid.parse().ok();
+    }
+    std::fs::read_to_string(dir.join(format!("{stem}.pid")))
+        .ok()?
+        .trim()
+        .parse()
+        .ok()
 }
 
 #[cfg(test)]
@@ -2026,11 +2171,172 @@ mod tests {
     }
 
     #[test]
-    fn srv_sock_pid_parses_only_matching_names() {
-        assert_eq!(srv_sock_pid(Path::new("/x/srv-123.sock")), Some(123));
-        assert_eq!(srv_sock_pid(Path::new("/x/sock")), None);
-        assert_eq!(srv_sock_pid(Path::new("/x/srv-abc.sock")), None);
-        assert_eq!(srv_sock_pid(Path::new("/x/other.sock")), None);
+    fn endpoint_stems_and_pids_parse_only_matching_names() {
+        let base = temp_base();
+        let dir = base.join("agent");
+        std::fs::create_dir_all(&dir).unwrap();
+        assert_eq!(sock_stem(Path::new("/x/srv-123.sock")).as_deref(), Some("srv-123"));
+        assert_eq!(sock_stem(Path::new("/x/mux-host.sock")).as_deref(), Some("mux-host"));
+        assert_eq!(sock_stem(Path::new("/x/sock")), None);
+        assert_eq!(sock_stem(Path::new("/x/other.sock")), None);
+        assert_eq!(endpoint_pid(&dir, "srv-123"), Some(123));
+        assert_eq!(endpoint_pid(&dir, "srv-abc"), None);
+        // A mux stem's pid lives in its `<stem>.pid` file; absent ⇒ None.
+        assert_eq!(endpoint_pid(&dir, "mux-host"), None);
+        std::fs::write(dir.join("mux-host.pid"), b"321").unwrap();
+        assert_eq!(endpoint_pid(&dir, "mux-host"), Some(321));
+        std::fs::remove_dir_all(&base).ok();
+    }
+
+    // --- mux-named endpoints (M1 Task 2, docs/plans/2026-07-28-mux-endpoint-m1-impl.md) ---
+
+    #[test]
+    fn mux_endpoint_binds_named_socket_marker_and_pidfile() {
+        let base = temp_base();
+        let dir = base.join("agent");
+        let ep = AgentEndpoint::new_mux(&base, "clienthost").unwrap();
+        // The socket + the #152 election files are keyed by the client id.
+        assert_eq!(ep.own_sock, dir.join("mux-clienthost.sock"));
+        assert!(ep.own_sock.exists());
+        assert_eq!(
+            std::fs::read_link(ep.sock_path()).unwrap().to_str().unwrap(),
+            "mux-clienthost.sock",
+            "a mux endpoint claims agent/sock at construction like any sibling"
+        );
+        // The owning pid is discoverable beside the socket: a mux name
+        // carries no pid, and the takeover/GC/repoint probes all reduce to
+        // kill(pid, 0).
+        assert_eq!(
+            std::fs::read_to_string(dir.join("mux-clienthost.pid")).unwrap(),
+            own_pid().to_string()
+        );
+        drop(ep);
+        assert!(!dir.join("mux-clienthost.sock").exists());
+        assert!(!dir.join("mux-clienthost.pid").exists());
+        assert!(std::fs::symlink_metadata(dir.join("sock")).is_err());
+        std::fs::remove_dir_all(&base).ok();
+    }
+
+    #[test]
+    fn mux_endpoint_rejects_unsafe_client_id() {
+        // The id lands in a socket file name: refuse anything outside the
+        // sanitized [A-Za-z0-9._-] set the client promises (mux::client_id),
+        // rather than silently rewriting it.
+        let base = temp_base();
+        assert!(AgentEndpoint::new_mux(&base, "").is_err());
+        assert!(AgentEndpoint::new_mux(&base, "a/b").is_err());
+        assert!(AgentEndpoint::new_mux(&base, "a b").is_err());
+        std::fs::remove_dir_all(&base).ok();
+    }
+
+    #[test]
+    fn gc_reaps_dead_mux_endpoint_files() {
+        let base = temp_base();
+        let ep = AgentEndpoint::new(&base).unwrap();
+        let dir = base.join("agent");
+        // A crashed mux endpoint: socket + marker + a pid file naming a dead
+        // pid — all three are leftovers.
+        std::fs::write(dir.join("mux-dead.sock"), b"").unwrap();
+        std::fs::write(dir.join("mux-dead.active"), b"1").unwrap();
+        std::fs::write(dir.join("mux-dead.pid"), b"999999").unwrap();
+        // A mux socket with NO pid file is unprovably live (the pid file is
+        // written before the bind): a crash leftover, reaped too.
+        std::fs::write(dir.join("mux-orphan.sock"), b"").unwrap();
+        // A LIVE mux sibling survives.
+        std::fs::write(dir.join("mux-live.sock"), b"").unwrap();
+        std::fs::write(dir.join("mux-live.pid"), own_pid().to_string()).unwrap();
+        ep.gc_dead_sockets();
+        assert!(!dir.join("mux-dead.sock").exists());
+        assert!(!dir.join("mux-dead.active").exists());
+        assert!(!dir.join("mux-dead.pid").exists());
+        assert!(!dir.join("mux-orphan.sock").exists());
+        assert!(dir.join("mux-live.sock").exists(), "a live mux sibling is not reaped");
+        assert!(dir.join("mux-live.pid").exists());
+        drop(ep);
+        std::fs::remove_dir_all(&base).ok();
+    }
+
+    #[test]
+    fn takeover_judges_mux_link_target_by_pidfile_liveness() {
+        let base = temp_base();
+        let ep = AgentEndpoint::new(&base).unwrap();
+        let dir = base.join("agent");
+        // agent/sock points at a mux sibling whose recorded pid is alive.
+        std::fs::write(dir.join("mux-x.sock"), b"").unwrap();
+        std::fs::write(dir.join("mux-x.pid"), own_pid().to_string()).unwrap();
+        let _ = std::fs::remove_file(dir.join("sock"));
+        std::os::unix::fs::symlink("mux-x.sock", dir.join("sock")).unwrap();
+        assert!(
+            !ep.symlink_needs_takeover(),
+            "a live mux owner is not taken over from"
+        );
+        // A dead recorded pid makes it takeable...
+        std::fs::write(dir.join("mux-x.pid"), b"999999").unwrap();
+        assert!(ep.symlink_needs_takeover());
+        // ...and so does a missing pid file (unprovably live).
+        std::fs::remove_file(dir.join("mux-x.pid")).unwrap();
+        assert!(ep.symlink_needs_takeover());
+        drop(ep);
+        std::fs::remove_dir_all(&base).ok();
+    }
+
+    // M1 Task 2 (docs/plans/2026-07-28-mux-endpoint-m1-impl.md): the
+    // agent-only remote's mux-named endpoint is a FULL sibling in the #152
+    // election — it claims `agent/sock`, hands it to an srv-named sibling on
+    // its own peer's inactivity edge, and receives it back on the reverse
+    // edge. Same tick-driven virtual-time pattern as
+    // `handoff_repoints_to_the_active_sibling_on_the_inactivity_edge`.
+    #[test]
+    fn agent_only_server_claims_and_repoints_like_a_sibling() {
+        let base = temp_base();
+        let agent_dir = base.join("agent");
+        // The srv sibling runs on pid 1 (always live, the new_with_id
+        // convention); the mux endpoint records our own pid in mux-cid.pid.
+        let mut srv = AgentEndpoint::new_with_id(&base, 1).unwrap();
+        let mut mux = AgentEndpoint::new_mux(&base, "cid").unwrap();
+        srv.last_tick = 0;
+        mux.last_tick = 0;
+        assert_eq!(
+            std::fs::read_link(agent_dir.join("sock")).unwrap().to_str().unwrap(),
+            "mux-cid.sock",
+            "the mux endpoint claims agent/sock at construction (newest wins)"
+        );
+
+        // Warm-up: both peers active across two slow ticks — both markers up.
+        let mut t = 0;
+        while t < AGENT_SLOW_TICK_MS * 2 {
+            t += 100;
+            srv.tick(true, t);
+            mux.tick(true, t);
+        }
+        assert!(agent_dir.join("mux-cid.active").exists());
+        assert!(agent_dir.join("srv-1.active").exists());
+
+        // The mux endpoint's peer roams away: the inactivity edge repoints
+        // agent/sock at the srv sibling — never stale, never absent.
+        t += 100;
+        srv.tick(true, t);
+        mux.tick(false, t);
+        assert_eq!(
+            std::fs::read_link(agent_dir.join("sock")).unwrap().to_str().unwrap(),
+            "srv-1.sock",
+            "mux → srv: the inactivity edge hands the link to the srv sibling"
+        );
+
+        // And back: the mux peer returns (its marker stands up), then the
+        // srv peer roams away — its edge repoints at the mux sibling.
+        t += 100;
+        mux.tick(true, t);
+        srv.tick(false, t);
+        assert_eq!(
+            std::fs::read_link(agent_dir.join("sock")).unwrap().to_str().unwrap(),
+            "mux-cid.sock",
+            "srv → mux: the reverse edge hands the link back"
+        );
+
+        drop(mux);
+        drop(srv);
+        std::fs::remove_dir_all(&base).ok();
     }
 
     // --- AgentClient (the local-agent proxy mirror) -----------------------
