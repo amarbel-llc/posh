@@ -11,7 +11,7 @@ default: validate lint build test
 
 validate: validate-devshell
 
-# Build-check the devShell (catches devShell-only breakage prod build masks).
+# build-check the devShell (catches devShell-only breakage prod build masks)
 [group("pre-build")]
 validate-devshell:
     #!/usr/bin/env bash
@@ -88,28 +88,28 @@ lint-worktree:
 
 build: build-nix build-rust build-go build-palette build-toolset
 
-# Hermetic C++ reference build: autogen.sh + configure + make (+ check).
+# hermetic C++ reference build: autogen.sh + configure + make (+ check)
 [group("build")]
 build-nix:
     # The C++ lane; doCheck runs the sandbox-safe test subset. Sources
     # zz-mosh/ only, so Rust-only changes don't rebuild it.
     nix build -L --show-trace ".#mosh" -o result-mosh
 
-# Hermetic Rust workspace build (cargo test --workspace in checkPhase).
+# hermetic Rust workspace build (cargo test --workspace in checkPhase)
 [group("build")]
 build-rust:
     # The Rust CI gate (github #33); result-posh holds bin/posh, the
     # bin/posh-server alias, and bin/poshterity.
     nix build -L --show-trace ".#posh" -o result-posh
 
-# Hermetic posht build (Go/Bubble Tea terminal-capability test).
+# hermetic posht build (Go/Bubble Tea terminal-capability test)
 [group("build")]
 build-go:
     # The static posht binary (docs/posht.md). Sources posht/ only, so
     # non-posht changes don't rebuild it.
     nix build -L --show-trace ".#posht" -o result-posht
 
-# Hermetic posh-palette build (the command-palette renderer, RFC 0005).
+# hermetic posh-palette build (the command-palette renderer, RFC 0005)
 [group("build")]
 build-palette:
     # The static posh-palette binary. Sources posh-palette/ only; buildGoModule's
@@ -134,7 +134,7 @@ build-toolset:
 
 test: test-nix test-rust test-go test-mosh-ffi
 
-# Hermetic, CI-safe C++ test signal (the mosh package's doCheck).
+# hermetic, CI-safe C++ test signal (the mosh package's doCheck)
 [group("post-build")]
 test-nix:
     # The sandbox runs the crypto/protocol/--local subset and SKIPs the
@@ -151,7 +151,7 @@ test-rust:
     # Cheap once build-rust has realized the derivation. github #33.
     nix build -L --show-trace --no-link ".#posh"
 
-# Hermetic posht build signal (cheap once build-go has realized it).
+# hermetic posht build signal (cheap once build-go has realized it)
 [group("post-build")]
 test-go:
     nix build -L --show-trace --no-link ".#posht"
@@ -172,7 +172,7 @@ test-mosh-ffi:
 
 # --- operational -----------------------------------------------------------
 
-# Run the default posh toolset via the flake (nix run . -- <args>).
+# run the default posh toolset via the flake (nix run . -- <args>)
 run-nix *ARGS:
     nix run . -- {{ ARGS }}
 
@@ -213,7 +213,7 @@ run-posht-session host session="posht" *ARGS:
 
 codemod-fmt: codemod-fmt-conformist
 
-# Rewrite the worktree in place via conformist (clang-format + nixfmt + shfmt).
+# rewrite the worktree in place via conformist (clang-format + nixfmt + shfmt)
 [group("codemod")]
 codemod-fmt-conformist:
     # Read-only counterpart is `lint-fmt`. They share ./conformist.nix.
@@ -223,13 +223,13 @@ codemod-fmt-conformist:
 
 clean: clean-build
 
-# Remove nix build symlinks (result, result-*) from the worktree.
+# remove nix build symlinks (result, result-*) from the worktree
 [group("maintenance")]
 clean-build:
     # The C++ tree's distclean is `just zz-mosh/clean-build`.
     rm -rf result result-*
 
-# Update every flake input to its latest revision (rewrites flake.lock).
+# update every flake input to its latest revision (rewrites flake.lock)
 [group("maintenance")]
 update-nix:
     nix flake update
