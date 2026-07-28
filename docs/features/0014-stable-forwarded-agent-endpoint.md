@@ -97,7 +97,11 @@ it — one connection per client-host pair means one endpoint, so the path becom
 a bound socket rather than an elected symlink (RFC 0011 §7). The mux daemon's
 process model remains #54's job; nothing in RFC 0011 waits on it — though
 closing posh#136 waits on BOTH (RFC 0011 §7's conditional-adoption rule, added
-by the 2026-07-28 review).
+by the 2026-07-28 review). The wire increment itself — envelope, session
+channel, agent channels, behind `POSH_CHANNELS`/`--channels` — landed
+2026-07-28; what remains for this record is the mux endpoint (M1 of
+`docs/plans/2026-07-28-connection-mux-endpoint-design.md`) and the §8 policy
+ratification below.
 
 ### Decision (2026-07-28, PROPOSED — awaiting ratification): the two-client-host policy
 

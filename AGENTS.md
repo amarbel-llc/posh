@@ -154,6 +154,17 @@ the `eng-*(7)` manpages — read them with `man eng-versioning`,
   present. A client without it stays on raw `Tag::Output` even with the gate on
   (the old-client skew case). `daemon.rs`'s four-way matrix pins all four
   combinations of daemon-gate × client-caps.
+- **The RFC 0011 channel envelope is opt-in and default-off:** setting
+  `POSH_CHANNELS=1` client-side makes the ssh bootstrap append `--channels`,
+  and only then does the datagram connection speak the 9-byte envelope — the
+  session stream on one channel, each forwarded agent connection on its own
+  `agent` channel (`AgentChannelMux`, `remote/agent.rs`), retired cap ids
+  6/7/8 never on the wire. Without the selector the wire is byte-identical
+  baseline; `remote/channel.rs` (`seal_instruction`/`open_any_instruction`)
+  is the single mode gate. The FDR 0004 agent symlink election remains in
+  force in BOTH modes until the per-destination mux endpoint exists (RFC 0011
+  §7 conditional rule; design:
+  `docs/plans/2026-07-28-connection-mux-endpoint-design.md`).
 - **posh-term is pure state:** feed PTY bytes via `Terminal::process`, read
   the screen via `screen()`/`dump_vt()`/`dump_text()`, drain query replies
   via `take_responses()`. `generation()` bumps on every visible change;

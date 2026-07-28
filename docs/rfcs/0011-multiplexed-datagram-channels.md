@@ -479,10 +479,20 @@ mechanism is best designed against whatever handshake replaces it.
 ## Conformance Testing
 
 - Envelope encode/decode roundtrip, including a rejected `ver` and a truncated
-  envelope.
+  envelope. IMPLEMENTED:
+  `remote::channel::tests::envelope_roundtrip_prefixes_nine_bytes`,
+  `envelope_rejects_unknown_ver_and_truncation`, and the receive-gate
+  discard-without-teardown pair
+  `remote::server::tests::enveloped_receiver_discards_unknown_ver_and_stays_alive`.
 - Identifier partitioning: allocation stays within a peer's own space, ordinals
   start at 1, identifier 0 is refused as a data channel, and a RESERVED kind is
-  closed rather than treated as a connection error.
+  closed rather than treated as a connection error. IMPLEMENTED (partial):
+  `remote::channel::tests::id_partition_roundtrips_initiator_kind_ordinal`,
+  `allocator_starts_at_one_and_is_monotonic_per_kind`,
+  `control_identifier_is_never_allocated_and_is_rejected_as_data`, and
+  `remote::server::tests::enveloped_receiver_discards_foreign_channel` — the
+  single-session increment discards a RESERVED kind without yet answering the
+  SHOULD-level CLOSE.
 - Concurrent reassembly (§4): interleaved fragments of two instructions both
   complete — the direct regression test for the discard-on-different-id
   behaviour this document forbids. Plus eviction under the byte bound.
@@ -494,7 +504,15 @@ mechanism is best designed against whatever handshake replaces it.
 - Agent channel (§5): OPEN/data/CLOSE lifecycle over the envelope, cumulative
   retransmission across a simulated loss, FAIL surfacing as a closed socket, and
   a payload larger than the retired 247-byte capability budget completing in one
-  instruction.
+  instruction. IMPLEMENTED: `remote::agent::tests::`
+  `enveloped_agent_channel_open_data_close_lifecycle`,
+  `enveloped_agent_retransmits_unacked_tail_across_loss`,
+  `enveloped_agent_fail_surfaces_as_closed_socket`,
+  `enveloped_agent_instruction_exceeds_retired_cap_budget`,
+  `enveloped_agent_channel_bound_refused_with_fail` (the §3.4 bound), and
+  `session_instructions_precede_bulk_agent_data` (the §4.1 ordering); retired
+  ids verified absent by the enveloped no-retired-cap-ids tests across
+  server, client, and relay encode sites.
 - Ownership (§7): a second endpoint MUST NOT take over a live peer's bound
   `agent/sock` (the §8 configuration), and a single endpoint binds it directly
   with no symlink present.
