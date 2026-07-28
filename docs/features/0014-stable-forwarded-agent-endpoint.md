@@ -95,7 +95,53 @@ So the chosen path is **the wire contract first, the daemon after**: RFC 0011
 specifies the channel envelope, and single ownership of `agent/sock` falls out of
 it — one connection per client-host pair means one endpoint, so the path becomes
 a bound socket rather than an elected symlink (RFC 0011 §7). The mux daemon's
-process model remains #54's job; nothing in RFC 0011 waits on it.
+process model remains #54's job; nothing in RFC 0011 waits on it — though
+closing posh#136 waits on BOTH (RFC 0011 §7's conditional-adoption rule, added
+by the 2026-07-28 review).
+
+### Decision (2026-07-28, PROPOSED — awaiting ratification): the two-client-host policy
+
+RFC 0011 §8 defers to this record the case single ownership does not cover: the
+same remote account reached from two different client hosts, two mux endpoints,
+one `agent/sock`. This is not an edge case in the motivating deployment — the
+forwarded agent is the *only* agent there (the #103 login-set rendezvous chains
+`SSH_AUTH_SOCK` straight to posh's path), and hosts are reached from more than
+one client machine — and §8's safe default (the second endpoint proceeds
+without forwarding) would be a regression against even today's racy election.
+
+**Proposed: a most-recently-active election among mux endpoints, on stable
+per-client-host sockets.**
+
+- Each mux endpoint binds its own **deterministically named** socket,
+  `agent/mux-<client-id>.sock` — per client host, not per process, so it
+  survives endpoint respawn. Anyone wanting a *specific* client host's agent
+  connects to it directly; this subsumes the per-client-host-sub-paths option
+  without giving up the one stable path.
+- `agent/sock` stays an atomically repointed symlink electing among those
+  sockets, owned by the endpoint whose **peer was most recently active**. The
+  agent that answers is the one nearest the user's attention, which is the only
+  ranking that predicts where the matching key lives.
+- Handoff is **event-driven, not tick-driven**: a mux endpoint knows its own
+  peer's activity transitions the moment they happen (they are its connection's
+  heartbeat), so the owner releases on its peer going inactive and an active
+  sibling claims on its next activity edge — no multi-tick window. What makes
+  this election tractable where today's is not (posh#136): participants are one
+  per client host, long-lived, and their liveness signal is the authoritative
+  connection state rather than a bound-socket probe.
+- An **explicit preference** (config/env naming a client id to pin) MAY sit on
+  top as an override; it is not the base mechanism, because a static preference
+  goes stale exactly when the user walks to the other machine.
+
+Rejected: bound-socket-only with no election (the §8 safe default; starves the
+second host), per-client-host sub-paths as the primary interface (relocates the
+question — something must still choose what the one rendezvous path resolves
+to, per #103), and a broker process owning `agent/sock` (reintroduces the
+blast-radius and respawn machinery this record's option 2 died of, for no
+routing power the election lacks).
+
+Ratifying this closes the §8 question; the mechanism lands with the #54 mux
+endpoint (its design doc specifies the claim/release IPC), not with the wire
+increment.
 
 ## Limitations
 
@@ -122,10 +168,11 @@ process model remains #54's job; nothing in RFC 0011 waits on it.
   connections and two endpoints contesting one path again, and which agent should
   answer is a policy question. RFC 0011 §8 specifies the safe behaviour (an
   endpoint MUST NOT take over a live peer's bound socket) and explicitly defers
-  the policy here. Options: per-client-host sub-paths, an explicit preference, or
-  an election among long-lived mux endpoints — the last being far more tractable
-  than today's, since a mux endpoint's liveness is meaningful where a
-  per-connection process's is not.
+  the policy here. A policy is now PROPOSED (the 2026-07-28 decision above): a
+  most-recently-active election among mux endpoints on stable per-client-host
+  sockets — far more tractable than today's election, since a mux endpoint's
+  liveness is meaningful where a per-connection process's is not. Awaiting
+  ratification.
 - **The agent-channel lifetime bound is normative in RFC 0011 §5.** A
   connection with no open `session` channel does not service agent channels, so
   exposure is held to the union of session lifetimes — no worse than today,
