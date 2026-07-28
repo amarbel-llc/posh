@@ -819,6 +819,26 @@ impl AgentClient {
     pub fn live_channel_count(&self) -> usize {
         live_count(&self.channels)
     }
+
+    /// Close every live proxied channel NOW, returning the `Close` records to
+    /// queue toward the peer so the wire channels terminate too. The FDR 0014
+    /// M1 unref-to-zero sweep: when the mux daemon's session refcount reaches
+    /// zero, open agent channels must not outlive the last session ref
+    /// (RFC 0011 §5's exposure bound, client-enforced). Idempotent.
+    pub fn close_all(&mut self) -> Vec<AgentRecord> {
+        let mut out = Vec::new();
+        for c in &mut self.channels {
+            if !c.closed {
+                c.closed = true;
+                out.push(close_record(c.id));
+            }
+        }
+        reap_closed(&mut self.channels);
+        // Match the apply_records sweep: a closed channel leaves no sniffer.
+        self.sniffers
+            .retain(|(id, _)| self.channels.iter().any(|c| c.id == *id && !c.closed));
+        out
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -2440,6 +2460,41 @@ mod tests {
         client.apply_records(&[close_record(5)]);
         assert_eq!(client.live_channel_count(), 0);
         std::fs::remove_file(&sock).ok();
+    }
+
+    #[test]
+    fn client_close_all_returns_close_records_and_drops_channels() {
+        // The FDR 0014 M1 unref-to-zero sweep: refs hit 0 => every proxied
+        // channel closes NOW, and the Close records go back to the peer so
+        // the wire channels terminate too (RFC 0011 §5).
+        let sock = temp_sock();
+        std::fs::remove_file(&sock).ok();
+        let _listener = UnixListener::bind(&sock).unwrap();
+        let mut client = AgentClient::new(sock.clone());
+        client.apply_records(&[
+            rec_open(1),
+            rec_open(2),
+        ]);
+        assert_eq!(client.live_channel_count(), 2);
+        let mut closes = client.close_all();
+        closes.sort_by_key(|r| r.channel);
+        assert_eq!(closes.len(), 2);
+        for (r, want) in closes.iter().zip([1u32, 2]) {
+            assert_eq!(r.kind, RecordKind::Close);
+            assert_eq!(r.channel, want);
+        }
+        assert_eq!(client.live_channel_count(), 0);
+        // Idempotent: nothing left to close.
+        assert!(client.close_all().is_empty());
+        std::fs::remove_file(&sock).ok();
+    }
+
+    fn rec_open(channel: u32) -> AgentRecord {
+        AgentRecord {
+            channel,
+            kind: RecordKind::Open,
+            payload: Vec::new(),
+        }
     }
 
     #[test]

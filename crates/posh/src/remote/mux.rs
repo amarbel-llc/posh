@@ -3,14 +3,21 @@
 //! remote side names in the FDR 0014 election.
 //!
 //! Design: docs/plans/2026-07-28-connection-mux-endpoint-design.md ("Keying
-//! and placement", "Remote side"). This file currently carries only Task 1 of
-//! docs/plans/2026-07-28-mux-endpoint-m1-impl.md — the pure helpers; the
-//! daemon + IPC (Task 3) and client integration (Task 4) consume them.
+//! and placement", "Remote side"). This file carries Tasks 1 and 3 of
+//! docs/plans/2026-07-28-mux-endpoint-m1-impl.md — the pure helpers, the
+//! refcount/linger state machine, the zmx-style IPC protocol, and the
+//! double-forked daemon owning the agent-only connection; client
+//! integration (Task 4) consumes [`run_daemon`].
 
+use std::os::fd::AsRawFd;
+use std::os::unix::net::{UnixListener, UnixStream};
 use std::path::{Path, PathBuf};
 
-use crate::remote::datagram::Family;
-use crate::util::{self, Result};
+use crate::remote::agent::{AgentChannelMux, AgentClient};
+use crate::remote::channel;
+use crate::remote::datagram::{Connection, Family};
+use crate::remote::sync::{self, AgentRecord, RecordKind, HEARTBEAT_INTERVAL};
+use crate::util::{self, now_ms, Result};
 
 /// Canonicalized, filesystem-safe destination key: `user@host` + address
 /// family + port range (#54), rendered as a slug safe to embed in
@@ -212,6 +219,713 @@ impl MuxState {
     }
 }
 
+// ---------------------------------------------------------------------------
+// The mux IPC protocol (M1 Task 3, design doc "IPC"): zmx-style framing —
+// 1-byte tag + u32 LE payload length, the session/ipc.rs style — but in the
+// mux socket's OWN tag space. Bounds-checked decodes throughout (RFC 0008
+// security rules); same-uid IPC under the hardened mux/ dir.
+
+/// The compile-time protocol/version stamp the RFC 0011 §6 endpoint rule
+/// keys on: `"mux1/"` (the mux IPC protocol generation) + the §2 channel
+/// envelope version this build speaks ([`channel::VER_1`], pinned by test).
+/// A client seeing a different stamp in the `MuxHelloAck` MUST start a fresh
+/// socket-name variant and let this endpoint drain — never negotiate down.
+pub const MUX_PROTO_STAMP: &str = "mux1/1";
+
+/// Upper bound on one mux IPC frame's payload. Legitimate payloads are a
+/// stamp + a few scalars (well under 1 KiB); the bound stops a hostile or
+/// confused peer from driving unbounded buffering via a huge length header.
+const MUX_MAX_FRAME_LEN: usize = 4096;
+
+/// Tags in the mux socket's own space (deliberately NOT `session/ipc::Tag`).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[repr(u8)]
+pub enum MuxTag {
+    /// Client → mux: `MuxHello` (version stamp + pid). First verb on a conn.
+    Hello = 0,
+    /// Mux → client: `MuxHelloAck` (stamp, connection state, destination key).
+    HelloAck = 1,
+    /// Client → mux: register this invocation as a live local session for the
+    /// destination (the FDR 0014 M1 policy input). At most one ref per IPC
+    /// connection; the ref drops automatically when the connection closes, so
+    /// a crashed client can never pin serviceability (no pid probing).
+    SessionRef = 2,
+    /// Client → mux: request the one-line debug summary (FDR 0007 surface).
+    Status = 3,
+    /// Mux → client: the summary line (UTF-8).
+    StatusReply = 4,
+}
+
+impl MuxTag {
+    fn from_u8(b: u8) -> Option<MuxTag> {
+        Some(match b {
+            0 => MuxTag::Hello,
+            1 => MuxTag::HelloAck,
+            2 => MuxTag::SessionRef,
+            3 => MuxTag::Status,
+            4 => MuxTag::StatusReply,
+            _ => return None,
+        })
+    }
+}
+
+pub fn encode_mux_frame(tag: MuxTag, payload: &[u8]) -> Vec<u8> {
+    let mut out = Vec::with_capacity(5 + payload.len());
+    out.push(tag as u8);
+    out.extend_from_slice(&(payload.len() as u32).to_le_bytes());
+    out.extend_from_slice(payload);
+    out
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct MuxFrame {
+    pub tag: MuxTag,
+    pub payload: Vec<u8>,
+}
+
+/// Reassembles mux frames from a (typically non-blocking) stream socket —
+/// the `session/ipc::FrameBuffer` shape over the mux tag space, with the
+/// tighter [`MUX_MAX_FRAME_LEN`] bound. Unknown tags are skipped (forward
+/// compatibility); an oversize length errors so the conn is dropped.
+#[derive(Default)]
+pub struct MuxFrameBuffer {
+    buf: Vec<u8>,
+    head: usize,
+}
+
+impl MuxFrameBuffer {
+    pub fn feed(&mut self, data: &[u8]) {
+        if self.head > 0 {
+            self.buf.drain(..self.head);
+            self.head = 0;
+        }
+        self.buf.extend_from_slice(data);
+    }
+
+    pub fn next(&mut self) -> Result<Option<MuxFrame>> {
+        loop {
+            let avail = &self.buf[self.head..];
+            if avail.len() < 5 {
+                return Ok(None);
+            }
+            let len = u32::from_le_bytes([avail[1], avail[2], avail[3], avail[4]]) as usize;
+            if len > MUX_MAX_FRAME_LEN {
+                return Err(util::Error::Msg(format!(
+                    "mux frame length {len} exceeds maximum {MUX_MAX_FRAME_LEN}"
+                )));
+            }
+            if avail.len() < 5 + len {
+                return Ok(None);
+            }
+            let tag_byte = avail[0];
+            let payload = avail[5..5 + len].to_vec();
+            self.head += 5 + len;
+            if let Some(tag) = MuxTag::from_u8(tag_byte) {
+                return Ok(Some(MuxFrame { tag, payload }));
+            }
+        }
+    }
+}
+
+/// `MuxTag::Hello` payload: `pid: u32 LE` + the sender's protocol stamp
+/// (UTF-8, to end of payload).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct MuxHello {
+    pub pid: u32,
+    pub stamp: String,
+}
+
+impl MuxHello {
+    #[allow(dead_code)] // the client half encodes (M1 Task 4, docs/plans/2026-07-28-mux-endpoint-m1-impl.md)
+    pub fn encode(&self) -> Vec<u8> {
+        let mut out = Vec::with_capacity(4 + self.stamp.len());
+        out.extend_from_slice(&self.pid.to_le_bytes());
+        out.extend_from_slice(self.stamp.as_bytes());
+        out
+    }
+
+    pub fn decode(payload: &[u8]) -> Option<MuxHello> {
+        if payload.len() < 4 {
+            return None;
+        }
+        Some(MuxHello {
+            pid: u32::from_le_bytes(payload[..4].try_into().ok()?),
+            stamp: String::from_utf8_lossy(&payload[4..]).into_owned(),
+        })
+    }
+}
+
+/// The connection state a `MuxHelloAck` reports (design doc "IPC").
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[repr(u8)]
+#[allow(dead_code)] // Bootstrapping/Draining reported by later daemon states + decoded by the Task 4 client
+pub enum MuxConnState {
+    /// The ssh bootstrap / UDP association is still coming up.
+    Bootstrapping = 0,
+    /// The enveloped agent-only connection is live.
+    Connected = 1,
+    /// Superseded (stamp mismatch) or winding down: serving no new refs.
+    Draining = 2,
+}
+
+impl MuxConnState {
+    #[allow(dead_code)] // the client half decodes (M1 Task 4, docs/plans/2026-07-28-mux-endpoint-m1-impl.md)
+    fn from_u8(b: u8) -> Option<MuxConnState> {
+        Some(match b {
+            0 => MuxConnState::Bootstrapping,
+            1 => MuxConnState::Connected,
+            2 => MuxConnState::Draining,
+            _ => return None,
+        })
+    }
+
+    fn label(self) -> &'static str {
+        match self {
+            MuxConnState::Bootstrapping => "bootstrapping",
+            MuxConnState::Connected => "connected",
+            MuxConnState::Draining => "draining",
+        }
+    }
+}
+
+/// `MuxTag::HelloAck` payload: `state: u8`, `stamp_len: u16 LE`, the stamp,
+/// then the destination key (UTF-8, to end of payload).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct MuxHelloAck {
+    pub state: MuxConnState,
+    pub stamp: String,
+    pub key: String,
+}
+
+impl MuxHelloAck {
+    pub fn encode(&self) -> Vec<u8> {
+        let stamp = self.stamp.as_bytes();
+        let mut out = Vec::with_capacity(3 + stamp.len() + self.key.len());
+        out.push(self.state as u8);
+        out.extend_from_slice(&(stamp.len() as u16).to_le_bytes());
+        out.extend_from_slice(stamp);
+        out.extend_from_slice(self.key.as_bytes());
+        out
+    }
+
+    #[allow(dead_code)] // the client half decodes (M1 Task 4, docs/plans/2026-07-28-mux-endpoint-m1-impl.md)
+    pub fn decode(payload: &[u8]) -> Option<MuxHelloAck> {
+        if payload.len() < 3 {
+            return None;
+        }
+        let state = MuxConnState::from_u8(payload[0])?;
+        let stamp_len = u16::from_le_bytes([payload[1], payload[2]]) as usize;
+        let rest = &payload[3..];
+        if stamp_len > rest.len() {
+            return None;
+        }
+        Some(MuxHelloAck {
+            state,
+            stamp: String::from_utf8_lossy(&rest[..stamp_len]).into_owned(),
+            key: String::from_utf8_lossy(&rest[stamp_len..]).into_owned(),
+        })
+    }
+}
+
+/// One accepted IPC connection: framing reassembly plus the two per-conn
+/// facts the daemon tracks — hello completed, and whether this conn holds
+/// the (at most one) session ref that auto-drops on close.
+struct IpcConn {
+    stream: UnixStream,
+    read_buf: MuxFrameBuffer,
+    hello_ok: bool,
+    holds_ref: bool,
+}
+
+impl IpcConn {
+    fn new(stream: UnixStream) -> IpcConn {
+        IpcConn {
+            stream,
+            read_buf: MuxFrameBuffer::default(),
+            hello_ok: false,
+            holds_ref: false,
+        }
+    }
+}
+
+/// The per-iteration facts `MuxStatus` reports alongside the live
+/// [`MuxState`]: destination key, connection state, peer address,
+/// last-heard age, forwarded-channel count.
+struct MuxStatusCtx<'a> {
+    key: &'a str,
+    conn_state: MuxConnState,
+    peer: Option<std::net::SocketAddr>,
+    heard_age_ms: u64,
+    channels: usize,
+}
+
+/// The `MuxStatus` one-liner (FDR 0007 dump surface): peer addr, last-heard
+/// age, channel count, refs, linger state.
+fn status_line(ctx: &MuxStatusCtx, state: &MuxState) -> String {
+    format!(
+        "mux {key}: state={cs} peer={peer} heard={heard}ms channels={ch} refs={refs} linger={linger}",
+        key = ctx.key,
+        cs = ctx.conn_state.label(),
+        peer = ctx
+            .peer
+            .map_or_else(|| "none".to_string(), |a| a.to_string()),
+        heard = ctx.heard_age_ms,
+        ch = ctx.channels,
+        refs = state.refs(),
+        linger = if state.lingering() { "armed" } else { "off" },
+    )
+}
+
+/// Writes one mux frame to a conn, reporting whether the conn is still good.
+/// IPC replies are tiny (a stamp + scalars), so a short/failed write within
+/// the retry budget just condemns the conn — no partial-write bookkeeping.
+fn send_mux_frame(conn: &mut IpcConn, tag: MuxTag, payload: &[u8]) -> bool {
+    let wire = encode_mux_frame(tag, payload);
+    matches!(
+        util::write_all_retry(conn.stream.as_raw_fd(), &wire, 100),
+        Ok(n) if n == wire.len()
+    )
+}
+
+/// Drains and processes one IPC connection: reads until `WouldBlock`, then
+/// dispatches every complete frame. Returns whether the connection stays
+/// open; `false` covers EOF, I/O errors, malformed frames, protocol-order
+/// violations (a verb before `Hello`), and the §6 stamp mismatch — which is
+/// first ANSWERED with our own stamp (so the client can tell and start a
+/// fresh `<key>.<ver>` endpoint) and then rejected. The caller drops a dead
+/// conn via [`drop_ipc_conn`], which releases its auto-unref ref.
+fn process_ipc_conn(conn: &mut IpcConn, state: &mut MuxState, ctx: &MuxStatusCtx) -> bool {
+    let fd = conn.stream.as_raw_fd();
+    let mut open = true;
+    loop {
+        let mut tmp = [0u8; 1024];
+        match util::read_fd(fd, &mut tmp) {
+            Ok(0) => {
+                open = false;
+                break;
+            }
+            Ok(n) => conn.read_buf.feed(&tmp[..n]),
+            Err(e) if e.kind() == std::io::ErrorKind::WouldBlock => break,
+            Err(e) if e.kind() == std::io::ErrorKind::Interrupted => continue,
+            Err(_) => {
+                open = false;
+                break;
+            }
+        }
+    }
+    loop {
+        let frame = match conn.read_buf.next() {
+            Ok(Some(frame)) => frame,
+            Ok(None) => break,
+            Err(_) => return false, // oversize/corrupt framing: drop the peer
+        };
+        match frame.tag {
+            MuxTag::Hello => {
+                let Some(hello) = MuxHello::decode(&frame.payload) else {
+                    return false;
+                };
+                let ack = MuxHelloAck {
+                    state: ctx.conn_state,
+                    stamp: MUX_PROTO_STAMP.to_string(),
+                    key: ctx.key.to_string(),
+                };
+                if !send_mux_frame(conn, MuxTag::HelloAck, &ack.encode()) {
+                    return false;
+                }
+                if hello.stamp != MUX_PROTO_STAMP {
+                    // RFC 0011 §6: never negotiate down. The ack above told
+                    // the client OUR stamp; it starts a fresh endpoint and
+                    // this conn is rejected.
+                    util::log_write(
+                        "warn",
+                        &format!(
+                            "rejecting mux hello with stamp {:?} (ours: {MUX_PROTO_STAMP}) pid={}",
+                            hello.stamp, hello.pid
+                        ),
+                    );
+                    return false;
+                }
+                conn.hello_ok = true;
+            }
+            MuxTag::SessionRef => {
+                if !conn.hello_ok {
+                    return false; // protocol order: Hello first
+                }
+                // Each accepted IPC conn carries at most one ref; a duplicate
+                // is idempotent so a confused client cannot inflate the count.
+                if !conn.holds_ref {
+                    conn.holds_ref = true;
+                    state.add_ref();
+                }
+            }
+            MuxTag::Status => {
+                if !conn.hello_ok {
+                    return false;
+                }
+                let line = status_line(ctx, state);
+                if !send_mux_frame(conn, MuxTag::StatusReply, line.as_bytes()) {
+                    return false;
+                }
+            }
+            // Mux → client verbs arriving FROM a peer: ignore, keep the conn.
+            MuxTag::HelloAck | MuxTag::StatusReply => {}
+        }
+    }
+    open
+}
+
+/// Releases a departing conn's session ref (the auto-unref half of
+/// `MuxSessionRef`): the caller invokes this exactly once per dropped conn.
+fn drop_ipc_conn(conn: &IpcConn, state: &mut MuxState, now: u64) {
+    if conn.holds_ref {
+        state.unref(now);
+    }
+}
+
+// ---------------------------------------------------------------------------
+// The daemon (M1 Task 3, design doc "Lifecycle"): a double-forked,
+// process-grouped grandchild per destination key — the session-daemon
+// pattern — owning the ssh bootstrap for `posh-server agent` and the client
+// half of the agent channels.
+
+/// What ensuring the endpoint for a key produced, for the spawner (Task 4).
+#[derive(Debug, PartialEq, Eq)]
+pub enum MuxSpawn {
+    /// This process bound the socket and forked the daemon; connect now.
+    Spawned,
+    /// A live daemon already owns the socket (we lost the bind race, or one
+    /// was simply already up): connect to it instead.
+    AlreadyRunning,
+}
+
+enum MuxBind {
+    Bound(UnixListener),
+    ExistingDaemon,
+}
+
+/// The bind seam, unit-testable with two binds in one process: bind wins;
+/// on `AddrInUse`, a successful probe connect means a live winner exists
+/// (losing race ⇒ defer to it), a dead socket (crash leftover) is unlinked
+/// and rebound — the session-daemon stale-socket pattern (github #15: only a
+/// genuinely dead socket is reclaimed; a live-but-slow daemon is not).
+fn bind_or_probe(path: &Path) -> Result<MuxBind> {
+    match UnixListener::bind(path) {
+        Ok(l) => return Ok(MuxBind::Bound(l)),
+        Err(e) if e.kind() == std::io::ErrorKind::AddrInUse => {}
+        Err(e) => return Err(util::Error::Msg(format!("bind {}: {e}", path.display()))),
+    }
+    if !crate::session::socket_is_dead(path) {
+        return Ok(MuxBind::ExistingDaemon);
+    }
+    util::log_write(
+        "warn",
+        &format!("stale mux socket found, cleaning up {}", path.display()),
+    );
+    let _ = std::fs::remove_file(path);
+    UnixListener::bind(path)
+        .map(MuxBind::Bound)
+        .map_err(|e| util::Error::Msg(format!("bind {}: {e}", path.display())))
+}
+
+/// Ensure the mux daemon for `key` toward ssh destination `dest`
+/// (`[user@]host`, what [`sshwrap::run`](crate::remote::sshwrap::run) takes).
+/// Binds `mux/<key>.sock` (losing a race defers to the live winner; a stale
+/// socket is reclaimed), double-forks like a session daemon, and in the
+/// grandchild drives the ssh bootstrap for `posh-server agent --client-id
+/// <id>` (channels implied — RFC 0011 §5 agent channels exist only enveloped)
+/// before entering [`mux_loop`]. `agent_source` is the FDR 0004-resolved
+/// local agent socket the spawning invocation carries (design doc
+/// "Security": the endpoint inherits the spawner's resolved source).
+///
+/// Returns in the SPAWNER only; the daemon grandchild exits the process.
+#[allow(dead_code)] // consumed by client integration (M1 Task 4, docs/plans/2026-07-28-mux-endpoint-m1-impl.md)
+pub fn run_daemon(
+    key: &str,
+    dest: &str,
+    family: Family,
+    port_range: Option<String>,
+    agent_source: PathBuf,
+) -> Result<MuxSpawn> {
+    let sock = mux_socket_path(key)?;
+    let listener = match bind_or_probe(&sock)? {
+        MuxBind::ExistingDaemon => return Ok(MuxSpawn::AlreadyRunning),
+        MuxBind::Bound(l) => l,
+    };
+    if util::double_fork()? {
+        drop(listener);
+        // Give the grandchild a beat to exist before the spawner connects
+        // (the socket is already bound, so a fast connect just queues).
+        std::thread::sleep(std::time::Duration::from_millis(10));
+        return Ok(MuxSpawn::Spawned);
+    }
+
+    // The daemon grandchild. Mirror daemon_main: detach stdio, log to a
+    // per-key file beside the socket, record panics, name terminating
+    // signals.
+    util::redirect_stdio_devnull();
+    let _ = util::log_init(&sock.with_extension("log"));
+    std::panic::set_hook(Box::new(|info| {
+        util::log_write("error", &format!("mux daemon panic: {info}"));
+    }));
+    util::install_daemon_signal_handlers();
+
+    let result = (|| -> Result<()> {
+        let opts = crate::remote::sshwrap::SshOptions {
+            family,
+            port_range,
+            agent_source: None, // the agent verb IS forwarding; no -A
+            real_ssh_agent_forward: None,
+            channels: true, // RFC 0011 §6: selected on the bootstrap invocation
+        };
+        let tail = vec![
+            "agent".to_string(),
+            "--client-id".to_string(),
+            client_id(),
+        ];
+        let (host, port, key_b64) = crate::remote::sshwrap::bootstrap(dest, &tail, &opts)?;
+        let addr = crate::remote::client::resolve(&host, port, family)?;
+        let udp_key = crate::remote::crypto::Key::from_base64(key_b64.trim())?;
+        let conn = Connection::client(addr, &udp_key)?;
+        util::log_write(
+            "info",
+            &format!("mux daemon started key={key} dest={dest} peer={addr}"),
+        );
+        mux_loop(listener, conn, &agent_source, linger_ms_from_env(), key);
+        Ok(())
+    })();
+    let _ = std::fs::remove_file(&sock);
+    match result {
+        Ok(()) => {
+            util::log_write("info", &format!("mux daemon exiting key={key}"));
+            std::process::exit(0);
+        }
+        Err(e) => {
+            util::log_write("error", &format!("mux daemon failed key={key}: {e}"));
+            std::process::exit(1);
+        }
+    }
+}
+
+/// The `ClientMessage` heartbeat body: the connection keepalive is the SAME
+/// mechanism the roaming client uses — a session-channel instruction at
+/// least every [`HEARTBEAT_INTERVAL`] (`drive_client`'s `session_due` arm) —
+/// not a new wire message. The agent-only remote discards session-kind
+/// instructions but counts them as authentic peer activity (they cleared the
+/// AEAD seal), which is exactly what keeps its `last_heard`/election marker
+/// fresh. Zero rows/cols and an empty input stream: there is no session.
+fn heartbeat_message() -> Vec<u8> {
+    sync::ClientMessage {
+        flags: 0,
+        caps: Vec::new(),
+        acked_frame: 0,
+        rows: 0,
+        cols: 0,
+        input_base: 0,
+        input: Vec::new(),
+    }
+    .encode()
+}
+
+/// The daemon's event loop — `drive_client` minus everything session, plus
+/// the IPC listener: polls the IPC socket + per-conn fds, the enveloped UDP
+/// connection, and the local-agent proxy's channel fds. Server-initiated
+/// agent OPENs dial the local `agent_source` while a session ref is held;
+/// with `refs == 0` every OPEN is answered FAIL and open channels are closed
+/// on the unref-to-zero edge (the FDR 0014 M1 policy, client-enforced).
+/// Outbound traffic drains through `iteration_sends(None, ..)` with RTO
+/// pacing; a heartbeat session instruction rides at least every
+/// [`HEARTBEAT_INTERVAL`]. Exits on the linger expiry or a terminating
+/// signal; the remote side's Drop follows from the ensuing silence (its
+/// peer timeout). Factored from [`run_daemon`] so tests drive it in-process
+/// over loopback UDP against a real Task 2 `agent_only_loop` peer.
+fn mux_loop(
+    listener: UnixListener,
+    mut conn: Connection,
+    agent_source: &Path,
+    linger_ms: u64,
+    key: &str,
+) {
+    let _ = listener.set_nonblocking(true);
+    let mut fragmenter = sync::Fragmenter::new();
+    let mut assembly = sync::FragmentAssembly::new();
+    let mut agent_mux = AgentChannelMux::new_client();
+    let mut proxy = AgentClient::new(agent_source.to_path_buf());
+    let mut state = MuxState::new(linger_ms, now_ms());
+    let mut conns: Vec<IpcConn> = Vec::new();
+    let mut last_send: u64 = 0;
+    let mut last_heard: u64 = now_ms();
+
+    loop {
+        if util::take_flag(&util::SIGTERM_RECEIVED) {
+            let signo = util::LAST_SIGNAL.load(std::sync::atomic::Ordering::Acquire);
+            util::log_write(
+                "info",
+                &format!("{} received, mux daemon winding down", util::signal_name(signo)),
+            );
+            break;
+        }
+        let now = now_ms();
+
+        // Wake for the next heartbeat, the linger expiry, and the agent
+        // mux's fresh sends / RTO retransmissions (RFC 0011 §5).
+        let mut deadline = last_send.saturating_add(HEARTBEAT_INTERVAL);
+        if let Some(d) = state.next_deadline() {
+            deadline = deadline.min(d);
+        }
+        if let Some(d) = agent_mux.next_deadline(conn.rto()) {
+            deadline = deadline.min(d.max(now));
+        }
+        let timeout = deadline.saturating_sub(now).min(1000) as i32;
+
+        let mut fds = vec![
+            util::pollfd(listener.as_raw_fd(), libc::POLLIN),
+            util::pollfd(conn.raw_fd(), libc::POLLIN),
+        ];
+        // IPC conns occupy 2..2+n_ipc; accepts below push AFTER them, so this
+        // iteration's fd<->conn index mapping stays stable (daemon.rs pattern).
+        let n_ipc = conns.len();
+        for c in &conns {
+            fds.push(util::pollfd(c.stream.as_raw_fd(), libc::POLLIN));
+        }
+        let agent_base = fds.len();
+        fds.extend_from_slice(&proxy.pollfds());
+
+        match util::poll(&mut fds, timeout) {
+            Ok(_) => {}
+            Err(e) if e.kind() == std::io::ErrorKind::Interrupted => continue,
+            Err(e) => {
+                util::log_write("error", &format!("mux poll failed: {e}"));
+                break;
+            }
+        }
+        let now = now_ms();
+
+        // New IPC connections.
+        if fds[0].revents & libc::POLLIN != 0 {
+            while let Ok((stream, _)) = listener.accept() {
+                let _ = stream.set_nonblocking(true);
+                conns.push(IpcConn::new(stream));
+            }
+        }
+
+        // Enveloped datagrams: agent-kind instructions dispatch through the
+        // channel mux; session-kind carries nothing here (the daemon IS the
+        // client — the remote sends no session frames) but any admitted
+        // instruction is authentic peer activity.
+        if fds[1].revents & libc::POLLIN != 0 {
+            loop {
+                match conn.recv() {
+                    Ok(Some(payload)) => {
+                        let Ok(frag) = sync::Fragment::from_bytes(&payload) else {
+                            continue;
+                        };
+                        let Some(assembled) = assembly.add(frag) else {
+                            continue;
+                        };
+                        let Some((chan, message)) =
+                            channel::open_any_instruction(true, &assembled)
+                        else {
+                            util::log_write(
+                                "warn",
+                                "mux: discarded instruction: bad envelope or foreign channel",
+                            );
+                            continue;
+                        };
+                        last_heard = now_ms();
+                        if chan.kind() != channel::KIND_AGENT {
+                            continue;
+                        }
+                        let recs = agent_mux.on_instruction(chan, message);
+                        if state.serviceable() {
+                            let replies = proxy.apply_records(&recs);
+                            agent_mux.queue_records(&replies);
+                        } else {
+                            // FDR 0014 M1 policy: refs == 0 ⇒ agent service
+                            // off — answer every OPEN with FAIL and hand
+                            // nothing to the local agent.
+                            let fails: Vec<AgentRecord> = recs
+                                .iter()
+                                .filter(|r| r.kind == RecordKind::Open)
+                                .map(|r| AgentRecord {
+                                    channel: r.channel,
+                                    kind: RecordKind::Fail,
+                                    payload: Vec::new(),
+                                })
+                                .collect();
+                            if !fails.is_empty() {
+                                agent_mux.queue_records(&fails);
+                            }
+                        }
+                    }
+                    Ok(None) => continue,
+                    Err(e) if e.kind() == std::io::ErrorKind::WouldBlock => break,
+                    Err(_) => break,
+                }
+            }
+        }
+
+        // Local-agent reply bytes onto the per-channel outboxes (one
+        // signalled fd drives the whole sweep, as in the sibling loops).
+        if (agent_base..fds.len())
+            .any(|i| fds[i].revents & (libc::POLLIN | libc::POLLHUP | libc::POLLERR) != 0)
+        {
+            agent_mux.queue_records(&proxy.read_channels());
+        }
+
+        // IPC traffic on the polled prefix; walk backwards so removal is
+        // safe. A departing conn auto-unrefs; the unref-to-zero edge closes
+        // every open agent channel (the M1 exposure bound — linger keeps the
+        // CONNECTION, never agent service).
+        let ctx = MuxStatusCtx {
+            key,
+            conn_state: MuxConnState::Connected,
+            peer: conn.remote(),
+            heard_age_ms: now.saturating_sub(last_heard),
+            channels: proxy.live_channel_count(),
+        };
+        let mut i = conns.len().min(n_ipc);
+        while i > 0 {
+            i -= 1;
+            if fds[2 + i].revents & (libc::POLLIN | libc::POLLHUP | libc::POLLERR) == 0 {
+                continue;
+            }
+            if !process_ipc_conn(&mut conns[i], &mut state, &ctx) {
+                let dead = conns.remove(i);
+                let was_serviceable = state.serviceable();
+                drop_ipc_conn(&dead, &mut state, now);
+                if was_serviceable && !state.serviceable() {
+                    agent_mux.queue_records(&proxy.close_all());
+                }
+            }
+        }
+
+        // Linger expiry — checked AFTER IPC processing so a ref queued on a
+        // just-accepted conn lands before the exit decision (the zero-linger
+        // spawner race).
+        if state.should_exit(now) {
+            util::log_write("info", "mux daemon: linger expired");
+            break;
+        }
+
+        // Sends: the RFC 0011 §4.1 ordered drain with the heartbeat as the
+        // only session instruction (see `heartbeat_message`); agent
+        // instructions flow every iteration with RTO pacing.
+        let session_due = now.saturating_sub(last_send) >= HEARTBEAT_INTERVAL;
+        let session = session_due.then(heartbeat_message);
+        if session.is_some() {
+            last_send = now;
+        }
+        for (chan, payload) in
+            crate::remote::agent::iteration_sends(session, Some(&mut agent_mux), now, conn.rto())
+        {
+            let wire = channel::seal_on(true, chan, &payload);
+            for frag in fragmenter.make_fragments(&wire, sync::FRAGMENT_CONTENTS_MAX) {
+                let _ = conn.send(&frag.to_bytes());
+            }
+        }
+    }
+}
+
 /// The local hostname via gethostname(2); `"unknown"` when the call fails or
 /// reports an empty name, so [`client_id`] never yields an empty id.
 fn hostname() -> String {
@@ -317,6 +1031,388 @@ mod tests {
         // Unref below zero saturates rather than wrapping.
         st.unref(99);
         assert_eq!(st.refs(), 0);
+    }
+
+    // --- The mux IPC protocol (M1 Task 3.2): codecs + conn lifecycle ---
+
+    #[test]
+    fn mux_stamp_pins_rfc0011_envelope_ver() {
+        // The compile-time stamp is "mux1/" + the RFC 0011 §2 envelope version
+        // this build speaks; bumping VER_1 without bumping the stamp (or vice
+        // versa) must fail here, since §6 keys endpoint compatibility on it.
+        assert_eq!(
+            MUX_PROTO_STAMP,
+            format!("mux1/{}", crate::remote::channel::VER_1)
+        );
+    }
+
+    #[test]
+    fn mux_hello_roundtrips_and_rejects_truncation() {
+        let hello = MuxHello {
+            pid: 4242,
+            stamp: MUX_PROTO_STAMP.to_string(),
+        };
+        assert_eq!(MuxHello::decode(&hello.encode()), Some(hello));
+        // An empty stamp survives (it just mismatches later).
+        let bare = MuxHello {
+            pid: 1,
+            stamp: String::new(),
+        };
+        assert_eq!(MuxHello::decode(&bare.encode()), Some(bare));
+        assert_eq!(MuxHello::decode(b""), None);
+        assert_eq!(MuxHello::decode(&[0u8; 3]), None);
+    }
+
+    #[test]
+    fn mux_hello_ack_roundtrips_all_states_and_rejects_truncation() {
+        for state in [
+            MuxConnState::Bootstrapping,
+            MuxConnState::Connected,
+            MuxConnState::Draining,
+        ] {
+            let ack = MuxHelloAck {
+                state,
+                stamp: MUX_PROTO_STAMP.to_string(),
+                key: "example.com-4".to_string(),
+            };
+            assert_eq!(MuxHelloAck::decode(&ack.encode()), Some(ack));
+        }
+        assert_eq!(MuxHelloAck::decode(b""), None);
+        assert_eq!(MuxHelloAck::decode(&[1u8, 9, 0]), None, "stamp_len past end");
+        // Unknown state byte is rejected, not guessed.
+        let mut wire = MuxHelloAck {
+            state: MuxConnState::Connected,
+            stamp: "s".into(),
+            key: "k".into(),
+        }
+        .encode();
+        wire[0] = 9;
+        assert_eq!(MuxHelloAck::decode(&wire), None);
+    }
+
+    #[test]
+    fn mux_frame_buffer_reassembles_split_frames_and_skips_unknown_tags() {
+        let mut wire = encode_mux_frame(MuxTag::Hello, b"abc");
+        wire.extend_from_slice(&[0xee, 2, 0, 0, 0, b'x', b'y']); // unknown tag
+        wire.extend_from_slice(&encode_mux_frame(MuxTag::SessionRef, b""));
+        let mut buf = MuxFrameBuffer::default();
+        // Byte-at-a-time delivery (ADR-0003): frames appear only when complete.
+        for (i, b) in wire.iter().enumerate() {
+            buf.feed(&[*b]);
+            if i + 1 < encode_mux_frame(MuxTag::Hello, b"abc").len() {
+                assert_eq!(buf.next().unwrap(), None);
+            }
+        }
+        let first = buf.next().unwrap().unwrap();
+        assert_eq!(first.tag, MuxTag::Hello);
+        assert_eq!(first.payload, b"abc");
+        let second = buf.next().unwrap().unwrap();
+        assert_eq!(second.tag, MuxTag::SessionRef, "unknown tag skipped");
+        assert!(second.payload.is_empty());
+        assert_eq!(buf.next().unwrap(), None);
+    }
+
+    #[test]
+    fn mux_frame_rejects_oversize_length() {
+        let mut wire = vec![MuxTag::Hello as u8];
+        wire.extend_from_slice(&u32::MAX.to_le_bytes());
+        let mut buf = MuxFrameBuffer::default();
+        buf.feed(&wire);
+        assert!(buf.next().is_err(), "a hostile length must not drive buffering");
+    }
+
+    /// A connected daemon-side conn + the client end of the socketpair.
+    fn ipc_pair() -> (IpcConn, std::os::unix::net::UnixStream) {
+        let (daemon_side, client_side) = std::os::unix::net::UnixStream::pair().unwrap();
+        daemon_side.set_nonblocking(true).unwrap();
+        (IpcConn::new(daemon_side), client_side)
+    }
+
+    fn test_ctx(key: &str) -> MuxStatusCtx<'_> {
+        MuxStatusCtx {
+            key,
+            conn_state: MuxConnState::Connected,
+            peer: None,
+            heard_age_ms: 12,
+            channels: 0,
+        }
+    }
+
+    /// Reads one mux frame off a blocking client-side stream.
+    fn read_client_frame(stream: &mut std::os::unix::net::UnixStream) -> MuxFrame {
+        use std::io::Read;
+        let mut buf = MuxFrameBuffer::default();
+        loop {
+            if let Some(f) = buf.next().unwrap() {
+                return f;
+            }
+            let mut tmp = [0u8; 256];
+            let n = stream.read(&mut tmp).unwrap();
+            assert!(n > 0, "conn closed before a frame arrived");
+            buf.feed(&tmp[..n]);
+        }
+    }
+
+    #[test]
+    fn ipc_hello_ref_status_drop_lifecycle_over_socketpair() {
+        use std::io::Write;
+        let (mut conn, mut client) = ipc_pair();
+        let mut state = MuxState::new(60_000, 0);
+        let ctx = test_ctx("example.com-4");
+
+        // Hello -> HelloAck carrying our stamp, connection state, and key.
+        let hello = MuxHello {
+            pid: 7,
+            stamp: MUX_PROTO_STAMP.to_string(),
+        };
+        client
+            .write_all(&encode_mux_frame(MuxTag::Hello, &hello.encode()))
+            .unwrap();
+        assert!(process_ipc_conn(&mut conn, &mut state, &ctx));
+        let ack_frame = read_client_frame(&mut client);
+        assert_eq!(ack_frame.tag, MuxTag::HelloAck);
+        let ack = MuxHelloAck::decode(&ack_frame.payload).unwrap();
+        assert_eq!(ack.stamp, MUX_PROTO_STAMP);
+        assert_eq!(ack.state, MuxConnState::Connected);
+        assert_eq!(ack.key, "example.com-4");
+        assert!(!state.serviceable(), "hello alone holds no ref");
+
+        // SessionRef -> serviceable; a duplicate on the same conn is one ref.
+        client
+            .write_all(&encode_mux_frame(MuxTag::SessionRef, b""))
+            .unwrap();
+        client
+            .write_all(&encode_mux_frame(MuxTag::SessionRef, b""))
+            .unwrap();
+        assert!(process_ipc_conn(&mut conn, &mut state, &ctx));
+        assert_eq!(state.refs(), 1, "one accepted conn = at most one ref");
+        assert!(state.serviceable());
+
+        // Status -> a one-line summary with the live counters.
+        client
+            .write_all(&encode_mux_frame(MuxTag::Status, b""))
+            .unwrap();
+        assert!(process_ipc_conn(&mut conn, &mut state, &ctx));
+        let status_frame = read_client_frame(&mut client);
+        assert_eq!(status_frame.tag, MuxTag::StatusReply);
+        let line = String::from_utf8(status_frame.payload).unwrap();
+        assert!(!line.contains('\n'), "one line: {line:?}");
+        for needle in ["example.com-4", "refs=1", "channels=0", "heard=12ms"] {
+            assert!(line.contains(needle), "{needle:?} missing from {line:?}");
+        }
+
+        // Dropping the IPC connection auto-unrefs (crashed client safety).
+        drop(client);
+        assert!(!process_ipc_conn(&mut conn, &mut state, &ctx), "EOF ends the conn");
+        drop_ipc_conn(&conn, &mut state, 5_000);
+        assert_eq!(state.refs(), 0);
+        assert!(!state.serviceable());
+        assert!(state.lingering(), "auto-unref-to-zero arms the linger clock");
+    }
+
+    #[test]
+    fn ipc_mismatched_hello_stamp_is_answered_then_rejected() {
+        use std::io::Write;
+        let (mut conn, mut client) = ipc_pair();
+        let mut state = MuxState::new(60_000, 0);
+        state.add_ref(); // an unrelated live ref must survive the rejection
+        let ctx = test_ctx("k");
+        let hello = MuxHello {
+            pid: 9,
+            stamp: "mux0/9".to_string(),
+        };
+        client
+            .write_all(&encode_mux_frame(MuxTag::Hello, &hello.encode()))
+            .unwrap();
+        // §6: never negotiate down — answer with OUR stamp (so the client can
+        // tell and start a fresh endpoint), then reject the connection.
+        assert!(!process_ipc_conn(&mut conn, &mut state, &ctx));
+        let ack = MuxHelloAck::decode(&read_client_frame(&mut client).payload).unwrap();
+        assert_eq!(ack.stamp, MUX_PROTO_STAMP);
+        assert!(!conn.holds_ref);
+        drop_ipc_conn(&conn, &mut state, 0);
+        assert_eq!(state.refs(), 1, "rejection must not touch other refs");
+    }
+
+    #[test]
+    fn ipc_session_ref_before_hello_is_a_protocol_error() {
+        use std::io::Write;
+        let (mut conn, mut client) = ipc_pair();
+        let mut state = MuxState::new(60_000, 0);
+        let ctx = test_ctx("k");
+        client
+            .write_all(&encode_mux_frame(MuxTag::SessionRef, b""))
+            .unwrap();
+        assert!(!process_ipc_conn(&mut conn, &mut state, &ctx));
+        assert_eq!(state.refs(), 0);
+    }
+
+    // --- The daemon (M1 Task 3.3): bind seam + the loop over loopback ---
+
+    #[test]
+    fn losing_bind_race_connects_to_the_live_winner() {
+        let base = temp_base();
+        let path = base.join("race.sock");
+        let winner = match bind_or_probe(&path).unwrap() {
+            MuxBind::Bound(l) => l,
+            MuxBind::ExistingDaemon => panic!("first bind must win"),
+        };
+        // A second binder while the winner LIVES: detect it and defer — the
+        // spawner then talks to the winner instead of spawning a duplicate.
+        match bind_or_probe(&path).unwrap() {
+            MuxBind::ExistingDaemon => {}
+            MuxBind::Bound(_) => panic!("must not steal a live daemon's socket"),
+        }
+        drop(winner);
+        std::fs::remove_dir_all(&base).ok();
+    }
+
+    #[test]
+    fn stale_mux_socket_is_unlinked_and_rebound() {
+        let base = temp_base();
+        let path = base.join("stale.sock");
+        // A crashed daemon leaves the socket file behind with nothing
+        // accepting: connect fails, so the next spawner reclaims it.
+        match bind_or_probe(&path).unwrap() {
+            MuxBind::Bound(l) => drop(l), // dead, file still present
+            MuxBind::ExistingDaemon => panic!("first bind must win"),
+        }
+        assert!(std::fs::symlink_metadata(&path).is_ok(), "stale file remains");
+        match bind_or_probe(&path).unwrap() {
+            MuxBind::Bound(_) => {}
+            MuxBind::ExistingDaemon => panic!("a dead socket must be reclaimed"),
+        }
+        std::fs::remove_dir_all(&base).ok();
+    }
+
+    /// End-to-end daemon-loop lifecycle against a synthetic remote — the
+    /// Task 2 [`agent_only_loop`](crate::remote::server) on loopback UDP is
+    /// the ideal peer. Drives: hello/ack over the real IPC socket, the
+    /// FDR 0014 M1 serviceability gate (an agent consumer is FAILed while
+    /// refs == 0, serviced after `MuxSessionRef`), `MuxStatus` through the
+    /// loop, and auto-unref-on-close arming the linger that exits the loop.
+    #[test]
+    fn mux_loop_gates_agent_service_on_refs_and_exits_after_linger() {
+        use std::io::{Read, Write};
+        use std::os::unix::net::{UnixListener, UnixStream};
+
+        const REQUEST: &[u8] = b"AGENT-REQUEST-PING";
+        const REPLY: &[u8] = b"AGENT-REPLY-PONG";
+
+        let local_base = temp_base();
+        let remote_base = temp_base();
+        let agent_sock = local_base.join("fake-agent.sock");
+
+        // Fake local ssh-agent: exactly one connection is ever expected to
+        // reach it — the serviceable phase-2 round-trip. The FAILed phase-1
+        // attempt must never dial it.
+        let agent_listener = UnixListener::bind(&agent_sock).unwrap();
+        let agent_thread = std::thread::spawn(move || {
+            if let Ok((mut s, _)) = agent_listener.accept() {
+                let mut buf = vec![0u8; REQUEST.len()];
+                if s.read_exact(&mut buf).is_ok() {
+                    assert_eq!(buf, REQUEST);
+                    let _ = s.write_all(REPLY);
+                }
+            }
+        });
+
+        // The synthetic remote: a real agent-only server (Task 2) with a
+        // short peer timeout so it exits once the daemon goes silent.
+        let key = crate::remote::crypto::Key::random();
+        let (server_conn, port) =
+            Connection::server((63400, 63449), &key, Family::Inet).unwrap();
+        let endpoint =
+            crate::remote::agent::AgentEndpoint::new_mux(&remote_base, "muxdaemon").unwrap();
+        let well_known = endpoint.sock_path().to_path_buf();
+        let remote = std::thread::spawn(move || {
+            crate::remote::server::agent_only_loop(server_conn, endpoint, 4_000)
+        });
+
+        // The daemon loop under test, on its own thread: real IPC listener,
+        // real loopback connection, a 3 s linger — the same clock also arms
+        // at construction (the orphan guard), so it must outlast the
+        // pre-ref phase-1 exchange below.
+        let sock_path = local_base.join("dest.sock");
+        let listener = UnixListener::bind(&sock_path).unwrap();
+        let addr = format!("127.0.0.1:{port}").parse().unwrap();
+        let conn = Connection::client(addr, &key).unwrap();
+        let daemon = {
+            let agent_sock = agent_sock.clone();
+            std::thread::spawn(move || mux_loop(listener, conn, &agent_sock, 3_000, "test-dest"))
+        };
+
+        // IPC hello.
+        let mut ipc = UnixStream::connect(&sock_path).unwrap();
+        ipc.set_read_timeout(Some(std::time::Duration::from_secs(8)))
+            .unwrap();
+        let hello = MuxHello {
+            pid: std::process::id(),
+            stamp: MUX_PROTO_STAMP.to_string(),
+        };
+        ipc.write_all(&encode_mux_frame(MuxTag::Hello, &hello.encode()))
+            .unwrap();
+        let ack = MuxHelloAck::decode(&read_client_frame(&mut ipc).payload).unwrap();
+        assert_eq!(ack.state, MuxConnState::Connected);
+        assert_eq!(ack.stamp, MUX_PROTO_STAMP);
+        assert_eq!(ack.key, "test-dest");
+
+        // Phase 1 — refs == 0 (the FDR 0014 M1 policy): a consumer on the
+        // remote's agent/sock is answered with FAIL, never the local agent.
+        let mut refused = UnixStream::connect(&well_known).unwrap();
+        refused
+            .set_read_timeout(Some(std::time::Duration::from_secs(8)))
+            .unwrap();
+        // The FAIL can close the socket before this write lands (EPIPE) —
+        // that is refusal evidence too, so the write is not asserted.
+        let _ = refused.write_all(REQUEST);
+        let mut got = Vec::new();
+        let _ = refused.read_to_end(&mut got); // failure answer + close
+        assert!(
+            !got.windows(REPLY.len()).any(|w| w == REPLY),
+            "an unreferenced mux must never service an agent request: {got:?}"
+        );
+
+        // Ref, then wait for the loop to confirm it via MuxStatus.
+        ipc.write_all(&encode_mux_frame(MuxTag::SessionRef, b""))
+            .unwrap();
+        let deadline = util::now_ms() + 8_000;
+        loop {
+            ipc.write_all(&encode_mux_frame(MuxTag::Status, b"")).unwrap();
+            let frame = read_client_frame(&mut ipc);
+            assert_eq!(frame.tag, MuxTag::StatusReply);
+            let line = String::from_utf8(frame.payload).unwrap();
+            if line.contains("refs=1") {
+                break;
+            }
+            assert!(util::now_ms() < deadline, "ref never landed: {line:?}");
+            std::thread::sleep(std::time::Duration::from_millis(10));
+        }
+
+        // Phase 2 — serviceable: the same consumer path round-trips through
+        // the daemon's client half to the fake local agent and back.
+        let mut served = UnixStream::connect(&well_known).unwrap();
+        served
+            .set_read_timeout(Some(std::time::Duration::from_secs(8)))
+            .unwrap();
+        served.write_all(REQUEST).unwrap();
+        let mut reply = vec![0u8; REPLY.len()];
+        served
+            .read_exact(&mut reply)
+            .expect("a referenced mux services agent channels");
+        assert_eq!(reply, REPLY);
+
+        // Drop the IPC conn: auto-unref -> linger (3 s) -> loop exit.
+        drop(ipc);
+        daemon
+            .join()
+            .expect("the daemon loop exits after the linger window");
+        // Silence from the departed daemon ends the remote too (Drop
+        // semantics on the remote side follow from connection timeout).
+        remote.join().expect("the agent-only remote exits on peer silence");
+        let _ = agent_thread.join();
+        std::fs::remove_dir_all(&local_base).ok();
+        std::fs::remove_dir_all(&remote_base).ok();
     }
 
     #[test]
