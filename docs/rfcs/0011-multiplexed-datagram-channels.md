@@ -31,8 +31,10 @@ election. The election is racy: posh#136 reports agent operations intermittently
 failing while a healthy, active connection exists. The shipped
 relinquish-on-inactive refinement removed the starvation but left a measured
 9.9 s window per handoff — two independent 5 s maintenance ticks — during which
-the path resolves to an endpoint that fast-fails, then vanishes entirely. FDR
-0014 exists to close that window by construction rather than narrow it.
+the path resolves to an endpoint that fast-fails, then vanishes entirely. (The
+posh#152 interim repoint-on-release has since zeroed that window's common
+case; it remains an election among per-connection processes.) FDR 0014 exists
+to close the window by construction rather than narrow it.
 
 **Every session pays a full connection.** Each attach re-runs the ssh bootstrap
 (the dominant connect latency) and adds a NAT binding, a heartbeat, and an
@@ -520,10 +522,13 @@ mechanism is best designed against whatever handshake replaces it.
   `agent/sock` (the §8 configuration), and a single endpoint binds it directly
   with no symlink present.
 - The posh#136 regression: with one connection per client host, the handoff
-  outage measured by
-  `remote::agent::tests::handoff_between_two_endpoints_leaves_a_multi_tick_outage`
-  MUST NOT be reachable — no interval exists in which `agent/sock` is absent or
-  resolves to an endpoint that cannot serve.
+  outage MUST NOT be reachable — no interval exists in which `agent/sock` is
+  absent or resolves to an endpoint that cannot serve. The measuring test was
+  `remote::agent::tests::handoff_between_two_endpoints_leaves_a_multi_tick_outage`;
+  the posh#152 interim repoint superseded it as
+  `handoff_repoints_to_the_active_sibling_on_the_inactivity_edge` (asserting
+  zero stale/absent time at the edge). That interim proof is NOT this bullet's
+  bar: the by-construction guarantee still awaits the mux endpoint.
 - Cross-host flows (real sshd, real `ssh-agent`, roam) remain covered by `just
   debug-agent-e2e` and `docs/manual-testing.md`.
 
@@ -571,7 +576,8 @@ Informative:
 - FDR 0012: Session layer collapse — the relay-retarget extension; its v1
   explicitly scopes cross-host chaining out, which is why §3.3 binds identity at
   OPEN rather than per datagram.
-- posh#136: the intermittent agent-forwarding failure, and the 9.9 s handoff
+- posh#136: the intermittent agent-forwarding failure, and the (since zeroed
+  by the posh#152 interim, pending the mux) 9.9 s handoff
   outage measured in `crates/posh/src/remote/agent.rs`.
 - github #54: the phase-2 connection mux — the process model this wire contract
   enables, closed as a decision without an implementation.

@@ -70,16 +70,23 @@ channels generate zero wire traffic. Direct connection to a specific
 attach's agent.
 
 Ownership tracks the newest connection *with an active client*, not merely
-the newest process: an endpoint whose client has roamed away (peer
-inactive) relinquishes `agent/sock` on its slow tick so a sibling
-connection whose client is still active takes it over, and reclaims it if
-its own client returns. Without this, a roamed-away owner keeps the link
-pinned to its still-bound-but-unserved socket (`socket_is_dead` reports the
-live listener "alive," so no takeover fires) and starves the active
-siblings — requests route to it and fast-fail. posh#136. This narrows the
-window rather than closing it: the handoff waits on the slow-tick cadence,
-and the definitive removal of the election race is the phase-2 mux (see
-More Information), where a single endpoint owns the socket by construction.
+the newest process: on the moment its peer goes inactive (an event-driven
+edge, not a slow-tick poll), an owning endpoint **repoints** `agent/sock`
+directly at the most-recently-active live sibling — each endpoint maintains
+an `srv-<pid>.active` marker while its peer is active, and the releasing
+owner picks the freshest — falling back to unlinking when no qualifying
+sibling exists; it reclaims on its own peer's return edge. Without this, a
+roamed-away owner keeps the link pinned to its still-bound-but-unserved
+socket (`socket_is_dead` reports the live listener "alive," so no takeover
+fires) and starves the active siblings — posh#136; the first fix
+(relinquish-on-inactive on the slow tick) still left a measured 9.9 s
+two-tick outage per handoff, and the posh#152 repoint-on-release closed
+that to zero stale/absent time at the edge
+(`remote::agent::tests::handoff_repoints_to_the_active_sibling_on_the_inactivity_edge`).
+This is still an election among per-connection processes — an
+acknowledged-throwaway interim; the definitive removal of the election race
+is the phase-2 mux (see More Information), where a single endpoint owns the
+socket by construction.
 
 **On the wire**, three new RFC 0001 capability ids
 (`6 = AGENT_FORWARD`, `7 = AGENT_DATA`, `8 = AGENT_ACK`) carry a second
@@ -207,7 +214,8 @@ agent:
 |---|---|---|---|
 | `AGENT_PEER_ACTIVE` | 15 s | Fast-fail `SSH_AGENT_FAILURE` rather than hang a `git push` when the peer is gone; stricter than the 60 s `PEER_TIMEOUT`. | Spurious failures on flaky links → raise; hung-push complaints → lower. |
 | `AGENT_REQUEST_TMOUT` | 10 s | A single outstanding request that exceeds this returns `SSH_AGENT_FAILURE`. | Slow real agents (HSM, confirm prompts) time out legitimately. |
-| slow tick | 5 s | Symlink liveness/takeover check + dead-`srv-*.sock` GC cadence. | Takeover after an owner quits feels sluggish → lower. Note the handoff between endpoints costs TWO of these (owner releases on its tick, sibling claims on its own), a measured 9.9 s of unusable `agent/sock` — posh#136, closed by construction under RFC 0011 §7 rather than by tuning this. |
+| slow tick | 5 s | Maintenance cadence only since posh#152: marker refresh, dead-`srv-*.sock`/marker GC, and the startup fallback for a peer that never appears. The release/reclaim handoff itself is event-driven (edge-triggered repoint, zero-tick cost). | Little reason to tune for handoff latency anymore; GC feeling slow is the remaining signal. |
+| `AGENT_MARKER_FRESH_MS` | 15 s (3 × slow tick) | How recent a sibling's `.active` marker must be for the releasing owner to repoint at it. | Repoints landing on just-gone-inactive siblings → lower; failovers missing barely-idle siblings → raise. |
 | `AGENT_NOTICE_INTERVAL_MS` | 60 s | Rate limit for the key-**listing** notice only. Signatures are never limited, so this cannot suppress a real key use. | Listing banners feel spammy → raise. Lowering it does not make signatures more visible; they are already unconditional. |
 | flow-control window | 64 KB / direction | Backpressure point: stop `poll()`ing the feeding unix fds when the outbox exceeds it. No new wire mechanism. | Large identity lists stall. |
 | `MAX_AGENT_CHANNELS` | 8 / connection | Bounds concurrent agent clients and memory. | Legitimate parallel agent use (many concurrent `git` ops) hits the cap. |
@@ -225,8 +233,9 @@ agent:
   an agent over its own transport and of the user-facing behaviour (on-by-default
   policy, roam survival, the tuning levers) — that part is unchanged. What is
   superseded is the wire carriage and the endpoint-ownership scheme. See also
-  FDR 0014 (the stable-endpoint record) and posh#136 (the 9.9 s handoff outage
-  the election produces).
+  FDR 0014 (the stable-endpoint record) and posh#136 (the handoff outage the
+  election produced — measured at 9.9 s, zeroed by the posh#152 interim
+  repoint pending the mux).
 - **github #55** — phase-1 implementation tracking issue (the sizing
   table as a checklist, the resolved open questions).
 - **github #53** — follow-up: `Setenv` IPC + `posh setenv` to retrofit
