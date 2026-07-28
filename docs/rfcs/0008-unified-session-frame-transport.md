@@ -162,10 +162,13 @@ Each id is classified by scope:
   **AMENDED by RFC 0011 §7.** The two sentences above are superseded for any
   connection speaking the RFC 0011 envelope. Ids 6/7/8 are RETIRED (permanently
   reserved, never reassigned); agent forwarding rides `agent` channels (RFC 0011
-  §5); and the symlink election is REMOVED — `<base>/agent/sock` becomes a bound
-  socket owned by the single endpoint that a one-connection-per-client-host mux
-  implies, with no takeover or liveness probing (RFC 0011 §7, and §8 for the
-  residual two-client-host case). What is NOT amended: the relay still terminates
+  §5); and the symlink election is removed FOR an implementation that
+  guarantees sole agent-capable ownership of the client-host-to-destination
+  relationship (the per-destination mux endpoint) — `<base>/agent/sock` then
+  becomes a bound socket with no takeover or liveness probing, while any other
+  implementation retains the FDR 0004 election (RFC 0011 §7's conditional
+  rule, and §8 for the residual two-client-host case). What is NOT amended:
+  the relay still terminates
   agent traffic rather than passing it to the daemon, so this section's security
   boundary — the daemon never brokers key material — stands unchanged.
 - Because a frame-consuming client repaints the visible screen in place on
