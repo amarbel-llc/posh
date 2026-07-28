@@ -765,7 +765,14 @@ fn mux_loop(
     let mut proxy = AgentClient::new(agent_source.to_path_buf());
     let mut state = MuxState::new(linger_ms, now_ms());
     let mut conns: Vec<IpcConn> = Vec::new();
-    let mut last_send: u64 = 0;
+    // `None` = never sent, so the FIRST heartbeat goes on the first
+    // iteration — the remote learns its peer address within ms of the
+    // connection coming up. (A `0` sentinel would NOT work: `now_ms()` is
+    // monotonic from a recent base, not epoch ms, so early in the daemon
+    // process `now - 0` sits below HEARTBEAT_INTERVAL and the first
+    // heartbeat would wait until the clock crossed 3 s — the same trap
+    // relay.rs's `wait_for_handshake` documents.)
+    let mut last_send: Option<u64> = None;
     let mut last_heard: u64 = now_ms();
 
     loop {
@@ -781,7 +788,7 @@ fn mux_loop(
 
         // Wake for the next heartbeat, the linger expiry, and the agent
         // mux's fresh sends / RTO retransmissions (RFC 0011 §5).
-        let mut deadline = last_send.saturating_add(HEARTBEAT_INTERVAL);
+        let mut deadline = last_send.map_or(now, |t| t.saturating_add(HEARTBEAT_INTERVAL));
         if let Some(d) = state.next_deadline() {
             deadline = deadline.min(d);
         }
@@ -923,10 +930,10 @@ fn mux_loop(
         // Sends: the RFC 0011 §4.1 ordered drain with the heartbeat as the
         // only session instruction (see `heartbeat_message`); agent
         // instructions flow every iteration with RTO pacing.
-        let session_due = now.saturating_sub(last_send) >= HEARTBEAT_INTERVAL;
+        let session_due = last_send.is_none_or(|t| now.saturating_sub(t) >= HEARTBEAT_INTERVAL);
         let session = session_due.then(heartbeat_message);
         if session.is_some() {
-            last_send = now;
+            last_send = Some(now);
         }
         for (chan, payload) in
             crate::remote::agent::iteration_sends(session, Some(&mut agent_mux), now, conn.rto())
