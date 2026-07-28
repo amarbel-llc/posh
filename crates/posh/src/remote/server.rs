@@ -255,6 +255,13 @@ pub(crate) fn server_loop(
     // inert unless `agent_endpoint` is Some.
     let mut agent_stream = sync::AgentStream::new();
     let mut agent_seen = false;
+    // RFC 0011 §5: on ENVELOPED connections agent traffic rides per-channel
+    // `agent`-kind instructions instead of the retired CAP_AGENT_* entries
+    // (§7). The mux adapts the endpoint's u32 record events onto
+    // server-allocated channel identifiers; baseline connections keep the
+    // capability path above bit-for-bit.
+    let mut agent_mux = (enveloped && agent_endpoint.is_some())
+        .then(crate::remote::agent::AgentChannelMux::new_server);
 
     let mut last_gen = term.generation();
     // #wedge organic watchdog. Auto-captures the Case-A stall (model advanced,
@@ -313,9 +320,17 @@ pub(crate) fn server_loop(
         if let Some(ep) = agent_endpoint.as_mut() {
             let agent_peer_active = conn.has_remote()
                 && now.saturating_sub(last_heard) < crate::remote::agent::AGENT_PEER_ACTIVE;
-            for rec in ep.tick(agent_peer_active, now) {
-                agent_stream.send(&rec);
-                force_ack = true;
+            let recs = ep.tick(agent_peer_active, now);
+            match agent_mux.as_mut() {
+                // Enveloped: the tick's Close records become terminal
+                // instructions on their own channels (RFC 0011 §5).
+                Some(mux) => mux.queue_records(&recs),
+                None => {
+                    for rec in recs {
+                        agent_stream.send(&rec);
+                        force_ack = true;
+                    }
+                }
             }
         }
         if util::take_flag(&util::SIGUSR1_RECEIVED)
@@ -366,6 +381,11 @@ pub(crate) fn server_loop(
             }
             if let Some(wait) = echo.wait_time(now) {
                 deadline = deadline.min(now + wait);
+            }
+            // RFC 0011 §5: wake in time for the agent mux's fresh sends and
+            // RTO retransmissions even with no fd activity.
+            if let Some(d) = agent_mux.as_ref().and_then(|m| m.next_deadline(conn.rto())) {
+                deadline = deadline.min(d.max(now));
             }
             deadline.saturating_sub(now).min(1000) as i32
         } else if shutdown {
@@ -530,12 +550,23 @@ pub(crate) fn server_loop(
                 let agent_revents = (agent_fd_base..agent_fd_base + agent_fd_count)
                     .any(|i| fds[i].revents & (libc::POLLIN | libc::POLLHUP | libc::POLLERR) != 0);
                 if agent_revents {
-                    for rec in ep.accept_pending() {
-                        agent_stream.send(&rec);
-                    }
-                    for rec in ep.read_channels() {
-                        agent_stream.send(&rec);
-                        force_ack = true; // pace agent chunks promptly (design §2)
+                    match agent_mux.as_mut() {
+                        // Enveloped (RFC 0011 §5): accepts open agent
+                        // channels, reads queue onto their outboxes; the
+                        // §4.1-ordered drain below ships them this iteration.
+                        Some(mux) => {
+                            mux.queue_records(&ep.accept_pending());
+                            mux.queue_records(&ep.read_channels());
+                        }
+                        None => {
+                            for rec in ep.accept_pending() {
+                                agent_stream.send(&rec);
+                            }
+                            for rec in ep.read_channels() {
+                                agent_stream.send(&rec);
+                                force_ack = true; // pace agent chunks promptly (design §2)
+                            }
+                        }
                     }
                 }
             }
@@ -554,8 +585,10 @@ pub(crate) fn server_loop(
                         };
                         // RFC 0011 §2/§3.2 (enveloped mode only): a malformed
                         // envelope or a foreign channel discards the
-                        // instruction, never the connection.
-                        let Some(message) = channel::open_instruction(enveloped, &assembled)
+                        // instruction, never the connection. Admitted
+                        // instructions dispatch by channel kind.
+                        let Some((chan, message)) =
+                            channel::open_any_instruction(enveloped, &assembled)
                         else {
                             util::log_write(
                                 "warn",
@@ -563,6 +596,19 @@ pub(crate) fn server_loop(
                             );
                             continue;
                         };
+                        if chan.kind() == channel::KIND_AGENT {
+                            // RFC 0011 §5: an agent-channel instruction —
+                            // authentic peer traffic (it cleared the AEAD
+                            // seal), applied through the mux to the endpoint.
+                            last_heard = now_ms();
+                            if let Some(mux) = agent_mux.as_mut() {
+                                let recs = mux.on_instruction(chan, message);
+                                if let Some(ep) = agent_endpoint.as_mut() {
+                                    ep.apply_records(&recs);
+                                }
+                            }
+                            continue;
+                        }
                         let Ok(msg) = ClientMessage::decode(message) else {
                             continue;
                         };
@@ -577,7 +623,11 @@ pub(crate) fn server_loop(
                         // AGENT_ACK drains our outbox. Only meaningful when the
                         // endpoint exists; a decoder error tears it down (a
                         // corrupt authenticated stream is unrecoverable).
-                        if let Some(ep) = agent_endpoint.as_mut() {
+                        // BASELINE ONLY: ids 6/7/8 are retired on enveloped
+                        // connections (RFC 0011 §7) — agent traffic arrived on
+                        // its own channels above, and a conforming peer never
+                        // sends the retired entries here.
+                        if let Some(ep) = agent_endpoint.as_mut().filter(|_| !enveloped) {
                             if caps::find(&msg.caps, caps::CAP_AGENT_FORWARD).is_some() {
                                 agent_seen = true;
                             }
@@ -770,6 +820,9 @@ pub(crate) fn server_loop(
         }
         let peer_active = conn.has_remote() && now.saturating_sub(last_heard) < PEER_TIMEOUT;
         if peer_active {
+            // This iteration's session frame, deferred to the §4.1-ordered
+            // send at the block's end (RFC 0011: session before agent data).
+            let mut session_out: Option<Vec<u8>> = None;
             // Broadcast source: the overlay terminal while an escape shell is up
             // (FDR 0008), else the live session. The session still updates `term`
             // underneath either way; only what we frame here changes.
@@ -1221,7 +1274,11 @@ pub(crate) fn server_loop(
                 // the endpoint is up so the peer may begin; emit AGENT_DATA
                 // chunks + AGENT_ACK only once the peer has advertised back
                 // (RFC 0001: not before seeing the peer's AGENT_FORWARD).
-                if agent_endpoint.is_some() {
+                // BASELINE ONLY: on enveloped connections ids 6/7/8 are
+                // retired (RFC 0011 §7) — agent traffic rides its own
+                // channels, and forwarding intent needs no capability (the
+                // endpoint exists iff the client's bootstrap said `-A`).
+                if agent_endpoint.is_some() && !enveloped {
                     extras.push(caps::Cap {
                         id: caps::CAP_AGENT_FORWARD,
                         payload: vec![],
@@ -1297,8 +1354,21 @@ pub(crate) fn server_loop(
                     echo_ack: echo.ack(),
                     body,
                 };
-                send_payload(&mut conn, &mut fragmenter, &frame.encode(), enveloped);
+                session_out = Some(frame.encode());
                 last_send = now;
+            }
+            // RFC 0011 §4.1 sender discipline: the pending session frame (if
+            // one is due this iteration) goes first, then the agent mux's
+            // instructions — fresh channel data at once, unacked tails on the
+            // RTO — which also flow on frame-less iterations. Baseline mode
+            // has no mux, so this reduces to exactly the old frame send.
+            for (chan, payload) in crate::remote::agent::iteration_sends(
+                session_out,
+                agent_mux.as_mut(),
+                now,
+                conn.rto(),
+            ) {
+                send_on_channel(&mut conn, &mut fragmenter, chan, &payload, enveloped);
             }
         }
         stats.flush_server(
@@ -1397,19 +1467,32 @@ fn handle_client_message(
     }
 }
 
-/// Fragment and send one encoded message. In enveloped mode (RFC 0011 §1/§2)
-/// the session-channel envelope is prepended ABOVE fragmentation, so it rides
-/// once per instruction; baseline mode sends the payload byte-identically.
+/// Fragment and send one instruction on `chan`. In enveloped mode (RFC 0011
+/// §1/§2) the channel envelope is prepended ABOVE fragmentation, so it rides
+/// once per instruction; baseline mode (session traffic only) sends the
+/// payload byte-identically.
+pub(crate) fn send_on_channel(
+    conn: &mut Connection,
+    fragmenter: &mut Fragmenter,
+    chan: channel::ChannelId,
+    payload: &[u8],
+    enveloped: bool,
+) {
+    let wire = channel::seal_on(enveloped, chan, payload);
+    for frag in fragmenter.make_fragments(&wire, sync::FRAGMENT_CONTENTS_MAX) {
+        let _ = conn.send(&frag.to_bytes());
+    }
+}
+
+/// [`send_on_channel`] fixed to the session channel — the send every
+/// `ClientMessage`/`ServerFrame` (and the relay's re-wrapped frames) uses.
 pub(crate) fn send_payload(
     conn: &mut Connection,
     fragmenter: &mut Fragmenter,
     payload: &[u8],
     enveloped: bool,
 ) {
-    let wire = channel::seal_instruction(enveloped, payload);
-    for frag in fragmenter.make_fragments(&wire, sync::FRAGMENT_CONTENTS_MAX) {
-        let _ = conn.send(&frag.to_bytes());
-    }
+    send_on_channel(conn, fragmenter, channel::SESSION_CHANNEL, payload, enveloped);
 }
 
 #[cfg(test)]
@@ -1497,15 +1580,22 @@ mod tests {
     /// inbound instruction opened off it. `preamble_wire` instructions are
     /// injected verbatim FIRST, so callers can assert the receiver discards
     /// crafted junk and still processes the valid traffic that follows.
-    /// Returns (saw_shutdown, input_acked, echo_acked).
-    fn drive_enveloped_exchange(preamble_wire: &[Vec<u8>]) -> (bool, u64, u64) {
+    /// An optional live `AgentEndpoint` puts the server in the state where
+    /// the baseline path would stamp agent caps on every frame (the RFC 0011
+    /// §7 retired-ids scan needs exactly that state). Returns
+    /// (saw_shutdown, input_acked, echo_acked, seen_cap_ids).
+    fn drive_enveloped_exchange(
+        preamble_wire: &[Vec<u8>],
+        agent: Option<crate::remote::agent::AgentEndpoint>,
+    ) -> (bool, u64, u64, Vec<u8>) {
         use crate::remote::channel;
         let key = Key::random();
         let (server_conn, port) = Connection::server((62100, 62199), &key, Family::Inet).unwrap();
         let cmd: Vec<String> = vec!["/bin/sh".into(), "-c".into(), "read x; exit 0".into()];
         let child = crate::pty::spawn_shell(Some(&cmd), 24, 80, &[], None).unwrap();
         util::set_nonblocking(child.master).unwrap();
-        let server = std::thread::spawn(move || server_loop(server_conn, child, 24, 80, None, true));
+        let server =
+            std::thread::spawn(move || server_loop(server_conn, child, 24, 80, agent, true));
 
         let addr = format!("127.0.0.1:{port}").parse().unwrap();
         let mut conn = Connection::client(addr, &key).unwrap();
@@ -1524,6 +1614,7 @@ mod tests {
         let mut input_acked = 0u64;
         let mut echo_acked = 0u64;
         let mut saw_shutdown = false;
+        let mut seen_cap_ids: Vec<u8> = Vec::new();
         let deadline = now_ms() + 15_000;
         while now_ms() < deadline {
             let msg = ClientMessage {
@@ -1559,6 +1650,11 @@ mod tests {
                         let Ok(frame) = ServerFrame::decode(message) else {
                             continue;
                         };
+                        for cap in &frame.caps {
+                            if !seen_cap_ids.contains(&cap.id) {
+                                seen_cap_ids.push(cap.id);
+                            }
+                        }
                         acked_frame = acked_frame.max(frame.frame_num);
                         input_acked = input_acked.max(frame.input_ack);
                         echo_acked = echo_acked.max(frame.echo_ack);
@@ -1577,7 +1673,7 @@ mod tests {
         if saw_shutdown {
             server.join().unwrap();
         }
-        (saw_shutdown, input_acked, echo_acked)
+        (saw_shutdown, input_acked, echo_acked, seen_cap_ids)
     }
 
     /// RFC 0011 Task 4: an enveloped loopback pair completes the same
@@ -1586,10 +1682,40 @@ mod tests {
     /// carry the same acks and shutdown flag, just from behind the envelope.
     #[test]
     fn enveloped_loopback_exchanges_frames_like_baseline() {
-        let (saw_shutdown, input_acked, echo_acked) = drive_enveloped_exchange(&[]);
+        let (saw_shutdown, input_acked, echo_acked, _) = drive_enveloped_exchange(&[], None);
         assert!(saw_shutdown, "never saw the shutdown flag");
         assert_eq!(input_acked, 6, "input stream not fully acked");
         assert_eq!(echo_acked, 6, "echo ack never caught up to the input");
+    }
+
+    /// RFC 0011 §7: retired capability ids 6/7/8 (CAP_AGENT_FORWARD/DATA/ACK)
+    /// MUST NOT be sent on enveloped connections. Drive a real enveloped
+    /// server_loop WITH a live agent endpoint — the state in which the
+    /// baseline path stamps CAP_AGENT_FORWARD onto every frame — and scan
+    /// every decoded frame's capability table.
+    #[test]
+    fn enveloped_messages_carry_no_retired_agent_cap_ids() {
+        use std::path::PathBuf;
+        let base = PathBuf::from(format!("/tmp/posh-noretired-{}", std::process::id()));
+        std::fs::remove_dir_all(&base).ok();
+        std::os::unix::fs::DirBuilderExt::mode(std::fs::DirBuilder::new().recursive(true), 0o700)
+            .create(&base)
+            .unwrap();
+        let endpoint = crate::remote::agent::AgentEndpoint::new(&base).unwrap();
+
+        let (saw_shutdown, _, _, seen_cap_ids) = drive_enveloped_exchange(&[], Some(endpoint));
+        std::fs::remove_dir_all(&base).ok();
+        assert!(saw_shutdown, "never saw the shutdown flag");
+        for id in [
+            caps::CAP_AGENT_FORWARD,
+            caps::CAP_AGENT_DATA,
+            caps::CAP_AGENT_ACK,
+        ] {
+            assert!(
+                !seen_cap_ids.contains(&id),
+                "retired cap id {id} rode an enveloped frame (RFC 0011 §7); saw {seen_cap_ids:?}"
+            );
+        }
     }
 
     /// RFC 0011 §2: a ver this implementation does not speak is discarded —
@@ -1609,7 +1735,7 @@ mod tests {
         };
         let mut wire = channel::seal_instruction(true, &msg.encode()).into_owned();
         wire[0] = 0x02; // an envelope ver this implementation does not speak
-        let (saw_shutdown, input_acked, echo_acked) = drive_enveloped_exchange(&[wire]);
+        let (saw_shutdown, input_acked, echo_acked, _) = drive_enveloped_exchange(&[wire], None);
         assert!(saw_shutdown, "never saw the shutdown flag");
         assert_eq!(input_acked, 6, "input stream not fully acked");
         assert_eq!(echo_acked, 6, "echo ack never caught up to the input");
@@ -1633,7 +1759,7 @@ mod tests {
         let mut wire = Vec::new();
         channel::Envelope::new(channel::ChannelId::new(false, 5, 1)).encode_to(&mut wire);
         wire.extend_from_slice(&msg.encode());
-        let (saw_shutdown, input_acked, echo_acked) = drive_enveloped_exchange(&[wire]);
+        let (saw_shutdown, input_acked, echo_acked, _) = drive_enveloped_exchange(&[wire], None);
         assert!(saw_shutdown, "never saw the shutdown flag");
         assert_eq!(input_acked, 6, "input stream not fully acked");
         assert_eq!(echo_acked, 6, "echo ack never caught up to the input");
