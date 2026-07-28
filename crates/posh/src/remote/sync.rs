@@ -115,41 +115,45 @@ impl Fragmenter {
 /// peer, which could otherwise force a 32768-slot buffer per id.
 const MAX_FRAGMENTS: usize = 8192;
 
+/// RFC 0011 §4 bounds: how many instructions may assemble concurrently (the
+/// RFC floor is 4) and how many payload bytes may sit buffered across ALL of
+/// them. Exceeding either evicts the least-recently-updated assembly, never
+/// the one being fed. The byte bound deliberately exceeds one maximal
+/// instruction (MAX_FRAGMENTS × ~MTU ≈ 11 MB), so a single large frame can
+/// never need to self-evict.
+const MAX_ASSEMBLIES: usize = 8;
+const MAX_ASSEMBLY_BYTES: usize = 16 * 1024 * 1024;
+
 #[derive(Default)]
-pub struct FragmentAssembly {
-    current_id: Option<u64>,
+struct Partial {
     fragments: Vec<Option<Vec<u8>>>,
     arrived: usize,
     total: Option<usize>,
+    bytes: usize,
+    touched: u64,
 }
 
-impl FragmentAssembly {
-    pub fn new() -> FragmentAssembly {
-        FragmentAssembly::default()
-    }
-
-    /// Adds one fragment; returns the reassembled payload once complete.
-    /// A fragment from a newer (or just different) id discards the partial
-    /// assembly in progress: only one instruction is in flight at a time.
-    pub fn add(&mut self, frag: Fragment) -> Option<Vec<u8>> {
-        if self.current_id != Some(frag.id) {
-            self.current_id = Some(frag.id);
-            self.fragments.clear();
-            self.arrived = 0;
-            self.total = None;
-        }
+impl Partial {
+    /// Drop fragments that cannot belong to a well-formed instruction: past
+    /// the allocation cap, past a known final index, or a final contradicting
+    /// fragments already received beyond it. Bogus fragments must not grow
+    /// the buffer or poison the completion gate.
+    fn rejects(&self, frag: &Fragment) -> bool {
         let idx = frag.num as usize;
-        // Drop fragments that cannot belong to a well-formed instruction:
-        // past the allocation cap, past a known final index, or a final
-        // contradicting fragments already received beyond it. Bogus
-        // fragments must not grow the buffer or poison the completion gate.
-        if idx >= MAX_FRAGMENTS
+        idx >= MAX_FRAGMENTS
             || self.total.is_some_and(|t| idx >= t)
             || (frag.is_final
                 && (self.fragments.len() > idx + 1 || self.total.is_some_and(|t| t != idx + 1)))
-        {
-            return None;
-        }
+    }
+
+    fn is_duplicate(&self, frag: &Fragment) -> bool {
+        self.fragments
+            .get(frag.num as usize)
+            .is_some_and(|slot| slot.is_some())
+    }
+
+    fn add(&mut self, frag: Fragment) -> Option<Vec<u8>> {
+        let idx = frag.num as usize;
         if self.fragments.len() <= idx {
             self.fragments.resize(idx + 1, None);
         }
@@ -157,6 +161,7 @@ impl FragmentAssembly {
             self.total = Some(idx + 1);
         }
         if self.fragments[idx].is_none() {
+            self.bytes += frag.contents.len();
             self.fragments[idx] = Some(frag.contents);
             self.arrived += 1;
         }
@@ -165,12 +170,133 @@ impl FragmentAssembly {
             for piece in self.fragments.drain(..) {
                 out.extend_from_slice(&piece.unwrap());
             }
-            self.current_id = None;
-            self.arrived = 0;
-            self.total = None;
             Some(out)
         } else {
             None
+        }
+    }
+}
+
+pub struct FragmentAssembly {
+    /// Concurrent assemblies keyed by instruction id (RFC 0011 §4). A Vec:
+    /// the count is bounded at MAX_ASSEMBLIES, so linear scans beat a map.
+    assemblies: Vec<(u64, Partial)>,
+    /// Sum of buffered payload bytes across every assembly.
+    buffered: usize,
+    max_assemblies: usize,
+    max_bytes: usize,
+    /// Monotonic per-add counter stamping each assembly's last update, so
+    /// eviction can pick the least-recently-updated without a real clock.
+    clock: u64,
+}
+
+impl Default for FragmentAssembly {
+    fn default() -> Self {
+        FragmentAssembly {
+            assemblies: Vec::new(),
+            buffered: 0,
+            max_assemblies: MAX_ASSEMBLIES,
+            max_bytes: MAX_ASSEMBLY_BYTES,
+            clock: 0,
+        }
+    }
+}
+
+impl FragmentAssembly {
+    pub fn new() -> FragmentAssembly {
+        FragmentAssembly::default()
+    }
+
+    /// Test-only: an assembly with explicit (tiny) bounds, for exercising the
+    /// RFC 0011 §4 eviction rules without megabytes of fixture.
+    #[cfg(test)]
+    pub(crate) fn with_limits(max_assemblies: usize, max_bytes: usize) -> FragmentAssembly {
+        FragmentAssembly {
+            max_assemblies,
+            max_bytes,
+            ..FragmentAssembly::default()
+        }
+    }
+
+    /// Adds one fragment; returns the reassembled payload once complete.
+    /// Reassembly state is kept per instruction id (RFC 0011 §4): fragments
+    /// of concurrent instructions interleave freely without destroying each
+    /// other's partial assemblies. Both bounds are enforced by evicting the
+    /// least-recently-updated assembly other than the one being fed.
+    pub fn add(&mut self, frag: Fragment) -> Option<Vec<u8>> {
+        self.clock += 1;
+
+        if !self.assemblies.iter().any(|(id, _)| *id == frag.id) {
+            while self.assemblies.len() >= self.max_assemblies {
+                if !self.evict_least_recently_updated(frag.id) {
+                    return None; // max_assemblies == 0
+                }
+            }
+            self.assemblies.push((frag.id, Partial::default()));
+        }
+
+        let pos = self
+            .assemblies
+            .iter()
+            .position(|(id, _)| *id == frag.id)
+            .unwrap();
+        self.assemblies[pos].1.touched = self.clock;
+        if self.assemblies[pos].1.rejects(&frag) {
+            return None;
+        }
+
+        if !self.assemblies[pos].1.is_duplicate(&frag) {
+            let incoming = frag.contents.len();
+            while self.buffered + incoming > self.max_bytes {
+                if !self.evict_least_recently_updated(frag.id) {
+                    // Nothing else left to evict: this instruction alone
+                    // exceeds the byte bound and can never complete within
+                    // it, so drop its assembly rather than wedge on it.
+                    self.remove(frag.id);
+                    return None;
+                }
+            }
+        }
+
+        let pos = self
+            .assemblies
+            .iter()
+            .position(|(id, _)| *id == frag.id)
+            .unwrap();
+        let bytes_before = self.assemblies[pos].1.bytes;
+        let completed = self.assemblies[pos].1.add(frag);
+        self.buffered += self.assemblies[pos].1.bytes - bytes_before;
+        if completed.is_some() {
+            self.buffered -= self.assemblies[pos].1.bytes;
+            self.assemblies.remove(pos);
+        }
+        completed
+    }
+
+    /// Evicts the least-recently-updated assembly other than `exclude`.
+    /// Returns false when no such assembly exists.
+    fn evict_least_recently_updated(&mut self, exclude: u64) -> bool {
+        let victim = self
+            .assemblies
+            .iter()
+            .enumerate()
+            .filter(|(_, (id, _))| *id != exclude)
+            .min_by_key(|(_, (_, p))| p.touched)
+            .map(|(i, _)| i);
+        match victim {
+            Some(i) => {
+                self.buffered -= self.assemblies[i].1.bytes;
+                self.assemblies.remove(i);
+                true
+            }
+            None => false,
+        }
+    }
+
+    fn remove(&mut self, id: u64) {
+        if let Some(i) = self.assemblies.iter().position(|(x, _)| *x == id) {
+            self.buffered -= self.assemblies[i].1.bytes;
+            self.assemblies.remove(i);
         }
     }
 }
@@ -732,7 +858,7 @@ mod tests {
     }
 
     #[test]
-    fn fragment_duplicate_tolerated_and_new_id_resets() {
+    fn fragment_duplicate_tolerated_and_partial_survives_other_id() {
         let mut fr = Fragmenter::new();
         let mut asm = FragmentAssembly::new();
         let frags_a = fr.make_fragments(&[1u8; 300], 100);
@@ -742,6 +868,10 @@ mod tests {
         let frags_b = fr.make_fragments(&[2u8; 150], 100);
         assert_eq!(asm.add(frags_b[0].clone()), None);
         assert_eq!(asm.add(frags_b[1].clone()), Some(vec![2u8; 150]));
+        // RFC 0011 §4: B passing through must NOT have destroyed A's partial —
+        // A completes once its remaining fragments arrive.
+        assert_eq!(asm.add(frags_a[1].clone()), None);
+        assert_eq!(asm.add(frags_a[2].clone()), Some(vec![1u8; 300]));
     }
 
     #[test]
@@ -767,20 +897,14 @@ mod tests {
         );
     }
 
-    // RFC 0011 §4, verification. The RFC's normative reassembly requirement
-    // rests on a claim about TODAY's behaviour: that two instructions in flight
-    // together destroy each other, because `FragmentAssembly` keeps one
-    // `current_id` and clears the partial assembly whenever a fragment bearing a
-    // different id arrives.
-    //
-    // `fragment_duplicate_tolerated_and_new_id_resets` above shows the reset in
-    // the sequential case (all of A, then all of B) and treats it as intended —
-    // which it is, while only one instruction is ever in flight. This test shows
-    // the INTERLEAVED case that multiplexing introduces: neither instruction
-    // completes, no matter how many times its fragments arrive. That is the
-    // corruption §4 forbids an implementation from shipping into.
+    // RFC 0011 §4, conformance. This is the INVERSION of the pre-implementation
+    // pin `interleaved_instructions_destroy_each_other_today` (inverted, not
+    // deleted, as the RFC's Conformance Testing section requires): with
+    // reassembly state keyed by instruction id, perfectly interleaved delivery
+    // of two instructions must complete BOTH — the direct regression test for
+    // the forbidden discard-on-different-id behaviour.
     #[test]
-    fn interleaved_instructions_destroy_each_other_today() {
+    fn interleaved_instructions_both_complete() {
         let mut fr = Fragmenter::new();
         let mut asm = FragmentAssembly::new();
         let a = fr.make_fragments(&[0xaa; 300], 100); // 3 fragments, id 1
@@ -800,14 +924,62 @@ mod tests {
             }
         }
 
-        assert!(
-            completed.is_empty(),
-            "with the current single-`current_id` buffer, interleaving must lose \
-             BOTH instructions despite every fragment arriving; got {} completion(s). \
-             If this now passes, RFC 0011 §4 has been implemented and this test \
-             should be inverted.",
-            completed.len()
+        assert_eq!(
+            completed,
+            vec![vec![0xaa; 300], vec![0xbb; 300]],
+            "RFC 0011 §4: interleaved instructions must each reassemble"
         );
+    }
+
+    // RFC 0011 §4: "A receiver MUST support at least 4 concurrent assemblies."
+    #[test]
+    fn four_concurrent_assemblies_all_complete() {
+        let mut fr = Fragmenter::new();
+        let mut asm = FragmentAssembly::new();
+        let instrs: Vec<Vec<Fragment>> = (0u8..4)
+            .map(|k| fr.make_fragments(&[k + 1; 250], 100))
+            .collect();
+        let mut completed = Vec::new();
+        for i in 0..3 {
+            for instr in &instrs {
+                if let Some(p) = asm.add(instr[i].clone()) {
+                    completed.push(p);
+                }
+            }
+        }
+        let want: Vec<Vec<u8>> = (0u8..4).map(|k| vec![k + 1; 250]).collect();
+        assert_eq!(completed, want);
+    }
+
+    // RFC 0011 §4: total buffered bytes are bounded, and the bound evicts the
+    // LEAST-RECENTLY-UPDATED assembly — never the one being fed, and never by
+    // wedging the receiver.
+    #[test]
+    fn byte_bound_evicts_least_recently_updated_assembly() {
+        let mut fr = Fragmenter::new();
+        // Tiny bound for the test; production uses MAX_ASSEMBLY_BYTES.
+        let mut asm = FragmentAssembly::with_limits(8, 450);
+        let a = fr.make_fragments(&[0xaa; 300], 100); // id 1
+        let b = fr.make_fragments(&[0xbb; 300], 100); // id 2
+        let c = fr.make_fragments(&[0xcc; 300], 100); // id 3
+
+        // Partially assemble A then B: 200 bytes buffered each.
+        assert_eq!(asm.add(a[0].clone()), None);
+        assert_eq!(asm.add(a[1].clone()), None);
+        assert_eq!(asm.add(b[0].clone()), None);
+        assert_eq!(asm.add(b[1].clone()), None);
+        // C's first fragment would exceed the 450-byte bound: A, the
+        // least-recently-updated assembly, is evicted to make room.
+        assert_eq!(asm.add(c[0].clone()), None);
+
+        // B and C, both still buffered, complete normally.
+        assert_eq!(asm.add(b[2].clone()), Some(vec![0xbb; 300]));
+        assert_eq!(asm.add(c[1].clone()), None);
+        assert_eq!(asm.add(c[2].clone()), Some(vec![0xcc; 300]));
+
+        // A was evicted: its final fragment alone starts a fresh partial
+        // assembly rather than completing the discarded one.
+        assert_eq!(asm.add(a[2].clone()), None);
     }
 
     // RFC 0011 §1/§2, verification. The RFC asserts that `ClientMessage` and
@@ -917,10 +1089,10 @@ mod tests {
             }),
             None
         );
+        let buffer_len = asm.assemblies[0].1.fragments.len();
         assert!(
-            asm.fragments.len() <= MAX_FRAGMENTS,
-            "fragment buffer grew past the cap: {}",
-            asm.fragments.len()
+            buffer_len <= MAX_FRAGMENTS,
+            "fragment buffer grew past the cap: {buffer_len}"
         );
     }
 
