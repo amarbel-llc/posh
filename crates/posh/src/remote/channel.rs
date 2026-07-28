@@ -145,32 +145,58 @@ impl Envelope {
     }
 }
 
-/// The Task 4 send gate, shared by the client, server, and relay loops so
-/// none duplicates the mode split: enveloped ⇒ prepend the §2 envelope on
-/// [`SESSION_CHANNEL`] (one owned buffer); baseline ⇒ the message verbatim,
-/// borrowed — baseline wire bytes stay byte-identical, without even a copy.
-pub fn seal_instruction(enveloped: bool, message: &[u8]) -> Cow<'_, [u8]> {
+/// The send gate, shared by the client, server, and relay loops so none
+/// duplicates the mode split: enveloped ⇒ prepend the §2 envelope on
+/// `channel` (one owned buffer); baseline ⇒ the message verbatim, borrowed —
+/// baseline wire bytes stay byte-identical, without even a copy. Baseline
+/// mode carries only session traffic, so a non-session channel there is a
+/// caller bug (agent channels exist only behind the envelope).
+pub fn seal_on(enveloped: bool, channel: ChannelId, message: &[u8]) -> Cow<'_, [u8]> {
     if !enveloped {
+        debug_assert_eq!(
+            channel, SESSION_CHANNEL,
+            "baseline wire carries only session traffic"
+        );
         return Cow::Borrowed(message);
     }
     let mut out = Vec::with_capacity(ENVELOPE_LEN + message.len());
-    Envelope::new(SESSION_CHANNEL).encode_to(&mut out);
+    Envelope::new(channel).encode_to(&mut out);
     out.extend_from_slice(message);
     Cow::Owned(out)
 }
 
-/// The Task 4 receive gate, `seal_instruction`'s mirror: enveloped ⇒ parse
-/// the envelope off a reassembled instruction and admit only the session
-/// channel — `None` means "discard this instruction and keep going" (§2:
-/// unknown ver / truncation; §3.2: RESERVED or foreign kind, CONTROL, wrong
-/// ordinal — never a connection teardown). Baseline ⇒ the payload verbatim.
-pub fn open_instruction(enveloped: bool, payload: &[u8]) -> Option<&[u8]> {
+/// [`seal_on`] fixed to the session channel — the Task 4 gate every
+/// `ClientMessage`/`ServerFrame` send goes through.
+pub fn seal_instruction(enveloped: bool, message: &[u8]) -> Cow<'_, [u8]> {
+    seal_on(enveloped, SESSION_CHANNEL, message)
+}
+
+/// The dispatching receive gate: enveloped ⇒ parse the §2 envelope off a
+/// reassembled instruction and admit only the channels this increment
+/// defines — the single session channel, or a server-initiated `agent` data
+/// channel (§3.2) — returning which one so the loops dispatch by kind.
+/// `None` means "discard this instruction and keep going" (§2: unknown ver /
+/// truncation; §3.1/§3.2: CONTROL, ordinal 0, RESERVED or wrong-initiator
+/// kind — never a connection teardown). Baseline ⇒ the payload verbatim on
+/// the session channel.
+pub fn open_any_instruction(enveloped: bool, payload: &[u8]) -> Option<(ChannelId, &[u8])> {
     if !enveloped {
-        return Some(payload);
+        return Some((SESSION_CHANNEL, payload));
     }
-    match Envelope::parse(payload) {
-        Ok((env, rest)) if env.channel == SESSION_CHANNEL => Some(rest),
-        Ok(_) | Err(_) => None,
+    let (env, rest) = Envelope::parse(payload).ok()?;
+    let ch = env.channel;
+    let admitted = ch == SESSION_CHANNEL
+        || (ch.server_initiated() && ch.kind() == KIND_AGENT && ch.is_data());
+    admitted.then_some((ch, rest))
+}
+
+/// [`open_any_instruction`] filtered to the session channel — the Task 4
+/// session-only gate (both gates share one envelope-validation
+/// implementation, so their receiver rules can never drift apart).
+pub fn open_instruction(enveloped: bool, payload: &[u8]) -> Option<&[u8]> {
+    match open_any_instruction(enveloped, payload)? {
+        (ch, rest) if ch == SESSION_CHANNEL => Some(rest),
+        _ => None,
     }
 }
 
@@ -406,6 +432,67 @@ mod tests {
         // And the enveloped seal is NOT the identity, so the two modes can
         // never be byte-confused.
         assert_ne!(seal_instruction(true, msg).as_ref(), msg);
+    }
+
+    #[test]
+    fn open_any_instruction_dispatches_session_and_agent_channels() {
+        let msg = b"payload";
+        // Baseline: everything is session traffic, verbatim.
+        assert_eq!(
+            open_any_instruction(false, msg),
+            Some((SESSION_CHANNEL, &msg[..]))
+        );
+        // The session channel opens through both gates identically.
+        let sealed = seal_instruction(true, msg);
+        assert_eq!(
+            open_any_instruction(true, &sealed),
+            Some((SESSION_CHANNEL, &msg[..]))
+        );
+        // A server-initiated agent channel is admitted by the dispatching
+        // gate (RFC 0011 §3.2: kind 1, server-initiated)...
+        let agent_id = ChannelId::new(true, KIND_AGENT, 3);
+        let sealed = seal_on(true, agent_id, msg);
+        assert_eq!(
+            open_any_instruction(true, &sealed),
+            Some((agent_id, &msg[..]))
+        );
+        // ...and still refused by the session-only gate.
+        assert_eq!(open_instruction(true, &sealed), None);
+        // Rejections shared with the session gate: bad ver, truncation, and
+        // every identifier no receiver may admit.
+        let mut bad_ver = seal_on(true, agent_id, msg).into_owned();
+        bad_ver[0] = 0x02;
+        assert_eq!(open_any_instruction(true, &bad_ver), None);
+        assert_eq!(
+            open_any_instruction(true, &bad_ver[..ENVELOPE_LEN - 1]),
+            None
+        );
+        for id in [
+            ChannelId::CONTROL,                    // identifier 0 (§3.1)
+            ChannelId::new(false, 5, 1),           // RESERVED kind (§3.2)
+            ChannelId::new(false, KIND_AGENT, 1),  // agent from the client space
+            ChannelId::new(true, KIND_SESSION, 1), // session from the server space
+            ChannelId::new(false, KIND_SESSION, 2), // not this increment's session
+            ChannelId::new(true, KIND_AGENT, 0),   // ordinal 0 (§3.1)
+        ] {
+            let wire = seal_on(true, id, msg);
+            assert_eq!(
+                open_any_instruction(true, &wire),
+                None,
+                "id {:#x} must be discarded",
+                id.0
+            );
+        }
+    }
+
+    #[test]
+    fn seal_on_session_channel_matches_the_session_gate() {
+        let msg = b"m";
+        assert_eq!(seal_on(false, SESSION_CHANNEL, msg).as_ref(), &msg[..]);
+        assert_eq!(
+            seal_on(true, SESSION_CHANNEL, msg),
+            seal_instruction(true, msg)
+        );
     }
 
     #[test]
