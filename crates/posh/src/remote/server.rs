@@ -148,6 +148,164 @@ pub fn run(
     std::process::exit(0);
 }
 
+/// The agent-only remote (`posh-server agent`, M1 Task 2 of
+/// docs/plans/2026-07-28-mux-endpoint-m1-impl.md): the same
+/// [`bootstrap_transport`] handshake as [`run`] — byte-identical
+/// `POSH IP`/`POSH CONNECT` lines, same detach — then [`agent_only_loop`]:
+/// no PTY, no shell, no session; a mux-named
+/// [`AgentEndpoint`](crate::remote::agent::AgentEndpoint) serving `agent`
+/// channels and the FDR 0014 election only. Enveloped mode is
+/// unconditional: agent channels do not exist unenveloped (RFC 0011 §5
+/// replaced the retired CAP_AGENT_* carriage), and there is no session
+/// stream here to carry anything else. Unlike [`run`]'s best-effort
+/// endpoint, a failure to stand the endpoint up is fatal — an agent-only
+/// server without it serves nothing.
+#[allow(dead_code)] // wired to main's `agent` verb in the next green step (M1 Task 2)
+pub fn run_agent_only(
+    port_range: Option<(u16, u16)>,
+    family: Family,
+    client_id: &str,
+) -> Result<()> {
+    let Some(conn) = bootstrap_transport(port_range, family)? else {
+        return Ok(()); // the detached parent
+    };
+    // Terminating signals break the loop instead of killing the process
+    // (the session-daemon convention: SIGTERM/SIGHUP/SIGINT all mean "wind
+    // down"), so the endpoint's Drop releases its socket, marker, pid file,
+    // and any owned agent/sock claim.
+    util::install_daemon_signal_handlers();
+    let endpoint = crate::remote::agent::AgentEndpoint::from_env_mux(client_id)?;
+    agent_only_loop(conn, endpoint, PEER_TIMEOUT);
+    std::process::exit(0);
+}
+
+/// [`server_loop`] minus PTY/producer/session, for the agent-only remote:
+/// one poll loop over the UDP socket and the mux-named endpoint's fds,
+/// always enveloped. Inbound `agent`-kind instructions dispatch through the
+/// [`AgentChannelMux`](crate::remote::agent::AgentChannelMux) exactly as in
+/// `server_loop`; session-kind instructions are DISCARDED (logged once) —
+/// no session exists here — but still count as authentic peer activity (they
+/// cleared the AEAD seal), so they drive `last_heard` and thereby the
+/// endpoint's #152 tick edges just as session traffic does in `server_loop`.
+/// Exits when the peer has been silent for `peer_timeout` ([`PEER_TIMEOUT`]
+/// in production: where a session server merely *forgets* a silent peer and
+/// keeps the session, an agent-only connection with a never-returning peer
+/// has nothing left to serve) or on a terminating signal — both paths return
+/// normally so the endpoint's Drop runs.
+fn agent_only_loop(
+    mut conn: Connection,
+    mut endpoint: crate::remote::agent::AgentEndpoint,
+    peer_timeout: u64,
+) {
+    let mut fragmenter = Fragmenter::new();
+    let mut assembly = FragmentAssembly::new();
+    let mut agent_mux = crate::remote::agent::AgentChannelMux::new_server();
+    let mut last_heard = now_ms();
+    let mut session_discard_logged = false;
+
+    loop {
+        if util::take_flag(&util::SIGTERM_RECEIVED) {
+            break; // SIGTERM/SIGHUP/SIGINT: wind down, Drop cleans up
+        }
+        let now = now_ms();
+        if now.saturating_sub(last_heard) >= peer_timeout {
+            break; // the peer roamed away and never came back
+        }
+        // The endpoint's #152 maintenance + tick edges, gated exactly as
+        // server_loop gates them: the stricter AGENT_PEER_ACTIVE window, so
+        // a roamed-away peer releases/repoints agent/sock and fast-fails
+        // open channels well before the exit timeout above.
+        let agent_peer_active = conn.has_remote()
+            && now.saturating_sub(last_heard) < crate::remote::agent::AGENT_PEER_ACTIVE;
+        agent_mux.queue_records(&endpoint.tick(agent_peer_active, now));
+
+        // Wake in time for the mux's fresh sends and RTO retransmissions
+        // (RFC 0011 §5) and for the peer-timeout exit edge.
+        let mut deadline = last_heard + peer_timeout;
+        if let Some(d) = agent_mux.next_deadline(conn.rto()) {
+            deadline = deadline.min(d.max(now));
+        }
+        let timeout = deadline.saturating_sub(now).min(1000) as i32;
+
+        let mut fds = vec![util::pollfd(conn.raw_fd(), libc::POLLIN)];
+        let agent_fd_base = fds.len();
+        fds.extend_from_slice(&endpoint.pollfds());
+        match util::poll(&mut fds, timeout) {
+            Ok(_) => {}
+            Err(e) if e.kind() == std::io::ErrorKind::Interrupted => continue,
+            Err(_) => break,
+        }
+
+        // Agent sockets: accepts open channels toward the client, reads
+        // queue onto their outboxes (RFC 0011 §5; the same
+        // one-signalled-fd-drives-all sweep as server_loop).
+        let agent_signalled = (agent_fd_base..fds.len())
+            .any(|i| fds[i].revents & (libc::POLLIN | libc::POLLHUP | libc::POLLERR) != 0);
+        if agent_signalled {
+            agent_mux.queue_records(&endpoint.accept_pending());
+            agent_mux.queue_records(&endpoint.read_channels());
+        }
+
+        // Client datagrams.
+        if fds[0].revents & libc::POLLIN != 0 {
+            loop {
+                match conn.recv() {
+                    Ok(Some(payload)) => {
+                        let Ok(frag) = sync::Fragment::from_bytes(&payload) else {
+                            continue;
+                        };
+                        let Some(assembled) = assembly.add(frag) else {
+                            continue;
+                        };
+                        // RFC 0011 §2/§3.2: a malformed envelope or foreign
+                        // channel discards the instruction, never the
+                        // connection.
+                        let Some((chan, message)) =
+                            channel::open_any_instruction(true, &assembled)
+                        else {
+                            util::log_write(
+                                "warn",
+                                "discarded instruction: bad envelope or foreign channel",
+                            );
+                            continue;
+                        };
+                        last_heard = now_ms();
+                        if chan.kind() == channel::KIND_AGENT {
+                            let recs = agent_mux.on_instruction(chan, message);
+                            endpoint.apply_records(&recs);
+                        } else if !session_discard_logged {
+                            // Session-kind traffic carries nothing for an
+                            // agent-only server. Logged once, not per
+                            // instruction — the client announces itself on
+                            // the session channel routinely.
+                            util::log_write(
+                                "info",
+                                "agent-only server: discarding session-channel instructions",
+                            );
+                            session_discard_logged = true;
+                        }
+                    }
+                    Ok(None) => continue,
+                    Err(e) if e.kind() == std::io::ErrorKind::WouldBlock => break,
+                    Err(_) => break,
+                }
+            }
+        }
+
+        // Sends: the RFC 0011 §4.1 ordered drain with no session frame ever
+        // pending — iteration_sends(None, ..) is exactly server_loop's send
+        // seam reduced to the agent mux.
+        if conn.has_remote() {
+            let now = now_ms();
+            for (chan, payload) in
+                crate::remote::agent::iteration_sends(None, Some(&mut agent_mux), now, conn.rto())
+            {
+                send_on_channel(&mut conn, &mut fragmenter, chan, &payload, true);
+            }
+        }
+    }
+}
+
 pub(crate) fn server_loop(
     mut conn: Connection,
     child: pty::PtyChild,
@@ -2533,6 +2691,178 @@ mod tests {
         assert_eq!(timeout_env("POSH_TEST_TMOUT_C"), 0);
         std::env::set_var("POSH_TEST_TMOUT_D", "junk");
         assert_eq!(timeout_env("POSH_TEST_TMOUT_D"), 0);
+    }
+
+    // --- The agent-only server loop (M1 Task 2 of
+    // docs/plans/2026-07-28-mux-endpoint-m1-impl.md) ---
+
+    /// Drives a real [`agent_only_loop`] over loopback UDP with a mux-named
+    /// endpoint. Note the direction: the CONSUMER connects to the remote
+    /// `agent/sock` — the server accepts unix connects and opens `agent`
+    /// channels TOWARD the client — and its request rides the enveloped
+    /// channel to a fake local agent behind the client pump, whose reply
+    /// comes back the same way. `announce_flags` rides every session-channel
+    /// announce the pump sends; the agent-only server discards session
+    /// instructions, so a caller can stamp CLIENT_FLAG_SHUTDOWN on all of
+    /// them and assert nothing winds down. The loop runs with a short peer
+    /// timeout so the server thread exits (and is joined) once the pump goes
+    /// silent — which also pins the exit-on-peer-silence behavior. Returns
+    /// the bytes the consumer read back.
+    fn drive_agent_only_exchange(
+        client_id: &str,
+        announce_flags: u8,
+        port_range: (u16, u16),
+    ) -> Vec<u8> {
+        use crate::remote::agent::{AgentChannelMux, AgentClient, AgentEndpoint};
+        use crate::remote::channel;
+        use std::io::{Read, Write};
+        use std::os::unix::net::{UnixListener, UnixStream};
+        use std::sync::atomic::{AtomicBool, Ordering};
+        use std::sync::Arc;
+
+        const REQUEST: &[u8] = b"AGENT-REQUEST-PING";
+        const REPLY: &[u8] = b"AGENT-REPLY-PONG";
+
+        // Short /tmp paths so the unix sockets stay within SUN_LEN.
+        let pid = std::process::id();
+        let base = std::path::PathBuf::from(format!("/tmp/posh-agonly-{pid}-{client_id}"));
+        std::fs::remove_dir_all(&base).ok();
+        std::os::unix::fs::DirBuilderExt::mode(std::fs::DirBuilder::new().recursive(true), 0o700)
+            .create(&base)
+            .unwrap();
+        let fake_agent_sock =
+            std::path::PathBuf::from(format!("/tmp/posh-agonly-{pid}-{client_id}.agent"));
+        std::fs::remove_file(&fake_agent_sock).ok();
+
+        // Fake local ssh-agent: one request in, the canned reply out.
+        let agent_listener = UnixListener::bind(&fake_agent_sock).unwrap();
+        let agent_thread = std::thread::spawn(move || {
+            if let Ok((mut s, _)) = agent_listener.accept() {
+                let mut buf = vec![0u8; REQUEST.len()];
+                if s.read_exact(&mut buf).is_ok() {
+                    assert_eq!(buf, REQUEST, "fake agent saw the forwarded request");
+                    let _ = s.write_all(REPLY);
+                }
+            }
+        });
+
+        // The agent-only server: no PTY, no session — just the transport and
+        // the mux-named endpoint.
+        let key = Key::random();
+        let (server_conn, port) = Connection::server(port_range, &key, Family::Inet).unwrap();
+        let endpoint = AgentEndpoint::new_mux(&base, client_id).unwrap();
+        let well_known = endpoint.sock_path().to_path_buf();
+        let server = std::thread::spawn(move || agent_only_loop(server_conn, endpoint, 2_000));
+
+        // Client pump: enveloped session-channel announces (pinning the peer
+        // and keeping it active) + the agent-channel adopter end dialing the
+        // fake agent — the mux daemon's client half in miniature.
+        let done = Arc::new(AtomicBool::new(false));
+        let pump = {
+            let done = done.clone();
+            let source = fake_agent_sock.clone();
+            std::thread::spawn(move || {
+                let addr = format!("127.0.0.1:{port}").parse().unwrap();
+                let mut conn = Connection::client(addr, &key).unwrap();
+                let mut fragmenter = Fragmenter::new();
+                let mut assembly = FragmentAssembly::new();
+                let mut proxy = AgentClient::new(source);
+                let mut mux_c = AgentChannelMux::new_client();
+                while !done.load(Ordering::Relaxed) {
+                    let msg = ClientMessage {
+                        flags: announce_flags,
+                        caps: vec![],
+                        acked_frame: 0,
+                        rows: 24,
+                        cols: 80,
+                        input_base: 0,
+                        input: Vec::new(),
+                    };
+                    let encoded = msg.encode();
+                    let wire = channel::seal_instruction(true, &encoded);
+                    for frag in fragmenter.make_fragments(&wire, sync::FRAGMENT_CONTENTS_MAX) {
+                        let _ = conn.send(&frag.to_bytes());
+                    }
+                    while let Ok(Some(payload)) = conn.recv() {
+                        let Ok(frag) = sync::Fragment::from_bytes(&payload) else {
+                            continue;
+                        };
+                        let Some(assembled) = assembly.add(frag) else {
+                            continue;
+                        };
+                        let Some((chan, message)) =
+                            channel::open_any_instruction(true, &assembled)
+                        else {
+                            continue;
+                        };
+                        if chan.kind() != channel::KIND_AGENT {
+                            continue;
+                        }
+                        let recs = mux_c.on_instruction(chan, message);
+                        let replies = proxy.apply_records(&recs);
+                        mux_c.queue_records(&replies);
+                    }
+                    mux_c.queue_records(&proxy.read_channels());
+                    for (id, wire) in mux_c.outgoing(now_ms(), 50) {
+                        send_on_channel(&mut conn, &mut fragmenter, id, &wire, true);
+                    }
+                    std::thread::sleep(std::time::Duration::from_millis(5));
+                }
+            })
+        };
+
+        // The consumer: what a `git push` on the remote host would do with
+        // SSH_AUTH_SOCK=agent/sock. The endpoint claims the symlink at
+        // construction, so it is connectable before the loop even starts.
+        let deadline = now_ms() + 5_000;
+        let mut stream = loop {
+            if let Ok(s) = UnixStream::connect(&well_known) {
+                break s;
+            }
+            assert!(now_ms() < deadline, "agent/sock never became connectable");
+            std::thread::sleep(std::time::Duration::from_millis(20));
+        };
+        stream
+            .set_read_timeout(Some(std::time::Duration::from_secs(8)))
+            .unwrap();
+        stream.write_all(REQUEST).unwrap();
+        let mut got = vec![0u8; REPLY.len()];
+        let read_result = stream.read_exact(&mut got);
+
+        done.store(true, Ordering::Relaxed);
+        let _ = pump.join();
+        let _ = agent_thread.join();
+        // The pump has gone silent: the loop must exit on its peer timeout —
+        // an agent-only server with a never-returning peer has nothing to
+        // keep alive (unlike a session server, whose session persists).
+        server
+            .join()
+            .expect("the agent-only loop exits once the peer goes silent");
+        std::fs::remove_dir_all(&base).ok();
+        std::fs::remove_file(&fake_agent_sock).ok();
+        read_result.expect("reply must arrive back through the agent-only channel");
+        got
+    }
+
+    #[test]
+    fn agent_only_server_serves_channels_without_a_session() {
+        let got = drive_agent_only_exchange("srvless", 0, (62900, 62949));
+        assert_eq!(got, b"AGENT-REPLY-PONG");
+    }
+
+    #[test]
+    fn agent_only_server_discards_session_instructions_and_stays_alive() {
+        // EVERY session-channel instruction the pump sends carries
+        // CLIENT_FLAG_SHUTDOWN — the request that winds a session server
+        // down. The agent-only loop has no session: it must discard session
+        // instructions (they still count as peer activity) and keep serving
+        // agent channels; honoring them would kill this round-trip.
+        let got = drive_agent_only_exchange(
+            "discard",
+            sync::CLIENT_FLAG_SHUTDOWN,
+            (62950, 62999),
+        );
+        assert_eq!(got, b"AGENT-REPLY-PONG");
     }
 
     // End-to-end agent forwarding over the real transport (FDR 0004 item 7):
