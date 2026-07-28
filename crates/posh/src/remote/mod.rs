@@ -2,6 +2,7 @@
 //! sync: frames are complete dump_vt screen states, optionally diffed).
 
 pub mod agent;
+pub mod channel;
 /// Re-export shim: the RFC 0001 capability table moved to posh-proto (github
 /// #75) so poshterity can share it; existing `crate::remote::caps::…` paths
 /// keep resolving through here.
