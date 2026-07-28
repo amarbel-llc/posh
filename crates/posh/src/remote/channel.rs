@@ -131,6 +131,55 @@ impl Envelope {
     }
 }
 
+/// §5 agent-channel payload flag bits.
+pub const AGENT_FLAG_OPEN: u8 = 0x01;
+pub const AGENT_FLAG_CLOSE: u8 = 0x02;
+pub const AGENT_FLAG_FAIL: u8 = 0x04;
+const AGENT_FLAGS_KNOWN: u8 = AGENT_FLAG_OPEN | AGENT_FLAG_CLOSE | AGENT_FLAG_FAIL;
+/// §5 header: flags u8 + send_base u64 LE + recv_ack u64 LE.
+pub const AGENT_PAYLOAD_HEADER_LEN: usize = 17;
+
+/// §5: the payload of one `agent` channel instruction. `send_base` is the
+/// offset of `data`'s first byte in this channel's cumulative outbound
+/// stream; `recv_ack` cumulatively acknowledges the peer's stream.
+#[derive(Clone, PartialEq, Eq, Debug)]
+pub struct AgentPayload {
+    pub flags: u8,
+    pub send_base: u64,
+    pub recv_ack: u64,
+    pub data: Vec<u8>,
+}
+
+impl AgentPayload {
+    pub fn encode(&self) -> Vec<u8> {
+        let mut out = Vec::with_capacity(AGENT_PAYLOAD_HEADER_LEN + self.data.len());
+        out.push(self.flags);
+        out.extend_from_slice(&self.send_base.to_le_bytes());
+        out.extend_from_slice(&self.recv_ack.to_le_bytes());
+        out.extend_from_slice(&self.data);
+        out
+    }
+
+    /// Rejects a truncated header. Unknown flag bits do NOT reject here —
+    /// §5 says the receiver ignores such instructions rather than guessing,
+    /// so the caller checks `has_unknown_flags()` and discards.
+    pub fn decode(input: &[u8]) -> Result<AgentPayload> {
+        if input.len() < AGENT_PAYLOAD_HEADER_LEN {
+            return Err(Error::from("truncated agent-channel payload"));
+        }
+        Ok(AgentPayload {
+            flags: input[0],
+            send_base: u64::from_le_bytes(input[1..9].try_into().unwrap()),
+            recv_ack: u64::from_le_bytes(input[9..17].try_into().unwrap()),
+            data: input[AGENT_PAYLOAD_HEADER_LEN..].to_vec(),
+        })
+    }
+
+    pub fn has_unknown_flags(&self) -> bool {
+        self.flags & !AGENT_FLAGS_KNOWN != 0
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -197,6 +246,58 @@ mod tests {
         );
         // An envelope with no payload is well-formed (empty payload).
         assert_eq!(Envelope::parse(&ok).unwrap().1, b"");
+    }
+
+    #[test]
+    fn agent_payload_roundtrips_including_empty_data() {
+        for data in [Vec::new(), b"agent bytes".to_vec()] {
+            let p = AgentPayload {
+                flags: AGENT_FLAG_OPEN,
+                send_base: 0,
+                recv_ack: 42,
+                data,
+            };
+            let decoded = AgentPayload::decode(&p.encode()).unwrap();
+            assert_eq!(decoded, p);
+            assert!(!decoded.has_unknown_flags());
+        }
+    }
+
+    #[test]
+    fn agent_payload_rejects_truncated_header() {
+        let wire = AgentPayload {
+            flags: 0,
+            send_base: 1,
+            recv_ack: 2,
+            data: vec![9],
+        }
+        .encode();
+        assert!(AgentPayload::decode(&wire[..AGENT_PAYLOAD_HEADER_LEN - 1]).is_err());
+    }
+
+    #[test]
+    fn agent_payload_flags_unknown_bits_detected() {
+        let p = AgentPayload {
+            flags: AGENT_FLAG_CLOSE | 0x40,
+            send_base: 3,
+            recv_ack: 4,
+            data: Vec::new(),
+        };
+        let decoded = AgentPayload::decode(&p.encode()).unwrap();
+        assert!(decoded.has_unknown_flags(), "reserved bit 0x40 must surface");
+    }
+
+    #[test]
+    fn agent_payload_larger_than_retired_247_budget_roundtrips() {
+        let p = AgentPayload {
+            flags: 0,
+            send_base: 1000,
+            recv_ack: 2000,
+            data: vec![0x5a; 4096],
+        };
+        let decoded = AgentPayload::decode(&p.encode()).unwrap();
+        assert_eq!(decoded.data.len(), 4096, "no 247-byte entry ceiling remains");
+        assert_eq!(decoded, p);
     }
 
     #[test]
