@@ -7,10 +7,7 @@
 //! codecs in posh-proto stay untouched (verified by
 //! `remote::sync::tests::a_nine_byte_envelope_prefix_leaves_both_codecs_verbatim`).
 
-// Consumed by the event loops from the wire-increment plan's Tasks 4-5
-// (docs/plans/2026-07-28-rfc0011-wire-increment-impl.md); the allow goes
-// with the first non-test consumer.
-#![allow(dead_code)]
+use std::borrow::Cow;
 
 use crate::util::{Error, Result};
 
@@ -21,7 +18,15 @@ pub const ENVELOPE_LEN: usize = 9;
 
 /// §3.2: channel kinds.
 pub const KIND_SESSION: u8 = 0;
+// Consumed by the wire-increment plan's Task 5 (agent channels).
+#[allow(dead_code)]
 pub const KIND_AGENT: u8 = 1;
+
+/// §3.2/§3.3: the single client-initiated `session` channel this increment
+/// carries every `ClientMessage`/`ServerFrame` on. The envelope is symmetric,
+/// so BOTH directions stamp this one identifier — the initiator bit records
+/// who opened the channel, not who is sending.
+pub const SESSION_CHANNEL: ChannelId = ChannelId::new(false, KIND_SESSION, 1);
 
 /// §3: bit 0 initiator (0 = client, 1 = server), bits 1..7 kind,
 /// bits 8..63 ordinal. Ordinal 0 is reserved, so raw id 0 (the
@@ -29,11 +34,15 @@ pub const KIND_AGENT: u8 = 1;
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
 pub struct ChannelId(pub u64);
 
+// The accessors and CONTROL gain their non-test consumers with the agent
+// channels (wire-increment plan Task 5); Task 4 needs only `new` (via
+// SESSION_CHANNEL) and whole-identifier equality.
+#[allow(dead_code)]
 impl ChannelId {
     /// §3.1: reserved for connection-level control; never carries data.
     pub const CONTROL: ChannelId = ChannelId(0);
 
-    pub fn new(server_initiated: bool, kind: u8, ordinal: u64) -> ChannelId {
+    pub const fn new(server_initiated: bool, kind: u8, ordinal: u64) -> ChannelId {
         ChannelId((server_initiated as u64) | ((kind as u64 & 0x7f) << 1) | (ordinal << 8))
     }
 
@@ -56,6 +65,9 @@ impl ChannelId {
 }
 
 /// The role a peer allocates identifiers for (§3.1: only its own space).
+// Task 5 consumer (agent channels): this increment's single session channel
+// is a fixed identifier, so nothing allocates yet.
+#[allow(dead_code)]
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
 pub enum Role {
     Client,
@@ -63,11 +75,13 @@ pub enum Role {
 }
 
 /// §3.1: per-(initiator, kind) monotonic ordinal allocation starting at 1.
+#[allow(dead_code)] // Task 5 consumer (agent channels)
 pub struct ChannelAllocator {
     role: Role,
     next_ordinal: [u64; 128],
 }
 
+#[allow(dead_code)] // Task 5 consumer (agent channels)
 impl ChannelAllocator {
     pub fn new(role: Role) -> ChannelAllocator {
         ChannelAllocator {
@@ -131,17 +145,54 @@ impl Envelope {
     }
 }
 
+/// The Task 4 send gate, shared by the client, server, and relay loops so
+/// none duplicates the mode split: enveloped ⇒ prepend the §2 envelope on
+/// [`SESSION_CHANNEL`] (one owned buffer); baseline ⇒ the message verbatim,
+/// borrowed — baseline wire bytes stay byte-identical, without even a copy.
+pub fn seal_instruction(enveloped: bool, message: &[u8]) -> Cow<'_, [u8]> {
+    if !enveloped {
+        return Cow::Borrowed(message);
+    }
+    let mut out = Vec::with_capacity(ENVELOPE_LEN + message.len());
+    Envelope::new(SESSION_CHANNEL).encode_to(&mut out);
+    out.extend_from_slice(message);
+    Cow::Owned(out)
+}
+
+/// The Task 4 receive gate, `seal_instruction`'s mirror: enveloped ⇒ parse
+/// the envelope off a reassembled instruction and admit only the session
+/// channel — `None` means "discard this instruction and keep going" (§2:
+/// unknown ver / truncation; §3.2: RESERVED or foreign kind, CONTROL, wrong
+/// ordinal — never a connection teardown). Baseline ⇒ the payload verbatim.
+pub fn open_instruction(enveloped: bool, payload: &[u8]) -> Option<&[u8]> {
+    if !enveloped {
+        return Some(payload);
+    }
+    match Envelope::parse(payload) {
+        Ok((env, rest)) if env.channel == SESSION_CHANNEL => Some(rest),
+        Ok(_) | Err(_) => None,
+    }
+}
+
+// The §5 agent payload codec below gains its non-test consumers with the
+// agent channels (wire-increment plan Task 5).
 /// §5 agent-channel payload flag bits.
+#[allow(dead_code)]
 pub const AGENT_FLAG_OPEN: u8 = 0x01;
+#[allow(dead_code)]
 pub const AGENT_FLAG_CLOSE: u8 = 0x02;
+#[allow(dead_code)]
 pub const AGENT_FLAG_FAIL: u8 = 0x04;
+#[allow(dead_code)]
 const AGENT_FLAGS_KNOWN: u8 = AGENT_FLAG_OPEN | AGENT_FLAG_CLOSE | AGENT_FLAG_FAIL;
 /// §5 header: flags u8 + send_base u64 LE + recv_ack u64 LE.
+#[allow(dead_code)]
 pub const AGENT_PAYLOAD_HEADER_LEN: usize = 17;
 
 /// §5: the payload of one `agent` channel instruction. `send_base` is the
 /// offset of `data`'s first byte in this channel's cumulative outbound
 /// stream; `recv_ack` cumulatively acknowledges the peer's stream.
+#[allow(dead_code)] // Task 5 consumer (agent channels)
 #[derive(Clone, PartialEq, Eq, Debug)]
 pub struct AgentPayload {
     pub flags: u8,
@@ -150,6 +201,7 @@ pub struct AgentPayload {
     pub data: Vec<u8>,
 }
 
+#[allow(dead_code)] // Task 5 consumer (agent channels)
 impl AgentPayload {
     pub fn encode(&self) -> Vec<u8> {
         let mut out = Vec::with_capacity(AGENT_PAYLOAD_HEADER_LEN + self.data.len());
@@ -298,6 +350,62 @@ mod tests {
         let decoded = AgentPayload::decode(&p.encode()).unwrap();
         assert_eq!(decoded.data.len(), 4096, "no 247-byte entry ceiling remains");
         assert_eq!(decoded, p);
+    }
+
+    #[test]
+    fn session_channel_gate_seals_and_opens_symmetrically() {
+        let msg = b"client message bytes";
+        let sealed = seal_instruction(true, msg);
+        assert_eq!(sealed.len(), ENVELOPE_LEN + msg.len());
+        assert_eq!(sealed[0], VER_1);
+        let (env, rest) = Envelope::parse(&sealed).unwrap();
+        assert_eq!(env.channel, SESSION_CHANNEL);
+        assert_eq!(rest, msg);
+        assert_eq!(open_instruction(true, &sealed), Some(&msg[..]));
+    }
+
+    #[test]
+    fn open_instruction_discards_bad_ver_foreign_channel_and_control() {
+        let msg = b"payload";
+        // Unknown ver (§2): discard.
+        let mut bad_ver = seal_instruction(true, msg).into_owned();
+        bad_ver[0] = 0x02;
+        assert_eq!(open_instruction(true, &bad_ver), None);
+        // Truncated (§2): discard.
+        assert_eq!(open_instruction(true, &bad_ver[..ENVELOPE_LEN - 1]), None);
+        // A valid envelope on a foreign channel (§3.2 receiver rules): discard.
+        let foreign = [
+            ChannelId::new(false, 5, 1),           // RESERVED kind
+            ChannelId::CONTROL,                    // identifier 0
+            ChannelId::new(false, KIND_SESSION, 2), // wrong ordinal
+            ChannelId::new(true, KIND_SESSION, 1), // wrong initiator space
+            ChannelId::new(false, KIND_AGENT, 1),  // agent kind (Task 5, not session)
+        ];
+        for id in foreign {
+            let mut wire = Vec::new();
+            Envelope::new(id).encode_to(&mut wire);
+            wire.extend_from_slice(msg);
+            assert_eq!(open_instruction(true, &wire), None, "id {:#x} must be discarded", id.0);
+        }
+    }
+
+    #[test]
+    fn baseline_wire_carries_no_envelope() {
+        // A payload that happens to START 0x01-envelope-shaped, to pin that
+        // baseline mode never prepends nor strips: enveloped mode is opt-in only.
+        let msg = b"\x01looks enveloped but is baseline";
+        match seal_instruction(false, msg) {
+            std::borrow::Cow::Borrowed(b) => assert_eq!(b, msg, "baseline seal is the identity"),
+            std::borrow::Cow::Owned(_) => panic!("baseline seal must not copy or prepend"),
+        }
+        assert_eq!(
+            open_instruction(false, msg),
+            Some(&msg[..]),
+            "a baseline receiver passes the payload through verbatim"
+        );
+        // And the enveloped seal is NOT the identity, so the two modes can
+        // never be byte-confused.
+        assert_ne!(seal_instruction(true, msg).as_ref(), msg);
     }
 
     #[test]

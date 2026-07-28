@@ -72,6 +72,7 @@ use std::os::unix::net::UnixStream;
 use crate::pty;
 use crate::remote::agent::AgentEndpoint;
 use crate::remote::caps::{self, Cap};
+use crate::remote::channel;
 use crate::remote::datagram::{Connection, SEND_INTERVAL_MIN};
 use crate::remote::server::{send_payload, server_loop};
 use crate::remote::sync::{
@@ -239,7 +240,7 @@ pub(crate) fn run(
     //    its first datagram BEFORE connecting to the daemon, so the daemon Init
     //    carries the right size and forwarded content caps (RFC 0008 §3). The
     //    datagram also teaches `conn` its peer address, so later sends land.
-    let (rows, cols, client_caps) = wait_for_handshake(&mut conn)?;
+    let (rows, cols, client_caps) = wait_for_handshake(&mut conn, channels)?;
 
     // Agent forwarding (FDR 0004, Task 3.2): stand up the remote endpoint BEFORE
     // creating the session, and seed SSH_AUTH_SOCK into THIS process's env. In
@@ -299,12 +300,9 @@ pub(crate) fn run(
     //    (the daemon sheds the dead frame-client) and run the legacy inner-PTY
     //    server against a FRESH `posh attach` client of the same daemon, reusing
     //    the already-peered `conn`. No flag day — either daemon works.
-    match first_daemon_record(&mut link, &mut conn)? {
+    match first_daemon_record(&mut link, &mut conn, channels)? {
         FirstRecord::Frame(frame) => {
-            // RFC 0011 §6: envelope selected; consumed by the wire-increment
-            // plan's Task 4. Purely additive plumbing until then.
-            let _ = channels;
-            relay_loop(conn, link, (rows, cols), agent, Some(frame))
+            relay_loop(conn, link, (rows, cols), agent, Some(frame), channels)
         }
         FirstRecord::Output => {
             drop(link); // shed the dead frame-client before the fresh attach
@@ -356,7 +354,11 @@ enum FirstRecord {
 /// `Fragmenter` whose ids restart from `relay_loop`'s fresh one, which is harmless:
 /// `FragmentAssembly` switches to any incoming id (no back-rejection, no
 /// completed-id dedup) and single-fragment Empty frames leave no partial state.
-fn first_daemon_record(link: &mut DaemonLink, conn: &mut Connection) -> Result<FirstRecord> {
+fn first_daemon_record(
+    link: &mut DaemonLink,
+    conn: &mut Connection,
+    enveloped: bool,
+) -> Result<FirstRecord> {
     // The daemon will not send anything until it has our Init+Resize. This must
     // go out whole — a partial write would hand the daemon a corrupt frame — so
     // a short write (budget spent) is an error, not silent loss.
@@ -399,7 +401,7 @@ fn first_daemon_record(link: &mut DaemonLink, conn: &mut Connection) -> Result<F
         let now = util::now_ms();
         let due = last_hb.is_none_or(|t| now.saturating_sub(t) >= sync::HEARTBEAT_INTERVAL);
         if conn.has_remote() && due {
-            send_empty(conn, &mut hb_fragmenter, &idle_inbox, 0, &[]);
+            send_empty(conn, &mut hb_fragmenter, &idle_inbox, 0, &[], enveloped);
             last_hb = Some(now);
         }
         // Wake in time for the next heartbeat even with no fd activity.
@@ -490,7 +492,7 @@ fn fallback_to_server(
 /// Block (polling) on the UDP socket until the first authentic, sized
 /// `ClientMessage` arrives; return its size + advertised caps. The datagram also
 /// pins the server `Connection`'s peer address as a side effect of `recv`.
-fn wait_for_handshake(conn: &mut Connection) -> Result<(u16, u16, Vec<Cap>)> {
+fn wait_for_handshake(conn: &mut Connection, enveloped: bool) -> Result<(u16, u16, Vec<Cap>)> {
     let mut assembly = FragmentAssembly::new();
     loop {
         let mut fds = [util::pollfd(conn.raw_fd(), libc::POLLIN)];
@@ -508,7 +510,18 @@ fn wait_for_handshake(conn: &mut Connection) -> Result<(u16, u16, Vec<Cap>)> {
                     let Some(assembled) = assembly.add(frag) else {
                         continue;
                     };
-                    let Ok(msg) = ClientMessage::decode(&assembled) else {
+                    // RFC 0011 §2/§3.2 (enveloped mode only): a malformed
+                    // envelope or a foreign channel discards the instruction,
+                    // never the connection. The first ClientMessage is the
+                    // session channel's OPEN-bearing instruction (§3.3).
+                    let Some(message) = channel::open_instruction(enveloped, &assembled) else {
+                        util::log_write(
+                            "warn",
+                            "discarded instruction: bad envelope or foreign channel",
+                        );
+                        continue;
+                    };
+                    let Ok(msg) = ClientMessage::decode(message) else {
                         continue;
                     };
                     if msg.rows > 0 && msg.cols > 0 {
@@ -533,6 +546,7 @@ fn relay_loop(
     mut client_size: (u16, u16),
     mut agent: Option<AgentEndpoint>,
     first_frame: Option<ServerFrame>,
+    enveloped: bool,
 ) -> Result<()> {
     let mut fragmenter = Fragmenter::new();
     let mut assembly = FragmentAssembly::new();
@@ -590,6 +604,7 @@ fn relay_loop(
             &mut last_send,
             &mut last_agent_send,
             util::now_ms(),
+            enveloped,
         );
     }
 
@@ -677,7 +692,18 @@ fn relay_loop(
                         let Some(assembled) = assembly.add(frag) else {
                             continue;
                         };
-                        let Ok(msg) = ClientMessage::decode(&assembled) else {
+                        // RFC 0011 §2/§3.2 (enveloped mode only): a malformed
+                        // envelope or a foreign channel discards the
+                        // instruction, never the connection.
+                        let Some(message) = channel::open_instruction(enveloped, &assembled)
+                        else {
+                            util::log_write(
+                                "warn",
+                                "discarded instruction: bad envelope or foreign channel",
+                            );
+                            continue;
+                        };
+                        let Ok(msg) = ClientMessage::decode(message) else {
                             continue;
                         };
                         last_heard = now;
@@ -815,6 +841,7 @@ fn relay_loop(
                                     &mut last_send,
                                     &mut last_agent_send,
                                     now,
+                                    enveloped,
                                 );
                             }
                             Tag::Exit => {
@@ -826,6 +853,7 @@ fn relay_loop(
                                     &inbox,
                                     last_frame_num,
                                     code,
+                                    enveloped,
                                 );
                                 return Ok(());
                             }
@@ -902,7 +930,7 @@ fn relay_loop(
             // stamped when it was held; fresh agent bytes ride the independent carrier.
             if due.retransmit {
                 if let Some(bytes) = held.bytes() {
-                    send_payload(&mut conn, &mut fragmenter, bytes);
+                    send_payload(&mut conn, &mut fragmenter, bytes, enveloped);
                 }
                 last_send = now;
             } else if due.heartbeat {
@@ -912,6 +940,7 @@ fn relay_loop(
                     &inbox,
                     last_frame_num,
                     &out_agent_caps,
+                    enveloped,
                 );
                 last_send = now;
             }
@@ -925,6 +954,7 @@ fn relay_loop(
                     &inbox,
                     last_frame_num,
                     &out_agent_caps,
+                    enveloped,
                 );
                 last_agent_send = now;
             }
@@ -934,7 +964,7 @@ fn relay_loop(
             // Push the queued Tag::Detach to the daemon (best-effort), then tell
             // the UDP client the transport is over.
             let _ = util::write_all_retry(link.stream.as_raw_fd(), &link.write, 100);
-            send_shutdown(&mut conn, &mut fragmenter, &inbox, last_frame_num, None);
+            send_shutdown(&mut conn, &mut fragmenter, &inbox, last_frame_num, None, enveloped);
             return Ok(());
         }
 
@@ -974,6 +1004,7 @@ fn forward_daemon_frame(
     last_send: &mut u64,
     last_agent_send: &mut u64,
     now: u64,
+    enveloped: bool,
 ) {
     let ack = inbox.next_offset();
     let mut out = rewrap(daemon_frame, frame_offset, ack, ack);
@@ -982,7 +1013,7 @@ fn forward_daemon_frame(
     held.hold(out.frame_num, out.encode());
     if conn.has_remote() {
         if let Some(bytes) = held.bytes() {
-            send_payload(conn, fragmenter, bytes);
+            send_payload(conn, fragmenter, bytes, enveloped);
         }
         *last_send = now;
         *last_agent_send = now;
@@ -1003,6 +1034,7 @@ fn send_empty(
     inbox: &InputInbox,
     frame_num: u64,
     extras: &[Cap],
+    enveloped: bool,
 ) {
     let ack = inbox.next_offset();
     let frame = ServerFrame {
@@ -1013,7 +1045,7 @@ fn send_empty(
         echo_ack: ack,
         body: FrameBody::Empty,
     };
-    send_payload(conn, fragmenter, &frame.encode());
+    send_payload(conn, fragmenter, &frame.encode(), enveloped);
 }
 
 /// Send the UDP client a final `FLAG_SHUTDOWN` frame (Empty body), carrying the
@@ -1026,6 +1058,7 @@ fn send_shutdown(
     inbox: &InputInbox,
     frame_num: u64,
     exit_code: Option<i32>,
+    enveloped: bool,
 ) {
     if !conn.has_remote() {
         return;
@@ -1046,7 +1079,7 @@ fn send_shutdown(
         echo_ack: ack,
         body: FrameBody::Empty,
     };
-    send_payload(conn, fragmenter, &frame.encode());
+    send_payload(conn, fragmenter, &frame.encode(), enveloped);
 }
 
 /// Which periodic frames the relay loop should emit this iteration.
@@ -1214,7 +1247,7 @@ mod tests {
         let mut rec = Vec::new();
         ipc::append_frame(&mut rec, Tag::Frame, &sf.encode());
         util::write_all_retry(daemon_end.as_raw_fd(), &rec, 1000).unwrap();
-        match first_daemon_record(&mut link, &mut conn).unwrap() {
+        match first_daemon_record(&mut link, &mut conn, false).unwrap() {
             FirstRecord::Frame(f) => assert_eq!(f.frame_num, 1, "the daemon frame is returned"),
             FirstRecord::Output => panic!("expected Frame, got Output"),
             FirstRecord::Closed => panic!("expected Frame, got Closed"),
@@ -1227,7 +1260,7 @@ mod tests {
         util::write_all_retry(daemon_end.as_raw_fd(), &rec, 1000).unwrap();
         assert!(
             matches!(
-                first_daemon_record(&mut link, &mut conn).unwrap(),
+                first_daemon_record(&mut link, &mut conn, false).unwrap(),
                 FirstRecord::Output
             ),
             "a frames-off daemon's Tag::Output triggers the legacy fallback"
@@ -1237,7 +1270,7 @@ mod tests {
         let (mut link, daemon_end) = new_link();
         drop(daemon_end);
         assert!(matches!(
-            first_daemon_record(&mut link, &mut conn).unwrap(),
+            first_daemon_record(&mut link, &mut conn, false).unwrap(),
             FirstRecord::Closed
         ));
     }
@@ -1307,7 +1340,7 @@ mod tests {
         ipc::append_frame(&mut rec, Tag::Frame, &sf.encode());
         util::write_all_retry(daemon_end.as_raw_fd(), &rec, 1000).unwrap();
 
-        match first_daemon_record(&mut link, &mut relay_conn).unwrap() {
+        match first_daemon_record(&mut link, &mut relay_conn, false).unwrap() {
             FirstRecord::Frame(f) => assert_eq!(f.frame_num, 1),
             _ => panic!("expected Frame"),
         }
@@ -1519,7 +1552,7 @@ mod tests {
         );
         ipc::append_frame(&mut link.write, Tag::Resize, &ipc::encode_resize(rows, cols));
 
-        let relay = std::thread::spawn(move || relay_loop(relay_conn, link, (rows, cols), None, None));
+        let relay = std::thread::spawn(move || relay_loop(relay_conn, link, (rows, cols), None, None, false));
 
         // --- synthetic UDP client state ---
         let mut client_term = Terminal::with_scrollback(rows, cols, 0);
@@ -1747,7 +1780,7 @@ mod tests {
             );
             ipc::append_frame(&mut link.write, Tag::Resize, &ipc::encode_resize(rows, cols));
 
-            let relay = std::thread::spawn(move || relay_loop(relay_conn, link, (rows, cols), None, None));
+            let relay = std::thread::spawn(move || relay_loop(relay_conn, link, (rows, cols), None, None, false));
 
             let mut dterm = Terminal::with_scrollback(rows, cols, 1000);
             fill_screen(&mut dterm);
@@ -2202,7 +2235,7 @@ mod tests {
         ipc::append_frame(&mut link.write, Tag::Resize, &ipc::encode_resize(rows, cols));
 
         let relay =
-            std::thread::spawn(move || relay_loop(relay_conn, link, (rows, cols), Some(endpoint), None));
+            std::thread::spawn(move || relay_loop(relay_conn, link, (rows, cols), Some(endpoint), None, false));
 
         // The agent CONSUMER dials the relay's agent/sock and issues one request.
         // The listener socket exists (bound in AgentEndpoint::new before the thread

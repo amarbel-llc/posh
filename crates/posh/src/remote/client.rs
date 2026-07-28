@@ -12,6 +12,7 @@ use serde_json::{json, Value};
 
 use crate::pty::{self, RawMode};
 use crate::remote::caps;
+use crate::remote::channel;
 use crate::remote::crypto::Key;
 use crate::remote::datagram::{Connection, Family};
 use crate::remote::diag;
@@ -675,6 +676,10 @@ fn resolve(host: &str, port: u16, family: Family) -> Result<SocketAddr> {
 struct ClientState {
     conn: Connection,
     fragmenter: Fragmenter,
+    /// RFC 0011 §6: this connection speaks the channel envelope (selected out
+    /// of band via `POSH_CHANNELS`/`--channels`). Fixed for the connection's
+    /// lifetime; `false` is the byte-identical baseline protocol.
+    enveloped: bool,
     outbox: InputOutbox,
     rows: u16,
     cols: u16,
@@ -848,10 +853,6 @@ fn client_loop(
     host: &str,
     enveloped: bool,
 ) -> Result<i32> {
-    // RFC 0011 §6: envelope selected; consumed by the wire-increment plan's
-    // Task 4. Purely additive plumbing until then — a connection without the
-    // selection is byte-identical to baseline.
-    let _ = enveloped;
     util::set_nonblocking(STDIN)?;
 
     let (rows, cols) = pty::term_size(STDOUT);
@@ -870,6 +871,7 @@ fn client_loop(
     let mut st = ClientState {
         conn,
         fragmenter: Fragmenter::new(),
+        enveloped,
         outbox: InputOutbox::new(),
         rows,
         cols,
@@ -1121,7 +1123,18 @@ fn drive_client(st: &mut ClientState, raw: &RawMode, port: u16) -> Result<i32> {
                         let Some(assembled) = assembly.add(frag) else {
                             continue;
                         };
-                        let Ok(frame) = ServerFrame::decode(&assembled) else {
+                        // RFC 0011 §2/§3.2 (enveloped mode only): a malformed
+                        // envelope or a foreign channel discards the
+                        // instruction, never the connection.
+                        let Some(message) = channel::open_instruction(st.enveloped, &assembled)
+                        else {
+                            util::log_write(
+                                "warn",
+                                "discarded instruction: bad envelope or foreign channel",
+                            );
+                            continue;
+                        };
+                        let Ok(frame) = ServerFrame::decode(message) else {
                             continue;
                         };
                         st.last_heard = now_ms();
@@ -2294,9 +2307,14 @@ fn send_message(st: &mut ClientState) {
         | sync::CLIENT_FLAG_LOG_ON
         | sync::CLIENT_FLAG_LOG_OFF
         | sync::CLIENT_FLAG_RESYNC);
+    // RFC 0011 §1/§2 (enveloped mode only): the session-channel envelope is
+    // prepended ABOVE fragmentation, once per instruction. Baseline mode
+    // sends the encoded message byte-identically.
+    let encoded = msg.encode();
+    let wire = channel::seal_instruction(st.enveloped, &encoded);
     for frag in st
         .fragmenter
-        .make_fragments(&msg.encode(), sync::FRAGMENT_CONTENTS_MAX)
+        .make_fragments(&wire, sync::FRAGMENT_CONTENTS_MAX)
     {
         let _ = st.conn.send(&frag.to_bytes());
     }
@@ -3129,6 +3147,7 @@ mod tests {
         ClientState {
             conn,
             fragmenter: Fragmenter::new(),
+            enveloped: false,
             outbox: InputOutbox::new(),
             rows,
             cols,

@@ -9,6 +9,7 @@ use posh_term::Terminal;
 use crate::overlay::{close_overlay, escape_command, Overlay};
 use crate::pty;
 use crate::remote::caps;
+use crate::remote::channel;
 use crate::remote::crypto::Key;
 use crate::remote::diag;
 use crate::remote::display::Snapshot;
@@ -155,10 +156,6 @@ pub(crate) fn server_loop(
     mut agent_endpoint: Option<crate::remote::agent::AgentEndpoint>,
     enveloped: bool,
 ) {
-    // RFC 0011 §6: envelope selected; consumed by the wire-increment plan's
-    // Task 4. Purely additive plumbing until then — a server invoked without
-    // `--channels` is byte-identical to baseline.
-    let _ = enveloped;
     // Optional perf instrumentation (POSH_DEBUG_LOG). run() has already
     // double-forked and redirected stdio to /dev/null, so this file fd is the
     // server's only viable diagnostic sink; inert when the env var is unset.
@@ -555,7 +552,18 @@ pub(crate) fn server_loop(
                         let Some(assembled) = assembly.add(frag) else {
                             continue;
                         };
-                        let Ok(msg) = ClientMessage::decode(&assembled) else {
+                        // RFC 0011 §2/§3.2 (enveloped mode only): a malformed
+                        // envelope or a foreign channel discards the
+                        // instruction, never the connection.
+                        let Some(message) = channel::open_instruction(enveloped, &assembled)
+                        else {
+                            util::log_write(
+                                "warn",
+                                "discarded instruction: bad envelope or foreign channel",
+                            );
+                            continue;
+                        };
+                        let Ok(msg) = ClientMessage::decode(message) else {
                             continue;
                         };
                         last_heard = now_ms();
@@ -1289,7 +1297,7 @@ pub(crate) fn server_loop(
                     echo_ack: echo.ack(),
                     body,
                 };
-                send_payload(&mut conn, &mut fragmenter, &frame.encode());
+                send_payload(&mut conn, &mut fragmenter, &frame.encode(), enveloped);
                 last_send = now;
             }
         }
@@ -1389,8 +1397,17 @@ fn handle_client_message(
     }
 }
 
-pub(crate) fn send_payload(conn: &mut Connection, fragmenter: &mut Fragmenter, payload: &[u8]) {
-    for frag in fragmenter.make_fragments(payload, sync::FRAGMENT_CONTENTS_MAX) {
+/// Fragment and send one encoded message. In enveloped mode (RFC 0011 §1/§2)
+/// the session-channel envelope is prepended ABOVE fragmentation, so it rides
+/// once per instruction; baseline mode sends the payload byte-identically.
+pub(crate) fn send_payload(
+    conn: &mut Connection,
+    fragmenter: &mut Fragmenter,
+    payload: &[u8],
+    enveloped: bool,
+) {
+    let wire = channel::seal_instruction(enveloped, payload);
+    for frag in fragmenter.make_fragments(&wire, sync::FRAGMENT_CONTENTS_MAX) {
         let _ = conn.send(&frag.to_bytes());
     }
 }
@@ -1472,6 +1489,154 @@ mod tests {
         assert_eq!(input_acked, 6, "input stream not fully acked");
         assert_eq!(echo_acked, 6, "echo ack never caught up to the input");
         server.join().unwrap();
+    }
+
+    /// Drive a real enveloped `server_loop` over loopback UDP (the RFC 0011
+    /// Task 4 mirror of `server_loop_input_and_shutdown_handshake`): every
+    /// outbound `ClientMessage` is sealed on the session channel and every
+    /// inbound instruction opened off it. `preamble_wire` instructions are
+    /// injected verbatim FIRST, so callers can assert the receiver discards
+    /// crafted junk and still processes the valid traffic that follows.
+    /// Returns (saw_shutdown, input_acked, echo_acked).
+    fn drive_enveloped_exchange(preamble_wire: &[Vec<u8>]) -> (bool, u64, u64) {
+        use crate::remote::channel;
+        let key = Key::random();
+        let (server_conn, port) = Connection::server((62100, 62199), &key, Family::Inet).unwrap();
+        let cmd: Vec<String> = vec!["/bin/sh".into(), "-c".into(), "read x; exit 0".into()];
+        let child = crate::pty::spawn_shell(Some(&cmd), 24, 80, &[], None).unwrap();
+        util::set_nonblocking(child.master).unwrap();
+        let server = std::thread::spawn(move || server_loop(server_conn, child, 24, 80, None, true));
+
+        let addr = format!("127.0.0.1:{port}").parse().unwrap();
+        let mut conn = Connection::client(addr, &key).unwrap();
+        let mut fragmenter = Fragmenter::new();
+        let mut assembly = FragmentAssembly::new();
+        let mut outbox = InputOutbox::new();
+        outbox.push(b"hello\n");
+
+        for wire in preamble_wire {
+            for frag in fragmenter.make_fragments(wire, sync::FRAGMENT_CONTENTS_MAX) {
+                conn.send(&frag.to_bytes()).unwrap();
+            }
+        }
+
+        let mut acked_frame = 0u64;
+        let mut input_acked = 0u64;
+        let mut echo_acked = 0u64;
+        let mut saw_shutdown = false;
+        let deadline = now_ms() + 15_000;
+        while now_ms() < deadline {
+            let msg = ClientMessage {
+                flags: 0,
+                caps: vec![],
+                acked_frame,
+                rows: 24,
+                cols: 80,
+                input_base: outbox.base(),
+                input: outbox.pending().to_vec(),
+            };
+            let encoded = msg.encode();
+            let wire = channel::seal_instruction(true, &encoded);
+            for frag in fragmenter.make_fragments(&wire, sync::FRAGMENT_CONTENTS_MAX) {
+                conn.send(&frag.to_bytes()).unwrap();
+            }
+            if saw_shutdown && acked_frame > 0 && echo_acked == 6 {
+                break; // shutdown frame acked in the message just sent
+            }
+            std::thread::sleep(std::time::Duration::from_millis(50));
+            loop {
+                match conn.recv() {
+                    Ok(Some(payload)) => {
+                        let Ok(frag) = sync::Fragment::from_bytes(&payload) else {
+                            continue;
+                        };
+                        let Some(assembled) = assembly.add(frag) else {
+                            continue;
+                        };
+                        let Some(message) = channel::open_instruction(true, &assembled) else {
+                            continue;
+                        };
+                        let Ok(frame) = ServerFrame::decode(message) else {
+                            continue;
+                        };
+                        acked_frame = acked_frame.max(frame.frame_num);
+                        input_acked = input_acked.max(frame.input_ack);
+                        echo_acked = echo_acked.max(frame.echo_ack);
+                        if frame.flags & sync::FLAG_SHUTDOWN != 0 {
+                            saw_shutdown = true;
+                        }
+                    }
+                    Ok(None) => continue,
+                    Err(e) if e.kind() == std::io::ErrorKind::WouldBlock => break,
+                    Err(_) => break,
+                }
+            }
+        }
+        // Join only on a clean shutdown: in a failure mode the loop is still
+        // running and the caller's asserts should fail, not hang on join.
+        if saw_shutdown {
+            server.join().unwrap();
+        }
+        (saw_shutdown, input_acked, echo_acked)
+    }
+
+    /// RFC 0011 Task 4: an enveloped loopback pair completes the same
+    /// Init→Frame→ack exchange as the baseline
+    /// `server_loop_input_and_shutdown_handshake` — the decoded ServerFrames
+    /// carry the same acks and shutdown flag, just from behind the envelope.
+    #[test]
+    fn enveloped_loopback_exchanges_frames_like_baseline() {
+        let (saw_shutdown, input_acked, echo_acked) = drive_enveloped_exchange(&[]);
+        assert!(saw_shutdown, "never saw the shutdown flag");
+        assert_eq!(input_acked, 6, "input stream not fully acked");
+        assert_eq!(echo_acked, 6, "echo ack never caught up to the input");
+    }
+
+    /// RFC 0011 §2: a ver this implementation does not speak is discarded —
+    /// the instruction is skipped, the connection lives, and the valid
+    /// traffic that follows completes the exchange.
+    #[test]
+    fn enveloped_receiver_discards_unknown_ver_and_stays_alive() {
+        use crate::remote::channel;
+        let msg = ClientMessage {
+            flags: 0,
+            caps: vec![],
+            acked_frame: 0,
+            rows: 24,
+            cols: 80,
+            input_base: 0,
+            input: vec![],
+        };
+        let mut wire = channel::seal_instruction(true, &msg.encode()).into_owned();
+        wire[0] = 0x02; // an envelope ver this implementation does not speak
+        let (saw_shutdown, input_acked, echo_acked) = drive_enveloped_exchange(&[wire]);
+        assert!(saw_shutdown, "never saw the shutdown flag");
+        assert_eq!(input_acked, 6, "input stream not fully acked");
+        assert_eq!(echo_acked, 6, "echo ack never caught up to the input");
+    }
+
+    /// RFC 0011 §3.2: a well-formed envelope on a channel that is not the
+    /// session channel (a RESERVED kind here) is discarded without tearing
+    /// down the connection; the following valid instruction is processed.
+    #[test]
+    fn enveloped_receiver_discards_foreign_channel() {
+        use crate::remote::channel;
+        let msg = ClientMessage {
+            flags: 0,
+            caps: vec![],
+            acked_frame: 0,
+            rows: 24,
+            cols: 80,
+            input_base: 0,
+            input: vec![],
+        };
+        let mut wire = Vec::new();
+        channel::Envelope::new(channel::ChannelId::new(false, 5, 1)).encode_to(&mut wire);
+        wire.extend_from_slice(&msg.encode());
+        let (saw_shutdown, input_acked, echo_acked) = drive_enveloped_exchange(&[wire]);
+        assert!(saw_shutdown, "never saw the shutdown flag");
+        assert_eq!(input_acked, 6, "input stream not fully acked");
+        assert_eq!(echo_acked, 6, "echo ack never caught up to the input");
     }
 
     #[test]
