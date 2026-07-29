@@ -26,7 +26,6 @@ use crate::util::{self, now_ms, Result};
 /// appears only for an explicit `-4`/`-6`, the port-range suffix only when a
 /// non-default range was given — so the common invocation stays a bare
 /// hostname slug.
-#[allow(dead_code)] // consumed by the mux daemon + client integration (M1 Tasks 3-4, docs/plans/2026-07-28-mux-endpoint-m1-impl.md)
 pub fn dest_key(user: Option<&str>, host: &str, family: Family, port_range: Option<&str>) -> String {
     let mut key = String::new();
     if let Some(user) = user {
@@ -53,7 +52,6 @@ pub fn dest_key(user: Option<&str>, host: &str, family: Family, port_range: Opti
 /// (`POSH_DIR > XDG_RUNTIME_DIR/posh > TMPDIR/posh-{uid} > /tmp/posh-{uid}`),
 /// created 0700 and hardened with the shared #7 check (self-owned,
 /// symlink-rejecting) exactly like `<base>/agent/`.
-#[allow(dead_code)] // consumed by the mux daemon (M1 Task 3, docs/plans/2026-07-28-mux-endpoint-m1-impl.md)
 pub fn mux_dir() -> Result<PathBuf> {
     let env = |k: &str| std::env::var(k).ok();
     let base = crate::session::resolve_socket_base(
@@ -66,7 +64,6 @@ pub fn mux_dir() -> Result<PathBuf> {
 }
 
 /// `<base>/mux/<key>.sock` — the endpoint socket for a destination key.
-#[allow(dead_code)] // consumed by the mux daemon + client integration (M1 Tasks 3-4, docs/plans/2026-07-28-mux-endpoint-m1-impl.md)
 pub fn mux_socket_path(key: &str) -> Result<PathBuf> {
     Ok(mux_socket_path_in(&mux_dir()?, key))
 }
@@ -82,7 +79,6 @@ fn mux_socket_path_in(dir: &Path, key: &str) -> PathBuf {
 /// sanitized local hostname, overridable via `POSH_CLIENT_ID` for the
 /// shared-hostname pathological case (design doc "Remote side"). The override
 /// is sanitized too — the id lands in remote socket names either way.
-#[allow(dead_code)] // consumed by the mux daemon + posh-server agent (M1 Tasks 2-3, docs/plans/2026-07-28-mux-endpoint-m1-impl.md)
 pub fn client_id() -> String {
     match std::env::var("POSH_CLIENT_ID") {
         Ok(id) if !id.is_empty() => sanitize_id(&id),
@@ -96,7 +92,6 @@ pub fn client_id() -> String {
 /// forwarding. Truthy values are the shared
 /// [`env_value_on`](crate::remote::sshwrap::env_value_on) set, the same
 /// spellings `POSH_CHANNELS` accepts.
-#[allow(dead_code)] // consumed by the main.rs invocation seam (M1 Task 4, docs/plans/2026-07-28-mux-endpoint-m1-impl.md)
 pub fn mux_selected() -> bool {
     std::env::var("POSH_MUX")
         .map(|v| crate::remote::sshwrap::env_value_on(&v))
@@ -151,7 +146,6 @@ pub const DEFAULT_LINGER_MS: u64 = 60_000;
 /// `POSH_MUX_PERSIST` in SECONDS (the `POSH_SERVER_*_TMOUT` / ssh
 /// ControlPersist convention), converted to the internal ms clock. `0`
 /// disables lingering; unset/unparsable falls back to the 60 s default.
-#[allow(dead_code)] // consumed by run_daemon (M1 Task 3) + client integration (Task 4)
 pub fn linger_ms_from_env() -> u64 {
     parse_linger_ms(std::env::var("POSH_MUX_PERSIST").ok().as_deref())
 }
@@ -179,7 +173,6 @@ pub struct MuxState {
     linger_deadline: Option<u64>,
 }
 
-#[allow(dead_code)] // consumed by the mux daemon loop (M1 Task 3, docs/plans/2026-07-28-mux-endpoint-m1-impl.md)
 impl MuxState {
     pub fn new(linger_ms: u64, now: u64) -> MuxState {
         MuxState {
@@ -349,7 +342,6 @@ pub struct MuxHello {
 }
 
 impl MuxHello {
-    #[allow(dead_code)] // the client half encodes (M1 Task 4, docs/plans/2026-07-28-mux-endpoint-m1-impl.md)
     pub fn encode(&self) -> Vec<u8> {
         let mut out = Vec::with_capacity(4 + self.stamp.len());
         out.extend_from_slice(&self.pid.to_le_bytes());
@@ -371,7 +363,6 @@ impl MuxHello {
 /// The connection state a `MuxHelloAck` reports (design doc "IPC").
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 #[repr(u8)]
-#[allow(dead_code)] // Bootstrapping/Draining reported by later daemon states + decoded by the Task 4 client
 pub enum MuxConnState {
     /// The ssh bootstrap / UDP association is still coming up.
     Bootstrapping = 0,
@@ -382,7 +373,6 @@ pub enum MuxConnState {
 }
 
 impl MuxConnState {
-    #[allow(dead_code)] // the client half decodes (M1 Task 4, docs/plans/2026-07-28-mux-endpoint-m1-impl.md)
     fn from_u8(b: u8) -> Option<MuxConnState> {
         Some(match b {
             0 => MuxConnState::Bootstrapping,
@@ -421,7 +411,6 @@ impl MuxHelloAck {
         out
     }
 
-    #[allow(dead_code)] // the client half decodes (M1 Task 4, docs/plans/2026-07-28-mux-endpoint-m1-impl.md)
     pub fn decode(payload: &[u8]) -> Option<MuxHelloAck> {
         if payload.len() < 3 {
             return None;
@@ -651,7 +640,6 @@ fn bind_or_probe(path: &Path) -> Result<MuxBind> {
 /// "Security": the endpoint inherits the spawner's resolved source).
 ///
 /// Returns in the SPAWNER only; the daemon grandchild exits the process.
-#[allow(dead_code)] // consumed by client integration (M1 Task 4, docs/plans/2026-07-28-mux-endpoint-m1-impl.md)
 pub fn run_daemon(
     key: &str,
     dest: &str,
@@ -977,7 +965,6 @@ pub struct MuxHandle {
     key: String,
 }
 
-#[allow(dead_code)] // consumed by the main.rs invocation seam (M1 Task 4, docs/plans/2026-07-28-mux-endpoint-m1-impl.md)
 impl MuxHandle {
     /// The endpoint's connection state as reported by its `MuxHelloAck`.
     pub fn state(&self) -> MuxConnState {
@@ -1020,7 +1007,6 @@ fn variant_key(key: &str) -> String {
 ///
 /// `agent_source` is the invocation's FDR 0004-resolved local agent socket,
 /// inherited by a daemon this call spawns (design doc "Security").
-#[allow(dead_code)] // consumed by the main.rs invocation seam (M1 Task 4, docs/plans/2026-07-28-mux-endpoint-m1-impl.md)
 pub fn ensure_mux(
     dest: &str,
     family: Family,
@@ -1160,7 +1146,6 @@ fn hello_handshake(
 /// invocation's lifetime; ANY failure warns once and falls back to
 /// per-connection forwarding exactly as today — never strand the user
 /// agentless.
-#[allow(dead_code)] // consumed by the main.rs invocation seam (M1 Task 4, docs/plans/2026-07-28-mux-endpoint-m1-impl.md)
 pub fn apply_mux_gate(
     selected: bool,
     agent_source: Option<PathBuf>,

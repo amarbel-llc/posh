@@ -505,11 +505,22 @@ fn cmd_ssh_session(
         return remote::sshwrap::run_detached(&dest, &inner, &opts);
     }
     // Foreground roaming attach. Resolve agent forwarding (flag > env >
-    // default-on).
+    // default-on), then the M1 mux gate (POSH_MUX, default off): when
+    // selected AND forwarding resolved on, the per-destination mux endpoint
+    // owns agent forwarding — ensured BEFORE the session bootstrap — and the
+    // session's own connection runs with forwarding off (no `-A`, no
+    // per-session srv endpoint). The handle holds this invocation's session
+    // ref until the function returns (Drop = auto-unref); any ensure failure
+    // falls back to per-connection forwarding exactly as before.
+    let (agent_source, _mux_ref) = remote::mux::apply_mux_gate(
+        remote::mux::mux_selected(),
+        resolve_agent_source(forward_flag),
+        |source| remote::mux::ensure_mux(&dest, Family::Auto, None, source),
+    );
     let opts = remote::sshwrap::SshOptions {
         family: Family::Auto,
         port_range: None,
-        agent_source: resolve_agent_source(forward_flag),
+        agent_source,
         real_ssh_agent_forward: None,
         channels: remote::sshwrap::channels_selected(),
     };
@@ -773,11 +784,22 @@ fn cmd_ssh(args: &[String], forward: Option<&remote::agent::ForwardFlag>) -> Res
         remote_cmd,
     } = parse_ssh_args(args)?;
     // Resolve agent forwarding for the roaming bare-host path; the explicit
-    // `posh ssh` subcommand passes None and stays a thin wrapper.
+    // `posh ssh` subcommand passes None and stays a thin wrapper (its None
+    // source also means the mux gate below never spawns anything for it).
+    // POSH_MUX (M1, default off): with forwarding resolved on, the
+    // per-destination mux endpoint owns forwarding for this invocation — the
+    // handle holds the session ref until return (Drop = auto-unref) — and
+    // the roaming connection itself forwards nothing; any ensure failure
+    // falls back to per-connection forwarding exactly as before.
+    let (agent_source, _mux_ref) = remote::mux::apply_mux_gate(
+        remote::mux::mux_selected(),
+        forward.and_then(resolve_agent_source),
+        |source| remote::mux::ensure_mux(target, family, port_range.as_deref(), source),
+    );
     let opts = remote::sshwrap::SshOptions {
         family,
         port_range,
-        agent_source: forward.and_then(resolve_agent_source),
+        agent_source,
         real_ssh_agent_forward: Some(resolve_real_ssh_agent_forward(real_ssh_agent_forward)),
         channels: remote::sshwrap::channels_selected(),
     };
