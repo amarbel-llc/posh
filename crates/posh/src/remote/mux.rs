@@ -2123,4 +2123,274 @@ mod tests {
         assert!(!id.is_empty());
         assert_eq!(sanitize_id(&id), id, "client_id must already be sanitized");
     }
+
+    // --- The M1 E2E (Task 5, docs/plans/2026-07-28-mux-endpoint-m1-impl.md):
+    // the FDR 0014 promotion-criteria run for posh#136. ---
+    //
+    // The pre-M1 shape this answers (reproduced conceptually, not re-run):
+    // each forwarded invocation stood up its own connection with a per-pid
+    // `srv-<pid>.sock` endpoint, and the remote `agent/sock` was a symlink
+    // ELECTED among them — so a client going idle or dying while its endpoint
+    // owned the link forced a handoff, whose unusable window measured 9.9 s
+    // before the posh#152 interim and zero-at-the-edge after (see
+    // `remote::agent::tests::handoff_repoints_to_the_active_sibling_on_the_inactivity_edge`
+    // — still an election among per-connection processes, explicitly not the
+    // FDR 0014 bar).
+    //
+    // Under POSH_MUX (M1) both invocations share ONE mux endpoint whose
+    // agent-only connection is the destination's sole agent-capable
+    // connection, so from a single client host `agent/sock` has exactly one
+    // owner BY CONSTRUCTION: a client departing is a local refcount decrement
+    // the remote never even observes. The FDR 0014 bar this proves: with two
+    // concurrent forwarded invocations, a real `ssh-add -l` through the
+    // remote `agent/sock` succeeds; after one client is killed, the OTHER's
+    // forwarding keeps working with ZERO handoff window — every probe from
+    // the instant of departure succeeds (no SSH_AGENT_FAILURE, which would
+    // surface as a failed `ssh-add -l`), and the symlink target never changes.
+    //
+    // Real components, per the suite's layering (server.rs agent E2Es): a
+    // real `ssh-agent` holding a real key behind the daemon's proxy; the REAL
+    // `posh server agent --client-id ...` BINARY as the remote — spawned over
+    // loopback via its own `POSH CONNECT` handshake, the suite's stand-in for
+    // the ssh bootstrap (whose command bytes sshwrap's tests pin) — and the
+    // REAL `mux_loop` + `ensure_mux_conn` client half as the two invocations
+    // (the spawn seam stands in for run_daemon's fork, exactly as the Task 4
+    // tests drive it). #[ignore]: needs the posh binary + ssh tooling, absent
+    // from the hermetic sandbox; run with `just debug-agent-e2e`.
+    #[test]
+    #[ignore = "mux M1 E2E; needs the posh binary + ssh tooling; run with --ignored"]
+    fn agent_forward_mux_m1_two_invocations_one_owner_zero_handoff_window() {
+        use std::io::BufRead;
+        use std::process::{Command, Stdio};
+
+        // The posh binary cargo builds alongside this test.
+        let posh_bin = {
+            let exe = std::env::current_exe().expect("current_exe");
+            exe.parent()
+                .and_then(|p| p.parent())
+                .expect("target/<profile> dir")
+                .join("posh")
+        };
+        assert!(
+            posh_bin.exists(),
+            "posh binary not found at {posh_bin:?} (cargo test should have built it)"
+        );
+
+        let local_base = temp_base(); // mux socket + the real agent's socket
+        let remote_base = temp_base(); // the remote server's POSH_DIR
+
+        // (1) A real ssh-agent holding an ephemeral key; the fingerprint
+        // `ssh-add -l` must report through the forwarded path.
+        let key_path = local_base.join("id_ed25519");
+        assert!(
+            Command::new("ssh-keygen")
+                .args(["-t", "ed25519", "-N", "", "-C", "posh-mux-m1-e2e", "-q", "-f"])
+                .arg(&key_path)
+                .status()
+                .expect("run ssh-keygen")
+                .success(),
+            "ssh-keygen failed"
+        );
+        let fp_out = Command::new("ssh-keygen")
+            .arg("-lf")
+            .arg(key_path.with_extension("pub"))
+            .output()
+            .expect("run ssh-keygen -lf");
+        let fp_text = String::from_utf8_lossy(&fp_out.stdout);
+        let fingerprint = fp_text
+            .split_whitespace()
+            .find(|t| t.starts_with("SHA256:"))
+            .expect("a SHA256 fingerprint")
+            .to_string();
+        let real_agent_sock = local_base.join("real-agent.sock");
+        let mut agent = Command::new("ssh-agent")
+            .arg("-D")
+            .arg("-a")
+            .arg(&real_agent_sock)
+            .stdout(Stdio::null())
+            .stderr(Stdio::null())
+            .spawn()
+            .expect("spawn ssh-agent");
+        let deadline = now_ms() + 5_000;
+        while !real_agent_sock.exists() {
+            assert!(now_ms() < deadline, "ssh-agent never bound its socket");
+            std::thread::sleep(std::time::Duration::from_millis(20));
+        }
+        assert!(
+            Command::new("ssh-add")
+                .arg(&key_path)
+                .env("SSH_AUTH_SOCK", &real_agent_sock)
+                .status()
+                .expect("run ssh-add")
+                .success(),
+            "ssh-add failed to load the key into the real agent"
+        );
+
+        // (2) The REAL agent-only remote: `posh server agent --client-id`
+        // (the exact tail run_daemon's ssh bootstrap execs as `posh-server
+        // agent ...`), detached via its own POSH CONNECT handshake.
+        let mut server = Command::new(&posh_bin)
+            .args(["server", "-p", "63500:63549", "agent", "--client-id", "m1e2e"])
+            .env("LC_ALL", "C.UTF-8")
+            .env("POSH_DIR", &remote_base)
+            .stdout(Stdio::piped())
+            .stderr(Stdio::null())
+            .spawn()
+            .expect("spawn posh server agent");
+        let connect = std::io::BufReader::new(server.stdout.take().expect("server stdout piped"))
+            .lines()
+            .map_while(|line| line.ok())
+            .find(|l| l.starts_with("POSH CONNECT "))
+            .expect("posh server agent printed POSH CONNECT");
+        let _ = server.wait(); // the parent exits right after the double-fork
+        let mut fields = connect
+            .strip_prefix("POSH CONNECT ")
+            .expect("POSH CONNECT prefix")
+            .split_whitespace();
+        let port: u16 = fields.next().expect("port").parse().expect("port number");
+        let udp_key = crate::remote::crypto::Key::from_base64(fields.next().expect("key"))
+            .expect("valid base64 key");
+
+        // (3) The mux endpoint: the REAL mux_loop on a thread (run_daemon's
+        // grandchild body; the fork + ssh bootstrap are what (2) stands in
+        // for), dialing the real remote over loopback and proxying the real
+        // ssh-agent. Short linger so teardown can join the thread.
+        let mut daemon = None;
+        let mut spawned = 0u32;
+        let mut spawn = |k: &str| {
+            spawned += 1;
+            let listener = UnixListener::bind(mux_socket_path_in(&local_base, k)).unwrap();
+            let addr = format!("127.0.0.1:{port}").parse().unwrap();
+            let conn = Connection::client(addr, &udp_key).unwrap();
+            let agent_sock = real_agent_sock.clone();
+            let k = k.to_string();
+            daemon = Some(std::thread::spawn(move || {
+                mux_loop(listener, conn, &agent_sock, 1_000, &k)
+            }));
+            Ok(MuxSpawn::Spawned)
+        };
+
+        // (4) TWO concurrent forwarded invocations — two session refs on the
+        // one endpoint through the real client half. One spawn only.
+        let timeout = std::time::Duration::from_secs(20);
+        let invocation1 = ensure_mux_conn(&local_base, "m1dest", &mut spawn, timeout).unwrap();
+        let invocation2 = ensure_mux_conn(&local_base, "m1dest", &mut spawn, timeout).unwrap();
+        assert_eq!(spawned, 1, "both invocations share the one endpoint");
+
+        // (5) A real `ssh-add -l` through the remote agent/sock lists the
+        // key (retrying through the come-up window: the first heartbeat must
+        // reach the remote before it can open channels toward us).
+        let forwarded_sock = remote_base.join("agent").join("sock");
+        let lists_key = || -> (bool, String) {
+            let out = Command::new("timeout")
+                .arg("4")
+                .arg("ssh-add")
+                .arg("-l")
+                .env("SSH_AUTH_SOCK", &forwarded_sock)
+                .output()
+                .expect("run ssh-add -l");
+            let stdout = String::from_utf8_lossy(&out.stdout).into_owned();
+            (out.status.success() && stdout.contains(&fingerprint), stdout)
+        };
+        let deadline = now_ms() + 15_000;
+        let mut came_up = false;
+        let mut last = String::new();
+        while now_ms() < deadline {
+            let (ok, out) = lists_key();
+            last = out;
+            if ok {
+                came_up = true;
+                break;
+            }
+            std::thread::sleep(std::time::Duration::from_millis(150));
+        }
+
+        // The structural claim: agent/sock is owned by the single mux
+        // endpoint (deterministically named), and no per-connection
+        // srv-<pid> endpoint exists to elect among.
+        let owner_before = std::fs::read_link(&forwarded_sock).ok();
+        let srv_endpoints: Vec<String> = std::fs::read_dir(remote_base.join("agent"))
+            .map(|rd| {
+                rd.flatten()
+                    .filter_map(|e| e.file_name().into_string().ok())
+                    .filter(|n| n.starts_with("srv-"))
+                    .collect()
+            })
+            .unwrap_or_default();
+
+        // (6) Kill one client: dropping the handle closes its IPC conn —
+        // the invocation dying and the invocation idling are the same event
+        // to the endpoint (auto-unref). The remote observes NOTHING.
+        drop(invocation1);
+
+        // (7) Zero handoff window: from the instant of departure, EVERY
+        // probe through agent/sock must keep succeeding — a single failed
+        // `ssh-add -l` here is the posh#136 SSH_AGENT_FAILURE — and the
+        // symlink target must never change (no election, no repoint).
+        let mut survived = came_up;
+        let mut probes = 0u32;
+        let mut owner_moved = false;
+        let post_kill_deadline = now_ms() + 2_000;
+        while now_ms() < post_kill_deadline {
+            let (ok, out) = lists_key();
+            probes += 1;
+            if !ok {
+                survived = false;
+                last = out;
+                break;
+            }
+            if std::fs::read_link(&forwarded_sock).ok() != owner_before {
+                owner_moved = true;
+                break;
+            }
+            std::thread::sleep(std::time::Duration::from_millis(100));
+        }
+        let owner_after = std::fs::read_link(&forwarded_sock).ok();
+
+        // (8) Teardown before asserting. Dropping the second ref arms the
+        // 1 s linger; the daemon thread exits on its expiry. The detached
+        // remote is then SIGTERMed via its recorded pid (the mux-<id>.pid
+        // liveness file) rather than waiting out its 60 s peer timeout.
+        drop(invocation2);
+        if let Some(d) = daemon {
+            let _ = d.join();
+        }
+        if let Ok(pid) = std::fs::read_to_string(remote_base.join("agent").join("mux-m1e2e.pid"))
+        {
+            if let Ok(pid) = pid.trim().parse::<i32>() {
+                // SAFETY: plain kill(2) on a recorded pid; no memory involved.
+                unsafe { libc::kill(pid, libc::SIGTERM) };
+            }
+        }
+        let _ = agent.kill();
+        let _ = agent.wait();
+        std::fs::remove_dir_all(&local_base).ok();
+        std::fs::remove_dir_all(&remote_base).ok();
+
+        assert!(
+            came_up,
+            "ssh-add -l via the mux-owned agent/sock never listed the key \
+             (fingerprint {fingerprint}); last stdout: {last:?}"
+        );
+        assert_eq!(
+            owner_before.as_deref().and_then(|p| p.to_str()),
+            Some("mux-m1e2e.sock"),
+            "agent/sock is owned by the single mux endpoint"
+        );
+        assert!(
+            srv_endpoints.is_empty(),
+            "no per-connection srv endpoints exist to elect among: {srv_endpoints:?}"
+        );
+        assert!(
+            survived,
+            "ssh-add -l failed after the first client departed (probe {probes}) — \
+             the posh#136 window reappeared; last stdout: {last:?}"
+        );
+        assert!(probes > 0, "the post-departure window was actually probed");
+        assert!(
+            !owner_moved && owner_after == owner_before,
+            "agent/sock changed owner across the departure ({owner_before:?} -> \
+             {owner_after:?}); ownership must be structural, not elected"
+        );
+    }
 }

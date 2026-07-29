@@ -469,7 +469,11 @@ debug-mosh-bless:
 # round-trip; the REAL ssh-agent `ssh-add -l` round-trip (in-thread
 # server_loop); and the REAL detached `posh server -A` PROCESS forwarding to an
 # in-process pump client. Each loads a real ssh-agent and asserts the key
-# round-trips through the forwarded socket. Needs the posh binary plus
+# round-trips through the forwarded socket. Plus the mux M1 lane (FDR 0014,
+# remote/mux.rs): the REAL `posh server agent` process + the real mux_loop,
+# two concurrent invocations on one endpoint, one killed — `ssh-add -l`
+# through the remote agent/sock keeps succeeding with zero handoff window
+# (the posh#136 promotion-criteria E2E). Needs the posh binary plus
 # ssh-keygen/ssh-agent/ssh-add, absent from the hermetic sandbox (hence
 # #[ignore]). Debug-only; the hermetic gate is build-rust.
 #
