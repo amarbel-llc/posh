@@ -143,6 +143,14 @@ fn mux_dir_at(base: &Path) -> Result<PathBuf> {
 /// (posh#145) lands.
 pub const DEFAULT_LINGER_MS: u64 = 60_000;
 
+/// The spawn grace: the orphan deadline armed at construction is at least
+/// this long, independent of the linger window. `POSH_MUX_PERSIST=0` means
+/// "exit the moment the last session ref drops" — it must NOT mean the
+/// daemon exits before its spawner's FIRST ref can land (the deferred-accept
+/// loop structure guarantees a freshly accepted conn's ref arrives an
+/// iteration after the accept, so a zero orphan deadline would always win).
+pub const SPAWN_GRACE_MS: u64 = 5_000;
+
 /// `POSH_MUX_PERSIST` in SECONDS (the `POSH_SERVER_*_TMOUT` / ssh
 /// ControlPersist convention), converted to the internal ms clock. `0`
 /// disables lingering; unset/unparsable falls back to the 60 s default.
@@ -163,9 +171,12 @@ fn parse_linger_ms(value: Option<&str>) -> u64 {
 /// invocations holding a `MuxSessionRef` gates agent serviceability
 /// (`refs > 0`), and unref-to-zero arms the linger clock — the endpoint keeps
 /// the connection (agent service OFF) for `linger_ms`, then
-/// [`should_exit`](Self::should_exit) signals shutdown. Construction arms the
-/// same clock, so a daemon whose spawner dies before its first ref exits
-/// instead of idling forever; the normal first ref cancels it.
+/// [`should_exit`](Self::should_exit) signals shutdown. Construction arms an
+/// orphan deadline of at least [`SPAWN_GRACE_MS`] — so a daemon whose
+/// spawner dies before its first ref exits instead of idling forever,
+/// without a zero linger racing the spawner's own first ref; the normal
+/// first ref cancels it, and `linger_ms` alone governs every post-unref
+/// window.
 pub struct MuxState {
     refs: usize,
     linger_ms: u64,
@@ -178,7 +189,7 @@ impl MuxState {
         MuxState {
             refs: 0,
             linger_ms,
-            linger_deadline: Some(now.saturating_add(linger_ms)),
+            linger_deadline: Some(now.saturating_add(linger_ms.max(SPAWN_GRACE_MS))),
         }
     }
 
@@ -260,6 +271,11 @@ pub enum MuxTag {
     Status = 3,
     /// Mux → client: the summary line (UTF-8).
     StatusReply = 4,
+    /// Mux → client: the `SessionRef` was registered. The confirmation the
+    /// client BLOCKS on before surrendering its per-connection forwarding —
+    /// a ref the daemon never acked is an error, not a silent success
+    /// (apply_mux_gate's fallback keys on exactly this).
+    RefAck = 5,
 }
 
 impl MuxTag {
@@ -270,6 +286,7 @@ impl MuxTag {
             2 => MuxTag::SessionRef,
             3 => MuxTag::Status,
             4 => MuxTag::StatusReply,
+            5 => MuxTag::RefAck,
             _ => return None,
         })
     }
@@ -559,6 +576,12 @@ fn process_ipc_conn(conn: &mut IpcConn, state: &mut MuxState, ctx: &MuxStatusCtx
                     conn.holds_ref = true;
                     state.add_ref();
                 }
+                // Confirm registration — the client blocks on this before
+                // dropping its own forwarding. A duplicate is re-acked so a
+                // waiting client never hangs on an idempotent ref.
+                if !send_mux_frame(conn, MuxTag::RefAck, b"") {
+                    return false;
+                }
             }
             MuxTag::Status => {
                 if !conn.hello_ok {
@@ -570,7 +593,7 @@ fn process_ipc_conn(conn: &mut IpcConn, state: &mut MuxState, ctx: &MuxStatusCtx
                 }
             }
             // Mux → client verbs arriving FROM a peer: ignore, keep the conn.
-            MuxTag::HelloAck | MuxTag::StatusReply => {}
+            MuxTag::HelloAck | MuxTag::StatusReply | MuxTag::RefAck => {}
         }
     }
     open
@@ -1037,9 +1060,9 @@ fn ensure_mux_conn(
     spawn: &mut dyn FnMut(&str) -> Result<MuxSpawn>,
     hello_timeout: std::time::Duration,
 ) -> Result<MuxHandle> {
-    let (stream, ack) = connect_and_hello(dir, key, spawn, hello_timeout)?;
+    let (stream, buf, ack) = connect_and_hello(dir, key, spawn, hello_timeout)?;
     if ack.stamp == MUX_PROTO_STAMP {
-        return claim_ref(stream, ack);
+        return claim_ref(stream, buf, ack, hello_timeout);
     }
     // RFC 0011 §6: never negotiate down. The endpoint told us ITS stamp; we
     // start a fresh daemon on the variant socket and let the old one drain.
@@ -1051,14 +1074,14 @@ fn ensure_mux_conn(
             ack.stamp
         ),
     );
-    let (stream, ack) = connect_and_hello(dir, &variant, spawn, hello_timeout)?;
+    let (stream, buf, ack) = connect_and_hello(dir, &variant, spawn, hello_timeout)?;
     if ack.stamp != MUX_PROTO_STAMP {
         return Err(util::Error::Msg(format!(
             "mux variant endpoint {variant} still speaks {:?} (ours: {MUX_PROTO_STAMP})",
             ack.stamp
         )));
     }
-    claim_ref(stream, ack)
+    claim_ref(stream, buf, ack, hello_timeout)
 }
 
 /// One connect-or-spawn + hello round for a single socket name. A failed
@@ -1070,7 +1093,7 @@ fn connect_and_hello(
     key: &str,
     spawn: &mut dyn FnMut(&str) -> Result<MuxSpawn>,
     hello_timeout: std::time::Duration,
-) -> Result<(UnixStream, MuxHelloAck)> {
+) -> Result<(UnixStream, MuxFrameBuffer, MuxHelloAck)> {
     let path = mux_socket_path_in(dir, key);
     let mut stream = match UnixStream::connect(&path) {
         Ok(s) => s,
@@ -1079,8 +1102,8 @@ fn connect_and_hello(
             retry_connect(&path)?
         }
     };
-    let ack = hello_handshake(&mut stream, hello_timeout)?;
-    Ok((stream, ack))
+    let (buf, ack) = hello_handshake(&mut stream, hello_timeout)?;
+    Ok((stream, buf, ack))
 }
 
 /// The bounded post-spawn backoff: [`CONNECT_ATTEMPTS`] tries,
@@ -1103,36 +1126,57 @@ fn retry_connect(path: &Path) -> Result<UnixStream> {
     )))
 }
 
-/// Sends `MuxHello` and reads frames (blocking, deadline via the socket read
-/// timeout) until the `MuxHelloAck` arrives. Frames other than the ack are
-/// skipped, mirroring the daemon's forward-compatibility posture.
+/// Reads frames (blocking, deadline via the socket read timeout) until one
+/// with tag `want` arrives; other frames are skipped, mirroring the daemon's
+/// forward-compatibility posture. The shared wait behind the hello ack and
+/// the ref ack: any close, error, or timeout is an `Err`, never a silent
+/// success. `buf` carries partial bytes between waits on the same stream.
+fn await_frame(
+    stream: &mut UnixStream,
+    buf: &mut MuxFrameBuffer,
+    timeout: std::time::Duration,
+    want: MuxTag,
+) -> Result<MuxFrame> {
+    use std::io::Read;
+    stream.set_read_timeout(Some(timeout))?;
+    loop {
+        while let Some(frame) = buf.next()? {
+            if frame.tag == want {
+                return Ok(frame);
+            }
+        }
+        let mut tmp = [0u8; 256];
+        match stream.read(&mut tmp) {
+            Ok(0) => {
+                return Err(util::Error::Msg(format!(
+                    "mux endpoint closed while awaiting {want:?}"
+                )))
+            }
+            Ok(n) => buf.feed(&tmp[..n]),
+            Err(e) if e.kind() == std::io::ErrorKind::Interrupted => {}
+            Err(e) => return Err(util::Error::Msg(format!("mux {want:?} read: {e}"))),
+        }
+    }
+}
+
+/// Sends `MuxHello` and awaits the `MuxHelloAck`. Returns the frame buffer
+/// alongside the ack so a follow-up wait on the same stream (the ref ack)
+/// never loses bytes already read past the hello.
 fn hello_handshake(
     stream: &mut UnixStream,
     timeout: std::time::Duration,
-) -> Result<MuxHelloAck> {
-    use std::io::{Read, Write};
+) -> Result<(MuxFrameBuffer, MuxHelloAck)> {
+    use std::io::Write;
     let hello = MuxHello {
         pid: std::process::id(),
         stamp: MUX_PROTO_STAMP.to_string(),
     };
     stream.write_all(&encode_mux_frame(MuxTag::Hello, &hello.encode()))?;
-    stream.set_read_timeout(Some(timeout))?;
     let mut buf = MuxFrameBuffer::default();
-    loop {
-        while let Some(frame) = buf.next()? {
-            if frame.tag == MuxTag::HelloAck {
-                return MuxHelloAck::decode(&frame.payload)
-                    .ok_or_else(|| util::Error::from("malformed mux hello ack"));
-            }
-        }
-        let mut tmp = [0u8; 256];
-        match stream.read(&mut tmp) {
-            Ok(0) => return Err(util::Error::from("mux endpoint closed during hello")),
-            Ok(n) => buf.feed(&tmp[..n]),
-            Err(e) if e.kind() == std::io::ErrorKind::Interrupted => {}
-            Err(e) => return Err(util::Error::Msg(format!("mux hello read: {e}"))),
-        }
-    }
+    let frame = await_frame(stream, &mut buf, timeout, MuxTag::HelloAck)?;
+    let ack = MuxHelloAck::decode(&frame.payload)
+        .ok_or_else(|| util::Error::from("malformed mux hello ack"))?;
+    Ok((buf, ack))
 }
 
 /// The invocation-seam gate (M1 Task 4.3): decides who owns agent
@@ -1180,11 +1224,21 @@ pub fn apply_mux_gate(
     }
 }
 
-/// Sends the invocation's `MuxSessionRef` and wraps the connection: from
-/// here the open socket IS the ref.
-fn claim_ref(mut stream: UnixStream, ack: MuxHelloAck) -> Result<MuxHandle> {
+/// Sends the invocation's `MuxSessionRef` and BLOCKS (bounded, the hello
+/// machinery) for the daemon's `RefAck` before wrapping the connection: only
+/// a confirmed ref lets the caller surrender per-connection forwarding — a
+/// daemon that dies, hangs, or closes pre-ack is an `Err`, which
+/// [`apply_mux_gate`]'s fallback turns back into per-connection forwarding.
+/// From the ack on, the open socket IS the ref.
+fn claim_ref(
+    mut stream: UnixStream,
+    mut buf: MuxFrameBuffer,
+    ack: MuxHelloAck,
+    timeout: std::time::Duration,
+) -> Result<MuxHandle> {
     use std::io::Write;
     stream.write_all(&encode_mux_frame(MuxTag::SessionRef, b""))?;
+    await_frame(&mut stream, &mut buf, timeout, MuxTag::RefAck)?;
     Ok(MuxHandle {
         _conn: stream,
         state: ack.state,
@@ -1264,13 +1318,18 @@ mod tests {
     }
 
     #[test]
-    fn zero_linger_exits_immediately_on_unref() {
+    fn zero_linger_exits_immediately_on_unref_but_not_before_spawn_grace() {
         let mut st = MuxState::new(0, 7);
-        assert!(st.should_exit(7), "unreferenced at spawn with no linger");
+        // POSH_MUX_PERSIST=0 must not exit the daemon before its spawner's
+        // first ref can land: construction arms the spawn grace, and the
+        // zero linger governs only the post-unref window.
+        assert!(!st.should_exit(7), "the spawn grace outlives a zero linger");
+        assert!(!st.should_exit(7 + SPAWN_GRACE_MS - 1));
+        assert!(st.should_exit(7 + SPAWN_GRACE_MS), "an orphan still exits");
         st.add_ref();
         assert!(!st.should_exit(u64::MAX));
         st.unref(42);
-        assert!(st.should_exit(42), "POSH_MUX_PERSIST=0: no linger window at all");
+        assert!(st.should_exit(42), "POSH_MUX_PERSIST=0: no linger after unref");
     }
 
     #[test]
@@ -1443,16 +1502,28 @@ mod tests {
         assert_eq!(ack.key, "example.com-4");
         assert!(!state.serviceable(), "hello alone holds no ref");
 
-        // SessionRef -> serviceable; a duplicate on the same conn is one ref.
+        // SessionRef -> serviceable, confirmed by a RefAck. One exchange per
+        // step (read_client_frame buffers per call, so coalesced replies
+        // would be lost across calls).
         client
             .write_all(&encode_mux_frame(MuxTag::SessionRef, b""))
             .unwrap();
+        assert!(process_ipc_conn(&mut conn, &mut state, &ctx));
+        assert_eq!(state.refs(), 1);
+        assert!(state.serviceable());
+        assert_eq!(read_client_frame(&mut client).tag, MuxTag::RefAck);
+        // A duplicate on the same conn stays one ref — and is RE-acked, so a
+        // waiting client can never hang on an idempotent ref.
         client
             .write_all(&encode_mux_frame(MuxTag::SessionRef, b""))
             .unwrap();
         assert!(process_ipc_conn(&mut conn, &mut state, &ctx));
         assert_eq!(state.refs(), 1, "one accepted conn = at most one ref");
-        assert!(state.serviceable());
+        assert_eq!(
+            read_client_frame(&mut client).tag,
+            MuxTag::RefAck,
+            "a duplicate SessionRef is re-acked"
+        );
 
         // Status -> a one-line summary with the live counters.
         client
@@ -1639,9 +1710,10 @@ mod tests {
             "an unreferenced mux must never service an agent request: {got:?}"
         );
 
-        // Ref, then wait for the loop to confirm it via MuxStatus.
+        // Ref; the daemon confirms registration with a RefAck.
         ipc.write_all(&encode_mux_frame(MuxTag::SessionRef, b""))
             .unwrap();
+        assert_eq!(read_client_frame(&mut ipc).tag, MuxTag::RefAck);
         let deadline = util::now_ms() + 8_000;
         loop {
             ipc.write_all(&encode_mux_frame(MuxTag::Status, b"")).unwrap();
@@ -1997,6 +2069,99 @@ mod tests {
         drop(obs);
         let (daemon, _server) = hold.take().unwrap();
         daemon.join().unwrap();
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    #[test]
+    fn zero_linger_daemon_accepts_the_first_ref_within_spawn_grace() {
+        // POSH_MUX_PERSIST=0: the daemon must not exit before the spawner's
+        // first ref can land — construction arms the spawn grace, not the
+        // (zero) linger — and the ref is CONFIRMED (RefAck), not
+        // fire-and-forgotten. The full connect+hello+ref ladder runs against
+        // the REAL mux_loop; the unref then exits with no linger at all.
+        let dir = temp_base();
+        let mut hold = None;
+        let mut spawn = |k: &str| {
+            hold = Some(start_inprocess_daemon(&dir, k, 0, (63490, 63499)));
+            Ok(MuxSpawn::Spawned)
+        };
+        let handle =
+            ensure_mux_conn(&dir, "zero", &mut spawn, std::time::Duration::from_secs(8))
+                .expect("a zero-linger daemon must accept its first ref");
+        assert_eq!(handle.key(), "zero");
+        assert_eq!(handle.state(), MuxConnState::Connected);
+        // Dropping the only ref exits immediately: linger 0 governs the
+        // post-unref window (the spawn grace does not extend it).
+        drop(handle);
+        let (daemon, _server) = hold.take().unwrap();
+        daemon.join().unwrap();
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    /// A fake endpoint that completes the hello and then closes WITHOUT
+    /// acking the session ref — the daemon-died-pre-ack seam.
+    fn fake_endpoint_closing_before_ref_ack(dir: &Path, key: &str) -> std::thread::JoinHandle<()> {
+        use std::io::Write;
+        let listener = UnixListener::bind(mux_socket_path_in(dir, key)).unwrap();
+        let key = key.to_string();
+        std::thread::spawn(move || {
+            let (mut s, _) = listener.accept().unwrap();
+            s.set_read_timeout(Some(std::time::Duration::from_secs(8))).unwrap();
+            let frame = read_client_frame(&mut s);
+            assert_eq!(frame.tag, MuxTag::Hello);
+            let ack = MuxHelloAck {
+                state: MuxConnState::Connected,
+                stamp: MUX_PROTO_STAMP.to_string(),
+                key,
+            };
+            s.write_all(&encode_mux_frame(MuxTag::HelloAck, &ack.encode())).unwrap();
+            // Consume the SessionRef so the client's write SUCCEEDS (the
+            // fire-and-forget trap), then exit without acking: the conn
+            // closes with the ref unconfirmed.
+            let frame = read_client_frame(&mut s);
+            assert_eq!(frame.tag, MuxTag::SessionRef);
+        })
+    }
+
+    #[test]
+    fn unacked_session_ref_is_an_error_not_a_silent_success() {
+        // The load-bearing finding-1 fix: claim_ref waits for the daemon's
+        // RefAck; a daemon that dies between HelloAck and registering the
+        // ref must yield Err — the signal apply_mux_gate's fallback keys on
+        // — never a handle whose forwarding silently went nowhere.
+        let dir = temp_base();
+        let fake = fake_endpoint_closing_before_ref_ack(&dir, "dying");
+        let mut spawn =
+            |_: &str| -> Result<MuxSpawn> { panic!("socket exists; no spawn expected") };
+        let got = ensure_mux_conn(&dir, "dying", &mut spawn, std::time::Duration::from_secs(2));
+        assert!(
+            got.is_err(),
+            "an unconfirmed session ref must be an Err, not a silent handle"
+        );
+        fake.join().unwrap();
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    #[test]
+    fn mux_gate_keeps_the_source_when_the_ref_is_never_acked() {
+        // End-to-end through the real seam: the ensure failure from an
+        // unacked ref reaches apply_mux_gate, whose fallback keeps the
+        // per-connection agent source — forwarding is never silently lost.
+        let dir = temp_base();
+        let fake = fake_endpoint_closing_before_ref_ack(&dir, "gated");
+        let source = PathBuf::from("/run/user/1000/agent.sock");
+        let (agent_source, handle) = apply_mux_gate(true, Some(source.clone()), |_| {
+            let mut spawn =
+                |_: &str| -> Result<MuxSpawn> { panic!("socket exists; no spawn expected") };
+            ensure_mux_conn(&dir, "gated", &mut spawn, std::time::Duration::from_secs(2))
+        });
+        assert_eq!(
+            agent_source,
+            Some(source),
+            "the fallback must keep the per-connection source on an unacked ref"
+        );
+        assert!(handle.is_none());
+        fake.join().unwrap();
         std::fs::remove_dir_all(&dir).ok();
     }
 

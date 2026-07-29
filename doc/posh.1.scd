@@ -300,11 +300,14 @@ _POSH_CLIENT_ID_
 
 _POSH_MUX_PERSIST_
 	Seconds the mux endpoint's connection lingers after the last local
-	invocation for its destination exits (default *60*; *0* = no
-	linger, exit immediately). Seconds, like the other timeout knobs
+	invocation for its destination exits (default *60*; *0* = exit
+	immediately when the last invocation ends, with no linger at all).
+	Seconds, like the other timeout knobs
 	(_POSH_SERVER_NETWORK_TMOUT_). Agent service is off while
 	lingering — the linger keeps only the connection warm for the next
-	invocation.
+	invocation. The value governs only that post-invocation window: a
+	freshly spawned endpoint always waits a short spawn grace for its
+	first invocation to register, even at *0*.
 
 _POSH_AGENT_NOTICE_
 	When agent forwarding is active, a rate-limited banner (at most one
