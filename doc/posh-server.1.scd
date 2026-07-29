@@ -10,6 +10,8 @@ posh-server - remote endpoint of a posh roaming session
 
 *posh server* [*new*] [*-p* _PORT_[*:*_PORT2_]] [*-4*|*-6*] [*-A*] [*--channels*] [*--* _command_...]
 
+*posh-server* [*-p* _PORT_[*:*_PORT2_]] [*-4*|*-6*] *agent* *--client-id* _ID_ [*--channels*]
+
 # DESCRIPTION
 
 *posh-server* is the host-side half of a posh roaming connection (the
@@ -60,6 +62,28 @@ non-interactive PATH.
 *--* _command_...
 	Run _command_ in the PTY instead of the default _$SHELL_.
 	Everything after *--* is the command and its arguments.
+
+*agent* *--client-id* _ID_
+	Run the agent-only mux remote (FDR 0014): no PTY, no shell, no
+	session. The server prints the same connect handshake, detaches,
+	binds the per-client-host socket _<base>/agent/mux-<ID>.sock_
+	(recording its pid beside it), participates in the _agent/sock_
+	election as a full sibling of the per-connection endpoints, and
+	serves forwarded-agent connections as RFC 0011 *agent* channels
+	over the enveloped transport. Bootstrapped by the *posh*(1)
+	per-destination mux daemon (one per destination, behind the
+	client's _$POSH_MUX_); not normally typed by hand. Flags precede
+	the verb, like *new*. It exits after a minute of peer silence — an
+	agent-only connection with a never-returning peer has nothing left
+	to serve.
+
+	*--client-id* _ID_ is required: it is the client-host identity the
+	election reports and the socket is named after, restricted to
+	letters, digits, dot, underscore, and dash (the client sends its
+	sanitized hostname, or _$POSH_CLIENT_ID_). *--channels* is implied
+	— agent channels exist
+	only on the enveloped transport — and is tolerated on either side
+	of the verb so the client builds one uniform bootstrap tail.
 
 # HANDSHAKE
 

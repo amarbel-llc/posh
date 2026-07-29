@@ -274,8 +274,37 @@ _POSH_CHANNELS_
 	invokes the remote server with *--channels*, and the session stream
 	and forwarded agent connections ride multiplexed channels on one
 	sealed datagram flow. Default off; the baseline wire is unchanged
-	without it. Experimental until the per-destination connection mux
-	lands.
+	without it. Experimental; the per-destination connection mux built
+	on it is available behind _POSH_MUX_.
+
+_POSH_MUX_
+	Opt in to the per-destination mux endpoint for agent forwarding
+	(*1*, *true*, *on*, or *yes* — the same truthy set as
+	_POSH_CHANNELS_). One local daemon per destination then owns a
+	single agent-only RFC 0011 connection (bootstrapping
+	*posh-server agent* on the remote), and sessions connect with their
+	own forwarding off — so the remote _agent/sock_ has exactly one
+	owner per client host by construction (FDR 0014) instead of an
+	election among connections. Default off until promotion; without it
+	every connection forwards independently, exactly as before. If the
+	endpoint cannot be reached or spawned, the invocation warns once and
+	falls back to per-connection forwarding.
+
+_POSH_CLIENT_ID_
+	Override the client-host identity the mux endpoint reports to the
+	remote (default: the local hostname). The id names the remote
+	per-client-host socket _agent/mux-<id>.sock_ and is what the
+	FDR 0014 election ranks, so set it when two client machines share a
+	hostname. Sanitized before use: letters, digits, dot, underscore,
+	and dash pass through; any other byte becomes a dash.
+
+_POSH_MUX_PERSIST_
+	Seconds the mux endpoint's connection lingers after the last local
+	invocation for its destination exits (default *60*; *0* = no
+	linger, exit immediately). Seconds, like the other timeout knobs
+	(_POSH_SERVER_NETWORK_TMOUT_). Agent service is off while
+	lingering — the linger keeps only the connection warm for the next
+	invocation.
 
 _POSH_AGENT_NOTICE_
 	When agent forwarding is active, a rate-limited banner (at most one

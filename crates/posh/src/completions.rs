@@ -157,6 +157,11 @@ _posh_completions() {
     list|ls|l)
       COMPREPLY=($(compgen -W "--short --json -j" -- "$cur"))
       ;;
+    server)
+      # Server verbs: new (default, mosh-server parity), relay (RFC 0008
+      # single-model relay), agent (FDR 0014 agent-only mux remote).
+      COMPREPLY=($(compgen -W "new relay agent" -- "$cur"))
+      ;;
     ssh)
       COMPREPLY=($(compgen -W "$(_posh_ssh_hosts | tr '\n' ' ') $(posh tailnet 2>/dev/null | tr '\n' ' ')" -- "$cur"))
       ;;
@@ -231,6 +236,11 @@ const ZSH_COMPLETIONS: &str = r#"_posh() {
           ;;
         list|ls|l)
           _values 'options' '--short' '--json' '-j'
+          ;;
+        server)
+          # Server verbs: new (default), relay (RFC 0008), agent (FDR 0014
+          # agent-only mux remote).
+          _values 'server verb' 'new' 'relay' 'agent'
           ;;
         ssh)
           _posh_ssh_hosts
@@ -476,6 +486,10 @@ complete -c posh -n 'string match -q "*:*" -- (__posh_subcommand)' -l detach -d 
 
 complete -c posh -n "__fish_seen_subcommand_from completions" -a 'bash zsh fish' -d 'Shell'
 
+# Server verbs: new (default, mosh-server parity), relay (RFC 0008
+# single-model relay), agent (FDR 0014 agent-only mux remote).
+complete -c posh -n "__fish_seen_subcommand_from server" -a 'new relay agent' -d 'Server verb'
+
 complete -c posh -n "__fish_seen_subcommand_from list" -l short -d 'Short output'
 complete -c posh -n "__fish_seen_subcommand_from list" -l json -s j -d 'JSON output'
 complete -c posh -n "__fish_seen_subcommand_from history" -l vt -d 'VT escape stream output'
@@ -549,6 +563,27 @@ mod tests {
         }
         assert!(script.contains("complete -c posh"));
         assert!(!script.contains("zmx"));
+    }
+
+    #[test]
+    fn server_verbs_are_completed_including_the_agent_mux_remote() {
+        // The server verbs main.rs's cmd_server accepts — new (default),
+        // relay (RFC 0008), agent (the FDR 0014 agent-only mux remote,
+        // mux M1 Task 5) — are offered after `posh server` in every shell.
+        assert!(
+            Shell::Bash.script().contains(r#"compgen -W "new relay agent""#),
+            "bash must complete the server verbs"
+        );
+        assert!(
+            Shell::Zsh.script().contains("_values 'server verb' 'new' 'relay' 'agent'"),
+            "zsh must complete the server verbs"
+        );
+        assert!(
+            Shell::Fish
+                .script()
+                .contains(r#"__fish_seen_subcommand_from server" -a 'new relay agent'"#),
+            "fish must complete the server verbs"
+        );
     }
 
     #[test]
