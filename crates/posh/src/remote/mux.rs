@@ -1149,6 +1149,52 @@ fn hello_handshake(
     }
 }
 
+/// The invocation-seam gate (M1 Task 4.3): decides who owns agent
+/// forwarding for a remote invocation. Off, or with forwarding already
+/// resolved off, it is a pass-through — the construction sites see exactly
+/// what FDR 0004 resolution produced and no endpoint is touched. On, with a
+/// resolved source, `ensure` runs BEFORE the session bootstrap: success
+/// moves ownership to the endpoint (session `agent_source` becomes `None`,
+/// so `remote_command` carries no `-A` and no per-session `srv-<pid>`
+/// endpoint exists) and the returned handle must be held for the
+/// invocation's lifetime; ANY failure warns once and falls back to
+/// per-connection forwarding exactly as today — never strand the user
+/// agentless.
+#[allow(dead_code)] // consumed by the main.rs invocation seam (M1 Task 4, docs/plans/2026-07-28-mux-endpoint-m1-impl.md)
+pub fn apply_mux_gate(
+    selected: bool,
+    agent_source: Option<PathBuf>,
+    ensure: impl FnOnce(&Path) -> Result<MuxHandle>,
+) -> (Option<PathBuf>, Option<MuxHandle>) {
+    if !selected {
+        return (agent_source, None);
+    }
+    let Some(source) = agent_source else {
+        // Forwarding resolved off: nothing for the endpoint to own — the
+        // mux exists to carry agent forwarding, so no spawn at all.
+        return (None, None);
+    };
+    match ensure(&source) {
+        Ok(handle) => {
+            util::log_write(
+                "info",
+                &format!(
+                    "mux endpoint {} {}; session forwarding off",
+                    handle.key(),
+                    handle.state().label()
+                ),
+            );
+            (None, Some(handle))
+        }
+        Err(e) => {
+            eprintln!(
+                "posh: mux endpoint unavailable ({e}); falling back to per-connection agent forwarding"
+            );
+            (Some(source), None)
+        }
+    }
+}
+
 /// Sends the invocation's `MuxSessionRef` and wraps the connection: from
 /// here the open socket IS the ref.
 fn claim_ref(mut stream: UnixStream, ack: MuxHelloAck) -> Result<MuxHandle> {
@@ -1967,6 +2013,105 @@ mod tests {
         let (daemon, _server) = hold.take().unwrap();
         daemon.join().unwrap();
         std::fs::remove_dir_all(&dir).ok();
+    }
+
+    // --- The invocation-seam gate (M1 Task 4.3): forwarding ownership. ---
+
+    /// A MuxHandle over a dangling socketpair half, for gate tests that only
+    /// care about ownership plumbing, not a live daemon.
+    fn fake_handle() -> MuxHandle {
+        let (a, _b) = std::os::unix::net::UnixStream::pair().unwrap();
+        MuxHandle {
+            _conn: a,
+            state: MuxConnState::Connected,
+            key: "k".to_string(),
+        }
+    }
+
+    /// SshOptions around a gate outcome, for pinning the bootstrap bytes.
+    fn opts_with(agent_source: Option<PathBuf>) -> crate::remote::sshwrap::SshOptions {
+        crate::remote::sshwrap::SshOptions {
+            family: Family::Auto,
+            port_range: None,
+            agent_source,
+            real_ssh_agent_forward: None,
+            channels: false,
+        }
+    }
+
+    #[test]
+    fn mux_gate_off_keeps_the_bootstrap_byte_identical() {
+        // The plan's Rollback contract: POSH_MUX off ⇒ the construction
+        // sites see exactly what resolve_agent_source produced, no ensure
+        // call, no handle — and the bootstrap wire string is byte-identical
+        // to today's (`-A` rides when forwarding resolved on).
+        let source = PathBuf::from("/run/user/1000/agent.sock");
+        let (agent_source, handle) = apply_mux_gate(false, Some(source.clone()), |_| {
+            panic!("mux off must never ensure an endpoint")
+        });
+        assert!(handle.is_none());
+        assert_eq!(agent_source, Some(source));
+        let cmd =
+            crate::remote::sshwrap::remote_command(&opts_with(agent_source), &[], &[]);
+        assert_eq!(cmd, "posh-server new -A");
+        // And forwarding-off stays byte-identical too.
+        let (agent_source, handle) =
+            apply_mux_gate(false, None, |_| panic!("mux off must never ensure"));
+        assert!(handle.is_none());
+        assert_eq!(agent_source, None);
+        let cmd =
+            crate::remote::sshwrap::remote_command(&opts_with(agent_source), &[], &[]);
+        assert_eq!(cmd, "posh-server new");
+    }
+
+    #[test]
+    fn mux_gate_on_moves_forwarding_ownership_to_the_endpoint() {
+        // mux on + forwarding on: the endpoint owns forwarding — the session
+        // bootstrap runs with agent_source None (no `-A`, no per-session
+        // srv endpoint) and the handle is held for the invocation.
+        let source = PathBuf::from("/run/user/1000/agent.sock");
+        let seen = std::cell::RefCell::new(None);
+        let (agent_source, handle) = apply_mux_gate(true, Some(source.clone()), |s| {
+            *seen.borrow_mut() = Some(s.to_path_buf());
+            Ok(fake_handle())
+        });
+        assert_eq!(
+            seen.borrow().as_deref(),
+            Some(source.as_path()),
+            "the endpoint inherits the invocation's resolved agent source"
+        );
+        assert_eq!(agent_source, None, "session bootstrap forwards nothing");
+        assert!(handle.is_some(), "the ref is held for the invocation");
+        let cmd =
+            crate::remote::sshwrap::remote_command(&opts_with(agent_source), &[], &[]);
+        assert_eq!(cmd, "posh-server new", "no -A on the session bootstrap");
+    }
+
+    #[test]
+    fn mux_gate_with_forwarding_off_skips_the_endpoint_entirely() {
+        // mux on but forwarding resolved off: nothing for the endpoint to
+        // own — no spawn, no handle, bootstrap unchanged.
+        let (agent_source, handle) = apply_mux_gate(true, None, |_| {
+            panic!("no forwarding ⇒ no mux spawn at all")
+        });
+        assert_eq!(agent_source, None);
+        assert!(handle.is_none());
+    }
+
+    #[test]
+    fn mux_gate_failure_falls_back_to_per_connection_forwarding() {
+        // Failure posture: any ensure_mux failure warns and proceeds with
+        // per-connection forwarding exactly as today — never strand the
+        // user agentless.
+        let source = PathBuf::from("/run/user/1000/agent.sock");
+        let (agent_source, handle) = apply_mux_gate(true, Some(source.clone()), |_| {
+            Err(util::Error::from("endpoint exploded"))
+        });
+        assert_eq!(agent_source, Some(source), "fallback keeps the session's -A");
+        assert!(handle.is_none());
+        let cmd =
+            crate::remote::sshwrap::remote_command(&opts_with(agent_source), &[], &[]);
+        assert_eq!(cmd, "posh-server new -A");
     }
 
     #[test]
