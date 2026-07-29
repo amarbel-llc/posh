@@ -2358,6 +2358,72 @@ mod tests {
         std::fs::remove_dir_all(&base).ok();
     }
 
+    // RFC 0011 §8 / FDR 0014 (the two-client-host policy, ratified
+    // 2026-07-28): the same remote account reached from TWO client hosts is
+    // two mux-named endpoints with distinct client ids sharing one agent
+    // dir — and `agent/sock` resolves by the most-recently-active election
+    // on the #152 marker machinery. What makes this election tractable
+    // where the per-connection one was not (posh#136): participants are one
+    // per client host, deterministically named, and each endpoint knows its
+    // own peer's activity edges authoritatively. Same tick-driven
+    // virtual-time harness as
+    // `handoff_repoints_to_the_active_sibling_on_the_inactivity_edge`.
+    #[test]
+    fn two_mux_endpoints_elect_the_most_recently_active_client_host() {
+        let base = temp_base();
+        let agent_dir = base.join("agent");
+        // Two client hosts: "hosta" and "hostb". Both endpoints live in this
+        // process (one pid, two pidfiles); self-skip in the election is by
+        // marker-path identity, so they are full siblings to each other.
+        let mut a = AgentEndpoint::new_mux(&base, "hosta").unwrap();
+        let mut b = AgentEndpoint::new_mux(&base, "hostb").unwrap();
+        a.last_tick = 0;
+        b.last_tick = 0;
+        assert_eq!(
+            std::fs::read_link(agent_dir.join("sock")).unwrap().to_str().unwrap(),
+            "mux-hostb.sock",
+            "construction order seeds ownership (newest wins), as today"
+        );
+
+        // Warm-up: both hosts' peers active across two slow ticks — both
+        // per-client-host sockets bound, both markers fresh.
+        let mut t = 0;
+        while t < AGENT_SLOW_TICK_MS * 2 {
+            t += 100;
+            a.tick(true, t);
+            b.tick(true, t);
+        }
+        assert!(agent_dir.join("mux-hosta.active").exists());
+        assert!(agent_dir.join("mux-hostb.active").exists());
+
+        // The user walks away from host b: its endpoint sees the inactivity
+        // edge and hands `agent/sock` to the most recently active sibling —
+        // host a — atomically (never stale, never absent; the agent that
+        // answers is the one nearest the user's attention).
+        t += 100;
+        a.tick(true, t);
+        b.tick(false, t);
+        assert_eq!(
+            std::fs::read_link(agent_dir.join("sock")).unwrap().to_str().unwrap(),
+            "mux-hosta.sock",
+            "hostb inactive: the election repoints at the active hosta"
+        );
+
+        // And walks back to host b: hosta's edge returns the link.
+        t += 100;
+        b.tick(true, t);
+        a.tick(false, t);
+        assert_eq!(
+            std::fs::read_link(agent_dir.join("sock")).unwrap().to_str().unwrap(),
+            "mux-hostb.sock",
+            "hosta inactive: the election repoints back at hostb"
+        );
+
+        drop(b);
+        drop(a);
+        std::fs::remove_dir_all(&base).ok();
+    }
+
     // --- AgentClient (the local-agent proxy mirror) -----------------------
 
     /// A short path under /tmp for a fake-agent listener socket (SUN_LEN again).
