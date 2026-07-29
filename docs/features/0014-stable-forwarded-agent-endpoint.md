@@ -120,7 +120,11 @@ double-forked local daemon per destination key owns a single enveloped
 agent-only connection, per-invocation posh processes hold `MuxSessionRef`s
 over its IPC socket, and sessions bootstrap with their own forwarding off —
 so from one client host the remote `agent/sock` has exactly one owner by
-construction. The M1 serviceability policy RFC 0011 §5 delegated here is in
+construction. That holds once every local invocation for the destination
+opts in: with mixed `POSH_MUX` on/off invocations, the per-connection
+endpoints remain election siblings of the mux endpoint (M1 keeps
+`agent/sock` a symlink for exactly this interop), so single ownership is
+not yet structural. The M1 serviceability policy RFC 0011 §5 delegated here is in
 force: agent channels are serviced iff a local session ref is held
 (client-side enforcement — the side whose agent is exposed); unref-to-zero
 FAILs new opens and closes open channels; the connection lingers

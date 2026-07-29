@@ -283,12 +283,17 @@ _POSH_MUX_
 	_POSH_CHANNELS_). One local daemon per destination then owns a
 	single agent-only RFC 0011 connection (bootstrapping
 	*posh-server agent* on the remote), and sessions connect with their
-	own forwarding off — so the remote _agent/sock_ has exactly one
-	owner per client host by construction (FDR 0014) instead of an
-	election among connections. Default off until promotion; without it
-	every connection forwards independently, exactly as before. If the
-	endpoint cannot be reached or spawned, the invocation warns once and
-	falls back to per-connection forwarding.
+	own forwarding off. Once every local invocation for a destination
+	opts in, the remote _agent/sock_ has exactly one owner per client
+	host by construction (FDR 0014) instead of an election among
+	connections; with mixed usage — some invocations without
+	_POSH_MUX_ — the mux endpoint instead participates in the
+	_agent/sock_ election as a full sibling of the remaining
+	per-connection endpoints (see *posh-server*(1)). Default off until
+	promotion; without it every connection forwards independently,
+	exactly as before. If the endpoint cannot be reached or spawned,
+	the invocation warns once and falls back to per-connection
+	forwarding.
 
 _POSH_CLIENT_ID_
 	Override the client-host identity the mux endpoint reports to the
