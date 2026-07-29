@@ -2336,6 +2336,79 @@ mod tests {
         std::fs::remove_dir_all(&dir).ok();
     }
 
+    #[test]
+    fn ensure_mux_conn_concurrent_cold_start_races_to_one_daemon() {
+        use std::sync::atomic::{AtomicU32, Ordering};
+        use std::sync::{Arc, Barrier, Mutex};
+
+        // The M1 E2E's two invocations are sequential; this pins the
+        // genuinely CONCURRENT cold start — two invocations race on one
+        // absent socket through the real spawn path (bind_or_probe deciding
+        // the race exactly as run_daemon does, the winner running the real
+        // mux_loop in-process): exactly one daemon is born, BOTH racers come
+        // back with confirmed handles, and the endpoint holds both refs.
+        let dir = Arc::new(temp_base());
+        let spawned = Arc::new(AtomicU32::new(0));
+        let daemon_hold = Arc::new(Mutex::new(Vec::new()));
+        let barrier = Arc::new(Barrier::new(2));
+        let mut racers = Vec::new();
+        for _ in 0..2 {
+            let dir = Arc::clone(&dir);
+            let spawned = Arc::clone(&spawned);
+            let daemon_hold = Arc::clone(&daemon_hold);
+            let barrier = Arc::clone(&barrier);
+            racers.push(std::thread::spawn(move || {
+                let mut spawn = |k: &str| {
+                    // run_daemon's bind seam: the bind winner BECOMES the
+                    // daemon; a lost race defers to the live winner.
+                    match bind_or_probe(&mux_socket_path_in(&dir, k))? {
+                        MuxBind::ExistingDaemon => Ok(MuxSpawn::AlreadyRunning),
+                        MuxBind::Bound(listener) => {
+                            spawned.fetch_add(1, Ordering::SeqCst);
+                            let ukey = crate::remote::crypto::Key::random();
+                            let (server_conn, port) =
+                                Connection::server((63440, 63449), &ukey, Family::Inet).unwrap();
+                            let addr = format!("127.0.0.1:{port}").parse().unwrap();
+                            let conn = Connection::client(addr, &ukey).unwrap();
+                            let agent = dir.join("no-agent.sock");
+                            let k = k.to_string();
+                            let daemon = std::thread::spawn(move || {
+                                mux_loop(listener, conn, &agent, 1_000, &k)
+                            });
+                            daemon_hold.lock().unwrap().push((daemon, server_conn));
+                            Ok(MuxSpawn::Spawned)
+                        }
+                    }
+                };
+                barrier.wait();
+                ensure_mux_conn(
+                    &dir,
+                    "cold",
+                    &mut spawn,
+                    std::time::Duration::from_secs(8),
+                    &dir.join("no-agent.sock"),
+                )
+            }));
+        }
+        let handles: Vec<MuxHandle> = racers
+            .into_iter()
+            .map(|t| t.join().unwrap().expect("both racers get confirmed handles"))
+            .collect();
+        assert_eq!(spawned.load(Ordering::SeqCst), 1, "exactly one daemon is born");
+        let mut obs = ipc_observer(&mux_socket_path_in(&dir, "cold"));
+        wait_status_contains(&mut obs, "refs=2 ");
+        drop(handles);
+        drop(obs);
+        let (daemon, _server) = {
+            let mut holds = daemon_hold.lock().unwrap();
+            let pair = holds.pop().unwrap();
+            assert!(holds.is_empty(), "one daemon means one hold");
+            pair
+        };
+        daemon.join().unwrap();
+        std::fs::remove_dir_all(&*dir).ok();
+    }
+
     // --- The invocation-seam gate (M1 Task 4.3): forwarding ownership. ---
 
     /// A MuxHandle over a dangling socketpair half, for gate tests that only
@@ -2500,11 +2573,15 @@ mod tests {
     // connection, so from a single client host `agent/sock` has exactly one
     // owner BY CONSTRUCTION: a client departing is a local refcount decrement
     // the remote never even observes. The FDR 0014 bar this proves: with two
-    // concurrent forwarded invocations, a real `ssh-add -l` through the
-    // remote `agent/sock` succeeds; after one client is killed, the OTHER's
-    // forwarding keeps working with ZERO handoff window — every probe from
-    // the instant of departure succeeds (no SSH_AGENT_FAILURE, which would
-    // surface as a failed `ssh-add -l`), and the symlink target never changes.
+    // forwarded invocations SHARING the endpoint — sequential ensure calls,
+    // the common shape of a second invocation joining a live endpoint; the
+    // cold-start CONCURRENT race is pinned separately by
+    // `ensure_mux_conn_concurrent_cold_start_races_to_one_daemon` — a real
+    // `ssh-add -l` through the remote `agent/sock` succeeds; after one
+    // client is killed, the OTHER's forwarding keeps working with ZERO
+    // handoff window — every probe from the instant of departure succeeds
+    // (no SSH_AGENT_FAILURE, which would surface as a failed `ssh-add -l`),
+    // and the symlink target never changes.
     //
     // Real components, per the suite's layering (server.rs agent E2Es): a
     // real `ssh-agent` holding a real key behind the daemon's proxy; the REAL
@@ -2517,7 +2594,7 @@ mod tests {
     // from the hermetic sandbox; run with `just debug-agent-e2e`.
     #[test]
     #[ignore = "mux M1 E2E; needs the posh binary + ssh tooling; run with --ignored"]
-    fn agent_forward_mux_m1_two_invocations_one_owner_zero_handoff_window() {
+    fn agent_forward_mux_m1_two_sequential_invocations_one_owner_zero_handoff_window() {
         use std::io::BufRead;
         use std::process::{Command, Stdio};
 
@@ -2628,8 +2705,11 @@ mod tests {
             Ok(MuxSpawn::Spawned)
         };
 
-        // (4) TWO concurrent forwarded invocations — two session refs on the
-        // one endpoint through the real client half. One spawn only.
+        // (4) TWO forwarded invocations, ensured sequentially — the second
+        // joins the live endpoint (the common shape); two session refs on
+        // the one endpoint through the real client half. One spawn only.
+        // (The cold-start concurrent race is covered by
+        // `ensure_mux_conn_concurrent_cold_start_races_to_one_daemon`.)
         let timeout = std::time::Duration::from_secs(20);
         let invocation1 =
             ensure_mux_conn(&local_base, "m1dest", &mut spawn, timeout, &real_agent_sock)

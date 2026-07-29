@@ -2,7 +2,7 @@
 
 Status: M1 IMPLEMENTED 2026-07-29 (`remote/mux.rs` + the `posh-server agent`
 verb, behind the opt-in `POSH_MUX`; FDR 0014 promotion-criteria E2E green —
-`remote::mux::tests::agent_forward_mux_m1_two_invocations_one_owner_zero_handoff_window`).
+`remote::mux::tests::agent_forward_mux_m1_two_sequential_invocations_one_owner_zero_handoff_window`).
 M2 (session sharing) remains gated on posh#143/#144 as specified below.
 Previously: ACCEPTED 2026-07-28 (M1-first sequencing approved; open
 questions 1 and 2 resolved — `posh-server agent` subcommand, 60 s linger

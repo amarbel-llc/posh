@@ -524,7 +524,7 @@ mechanism is best designed against whatever handshake replaces it.
   opt-in `POSH_MUX` — the per-connection election remains the default until
   promotion, and M1 retains `agent/sock` as a symlink so mux and legacy
   endpoints elect as siblings): single-client-host sole ownership is proven by
-  `remote::mux::tests::agent_forward_mux_m1_two_invocations_one_owner_zero_handoff_window`
+  `remote::mux::tests::agent_forward_mux_m1_two_sequential_invocations_one_owner_zero_handoff_window`
   (the deterministically named mux socket is the sole owner, zero `srv-*`
   endpoints exist, the target never moves); no-takeover-from-a-live-peer by
   `remote::agent::tests::takeover_judges_mux_link_target_by_pidfile_liveness`;
@@ -538,8 +538,10 @@ mechanism is best designed against whatever handshake replaces it.
   `handoff_repoints_to_the_active_sibling_on_the_inactivity_edge` (asserting
   zero stale/absent time at the edge). That interim proof is NOT this bullet's
   bar. IMPLEMENTED (mux M1, under `POSH_MUX` only):
-  `remote::mux::tests::agent_forward_mux_m1_two_invocations_one_owner_zero_handoff_window`
-  (`just debug-agent-e2e`) kills one of two concurrent forwarded invocations
+  `remote::mux::tests::agent_forward_mux_m1_two_sequential_invocations_one_owner_zero_handoff_window`
+  (`just debug-agent-e2e`) kills one of two forwarded invocations sharing the
+  endpoint (ensured sequentially; the cold-start concurrent spawn race is
+  pinned by `remote::mux::tests::ensure_mux_conn_concurrent_cold_start_races_to_one_daemon`)
   and asserts every real `ssh-add -l` from the instant of departure succeeds
   with the symlink target unchanged — no reachable outage interval.
 - Cross-host flows (real sshd, real `ssh-agent`, roam) remain covered by `just

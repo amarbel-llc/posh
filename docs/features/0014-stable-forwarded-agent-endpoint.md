@@ -7,7 +7,7 @@ promotion-criteria: "MET 2026-07-29 for the original bar: the mux endpoint
   forwarded-agent endpoint — from one client host there is no per-connection
   symlink election, ownership is structural — and the posh#136
   reproduced-then-fixed E2E passes:
-  `remote::mux::tests::agent_forward_mux_m1_two_invocations_one_owner_zero_handoff_window`
+  `remote::mux::tests::agent_forward_mux_m1_two_sequential_invocations_one_owner_zero_handoff_window`
   (`just debug-agent-e2e`) proves a real `ssh-add -l` from the surviving
   invocation succeeds with zero handoff window after its sibling is killed,
   the symlink target never moving (`ssh-add -l` stands in for the `git push`,
