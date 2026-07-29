@@ -520,7 +520,16 @@ mechanism is best designed against whatever handshake replaces it.
   server, client, and relay encode sites.
 - Ownership (§7): a second endpoint MUST NOT take over a live peer's bound
   `agent/sock` (the §8 configuration), and a single endpoint binds it directly
-  with no symlink present.
+  with no symlink present. IMPLEMENTED (mux M1, satisfiable only under the
+  opt-in `POSH_MUX` — the per-connection election remains the default until
+  promotion, and M1 retains `agent/sock` as a symlink so mux and legacy
+  endpoints elect as siblings): single-client-host sole ownership is proven by
+  `remote::mux::tests::agent_forward_mux_m1_two_invocations_one_owner_zero_handoff_window`
+  (the deterministically named mux socket is the sole owner, zero `srv-*`
+  endpoints exist, the target never moves); no-takeover-from-a-live-peer by
+  `remote::agent::tests::takeover_judges_mux_link_target_by_pidfile_liveness`;
+  and the §8 two-client-host election (the FDR 0014 ratified policy) by
+  `remote::agent::tests::two_mux_endpoints_elect_the_most_recently_active_client_host`.
 - The posh#136 regression: with one connection per client host, the handoff
   outage MUST NOT be reachable — no interval exists in which `agent/sock` is
   absent or resolves to an endpoint that cannot serve. The measuring test was
@@ -528,7 +537,11 @@ mechanism is best designed against whatever handshake replaces it.
   the posh#152 interim repoint superseded it as
   `handoff_repoints_to_the_active_sibling_on_the_inactivity_edge` (asserting
   zero stale/absent time at the edge). That interim proof is NOT this bullet's
-  bar: the by-construction guarantee still awaits the mux endpoint.
+  bar. IMPLEMENTED (mux M1, under `POSH_MUX` only):
+  `remote::mux::tests::agent_forward_mux_m1_two_invocations_one_owner_zero_handoff_window`
+  (`just debug-agent-e2e`) kills one of two concurrent forwarded invocations
+  and asserts every real `ssh-add -l` from the instant of departure succeeds
+  with the symlink target unchanged — no reachable outage interval.
 - Cross-host flows (real sshd, real `ssh-agent`, roam) remain covered by `just
   debug-agent-e2e` and `docs/manual-testing.md`.
 

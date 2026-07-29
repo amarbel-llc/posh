@@ -161,9 +161,13 @@ the `eng-*(7)` manpages — read them with `man eng-versioning`,
   `agent` channel (`AgentChannelMux`, `remote/agent.rs`), retired cap ids
   6/7/8 never on the wire. Without the selector the wire is byte-identical
   baseline; `remote/channel.rs` (`seal_instruction`/`open_any_instruction`)
-  is the single mode gate. The FDR 0004 agent symlink election remains in
-  force in BOTH modes until the per-destination mux endpoint exists (RFC 0011
-  §7 conditional rule; design:
+  is the single mode gate. The per-destination mux endpoint (M1,
+  `remote/mux.rs` + `posh-server agent`) exists behind `POSH_MUX` (opt-in,
+  default off): one agent-only enveloped connection per destination owns
+  agent forwarding, sessions bootstrap with forwarding off, and remote
+  `agent/sock` ownership is structural from a single client host. The
+  FDR 0004 agent symlink election PERSISTS as the default (POSH_MUX unset)
+  until promotion (RFC 0011 §7 conditional rule; design:
   `docs/plans/2026-07-28-connection-mux-endpoint-design.md`).
 - **posh-term is pure state:** feed PTY bytes via `Terminal::process`, read
   the screen via `screen()`/`dump_vt()`/`dump_text()`, drain query replies

@@ -1,17 +1,24 @@
 ---
-status: proposed
+status: experimental
 date: 2026-07-08
-promotion-criteria: a working implementation of a connection-independent
-  forwarded-agent endpoint (no per-connection symlink election) exists, with the
-  posh#136 multi-connection starvation reproduced-then-fixed E2E — a `git push`
-  from an idle-owner's sibling connection succeeds with zero handoff window. The
-  interim refinements (already shipped: relinquish-on-inactive, then the posh#152
-  repoint-on-release that closed its measured 9.9 s window) are NOT this bar —
-  they are still an election among per-connection processes. The mechanism is
-  now settled: RFC 0011 (multiplexed datagram channels), under which one
-  connection per client-host pair makes single ownership structural. What remains
-  for this record is the RFC 0011 §8 policy question (two client hosts reaching
-  one remote account) and the §5 agent-channel lifetime bound.
+promotion-criteria: "MET 2026-07-29 for the original bar: the mux endpoint
+  (M1 of docs/plans/2026-07-28-connection-mux-endpoint-design.md,
+  `remote/mux.rs`, behind `POSH_MUX`) is a working connection-independent
+  forwarded-agent endpoint — from one client host there is no per-connection
+  symlink election, ownership is structural — and the posh#136
+  reproduced-then-fixed E2E passes:
+  `remote::mux::tests::agent_forward_mux_m1_two_invocations_one_owner_zero_handoff_window`
+  (`just debug-agent-e2e`) proves a real `ssh-add -l` from the surviving
+  invocation succeeds with zero handoff window after its sibling is killed,
+  the symlink target never moving (`ssh-add -l` stands in for the `git push`,
+  as throughout the agent E2E suite). Advanced to `experimental` on that
+  basis. The §8 two-client-host policy is ratified AND its mechanism landed
+  (mux-named per-client-host sockets + most-recently-active election —
+  `remote::agent::tests::two_mux_endpoints_elect_the_most_recently_active_client_host`).
+  The remaining bar for `stable`: promote `POSH_MUX` to default-on (until
+  then the per-connection election of FDR 0004 remains the default path and
+  posh#136's fix is opt-in), plus the §5 lifetime-bound consent surface for
+  any standing connection beyond the M1 session-ref policy."
 ---
 
 # Stable forwarded-agent endpoint
@@ -100,9 +107,28 @@ process model remains #54's job; nothing in RFC 0011 waits on it — though
 closing posh#136 waits on BOTH (RFC 0011 §7's conditional-adoption rule, added
 by the 2026-07-28 review). The wire increment itself — envelope, session
 channel, agent channels, behind `POSH_CHANNELS`/`--channels` — landed
-2026-07-28; what remains for this record is the mux endpoint (M1 of
+2026-07-28; the mux endpoint (M1 of
 `docs/plans/2026-07-28-connection-mux-endpoint-design.md`, approved M1-first
-2026-07-28) — the §8 policy below is ratified.
+2026-07-28) landed 2026-07-29 — the §8 policy below is ratified and its
+mechanism shipped with it.
+
+### M1 landed (2026-07-29), behind `POSH_MUX`
+
+The agent-only mux endpoint is implemented (`remote/mux.rs`; the remote half
+is the `posh-server agent` verb, `remote/server.rs::run_agent_only`): one
+double-forked local daemon per destination key owns a single enveloped
+agent-only connection, per-invocation posh processes hold `MuxSessionRef`s
+over its IPC socket, and sessions bootstrap with their own forwarding off —
+so from one client host the remote `agent/sock` has exactly one owner by
+construction. The M1 serviceability policy RFC 0011 §5 delegated here is in
+force: agent channels are serviced iff a local session ref is held
+(client-side enforcement — the side whose agent is exposed); unref-to-zero
+FAILs new opens and closes open channels; the connection lingers
+`POSH_MUX_PERSIST` seconds (default 60, 0 = none) with agent service off.
+Exposure is identical to today's. The promotion-criteria E2E passes (see
+frontmatter). `POSH_MUX` is opt-in and default-off until promotion: without
+it, invocations forward per-connection and the FDR 0004 election (with the
+posh#152 interim) remains exactly today's behavior.
 
 ### Decision (2026-07-28, RATIFIED): the two-client-host policy
 
@@ -144,9 +170,13 @@ to, per #103), and a broker process owning `agent/sock` (reintroduces the
 blast-radius and respawn machinery this record's option 2 died of, for no
 routing power the election lacks).
 
-Ratified 2026-07-28, closing the §8 question; the mechanism lands with the
-#54 mux endpoint (its design doc specifies the claim/release IPC), not with
-the wire increment.
+Ratified 2026-07-28, closing the §8 question; the mechanism landed with the
+M1 mux endpoint (2026-07-29): each `posh-server agent` binds its
+deterministic `agent/mux-<client-id>.sock` (+ a pid liveness record) and
+elects on the #152 marker machinery as a full sibling —
+`remote::agent::tests::two_mux_endpoints_elect_the_most_recently_active_client_host`
+pins the two-host election at the unit level. The explicit-preference
+override remains unimplemented (MAY).
 
 ## Limitations
 
@@ -164,9 +194,10 @@ the wire increment.
   measured handoff is now zero stale/absent time at the releasing endpoint's
   edge (residual: one `server_loop` poll wake). See
   `remote::agent::tests::handoff_repoints_to_the_active_sibling_on_the_inactivity_edge`.
-  The mechanism is explicitly throwaway once the mux endpoint (M1 of
-  `docs/plans/2026-07-28-connection-mux-endpoint-design.md`) makes ownership
-  structural.
+  The mechanism is explicitly throwaway once the mux endpoint makes ownership
+  structural — which it now does (M1, landed 2026-07-29), but only behind the
+  opt-in `POSH_MUX`; the interim election remains the DEFAULT path until the
+  gate is promoted, so it cannot be removed yet.
 - **Broker blast radius (option 2/3).** A single long-lived endpoint (broker or
   mux) that owns `agent/sock` becomes a shared failure point: if it dies, agent
   forwarding for every connection to that host drops until it is respawned —
@@ -182,10 +213,11 @@ the wire increment.
   answer is a policy question. RFC 0011 §8 specifies the safe behaviour (an
   endpoint MUST NOT take over a live peer's bound socket) and explicitly defers
   the policy here. The policy is DECIDED (the ratified 2026-07-28 decision
-  above): a most-recently-active election among mux endpoints on stable
-  per-client-host sockets — far more tractable than today's election, since a
-  mux endpoint's liveness is meaningful where a per-connection process's is
-  not. The mechanism lands with the mux endpoint.
+  above) and its mechanism LANDED with M1: a most-recently-active election
+  among mux endpoints on stable per-client-host sockets — far more tractable
+  than today's election, since a mux endpoint's liveness is meaningful where
+  a per-connection process's is not
+  (`remote::agent::tests::two_mux_endpoints_elect_the_most_recently_active_client_host`).
 - **The agent-channel lifetime bound is normative in RFC 0011 §5.** A
   connection with no open `session` channel does not service agent channels, so
   exposure is held to the union of session lifetimes — no worse than today,
@@ -203,7 +235,9 @@ the wire increment.
   this stabilizes; its "Forwarded once" section documents the symlink election
   and now the shipped active-owner refinement (option 1).
 - **posh#136** — the intermittent-drop bug this record's design closes; the
-  landed relinquish-on-inactive fix (option 1) is `Refs #136`, not a close.
+  landed relinquish-on-inactive fix (option 1) was `Refs #136`, not a close.
+  Closed by the M1 mux endpoint (2026-07-29) — opt-in via `POSH_MUX` until
+  promotion.
 - **RFC 0011** (`docs/rfcs/0011-multiplexed-datagram-channels.md`) — the wire
   contract this record's mechanism now rests on. §7 removes the symlink election
   and makes `agent/sock` a bound socket; §5 collapses agent forwarding onto mux
