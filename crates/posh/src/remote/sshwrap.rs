@@ -27,6 +27,13 @@ pub struct SshOptions {
     /// RFC 0011 §6 — selects the channel-envelope protocol on the remote
     /// invocation; default off until the mux endpoint exists.
     pub channels: bool,
+    /// Bound on the bootstrap ssh's TCP connect (`-o ConnectTimeout=<n>`).
+    /// `None` says nothing, leaving ssh's own default/config — the normal
+    /// session path, whose argv stays byte-identical to before this field.
+    /// The mux daemon sets it so a hung destination cannot wedge the SHARED
+    /// per-destination endpoint for every invocation behind it (a pre-mux
+    /// hang cost only its own invocation).
+    pub connect_timeout_secs: Option<u32>,
 }
 
 /// What the wrapped server reported on stdout.
@@ -207,6 +214,31 @@ fn forwarded_env_vars() -> Vec<(String, String)> {
 /// `channels: true`) without inheriting the foreground client that `run`
 /// chains into. The key is returned, never exported — only `run`'s
 /// foreground path uses the `POSH_KEY` env convention.
+/// The ssh argv ahead of the target — address family, real agent-forward
+/// pass-through, and the optional `-o ConnectTimeout=<n>` bound. The pure
+/// seam behind [`bootstrap`]'s process spawn, so tests pin the exact flag
+/// shape (present for the mux daemon's bounded bootstrap, absent — argv
+/// byte-identical — for the normal session path) without spawning ssh.
+/// `pub(crate)` so the mux module pins its own call shape against it.
+pub(crate) fn ssh_args(opts: &SshOptions) -> Vec<String> {
+    let mut args = Vec::new();
+    match opts.family {
+        Family::Inet => args.push("-4".to_string()),
+        Family::Inet6 => args.push("-6".to_string()),
+        Family::Auto => {}
+    }
+    match opts.real_ssh_agent_forward {
+        Some(true) => args.push("-A".to_string()),
+        Some(false) => args.push("-a".to_string()),
+        None => {}
+    }
+    if let Some(secs) = opts.connect_timeout_secs {
+        args.push("-o".to_string());
+        args.push(format!("ConnectTimeout={secs}"));
+    }
+    args
+}
+
 pub fn bootstrap(
     target: &str,
     remote_cmd: &[String],
@@ -215,24 +247,7 @@ pub fn bootstrap(
     let server_cmd = remote_command(opts, remote_cmd, &forwarded_env_vars());
 
     let mut ssh = Command::new("ssh");
-    match opts.family {
-        Family::Inet => {
-            ssh.arg("-4");
-        }
-        Family::Inet6 => {
-            ssh.arg("-6");
-        }
-        Family::Auto => {}
-    }
-    match opts.real_ssh_agent_forward {
-        Some(true) => {
-            ssh.arg("-A");
-        }
-        Some(false) => {
-            ssh.arg("-a");
-        }
-        None => {}
-    }
+    ssh.args(ssh_args(opts));
     let mut child = ssh
         .arg(target)
         .arg("--")
@@ -424,6 +439,7 @@ mod tests {
             agent_source: None,
             real_ssh_agent_forward: None,
             channels: false,
+            connect_timeout_secs: None,
         };
         // New contract (RFC 0008 §3): the caller owns the `--`; the legacy tail
         // leads with it, then the shell-quoted inner argv. Byte-identical output.
@@ -471,6 +487,7 @@ mod tests {
             agent_source: None,
             real_ssh_agent_forward: None,
             channels: false,
+            connect_timeout_secs: None,
         };
         let locale = vec![("LANG".to_string(), "en_US.UTF-8".to_string())];
         // The bare-host tail now carries its own leading `--` (caller-owned).
@@ -491,6 +508,7 @@ mod tests {
                 agent_source: None,
                 real_ssh_agent_forward: None,
                 channels: false,
+                connect_timeout_secs: None,
             },
             &[],
             &[],
@@ -511,6 +529,7 @@ mod tests {
             agent_source: None,
             real_ssh_agent_forward: None,
             channels: false,
+            connect_timeout_secs: None,
         };
         let tail: Vec<String> = ["relay", "-g", "grp", "dev", "--", "htop"]
             .iter()
@@ -531,6 +550,7 @@ mod tests {
             agent_source: None,
             real_ssh_agent_forward: None,
             channels: false,
+            connect_timeout_secs: None,
         };
         let tail: Vec<String> = ["relay", "dev"].iter().map(|s| s.to_string()).collect();
         assert_eq!(remote_command(&opts, &tail, &[]), "posh-server new 'relay' 'dev'");
@@ -546,6 +566,7 @@ mod tests {
             agent_source: Some("/run/user/1000/agent.sock".into()),
             real_ssh_agent_forward: None,
             channels: false,
+            connect_timeout_secs: None,
         };
         let tail: Vec<String> = ["relay", "-g", "grp", "dev"]
             .iter()
@@ -570,6 +591,7 @@ mod tests {
             agent_source: Some("/run/user/1000/agent.sock".into()),
             real_ssh_agent_forward: None,
             channels: false,
+            connect_timeout_secs: None,
         };
         let cmd = remote_command(&opts, &[], &[]);
         assert_eq!(cmd, "posh-server new -A -4 -p 60001:60999");
@@ -582,6 +604,7 @@ mod tests {
             agent_source: None,
             real_ssh_agent_forward: None,
             channels: false,
+            connect_timeout_secs: None,
         };
         assert_eq!(remote_command(&off, &[], &[]), "posh-server new");
     }
@@ -597,6 +620,7 @@ mod tests {
             agent_source: None,
             real_ssh_agent_forward: None,
             channels: true,
+            connect_timeout_secs: None,
         };
         let cmd = remote_command(&on, &[], &[]);
         assert!(cmd.contains(" --channels"), "flag missing: {cmd}");
@@ -608,9 +632,49 @@ mod tests {
             agent_source: None,
             real_ssh_agent_forward: None,
             channels: false,
+            connect_timeout_secs: None,
         };
         let cmd = remote_command(&off, &[], &[]);
         assert!(!cmd.contains("--channels"), "flag must be absent: {cmd}");
+    }
+
+    #[test]
+    fn ssh_argv_carries_connect_timeout_only_when_set() {
+        // The normal session path says nothing (None): the pre-target ssh
+        // argv stays byte-identical to before the field existed.
+        let session = SshOptions {
+            family: Family::Auto,
+            port_range: None,
+            agent_source: None,
+            real_ssh_agent_forward: None,
+            channels: false,
+            connect_timeout_secs: None,
+        };
+        assert_eq!(ssh_args(&session), Vec::<String>::new());
+
+        // The mux daemon's bounded bootstrap: `-o ConnectTimeout=<n>` rides
+        // after the family/agent flags, so a hung destination cannot wedge
+        // the shared endpoint indefinitely.
+        let mux = SshOptions {
+            family: Family::Inet,
+            port_range: None,
+            agent_source: None,
+            real_ssh_agent_forward: None,
+            channels: true,
+            connect_timeout_secs: Some(10),
+        };
+        assert_eq!(ssh_args(&mux), vec!["-4", "-o", "ConnectTimeout=10"]);
+
+        // Family/agent flags are untouched by the timeout being unset.
+        let flags_only = SshOptions {
+            family: Family::Inet6,
+            port_range: None,
+            agent_source: None,
+            real_ssh_agent_forward: Some(true),
+            channels: false,
+            connect_timeout_secs: None,
+        };
+        assert_eq!(ssh_args(&flags_only), vec!["-6", "-A"]);
     }
 
     #[test]
@@ -663,6 +727,7 @@ mod tests {
             agent_source: None,
             real_ssh_agent_forward: None,
             channels: false,
+            connect_timeout_secs: None,
         };
         let env = vec![
             ("TERM".to_string(), "xterm-kitty".to_string()),

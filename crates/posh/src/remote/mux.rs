@@ -652,6 +652,31 @@ fn bind_or_probe(path: &Path) -> Result<MuxBind> {
         .map_err(|e| util::Error::Msg(format!("bind {}: {e}", path.display())))
 }
 
+/// Bound on the mux daemon's bootstrap ssh TCP connect. The daemon is
+/// SHARED per destination, so a hung ssh here would gate every invocation
+/// behind it for the hang's duration (pre-M1 a hang cost only its own
+/// invocation); on the resulting bootstrap error the daemon exits and
+/// unlinks its socket, so the next invocation's bind reclaims the key.
+const MUX_BOOTSTRAP_CONNECT_TIMEOUT_SECS: u32 = 10;
+
+/// The mux daemon's bootstrap [`SshOptions`](crate::remote::sshwrap::SshOptions):
+/// no `-A` (the agent verb IS forwarding), channels on (RFC 0011 §5 agent
+/// channels exist only enveloped), and the bounded ssh ConnectTimeout —
+/// factored from [`run_daemon`] so the call shape is pinned by test.
+fn mux_ssh_options(
+    family: Family,
+    port_range: Option<String>,
+) -> crate::remote::sshwrap::SshOptions {
+    crate::remote::sshwrap::SshOptions {
+        family,
+        port_range,
+        agent_source: None, // the agent verb IS forwarding; no -A
+        real_ssh_agent_forward: None,
+        channels: true, // RFC 0011 §6: selected on the bootstrap invocation
+        connect_timeout_secs: Some(MUX_BOOTSTRAP_CONNECT_TIMEOUT_SECS),
+    }
+}
+
 /// Ensure the mux daemon for `key` toward ssh destination `dest`
 /// (`[user@]host`, what [`sshwrap::run`](crate::remote::sshwrap::run) takes).
 /// Binds `mux/<key>.sock` (losing a race defers to the live winner; a stale
@@ -694,13 +719,7 @@ pub fn run_daemon(
     util::install_daemon_signal_handlers();
 
     let result = (|| -> Result<()> {
-        let opts = crate::remote::sshwrap::SshOptions {
-            family,
-            port_range,
-            agent_source: None, // the agent verb IS forwarding; no -A
-            real_ssh_agent_forward: None,
-            channels: true, // RFC 0011 §6: selected on the bootstrap invocation
-        };
+        let opts = mux_ssh_options(family, port_range);
         let tail = vec![
             "agent".to_string(),
             "--client-id".to_string(),
@@ -2186,7 +2205,28 @@ mod tests {
             agent_source,
             real_ssh_agent_forward: None,
             channels: false,
+            connect_timeout_secs: None,
         }
+    }
+
+    #[test]
+    fn mux_bootstrap_ssh_argv_is_bounded_by_connect_timeout() {
+        // The daemon's ssh bootstrap call shape: a hung destination must not
+        // wedge the SHARED endpoint indefinitely, so the mux options carry
+        // the bounded ConnectTimeout — pinned at the argv seam.
+        let opts = mux_ssh_options(Family::Auto, None);
+        assert_eq!(
+            crate::remote::sshwrap::ssh_args(&opts),
+            vec!["-o", "ConnectTimeout=10"]
+        );
+        // Family still rides ahead of the timeout, as in the session path.
+        let opts = mux_ssh_options(Family::Inet, Some("60000:61000".to_string()));
+        assert_eq!(
+            crate::remote::sshwrap::ssh_args(&opts),
+            vec!["-4", "-o", "ConnectTimeout=10"]
+        );
+        assert!(opts.channels, "agent channels exist only enveloped");
+        assert_eq!(opts.agent_source, None, "the agent verb IS forwarding; no -A");
     }
 
     #[test]

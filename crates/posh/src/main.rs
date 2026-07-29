@@ -501,6 +501,7 @@ fn cmd_ssh_session(
             agent_source: None,
             real_ssh_agent_forward: None,
             channels: remote::sshwrap::channels_selected(),
+            connect_timeout_secs: None,
         };
         return remote::sshwrap::run_detached(&dest, &inner, &opts);
     }
@@ -523,6 +524,7 @@ fn cmd_ssh_session(
         agent_source,
         real_ssh_agent_forward: None,
         channels: remote::sshwrap::channels_selected(),
+        connect_timeout_secs: None,
     };
     // Bootstrap selection (RFC 0008 §3): the single-model relay by default;
     // `POSH_RELAY=0` forces the legacy Architecture-A inner-`posh attach`
@@ -802,6 +804,7 @@ fn cmd_ssh(args: &[String], forward: Option<&remote::agent::ForwardFlag>) -> Res
         agent_source,
         real_ssh_agent_forward: Some(resolve_real_ssh_agent_forward(real_ssh_agent_forward)),
         channels: remote::sshwrap::channels_selected(),
+        connect_timeout_secs: None,
     };
     // The server tail is caller-owned now (RFC 0008 §3): a bare host runs
     // `posh-server new [flags]` with `-- command...` only when a command was
