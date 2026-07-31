@@ -658,10 +658,19 @@ enum MuxBind {
 fn bind_or_probe(path: &Path) -> Result<MuxBind> {
     match UnixListener::bind(path) {
         Ok(l) => return Ok(MuxBind::Bound(l)),
-        Err(e) if e.kind() == std::io::ErrorKind::AddrInUse => {}
+        // "a node is already at this path — probe it." Linux reports EADDRINUSE
+        // (AddrInUse); macOS reports EEXIST (AlreadyExists) when a concurrent
+        // bind to the same path just won the race — the cold-start loser. Both
+        // must route into the live-daemon-defer / dead-socket-reclaim logic
+        // below, not the hard-error arm.
+        Err(e)
+            if matches!(
+                e.kind(),
+                std::io::ErrorKind::AddrInUse | std::io::ErrorKind::AlreadyExists
+            ) => {}
         Err(e) => return Err(util::Error::Msg(format!("bind {}: {e}", path.display()))),
     }
-    if !crate::session::socket_is_dead(path) {
+    if socket_becomes_live(path) {
         return Ok(MuxBind::ExistingDaemon);
     }
     util::log_write(
@@ -672,6 +681,24 @@ fn bind_or_probe(path: &Path) -> Result<MuxBind> {
     UnixListener::bind(path)
         .map(MuxBind::Bound)
         .map_err(|e| util::Error::Msg(format!("bind {}: {e}", path.display())))
+}
+
+/// Bounded liveness probe for a contended socket path. Returns `true` as soon
+/// as a connect succeeds (a live winner — reclaim would clobber it), and
+/// `false` only after the socket stays unconnectable across every attempt (a
+/// genuine crash leftover — safe to reclaim). The retry closes the concurrent
+/// cold-start window where a winner has bound but the loser probed a beat too
+/// early. See [`PROBE_ATTEMPTS`].
+fn socket_becomes_live(path: &Path) -> bool {
+    for i in 0..PROBE_ATTEMPTS {
+        if !crate::session::socket_is_dead(path) {
+            return true;
+        }
+        if i + 1 < PROBE_ATTEMPTS {
+            std::thread::sleep(PROBE_RETRY_DELAY);
+        }
+    }
+    false
 }
 
 /// Bound on the mux daemon's bootstrap ssh TCP connect. The daemon is
@@ -1017,6 +1044,17 @@ const HELLO_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(30);
 /// beat away from `bind`, or has just reclaimed a stale socket.
 const CONNECT_ATTEMPTS: u32 = 20;
 const CONNECT_RETRY_DELAY: std::time::Duration = std::time::Duration::from_millis(25);
+
+/// [`bind_or_probe`]'s bounded liveness retry for a CONTENDED socket: a
+/// cold-start loser that finds a node already at the path retries the connect
+/// probe before concluding the socket is dead. A live winner (bound, so
+/// connectable via the listen backlog even before it reaches `accept`) answers
+/// within a beat; a genuine crash leftover never does. This closes the
+/// concurrent cold-start window where the loser would otherwise clobber the
+/// winner's socket and spawn a duplicate daemon. The budget (~50ms worst case)
+/// stays well under the loser's own post-spawn `CONNECT_ATTEMPTS` backoff.
+const PROBE_ATTEMPTS: u32 = 10;
+const PROBE_RETRY_DELAY: std::time::Duration = std::time::Duration::from_millis(5);
 
 /// The client's live claim on a mux endpoint: holds the IPC connection
 /// carrying this invocation's `MuxSessionRef` open for the invocation's
