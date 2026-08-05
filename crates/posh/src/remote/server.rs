@@ -579,23 +579,38 @@ fn handle_session_instruction(
     let idx = channels.iter().position(|c| c.chan() == chan);
     match message.first() {
         Some(&SESSION_WIRE_OPEN) => {
-            if idx.is_some() {
-                return; // §3.3: a duplicate OPEN is a retransmission
-            }
-            if channels.len() >= MAX_SESSION_CHANNELS {
-                send_session_wire(
-                    conn,
-                    fragmenter,
+            if idx.is_none() {
+                if channels.len() >= MAX_SESSION_CHANNELS {
+                    send_session_wire(
+                        conn,
+                        fragmenter,
+                        chan,
+                        SESSION_WIRE_CLOSE,
+                        b"session channel table full",
+                    );
+                    return;
+                }
+                channels.push(PeerChannel::Awaiting {
                     chan,
-                    SESSION_WIRE_CLOSE,
-                    b"session channel table full",
-                );
-                return;
+                    target: String::from_utf8_lossy(&message[1..]).into_owned(),
+                });
             }
-            channels.push(PeerChannel::Awaiting {
-                chan,
-                target: String::from_utf8_lossy(&message[1..]).into_owned(),
-            });
+            // Confirm the open — for a fresh admit AND for §3.3 duplicate
+            // retransmissions (the first confirmation may have been lost):
+            // an Empty ServerFrame is the session kind's ack vehicle, and
+            // the opener stops retransmitting on the first instruction it
+            // hears on the identifier. Without this, the two ends deadlock
+            // — the local daemon queues messages until confirmed, and this
+            // peer has nothing to send until a message arrives.
+            let confirm = crate::remote::sync::ServerFrame {
+                flags: 0,
+                caps: caps::own_table(&[]),
+                frame_num: 0,
+                input_ack: 0,
+                echo_ack: 0,
+                body: crate::remote::sync::FrameBody::Empty,
+            };
+            send_session_wire(conn, fragmenter, chan, SESSION_WIRE_DATA, &confirm.encode());
         }
         Some(&SESSION_WIRE_DATA) => {
             let Some(i) = idx else {
@@ -3482,16 +3497,17 @@ mod tests {
             use std::io::Write;
             (&stream).write_all(&out).unwrap();
         }
-        // Two frames come back on the channel: FIRST the prompt Empty ack
-        // (the input arrived with no visible frame to carry its ack —
-        // relay.rs::send_empty's role, per channel), THEN the daemon's
-        // frame, rewrapped. Both carry the peer's cumulative input ack.
+        // Empty frames come back on the channel before any daemon frame:
+        // the OPEN confirmation (ack 0), then the prompt input ack (ack 2 —
+        // relay.rs::send_empty's role, per channel). Assert the prompt ack
+        // arrives with the daemon frame still unsent.
         let (_, m) = peer_recv_until(&mut wire, &mut asm, |c, m| {
-            c == chan && m.first() == Some(&crate::remote::mux::SESSION_WIRE_DATA)
+            c == chan
+                && m.first() == Some(&crate::remote::mux::SESSION_WIRE_DATA)
+                && sync::ServerFrame::decode(&m[1..])
+                    .is_ok_and(|f| f.frame_num == 0 && f.input_ack == 2)
         });
         let ack_frame = sync::ServerFrame::decode(&m[1..]).unwrap();
-        assert_eq!(ack_frame.frame_num, 0, "the prompt ack precedes any daemon frame");
-        assert_eq!(ack_frame.input_ack, 2, "the accepted input is acked promptly");
         assert!(matches!(ack_frame.body, sync::FrameBody::Empty));
         let (_, m) = peer_recv_until(&mut wire, &mut asm, |c, m| {
             c == chan

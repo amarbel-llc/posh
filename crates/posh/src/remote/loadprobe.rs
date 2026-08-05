@@ -17,9 +17,12 @@
 //! Modeling notes, deliberate and worth knowing when reading numbers:
 //!
 //!   * N sessions ride the single `SESSION_CHANNEL` with a session index in
-//!     the payload — M2's per-session channel ids don't exist yet, and the
-//!     §4.1 discipline under measurement (session instructions precede bulk
-//!     agent data in each drain) is per-SENDER, not per-channel.
+//!     the payload. M2's real per-session channels (ordinals >= 2, the
+//!     `mux_loop`/`mux_peer_loop` pair) have since landed; this model stays
+//!     because the §4.1 discipline under measurement (session instructions
+//!     precede bulk agent data in each drain) is per-SENDER, not
+//!     per-channel — pointing the probe at the production loops is a
+//!     recorded follow-up.
 //!   * Session frames and agent bulk both flow client→remote, sharing the
 //!     constrained uplink — the contended-drain configuration §9.3's
 //!     starvation question is about. Session frames are fire-and-forget

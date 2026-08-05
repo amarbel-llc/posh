@@ -3121,6 +3121,189 @@ mod tests {
         std::fs::remove_dir_all(&dir).ok();
     }
 
+    /// The M2 end-to-end, all four components REAL and in-process: two
+    /// `MuxSessionTransport`s → the mux daemon (`mux_loop`) → one loopback
+    /// AEAD-UDP connection → the channel-table peer (`mux_peer_loop`) →
+    /// per-channel fake daemons whose reply frames carry disjoint
+    /// frame-number ranges, so delivery AND isolation are asserted through
+    /// the whole chain. An agent round-trip rides the SAME connection
+    /// (agent bulk + sessions coexisting), and killing one transport leaves
+    /// the other fully live — the design doc's promotion-criteria shape,
+    /// minus only the real-binary/real-ssh-agent staging that promotion
+    /// itself will run.
+    #[test]
+    fn m2_two_transports_share_one_connection_and_survive_peer_loss() {
+        use std::io::{Read, Write};
+        use std::os::fd::AsRawFd as _;
+
+        const REQUEST: &[u8] = b"AGENT-REQUEST-PING";
+        const REPLY: &[u8] = b"AGENT-REPLY-PONG";
+
+        let local_base = temp_base();
+        let remote_base = temp_base();
+
+        // Fake local ssh-agent behind the mux daemon's proxy.
+        let agent_sock = local_base.join("fake-agent.sock");
+        let agent_listener = UnixListener::bind(&agent_sock).unwrap();
+        let agent_thread = std::thread::spawn(move || {
+            if let Ok((mut s, _)) = agent_listener.accept() {
+                let mut buf = vec![0u8; REQUEST.len()];
+                if s.read_exact(&mut buf).is_ok() {
+                    assert_eq!(buf, REQUEST);
+                    let _ = s.write_all(REPLY);
+                }
+            }
+        });
+
+        // The remote peer: real mux_peer_loop; each opened target gets a
+        // fake daemon thread that answers every Tag::Input with a frame in
+        // its own frame-number range (a=100+, b=200+).
+        let ukey = crate::remote::crypto::Key::random();
+        let (server_conn, port) = Connection::server((63650, 63659), &ukey, Family::Inet).unwrap();
+        let endpoint =
+            crate::remote::agent::AgentEndpoint::new_mux(&remote_base, "m2e2e").unwrap();
+        let well_known = endpoint.sock_path().to_path_buf();
+        let peer = std::thread::spawn(move || {
+            let mut connector = |target: &str| {
+                let (peer_side, daemon_side) = UnixStream::pair().unwrap();
+                peer_side.set_nonblocking(true).unwrap();
+                let base = if target.ends_with("/a") { 100u64 } else { 200u64 };
+                std::thread::spawn(move || {
+                    let mut buf = crate::session::ipc::FrameBuffer::new();
+                    let mut inputs = 0u64;
+                    daemon_side
+                        .set_read_timeout(Some(std::time::Duration::from_millis(50)))
+                        .ok();
+                    let deadline = util::now_ms() + 15_000;
+                    while util::now_ms() < deadline {
+                        let _ = buf.read_from(daemon_side.as_raw_fd());
+                        let mut wrote = false;
+                        while let Ok(Some(rec)) = buf.next() {
+                            match rec.tag {
+                                crate::session::ipc::Tag::Input => {
+                                    inputs += 1;
+                                    let frame = sync::ServerFrame {
+                                        flags: 0,
+                                        caps: crate::remote::caps::own_table(&[]),
+                                        frame_num: base + inputs,
+                                        input_ack: 0,
+                                        echo_ack: 0,
+                                        body: sync::FrameBody::Empty,
+                                    };
+                                    let mut out = Vec::new();
+                                    crate::session::ipc::append_frame(
+                                        &mut out,
+                                        crate::session::ipc::Tag::Frame,
+                                        &frame.encode(),
+                                    );
+                                    if (&daemon_side).write_all(&out).is_err() {
+                                        return;
+                                    }
+                                    wrote = true;
+                                }
+                                crate::session::ipc::Tag::Detach => return,
+                                _ => {}
+                            }
+                        }
+                        if !wrote {
+                            std::thread::sleep(std::time::Duration::from_millis(5));
+                        }
+                    }
+                });
+                Ok(peer_side)
+            };
+            crate::remote::server::mux_peer_loop(server_conn, endpoint, 6_000, &mut connector);
+        });
+
+        // The local mux daemon: real mux_loop over the loopback connection.
+        let dir = local_base.clone();
+        let listener = UnixListener::bind(mux_socket_path_in(&dir, "m2e2e")).unwrap();
+        let addr = format!("127.0.0.1:{port}").parse().unwrap();
+        let daemon_conn = Connection::client(addr, &ukey).unwrap();
+        let agent_path = agent_sock.clone();
+        let daemon = std::thread::spawn(move || {
+            mux_loop(listener, daemon_conn, &agent_path, 1_000, "m2e2e")
+        });
+
+        // Two invocations through the real client half.
+        let mut spawn = |_: &str| -> Result<MuxSpawn> { panic!("daemon is live") };
+        let timeout = std::time::Duration::from_secs(10);
+        let h_a = ensure_mux_conn(&dir, "m2e2e", &mut spawn, timeout, &agent_sock).unwrap();
+        let mut t_a = h_a.open_session("default/a").unwrap();
+        let h_b = ensure_mux_conn(&dir, "m2e2e", &mut spawn, timeout, &agent_sock).unwrap();
+        let mut t_b = h_b.open_session("default/b").unwrap();
+
+        let msg = |input: &[u8], acked: u64| {
+            sync::ClientMessage {
+                flags: 0,
+                caps: crate::remote::caps::own_table(&[]),
+                acked_frame: acked,
+                rows: 24,
+                cols: 80,
+                input_base: 0,
+                input: input.to_vec(),
+            }
+            .encode()
+        };
+        // Skips confirmation/ack empties (frame_num 0) and held-frame
+        // retransmissions below `min` — cumulative acks make re-sends of an
+        // already-seen number legal, never a test signal.
+        let next_frame = |t: &mut MuxSessionTransport, min: u64| -> sync::ServerFrame {
+            let deadline = util::now_ms() + 10_000;
+            loop {
+                assert!(util::now_ms() < deadline, "frame never arrived");
+                match t.next_event() {
+                    Some(MuxSessionEvent::Frame(b)) => {
+                        let f = sync::ServerFrame::decode(&b).unwrap();
+                        if f.frame_num >= min {
+                            return f;
+                        }
+                    }
+                    Some(MuxSessionEvent::Closed(p)) => {
+                        panic!("channel closed unexpectedly: {p:?}")
+                    }
+                    None => std::thread::sleep(std::time::Duration::from_millis(5)),
+                }
+            }
+        };
+
+        t_a.send_msg(&msg(b"ping-a", 0));
+        t_b.send_msg(&msg(b"ping-b", 0));
+        let f_a = next_frame(&mut t_a, 1);
+        let f_b = next_frame(&mut t_b, 1);
+        assert_eq!(f_a.frame_num, 101, "A's frame from A's daemon, nothing else");
+        assert_eq!(f_b.frame_num, 201, "B's frame from B's daemon, nothing else");
+
+        // Agent bulk on the SAME connection: consumer → remote endpoint →
+        // agent channel → mux daemon's proxy → fake local agent → back.
+        let mut served = UnixStream::connect(&well_known).unwrap();
+        served
+            .set_read_timeout(Some(std::time::Duration::from_secs(8)))
+            .unwrap();
+        served.write_all(REQUEST).unwrap();
+        let mut reply = vec![0u8; REPLY.len()];
+        served
+            .read_exact(&mut reply)
+            .expect("agent service rides the shared connection");
+        assert_eq!(reply, REPLY);
+
+        // Kill A: B is untouched — another round-trip proves it. The message
+        // acks 201 so the peer releases its held frame instead of
+        // retransmitting it over the fresh one.
+        drop(t_a);
+        t_b.send_msg(&msg(b"ping-b-again", 201));
+        let f_b2 = next_frame(&mut t_b, 202);
+        assert_eq!(f_b2.frame_num, 202, "B keeps its daemon after A's death");
+
+        drop(t_b);
+        drop(served);
+        agent_thread.join().unwrap();
+        daemon.join().unwrap();
+        peer.join().unwrap();
+        std::fs::remove_dir_all(&local_base).ok();
+        std::fs::remove_dir_all(&remote_base).ok();
+    }
+
     #[test]
     fn split_dest_separates_the_optional_user() {
         assert_eq!(split_dest("example.com"), (None, "example.com"));
