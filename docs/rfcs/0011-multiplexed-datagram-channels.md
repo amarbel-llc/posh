@@ -622,10 +622,14 @@ mechanism is best designed against whatever handshake replaces it.
   FDR 0004 election (§7) and the posh#136 window persists. The §9.2/§9.3
   decisions gating additional `session` channels were RESOLVED 2026-08-05 by
   measurement (see those sections): §9.3 needs no mechanism, but §9.2 requires
-  a sender-side congestion response — so additional `session` channels (the
-  #54 connection sharing itself) MUST NOT ship before that response is
-  IMPLEMENTED, not merely decided; N sessions on one connection is exactly the
-  measured collapse shape.
+  a sender-side congestion response — implemented the same day (posh#155),
+  after which additional `session` channels SHIPPED behind the opt-in
+  `POSH_MUX_SESSIONS` (the M2 revision of the #54 design doc): client-space
+  session ordinals >= 2 carry a 1-byte micro-envelope (data/open/close; the
+  §3.3 open-carries-binding rule made positional-safe against datagram
+  reordering), ordinal 1 remains the bare single-session/heartbeat stream,
+  and single-session receivers MUST ignore higher ordinals rather than feed
+  them to their frame paths.
 - Future channel kinds MUST use a RESERVED kind value; future envelope fields
   MUST use a `ver` bump. Neither may be added ad hoc.
 

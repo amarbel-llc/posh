@@ -171,7 +171,14 @@ the `eng-*(7)` manpages — read them with `man eng-versioning`,
   symlink election code PERSISTS for the opt-out, mixed versions, and the
   two-client-host election (RFC 0011 §7 conditional rule — direct
   `agent/sock` bind stays a future decision; design:
-  `docs/plans/2026-07-28-connection-mux-endpoint-design.md`).
+  `docs/plans/2026-07-28-connection-mux-endpoint-design.md`). M2 session
+  sharing exists behind the OPT-IN `POSH_MUX_SESSIONS`: a `host:session`
+  attach then rides the mux connection as a session channel (`mux_loop`
+  routes whole messages; the remote `posh-server mux` channel table applies
+  the §3 relay contract per channel; `remote/client.rs`'s `Wire` seam keeps
+  prediction/rendering in the foreground process), falling back
+  per-invocation on any failure. The palette's *About / transport info*
+  command shows the mode and every gate's resolved value.
 - **posh-term is pure state:** feed PTY bytes via `Terminal::process`, read
   the screen via `screen()`/`dump_vt()`/`dump_text()`, drain query replies
   via `take_responses()`. `generation()` bumps on every visible change;

@@ -13,7 +13,15 @@ deliberately none, §9.2 requires a sender-side congestion response
 specified below is fully satisfied. M2 DESIGN REVISED 2026-08-05 (this
 revision, approved in review): scope, the local IPC session tags, the
 remote channel-table peer, gating (`POSH_MUX_SESSIONS`), and the palette
-info surface are specified below; M2 awaits implementation.
+info surface are specified below. M2 IMPLEMENTED 2026-08-05 per that
+revision, behind the OPT-IN `POSH_MUX_SESSIONS`: the IPC session tags,
+the mux daemon's channel routing, the `posh-server mux` channel-table
+peer (`agent` kept as the M1 alias), the client `Wire` seam, and the
+palette About surface — the in-process end-to-end
+(`remote::mux::tests::m2_two_transports_share_one_connection_and_survive_peer_loss`)
+pins two sessions + agent on one connection with per-channel failure
+isolation. Promotion to default-on remains a later dated decision per
+the gating section (its real-binary/real-agent E2E staging runs then).
 Previously: ACCEPTED 2026-07-28 (M1-first sequencing approved; open
 questions 1 and 2 resolved — `posh-server agent` subcommand, 60 s linger
 default). Originally: DRAFT for review, 2026-07-28. This is the design doc #54's closing note

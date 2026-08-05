@@ -64,8 +64,12 @@ non-interactive PATH.
 	Everything after *--* is the command and its arguments.
 
 *agent* *--client-id* _ID_
-	Run the agent-only mux remote (FDR 0014): no PTY, no shell, no
-	session. The server prints the same connect handshake, detaches,
+	Run the per-destination mux remote peer: agent channels (FDR 0014)
+	plus, since M2, a channel table relaying each wire session channel
+	to its named session daemon under the relay contract — one process
+	per destination, no PTY of its own. *mux* is the M2 verb name;
+	*agent* remains as the M1 alias (the zero-session case). The
+	server prints the same connect handshake, detaches,
 	binds the per-client-host socket _<base>/agent/mux-<ID>.sock_
 	(recording its pid beside it), participates in the _agent/sock_
 	election as a full sibling of the per-connection endpoints, and

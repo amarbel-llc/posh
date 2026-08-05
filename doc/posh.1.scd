@@ -297,6 +297,18 @@ _POSH_MUX_
 	*agent* verb included), the invocation warns once and falls back to
 	per-connection forwarding.
 
+_POSH_MUX_SESSIONS_
+	Opt in to M2 session sharing (*1*, *true*, *on*, or *yes*): a
+	named-session attach (_host:session_) then rides the mux endpoint's
+	one connection as a session channel — no per-invocation ssh
+	bootstrap, attach latency drops to a unix-socket hop, and the
+	palette's *About / transport info* shows the mode. Default off
+	until promotion; requires _POSH_MUX_ on and agent forwarding
+	resolved on. Any failure (endpoint unreachable, channel refused,
+	an older remote) falls back to a per-invocation connection with a
+	one-line warning. Bare-host roaming shells (*posh user@host*) are
+	unaffected.
+
 _POSH_CONGESTION_
 	The RFC 0011 sender-side congestion response for agent channels,
 	default ON: consecutive unacknowledged retransmissions back off
