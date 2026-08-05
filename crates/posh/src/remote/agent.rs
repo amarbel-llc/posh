@@ -911,7 +911,9 @@ fn parse_congestion_gate(value: Option<&str>) -> bool {
 }
 
 /// Reads the [`parse_congestion_gate`] decision from the environment.
-fn congestion_selected() -> bool {
+/// pub(crate): the palette About table reports it through this same
+/// selector so the table can never drift from the behavior.
+pub(crate) fn congestion_selected() -> bool {
     parse_congestion_gate(std::env::var("POSH_CONGESTION").ok().as_deref())
 }
 

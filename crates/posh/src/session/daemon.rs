@@ -501,7 +501,9 @@ fn parse_frames_gate(value: Option<&str>) -> bool {
 /// `no`), in which case no producer is ever constructed and every client receives
 /// raw `Tag::Output`, byte-for-byte the legacy behavior. The local client has
 /// consumed frames since Phase 2 (RFC 0008 / FDR 0011), so on-by-default is safe.
-fn session_frames_enabled() -> bool {
+/// pub(crate): the palette About table reports the gate through this same
+/// selector so the table can never drift from the behavior.
+pub(crate) fn session_frames_enabled() -> bool {
     parse_frames_gate(std::env::var("POSH_SESSION_FRAMES").ok().as_deref())
 }
 

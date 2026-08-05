@@ -150,6 +150,11 @@ fn palette_commands(server_log_on: bool, scroll_opt: bool) -> Value {
         // hyphence champion record) when a GP species is selected.
         { "name": "Show echo prediction stats", "action": { "method": "session.predictinfo" } },
         { "name": "Show agent-forwarding debug info", "action": { "method": "session.agentinfo" } },
+        // M2 design revision (2026-08-05): the env-var verification surface —
+        // version, connection mode, and every transport gate's RESOLVED value
+        // with its source, so "is POSH_X actually affecting this session?"
+        // is answerable in-session.
+        { "name": "About / transport info", "action": { "method": "session.aboutinfo" } },
         { "name": "Suspend client", "action": { "method": "client.suspend" } },
         { "name": "Quit session", "action": { "method": "app.quit" } },
     ])
@@ -254,6 +259,47 @@ fn wedge_debug_summary(st: &ClientState, now: u64) -> String {
 /// contextualize the pacing; `send_iv` is the client's own send cadence.
 /// Composites over a frozen session like the wedge view — readable in-session
 /// without a second terminal or knowing the pid.
+/// The palette About / transport-info table (M2 design revision,
+/// user-requested): posh version + git sha, the live connection mode, and
+/// every transport gate's RESOLVED value with its source (`env=...` vs
+/// `default`) — the surface that answers "is this env var actually
+/// affecting behavior?" without reading code. Gate resolution goes through
+/// the same selectors the gates themselves use, so this table can never
+/// drift from the behavior it reports. Live congestion numbers stay on the
+/// mux `MuxStatus` line (`just debug-posh-dump`) — surfacing them here is a
+/// recorded follow-up, not a v1 row.
+fn about_summary(st: &ClientState) -> String {
+    let gate = |name: &str, resolved: bool| {
+        let src = match std::env::var(name) {
+            Ok(v) => format!("env={v:?}"),
+            Err(_) => "default".to_string(),
+        };
+        format!("{name}={} ({src})", if resolved { "on" } else { "off" })
+    };
+    let mode = match &st.wire {
+        Wire::Udp(_) if st.enveloped => "per-invocation connection (enveloped)",
+        Wire::Udp(_) => "per-invocation connection (baseline)",
+        Wire::Mux(_) => "mux session channel (shared connection)",
+    };
+    // POSH_RELAY's parser lives in main.rs (`relay_enabled`; only "0"
+    // disables — posh#154 tracks the cross-gate normalization).
+    let relay_on = std::env::var("POSH_RELAY").as_deref() != Ok("0");
+    format!(
+        "posh {} ({})\nmode: {mode}\n{}\n{}\n{}\n{}\n{}\n{}",
+        env!("POSH_VERSION"),
+        env!("POSH_GIT_SHA"),
+        gate("POSH_MUX", crate::remote::mux::mux_selected()),
+        gate("POSH_MUX_SESSIONS", crate::remote::mux::mux_sessions_selected()),
+        gate("POSH_CHANNELS", crate::remote::sshwrap::channels_selected()),
+        gate("POSH_CONGESTION", crate::remote::agent::congestion_selected()),
+        gate(
+            "POSH_SESSION_FRAMES",
+            crate::session::daemon::session_frames_enabled()
+        ),
+        gate("POSH_RELAY", relay_on),
+    )
+}
+
 fn link_debug_summary(st: &ClientState, now: u64) -> String {
     let l = st.stats.link_snapshot();
     let heard = now.saturating_sub(st.last_heard);
@@ -530,6 +576,14 @@ fn dispatch_palette_action(
             let summary = agent_debug_summary(st);
             util::log_write("agentinfo", &summary);
             show_debug_info(st, "agent forwarding", &summary, now);
+            false
+        }
+        "session.aboutinfo" => {
+            // M2: version + connection mode + every gate's resolved value
+            // and source — the "which env vars are live?" table.
+            let summary = about_summary(st);
+            util::log_write("aboutinfo", &summary);
+            show_debug_info(st, "about / transport", &summary, now);
             false
         }
         "client.suspend" => {
@@ -3152,6 +3206,33 @@ mod tests {
             summary.contains("champion doc: (none written yet)"),
             "{summary}"
         );
+    }
+
+    #[test]
+    fn about_summary_reports_gates_mode_and_version() {
+        let st = test_state(24, 80);
+        let s = about_summary(&st);
+        assert!(s.contains(&format!("posh {}", env!("POSH_VERSION"))), "{s}");
+        assert!(s.contains("mode: per-invocation connection (baseline)"), "{s}");
+        for gate in [
+            "POSH_MUX=",
+            "POSH_MUX_SESSIONS=",
+            "POSH_CHANNELS=",
+            "POSH_CONGESTION=",
+            "POSH_SESSION_FRAMES=",
+            "POSH_RELAY=",
+        ] {
+            assert!(s.contains(gate), "{gate} missing from {s}");
+        }
+        // Every row names its source so "is my env var live?" is readable.
+        assert!(
+            s.matches("(env=").count() + s.matches("(default)").count() >= 6,
+            "{s}"
+        );
+        let raw = pty_raw_mode();
+        let mut st = st;
+        let send = dispatch_palette_action(&mut st, &raw, "session.aboutinfo", &json!({}), 0);
+        assert!(!send, "about is client-local, no wire send");
     }
 
     #[test]
