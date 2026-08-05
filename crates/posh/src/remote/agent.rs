@@ -885,6 +885,21 @@ fn backed_off(rto: u64, streak: u32) -> u64 {
     rto.saturating_mul(1u64 << streak.min(BACKOFF_SHIFT_MAX))
 }
 
+/// RFC 0011 §9.2 (posh#155): the per-connection AIMD bound on aggregate
+/// agent data offered per RTO window. `CWND_MAX` is today's implicit bound
+/// (every channel's full per-instruction window) — the connection STARTS
+/// there and only leaves it when an unacked-data retransmission fires, so an
+/// uncongested connection is byte-identical to the pre-§9.2 sender and the
+/// clean-path ceiling cannot regress by construction. Multiplicative
+/// decrease halves toward `CWND_FLOOR` (one full instruction, so forward
+/// progress and the terminal-rides-full-tail rule never deadlock on
+/// budget); additive recovery restores one instruction quantum per clean
+/// progressed window (floor→max in 7 windows). Learned cwnd survives idle
+/// windows rather than resetting.
+const CWND_MAX: usize = MAX_AGENT_CHANNELS * AGENT_INSTRUCTION_DATA_MAX;
+const CWND_FLOOR: usize = AGENT_INSTRUCTION_DATA_MAX;
+const CWND_INCREMENT: usize = AGENT_INSTRUCTION_DATA_MAX;
+
 use crate::remote::channel::{
     AgentPayload, ChannelAllocator, ChannelId, Role, AGENT_FLAG_CLOSE, AGENT_FLAG_FAIL,
     AGENT_FLAG_OPEN, AGENT_INSTRUCTION_DATA_MAX, KIND_AGENT, SESSION_CHANNEL,
@@ -968,6 +983,19 @@ pub struct AgentChannelMux {
     next_rec_id: u32,
     channels: Vec<MuxChannel>,
     closed: Vec<Tombstone>,
+    /// §9.2 AIMD state: the aggregate data budget per RTO window. See
+    /// [`CWND_MAX`]. `window_used` is the data spent in the current window
+    /// (the emission budget's meter); `window_cut`/`window_progress` gate
+    /// one MD cut and the AI recovery decision per window.
+    cwnd: usize,
+    window_start: u64,
+    window_used: usize,
+    window_cut: bool,
+    window_progress: bool,
+    /// Telemetry (mux StatusReply): cumulative MD cuts and the deepest
+    /// backoff streak observed.
+    cuts: u64,
+    streak_hwm: u32,
 }
 
 impl AgentChannelMux {
@@ -988,6 +1016,13 @@ impl AgentChannelMux {
             next_rec_id: 1,
             channels: Vec::new(),
             closed: Vec::new(),
+            cwnd: CWND_MAX,
+            window_start: 0,
+            window_used: 0,
+            window_cut: false,
+            window_progress: false,
+            cuts: 0,
+            streak_hwm: 0,
         }
     }
 
@@ -1095,8 +1130,10 @@ impl AgentChannelMux {
         ch.outbox.ack(p.recv_ack);
         if ch.outbox.base() > base_before {
             // Ack progress: the peer is receiving — the §9.2 backoff streak
-            // ends and re-offers resume at the plain RTO cadence.
+            // ends and re-offers resume at the plain RTO cadence, and the
+            // AIMD window counts as progressed (additive recovery at roll).
             ch.retx_streak = 0;
+            self.window_progress = true;
         }
         if !ch.outbox.is_empty() {
             // A partially-acked tail (e.g. past the §4.1 per-instruction
@@ -1139,6 +1176,19 @@ impl AgentChannelMux {
     /// rides only an instruction carrying the entire remaining tail, so the
     /// receiver never closes the socket with bytes still owed.
     pub fn outgoing(&mut self, now: u64, rto: u64) -> Vec<(ChannelId, Vec<u8>)> {
+        // §9.2 window roll: settle the previous RTO window's AIMD decision
+        // (additive recovery iff progressed and uncut) and refill the data
+        // budget. Idle windows (no progress, no cut) change nothing — the
+        // learned cwnd survives idle rather than resetting.
+        if now.saturating_sub(self.window_start) >= rto {
+            if !self.window_cut && self.window_progress {
+                self.cwnd = (self.cwnd + CWND_INCREMENT).min(CWND_MAX);
+            }
+            self.window_cut = false;
+            self.window_progress = false;
+            self.window_used = 0;
+            self.window_start = now;
+        }
         let mut out = Vec::new();
         for t in &mut self.closed {
             if std::mem::take(&mut t.echo_due) {
@@ -1166,6 +1216,17 @@ impl AgentChannelMux {
                 wants_retx && now.saturating_sub(ch.last_send) >= backed_off(rto, ch.retx_streak);
             if retx_fires && !ch.send_due {
                 ch.retx_streak = ch.retx_streak.saturating_add(1);
+                self.streak_hwm = self.streak_hwm.max(ch.retx_streak);
+                // MD: an unacked-DATA retransmission is the congestion
+                // signal — halve the window budget, at most once per
+                // window, immediately (not at settle). OPEN/terminal
+                // retransmissions never cut: a lost handshake instruction
+                // is a poor congestion signal (they still back off above).
+                if unacked && !self.window_cut {
+                    self.window_cut = true;
+                    self.cwnd = (self.cwnd / 2).max(CWND_FLOOR);
+                    self.cuts += 1;
+                }
             }
             if ch.send_due || retx_fires {
                 let pending = ch.outbox.pending();
@@ -2881,6 +2942,123 @@ mod tests {
         // at 151 + 4*rto (streak still 2), not 151 + 8*rto.
         assert!(mux.outgoing(350, 50).is_empty());
         assert_eq!(mux.outgoing(351, 50).len(), 1);
+    }
+
+    /// §9.2 MD: an unacked-data RTO fire halves cwnd — but at most once per
+    /// window, even when several channels' RTOs coincide in one drain.
+    #[test]
+    fn cwnd_halves_at_most_once_per_window_on_rto_retx() {
+        let mut mux = AgentChannelMux::new_server();
+        mux.queue_records(&[rec(1, RecordKind::Open, b""), rec(1, RecordKind::Data, b"a")]);
+        mux.queue_records(&[rec(2, RecordKind::Open, b""), rec(2, RecordKind::Data, b"b")]);
+        let _ = mux.outgoing(100, 50); // rolls the window, initial sends
+        assert_eq!(mux.cwnd, CWND_MAX);
+        // Both channels' retx fire in the same drain: exactly one cut.
+        let fired = mux.outgoing(150, 50);
+        assert_eq!(fired.len(), 2, "both channels retransmit");
+        assert_eq!(mux.cwnd, CWND_MAX / 2, "one halving, not two");
+        assert_eq!(mux.cuts, 1);
+    }
+
+    /// §9.2: MD floors at one full instruction (forward progress can never
+    /// deadlock on budget) and AI ceilings at today's implicit max.
+    #[test]
+    fn cwnd_floor_and_ceiling_clamp() {
+        let mut mux = AgentChannelMux::new_server();
+        mux.queue_records(&[rec(1, RecordKind::Open, b""), rec(1, RecordKind::Data, b"x")]);
+        let mut now = 100;
+        let _ = mux.outgoing(now, 50);
+        // Cut every window far past the floor: 256K -> 128K -> ... -> 32K.
+        for _ in 0..10 {
+            now += 1000; // new window, and past any backoff interval
+            let _ = mux.outgoing(now, 50);
+        }
+        assert_eq!(mux.cwnd, CWND_FLOOR, "MD floors at one instruction");
+        // Recovery can never exceed CWND_MAX: drain the retx source, then
+        // force progressed clean windows well past the 7 needed.
+        mux.channels.clear();
+        for _ in 0..10 {
+            now += 1000;
+            mux.window_progress = true;
+            let _ = mux.outgoing(now, 50); // roll applies AI
+        }
+        assert_eq!(mux.cwnd, CWND_MAX, "AI ceilings at the implicit max");
+    }
+
+    /// §9.2 AI: a clean progressed window restores one instruction quantum.
+    #[test]
+    fn cwnd_recovers_additively_on_clean_progressed_windows() {
+        let mut mux_s = AgentChannelMux::new_server();
+        let mut mux_c = AgentChannelMux::new_client();
+        mux_s.queue_records(&[rec(1, RecordKind::Open, b""), rec(1, RecordKind::Data, b"d")]);
+        let first = mux_s.outgoing(100, 50);
+        let _ = mux_s.outgoing(150, 50); // unacked retx: cut to 128K
+        assert_eq!(mux_s.cwnd, CWND_MAX / 2);
+        // The peer's ack lands in the SAME window as the cut: no recovery
+        // from it (a cut window is not clean) — pin that first.
+        mux_c.on_instruction(first[0].0, &first[0].1);
+        for (id, wire) in mux_c.outgoing(160, 50) {
+            mux_s.on_instruction(id, &wire);
+        }
+        let _ = mux_s.outgoing(210, 50); // roll: progressed BUT cut => no AI
+        assert_eq!(mux_s.cwnd, CWND_MAX / 2, "a cut window never recovers");
+        // A fresh exchange in the NEW (clean) window: progress marked, and
+        // the next roll restores one quantum.
+        mux_s.queue_records(&[rec(1, RecordKind::Data, b"e")]);
+        let second = mux_s.outgoing(211, 50); // send_due emission
+        mux_c.on_instruction(second[0].0, &second[0].1);
+        for (id, wire) in mux_c.outgoing(220, 50) {
+            mux_s.on_instruction(id, &wire);
+        }
+        assert!(mux_s.window_progress);
+        let _ = mux_s.outgoing(270, 50); // clean + progressed => +32K
+        assert_eq!(mux_s.cwnd, CWND_MAX / 2 + CWND_INCREMENT);
+    }
+
+    /// §9.2: OPEN and terminal retransmissions back off individually but
+    /// never cut cwnd — a lost handshake is a poor congestion signal.
+    #[test]
+    fn open_and_terminal_retx_do_not_cut_cwnd() {
+        // OPEN-only channel (empty outbox).
+        let mut mux = AgentChannelMux::new_server();
+        mux.queue_records(&[rec(1, RecordKind::Open, b"")]);
+        let _ = mux.outgoing(100, 50);
+        let fired = mux.outgoing(150, 50);
+        assert_eq!(fired.len(), 1, "OPEN retransmits");
+        assert_eq!(mux.cwnd, CWND_MAX, "no cut for an OPEN retx");
+        // Terminal with a drained outbox.
+        let mut mux2 = AgentChannelMux::new_server();
+        mux2.queue_records(&[rec(1, RecordKind::Open, b"")]);
+        let first = mux2.outgoing(100, 50);
+        let mut mux_c = AgentChannelMux::new_client();
+        mux_c.on_instruction(first[0].0, &first[0].1);
+        for (id, wire) in mux_c.outgoing(101, 50) {
+            mux2.on_instruction(id, &wire); // confirms the OPEN
+        }
+        mux2.queue_records(&[rec(1, RecordKind::Close, b"")]);
+        let _ = mux2.outgoing(110, 50); // terminal rides (send_due)
+        let terminal_retx = mux2.outgoing(200, 50);
+        assert_eq!(terminal_retx.len(), 1, "terminal retransmits");
+        assert_eq!(mux2.cwnd, CWND_MAX, "no cut for a terminal retx");
+    }
+
+    /// §9.2: idle windows neither cut nor recover — the learned cwnd
+    /// survives idle instead of resetting.
+    #[test]
+    fn idle_windows_leave_cwnd_unchanged() {
+        let mut mux = AgentChannelMux::new_server();
+        mux.queue_records(&[rec(1, RecordKind::Open, b""), rec(1, RecordKind::Data, b"q")]);
+        let _ = mux.outgoing(100, 50);
+        let _ = mux.outgoing(150, 50); // cut to 128K
+        let cut_to = mux.cwnd;
+        assert_eq!(cut_to, CWND_MAX / 2);
+        // Drain the channel so nothing wants sending, then roll many idle
+        // windows.
+        mux.channels.clear();
+        for i in 0..20 {
+            let _ = mux.outgoing(1_000 + i * 1_000, 50);
+        }
+        assert_eq!(mux.cwnd, cut_to, "idle windows change nothing");
     }
 
     /// §5: FAIL surfaces to the far end's agent client as a CLOSED socket —
