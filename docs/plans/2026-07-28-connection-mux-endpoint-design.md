@@ -10,7 +10,10 @@ deliberately none, §9.2 requires a sender-side congestion response
 (RTO backoff + AIMD aggregate bound). That mechanism is IMPLEMENTED
 2026-08-05 (posh#155, `remote/agent.rs`, behind the default-on
 `POSH_CONGESTION`) with the §9.3 re-measurement green — the M2 gate
-specified below is fully satisfied; M2 awaits only its design revision.
+specified below is fully satisfied. M2 DESIGN REVISED 2026-08-05 (this
+revision, approved in review): scope, the local IPC session tags, the
+remote channel-table peer, gating (`POSH_MUX_SESSIONS`), and the palette
+info surface are specified below; M2 awaits implementation.
 Previously: ACCEPTED 2026-07-28 (M1-first sequencing approved; open
 questions 1 and 2 resolved — `posh-server agent` subcommand, 60 s linger
 default). Originally: DRAFT for review, 2026-07-28. This is the design doc #54's closing note
@@ -67,6 +70,30 @@ generalizes the remote `posh-server` from one PTY to a channel table and is
 where `FragmentAssembly`'s concurrency (already landed per RFC 0011 §4)
 starts carrying real interleaving.
 
+### M2 scope (revised 2026-08-05)
+
+NAMED-SESSION attaches only (`posh host:session` — the relay-shaped path,
+RFC 0008 §3): each session channel is one DaemonLink in the remote peer's
+channel table, the §3 contract applied per channel, unchanged. Bare-host
+ephemeral shells (`posh user@host`, remote-PTY-owning) keep per-invocation
+connections; they MAY later ride the mux as auto-named "default" durable
+sessions (the FDR 0011 unification direction) — a future milestone, not
+M2. Relay retargeting (FDR 0012) remains a later feature on top of this
+infrastructure. The session-daemon socket protocol (`session/ipc.rs`
+`Tag`s) is untouched.
+
+### M2 gating and rollback
+
+`POSH_MUX_SESSIONS`, opt-in (M1's rollout arc): sessions ride the mux only
+when selected; per-invocation relay connections remain the default path AND
+the automatic fallback when the endpoint cannot be reached, spawned, or the
+channel open fails — byte-identical to today, pinned by test like the M1
+`mux_gate_off` contract. `POSH_MUX=0` still disables the whole endpoint.
+Promotion to default-on is a later dated decision; criteria: the M2 E2E
+green (two sessions + agent bulk on one connection; kill/reattach; zero
+cross-channel talk), the `just debug-mux-load` regression bar holding, and
+a daily-driving soak.
+
 The review's sequencing conclusion, restated: the wire increment (envelope +
 agent kind + single session channel) is necessary for both milestones but
 closes nothing by itself; M1 is the shortest path to closing posh#136.
@@ -107,10 +134,32 @@ new tags in the mux socket's own tag space:
   linger clock.
   Registration is by open IPC connection, so a crashed client auto-unrefs on
   socket close — no pid probing.
-- M2 adds the session-channel tags (open-with-target, input, resize, frame
-  delivery, detach), lifted from #54's sketch: prediction and rendering stay
-  in the foreground process; the mux relays whole assembled messages, cost of
-  one unix hop. Their shapes are deferred to the M2 revision of this doc.
+- M2 session-channel tags (specified 2026-08-05; #54's sketch made
+  concrete). Prediction, rendering, scrollview, and the palette stay in the
+  foreground process; the mux daemon holds NO terminal model — it routes
+  whole assembled messages between IPC conns and wire channels, cost of one
+  unix hop. Each IPC session channel maps 1:1 to an RFC 0011 `session`-kind
+  wire channel; the wire OPEN carries the RFC 0001 target (RFC 0011 §3.3),
+  and frame reliability is the existing per-channel `frame_num`/`acked_frame`
+  scheme.
+  - `MuxSessionOpen` (client→mux): the RFC 0001 target string. Opens the
+    wire channel; implies the session ref (below). `MuxSessionOpenAck`
+    (mux→client): the assigned channel ordinal, or a failure reason — on
+    failure the client falls back to a per-invocation connection.
+  - `MuxSessionMsg` (client→mux): one encoded `ClientMessage`, opaque to the
+    mux (input, resize, frame acks, shutdown — exactly what `drive_client`
+    already produces). Relayed onto the session channel verbatim.
+  - `MuxSessionFrame` (mux→client): one encoded `ServerFrame`, opaque — so
+    `CAP_SESSION_SIZE` geometry (RFC 0012), scrollback caps, and codec
+    selection pass through untouched.
+  - `MuxSessionClose` (either direction): local close (detach) or the wire
+    channel's terminal surfacing (remote daemon exit; carries the
+    exit-status path's payload). Dropping the IPC conn implies close, so a
+    crashed client detaches cleanly — no pid probing, as with refs.
+- An open session channel IS a session ref: `MuxSessionOpen` implies
+  `MuxSessionRef` for the conn; the explicit ref tags remain for agent-only
+  invocations (M1-mode attaches, `posh ssh`). Agent serviceability stays
+  gated on refs > 0, satisfied by either kind.
 
 ## Lifecycle
 
@@ -147,6 +196,21 @@ new tags in the mux socket's own tag space:
 - The M1 remote server for the mux connection is a `posh-server` with no PTY:
   it serves agent channels and the election only. M2 folds session relaying
   back in via the RFC 0008 relay contract.
+- M2 remote peer (specified 2026-08-05): `posh-server agent` generalizes to
+  the full mux peer — verb `posh-server mux`, with `agent` kept as an alias
+  for the zero-session case during transition. ONE process per destination:
+  the agent endpoint exactly as M1, plus a channel table — each inbound
+  session-channel OPEN resolves its target and stands up one DaemonLink
+  (connect-or-create the named session daemon, `Tag::Init` with forwarded
+  caps, per-channel O(1) `HeldFrame` retransmit, lossy→reliable input
+  bridging): the §3 relay MUSTs (no second model, terminate agent caps,
+  opaque frame bodies) applied PER CHANNEL, verbatim. A channel CLOSE (or
+  `CLIENT_FLAG_SHUTDOWN`) drops only its DaemonLink; a DaemonLink failure
+  closes only its channel (the peer sees the terminal + exit status; other
+  sessions unaffected). The remote peer's §4.1 drain sends due session
+  frames (all channels) before agent bulk, under the §9.2 congestion
+  response — the loadprobe starvation scenario is the standing regression
+  bar, and stops being synthetic once the real loops carry N sessions.
 
 ## Security
 
@@ -175,7 +239,30 @@ new tags in the mux socket's own tag space:
    linger, and the window stays conservative until rekey (#145) lands.
 3. Does `posh list`/diagnostics enumerate mux endpoints? (FDR 0007's dump
    covers the transport; a `posh mux ls` is cheap once the socket dir
-   exists.) Deferred to implementation.
+   exists.) Deferred to implementation. PARTIALLY ADDRESSED by the M2
+   palette info surface (below); a CLI `posh mux ls` remains open.
+
+## M2 companion: the palette info surface (added 2026-08-05, user-requested)
+
+A new command-palette entry (*About / transport info*, RFC 0005) renders a
+table so a user can VERIFY which gates are affecting the live connection:
+posh version, destination key, connection mode (mux vs per-invocation,
+enveloped vs baseline), each gate's RESOLVED value and source
+(`POSH_MUX`, `POSH_MUX_SESSIONS`, `POSH_CONGESTION`, `POSH_CHANNELS`,
+`POSH_SESSION_FRAMES`, `POSH_RELAY`), and the live congestion summary
+(cwnd/cuts/streak high-water) read from the mux `MuxStatus` reply. Data
+flows over the existing RFC 0005 JSON-RPC channel; no new wire surface.
+
+## M2 tuning levers (revisit against real usage; not settled)
+
+- `MAX_SESSION_CHANNELS` per connection: start 16 (RFC 0011 §3.4 requires a
+  bound; refusal, never allocation past it). Change signal: a legitimate
+  attach refused.
+- `POSH_MUX_PERSIST` (60 s) now also amortizes session re-attach, not just
+  agent warmth. Change signal: cold-start latency complaints (raise) or
+  lingering-daemon complaints (lower).
+- Per-channel `HeldFrame` on the remote peer (one encoded frame per
+  channel). Change signal: remote memory pressure at high channel counts.
 
 ## References
 
