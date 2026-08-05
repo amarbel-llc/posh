@@ -297,6 +297,17 @@ _POSH_MUX_
 	*agent* verb included), the invocation warns once and falls back to
 	per-connection forwarding.
 
+_POSH_CONGESTION_
+	The RFC 0011 sender-side congestion response for agent channels,
+	default ON: consecutive unacknowledged retransmissions back off
+	exponentially (up to 8× the retransmission timeout), and a
+	per-connection AIMD budget bounds the aggregate agent data offered
+	per timeout window on congested paths. Uncongested connections are
+	unaffected (the budget only engages after a loss signal).
+	_POSH_CONGESTION=0_ (or *false*, *off*, *no*) restores the
+	fixed-rate re-offer behaviour — a rollback switch, not a tuning
+	knob; fresh data and acknowledgements are never delayed either way.
+
 _POSH_CLIENT_ID_
 	Override the client-host identity the mux endpoint reports to the
 	remote (default: the local hostname). The id names the remote

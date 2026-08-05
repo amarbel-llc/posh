@@ -900,6 +900,21 @@ const CWND_MAX: usize = MAX_AGENT_CHANNELS * AGENT_INSTRUCTION_DATA_MAX;
 const CWND_FLOOR: usize = AGENT_INSTRUCTION_DATA_MAX;
 const CWND_INCREMENT: usize = AGENT_INSTRUCTION_DATA_MAX;
 
+/// The §9.2 congestion response's rollback switch: `POSH_CONGESTION` is
+/// DEFAULT ON (the response is a normative MUST); `=0`/`false`/`off`/`no`
+/// restores the pre-§9.2 sender byte-for-byte — the streak never grows and
+/// cwnd never leaves max, so backoff and budget are both inert. The same
+/// off-switch shape as `POSH_MUX`/`POSH_SESSION_FRAMES`
+/// ([`util::parse_default_on_gate`]).
+fn parse_congestion_gate(value: Option<&str>) -> bool {
+    crate::util::parse_default_on_gate(value)
+}
+
+/// Reads the [`parse_congestion_gate`] decision from the environment.
+fn congestion_selected() -> bool {
+    parse_congestion_gate(std::env::var("POSH_CONGESTION").ok().as_deref())
+}
+
 use crate::remote::channel::{
     AgentPayload, ChannelAllocator, ChannelId, Role, AGENT_FLAG_CLOSE, AGENT_FLAG_FAIL,
     AGENT_FLAG_OPEN, AGENT_INSTRUCTION_DATA_MAX, KIND_AGENT, SESSION_CHANNEL,
@@ -1002,6 +1017,10 @@ pub struct AgentChannelMux {
     /// backoff streak observed.
     cuts: u64,
     streak_hwm: u32,
+    /// The `POSH_CONGESTION` gate, read once at construction. Off freezes
+    /// the streak at 0 (backoff inert) which also keeps cwnd at max
+    /// (budget inert): the pre-§9.2 sender byte-for-byte.
+    congestion: bool,
 }
 
 impl AgentChannelMux {
@@ -1029,6 +1048,7 @@ impl AgentChannelMux {
             window_progress: false,
             cuts: 0,
             streak_hwm: 0,
+            congestion: congestion_selected(),
         }
     }
 
@@ -1233,7 +1253,7 @@ impl AgentChannelMux {
             // state (`send_due`) is never delayed by it.
             let retx_fires =
                 wants_retx && now.saturating_sub(ch.last_send) >= backed_off(rto, ch.retx_streak);
-            if retx_fires && !ch.send_due {
+            if retx_fires && !ch.send_due && self.congestion {
                 ch.retx_streak = ch.retx_streak.saturating_add(1);
                 self.streak_hwm = self.streak_hwm.max(ch.retx_streak);
                 // MD: an unacked-DATA retransmission is the congestion
@@ -3330,6 +3350,38 @@ mod tests {
             0,
             "the echo re-answers with the terminal"
         );
+    }
+
+    /// §9.2 rollback switch: default on, off only for the shared off
+    /// spellings (no env mutation — the parser is pinned directly).
+    #[test]
+    fn congestion_gate_parses_default_on() {
+        assert!(parse_congestion_gate(None), "unset selects the response");
+        for v in ["", "1", "true", "on", "yes", "2"] {
+            assert!(parse_congestion_gate(Some(v)), "{v:?} selects the response");
+        }
+        for v in ["0", "false", "off", "no", " OFF "] {
+            assert!(!parse_congestion_gate(Some(v)), "{v:?} switches it off");
+        }
+    }
+
+    /// §9.2 rollback: with the gate off, the streak never grows (plain-RTO
+    /// retransmission cadence forever) and cwnd never leaves max (budget
+    /// inert) — the pre-§9.2 sender byte-for-byte.
+    #[test]
+    fn gate_off_restores_ungated_emission() {
+        let mut mux = AgentChannelMux::new_server();
+        mux.congestion = false;
+        mux.queue_records(&[rec(1, RecordKind::Open, b""), rec(1, RecordKind::Data, b"x")]);
+        let _ = mux.outgoing(100, 50);
+        // Plain-rto cadence at any depth of unacked retransmissions.
+        for i in 1..=6u64 {
+            assert!(mux.outgoing(100 + i * 50 - 1, 50).is_empty());
+            assert_eq!(mux.outgoing(100 + i * 50, 50).len(), 1, "plain rto, no backoff");
+        }
+        assert_eq!(mux.cwnd, CWND_MAX, "no cuts with the gate off");
+        assert_eq!(mux.cuts, 0);
+        assert_eq!(mux.next_deadline(50), Some(400 + 50), "plain-rto deadline");
     }
 
     /// §5: FAIL surfaces to the far end's agent client as a CLOSED socket —
