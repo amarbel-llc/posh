@@ -3042,7 +3042,6 @@ mod tests {
 
     #[test]
     fn open_session_grants_and_transports_frames() {
-        use std::io::Write as _;
         let dir = temp_base();
         let (daemon, mut server) = start_inprocess_daemon(&dir, "m2t", 1_000, (63630, 63639));
         let mut spawn = |_: &str| -> Result<MuxSpawn> { panic!("daemon is live") };

@@ -184,18 +184,18 @@ fn open_palette(st: &mut ClientState) -> bool {
 fn dump_client_state(st: &ClientState, now: u64) {
     let ps = predict_sample(&st.predict.stats());
     diag::ClientState {
-        remote: st.conn.remote(),
+        remote: st.wire.remote(),
         last_send_age_ms: (st.last_send != 0).then(|| now.saturating_sub(st.last_send)),
         last_heard_age_ms: now.saturating_sub(st.last_heard),
         applied_num: st.applied_num,
         outbox_base: st.outbox.base(),
         outbox_pending: st.outbox.pending().len(),
         scrollback_len: st.scrollback.len(),
-        srtt: st.conn.srtt(),
-        rto: st.conn.rto(),
-        send_interval: st.conn.send_interval(),
-        bytes_rx: st.conn.bytes_rx(),
-        bytes_tx: st.conn.bytes_tx(),
+        srtt: st.wire.srtt(),
+        rto: st.wire.rto(),
+        send_interval: st.wire.send_interval(),
+        bytes_rx: st.wire.bytes_rx(),
+        bytes_tx: st.wire.bytes_tx(),
         predict_active: ps.active,
         predict_shown: ps.shown,
         predict_epoch_lag: ps.epoch_lag,
@@ -263,9 +263,9 @@ fn link_debug_summary(st: &ClientState, now: u64) -> String {
          rx: total={} full={} diff={} heartbeats={} scrollback={} retransmits={}\n\
          gaps: max={}ms late_gaps={} srtt={:.0}ms rto={}ms send_iv={}ms",
         std::process::id(),
-        st.conn
+        st.wire
             .remote()
-            .map_or_else(|| "none".to_string(), |a| a.to_string()),
+            .map_or_else(|| "mux-ipc".to_string(), |a| a.to_string()),
         if late { "yes" } else { "no" },
         display::SERVER_LATE_AFTER,
         l.frames_total,
@@ -276,9 +276,9 @@ fn link_debug_summary(st: &ClientState, now: u64) -> String {
         l.retransmits,
         l.frame_gap_ms_max,
         l.frame_gaps_late,
-        st.conn.srtt(),
-        st.conn.rto(),
-        st.conn.send_interval(),
+        st.wire.srtt(),
+        st.wire.rto(),
+        st.wire.send_interval(),
     )
 }
 
@@ -614,7 +614,7 @@ pub fn run(
     // the user's pre-connect shell screen on the way out.
     write_display_control("smcup (connect)", &display::open());
     let result = client_loop(
-        conn,
+        Wire::Udp(conn),
         model,
         render,
         predict_overwrite,
@@ -635,6 +635,50 @@ pub fn run(
         Ok(code) => std::process::exit(code),
         Err(e) => Err(e),
     }
+}
+
+/// The M2 (`POSH_MUX_SESSIONS`) entry: the same foreground client —
+/// prediction, rendering, scrollview, palette — driven over the mux
+/// daemon's IPC session transport instead of a per-invocation UDP
+/// connection. No key, no resolve, no ssh bootstrap; agent forwarding is
+/// the endpoint's (the session side runs with it off, exactly like the M1
+/// relay attach under the mux gate).
+pub fn run_over_mux(
+    transport: crate::remote::mux::MuxSessionTransport,
+    host: &str,
+) -> Result<i32> {
+    util::check_utf8_locale("posh-client")?;
+    let model_env = std::env::var("POSH_PREDICTION_MODEL")
+        .ok()
+        .or_else(|| std::env::var("POSH_PREDICTION").ok());
+    let model = PredictionModel::parse(model_env.as_deref()).map_err(Error::Msg)?;
+    let render_env = std::env::var("POSH_PREDICTION_RENDER").ok();
+    let render = RenderStyle::parse(render_env.as_deref()).map_err(Error::Msg)?;
+    let predict_overwrite = std::env::var("POSH_PREDICTION_OVERWRITE")
+        .map(|v| !v.is_empty())
+        .unwrap_or(false);
+    let grab_mouse = GrabMouse::parse(std::env::var("POSH_GRAB_MOUSE").ok().as_deref())?;
+
+    util::install_client_signal_handlers();
+    util::install_sigusr2_handler();
+    let raw = RawMode::enable(STDIN)?;
+    write_display_control("smcup (connect)", &display::open());
+    let result = client_loop(
+        Wire::Mux(transport),
+        model,
+        render,
+        predict_overwrite,
+        grab_mouse,
+        &raw,
+        0,
+        None,
+        host,
+        false,
+    );
+    write_display_control("rmcup (exit)", &display::close());
+    drop(raw);
+    eprintln!("\nposh: [client exited]");
+    result
 }
 
 /// `pub(crate)` so the mux daemon (remote::mux, M1 Task 3) resolves its
@@ -675,8 +719,65 @@ pub(crate) fn resolve(host: &str, port: u16, family: Family) -> Result<SocketAdd
     )))
 }
 
+/// The client's wire: its own per-invocation UDP connection (today's shape),
+/// or the mux daemon's IPC session transport (M2, `POSH_MUX_SESSIONS`).
+/// Pacing numbers come from the same clamps either way, so prediction and
+/// the send cadence behave identically; structural I/O (send/receive)
+/// branches at its two call sites.
+enum Wire {
+    Udp(Connection),
+    Mux(crate::remote::mux::MuxSessionTransport),
+}
+
+impl Wire {
+    fn srtt(&self) -> f64 {
+        match self {
+            Wire::Udp(c) => c.srtt(),
+            Wire::Mux(t) => t.srtt(),
+        }
+    }
+    fn rto(&self) -> u64 {
+        match self {
+            Wire::Udp(c) => c.rto(),
+            Wire::Mux(t) => t.rto(),
+        }
+    }
+    fn send_interval(&self) -> u64 {
+        match self {
+            Wire::Udp(c) => c.send_interval(),
+            Wire::Mux(t) => t.send_interval(),
+        }
+    }
+    fn bytes_tx(&self) -> u64 {
+        match self {
+            Wire::Udp(c) => c.bytes_tx(),
+            Wire::Mux(t) => t.bytes_tx(),
+        }
+    }
+    fn bytes_rx(&self) -> u64 {
+        match self {
+            Wire::Udp(c) => c.bytes_rx(),
+            Wire::Mux(t) => t.bytes_rx(),
+        }
+    }
+    fn raw_fd(&self) -> std::os::unix::io::RawFd {
+        match self {
+            Wire::Udp(c) => c.raw_fd(),
+            Wire::Mux(t) => t.raw_fd(),
+        }
+    }
+    /// The peer address (SIGUSR2 diag); a mux transport has none — its
+    /// peer is the local daemon socket.
+    fn remote(&self) -> Option<std::net::SocketAddr> {
+        match self {
+            Wire::Udp(c) => c.remote(),
+            Wire::Mux(_) => None,
+        }
+    }
+}
+
 struct ClientState {
-    conn: Connection,
+    wire: Wire,
     fragmenter: Fragmenter,
     /// RFC 0011 §6: this connection speaks the channel envelope (selected out
     /// of band via `POSH_CHANNELS`/`--channels`). Fixed for the connection's
@@ -849,7 +950,7 @@ struct ClientState {
 
 #[allow(clippy::too_many_arguments)]
 fn client_loop(
-    conn: Connection,
+    wire: Wire,
     model: PredictionModel,
     render: RenderStyle,
     predict_overwrite: bool,
@@ -876,7 +977,7 @@ fn client_loop(
     let stats = Stats::new();
     let want_server_diag = stats.enabled() || stats.wedge_watchdog_explicit();
     let mut st = ClientState {
-        conn,
+        wire,
         fragmenter: Fragmenter::new(),
         enveloped,
         outbox: InputOutbox::new(),
@@ -959,13 +1060,13 @@ fn client_loop(
     let predict_stats = st.predict.stats();
     st.stats.final_client(
         now,
-        st.conn.srtt(),
-        st.conn.rto(),
-        st.conn.send_interval(),
+        st.wire.srtt(),
+        st.wire.rto(),
+        st.wire.send_interval(),
         predict_sample(&predict_stats),
         predict_stats.srtt_trigger,
-        st.conn.bytes_rx(),
-        st.conn.bytes_tx(),
+        st.wire.bytes_rx(),
+        st.wire.bytes_tx(),
     );
     result
 }
@@ -995,7 +1096,7 @@ fn drive_client(st: &mut ClientState, raw: &RawMode, port: u16) -> Result<i32> {
         let now = now_ms();
         let mut deadline = st.last_send + HEARTBEAT_INTERVAL;
         if !st.outbox.is_empty() || st.flags != 0 {
-            deadline = deadline.min(st.last_send + st.conn.rto());
+            deadline = deadline.min(st.last_send + st.wire.rto());
         }
         deadline = deadline.min(now + st.notify.wait_time(now));
         if st.predict.needs_timer() {
@@ -1011,7 +1112,7 @@ fn drive_client(st: &mut ClientState, raw: &RawMode, port: u16) -> Result<i32> {
         if let Some(d) = st
             .agent_mux
             .as_ref()
-            .and_then(|m| m.next_deadline(st.conn.rto()))
+            .and_then(|m| m.next_deadline(st.wire.rto()))
         {
             deadline = deadline.min(d.max(now));
         }
@@ -1019,7 +1120,7 @@ fn drive_client(st: &mut ClientState, raw: &RawMode, port: u16) -> Result<i32> {
 
         let mut fds = vec![
             util::pollfd(STDIN, libc::POLLIN),
-            util::pollfd(st.conn.raw_fd(), libc::POLLIN),
+            util::pollfd(st.wire.raw_fd(), libc::POLLIN),
         ];
         // Poll the palette renderer's fds (its PTY + control socket) while it is
         // resident, so its output drains and selections are seen promptly.
@@ -1131,11 +1232,68 @@ fn drive_client(st: &mut ClientState, raw: &RawMode, port: u16) -> Result<i32> {
             }
         }
 
-        // Server frames.
+        // Server frames. One receive step per turn, wire-agnostic: a raw
+        // datagram to assemble (UDP), a whole frame / a close (mux IPC), or
+        // dry/dead — so the frame-processing tail below borrows `st` freely.
         if fds[1].revents & libc::POLLIN != 0 {
+            enum Rx {
+                Datagram(Vec<u8>),
+                Frame(Vec<u8>),
+                Closed(Vec<u8>),
+                Skip,
+                Dry,
+                Dead,
+            }
             loop {
-                match st.conn.recv() {
-                    Ok(Some(payload)) => {
+                let rx = match &mut st.wire {
+                    Wire::Udp(c) => match c.recv() {
+                        Ok(Some(p)) => Rx::Datagram(p),
+                        Ok(None) => Rx::Skip,
+                        Err(e) if e.kind() == std::io::ErrorKind::WouldBlock => Rx::Dry,
+                        Err(_) => Rx::Dead,
+                    },
+                    Wire::Mux(t) => match t.next_event() {
+                        Some(crate::remote::mux::MuxSessionEvent::Frame(b)) => Rx::Frame(b),
+                        Some(crate::remote::mux::MuxSessionEvent::Closed(p)) => Rx::Closed(p),
+                        None => Rx::Dry,
+                    },
+                };
+                match rx {
+                    Rx::Skip => continue,
+                    Rx::Dry => break,
+                    Rx::Dead => break,
+                    Rx::Closed(payload) => {
+                        // The mux channel is over: the remote daemon exited
+                        // or the endpoint tore down. The session (if any)
+                        // survives in its daemon; this attach ends like a
+                        // server-side shutdown.
+                        if !payload.is_empty() {
+                            util::log_write(
+                                "info",
+                                &format!(
+                                    "mux session closed: {}",
+                                    String::from_utf8_lossy(&payload)
+                                ),
+                            );
+                        }
+                        break 'client Ok(st.exit_status);
+                    }
+                    Rx::Frame(bytes) => {
+                        let Ok(frame) = ServerFrame::decode(&bytes) else {
+                            continue;
+                        };
+                        st.last_heard = now_ms();
+                        if !heard {
+                            heard = true;
+                            if st.notify.message().starts_with("Nothing received") {
+                                st.notify.set_message("", false, now_ms());
+                            }
+                        }
+                        if process_frame(st, &frame) {
+                            send_now = true;
+                        }
+                    }
+                    Rx::Datagram(payload) => {
                         let Ok(frag) = sync::Fragment::from_bytes(&payload) else {
                             continue;
                         };
@@ -1179,9 +1337,6 @@ fn drive_client(st: &mut ClientState, raw: &RawMode, port: u16) -> Result<i32> {
                             send_now = true; // ack the new state promptly
                         }
                     }
-                    Ok(None) => continue,
-                    Err(e) if e.kind() == std::io::ErrorKind::WouldBlock => break,
-                    Err(_) => break,
                 }
             }
         }
@@ -1295,36 +1450,41 @@ fn drive_client(st: &mut ClientState, raw: &RawMode, port: u16) -> Result<i32> {
         let predict_stats = st.predict.stats();
         st.stats.flush_client(
             now,
-            st.conn.srtt(),
-            st.conn.rto(),
-            st.conn.send_interval(),
+            st.wire.srtt(),
+            st.wire.rto(),
+            st.wire.send_interval(),
             predict_sample(&predict_stats),
             predict_stats.srtt_trigger,
-            st.conn.bytes_rx(),
-            st.conn.bytes_tx(),
+            st.wire.bytes_rx(),
+            st.wire.bytes_tx(),
         );
 
         let session_due = send_now
             || ((!st.outbox.is_empty() || st.flags != 0)
-                && now.saturating_sub(st.last_send) >= st.conn.rto())
+                && now.saturating_sub(st.last_send) >= st.wire.rto())
             || now.saturating_sub(st.last_send) >= HEARTBEAT_INTERVAL;
         // RFC 0011 §4.1 sender discipline: the pending session message (if
         // one is due) goes first, then the agent mux's instructions — which
         // also flow on message-less iterations. Baseline mode has no mux, so
         // this reduces to exactly the old send_message call.
         let session = session_due.then(|| encode_message(st));
-        for (chan, payload) in crate::remote::agent::iteration_sends(
-            session,
-            st.agent_mux.as_mut(),
-            now,
-            st.conn.rto(),
-        ) {
-            let wire = channel::seal_on(st.enveloped, chan, &payload);
-            for frag in st
-                .fragmenter
-                .make_fragments(&wire, sync::FRAGMENT_CONTENTS_MAX)
-            {
-                let _ = st.conn.send(&frag.to_bytes());
+        let rto = st.wire.rto();
+        for (chan, payload) in
+            crate::remote::agent::iteration_sends(session, st.agent_mux.as_mut(), now, rto)
+        {
+            match &mut st.wire {
+                Wire::Udp(c) => {
+                    let wire = channel::seal_on(st.enveloped, chan, &payload);
+                    for frag in st
+                        .fragmenter
+                        .make_fragments(&wire, sync::FRAGMENT_CONTENTS_MAX)
+                    {
+                        let _ = c.send(&frag.to_bytes());
+                    }
+                }
+                // The mux path has no agent mux (the endpoint owns agent
+                // forwarding), so this is exactly the session message.
+                Wire::Mux(t) => t.send_msg(&payload),
             }
         }
 
@@ -1720,7 +1880,7 @@ fn process_frame(st: &mut ClientState, frame: &ServerFrame) -> bool {
         st.stats.record_input_ms(now.saturating_sub(queued));
     }
     st.predict
-        .on_server_frame(frame.input_ack, frame.echo_ack, st.conn.send_interval());
+        .on_server_frame(frame.input_ack, frame.echo_ack, st.wire.send_interval());
     // Remote PTY echo state for the optimistic-echo gate (FDR 0006).
     st.echo_on = frame.flags & sync::FLAG_ECHO != 0;
     // Server debug-logging state for the palette's "Server debug logging" label (#3).
@@ -2162,9 +2322,9 @@ fn compose_frame(st: &mut ClientState, now: u64) -> Vec<u8> {
     if is_gp_species(st.predict_model) {
         let mut metrics = predict::gather_client_local(&base);
         metrics.fill_transport(
-            st.conn.srtt(),
-            st.conn.rto() as f64,
-            st.conn.send_interval() as f64,
+            st.wire.srtt(),
+            st.wire.rto() as f64,
+            st.wire.send_interval() as f64,
             st.outbox.pending().len() as f64,
         );
         // Render headroom from the most recent event-loop iteration + frame
@@ -2407,14 +2567,21 @@ fn encode_message(st: &mut ClientState) -> Vec<u8> {
 fn send_message(st: &mut ClientState) {
     // RFC 0011 §1/§2 (enveloped mode only): the session-channel envelope is
     // prepended ABOVE fragmentation, once per instruction. Baseline mode
-    // sends the encoded message byte-identically.
+    // sends the encoded message byte-identically. The mux path relays the
+    // whole encoded message over IPC — sealing and fragmentation are the
+    // daemon's job on its wire channel.
     let encoded = encode_message(st);
-    let wire = channel::seal_instruction(st.enveloped, &encoded);
-    for frag in st
-        .fragmenter
-        .make_fragments(&wire, sync::FRAGMENT_CONTENTS_MAX)
-    {
-        let _ = st.conn.send(&frag.to_bytes());
+    match &mut st.wire {
+        Wire::Udp(c) => {
+            let wire = channel::seal_instruction(st.enveloped, &encoded);
+            for frag in st
+                .fragmenter
+                .make_fragments(&wire, sync::FRAGMENT_CONTENTS_MAX)
+            {
+                let _ = c.send(&frag.to_bytes());
+            }
+        }
+        Wire::Mux(t) => t.send_msg(&encoded),
     }
 }
 
@@ -3288,7 +3455,7 @@ mod tests {
         let key = Key::random();
         let conn = Connection::client("127.0.0.1:9".parse().unwrap(), &key).unwrap();
         ClientState {
-            conn,
+            wire: Wire::Udp(conn),
             fragmenter: Fragmenter::new(),
             enveloped: false,
             outbox: InputOutbox::new(),

@@ -507,6 +507,38 @@ fn cmd_ssh_session(
         };
         return remote::sshwrap::run_detached(&dest, &inner, &opts);
     }
+    // M2 session sharing (POSH_MUX_SESSIONS, opt-in): the attach rides the
+    // mux daemon's one connection as a session channel — no ssh bootstrap,
+    // no per-invocation transport; agent forwarding stays the endpoint's.
+    // Any failure (endpoint unreachable, open refused, transport error)
+    // falls THROUGH to the unchanged per-invocation path below, which
+    // re-ensures the endpoint for M1 agent ownership on its own — so a
+    // failed session open never strands forwarding. Forwarding-off
+    // invocations skip (the endpoint spawn is keyed to an agent source);
+    // they keep per-invocation connections until a later increment.
+    if remote::mux::mux_selected() && remote::mux::mux_sessions_selected() {
+        if let Some(source) = resolve_agent_source(forward_flag) {
+            let target =
+                group.map_or_else(|| session.clone(), |g| format!("{g}/{session}"));
+            match remote::mux::ensure_mux(&dest, Family::Auto, None, &source)
+                .and_then(|handle| handle.open_session(&target))
+            {
+                Ok(transport) => {
+                    return match remote::client::run_over_mux(transport, &dest) {
+                        Ok(0) => Ok(()),
+                        Ok(code) => std::process::exit(code),
+                        Err(e) => Err(e),
+                    };
+                }
+                Err(e) => {
+                    eprintln!(
+                        "posh: mux session unavailable ({e}); falling back to a \
+                         per-invocation connection"
+                    );
+                }
+            }
+        }
+    }
     // Foreground roaming attach. Resolve agent forwarding (flag > env >
     // default-on), then the mux gate (POSH_MUX, default ON since the FDR
     // 0014 promotion; `=0` opts out): when selected AND forwarding resolved
