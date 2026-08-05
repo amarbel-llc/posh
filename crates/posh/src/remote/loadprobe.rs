@@ -636,7 +636,7 @@ pub fn run_loaded_mux(
         for (chan, payload) in session_payloads
             .into_iter()
             .map(|p| (SESSION_CHANNEL, p))
-            .chain(agent_out.into_iter())
+            .chain(agent_out)
         {
             if chan.kind() == KIND_AGENT {
                 if let Ok(p) = AgentPayload::decode(&payload) {
