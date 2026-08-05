@@ -1447,23 +1447,62 @@ fn mux_loop(
         // retransmits until confirmed, pending closes on the RTO cadence),
         // then the heartbeat, then agent instructions.
         let now = now_ms();
+        let mut expired: Vec<u64> = Vec::new();
         for c in &mut conns {
             if let Some(s) = c.session.as_mut() {
-                if !s.confirmed
-                    && s.open_sends < SESSION_OPEN_RETRANSMITS_MAX
-                    && s.last_open_send
+                if !s.confirmed {
+                    if s.open_sends >= SESSION_OPEN_RETRANSMITS_MAX {
+                        // Exhausted: the remote never answered (dead peer,
+                        // or a pre-M2 remote that ignores session
+                        // channels). Surface the failure instead of
+                        // retransmitting-then-hanging forever.
+                        expired.push(c.conn_id);
+                        continue;
+                    }
+                    if s.last_open_send
                         .is_none_or(|t| now.saturating_sub(t) >= conn.rto())
-                {
-                    s.open_sends += 1;
-                    s.last_open_send = Some(now);
-                    let (chan, target) = (s.chan, s.target.clone());
-                    send_session_wire(
-                        &mut conn,
-                        &mut fragmenter,
-                        chan,
-                        SESSION_WIRE_OPEN,
-                        &target,
-                    );
+                    {
+                        s.open_sends += 1;
+                        s.last_open_send = Some(now);
+                        let (chan, target) = (s.chan, s.target.clone());
+                        send_session_wire(
+                            &mut conn,
+                            &mut fragmenter,
+                            chan,
+                            SESSION_WIRE_OPEN,
+                            &target,
+                        );
+                    }
+                }
+            }
+        }
+        // Exhausted opens: tell the client (SessionClose ⇒ its fallback
+        // cue), free the channel slot and ref, and owe the wire a CLOSE in
+        // case the remote half-opened. Exactly the wire-CLOSE teardown,
+        // driven by timeout instead of an answer.
+        for id in expired {
+            let Some(c) = conns.iter_mut().find(|c| c.conn_id == id) else {
+                continue;
+            };
+            let Some(s) = c.session.take() else { continue };
+            routes.remove(&s.chan);
+            pending_closes.push(PendingClose {
+                chan: s.chan,
+                payload: Vec::new(),
+                sends: 0,
+                last_send: None,
+            });
+            let close = MuxSessionClose {
+                remote: true,
+                payload: b"session open timed out (no answer from the remote peer)".to_vec(),
+            };
+            let _ = send_mux_frame(c, MuxTag::SessionClose, &close.encode());
+            if c.holds_ref {
+                c.holds_ref = false;
+                let was = state.serviceable();
+                state.unref(now);
+                if was && !state.serviceable() {
+                    agent_mux.queue_records(&proxy.close_all());
                 }
             }
         }
@@ -1611,6 +1650,7 @@ impl MuxHandle {
                     srtt_ms: 0,
                     bytes_tx: 0,
                     bytes_rx: 0,
+                    established: false,
                 })
             }
             Some(MuxSessionOpenAck::Refused { reason }) => {
@@ -1642,6 +1682,11 @@ pub struct MuxSessionTransport {
     srtt_ms: u32,
     bytes_tx: u64,
     bytes_rx: u64,
+    /// At least one frame arrived: the channel reached the remote daemon.
+    /// A close BEFORE this is a failed establishment (remote refusal, dead
+    /// peer, open timeout) — the client's per-invocation fallback cue, as
+    /// opposed to a genuine session ending.
+    established: bool,
 }
 
 impl MuxSessionTransport {
@@ -1667,6 +1712,7 @@ impl MuxSessionTransport {
                     MuxTag::SessionFrame => {
                         if let Some((srtt, body)) = decode_session_frame(&frame.payload) {
                             self.srtt_ms = srtt;
+                            self.established = true;
                             return Some(MuxSessionEvent::Frame(body.to_vec()));
                         }
                     }
@@ -1693,6 +1739,12 @@ impl MuxSessionTransport {
                 Err(_) => return Some(MuxSessionEvent::Closed(Vec::new())),
             }
         }
+    }
+
+    /// Whether any frame ever arrived — a close before this is a failed
+    /// establishment, not a session ending.
+    pub fn established(&self) -> bool {
+        self.established
     }
 
     /// The connection's smoothed RTT as last hinted by a frame (ms).

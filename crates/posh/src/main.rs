@@ -524,11 +524,21 @@ fn cmd_ssh_session(
                 .and_then(|handle| handle.open_session(&target))
             {
                 Ok(transport) => {
-                    return match remote::client::run_over_mux(transport, &dest) {
-                        Ok(0) => Ok(()),
+                    match remote::client::run_over_mux(transport, &dest) {
+                        Ok(0) => return Ok(()),
                         Ok(code) => std::process::exit(code),
-                        Err(e) => Err(e),
-                    };
+                        // A close BEFORE any frame arrived: the remote
+                        // refused/failed the channel after the local grant
+                        // — fall through to the per-invocation path, like
+                        // every other establishment failure.
+                        Err(e) if e.to_string().contains("before establishing") => {
+                            eprintln!(
+                                "posh: mux session unavailable ({e}); falling back \
+                                 to a per-invocation connection"
+                            );
+                        }
+                        Err(e) => return Err(e),
+                    }
                 }
                 Err(e) => {
                     eprintln!(

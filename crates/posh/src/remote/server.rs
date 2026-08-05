@@ -224,6 +224,20 @@ fn connect_named_daemon(target: &str) -> Result<std::os::unix::net::UnixStream> 
 /// the local mux daemon so the common refusal happens on the unix hop.
 pub(crate) const MAX_SESSION_CHANNELS: usize = 16;
 
+/// An Empty `ServerFrame` carrying only acks — the session kind's ack
+/// vehicle (relay.rs::send_empty's shape, per channel): the OPEN
+/// confirmation and the prompt input ack are both this frame.
+fn empty_ack_frame(frame_num: u64, ack: u64) -> crate::remote::sync::ServerFrame {
+    crate::remote::sync::ServerFrame {
+        flags: 0,
+        caps: caps::own_table(&[]),
+        frame_num,
+        input_ack: ack,
+        echo_ack: ack,
+        body: crate::remote::sync::FrameBody::Empty,
+    }
+}
+
 /// One session channel's bridge in the M2 channel table: the §3 relay
 /// contract's per-session state (DaemonLink + one held frame + the reliable
 /// input inbox), instantiated per channel instead of per process.
@@ -417,15 +431,23 @@ pub(crate) fn mux_peer_loop(
         // owed input acks as Empty frames. Runs BEFORE the agent drain
         // below, which keeps §4.1's session-before-agent ordering
         // structural. Removals collect and apply after the sweep.
+        // Signalled bridges are keyed by RAW FD, not index — the recv phase
+        // above may have removed channels, shifting indices out of
+        // alignment with the fds snapshot taken at poll time.
+        let signalled_bridges: std::collections::HashSet<std::os::unix::io::RawFd> = fds
+            [bridge_base..bridge_base + n_bridges.min(fds.len() - bridge_base)]
+            .iter()
+            .filter(|p| {
+                p.fd >= 0 && p.revents & (libc::POLLIN | libc::POLLHUP | libc::POLLERR) != 0
+            })
+            .map(|p| p.fd)
+            .collect();
         let now = now_ms();
         let mut closed: Vec<(usize, Vec<u8>)> = Vec::new();
         for (i, chp) in channels.iter_mut().enumerate() {
             let PeerChannel::Linked(b) = chp else { continue };
             let fd = b.link.stream.as_raw_fd();
-            let signalled = (i < n_bridges)
-                && fds[bridge_base + i].revents
-                    & (libc::POLLIN | libc::POLLHUP | libc::POLLERR)
-                    != 0;
+            let signalled = signalled_bridges.contains(&fd);
             let mut eof = false;
             if signalled {
                 match b.link.read.read_from(fd) {
@@ -482,10 +504,15 @@ pub(crate) fn mux_peer_loop(
                 }
             }
             if !b.link.write.is_empty() {
-                if util::write_all_retry(fd, &b.link.write, 100).is_ok() {
-                    b.link.write.clear();
-                } else {
-                    eof = true;
+                // Non-blocking drain: a wedged daemon socket must not stall
+                // the whole sweep (head-of-line across every channel + agent
+                // service). Partial writes stay buffered; POLLOUT re-wakes
+                // the loop to finish.
+                match util::write_all_retry(fd, &b.link.write, 0) {
+                    Ok(n) => {
+                        b.link.write.drain(..n);
+                    }
+                    Err(_) => eof = true,
                 }
             }
             if b.held.is_held()
@@ -505,17 +532,8 @@ pub(crate) fn mux_peer_loop(
             }
             if b.ack_due && conn.has_remote() {
                 // An owed input ack with no visible frame to carry it: an
-                // Empty frame drains the client's input outbox promptly
-                // (relay.rs::send_empty's role, per channel).
-                let ack = b.inbox.next_offset();
-                let empty = crate::remote::sync::ServerFrame {
-                    flags: 0,
-                    caps: caps::own_table(&[]),
-                    frame_num: b.last_frame_num,
-                    input_ack: ack,
-                    echo_ack: ack,
-                    body: crate::remote::sync::FrameBody::Empty,
-                };
+                // Empty frame drains the client's input outbox promptly.
+                let empty = empty_ack_frame(b.last_frame_num, b.inbox.next_offset());
                 crate::remote::mux::send_session_wire(
                     &mut conn,
                     &mut fragmenter,
@@ -602,14 +620,7 @@ fn handle_session_instruction(
             // hears on the identifier. Without this, the two ends deadlock
             // — the local daemon queues messages until confirmed, and this
             // peer has nothing to send until a message arrives.
-            let confirm = crate::remote::sync::ServerFrame {
-                flags: 0,
-                caps: caps::own_table(&[]),
-                frame_num: 0,
-                input_ack: 0,
-                echo_ack: 0,
-                body: crate::remote::sync::FrameBody::Empty,
-            };
+            let confirm = empty_ack_frame(0, 0);
             send_session_wire(conn, fragmenter, chan, SESSION_WIRE_DATA, &confirm.encode());
         }
         Some(&SESSION_WIRE_DATA) => {

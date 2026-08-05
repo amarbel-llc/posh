@@ -637,19 +637,7 @@ pub fn run(
     std::env::remove_var("POSH_KEY");
     let key = Key::from_base64(key_str.trim())?;
 
-    // Model selection: $POSH_PREDICTION_MODEL, falling back to the deprecated
-    // $POSH_PREDICTION alias. Render style: $POSH_PREDICTION_RENDER (default
-    // replace).
-    let model_env = std::env::var("POSH_PREDICTION_MODEL")
-        .ok()
-        .or_else(|| std::env::var("POSH_PREDICTION").ok());
-    let model = PredictionModel::parse(model_env.as_deref()).map_err(Error::Msg)?;
-    let render_env = std::env::var("POSH_PREDICTION_RENDER").ok();
-    let render = RenderStyle::parse(render_env.as_deref()).map_err(Error::Msg)?;
-    let predict_overwrite = std::env::var("POSH_PREDICTION_OVERWRITE")
-        .map(|v| !v.is_empty())
-        .unwrap_or(false);
-    let grab_mouse = GrabMouse::parse(std::env::var("POSH_GRAB_MOUSE").ok().as_deref())?;
+    let (model, render, predict_overwrite, grab_mouse) = client_env_config()?;
 
     let addr = resolve(host, port, family)?;
     let conn = Connection::client(addr, &key)?;
@@ -702,16 +690,7 @@ pub fn run_over_mux(
     host: &str,
 ) -> Result<i32> {
     util::check_utf8_locale("posh-client")?;
-    let model_env = std::env::var("POSH_PREDICTION_MODEL")
-        .ok()
-        .or_else(|| std::env::var("POSH_PREDICTION").ok());
-    let model = PredictionModel::parse(model_env.as_deref()).map_err(Error::Msg)?;
-    let render_env = std::env::var("POSH_PREDICTION_RENDER").ok();
-    let render = RenderStyle::parse(render_env.as_deref()).map_err(Error::Msg)?;
-    let predict_overwrite = std::env::var("POSH_PREDICTION_OVERWRITE")
-        .map(|v| !v.is_empty())
-        .unwrap_or(false);
-    let grab_mouse = GrabMouse::parse(std::env::var("POSH_GRAB_MOUSE").ok().as_deref())?;
+    let (model, render, predict_overwrite, grab_mouse) = client_env_config()?;
 
     util::install_client_signal_handlers();
     util::install_sigusr2_handler();
@@ -733,6 +712,25 @@ pub fn run_over_mux(
     drop(raw);
     eprintln!("\nposh: [client exited]");
     result
+}
+
+/// The client's env-driven configuration, shared by both entry points
+/// (`run` and `run_over_mux`) so a new knob can never drift between them.
+/// Model selection: $POSH_PREDICTION_MODEL, falling back to the deprecated
+/// $POSH_PREDICTION alias. Render style: $POSH_PREDICTION_RENDER (default
+/// replace).
+fn client_env_config() -> Result<(PredictionModel, RenderStyle, bool, GrabMouse)> {
+    let model_env = std::env::var("POSH_PREDICTION_MODEL")
+        .ok()
+        .or_else(|| std::env::var("POSH_PREDICTION").ok());
+    let model = PredictionModel::parse(model_env.as_deref()).map_err(Error::Msg)?;
+    let render_env = std::env::var("POSH_PREDICTION_RENDER").ok();
+    let render = RenderStyle::parse(render_env.as_deref()).map_err(Error::Msg)?;
+    let predict_overwrite = std::env::var("POSH_PREDICTION_OVERWRITE")
+        .map(|v| !v.is_empty())
+        .unwrap_or(false);
+    let grab_mouse = GrabMouse::parse(std::env::var("POSH_GRAB_MOUSE").ok().as_deref())?;
+    Ok((model, render, predict_overwrite, grab_mouse))
 }
 
 /// `pub(crate)` so the mux daemon (remote::mux, M1 Task 3) resolves its
@@ -1317,10 +1315,14 @@ fn drive_client(st: &mut ClientState, raw: &RawMode, port: u16) -> Result<i32> {
                     Rx::Dry => break,
                     Rx::Dead => break,
                     Rx::Closed(payload) => {
-                        // The mux channel is over: the remote daemon exited
-                        // or the endpoint tore down. The session (if any)
-                        // survives in its daemon; this attach ends like a
-                        // server-side shutdown.
+                        // The mux channel is over. If it ESTABLISHED (a
+                        // frame ever arrived), the remote daemon exited or
+                        // the endpoint tore down — the session survives in
+                        // its daemon and this attach ends like a
+                        // server-side shutdown. A close BEFORE any frame is
+                        // a failed establishment (remote refusal, dead
+                        // peer, open timeout): an Err, so the caller runs
+                        // its per-invocation fallback instead of exiting 0.
                         if !payload.is_empty() {
                             util::log_write(
                                 "info",
@@ -1329,6 +1331,16 @@ fn drive_client(st: &mut ClientState, raw: &RawMode, port: u16) -> Result<i32> {
                                     String::from_utf8_lossy(&payload)
                                 ),
                             );
+                        }
+                        let established = match &st.wire {
+                            Wire::Mux(t) => t.established(),
+                            Wire::Udp(_) => true,
+                        };
+                        if !established {
+                            break 'client Err(Error::Msg(format!(
+                                "mux session closed before establishing: {}",
+                                String::from_utf8_lossy(&payload)
+                            )));
                         }
                         break 'client Ok(st.exit_status);
                     }
@@ -3145,7 +3157,7 @@ mod tests {
             off.iter().any(|n| n == "Enable scroll-region optimization"),
             "scroll-opt enable command missing when off: {off:?}"
         );
-        assert_eq!(arr.len(), 18, "expected 18 commands, got {names:?}");
+        assert_eq!(arr.len(), 19, "expected 19 commands, got {names:?}");
     }
 
     #[test]
