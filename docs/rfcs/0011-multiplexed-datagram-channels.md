@@ -414,12 +414,37 @@ This document weakens that premise. One connection now carries agent traffic,
 scrollback, and an arbitrary number of sessions — materially more bulk-shaped
 than one terminal.
 
-This document does not specify congestion control. Implementations MUST NOT read
-that silence as a determination that none is required; the question is open, and
-"deliberately none, because ..." is a valid resolution that has not yet been
-made.
+**RESOLVED 2026-08-05, by measurement** (`just debug-mux-load`, the
+`remote/loadprobe.rs` harness: real transport through an in-process
+delay/loss/bottleneck-queue relay; posh#143). Congestion control is
+REQUIRED — the silence would have shipped collapse:
 
-Tracked as posh#143.
+- On a clean uncongested path the §4.1/§5 machinery is ack-clocked and
+  benign: measured 2,476 KB/s against the analytic 8×32 KiB-per-RTT
+  ceiling, retransmit ratio 1.008. The hard bounds ARE what clocks
+  throughput there.
+- On a constrained path (1 Mbit/s, 64 KiB bottleneck queue, 150 ms, 1%
+  loss) the fixed-rate re-offer of every channel's unacked window
+  collapses the link: 27% utilization (34 KB/s of 125 KB/s), retransmit
+  ratio 10×, thousands of queue drops, RTO pinned at its clamp. With a
+  large queue instead (512 KiB, no loss) the same load builds
+  multi-second standing queues: srtt median 1.7 s, session-frame p50
+  latency 4.1 s.
+- Offered load does not respond to loss at all: constant offered bytes
+  measured at 0%, 2%, and 5% loss (retransmit ratio 1.0 → 2.3 → 5.1).
+
+A conforming sender therefore MUST bound its aggregate re-offer rate
+under congestion: exponential backoff of the per-channel retransmission
+interval across consecutive unacked RTOs, and a per-connection bound on
+aggregate unacked bytes in flight, reduced multiplicatively on RTO
+expiry and restored additively on clean RTTs (AIMD over the existing
+RTT-paced sending). This is unilateral sender policy — no wire change,
+no `ver` bump. Constants are implementation-chosen (the RFC 0007
+evolutionary metric-vector machinery is a candidate tuning path for
+them); the measurements above, reproducible via `just debug-mux-load`,
+are the regression bar. Implementation is tracked separately from this
+resolution and gates M2 (the design doc's milestone gate now reads on
+the mechanism existing, not merely on this decision being recorded).
 
 #### 9.3 Flow control
 
@@ -430,11 +455,23 @@ REQUIRED for it.
 
 They are not backpressure. There is no credit or window mechanism at either the
 channel or the connection level, so a sender that outpaces a receiver has its
-channel refused rather than slowed. Whether the multiplexed connection needs
-real flow control, or whether hard bounds plus the existing coalescing
-capability suffice, is an open decision coupled to §9.2.
+channel refused rather than slowed.
 
-Tracked as posh#144.
+**RESOLVED 2026-08-05, by measurement (posh#144): deliberately no
+credit/window mechanism, conditional on the §9.2 response.** The
+§3.4/§4 hard bounds are the normative backpressure statement: the
+`agent` kind's 8-channel × 32 KiB-per-instruction cumulative windows
+bound per-connection in-flight to ≤256 KiB plus the pending session
+frames, and the clean-path baseline confirms that bound is exactly what
+clocks throughput. The measured session-frame degradation under load
+(delivery 96% → 74%, p50 latency 188 ms → ~390 ms as agent bulk
+saturates a constrained link at 1–8 sessions) is driven by the §9.2
+uncontrolled re-offer flooding the shared bottleneck queue — sender-side
+§4.1 ordering cannot help once the contention is in the network queue —
+not by missing receiver credit. Re-measure with the same harness after
+the §9.2 mechanism lands; this resolution is REOPENED if session-frame
+latency under load does not then recover. A future credit mechanism
+remains fenced behind §9.1 (a `ver` bump or new kind).
 
 #### 9.4 Key update
 
@@ -568,11 +605,13 @@ mechanism is best designed against whatever handshake replaces it.
   later increment touches the envelope again. Closing posh#136, however, takes
   the first increment AND the one-connection-per-client-host property, i.e. the
   #54 mux endpoint: until connections are shared, enveloped connections keep the
-  FDR 0004 election (§7) and the posh#136 window persists. And additional
-  `session` channels (the #54 connection sharing itself) MUST NOT ship before
-  the §9.2/§9.3 congestion and flow-control decisions (posh#143, posh#144) are
-  resolved — one session plus agent traffic matches today's load; N sessions on
-  one connection is the shape that voids the no-congestion-control premise.
+  FDR 0004 election (§7) and the posh#136 window persists. The §9.2/§9.3
+  decisions gating additional `session` channels were RESOLVED 2026-08-05 by
+  measurement (see those sections): §9.3 needs no mechanism, but §9.2 requires
+  a sender-side congestion response — so additional `session` channels (the
+  #54 connection sharing itself) MUST NOT ship before that response is
+  IMPLEMENTED, not merely decided; N sessions on one connection is exactly the
+  measured collapse shape.
 - Future channel kinds MUST use a RESERVED kind value; future envelope fields
   MUST use a `ver` bump. Neither may be added ad hoc.
 
@@ -601,7 +640,9 @@ Informative:
   enables, closed as a decision without an implementation.
 - github #103: host-global agent rendezvous — out of scope here; §8 is the
   nearest boundary.
-- posh#142, posh#143, posh#144, posh#145: the §9.1 / §9.2 / §9.3 / §9.4
-  deferred mechanisms.
+- posh#142, posh#145: the §9.1 / §9.4 deferred mechanisms. posh#143 and
+  posh#144 (§9.2 / §9.3) were RESOLVED 2026-08-05 by the `remote/loadprobe.rs`
+  measurements; the §9.2 sender-side congestion response is tracked as its own
+  implementation issue and gates M2.
 - posh#146: a 0-RTT handshake fastpath — not a concern of this document, but
   the prerequisite for §9.4's key update.
