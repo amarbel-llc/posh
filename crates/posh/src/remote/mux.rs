@@ -103,6 +103,19 @@ pub fn mux_selected() -> bool {
     parse_mux_gate(std::env::var("POSH_MUX").ok().as_deref())
 }
 
+/// The M2 session-sharing gate: OPT-IN (`POSH_MUX_SESSIONS`, the
+/// `POSH_CHANNELS` truthy shape — NOT the default-on off-switch), per the
+/// 2026-08-05 design revision's rollout arc. Off (the default) keeps the
+/// per-invocation relay attach byte-identical; on, a `host:session` attach
+/// rides the mux daemon's connection as a session channel, falling back
+/// per-invocation on any failure. Promotion to default-on is a later dated
+/// decision.
+pub fn mux_sessions_selected() -> bool {
+    std::env::var("POSH_MUX_SESSIONS")
+        .map(|v| crate::remote::sshwrap::env_value_on(&v))
+        .unwrap_or(false)
+}
+
 /// Maps every byte outside `[A-Za-z0-9._-]` to `-`. The one sanitizer behind
 /// both [`dest_key`] and [`client_id`], pure so it is testable without env
 /// mutation.
@@ -1539,8 +1552,13 @@ const PROBE_RETRY_DELAY: std::time::Duration = std::time::Duration::from_millis(
 /// auto-unref on disconnect) — there is no explicit release verb, so a
 /// crashed client can never pin the refcount.
 pub struct MuxHandle {
-    /// Held, never read after the handshake: closing it is the unref.
-    _conn: UnixStream,
+    /// The IPC connection. Idle after the handshake on the agent-only (M1)
+    /// path — closing it is the unref — and the session transport on the
+    /// M2 path after [`open_session`](Self::open_session).
+    conn: UnixStream,
+    /// Frame reassembly for the post-handshake protocol (M2 session
+    /// traffic); carries any bytes read past the acks.
+    buf: MuxFrameBuffer,
     state: MuxConnState,
     key: String,
     /// `Some(daemon's source)` when the endpoint forwards a DIFFERENT local
@@ -1567,6 +1585,137 @@ impl MuxHandle {
     /// forwarding ITS source either way — the caller's job is to warn.
     pub fn source_mismatch(&self) -> Option<&Path> {
         self.source_mismatch.as_deref()
+    }
+
+    /// M2: opens this invocation's session channel to `target` over the
+    /// handle's IPC connection, consuming the handle into the
+    /// [`MuxSessionTransport`] the client loop drives. A refusal or timeout
+    /// is an `Err` — the caller's cue to fall back to a per-invocation
+    /// connection (the handle is gone either way; the fallback path re-runs
+    /// `apply_mux_gate` semantics on its own connection).
+    pub fn open_session(mut self, target: &str) -> Result<MuxSessionTransport> {
+        use std::io::Write;
+        self.conn
+            .write_all(&encode_mux_frame(MuxTag::SessionOpen, target.as_bytes()))?;
+        let frame = await_frame(
+            &mut self.conn,
+            &mut self.buf,
+            HELLO_TIMEOUT,
+            MuxTag::SessionOpenAck,
+        )?;
+        match MuxSessionOpenAck::decode(&frame.payload) {
+            Some(MuxSessionOpenAck::Granted { .. }) => {
+                self.conn.set_nonblocking(true)?;
+                Ok(MuxSessionTransport {
+                    handle: self,
+                    srtt_ms: 0,
+                    bytes_tx: 0,
+                    bytes_rx: 0,
+                })
+            }
+            Some(MuxSessionOpenAck::Refused { reason }) => {
+                Err(util::Error::Msg(format!("mux session refused: {reason}")))
+            }
+            None => Err(util::Error::from("mux session ack malformed")),
+        }
+    }
+}
+
+/// What one [`MuxSessionTransport::next_event`] poll surfaced.
+#[derive(Debug, PartialEq, Eq)]
+pub enum MuxSessionEvent {
+    /// One whole encoded `ServerFrame` (the srtt hint already consumed).
+    Frame(Vec<u8>),
+    /// The channel closed (remote daemon exit / endpoint teardown); the
+    /// payload is the exit-status path's bytes, possibly empty.
+    Closed(Vec<u8>),
+}
+
+/// The M2 client-side transport: whole assembled messages over the mux IPC
+/// socket, in place of a per-invocation UDP connection. Pacing numbers come
+/// from the srtt hint each `SessionFrame` carries (the foreground process no
+/// longer owns a socket to measure), shaped by the same clamps as
+/// `datagram.rs` so the prediction engine and send cadence behave
+/// identically.
+pub struct MuxSessionTransport {
+    handle: MuxHandle,
+    srtt_ms: u32,
+    bytes_tx: u64,
+    bytes_rx: u64,
+}
+
+impl MuxSessionTransport {
+    pub fn raw_fd(&self) -> std::os::unix::io::RawFd {
+        self.handle.conn.as_raw_fd()
+    }
+
+    /// Sends one encoded `ClientMessage` as a `SessionMsg` frame.
+    pub fn send_msg(&mut self, message: &[u8]) {
+        use std::io::Write;
+        let frame = encode_mux_frame(MuxTag::SessionMsg, message);
+        self.bytes_tx += frame.len() as u64;
+        let _ = self.handle.conn.write_all(&frame);
+    }
+
+    /// Drains the (non-blocking) socket and returns the next event, `None`
+    /// when the socket runs dry. A dead daemon surfaces as `Closed`.
+    pub fn next_event(&mut self) -> Option<MuxSessionEvent> {
+        use std::io::Read;
+        loop {
+            match self.handle.buf.next() {
+                Ok(Some(frame)) => match frame.tag {
+                    MuxTag::SessionFrame => {
+                        if let Some((srtt, body)) = decode_session_frame(&frame.payload) {
+                            self.srtt_ms = srtt;
+                            return Some(MuxSessionEvent::Frame(body.to_vec()));
+                        }
+                    }
+                    MuxTag::SessionClose => {
+                        let payload = MuxSessionClose::decode(&frame.payload)
+                            .map(|c| c.payload)
+                            .unwrap_or_default();
+                        return Some(MuxSessionEvent::Closed(payload));
+                    }
+                    _ => {}
+                },
+                Ok(None) => {}
+                Err(_) => return Some(MuxSessionEvent::Closed(Vec::new())),
+            }
+            let mut tmp = [0u8; 4096];
+            match self.handle.conn.read(&mut tmp) {
+                Ok(0) => return Some(MuxSessionEvent::Closed(Vec::new())),
+                Ok(n) => {
+                    self.bytes_rx += n as u64;
+                    self.handle.buf.feed(&tmp[..n]);
+                }
+                Err(e) if e.kind() == std::io::ErrorKind::WouldBlock => return None,
+                Err(e) if e.kind() == std::io::ErrorKind::Interrupted => {}
+                Err(_) => return Some(MuxSessionEvent::Closed(Vec::new())),
+            }
+        }
+    }
+
+    /// The connection's smoothed RTT as last hinted by a frame (ms).
+    pub fn srtt(&self) -> f64 {
+        self.srtt_ms as f64
+    }
+
+    /// The RTO analog, `datagram.rs`'s clamp shape over the hinted srtt.
+    pub fn rto(&self) -> u64 {
+        ((self.srtt_ms as u64).saturating_mul(2)).clamp(50, 1000)
+    }
+
+    /// mosh's send interval over the hinted srtt (`datagram.rs` clamps).
+    pub fn send_interval(&self) -> u64 {
+        ((self.srtt_ms as f64 / 2.0).ceil() as u64).clamp(20, 250)
+    }
+
+    pub fn bytes_tx(&self) -> u64 {
+        self.bytes_tx
+    }
+
+    pub fn bytes_rx(&self) -> u64 {
+        self.bytes_rx
     }
 }
 
@@ -1824,7 +1973,8 @@ fn claim_ref(
     await_frame(&mut stream, &mut buf, timeout, MuxTag::RefAck)?;
     let source_mismatch = (ack.source != local_source).then_some(ack.source);
     Ok(MuxHandle {
-        _conn: stream,
+        conn: stream,
+        buf,
         state: ack.state,
         key: ack.key,
         source_mismatch,
@@ -2877,6 +3027,102 @@ mod tests {
     }
 
     #[test]
+    fn mux_sessions_gate_is_opt_in() {
+        use crate::remote::sshwrap::env_value_on;
+        // The M2 rollout gate deliberately takes the POSH_CHANNELS opt-IN
+        // truthy shape, NOT the promoted default-on off-switch (no env
+        // mutation: the predicate is pinned directly).
+        for v in ["1", "true", "on", "yes"] {
+            assert!(env_value_on(v), "{v:?} must select mux sessions");
+        }
+        for v in ["", "0", "false", "off", "no", "2"] {
+            assert!(!env_value_on(v), "{v:?} must leave the opt-in gate off");
+        }
+    }
+
+    #[test]
+    fn open_session_grants_and_transports_frames() {
+        use std::io::Write as _;
+        let dir = temp_base();
+        let (daemon, mut server) = start_inprocess_daemon(&dir, "m2t", 1_000, (63630, 63639));
+        let mut spawn = |_: &str| -> Result<MuxSpawn> { panic!("daemon is live") };
+        let handle = ensure_mux_conn(
+            &dir,
+            "m2t",
+            &mut spawn,
+            std::time::Duration::from_secs(8),
+            &dir.join("no-agent.sock"),
+        )
+        .unwrap();
+        let mut t = handle.open_session("box:t").unwrap();
+        // The wire OPEN reaches the remote; a frame comes back through the
+        // transport with its body intact.
+        let mut assembly = sync::FragmentAssembly::new();
+        let mut fragmenter = sync::Fragmenter::new();
+        let (chan, m) = recv_wire_until(&mut server, &mut assembly, |c, m| {
+            c.kind() == channel::KIND_SESSION
+                && c != channel::SESSION_CHANNEL
+                && m.first() == Some(&SESSION_WIRE_OPEN)
+        });
+        assert_eq!(&m[1..], b"box:t");
+        send_wire(&mut server, &mut fragmenter, chan, SESSION_WIRE_DATA, b"frame-bytes");
+        let deadline = util::now_ms() + 8_000;
+        let ev = loop {
+            assert!(util::now_ms() < deadline, "transport never surfaced the frame");
+            if let Some(ev) = t.next_event() {
+                break ev;
+            }
+            std::thread::sleep(std::time::Duration::from_millis(5));
+        };
+        assert_eq!(ev, MuxSessionEvent::Frame(b"frame-bytes".to_vec()));
+        // A client message relays out as channel DATA.
+        t.send_msg(b"client-message");
+        let (_, m) = recv_wire_until(&mut server, &mut assembly, |c, m| {
+            c == chan && m.first() == Some(&SESSION_WIRE_DATA) && &m[1..] == b"client-message"
+        });
+        assert_eq!(&m[1..], b"client-message");
+        // Dropping the transport (the IPC conn) owes the wire a CLOSE.
+        drop(t);
+        recv_wire_until(&mut server, &mut assembly, |c, m| {
+            c == chan && m.first() == Some(&SESSION_WIRE_CLOSE)
+        });
+        daemon.join().unwrap();
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    #[test]
+    fn open_session_refusal_is_an_error() {
+        let dir = temp_base();
+        let (daemon, _server) = start_inprocess_daemon(&dir, "m2full", 1_000, (63640, 63649));
+        let path = mux_socket_path_in(&dir, "m2full");
+        // Fill the local table (MAX_LOCAL_SESSION_CHANNELS) with raw opens…
+        let mut held = Vec::new();
+        for i in 0..MAX_LOCAL_SESSION_CHANNELS {
+            let (s, _ord) = ipc_open_session(&path, format!("box:{i}").as_bytes());
+            held.push(s);
+        }
+        // …then the 17th, through the real client half, must Err — the
+        // fallback cue.
+        let mut spawn = |_: &str| -> Result<MuxSpawn> { panic!("daemon is live") };
+        let handle = ensure_mux_conn(
+            &dir,
+            "m2full",
+            &mut spawn,
+            std::time::Duration::from_secs(8),
+            &dir.join("no-agent.sock"),
+        )
+        .unwrap();
+        let err = match handle.open_session("box:overflow") {
+            Ok(_) => panic!("a full table must refuse"),
+            Err(e) => e.to_string(),
+        };
+        assert!(err.contains("refused"), "got: {err}");
+        drop(held);
+        daemon.join().unwrap();
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    #[test]
     fn split_dest_separates_the_optional_user() {
         assert_eq!(split_dest("example.com"), (None, "example.com"));
         assert_eq!(split_dest("me@example.com"), (Some("me"), "example.com"));
@@ -3318,7 +3564,8 @@ mod tests {
     fn fake_handle() -> MuxHandle {
         let (a, _b) = std::os::unix::net::UnixStream::pair().unwrap();
         MuxHandle {
-            _conn: a,
+            conn: a,
+            buf: MuxFrameBuffer::default(),
             state: MuxConnState::Connected,
             key: "k".to_string(),
             source_mismatch: None,
