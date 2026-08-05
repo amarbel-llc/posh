@@ -866,6 +866,25 @@ const TERM_RETRANSMITS: u32 = 4;
 /// long gone).
 const CLOSED_CHANNEL_MEMORY: usize = 256;
 
+/// RFC 0011 §9.2 (RESOLVED 2026-08-05, posh#155): the per-channel
+/// exponential-backoff cap on the retransmission interval. A channel whose
+/// re-offers go unacked across consecutive RTOs doubles its retx interval
+/// per streak step, up to `rto << 3` = 8× (≤8 s at the 1 s RTO clamp).
+/// Fresh state (`send_due` — new data, due acks, partial-ack progress) is
+/// NEVER delayed by backoff, and any ack progress resets the streak with a
+/// prompt resumption, so the cap trades dead-link reprobe latency for flood
+/// reduction only. Side effect, accepted: an unacked terminal's
+/// TERM_RETRANSMITS quota can stretch to ~15× rto before tombstoning (GC
+/// latency, not correctness — the tombstone re-answer still closes the
+/// 2-generals gap).
+const BACKOFF_SHIFT_MAX: u32 = 3;
+
+/// The §9.2 backed-off retransmission interval for a channel `streak`
+/// consecutive unacked RTOs deep. Pure so the pacing tests pin it directly.
+fn backed_off(rto: u64, streak: u32) -> u64 {
+    rto.saturating_mul(1u64 << streak.min(BACKOFF_SHIFT_MAX))
+}
+
 use crate::remote::channel::{
     AgentPayload, ChannelAllocator, ChannelId, Role, AGENT_FLAG_CLOSE, AGENT_FLAG_FAIL,
     AGENT_FLAG_OPEN, AGENT_INSTRUCTION_DATA_MAX, KIND_AGENT, SESSION_CHANNEL,
@@ -897,6 +916,11 @@ struct MuxChannel {
     /// as opposed to the RTO-paced retransmission of old state.
     send_due: bool,
     last_send: u64,
+    /// §9.2: consecutive retransmissions with no ack progress — the exponent
+    /// behind [`backed_off`]. Bumped only by the retx branch (never by
+    /// `send_due` emissions); reset to 0 when `outbox.base()` advances or the
+    /// peer confirms our OPEN.
+    retx_streak: u32,
 }
 
 impl MuxChannel {
@@ -911,6 +935,7 @@ impl MuxChannel {
             term_sends: 0,
             send_due: true,
             last_send: 0,
+            retx_streak: 0,
         }
     }
 }
@@ -1060,9 +1085,19 @@ impl AgentChannelMux {
         };
         let ch = &mut self.channels[idx];
         // Any instruction from the peer on this identifier proves our OPEN
-        // arrived (§3.3): it could only know the identifier from it.
+        // arrived (§3.3): it could only know the identifier from it — which
+        // also ends any OPEN-retx backoff streak (§9.2).
+        if ch.open_unconfirmed {
+            ch.retx_streak = 0;
+        }
         ch.open_unconfirmed = false;
+        let base_before = ch.outbox.base();
         ch.outbox.ack(p.recv_ack);
+        if ch.outbox.base() > base_before {
+            // Ack progress: the peer is receiving — the §9.2 backoff streak
+            // ends and re-offers resume at the plain RTO cadence.
+            ch.retx_streak = 0;
+        }
         if !ch.outbox.is_empty() {
             // A partially-acked tail (e.g. past the §4.1 per-instruction
             // bound): keep pumping promptly rather than waiting out the RTO.
@@ -1125,7 +1160,14 @@ impl AgentChannelMux {
             let unacked = !ch.outbox.is_empty();
             let term_unsettled = ch.term_flag.is_some() && ch.term_sends < TERM_RETRANSMITS;
             let wants_retx = unacked || ch.open_unconfirmed || term_unsettled;
-            if ch.send_due || (wants_retx && now.saturating_sub(ch.last_send) >= rto) {
+            // §9.2: retransmissions pace on the backed-off interval; fresh
+            // state (`send_due`) is never delayed by it.
+            let retx_fires =
+                wants_retx && now.saturating_sub(ch.last_send) >= backed_off(rto, ch.retx_streak);
+            if retx_fires && !ch.send_due {
+                ch.retx_streak = ch.retx_streak.saturating_add(1);
+            }
+            if ch.send_due || retx_fires {
                 let pending = ch.outbox.pending();
                 let take = pending.len().min(AGENT_INSTRUCTION_DATA_MAX);
                 let mut flags = 0u8;
@@ -1185,7 +1227,10 @@ impl AgentChannelMux {
                 || ch.open_unconfirmed
                 || (ch.term_flag.is_some() && ch.term_sends < TERM_RETRANSMITS);
             if wants {
-                fold(ch.last_send + rto);
+                // §9.2: the poll deadline mirrors the backed-off retx
+                // interval, or retransmissions would fire early off the
+                // caller's wakeup.
+                fold(ch.last_send + backed_off(rto, ch.retx_streak));
             }
         }
         due
@@ -2732,6 +2777,110 @@ mod tests {
             mux_s.on_instruction(id, &wire);
         }
         assert!(mux_s.outgoing(10_000, 50).is_empty());
+    }
+
+    /// §9.2: consecutive unacked retransmissions double the retx interval
+    /// (rto ≪ streak) up to the 8× cap — the flood-reduction half of the
+    /// congestion response.
+    #[test]
+    fn backoff_doubles_retx_interval_across_unacked_rtos() {
+        let mut mux = AgentChannelMux::new_server();
+        mux.queue_records(&[rec(1, RecordKind::Open, b""), rec(1, RecordKind::Data, b"x")]);
+        assert_eq!(mux.outgoing(0, 50).len(), 1, "initial send_due emission");
+        // Streak 0: first retx at +rto.
+        assert!(mux.outgoing(49, 50).is_empty());
+        assert_eq!(mux.outgoing(50, 50).len(), 1); // streak -> 1
+        // Streak 1: next at +2*rto.
+        assert!(mux.outgoing(149, 50).is_empty());
+        assert_eq!(mux.outgoing(150, 50).len(), 1); // streak -> 2
+        // Streak 2: next at +4*rto.
+        assert!(mux.outgoing(349, 50).is_empty());
+        assert_eq!(mux.outgoing(350, 50).len(), 1); // streak -> 3
+        // Streak 3 (the cap): +8*rto, and it stays 8x forever after.
+        assert!(mux.outgoing(749, 50).is_empty());
+        assert_eq!(mux.outgoing(750, 50).len(), 1); // streak -> 4, capped
+        assert!(mux.outgoing(1149, 50).is_empty());
+        assert_eq!(mux.outgoing(1150, 50).len(), 1, "capped at 8x, not 16x");
+    }
+
+    /// §9.2: ack progress ends the streak — the next retransmission after
+    /// recovery paces at the plain RTO again.
+    #[test]
+    fn backoff_resets_on_ack_progress() {
+        let mut mux_s = AgentChannelMux::new_server();
+        let mut mux_c = AgentChannelMux::new_client();
+        mux_s.queue_records(&[rec(1, RecordKind::Open, b""), rec(1, RecordKind::Data, b"a")]);
+        let first = mux_s.outgoing(0, 50);
+        assert_eq!(mux_s.outgoing(50, 50).len(), 1); // streak -> 1
+        assert_eq!(mux_s.outgoing(150, 50).len(), 1); // streak -> 2
+        // The peer finally receives and acks — base advances, streak resets.
+        mux_c.on_instruction(first[0].0, &first[0].1);
+        for (id, wire) in mux_c.outgoing(151, 50) {
+            mux_s.on_instruction(id, &wire);
+        }
+        // Fresh data goes out promptly (send_due), then its retx fires at
+        // the PLAIN rto — the streak is gone.
+        mux_s.queue_records(&[rec(1, RecordKind::Data, b"b")]);
+        assert_eq!(mux_s.outgoing(200, 50).len(), 1, "send_due, no delay");
+        assert!(mux_s.outgoing(249, 50).is_empty());
+        assert_eq!(mux_s.outgoing(250, 50).len(), 1, "plain rto after reset");
+    }
+
+    /// §9.2: the peer's first instruction on the identifier confirms our
+    /// OPEN and ends an OPEN-retx streak even with an empty outbox.
+    #[test]
+    fn backoff_resets_on_open_confirmation() {
+        let mut mux_s = AgentChannelMux::new_server();
+        let mut mux_c = AgentChannelMux::new_client();
+        mux_s.queue_records(&[rec(1, RecordKind::Open, b"")]);
+        let first = mux_s.outgoing(0, 50);
+        assert_eq!(first.len(), 1);
+        assert_eq!(mux_s.outgoing(50, 50).len(), 1); // OPEN retx, streak -> 1
+        assert_eq!(mux_s.outgoing(150, 50).len(), 1); // streak -> 2
+        // Confirmation arrives (the client's reply on the identifier).
+        mux_c.on_instruction(first[0].0, &first[0].1);
+        for (id, wire) in mux_c.outgoing(151, 50) {
+            mux_s.on_instruction(id, &wire);
+        }
+        // Later data retransmits at the plain rto — the streak died with
+        // the confirmation, not with an ack (the outbox was empty).
+        mux_s.queue_records(&[rec(1, RecordKind::Data, b"z")]);
+        assert_eq!(mux_s.outgoing(500, 50).len(), 1, "send_due emission");
+        assert!(mux_s.outgoing(549, 50).is_empty());
+        assert_eq!(mux_s.outgoing(550, 50).len(), 1, "plain rto cadence");
+    }
+
+    /// §9.2: the poll deadline mirrors the backed-off interval, so a loop
+    /// sleeping on next_deadline neither fires retransmits early nor spins.
+    #[test]
+    fn next_deadline_honors_backoff() {
+        let mut mux = AgentChannelMux::new_server();
+        mux.queue_records(&[rec(1, RecordKind::Open, b""), rec(1, RecordKind::Data, b"x")]);
+        let _ = mux.outgoing(0, 50);
+        assert_eq!(mux.next_deadline(50), Some(50), "streak 0: plain rto");
+        let _ = mux.outgoing(50, 50); // streak -> 1
+        assert_eq!(mux.next_deadline(50), Some(150), "streak 1: last_send + 2*rto");
+        let _ = mux.outgoing(150, 50); // streak -> 2
+        assert_eq!(mux.next_deadline(50), Some(350), "streak 2: last_send + 4*rto");
+    }
+
+    /// §9.2: backoff delays only retransmissions of old state — fresh data
+    /// (`send_due`) goes out immediately at any streak depth, without
+    /// bumping the streak.
+    #[test]
+    fn send_due_is_never_delayed_by_backoff() {
+        let mut mux = AgentChannelMux::new_server();
+        mux.queue_records(&[rec(1, RecordKind::Open, b""), rec(1, RecordKind::Data, b"x")]);
+        let _ = mux.outgoing(0, 50);
+        let _ = mux.outgoing(50, 50); // streak -> 1
+        let _ = mux.outgoing(150, 50); // streak -> 2
+        // Fresh data at t=151, far inside the 4*rto backoff window.
+        mux.queue_records(&[rec(1, RecordKind::Data, b"y")]);
+        assert_eq!(mux.outgoing(151, 50).len(), 1, "send_due bypasses backoff");
+        // And that emission did not deepen the streak: the next retx fires
+        // at 151 + 4*rto (streak still 2), not 151 + 8*rto.
+        assert!(mux.outgoing(350, 50).is_empty());
+        assert_eq!(mux.outgoing(351, 50).len(), 1);
     }
 
     /// §5: FAIL surfaces to the far end's agent client as a CLOSED socket —
