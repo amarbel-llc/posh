@@ -306,12 +306,14 @@ fn cmd_server(args: &[String]) -> Result<()> {
             "relay" => {
                 return cmd_server_relay(&rest[i + 1..], port_range, family, agent_forward, channels);
             }
-            // The agent-only mux remote (M1 Task 2 of
-            // docs/plans/2026-07-28-mux-endpoint-m1-impl.md): like `relay`,
-            // flags precede the verb; everything after `agent` is the verb's
-            // own. Pre-verb `--channels`/`-A` are accepted-and-ignored — the
-            // verb IS agent forwarding and the envelope is its only wire.
-            "agent" => {
+            // The per-destination mux remote peer (M2 of
+            // docs/plans/2026-07-28-connection-mux-endpoint-design.md):
+            // agent channels + the session channel table. `agent` is the M1
+            // name, kept as an alias for the zero-session case during
+            // transition. Like `relay`, flags precede the verb; pre-verb
+            // `--channels`/`-A` are accepted-and-ignored — the envelope is
+            // this peer's only wire and it IS agent forwarding.
+            "mux" | "agent" => {
                 return cmd_server_agent(&rest[i + 1..], port_range, family);
             }
             "--" => {

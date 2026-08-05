@@ -89,18 +89,21 @@ use crate::util::{self, Result};
 /// re-Init, and bump `frame_offset` so the new daemon's `frame_num = 1` Full is
 /// not rejected as stale by the UDP client (`framereplay.rs`:
 /// `if frame.frame_num < applied_num`). `frame_offset` is 0 throughout Phase 3.
-struct DaemonLink {
-    stream: UnixStream,
-    read: FrameBuffer,
-    write: Vec<u8>,
-    frame_offset: u64,
+/// pub(crate): the M2 mux peer (`server.rs::mux_peer_loop`) holds one of
+/// these per session channel — the §3 contract's per-session state must not
+/// fork between the single-session relay and the channel table.
+pub(crate) struct DaemonLink {
+    pub(crate) stream: UnixStream,
+    pub(crate) read: FrameBuffer,
+    pub(crate) write: Vec<u8>,
+    pub(crate) frame_offset: u64,
 }
 
 /// The client's CONTENT caps to forward into the daemon Init: MORPH / SCROLLBACK
 /// / BASE_SUM (RFC 0008 §4). The agent caps (6/7/8) are relay-TERMINATED (Task
 /// 3.2) and MUST NOT reach the daemon; CAP_DIAG/CAP_METRICS are answered by the
 /// relay from its own transport state — so neither category is forwarded here.
-fn content_caps(client_caps: &[Cap]) -> Vec<Cap> {
+pub(crate) fn content_caps(client_caps: &[Cap]) -> Vec<Cap> {
     [caps::CAP_MORPH, caps::CAP_SCROLLBACK, caps::CAP_BASE_SUM]
         .iter()
         .filter_map(|&id| caps::find(client_caps, id).cloned())
@@ -150,7 +153,7 @@ fn agent_caps(
 /// table `own_table(content_caps ++ CAP_LOSSY)`. `CAP_LOSSY` opts the daemon's
 /// per-client `FrameProducer` into ack-gated, base-anchored mode (no self-ack;
 /// RFC 0008 §3), so the base advances only on a forwarded `Tag::FrameAck`.
-fn init_payload(rows: u16, cols: u16, content: &[Cap]) -> Vec<u8> {
+pub(crate) fn init_payload(rows: u16, cols: u16, content: &[Cap]) -> Vec<u8> {
     let mut table = content.to_vec();
     table.push(Cap {
         id: caps::CAP_LOSSY,
@@ -165,7 +168,12 @@ fn init_payload(rows: u16, cols: u16, content: &[Cap]) -> Vec<u8> {
 /// body, flags, and content caps are forwarded verbatim (the daemon is the frame
 /// producer), but the frame number carries the retarget `frame_offset` seam and
 /// the input/echo acks are the relay's own (the daemon sends 0). RFC 0008 §3.
-fn rewrap(daemon: ServerFrame, frame_offset: u64, input_ack: u64, echo_ack: u64) -> ServerFrame {
+pub(crate) fn rewrap(
+    daemon: ServerFrame,
+    frame_offset: u64,
+    input_ack: u64,
+    echo_ack: u64,
+) -> ServerFrame {
     ServerFrame {
         flags: daemon.flags,
         caps: daemon.caps,
@@ -187,7 +195,7 @@ fn rewrap(daemon: ServerFrame, frame_offset: u64, input_ack: u64, echo_ack: u64)
 /// of Model 2 — the alternative (relay-owned reliability) must buffer and
 /// retransmit the entire unacked chain, which grows unboundedly on roam.
 #[derive(Default)]
-struct HeldFrame {
+pub(crate) struct HeldFrame {
     /// The one unacked frame: (re-wrapped `frame_num`, encoded `ServerFrame` bytes
     /// ready to (re)send). `None` when nothing is outstanding.
     frame: Option<(u64, Vec<u8>)>,
@@ -196,14 +204,14 @@ struct HeldFrame {
 impl HeldFrame {
     /// Supersede any previously-held frame with the newest one. O(1): this
     /// replaces, it never appends — the supersession invariant makes one enough.
-    fn hold(&mut self, frame_num: u64, encoded: Vec<u8>) {
+    pub(crate) fn hold(&mut self, frame_num: u64, encoded: Vec<u8>) {
         self.frame = Some((frame_num, encoded));
     }
 
     /// Release the held frame once the client's cumulative `acked_frame` reaches
     /// it: the client has it, so there is nothing left to retransmit. Idempotent
     /// (a no-op when nothing is held or the ack is still behind).
-    fn drop_if_acked(&mut self, acked_frame: u64) {
+    pub(crate) fn drop_if_acked(&mut self, acked_frame: u64) {
         if self.frame.as_ref().is_some_and(|(num, _)| acked_frame >= *num) {
             self.frame = None;
         }
@@ -212,16 +220,16 @@ impl HeldFrame {
     /// Discard the held frame unconditionally: on a base-sum divergence
     /// (`CLIENT_FLAG_RESYNC`) it diffs against a base the client rejected, so the
     /// daemon's forced `Full` — not this frame — re-establishes the client.
-    fn clear(&mut self) {
+    pub(crate) fn clear(&mut self) {
         self.frame = None;
     }
 
-    fn is_held(&self) -> bool {
+    pub(crate) fn is_held(&self) -> bool {
         self.frame.is_some()
     }
 
     /// The encoded bytes of the held frame, for a (re)send.
-    fn bytes(&self) -> Option<&[u8]> {
+    pub(crate) fn bytes(&self) -> Option<&[u8]> {
         self.frame.as_ref().map(|(_, bytes)| bytes.as_slice())
     }
 

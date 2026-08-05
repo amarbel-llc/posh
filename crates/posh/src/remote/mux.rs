@@ -1488,8 +1488,9 @@ fn mux_loop(
 
 /// Seals one M2 session-channel instruction — the 1-byte wire micro-envelope
 /// kind + body — and sends its fragments. The single seam every session
-/// send goes through.
-fn send_session_wire(
+/// send goes through, on BOTH ends of the connection (the local daemon here,
+/// the remote channel-table peer in `server.rs`).
+pub(crate) fn send_session_wire(
     conn: &mut Connection,
     fragmenter: &mut sync::Fragmenter,
     chan: channel::ChannelId,

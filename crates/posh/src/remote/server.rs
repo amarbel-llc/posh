@@ -192,13 +192,96 @@ pub fn run_agent_only(
 /// has nothing left to serve) or on a terminating signal — both paths return
 /// normally so the endpoint's Drop runs.
 pub(crate) fn agent_only_loop(
+    conn: Connection,
+    endpoint: crate::remote::agent::AgentEndpoint,
+    peer_timeout: u64,
+) {
+    mux_peer_loop(conn, endpoint, peer_timeout, &mut connect_named_daemon)
+}
+
+/// The production daemon connector for [`mux_peer_loop`]: parses the wire
+/// OPEN's `[group/]session` target and connect-or-creates the named session
+/// daemon (RFC 0008 §3's "connect to the session's Unix socket", per
+/// channel). Creation runs the default `$SHELL` — a create-command tail on
+/// the M2 target is deliberately unsupported (FDR 0010's detached spawn owns
+/// command-carrying creation).
+fn connect_named_daemon(target: &str) -> Result<std::os::unix::net::UnixStream> {
+    let (group, name) = match target.split_once('/') {
+        Some((g, s)) if !g.is_empty() => (g, s),
+        _ => ("default", target),
+    };
+    if name.is_empty() {
+        return Err(crate::util::Error::from("mux open: empty session name"));
+    }
+    let cfg = crate::session::Config::new(group)?;
+    let stream = crate::session::connect_or_create(&cfg, name, None)?;
+    stream.set_nonblocking(true)?;
+    Ok(stream)
+}
+
+/// RFC 0011 §3.4: the remote channel table's bound on concurrent session
+/// channels — refuse (a wire CLOSE), never allocate past it. Mirrored by
+/// the local mux daemon so the common refusal happens on the unix hop.
+pub(crate) const MAX_SESSION_CHANNELS: usize = 16;
+
+/// One session channel's bridge in the M2 channel table: the §3 relay
+/// contract's per-session state (DaemonLink + one held frame + the reliable
+/// input inbox), instantiated per channel instead of per process.
+struct SessionBridge {
+    chan: channel::ChannelId,
+    link: crate::remote::relay::DaemonLink,
+    inbox: crate::remote::sync::InputInbox,
+    held: crate::remote::relay::HeldFrame,
+    client_size: (u16, u16),
+    acked_forwarded: u64,
+    last_frame_num: u64,
+    /// Last (re)send of the held frame, for the RTO retransmit cadence.
+    last_retx: u64,
+    /// An input/resync ack is owed and no visible frame has carried it yet:
+    /// emit an Empty ack frame so the client's input outbox drains without
+    /// waiting for the next daemon frame.
+    ack_due: bool,
+}
+
+/// A channel the wire opened whose first `ClientMessage` (caps + geometry)
+/// has not arrived yet — the DaemonLink waits for it, because the daemon
+/// `Tag::Init` needs the client's content caps and size.
+enum PeerChannel {
+    Awaiting { chan: channel::ChannelId, target: String },
+    Linked(Box<SessionBridge>),
+}
+
+impl PeerChannel {
+    fn chan(&self) -> channel::ChannelId {
+        match self {
+            PeerChannel::Awaiting { chan, .. } => *chan,
+            PeerChannel::Linked(b) => b.chan,
+        }
+    }
+}
+
+/// [`server_loop`] minus PTY/producer, the M2 generalization of the M1
+/// agent-only loop (design doc "Remote side", revised 2026-08-05): one poll
+/// loop over the UDP socket, the mux-named agent endpoint's fds, and one
+/// DaemonLink per open session channel — the §3 relay contract applied per
+/// channel. §4.1 ordering is structural: daemon frames forward inline
+/// (before the trailing agent drain), so session sends precede agent bulk
+/// within an iteration. Exits on peer silence (`peer_timeout`) or a
+/// terminating signal; session daemons survive both (a dropped link is a
+/// detach, never a kill).
+pub(crate) fn mux_peer_loop(
     mut conn: Connection,
     mut endpoint: crate::remote::agent::AgentEndpoint,
     peer_timeout: u64,
+    connect_daemon: &mut dyn FnMut(&str) -> Result<std::os::unix::net::UnixStream>,
 ) {
+    use crate::session::ipc;
+    use std::os::fd::AsRawFd as _;
+
     let mut fragmenter = Fragmenter::new();
     let mut assembly = FragmentAssembly::new();
     let mut agent_mux = crate::remote::agent::AgentChannelMux::new_server();
+    let mut channels: Vec<PeerChannel> = Vec::new();
     let mut last_heard = now_ms();
     let mut session_discard_logged = false;
 
@@ -219,16 +302,42 @@ pub(crate) fn agent_only_loop(
         agent_mux.queue_records(&endpoint.tick(agent_peer_active, now));
 
         // Wake in time for the mux's fresh sends and RTO retransmissions
-        // (RFC 0011 §5) and for the peer-timeout exit edge.
+        // (RFC 0011 §5), each bridge's held-frame retransmit, and the
+        // peer-timeout exit edge.
         let mut deadline = last_heard + peer_timeout;
         if let Some(d) = agent_mux.next_deadline(conn.rto()) {
             deadline = deadline.min(d.max(now));
+        }
+        for ch in &channels {
+            if let PeerChannel::Linked(b) = ch {
+                if b.held.is_held() {
+                    deadline = deadline.min((b.last_retx + conn.rto()).max(now));
+                }
+            }
         }
         let timeout = deadline.saturating_sub(now).min(1000) as i32;
 
         let mut fds = vec![util::pollfd(conn.raw_fd(), libc::POLLIN)];
         let agent_fd_base = fds.len();
         fds.extend_from_slice(&endpoint.pollfds());
+        // Bridges occupy the tail; channels added mid-iteration poll next
+        // time (their sockets are freshly drained at creation anyway).
+        let bridge_base = fds.len();
+        let n_bridges = channels.len();
+        for ch in &channels {
+            match ch {
+                PeerChannel::Linked(b) => {
+                    let mut ev = libc::POLLIN;
+                    if !b.link.write.is_empty() {
+                        ev |= libc::POLLOUT;
+                    }
+                    fds.push(util::pollfd(b.link.stream.as_raw_fd(), ev));
+                }
+                // A placeholder keeps fd indices aligned with channel
+                // indices; poll ignores fd -1.
+                PeerChannel::Awaiting { .. } => fds.push(util::pollfd(-1, 0)),
+            }
+        }
         match util::poll(&mut fds, timeout) {
             Ok(_) => {}
             Err(e) if e.kind() == std::io::ErrorKind::Interrupted => continue,
@@ -272,14 +381,26 @@ pub(crate) fn agent_only_loop(
                         if chan.kind() == channel::KIND_AGENT {
                             let recs = agent_mux.on_instruction(chan, message);
                             endpoint.apply_records(&recs);
+                        } else if chan.kind() == channel::KIND_SESSION
+                            && chan != channel::SESSION_CHANNEL
+                        {
+                            // M2 session channels: the wire micro-envelope.
+                            handle_session_instruction(
+                                &mut channels,
+                                chan,
+                                message,
+                                &mut conn,
+                                &mut fragmenter,
+                                connect_daemon,
+                            );
                         } else if !session_discard_logged {
-                            // Session-kind traffic carries nothing for an
-                            // agent-only server. Logged once, not per
+                            // The bare ordinal-1 heartbeat stream carries
+                            // nothing for this peer. Logged once, not per
                             // instruction — the client announces itself on
                             // the session channel routinely.
                             util::log_write(
                                 "info",
-                                "agent-only server: discarding session-channel instructions",
+                                "mux peer: ignoring bare session-stream instructions",
                             );
                             session_discard_logged = true;
                         }
@@ -291,9 +412,139 @@ pub(crate) fn agent_only_loop(
             }
         }
 
-        // Sends: the RFC 0011 §4.1 ordered drain with no session frame ever
-        // pending — iteration_sends(None, ..) is exactly server_loop's send
-        // seam reduced to the agent mux.
+        // Bridge maintenance (session channels): daemon reads → forwarded
+        // frames, buffered writes flushed, held-frame RTO retransmits, and
+        // owed input acks as Empty frames. Runs BEFORE the agent drain
+        // below, which keeps §4.1's session-before-agent ordering
+        // structural. Removals collect and apply after the sweep.
+        let now = now_ms();
+        let mut closed: Vec<(usize, Vec<u8>)> = Vec::new();
+        for (i, chp) in channels.iter_mut().enumerate() {
+            let PeerChannel::Linked(b) = chp else { continue };
+            let fd = b.link.stream.as_raw_fd();
+            let signalled = (i < n_bridges)
+                && fds[bridge_base + i].revents
+                    & (libc::POLLIN | libc::POLLHUP | libc::POLLERR)
+                    != 0;
+            let mut eof = false;
+            if signalled {
+                match b.link.read.read_from(fd) {
+                    Ok(0) => eof = true,
+                    Ok(_) => {}
+                    Err(e) if e.kind() == std::io::ErrorKind::WouldBlock => {}
+                    Err(_) => eof = true,
+                }
+            }
+            let mut exit_payload: Option<Vec<u8>> = None;
+            while let Ok(Some(rec)) = b.link.read.next() {
+                match rec.tag {
+                    ipc::Tag::Frame => {
+                        let Ok(frame) = crate::remote::sync::ServerFrame::decode(&rec.payload)
+                        else {
+                            continue;
+                        };
+                        let ack = b.inbox.next_offset();
+                        let out =
+                            crate::remote::relay::rewrap(frame, b.link.frame_offset, ack, ack);
+                        b.last_frame_num = out.frame_num;
+                        b.held.hold(out.frame_num, out.encode());
+                        b.ack_due = false;
+                        if conn.has_remote() {
+                            if let Some(bytes) = b.held.bytes() {
+                                crate::remote::mux::send_session_wire(
+                                    &mut conn,
+                                    &mut fragmenter,
+                                    b.chan,
+                                    crate::remote::mux::SESSION_WIRE_DATA,
+                                    bytes,
+                                );
+                            }
+                            b.last_retx = now;
+                        }
+                    }
+                    ipc::Tag::Output => {
+                        // A frames-off daemon cannot ride a mux channel
+                        // (RFC 0008 §3's relay would fall back to the
+                        // legacy inner server; the channel table has no
+                        // such mode). Close; the client falls back to a
+                        // per-invocation connection.
+                        exit_payload = Some(b"daemon has frames off".to_vec());
+                        eof = true;
+                    }
+                    ipc::Tag::Exit => {
+                        exit_payload = Some(rec.payload.clone());
+                        eof = true;
+                    }
+                    _ => {}
+                }
+                if eof {
+                    break;
+                }
+            }
+            if !b.link.write.is_empty() {
+                if util::write_all_retry(fd, &b.link.write, 100).is_ok() {
+                    b.link.write.clear();
+                } else {
+                    eof = true;
+                }
+            }
+            if b.held.is_held()
+                && conn.has_remote()
+                && now.saturating_sub(b.last_retx) >= conn.rto()
+            {
+                if let Some(bytes) = b.held.bytes() {
+                    crate::remote::mux::send_session_wire(
+                        &mut conn,
+                        &mut fragmenter,
+                        b.chan,
+                        crate::remote::mux::SESSION_WIRE_DATA,
+                        bytes,
+                    );
+                }
+                b.last_retx = now;
+            }
+            if b.ack_due && conn.has_remote() {
+                // An owed input ack with no visible frame to carry it: an
+                // Empty frame drains the client's input outbox promptly
+                // (relay.rs::send_empty's role, per channel).
+                let ack = b.inbox.next_offset();
+                let empty = crate::remote::sync::ServerFrame {
+                    flags: 0,
+                    caps: caps::own_table(&[]),
+                    frame_num: b.last_frame_num,
+                    input_ack: ack,
+                    echo_ack: ack,
+                    body: crate::remote::sync::FrameBody::Empty,
+                };
+                crate::remote::mux::send_session_wire(
+                    &mut conn,
+                    &mut fragmenter,
+                    b.chan,
+                    crate::remote::mux::SESSION_WIRE_DATA,
+                    &empty.encode(),
+                );
+                b.ack_due = false;
+            }
+            if eof {
+                closed.push((i, exit_payload.unwrap_or_default()));
+            }
+        }
+        for (i, payload) in closed.into_iter().rev() {
+            let chan = channels[i].chan();
+            channels.remove(i);
+            if conn.has_remote() {
+                crate::remote::mux::send_session_wire(
+                    &mut conn,
+                    &mut fragmenter,
+                    chan,
+                    crate::remote::mux::SESSION_WIRE_CLOSE,
+                    &payload,
+                );
+            }
+        }
+
+        // Sends: the RFC 0011 §4.1 ordered drain — session frames went out
+        // inline above; the agent mux drains last.
         if conn.has_remote() {
             let now = now_ms();
             for (chan, payload) in
@@ -303,6 +554,174 @@ pub(crate) fn agent_only_loop(
             }
         }
     }
+}
+
+/// Dispatches one M2 session-channel wire instruction into the channel
+/// table: OPEN admits (bounded) or ignores a duplicate; DATA decodes the
+/// `ClientMessage` and bridges it (establishing the DaemonLink on the first
+/// one, which carries the caps + geometry the daemon Init needs); CLOSE
+/// detaches. Refusals and failures answer with a wire CLOSE — the client's
+/// cue to fall back per-invocation.
+fn handle_session_instruction(
+    channels: &mut Vec<PeerChannel>,
+    chan: channel::ChannelId,
+    message: &[u8],
+    conn: &mut Connection,
+    fragmenter: &mut Fragmenter,
+    connect_daemon: &mut dyn FnMut(&str) -> Result<std::os::unix::net::UnixStream>,
+) {
+    use crate::remote::mux::{
+        send_session_wire, SESSION_WIRE_CLOSE, SESSION_WIRE_DATA, SESSION_WIRE_OPEN,
+    };
+    use crate::session::ipc::{self, Tag};
+    use std::os::fd::AsRawFd as _;
+
+    let idx = channels.iter().position(|c| c.chan() == chan);
+    match message.first() {
+        Some(&SESSION_WIRE_OPEN) => {
+            if idx.is_some() {
+                return; // §3.3: a duplicate OPEN is a retransmission
+            }
+            if channels.len() >= MAX_SESSION_CHANNELS {
+                send_session_wire(
+                    conn,
+                    fragmenter,
+                    chan,
+                    SESSION_WIRE_CLOSE,
+                    b"session channel table full",
+                );
+                return;
+            }
+            channels.push(PeerChannel::Awaiting {
+                chan,
+                target: String::from_utf8_lossy(&message[1..]).into_owned(),
+            });
+        }
+        Some(&SESSION_WIRE_DATA) => {
+            let Some(i) = idx else {
+                return; // straggler on a closed/unknown channel (§3.3)
+            };
+            let Ok(msg) = crate::remote::sync::ClientMessage::decode(&message[1..]) else {
+                return;
+            };
+            if let PeerChannel::Awaiting { target, .. } = &channels[i] {
+                let target = target.clone();
+                let (rows, cols) = (msg.rows.max(1), msg.cols.max(1));
+                match connect_daemon(&target) {
+                    Ok(stream) => {
+                        let mut link = crate::remote::relay::DaemonLink {
+                            stream,
+                            read: crate::session::ipc::FrameBuffer::new(),
+                            write: Vec::new(),
+                            frame_offset: 0,
+                        };
+                        let content = crate::remote::relay::content_caps(&msg.caps);
+                        ipc::append_frame(
+                            &mut link.write,
+                            Tag::Init,
+                            &crate::remote::relay::init_payload(rows, cols, &content),
+                        );
+                        ipc::append_frame(
+                            &mut link.write,
+                            Tag::Resize,
+                            &ipc::encode_resize(rows, cols),
+                        );
+                        channels[i] = PeerChannel::Linked(Box::new(SessionBridge {
+                            chan,
+                            link,
+                            inbox: crate::remote::sync::InputInbox::new(),
+                            held: crate::remote::relay::HeldFrame::default(),
+                            client_size: (rows, cols),
+                            acked_forwarded: 0,
+                            last_frame_num: 0,
+                            last_retx: 0,
+                            ack_due: false,
+                        }));
+                    }
+                    Err(e) => {
+                        channels.remove(i);
+                        send_session_wire(
+                            conn,
+                            fragmenter,
+                            chan,
+                            SESSION_WIRE_CLOSE,
+                            format!("open failed: {e}").as_bytes(),
+                        );
+                        return;
+                    }
+                }
+            }
+            if let PeerChannel::Linked(b) = &mut channels[i] {
+                if !bridge_client_message(b, &msg) {
+                    // CLIENT_FLAG_SHUTDOWN: detach and close the channel.
+                    let _ = util::write_all_retry(
+                        b.link.stream.as_raw_fd(),
+                        &b.link.write,
+                        100,
+                    );
+                    channels.remove(i);
+                    send_session_wire(conn, fragmenter, chan, SESSION_WIRE_CLOSE, b"");
+                }
+            }
+        }
+        Some(&SESSION_WIRE_CLOSE) => {
+            if let Some(i) = idx {
+                if let PeerChannel::Linked(b) = &mut channels[i] {
+                    ipc::append_frame(&mut b.link.write, Tag::Detach, b"");
+                    let _ = util::write_all_retry(
+                        b.link.stream.as_raw_fd(),
+                        &b.link.write,
+                        100,
+                    );
+                }
+                channels.remove(i);
+            }
+        }
+        // Unknown micro-kind: forward compatibility, ignore.
+        _ => {}
+    }
+}
+
+/// Applies one decoded `ClientMessage` to its bridge — the §3 lossy→reliable
+/// conversion per channel, mirroring `relay_loop`'s client-message block:
+/// resize → `Tag::Resize`, fresh input → `Tag::Input` (idempotent under the
+/// cumulative retransmit stream), cumulative frame ack / RESYNC →
+/// `Tag::FrameAck` (dropping/clearing the held frame). Returns `false` on
+/// `CLIENT_FLAG_SHUTDOWN` (the caller detaches and closes the channel).
+fn bridge_client_message(b: &mut SessionBridge, msg: &crate::remote::sync::ClientMessage) -> bool {
+    use crate::session::ipc::{self, Tag};
+
+    if msg.rows > 0 && msg.cols > 0 && (msg.rows, msg.cols) != b.client_size {
+        b.client_size = (msg.rows, msg.cols);
+        ipc::append_frame(
+            &mut b.link.write,
+            Tag::Resize,
+            &ipc::encode_resize(msg.rows, msg.cols),
+        );
+    }
+    if let Some(new_input) = b.inbox.accept(msg.input_base, &msg.input) {
+        ipc::append_frame(&mut b.link.write, Tag::Input, new_input);
+        b.ack_due = true;
+    }
+    b.held.drop_if_acked(msg.acked_frame);
+    let resync = msg.flags & crate::remote::sync::CLIENT_FLAG_RESYNC != 0;
+    if msg.acked_frame > b.acked_forwarded || resync {
+        b.acked_forwarded = b.acked_forwarded.max(msg.acked_frame);
+        let ack_flags = if resync { ipc::FRAME_ACK_RESYNC } else { 0 };
+        ipc::append_frame(
+            &mut b.link.write,
+            Tag::FrameAck,
+            &ipc::encode_frame_ack(b.acked_forwarded - b.link.frame_offset, ack_flags),
+        );
+        if resync {
+            b.held.clear();
+        }
+    }
+    if msg.flags & crate::remote::sync::CLIENT_FLAG_SHUTDOWN != 0 {
+        ipc::append_frame(&mut b.link.write, Tag::Detach, b"");
+        return false;
+    }
+    true
 }
 
 pub(crate) fn server_loop(
@@ -2885,6 +3304,336 @@ mod tests {
     // the AGENT_DATA stream over real loopback UDP, the client proxy, reach the
     // fake agent, and the reply must come all the way back. #[ignore] (real PTY
     // + UDP + threads): run with `cargo test -p posh -- --ignored agent_forward`.
+    // --- M2 channel-table peer (mux_peer_loop): driven in-process, the
+    // test playing the mux daemon on the wire and the session daemons
+    // behind socketpair fakes handed out by the connector seam. ---
+
+    use crate::session::ipc;
+    use std::path::Path;
+
+    fn peer_temp_base() -> std::path::PathBuf {
+        use std::os::unix::fs::DirBuilderExt;
+        use std::sync::atomic::{AtomicU32, Ordering};
+        static N: AtomicU32 = AtomicU32::new(0);
+        let dir = std::path::PathBuf::from(format!(
+            "/tmp/posh-peer-{}-{}",
+            std::process::id(),
+            N.fetch_add(1, Ordering::Relaxed)
+        ));
+        std::fs::DirBuilder::new().mode(0o700).create(&dir).unwrap();
+        dir
+    }
+
+    type FakeDaemons =
+        std::sync::Arc<std::sync::Mutex<Vec<(String, std::os::unix::net::UnixStream)>>>;
+
+    /// Real [`mux_peer_loop`] on a thread; the test drives the wire side.
+    fn start_peer(
+        ports: (u16, u16),
+        base: &Path,
+    ) -> (std::thread::JoinHandle<()>, Connection, FakeDaemons) {
+        let ukey = crate::remote::crypto::Key::random();
+        let (peer_conn, port) =
+            Connection::server(ports, &ukey, crate::remote::datagram::Family::Inet).unwrap();
+        let addr = format!("127.0.0.1:{port}").parse().unwrap();
+        let test_conn = Connection::client(addr, &ukey).unwrap();
+        let endpoint = crate::remote::agent::AgentEndpoint::new_mux(base, "peer-test").unwrap();
+        let daemons: FakeDaemons = Default::default();
+        let d2 = daemons.clone();
+        let handle = std::thread::spawn(move || {
+            let mut connector = move |target: &str| {
+                let (peer_side, daemon_side) = std::os::unix::net::UnixStream::pair().unwrap();
+                peer_side.set_nonblocking(true).unwrap();
+                daemon_side.set_nonblocking(true).unwrap();
+                d2.lock().unwrap().push((target.to_string(), daemon_side));
+                Ok(peer_side)
+            };
+            mux_peer_loop(peer_conn, endpoint, 2_500, &mut connector);
+        });
+        (handle, test_conn, daemons)
+    }
+
+    fn peer_send(
+        conn: &mut Connection,
+        frag: &mut Fragmenter,
+        chan: channel::ChannelId,
+        kind: u8,
+        body: &[u8],
+    ) {
+        let mut payload = vec![kind];
+        payload.extend_from_slice(body);
+        let wire = channel::seal_on(true, chan, &payload);
+        for f in frag.make_fragments(&wire, sync::FRAGMENT_CONTENTS_MAX) {
+            let _ = conn.send(&f.to_bytes());
+        }
+    }
+
+    fn peer_recv_until(
+        conn: &mut Connection,
+        asm: &mut FragmentAssembly,
+        mut pred: impl FnMut(channel::ChannelId, &[u8]) -> bool,
+    ) -> (channel::ChannelId, Vec<u8>) {
+        let deadline = now_ms() + 8_000;
+        loop {
+            assert!(now_ms() < deadline, "peer wire instruction never arrived");
+            match conn.recv() {
+                Ok(Some(payload)) => {
+                    let Ok(f) = sync::Fragment::from_bytes(&payload) else { continue };
+                    let Some(a) = asm.add(f) else { continue };
+                    let Some((c, m)) = channel::open_any_instruction(true, &a) else { continue };
+                    if pred(c, m) {
+                        return (c, m.to_vec());
+                    }
+                }
+                Ok(None) => {}
+                Err(e) if e.kind() == std::io::ErrorKind::WouldBlock => {
+                    std::thread::sleep(std::time::Duration::from_millis(5));
+                }
+                Err(e) => panic!("test wire recv: {e}"),
+            }
+        }
+    }
+
+    fn daemon_tags(
+        stream: &std::os::unix::net::UnixStream,
+        buf: &mut ipc::FrameBuffer,
+    ) -> Vec<(ipc::Tag, Vec<u8>)> {
+        use std::os::fd::AsRawFd as _;
+        let _ = buf.read_from(stream.as_raw_fd());
+        let mut out = Vec::new();
+        while let Ok(Some(f)) = buf.next() {
+            out.push((f.tag, f.payload));
+        }
+        out
+    }
+
+    fn wait_daemon(daemons: &FakeDaemons, n: usize) {
+        let deadline = now_ms() + 8_000;
+        while daemons.lock().unwrap().len() < n {
+            assert!(now_ms() < deadline, "daemon link never established");
+            std::thread::sleep(std::time::Duration::from_millis(5));
+        }
+    }
+
+    fn cm(rows: u16, cols: u16, input: &[u8], acked: u64, flags: u8) -> Vec<u8> {
+        sync::ClientMessage {
+            flags,
+            caps: caps::own_table(&[]),
+            acked_frame: acked,
+            rows,
+            cols,
+            input_base: 0,
+            input: input.to_vec(),
+        }
+        .encode()
+    }
+
+    #[test]
+    fn mux_peer_opens_daemonlink_per_session_channel() {
+        let base = peer_temp_base();
+        let (h, mut wire, daemons) = start_peer((63750, 63759), &base);
+        let mut frag = Fragmenter::new();
+        let mut asm = FragmentAssembly::new();
+        let chan = channel::ChannelId::new(false, channel::KIND_SESSION, 2);
+        peer_send(&mut wire, &mut frag, chan, crate::remote::mux::SESSION_WIRE_OPEN, b"default/alpha");
+        peer_send(&mut wire, &mut frag, chan, crate::remote::mux::SESSION_WIRE_DATA, &cm(24, 80, b"hi", 0, 0));
+        wait_daemon(&daemons, 1);
+        let (target, stream) = {
+            let mut g = daemons.lock().unwrap();
+            g.remove(0)
+        };
+        assert_eq!(target, "default/alpha");
+        // The daemon must see the §3 Init (with CAP_LOSSY), the resize, and
+        // the bridged input — possibly across several reads.
+        let mut buf = ipc::FrameBuffer::new();
+        let mut seen_lossy_init = false;
+        let mut seen_input = Vec::new();
+        let deadline = now_ms() + 8_000;
+        while now_ms() < deadline && !(seen_lossy_init && seen_input == b"hi") {
+            for (tag, payload) in daemon_tags(&stream, &mut buf) {
+                match tag {
+                    ipc::Tag::Init => {
+                        seen_lossy_init |= payload
+                            .get(4..)
+                            .and_then(|b| caps::decode_table(b).ok())
+                            .is_some_and(|(t, _)| caps::find(&t, caps::CAP_LOSSY).is_some());
+                    }
+                    ipc::Tag::Input => seen_input.extend_from_slice(&payload),
+                    _ => {}
+                }
+            }
+            std::thread::sleep(std::time::Duration::from_millis(5));
+        }
+        assert!(seen_lossy_init, "the daemon must be Init'd as a lossy frame client");
+        assert_eq!(seen_input, b"hi", "bridged input must reach the daemon");
+        // A daemon frame comes back rewrapped on the same channel with the
+        // peer's own input acks (2 bytes accepted).
+        let frame = sync::ServerFrame {
+            flags: 0,
+            caps: caps::own_table(&[]),
+            frame_num: 1,
+            input_ack: 0,
+            echo_ack: 0,
+            body: sync::FrameBody::Empty,
+        };
+        let mut out = Vec::new();
+        ipc::append_frame(&mut out, ipc::Tag::Frame, &frame.encode());
+        {
+            use std::io::Write;
+            (&stream).write_all(&out).unwrap();
+        }
+        // Two frames come back on the channel: FIRST the prompt Empty ack
+        // (the input arrived with no visible frame to carry its ack —
+        // relay.rs::send_empty's role, per channel), THEN the daemon's
+        // frame, rewrapped. Both carry the peer's cumulative input ack.
+        let (_, m) = peer_recv_until(&mut wire, &mut asm, |c, m| {
+            c == chan && m.first() == Some(&crate::remote::mux::SESSION_WIRE_DATA)
+        });
+        let ack_frame = sync::ServerFrame::decode(&m[1..]).unwrap();
+        assert_eq!(ack_frame.frame_num, 0, "the prompt ack precedes any daemon frame");
+        assert_eq!(ack_frame.input_ack, 2, "the accepted input is acked promptly");
+        assert!(matches!(ack_frame.body, sync::FrameBody::Empty));
+        let (_, m) = peer_recv_until(&mut wire, &mut asm, |c, m| {
+            c == chan
+                && m.first() == Some(&crate::remote::mux::SESSION_WIRE_DATA)
+                && sync::ServerFrame::decode(&m[1..]).is_ok_and(|f| f.frame_num == 1)
+        });
+        let got = sync::ServerFrame::decode(&m[1..]).unwrap();
+        assert_eq!(got.frame_num, 1);
+        assert_eq!(got.input_ack, 2, "the peer's own cumulative input ack");
+        drop(stream);
+        h.join().unwrap();
+        std::fs::remove_dir_all(&base).ok();
+    }
+
+    #[test]
+    fn mux_peer_bounds_session_channels_and_refuses_past_16() {
+        let base = peer_temp_base();
+        let (h, mut wire, _daemons) = start_peer((63760, 63769), &base);
+        let mut frag = Fragmenter::new();
+        let mut asm = FragmentAssembly::new();
+        for n in 0..=MAX_SESSION_CHANNELS as u64 {
+            let chan = channel::ChannelId::new(false, channel::KIND_SESSION, 2 + n);
+            peer_send(&mut wire, &mut frag, chan, crate::remote::mux::SESSION_WIRE_OPEN, b"s");
+        }
+        let over = channel::ChannelId::new(false, channel::KIND_SESSION, 2 + MAX_SESSION_CHANNELS as u64);
+        let (_, m) = peer_recv_until(&mut wire, &mut asm, |c, m| {
+            c == over && m.first() == Some(&crate::remote::mux::SESSION_WIRE_CLOSE)
+        });
+        assert_eq!(&m[1..], b"session channel table full");
+        h.join().unwrap();
+        std::fs::remove_dir_all(&base).ok();
+    }
+
+    #[test]
+    fn daemonlink_eof_closes_only_its_channel() {
+        let base = peer_temp_base();
+        let (h, mut wire, daemons) = start_peer((63770, 63779), &base);
+        let mut frag = Fragmenter::new();
+        let mut asm = FragmentAssembly::new();
+        let chan_a = channel::ChannelId::new(false, channel::KIND_SESSION, 2);
+        let chan_b = channel::ChannelId::new(false, channel::KIND_SESSION, 3);
+        peer_send(&mut wire, &mut frag, chan_a, crate::remote::mux::SESSION_WIRE_OPEN, b"a");
+        peer_send(&mut wire, &mut frag, chan_a, crate::remote::mux::SESSION_WIRE_DATA, &cm(24, 80, b"", 0, 0));
+        wait_daemon(&daemons, 1);
+        peer_send(&mut wire, &mut frag, chan_b, crate::remote::mux::SESSION_WIRE_OPEN, b"b");
+        peer_send(&mut wire, &mut frag, chan_b, crate::remote::mux::SESSION_WIRE_DATA, &cm(24, 80, b"", 0, 0));
+        wait_daemon(&daemons, 2);
+        // Kill daemon A: its channel closes; B stays live.
+        let a_stream = daemons.lock().unwrap().remove(0).1;
+        drop(a_stream);
+        peer_recv_until(&mut wire, &mut asm, |c, m| {
+            c == chan_a && m.first() == Some(&crate::remote::mux::SESSION_WIRE_CLOSE)
+        });
+        peer_send(&mut wire, &mut frag, chan_b, crate::remote::mux::SESSION_WIRE_DATA, &cm(24, 80, b"still", 0, 0));
+        let b_stream = &daemons.lock().unwrap()[0].1;
+        let mut buf = ipc::FrameBuffer::new();
+        let mut seen = Vec::new();
+        let deadline = now_ms() + 8_000;
+        while now_ms() < deadline && seen != b"still" {
+            for (tag, payload) in daemon_tags(b_stream, &mut buf) {
+                if tag == ipc::Tag::Input {
+                    seen.extend_from_slice(&payload);
+                }
+            }
+            std::thread::sleep(std::time::Duration::from_millis(5));
+        }
+        assert_eq!(seen, b"still", "channel B must keep bridging after A's EOF");
+        h.join().unwrap();
+        std::fs::remove_dir_all(&base).ok();
+    }
+
+    #[test]
+    fn dup_open_is_idempotent_and_close_detaches() {
+        let base = peer_temp_base();
+        let (h, mut wire, daemons) = start_peer((63780, 63789), &base);
+        let mut frag = Fragmenter::new();
+        let chan = channel::ChannelId::new(false, channel::KIND_SESSION, 2);
+        peer_send(&mut wire, &mut frag, chan, crate::remote::mux::SESSION_WIRE_OPEN, b"one");
+        peer_send(&mut wire, &mut frag, chan, crate::remote::mux::SESSION_WIRE_DATA, &cm(24, 80, b"", 0, 0));
+        wait_daemon(&daemons, 1);
+        // §3.3: a duplicate OPEN is a retransmission — no second link.
+        peer_send(&mut wire, &mut frag, chan, crate::remote::mux::SESSION_WIRE_OPEN, b"one");
+        std::thread::sleep(std::time::Duration::from_millis(150));
+        assert_eq!(daemons.lock().unwrap().len(), 1, "dup OPEN must not relink");
+        // CLOSE detaches: the daemon sees Tag::Detach, the session survives.
+        peer_send(&mut wire, &mut frag, chan, crate::remote::mux::SESSION_WIRE_CLOSE, b"");
+        let stream = daemons.lock().unwrap().remove(0).1;
+        let mut buf = ipc::FrameBuffer::new();
+        let mut detached = false;
+        let deadline = now_ms() + 8_000;
+        while now_ms() < deadline && !detached {
+            detached = daemon_tags(&stream, &mut buf)
+                .iter()
+                .any(|(t, _)| *t == ipc::Tag::Detach);
+            std::thread::sleep(std::time::Duration::from_millis(5));
+        }
+        assert!(detached, "wire CLOSE must reach the daemon as Tag::Detach");
+        h.join().unwrap();
+        std::fs::remove_dir_all(&base).ok();
+    }
+
+    #[test]
+    fn agent_alias_zero_sessions_serves_agent_channels() {
+        let base = peer_temp_base();
+        // Build the endpoint first to learn its socket path, then hand it in.
+        let ukey = crate::remote::crypto::Key::random();
+        let (peer_conn, port) =
+            Connection::server((63790, 63799), &ukey, crate::remote::datagram::Family::Inet)
+                .unwrap();
+        let addr: std::net::SocketAddr = format!("127.0.0.1:{port}").parse().unwrap();
+        let mut wire = Connection::client(addr, &ukey).unwrap();
+        let endpoint = crate::remote::agent::AgentEndpoint::new_mux(&base, "peer-test").unwrap();
+        let sock = endpoint.sock_path().to_path_buf();
+        let h = std::thread::spawn(move || {
+            let mut connector =
+                |_: &str| -> Result<std::os::unix::net::UnixStream> { panic!("no sessions here") };
+            mux_peer_loop(peer_conn, endpoint, 2_500, &mut connector);
+        });
+        // Zero sessions: the M1 agent path is untouched — a consumer dialing
+        // the endpoint's socket opens a server-initiated agent channel.
+        let mut frag = Fragmenter::new();
+        let mut asm = FragmentAssembly::new();
+        // A heartbeat-ish nudge so the peer learns our address.
+        peer_send(
+            &mut wire,
+            &mut frag,
+            channel::SESSION_CHANNEL,
+            crate::remote::mux::SESSION_WIRE_DATA,
+            b"",
+        );
+        use std::io::Write;
+        let mut consumer = std::os::unix::net::UnixStream::connect(&sock).unwrap();
+        consumer.write_all(&[0, 0, 0, 1, 11]).unwrap(); // an agent request
+        let (chan, _) = peer_recv_until(&mut wire, &mut asm, |c, _| {
+            c.kind() == channel::KIND_AGENT
+        });
+        assert!(chan.server_initiated(), "agent channels open from the server space");
+        drop(consumer);
+        h.join().unwrap();
+        std::fs::remove_dir_all(&base).ok();
+    }
+
     #[test]
     #[ignore = "agent-forwarding E2E harness; run with --ignored"]
     fn agent_forward_round_trips_request_to_local_agent() {
