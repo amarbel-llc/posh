@@ -656,7 +656,7 @@ pub fn run(
     // the user's pre-connect shell screen on the way out.
     write_display_control("smcup (connect)", &display::open());
     let result = client_loop(
-        Wire::Udp(conn),
+        Wire::Udp(Box::new(conn)),
         model,
         render,
         predict_overwrite,
@@ -777,7 +777,9 @@ pub(crate) fn resolve(host: &str, port: u16, family: Family) -> Result<SocketAdd
 /// the send cadence behave identically; structural I/O (send/receive)
 /// branches at its two call sites.
 enum Wire {
-    Udp(Connection),
+    /// Boxed: `Connection` is ~900 bytes (AEAD session + RTT estimator)
+    /// against the transport's ~100, and `ClientState` embeds the enum.
+    Udp(Box<Connection>),
     Mux(crate::remote::mux::MuxSessionTransport),
 }
 
@@ -3548,7 +3550,7 @@ mod tests {
         let key = Key::random();
         let conn = Connection::client("127.0.0.1:9".parse().unwrap(), &key).unwrap();
         ClientState {
-            wire: Wire::Udp(conn),
+            wire: Wire::Udp(Box::new(conn)),
             fragmenter: Fragmenter::new(),
             enveloped: false,
             outbox: InputOutbox::new(),
