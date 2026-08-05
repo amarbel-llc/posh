@@ -29,7 +29,7 @@ pub const SESSION_CHANNEL: ChannelId = ChannelId::new(false, KIND_SESSION, 1);
 /// §3: bit 0 initiator (0 = client, 1 = server), bits 1..7 kind,
 /// bits 8..63 ordinal. Ordinal 0 is reserved, so raw id 0 (the
 /// connection-control identifier) is never a data channel.
-#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+#[derive(Clone, Copy, PartialEq, Eq, Hash, Debug)]
 pub struct ChannelId(pub u64);
 
 impl ChannelId {
@@ -164,20 +164,24 @@ pub fn seal_instruction(enveloped: bool, message: &[u8]) -> Cow<'_, [u8]> {
 }
 
 /// The dispatching receive gate: enveloped ⇒ parse the §2 envelope off a
-/// reassembled instruction and admit only the channels this increment
-/// defines — the single session channel, or a server-initiated `agent` data
-/// channel (§3.2) — returning which one so the loops dispatch by kind.
-/// `None` means "discard this instruction and keep going" (§2: unknown ver /
-/// truncation; §3.1/§3.2: CONTROL, ordinal 0, RESERVED or wrong-initiator
-/// kind — never a connection teardown). Baseline ⇒ the payload verbatim on
-/// the session channel.
+/// reassembled instruction and admit only the channels the increments
+/// define — client-initiated `session` data channels (ordinal 1 is the
+/// pre-M2 single session / heartbeat stream; ordinals >= 2 are M2 mux
+/// session channels, §3.2/§3.3), or a server-initiated `agent` data channel
+/// (§3.2) — returning which one so the loops dispatch by kind AND ordinal
+/// (a loop that serves only the single-session shape must ignore higher
+/// ordinals, not feed them to its frame path). `None` means "discard this
+/// instruction and keep going" (§2: unknown ver / truncation; §3.1/§3.2:
+/// CONTROL, ordinal 0, RESERVED or wrong-initiator kind — never a
+/// connection teardown). Baseline ⇒ the payload verbatim on the session
+/// channel.
 pub fn open_any_instruction(enveloped: bool, payload: &[u8]) -> Option<(ChannelId, &[u8])> {
     if !enveloped {
         return Some((SESSION_CHANNEL, payload));
     }
     let (env, rest) = Envelope::parse(payload).ok()?;
     let ch = env.channel;
-    let admitted = ch == SESSION_CHANNEL
+    let admitted = (!ch.server_initiated() && ch.kind() == KIND_SESSION && ch.is_data())
         || (ch.server_initiated() && ch.kind() == KIND_AGENT && ch.is_data());
     admitted.then_some((ch, rest))
 }
@@ -448,6 +452,16 @@ mod tests {
         );
         // ...and still refused by the session-only gate.
         assert_eq!(open_instruction(true, &sealed), None);
+        // An M2 mux session channel (client-initiated, ordinal >= 2) is
+        // admitted by the dispatching gate but NOT the session-only gate —
+        // single-session loops must ignore it, not frame-decode it.
+        let mux_session = ChannelId::new(false, KIND_SESSION, 2);
+        let sealed = seal_on(true, mux_session, msg);
+        assert_eq!(
+            open_any_instruction(true, &sealed),
+            Some((mux_session, &msg[..]))
+        );
+        assert_eq!(open_instruction(true, &sealed), None);
         // Rejections shared with the session gate: bad ver, truncation, and
         // every identifier no receiver may admit.
         let mut bad_ver = seal_on(true, agent_id, msg).into_owned();
@@ -462,7 +476,6 @@ mod tests {
             ChannelId::new(false, 5, 1),           // RESERVED kind (§3.2)
             ChannelId::new(false, KIND_AGENT, 1),  // agent from the client space
             ChannelId::new(true, KIND_SESSION, 1), // session from the server space
-            ChannelId::new(false, KIND_SESSION, 2), // not this increment's session
             ChannelId::new(true, KIND_AGENT, 0),   // ordinal 0 (§3.1)
         ] {
             let wire = seal_on(true, id, msg);

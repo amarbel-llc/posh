@@ -596,23 +596,86 @@ impl MuxSessionClose {
     }
 }
 
-/// One accepted IPC connection: framing reassembly plus the two per-conn
-/// facts the daemon tracks — hello completed, and whether this conn holds
-/// the (at most one) session ref that auto-drops on close.
+/// M2 wire micro-envelope: the first byte of every instruction on a
+/// session-kind channel with ordinal >= 2 (ordinal 1 — `SESSION_CHANNEL` —
+/// stays bare for the M1 heartbeat and the pre-M2 single-session wire).
+/// RFC 0011 §3.3 requires the OPEN-bearing instruction to carry the
+/// channel's binding parameters and a receiver to distinguish stragglers
+/// from opens; datagrams reorder, so the marker cannot be positional.
+pub(crate) const SESSION_WIRE_DATA: u8 = 0;
+pub(crate) const SESSION_WIRE_OPEN: u8 = 1;
+pub(crate) const SESSION_WIRE_CLOSE: u8 = 2;
+
+/// How long an unconfirmed session OPEN retransmits (one send per RTO)
+/// before the endpoint gives up and surfaces a remote close to the client
+/// (which then falls back per-invocation). Generous: a cold remote daemon
+/// spawn sits behind connect-or-create.
+const SESSION_OPEN_RETRANSMITS_MAX: u32 = 60;
+
+/// Best-effort close retransmits (the agent kind's TERM_RETRANSMITS shape);
+/// the remote also reaps on connection silence, so this only shortens the
+/// window.
+const SESSION_CLOSE_RETRANSMITS: u32 = 4;
+
+/// The local bound on session channels across one endpoint's IPC conns —
+/// mirrors the remote peer's table bound so a refusal happens on the unix
+/// hop, not a wire round-trip later.
+const MAX_LOCAL_SESSION_CHANNELS: usize = 16;
+
+/// One IPC conn's live session channel (M2): the wire channel it owns, the
+/// open state (RFC 0011 §3.3 open-until-confirmed), and messages queued
+/// while unconfirmed (they must not race the OPEN onto the wire — a data
+/// instruction arriving on an unseen identifier is a straggler, not an
+/// open).
+struct IpcSession {
+    chan: channel::ChannelId,
+    target: Vec<u8>,
+    confirmed: bool,
+    queued: Vec<Vec<u8>>,
+    open_sends: u32,
+    last_open_send: Option<u64>,
+}
+
+/// A close owed to the wire after its IPC conn is gone (or detached):
+/// retransmitted [`SESSION_CLOSE_RETRANSMITS`] times on the RTO cadence.
+struct PendingClose {
+    chan: channel::ChannelId,
+    payload: Vec<u8>,
+    sends: u32,
+    last_send: Option<u64>,
+}
+
+/// The M2 verbs `process_ipc_conn` parses but cannot apply itself (they
+/// need the wire connection, the allocator, and the routing table, all
+/// owned by `mux_loop`).
+enum MuxSessionVerb {
+    Open(Vec<u8>),
+    Msg(Vec<u8>),
+    Close(Vec<u8>),
+}
+
+/// One accepted IPC connection: framing reassembly plus the per-conn
+/// facts the daemon tracks — hello completed, whether this conn holds
+/// the (at most one) session ref that auto-drops on close, a stable id
+/// (routing survives Vec index shifts), and the M2 session channel.
 struct IpcConn {
     stream: UnixStream,
     read_buf: MuxFrameBuffer,
     hello_ok: bool,
     holds_ref: bool,
+    conn_id: u64,
+    session: Option<IpcSession>,
 }
 
 impl IpcConn {
-    fn new(stream: UnixStream) -> IpcConn {
+    fn with_id(stream: UnixStream, conn_id: u64) -> IpcConn {
         IpcConn {
             stream,
             read_buf: MuxFrameBuffer::default(),
             hello_ok: false,
             holds_ref: false,
+            conn_id,
+            session: None,
         }
     }
 }
@@ -671,7 +734,12 @@ fn send_mux_frame(conn: &mut IpcConn, tag: MuxTag, payload: &[u8]) -> bool {
 /// first ANSWERED with our own stamp (so the client can tell and start a
 /// fresh `<key>.<ver>` endpoint) and then rejected. The caller drops a dead
 /// conn via [`drop_ipc_conn`], which releases its auto-unref ref.
-fn process_ipc_conn(conn: &mut IpcConn, state: &mut MuxState, ctx: &MuxStatusCtx) -> bool {
+fn process_ipc_conn(
+    conn: &mut IpcConn,
+    state: &mut MuxState,
+    ctx: &MuxStatusCtx,
+    verbs: &mut Vec<MuxSessionVerb>,
+) -> bool {
     let fd = conn.stream.as_raw_fd();
     let mut open = true;
     loop {
@@ -753,20 +821,25 @@ fn process_ipc_conn(conn: &mut IpcConn, state: &mut MuxState, ctx: &MuxStatusCtx
             }
             MuxTag::SessionOpen => {
                 if !conn.hello_ok {
-                    return false;
+                    return false; // protocol order: Hello first
                 }
-                // M2 routing lands in the session-channel task; until this
-                // daemon serves it, an honest refusal sends the client to
-                // its per-invocation fallback rather than a hang.
-                let ack = MuxSessionOpenAck::Refused {
-                    reason: "session channels not served by this endpoint".into(),
-                };
-                if !send_mux_frame(conn, MuxTag::SessionOpenAck, &ack.encode()) {
-                    return false;
-                }
+                verbs.push(MuxSessionVerb::Open(frame.payload));
             }
-            // M2 data/close before routing exists: ignore, keep the conn.
-            MuxTag::SessionMsg | MuxTag::SessionClose => {}
+            MuxTag::SessionMsg => {
+                if !conn.hello_ok {
+                    return false;
+                }
+                verbs.push(MuxSessionVerb::Msg(frame.payload));
+            }
+            MuxTag::SessionClose => {
+                if !conn.hello_ok {
+                    return false;
+                }
+                let payload = MuxSessionClose::decode(&frame.payload)
+                    .map(|c| c.payload)
+                    .unwrap_or_default();
+                verbs.push(MuxSessionVerb::Close(payload));
+            }
             // Mux → client verbs arriving FROM a peer: ignore, keep the conn.
             MuxTag::HelloAck | MuxTag::StatusReply | MuxTag::RefAck
             | MuxTag::SessionOpenAck | MuxTag::SessionFrame => {}
@@ -998,6 +1071,18 @@ fn mux_loop(
     let mut proxy = AgentClient::new(agent_source.to_path_buf());
     let mut state = MuxState::new(linger_ms, now_ms());
     let mut conns: Vec<IpcConn> = Vec::new();
+    // M2 session channels: the wire allocator (ordinal 1 = SESSION_CHANNEL,
+    // reserved for the bare heartbeat stream — session channels start at 2),
+    // the ChannelId → conn_id routing table (conn ids are stable across Vec
+    // index shifts), and closes owed to the wire after their conn is gone.
+    let mut alloc = channel::ChannelAllocator::new(channel::Role::Client);
+    let reserved = alloc.next(channel::KIND_SESSION);
+    debug_assert_eq!(reserved, channel::SESSION_CHANNEL);
+    let mut routes: std::collections::HashMap<channel::ChannelId, u64> =
+        std::collections::HashMap::new();
+    let mut pending_closes: Vec<PendingClose> = Vec::new();
+    let mut next_conn_id: u64 = 1;
+    let mut verbs: Vec<MuxSessionVerb> = Vec::new();
     // `None` = never sent, so the FIRST heartbeat goes on the first
     // iteration — the remote learns its peer address within ms of the
     // connection coming up. (A `0` sentinel would NOT work: `now_ms()` is
@@ -1019,14 +1104,27 @@ fn mux_loop(
         }
         let now = now_ms();
 
-        // Wake for the next heartbeat, the linger expiry, and the agent
-        // mux's fresh sends / RTO retransmissions (RFC 0011 §5).
+        // Wake for the next heartbeat, the linger expiry, the agent mux's
+        // fresh sends / RTO retransmissions (RFC 0011 §5), and the M2
+        // session-channel open/close retransmit cadence.
         let mut deadline = last_send.map_or(now, |t| t.saturating_add(HEARTBEAT_INTERVAL));
         if let Some(d) = state.next_deadline() {
             deadline = deadline.min(d);
         }
         if let Some(d) = agent_mux.next_deadline(conn.rto()) {
             deadline = deadline.min(d.max(now));
+        }
+        for c in &conns {
+            if let Some(s) = &c.session {
+                if !s.confirmed {
+                    let due = s.last_open_send.map_or(now, |t| t + conn.rto());
+                    deadline = deadline.min(due.max(now));
+                }
+            }
+        }
+        for p in &pending_closes {
+            let due = p.last_send.map_or(now, |t| t + conn.rto());
+            deadline = deadline.min(due.max(now));
         }
         let timeout = deadline.saturating_sub(now).min(1000) as i32;
 
@@ -1057,7 +1155,8 @@ fn mux_loop(
         if fds[0].revents & libc::POLLIN != 0 {
             while let Ok((stream, _)) = listener.accept() {
                 let _ = stream.set_nonblocking(true);
-                conns.push(IpcConn::new(stream));
+                conns.push(IpcConn::with_id(stream, next_conn_id));
+                next_conn_id += 1;
             }
         }
 
@@ -1086,6 +1185,75 @@ fn mux_loop(
                         };
                         last_heard = now_ms();
                         if chan.kind() != channel::KIND_AGENT {
+                            // M2 session channels (ordinal >= 2, the wire
+                            // micro-envelope); ordinal 1 stays the bare
+                            // heartbeat stream and is ignored as before.
+                            if chan.kind() == channel::KIND_SESSION
+                                && chan != channel::SESSION_CHANNEL
+                            {
+                                let srtt = conn.srtt() as u32;
+                                let Some(owner) = routes.get(&chan).copied() else {
+                                    continue; // straggler on a closed channel
+                                };
+                                let Some(ci) =
+                                    conns.iter_mut().find(|c| c.conn_id == owner)
+                                else {
+                                    continue;
+                                };
+                                let Some(sess) = ci.session.as_mut() else {
+                                    continue;
+                                };
+                                // Any inbound on the identifier proves our
+                                // OPEN arrived (§3.3): flush what queued.
+                                if !sess.confirmed {
+                                    sess.confirmed = true;
+                                    let chan = sess.chan;
+                                    for m in std::mem::take(&mut sess.queued) {
+                                        send_session_wire(
+                                            &mut conn,
+                                            &mut fragmenter,
+                                            chan,
+                                            SESSION_WIRE_DATA,
+                                            &m,
+                                        );
+                                    }
+                                }
+                                match message.first() {
+                                    Some(&SESSION_WIRE_DATA) => {
+                                        let framed =
+                                            encode_session_frame(srtt, &message[1..]);
+                                        let _ = send_mux_frame(
+                                            ci,
+                                            MuxTag::SessionFrame,
+                                            &framed,
+                                        );
+                                    }
+                                    Some(&SESSION_WIRE_CLOSE) => {
+                                        let close = MuxSessionClose {
+                                            remote: true,
+                                            payload: message[1..].to_vec(),
+                                        };
+                                        let _ = send_mux_frame(
+                                            ci,
+                                            MuxTag::SessionClose,
+                                            &close.encode(),
+                                        );
+                                        ci.session = None;
+                                        routes.remove(&chan);
+                                        if ci.holds_ref {
+                                            ci.holds_ref = false;
+                                            let was = state.serviceable();
+                                            state.unref(now_ms());
+                                            if was && !state.serviceable() {
+                                                agent_mux
+                                                    .queue_records(&proxy.close_all());
+                                            }
+                                        }
+                                    }
+                                    // Unknown micro-kind: forward compat.
+                                    _ => {}
+                                }
+                            }
                             continue;
                         }
                         let recs = agent_mux.on_instruction(chan, message);
@@ -1144,12 +1312,112 @@ fn mux_loop(
             if fds[2 + i].revents & (libc::POLLIN | libc::POLLHUP | libc::POLLERR) == 0 {
                 continue;
             }
-            if !process_ipc_conn(&mut conns[i], &mut state, &ctx) {
+            verbs.clear();
+            if !process_ipc_conn(&mut conns[i], &mut state, &ctx, &mut verbs) {
                 let dead = conns.remove(i);
+                // A departing conn's open channel owes the wire a close.
+                if let Some(s) = dead.session.as_ref() {
+                    routes.remove(&s.chan);
+                    pending_closes.push(PendingClose {
+                        chan: s.chan,
+                        payload: Vec::new(),
+                        sends: 0,
+                        last_send: None,
+                    });
+                }
                 let was_serviceable = state.serviceable();
                 drop_ipc_conn(&dead, &mut state, now);
                 if was_serviceable && !state.serviceable() {
                     agent_mux.queue_records(&proxy.close_all());
+                }
+                continue;
+            }
+            // Apply the M2 session verbs this conn produced.
+            for verb in verbs.drain(..) {
+                match verb {
+                    MuxSessionVerb::Open(target) => {
+                        if let Some(s) = &conns[i].session {
+                            // Idempotent re-open: re-ack the same grant so a
+                            // retrying client never hangs.
+                            let ack = MuxSessionOpenAck::Granted {
+                                ordinal: s.chan.ordinal(),
+                            };
+                            let _ = send_mux_frame(
+                                &mut conns[i],
+                                MuxTag::SessionOpenAck,
+                                &ack.encode(),
+                            );
+                            continue;
+                        }
+                        let live = conns.iter().filter(|c| c.session.is_some()).count();
+                        if live >= MAX_LOCAL_SESSION_CHANNELS {
+                            let ack = MuxSessionOpenAck::Refused {
+                                reason: "session channel table full".into(),
+                            };
+                            let _ = send_mux_frame(
+                                &mut conns[i],
+                                MuxTag::SessionOpenAck,
+                                &ack.encode(),
+                            );
+                            continue;
+                        }
+                        let chan = alloc.next(channel::KIND_SESSION);
+                        routes.insert(chan, conns[i].conn_id);
+                        if !conns[i].holds_ref {
+                            conns[i].holds_ref = true;
+                            state.add_ref();
+                        }
+                        conns[i].session = Some(IpcSession {
+                            chan,
+                            target,
+                            confirmed: false,
+                            queued: Vec::new(),
+                            open_sends: 0,
+                            last_open_send: None,
+                        });
+                        let ack = MuxSessionOpenAck::Granted { ordinal: chan.ordinal() };
+                        let _ = send_mux_frame(
+                            &mut conns[i],
+                            MuxTag::SessionOpenAck,
+                            &ack.encode(),
+                        );
+                        // The wire OPEN goes out in this iteration's session
+                        // send pass below.
+                    }
+                    MuxSessionVerb::Msg(bytes) => {
+                        if let Some(s) = conns[i].session.as_mut() {
+                            if s.confirmed {
+                                send_session_wire(
+                                    &mut conn,
+                                    &mut fragmenter,
+                                    s.chan,
+                                    SESSION_WIRE_DATA,
+                                    &bytes,
+                                );
+                            } else {
+                                s.queued.push(bytes);
+                            }
+                        }
+                    }
+                    MuxSessionVerb::Close(payload) => {
+                        if let Some(s) = conns[i].session.take() {
+                            routes.remove(&s.chan);
+                            pending_closes.push(PendingClose {
+                                chan: s.chan,
+                                payload,
+                                sends: 0,
+                                last_send: None,
+                            });
+                            if conns[i].holds_ref {
+                                conns[i].holds_ref = false;
+                                let was = state.serviceable();
+                                state.unref(now);
+                                if was && !state.serviceable() {
+                                    agent_mux.queue_records(&proxy.close_all());
+                                }
+                            }
+                        }
+                    }
                 }
             }
         }
@@ -1162,9 +1430,46 @@ fn mux_loop(
             break;
         }
 
-        // Sends: the RFC 0011 §4.1 ordered drain with the heartbeat as the
-        // only session instruction (see `heartbeat_message`); agent
-        // instructions flow every iteration with RTO pacing.
+        // Sends, §4.1 order: session-channel maintenance first (open
+        // retransmits until confirmed, pending closes on the RTO cadence),
+        // then the heartbeat, then agent instructions.
+        let now = now_ms();
+        for c in &mut conns {
+            if let Some(s) = c.session.as_mut() {
+                if !s.confirmed
+                    && s.open_sends < SESSION_OPEN_RETRANSMITS_MAX
+                    && s.last_open_send
+                        .is_none_or(|t| now.saturating_sub(t) >= conn.rto())
+                {
+                    s.open_sends += 1;
+                    s.last_open_send = Some(now);
+                    let (chan, target) = (s.chan, s.target.clone());
+                    send_session_wire(
+                        &mut conn,
+                        &mut fragmenter,
+                        chan,
+                        SESSION_WIRE_OPEN,
+                        &target,
+                    );
+                }
+            }
+        }
+        pending_closes.retain_mut(|p| {
+            if p.last_send
+                .is_none_or(|t| now.saturating_sub(t) >= conn.rto())
+            {
+                p.sends += 1;
+                p.last_send = Some(now);
+                send_session_wire(
+                    &mut conn,
+                    &mut fragmenter,
+                    p.chan,
+                    SESSION_WIRE_CLOSE,
+                    &p.payload,
+                );
+            }
+            p.sends < SESSION_CLOSE_RETRANSMITS
+        });
         let session_due = last_send.is_none_or(|t| now.saturating_sub(t) >= HEARTBEAT_INTERVAL);
         let session = session_due.then(heartbeat_message);
         if session.is_some() {
@@ -1179,6 +1484,22 @@ fn mux_loop(
             }
         }
     }
+}
+
+/// Seals one M2 session-channel instruction — the 1-byte wire micro-envelope
+/// kind + body — and sends its fragments. The single seam every session
+/// send goes through.
+fn send_session_wire(
+    conn: &mut Connection,
+    fragmenter: &mut sync::Fragmenter,
+    chan: channel::ChannelId,
+    kind: u8,
+    body: &[u8],
+) {
+    let mut payload = Vec::with_capacity(1 + body.len());
+    payload.push(kind);
+    payload.extend_from_slice(body);
+    crate::remote::server::send_on_channel(conn, fragmenter, chan, &payload, true);
 }
 
 // ---------------------------------------------------------------------------
@@ -1793,7 +2114,7 @@ mod tests {
     fn ipc_pair() -> (IpcConn, std::os::unix::net::UnixStream) {
         let (daemon_side, client_side) = std::os::unix::net::UnixStream::pair().unwrap();
         daemon_side.set_nonblocking(true).unwrap();
-        (IpcConn::new(daemon_side), client_side)
+        (IpcConn::with_id(daemon_side, 0), client_side)
     }
 
     /// The agent-source path every `test_ctx` daemon reports in its ack.
@@ -1841,7 +2162,7 @@ mod tests {
         client
             .write_all(&encode_mux_frame(MuxTag::Hello, &hello.encode()))
             .unwrap();
-        assert!(process_ipc_conn(&mut conn, &mut state, &ctx));
+        assert!(process_ipc_conn(&mut conn, &mut state, &ctx, &mut Vec::new()));
         let ack_frame = read_client_frame(&mut client);
         assert_eq!(ack_frame.tag, MuxTag::HelloAck);
         let ack = MuxHelloAck::decode(&ack_frame.payload).unwrap();
@@ -1861,7 +2182,7 @@ mod tests {
         client
             .write_all(&encode_mux_frame(MuxTag::SessionRef, b""))
             .unwrap();
-        assert!(process_ipc_conn(&mut conn, &mut state, &ctx));
+        assert!(process_ipc_conn(&mut conn, &mut state, &ctx, &mut Vec::new()));
         assert_eq!(state.refs(), 1);
         assert!(state.serviceable());
         assert_eq!(read_client_frame(&mut client).tag, MuxTag::RefAck);
@@ -1870,7 +2191,7 @@ mod tests {
         client
             .write_all(&encode_mux_frame(MuxTag::SessionRef, b""))
             .unwrap();
-        assert!(process_ipc_conn(&mut conn, &mut state, &ctx));
+        assert!(process_ipc_conn(&mut conn, &mut state, &ctx, &mut Vec::new()));
         assert_eq!(state.refs(), 1, "one accepted conn = at most one ref");
         assert_eq!(
             read_client_frame(&mut client).tag,
@@ -1882,7 +2203,7 @@ mod tests {
         client
             .write_all(&encode_mux_frame(MuxTag::Status, b""))
             .unwrap();
-        assert!(process_ipc_conn(&mut conn, &mut state, &ctx));
+        assert!(process_ipc_conn(&mut conn, &mut state, &ctx, &mut Vec::new()));
         let status_frame = read_client_frame(&mut client);
         assert_eq!(status_frame.tag, MuxTag::StatusReply);
         let line = String::from_utf8(status_frame.payload).unwrap();
@@ -1901,7 +2222,7 @@ mod tests {
 
         // Dropping the IPC connection auto-unrefs (crashed client safety).
         drop(client);
-        assert!(!process_ipc_conn(&mut conn, &mut state, &ctx), "EOF ends the conn");
+        assert!(!process_ipc_conn(&mut conn, &mut state, &ctx, &mut Vec::new()), "EOF ends the conn");
         drop_ipc_conn(&conn, &mut state, 5_000);
         assert_eq!(state.refs(), 0);
         assert!(!state.serviceable());
@@ -1924,7 +2245,7 @@ mod tests {
             .unwrap();
         // §6: never negotiate down — answer with OUR stamp (so the client can
         // tell and start a fresh endpoint), then reject the connection.
-        assert!(!process_ipc_conn(&mut conn, &mut state, &ctx));
+        assert!(!process_ipc_conn(&mut conn, &mut state, &ctx, &mut Vec::new()));
         let ack = MuxHelloAck::decode(&read_client_frame(&mut client).payload).unwrap();
         assert_eq!(ack.stamp, MUX_PROTO_STAMP);
         assert!(!conn.holds_ref);
@@ -1941,7 +2262,7 @@ mod tests {
         client
             .write_all(&encode_mux_frame(MuxTag::SessionRef, b""))
             .unwrap();
-        assert!(!process_ipc_conn(&mut conn, &mut state, &ctx));
+        assert!(!process_ipc_conn(&mut conn, &mut state, &ctx, &mut Vec::new()));
         assert_eq!(state.refs(), 0);
     }
 
@@ -2304,6 +2625,254 @@ mod tests {
             assert!(util::now_ms() < deadline, "status never showed {needle:?}: {line:?}");
             std::thread::sleep(std::time::Duration::from_millis(10));
         }
+    }
+
+    // --- M2 session-channel routing (Task 2): the daemon side driven over
+    // the in-process harness; the test plays the remote peer on the wire. ---
+
+    /// Receives assembled instructions on the test's server connection until
+    /// `pred` accepts one (bounded). Heartbeats ride bare `SESSION_CHANNEL`
+    /// and are skipped by predicates keyed on ordinals >= 2.
+    fn recv_wire_until(
+        server: &mut Connection,
+        assembly: &mut sync::FragmentAssembly,
+        mut pred: impl FnMut(channel::ChannelId, &[u8]) -> bool,
+    ) -> (channel::ChannelId, Vec<u8>) {
+        let deadline = util::now_ms() + 8_000;
+        loop {
+            assert!(util::now_ms() < deadline, "wire instruction never arrived");
+            match server.recv() {
+                Ok(Some(payload)) => {
+                    let Ok(frag) = sync::Fragment::from_bytes(&payload) else { continue };
+                    let Some(assembled) = assembly.add(frag) else { continue };
+                    let Some((chan, message)) = channel::open_any_instruction(true, &assembled)
+                    else {
+                        continue;
+                    };
+                    if pred(chan, message) {
+                        return (chan, message.to_vec());
+                    }
+                }
+                Ok(None) => {}
+                Err(e) if e.kind() == std::io::ErrorKind::WouldBlock => {
+                    std::thread::sleep(std::time::Duration::from_millis(5));
+                }
+                Err(e) => panic!("server recv: {e}"),
+            }
+        }
+    }
+
+    /// Sends one micro-enveloped session instruction from the test's remote
+    /// peer toward the mux daemon.
+    fn send_wire(
+        server: &mut Connection,
+        fragmenter: &mut sync::Fragmenter,
+        chan: channel::ChannelId,
+        kind: u8,
+        body: &[u8],
+    ) {
+        let mut payload = vec![kind];
+        payload.extend_from_slice(body);
+        let wire = channel::seal_on(true, chan, &payload);
+        for frag in fragmenter.make_fragments(&wire, sync::FRAGMENT_CONTENTS_MAX) {
+            let _ = server.send(&frag.to_bytes());
+        }
+    }
+
+    /// Hello + SessionOpen over the IPC socket; returns the stream and the
+    /// granted wire ordinal.
+    fn ipc_open_session(path: &Path, target: &[u8]) -> (std::os::unix::net::UnixStream, u64) {
+        use std::io::Write;
+        let mut s = ipc_observer(path);
+        s.write_all(&encode_mux_frame(MuxTag::SessionOpen, target)).unwrap();
+        loop {
+            let f = read_client_frame(&mut s);
+            if f.tag == MuxTag::SessionOpenAck {
+                match MuxSessionOpenAck::decode(&f.payload).unwrap() {
+                    MuxSessionOpenAck::Granted { ordinal } => return (s, ordinal),
+                    MuxSessionOpenAck::Refused { reason } => panic!("refused: {reason}"),
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn session_open_allocates_channel_acks_and_refs() {
+        let dir = temp_base();
+        let (daemon, mut server) = start_inprocess_daemon(&dir, "m2open", 1_000, (63700, 63709));
+        let (ipc, ordinal) = ipc_open_session(&mux_socket_path_in(&dir, "m2open"), b"box:dev");
+        assert!(ordinal >= 2, "ordinal 1 is the reserved heartbeat stream, got {ordinal}");
+        let mut obs = ipc_observer(&mux_socket_path_in(&dir, "m2open"));
+        wait_status_contains(&mut obs, "refs=1 ");
+        // The wire OPEN carries the target (RFC 0011 §3.3), retransmitted
+        // until confirmed — the remote peer sees it.
+        let mut assembly = sync::FragmentAssembly::new();
+        let (chan, msg) = recv_wire_until(&mut server, &mut assembly, |c, m| {
+            c.kind() == channel::KIND_SESSION
+                && c.ordinal() == ordinal
+                && m.first() == Some(&SESSION_WIRE_OPEN)
+        });
+        assert_eq!(&msg[1..], b"box:dev");
+        assert_eq!(chan.ordinal(), ordinal);
+        drop(ipc);
+        wait_status_contains(&mut obs, "refs=0 ");
+        drop(obs);
+        daemon.join().unwrap();
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    #[test]
+    fn session_msg_routes_to_the_wire_and_frames_route_back() {
+        use std::io::Write;
+        let dir = temp_base();
+        let (daemon, mut server) = start_inprocess_daemon(&dir, "m2msg", 1_000, (63710, 63719));
+        let (mut ipc, ordinal) = ipc_open_session(&mux_socket_path_in(&dir, "m2msg"), b"box:a");
+        let mut assembly = sync::FragmentAssembly::new();
+        let mut fragmenter = sync::Fragmenter::new();
+        // A message sent BEFORE confirmation queues — the wire must show the
+        // OPEN first, and the data only after the remote's first reply.
+        ipc.write_all(&encode_mux_frame(MuxTag::SessionMsg, b"early input")).unwrap();
+        let (chan, _) = recv_wire_until(&mut server, &mut assembly, |c, m| {
+            c.ordinal() == ordinal && m.first() == Some(&SESSION_WIRE_OPEN)
+        });
+        // Confirm by answering with a frame; the mux must (a) deliver it to
+        // the IPC conn with the srtt prefix and (b) flush the queued input.
+        send_wire(&mut server, &mut fragmenter, chan, SESSION_WIRE_DATA, b"first frame");
+        loop {
+            let f = read_client_frame(&mut ipc);
+            if f.tag == MuxTag::SessionFrame {
+                let (_srtt, body) = decode_session_frame(&f.payload).unwrap();
+                assert_eq!(body, b"first frame");
+                break;
+            }
+        }
+        let (_, early) = recv_wire_until(&mut server, &mut assembly, |c, m| {
+            c.ordinal() == ordinal && m.first() == Some(&SESSION_WIRE_DATA)
+        });
+        assert_eq!(&early[1..], b"early input", "queued input flushes on confirmation");
+        // Post-confirmation messages relay immediately.
+        ipc.write_all(&encode_mux_frame(MuxTag::SessionMsg, b"live input")).unwrap();
+        let (_, live) = recv_wire_until(&mut server, &mut assembly, |c, m| {
+            c.ordinal() == ordinal
+                && m.first() == Some(&SESSION_WIRE_DATA)
+                && &m[1..] == b"live input"
+        });
+        assert_eq!(&live[1..], b"live input");
+        drop(ipc);
+        daemon.join().unwrap();
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    #[test]
+    fn two_ipc_conns_get_disjoint_channels_and_isolated_frames() {
+        let dir = temp_base();
+        let (daemon, mut server) = start_inprocess_daemon(&dir, "m2iso", 1_000, (63720, 63729));
+        let path = mux_socket_path_in(&dir, "m2iso");
+        let (mut ipc_a, ord_a) = ipc_open_session(&path, b"box:a");
+        let (mut ipc_b, ord_b) = ipc_open_session(&path, b"box:b");
+        assert_ne!(ord_a, ord_b, "channels are disjoint");
+        let mut assembly = sync::FragmentAssembly::new();
+        let mut fragmenter = sync::Fragmenter::new();
+        let (chan_a, _) = recv_wire_until(&mut server, &mut assembly, |c, m| {
+            c.ordinal() == ord_a && m.first() == Some(&SESSION_WIRE_OPEN)
+        });
+        let (chan_b, _) = recv_wire_until(&mut server, &mut assembly, |c, m| {
+            c.ordinal() == ord_b && m.first() == Some(&SESSION_WIRE_OPEN)
+        });
+        // One frame to each channel: each IPC conn sees exactly its own.
+        send_wire(&mut server, &mut fragmenter, chan_a, SESSION_WIRE_DATA, b"for a");
+        send_wire(&mut server, &mut fragmenter, chan_b, SESSION_WIRE_DATA, b"for b");
+        let fa = loop {
+            let f = read_client_frame(&mut ipc_a);
+            if f.tag == MuxTag::SessionFrame {
+                break decode_session_frame(&f.payload).unwrap().1.to_vec();
+            }
+        };
+        let fb = loop {
+            let f = read_client_frame(&mut ipc_b);
+            if f.tag == MuxTag::SessionFrame {
+                break decode_session_frame(&f.payload).unwrap().1.to_vec();
+            }
+        };
+        assert_eq!(fa, b"for a");
+        assert_eq!(fb, b"for b");
+        drop(ipc_a);
+        drop(ipc_b);
+        daemon.join().unwrap();
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    #[test]
+    fn ipc_conn_drop_closes_its_wire_channel_and_unrefs() {
+        let dir = temp_base();
+        let (daemon, mut server) = start_inprocess_daemon(&dir, "m2drop", 1_000, (63730, 63739));
+        let path = mux_socket_path_in(&dir, "m2drop");
+        let (ipc, ordinal) = ipc_open_session(&path, b"box:gone");
+        let mut obs = ipc_observer(&path);
+        wait_status_contains(&mut obs, "refs=1 ");
+        let mut assembly = sync::FragmentAssembly::new();
+        recv_wire_until(&mut server, &mut assembly, |c, m| {
+            c.ordinal() == ordinal && m.first() == Some(&SESSION_WIRE_OPEN)
+        });
+        // Dropping the IPC conn owes the wire a CLOSE and releases the ref.
+        drop(ipc);
+        recv_wire_until(&mut server, &mut assembly, |c, m| {
+            c.ordinal() == ordinal && m.first() == Some(&SESSION_WIRE_CLOSE)
+        });
+        wait_status_contains(&mut obs, "refs=0 ");
+        drop(obs);
+        daemon.join().unwrap();
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    #[test]
+    fn open_retransmits_target_until_acked() {
+        let dir = temp_base();
+        let (daemon, mut server) = start_inprocess_daemon(&dir, "m2retx", 2_000, (63740, 63749));
+        let (ipc, ordinal) = ipc_open_session(&mux_socket_path_in(&dir, "m2retx"), b"box:slow");
+        let mut assembly = sync::FragmentAssembly::new();
+        let mut fragmenter = sync::Fragmenter::new();
+        // Two OPENs without an answer proves the RTO retransmit; both carry
+        // the target (subsequent instructions never repeat it — §3.3 — so
+        // both being OPEN-marked shows these are retransmissions).
+        for _ in 0..2 {
+            let (_, m) = recv_wire_until(&mut server, &mut assembly, |c, m| {
+                c.ordinal() == ordinal && m.first() == Some(&SESSION_WIRE_OPEN)
+            });
+            assert_eq!(&m[1..], b"box:slow");
+        }
+        // Answer: the retransmits stop (bounded look for silence).
+        let chan = channel::ChannelId::new(false, channel::KIND_SESSION, ordinal);
+        send_wire(&mut server, &mut fragmenter, chan, SESSION_WIRE_DATA, b"ok");
+        // Drain until quiet: after the confirmation reaches the daemon, no
+        // further OPEN should arrive for a full second.
+        let quiet_from = util::now_ms() + 1_500;
+        let mut last_open = 0u64;
+        while util::now_ms() < quiet_from + 1_000 {
+            match server.recv() {
+                Ok(Some(payload)) => {
+                    if let Ok(frag) = sync::Fragment::from_bytes(&payload) {
+                        if let Some(assembled) = assembly.add(frag) {
+                            if let Some((c, m)) = channel::open_any_instruction(true, &assembled) {
+                                if c.ordinal() == ordinal
+                                    && m.first() == Some(&SESSION_WIRE_OPEN)
+                                {
+                                    last_open = util::now_ms();
+                                }
+                            }
+                        }
+                    }
+                }
+                _ => std::thread::sleep(std::time::Duration::from_millis(10)),
+            }
+        }
+        assert!(
+            last_open < quiet_from,
+            "OPEN retransmits must stop after confirmation (last at {last_open}, quiet from {quiet_from})"
+        );
+        drop(ipc);
+        daemon.join().unwrap();
+        std::fs::remove_dir_all(&dir).ok();
     }
 
     #[test]

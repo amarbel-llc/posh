@@ -1159,6 +1159,12 @@ fn drive_client(st: &mut ClientState, raw: &RawMode, port: u16) -> Result<i32> {
                             handle_agent_instruction(st, chan, message);
                             continue;
                         }
+                        if chan != channel::SESSION_CHANNEL {
+                            // M2 mux session ordinals (>= 2) are not this
+                            // loop's session — ignore, never feed the frame
+                            // path (the gate admits them for the mux loops).
+                            continue;
+                        }
                         let Ok(frame) = ServerFrame::decode(message) else {
                             continue;
                         };

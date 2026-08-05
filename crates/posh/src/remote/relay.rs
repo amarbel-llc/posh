@@ -745,6 +745,11 @@ fn relay_loop(
                             }
                             continue;
                         }
+                        if chan != channel::SESSION_CHANNEL {
+                            // M2 mux session ordinals (>= 2) are not this
+                            // single-session relay's traffic — ignore.
+                            continue;
+                        }
                         let Ok(msg) = ClientMessage::decode(message) else {
                             continue;
                         };
