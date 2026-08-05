@@ -502,13 +502,16 @@ struct MuxStatusCtx<'a> {
     heard_age_ms: u64,
     channels: usize,
     agent_source: &'a Path,
+    /// The §9.2 congestion summary (`AgentChannelMux::congestion_summary`):
+    /// live cwnd bytes, cumulative MD cuts, deepest backoff streak.
+    congestion: (usize, u64, u32),
 }
 
 /// The `MuxStatus` one-liner (FDR 0007 dump surface): peer addr, last-heard
-/// age, channel count, refs, linger state.
+/// age, channel count, refs, linger state, §9.2 congestion summary.
 fn status_line(ctx: &MuxStatusCtx, state: &MuxState) -> String {
     format!(
-        "mux {key}: state={cs} peer={peer} heard={heard}ms channels={ch} refs={refs} linger={linger}",
+        "mux {key}: state={cs} peer={peer} heard={heard}ms channels={ch} refs={refs} linger={linger} cwnd={cwnd} cuts={cuts} streak_hwm={hwm}",
         key = ctx.key,
         cs = ctx.conn_state.label(),
         peer = ctx
@@ -518,6 +521,9 @@ fn status_line(ctx: &MuxStatusCtx, state: &MuxState) -> String {
         ch = ctx.channels,
         refs = state.refs(),
         linger = if state.lingering() { "armed" } else { "off" },
+        cwnd = ctx.congestion.0,
+        cuts = ctx.congestion.1,
+        hwm = ctx.congestion.2,
     )
 }
 
@@ -987,6 +993,7 @@ fn mux_loop(
             heard_age_ms: now.saturating_sub(last_heard),
             channels: proxy.live_channel_count(),
             agent_source,
+            congestion: agent_mux.congestion_summary(),
         };
         let mut i = conns.len().min(n_ipc);
         while i > 0 {
@@ -1598,6 +1605,7 @@ mod tests {
             heard_age_ms: 12,
             channels: 0,
             agent_source: Path::new(TEST_CTX_SOURCE),
+            congestion: (262_144, 0, 0),
         }
     }
 
@@ -1677,7 +1685,15 @@ mod tests {
         assert_eq!(status_frame.tag, MuxTag::StatusReply);
         let line = String::from_utf8(status_frame.payload).unwrap();
         assert!(!line.contains('\n'), "one line: {line:?}");
-        for needle in ["example.com-4", "refs=1", "channels=0", "heard=12ms"] {
+        for needle in [
+            "example.com-4",
+            "refs=1",
+            "channels=0",
+            "heard=12ms",
+            "cwnd=262144",
+            "cuts=0",
+            "streak_hwm=0",
+        ] {
             assert!(line.contains(needle), "{needle:?} missing from {line:?}");
         }
 

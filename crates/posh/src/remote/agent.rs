@@ -1359,6 +1359,12 @@ impl AgentChannelMux {
         due
     }
 
+    /// §9.2 telemetry for the mux `StatusReply` one-liner: the live window
+    /// budget, cumulative MD cuts, and the deepest backoff streak observed.
+    pub fn congestion_summary(&self) -> (usize, u64, u32) {
+        (self.cwnd, self.cuts, self.streak_hwm)
+    }
+
     fn by_rec(&mut self, rec_id: u32) -> Option<&mut MuxChannel> {
         self.channels.iter_mut().find(|c| c.rec_id == rec_id)
     }
