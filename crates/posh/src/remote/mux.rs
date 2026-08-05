@@ -89,16 +89,13 @@ pub fn client_id() -> String {
 /// The promoted `POSH_MUX` gate (FDR 0014 stable bar): the per-destination
 /// mux endpoint is DEFAULT ON; `POSH_MUX=0` (or `false`/`off`/`no`) is the
 /// rollback switch — off means no mux spawn and sessions keep their own
-/// forwarding, byte-identical to the pre-M1 bootstrap. Same off-switch shape
-/// as `parse_frames_gate` (`session/daemon.rs`), deliberately duplicated
-/// rather than shared across the session/remote module boundary. On ensure
-/// failure the invocation falls back to per-connection forwarding
-/// ([`apply_mux_gate`]), so default-on never strands the user agentless.
+/// forwarding, byte-identical to the pre-M1 bootstrap. The off-switch shape
+/// is the shared [`util::parse_default_on_gate`], the same contract as
+/// `POSH_SESSION_FRAMES`. On ensure failure the invocation falls back to
+/// per-connection forwarding ([`apply_mux_gate`]), so default-on never
+/// strands the user agentless.
 fn parse_mux_gate(value: Option<&str>) -> bool {
-    !matches!(
-        value.map(|v| v.trim().to_ascii_lowercase()).as_deref(),
-        Some("0" | "false" | "off" | "no")
-    )
+    util::parse_default_on_gate(value)
 }
 
 /// Reads the [`parse_mux_gate`] decision from the environment.

@@ -492,10 +492,7 @@ impl ClientConn {
 /// not which codec. `POSH_SESSION_FRAMES=0` restores today's raw-`Tag::Output`
 /// path byte-for-byte.
 fn parse_frames_gate(value: Option<&str>) -> bool {
-    !matches!(
-        value.map(|v| v.trim().to_ascii_lowercase()).as_deref(),
-        Some("0" | "false" | "off" | "no")
-    )
+    util::parse_default_on_gate(value)
 }
 
 /// Whether this daemon emits posh-proto `ServerFrame`s (`Tag::Frame`) to

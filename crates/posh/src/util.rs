@@ -89,6 +89,20 @@ pub fn now_ms() -> u64 {
     START.get_or_init(Instant::now).elapsed().as_millis() as u64
 }
 
+/// The default-on env-gate parser shared by the promoted opt-out gates
+/// (`POSH_SESSION_FRAMES`, `POSH_MUX`): ON unless the value, trimmed and
+/// ASCII-lowercased, is one of the explicit off spellings. Unset, empty,
+/// and unrecognized values are all ON — an off-SWITCH, not a truthy set
+/// (contrast `sshwrap::env_value_on`, the opt-IN predicate). Pure so each
+/// gate's tests can pin it without touching the (global, test-racy)
+/// process environment.
+pub fn parse_default_on_gate(value: Option<&str>) -> bool {
+    !matches!(
+        value.map(|v| v.trim().to_ascii_lowercase()).as_deref(),
+        Some("0" | "false" | "off" | "no")
+    )
+}
+
 // ---------------------------------------------------------------------------
 // Session-name percent-encoding (zmx semantics: only bytes that are unsafe in
 // a single filename component are escaped).
