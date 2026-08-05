@@ -494,6 +494,18 @@ debug-agent-e2e:
 debug-perf-compose:
     nix develop --command cargo test -p posh --release remote::perf_probe -- --ignored --nocapture
 
+# Loaded-mux measurement (posh#143/#144, RFC 0011 §9.2/§9.3): N synthetic
+# sessions + bulk agent channels over the real transport through an
+# in-process impairment relay (delay/loss/bottleneck-queue), printing the
+# LoadReports the congestion/flow-control decisions quote. Release build
+# (timing), --test-threads=1 (fixed loopback UDP port ranges + wall-clock
+# measurement). Debug-only; the hermetic gate is build-rust.
+#
+# run the loaded-mux transport measurement scenarios
+[group("debug")]
+debug-mux-load:
+    nix develop --command cargo test -p posh --release remote::loadprobe -- --ignored --nocapture --test-threads=1
+
 # Prove poshterity replay determinism (poshterity phase 5, #61): `poshterity assert`
 # the committed VT100 emulation fixture against its golden N times (default 50)
 # and fail loudly on the first mismatch. Zero flakes is the headline of the

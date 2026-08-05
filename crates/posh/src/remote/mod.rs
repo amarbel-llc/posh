@@ -51,6 +51,11 @@ pub mod mux;
 /// the palette hosts and overlays identically over a roaming and a local
 /// session (FDR 0011 Phase 2.3).
 pub mod palette;
+/// The loaded-mux measurement harness (posh#143/#144, RFC 0011 §9.2/§9.3):
+/// real transport through an in-process impairment relay, `#[ignore]`d
+/// scenarios run via `just debug-mux-load`.
+#[cfg(test)]
+mod loadprobe;
 #[cfg(test)]
 mod perf_probe;
 pub mod predict;
