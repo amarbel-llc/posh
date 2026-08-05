@@ -936,6 +936,11 @@ struct MuxChannel {
     /// `send_due` emissions); reset to 0 when `outbox.base()` advances or the
     /// peer confirms our OPEN.
     retx_streak: u32,
+    /// §9.2: this channel's data was truncated by an exhausted window
+    /// budget. Promoted back to `send_due` at the next window roll (refill),
+    /// so a budget denial costs at most one window — never a backoff
+    /// interval.
+    budget_starved: bool,
 }
 
 impl MuxChannel {
@@ -951,6 +956,7 @@ impl MuxChannel {
             send_due: true,
             last_send: 0,
             retx_streak: 0,
+            budget_starved: false,
         }
     }
 }
@@ -1188,6 +1194,19 @@ impl AgentChannelMux {
             self.window_progress = false;
             self.window_used = 0;
             self.window_start = now;
+            // Refill re-arms budget-starved channels promptly.
+            for ch in &mut self.channels {
+                if std::mem::take(&mut ch.budget_starved) {
+                    ch.send_due = true;
+                }
+            }
+        }
+        // Fairness under a binding budget: rotate the service order one
+        // step per drain so a reduced cwnd is shared across channels
+        // instead of pinning to the head. Channel order carries no
+        // protocol semantics (lookups are id-keyed).
+        if self.channels.len() > 1 {
+            self.channels.rotate_left(1);
         }
         let mut out = Vec::new();
         for t in &mut self.closed {
@@ -1230,7 +1249,22 @@ impl AgentChannelMux {
             }
             if ch.send_due || retx_fires {
                 let pending = ch.outbox.pending();
-                let take = pending.len().min(AGENT_INSTRUCTION_DATA_MAX);
+                let desired = pending.len().min(AGENT_INSTRUCTION_DATA_MAX);
+                // §9.2: the window budget gates DATA BYTES only, and only
+                // while cwnd sits below max — at max, emission is
+                // byte-identical to the ungated sender. A truncated (even
+                // to zero) instruction still goes out: acks, OPENs, and
+                // terminal echoes are never budget-blocked.
+                let take = if self.cwnd < CWND_MAX {
+                    let t = desired.min(self.cwnd.saturating_sub(self.window_used));
+                    if t < desired {
+                        ch.budget_starved = true;
+                    }
+                    t
+                } else {
+                    desired
+                };
+                self.window_used += take;
                 let mut flags = 0u8;
                 if ch.open_unconfirmed {
                     flags |= AGENT_FLAG_OPEN;
@@ -1282,6 +1316,14 @@ impl AgentChannelMux {
         for ch in &self.channels {
             if ch.send_due {
                 fold(0);
+                continue;
+            }
+            if ch.budget_starved {
+                // §9.2: a starved channel resumes at the window REFILL —
+                // never 0 (that would busy-spin the poll loop against an
+                // exhausted budget) and never the backoff interval (a
+                // budget denial is not a loss signal).
+                fold(self.window_start + rto);
                 continue;
             }
             let wants = !ch.outbox.is_empty()
@@ -3059,6 +3101,235 @@ mod tests {
             let _ = mux.outgoing(1_000 + i * 1_000, 50);
         }
         assert_eq!(mux.cwnd, cut_to, "idle windows change nothing");
+    }
+
+    /// §9.2: at CWND_MAX (the uncongested steady state) the budget is
+    /// inert — a maximal 8-channel drain emits every channel's full
+    /// per-instruction window exactly as the pre-§9.2 sender did.
+    #[test]
+    fn cwnd_at_max_is_byte_identical_to_ungated_drain() {
+        let mut mux = AgentChannelMux::new_server();
+        let big = vec![0xAAu8; AGENT_INSTRUCTION_DATA_MAX + 8 * 1024];
+        for c in 1..=MAX_AGENT_CHANNELS as u32 {
+            mux.queue_records(&[rec(c, RecordKind::Open, b"")]);
+            mux.queue_records(&[rec(c, RecordKind::Data, &big)]);
+        }
+        let sends = mux.outgoing(100, 50);
+        assert_eq!(sends.len(), MAX_AGENT_CHANNELS);
+        for (_, wire) in &sends {
+            let p = AgentPayload::decode(wire).unwrap();
+            assert_eq!(
+                p.data.len(),
+                AGENT_INSTRUCTION_DATA_MAX,
+                "full per-instruction window at cwnd max — no truncation"
+            );
+        }
+        assert_eq!(mux.cwnd, CWND_MAX);
+        assert!(
+            mux.channels.iter().all(|c| !c.budget_starved),
+            "nothing starves at max"
+        );
+    }
+
+    /// §9.2 fairness: under a binding budget the rotate-by-one service
+    /// order plus the refill re-arm spread the window across all channels —
+    /// every channel's data lands within a few windows, none starves out.
+    #[test]
+    fn drain_rotation_serves_all_channels_under_reduced_cwnd() {
+        let mut mux_s = AgentChannelMux::new_server();
+        let mut mux_c = AgentChannelMux::new_client();
+        let chunk = vec![0x55u8; AGENT_INSTRUCTION_DATA_MAX];
+        for c in 1..=MAX_AGENT_CHANNELS as u32 {
+            mux_s.queue_records(&[rec(c, RecordKind::Open, b"")]);
+            mux_s.queue_records(&[rec(c, RecordKind::Data, &chunk)]);
+        }
+        // Congested: two instructions per window.
+        mux_s.cwnd = 2 * AGENT_INSTRUCTION_DATA_MAX;
+        mux_s.window_start = 100;
+        let mut delivered: std::collections::HashMap<u32, usize> =
+            std::collections::HashMap::new();
+        let mut now = 100;
+        for _ in 0..8 {
+            for (id, wire) in mux_s.outgoing(now, 50) {
+                let p = AgentPayload::decode(&wire).unwrap();
+                *delivered.entry(id.ordinal() as u32).or_default() += p.data.len();
+                // The peer receives and acks promptly (uncongested return
+                // path), so served channels drain instead of re-offering.
+                mux_c.on_instruction(id, &wire);
+            }
+            for (id, wire) in mux_c.outgoing(now + 1, 50) {
+                mux_s.on_instruction(id, &wire);
+            }
+            now += 50; // next window
+        }
+        let served = delivered.values().filter(|&&v| v >= AGENT_INSTRUCTION_DATA_MAX).count();
+        assert_eq!(
+            served, MAX_AGENT_CHANNELS,
+            "every channel's chunk fully delivered under the reduced cwnd: {delivered:?}"
+        );
+    }
+
+    /// §9.2: an exhausted budget truncates data, never acks — a channel
+    /// owing the peer an ack emits it as a zero-data instruction even at
+    /// budget zero.
+    #[test]
+    fn zero_data_acks_bypass_exhausted_budget() {
+        let mut mux_s = AgentChannelMux::new_server();
+        let mut mux_c = AgentChannelMux::new_client();
+        // ch1 carries bulk; ch2 exists to owe the peer an ack.
+        let bulk = vec![0x77u8; AGENT_INSTRUCTION_DATA_MAX + 1024];
+        mux_s.queue_records(&[rec(1, RecordKind::Open, b""), rec(2, RecordKind::Open, b"")]);
+        let opens = mux_s.outgoing(100, 50);
+        // Emission order rotates, so identify ch2 by its ordinal (server
+        // allocation order matches queue_records order) and learn the
+        // client's rec id from the Open record its adoption returns.
+        let (ch2_id, ch2_wire) = opens
+            .iter()
+            .find(|(id, _)| id.ordinal() == 2)
+            .map(|(id, w)| (*id, w.clone()))
+            .unwrap();
+        let mut ch2_rec = 0u32;
+        for (id, wire) in &opens {
+            for r in mux_c.on_instruction(*id, wire) {
+                if r.kind == RecordKind::Open && *id == ch2_id {
+                    ch2_rec = r.channel;
+                }
+            }
+        }
+        assert_ne!(ch2_rec, 0, "the client adopted ch2");
+        let _ = ch2_wire;
+        mux_c.queue_records(&[rec(ch2_rec, RecordKind::Data, b"payload-needing-ack")]);
+        for (id, wire) in mux_c.outgoing(101, 50) {
+            mux_s.on_instruction(id, &wire);
+        }
+        mux_s.queue_records(&[rec(1, RecordKind::Data, &bulk)]);
+        // Congested to the floor; same window (no roll before the drain).
+        mux_s.cwnd = CWND_FLOOR;
+        mux_s.window_start = 100;
+        let sends = mux_s.outgoing(120, 50);
+        let ack = sends
+            .iter()
+            .map(|(id, wire)| (id, AgentPayload::decode(wire).unwrap()))
+            .find(|(id, _)| **id == ch2_id)
+            .expect("the ack-owing channel must emit despite the exhausted budget");
+        assert!(ack.1.data.is_empty(), "budget-blocked data, never the ack");
+        assert_eq!(
+            ack.1.recv_ack,
+            b"payload-needing-ack".len() as u64,
+            "the zero-data instruction carries the current ack"
+        );
+    }
+
+    /// §9.2 × §3.3: a terminal flag only rides an instruction carrying the
+    /// entire remaining tail — budget truncation defers it (exactly like an
+    /// over-32KiB tail always has), and it lands once acks + refill expose
+    /// the full remainder.
+    #[test]
+    fn terminal_flag_defers_under_budget_truncation_and_lands_with_full_tail() {
+        let mut mux_s = AgentChannelMux::new_server();
+        let mut mux_c = AgentChannelMux::new_client();
+        let tail = vec![0x99u8; AGENT_INSTRUCTION_DATA_MAX + 4 * 1024];
+        mux_s.queue_records(&[rec(1, RecordKind::Open, b"")]);
+        mux_s.queue_records(&[rec(1, RecordKind::Data, &tail)]);
+        mux_s.queue_records(&[rec(1, RecordKind::Close, b"")]);
+        mux_s.cwnd = CWND_FLOOR;
+        mux_s.window_start = 100;
+        let first = mux_s.outgoing(100, 50);
+        let p = AgentPayload::decode(&first[0].1).unwrap();
+        assert_eq!(p.data.len(), AGENT_INSTRUCTION_DATA_MAX, "truncated to the budget");
+        assert_eq!(
+            p.flags & (AGENT_FLAG_CLOSE | AGENT_FLAG_FAIL),
+            0,
+            "the terminal defers while any tail is unsent"
+        );
+        // The peer acks the first window; the next window's refill exposes
+        // the 4 KiB remainder, and the terminal rides it.
+        mux_c.on_instruction(first[0].0, &first[0].1);
+        for (id, wire) in mux_c.outgoing(120, 50) {
+            mux_s.on_instruction(id, &wire);
+        }
+        let second = mux_s.outgoing(160, 50); // next window (refill + send_due)
+        let p2 = second
+            .iter()
+            .map(|(_, w)| AgentPayload::decode(w).unwrap())
+            .find(|p| !p.data.is_empty())
+            .expect("the remainder must send after refill");
+        assert_eq!(p2.data.len(), 4 * 1024, "the entire remaining tail");
+        assert_ne!(p2.flags & AGENT_FLAG_CLOSE, 0, "the terminal rides the full tail");
+    }
+
+    /// §9.2: a budget denial is not a loss signal — the starved channel's
+    /// next_deadline is the window refill, not its (possibly backed-off)
+    /// retransmission timer.
+    #[test]
+    fn budget_starved_channel_resumes_at_window_refill_not_backoff() {
+        let mut mux_s = AgentChannelMux::new_server();
+        let mut mux_c = AgentChannelMux::new_client();
+        // ch1: served and fully acked (folds nothing afterward).
+        let chunk = vec![0x11u8; AGENT_INSTRUCTION_DATA_MAX];
+        mux_s.queue_records(&[rec(1, RecordKind::Open, b"")]);
+        mux_s.queue_records(&[rec(1, RecordKind::Data, &chunk)]);
+        mux_s.cwnd = CWND_FLOOR;
+        mux_s.window_start = 100;
+        let first = mux_s.outgoing(100, 50); // ch1 eats the whole budget
+        mux_c.on_instruction(first[0].0, &first[0].1);
+        for (id, wire) in mux_c.outgoing(101, 50) {
+            mux_s.on_instruction(id, &wire);
+        }
+        // ch2 arrives mid-window: send_due, but the budget is gone.
+        mux_s.queue_records(&[rec(2, RecordKind::Open, b"")]);
+        mux_s.queue_records(&[rec(2, RecordKind::Data, b"starved")]);
+        let mid = mux_s.outgoing(110, 50); // no roll (within the window)
+        assert!(
+            mid.iter()
+                .all(|(_, w)| AgentPayload::decode(w).unwrap().data.is_empty()),
+            "ch2's data is budget-blocked this window"
+        );
+        // Refill at window_start + rto = 150; ch2's own retx timer would be
+        // last_send + rto = 160. The deadline must be the refill.
+        assert_eq!(mux_s.next_deadline(50), Some(150), "resume at refill, not backoff");
+    }
+
+    /// §9.2 × §3.3: tombstone terminal echoes are zero-data and emit
+    /// through an exhausted budget — a closed channel's straggler answer is
+    /// never congestion-blocked.
+    #[test]
+    fn tombstone_echoes_unaffected_by_budget() {
+        let mut mux_s = AgentChannelMux::new_server();
+        let mut mux_c = AgentChannelMux::new_client();
+        mux_s.queue_records(&[rec(1, RecordKind::Open, b"")]);
+        let opens = mux_s.outgoing(100, 50);
+        mux_c.on_instruction(opens[0].0, &opens[0].1);
+        // The client closes the channel: the server tombstones it with a
+        // terminal echo owed.
+        mux_c.queue_records(&[rec(1, RecordKind::Close, b"")]);
+        for (id, wire) in mux_c.outgoing(101, 50) {
+            mux_s.on_instruction(id, &wire);
+        }
+        // Bulk on another channel exhausts the floor budget in-window.
+        let bulk = vec![0x33u8; AGENT_INSTRUCTION_DATA_MAX];
+        mux_s.queue_records(&[rec(2, RecordKind::Open, b"")]);
+        mux_s.queue_records(&[rec(2, RecordKind::Data, &bulk)]);
+        mux_s.cwnd = CWND_FLOOR;
+        mux_s.window_start = 100;
+        // A straggler from the peer on the closed identifier re-owes the
+        // echo (it was consumed by the close handshake already).
+        mux_c.queue_records(&[rec(1, RecordKind::Data, b"straggler")]);
+        for (id, wire) in mux_c.outgoing(110, 50) {
+            mux_s.on_instruction(id, &wire);
+        }
+        let sends = mux_s.outgoing(120, 50);
+        let echo = sends
+            .iter()
+            .map(|(id, w)| (id, AgentPayload::decode(w).unwrap()))
+            .find(|(id, _)| **id == opens[0].0)
+            .expect("the tombstone echo must emit despite the exhausted budget");
+        assert!(echo.1.data.is_empty());
+        assert_ne!(
+            echo.1.flags & (AGENT_FLAG_CLOSE | AGENT_FLAG_FAIL),
+            0,
+            "the echo re-answers with the terminal"
+        );
     }
 
     /// §5: FAIL surfaces to the far end's agent client as a CLOSED socket —
