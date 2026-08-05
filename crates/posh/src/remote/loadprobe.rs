@@ -757,6 +757,15 @@ fn load_constrained_link_burst_behavior() {
     let r = run_loaded_mux(LinkShape::constrained(), 0, 8, BULK, 15, (63510, 63519));
     r.print("constrained: 150ms/1%loss/1Mbit/64KiB queue, 8 agent channels");
     assert!(r.agent_bytes_unique > 0, "no agent bytes crossed the relay");
+    // The §9.2 response's regression ceiling, generous per this file's
+    // floors-not-golden posture: pre-response this measured 10x (the
+    // recorded collapse), post-response 3.75x. A return above 6x means the
+    // backoff/AIMD sender stopped bounding its re-offers.
+    let retx = r.agent_payload_bytes_offered as f64 / r.agent_bytes_unique.max(1) as f64;
+    assert!(
+        retx < 6.0,
+        "constrained-link retransmit ratio {retx:.2} regressed past the §9.2 ceiling"
+    );
 }
 
 /// The §9.3 decider: does the §4.1 session-first drain ordering survive a

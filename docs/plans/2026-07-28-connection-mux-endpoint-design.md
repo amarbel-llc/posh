@@ -7,9 +7,10 @@ PROMOTED 2026-08-04: `POSH_MUX` is default-on (`=0` opts out; FDR 0014
 `stable`). posh#143/#144 RESOLVED 2026-08-05 by measurement (RFC 0011
 §9.2/§9.3, the `remote/loadprobe.rs` harness, `just debug-mux-load`): §9.3
 deliberately none, §9.2 requires a sender-side congestion response
-(RTO backoff + AIMD aggregate bound) — so M2 (session sharing) is now gated
-on that mechanism being IMPLEMENTED, superseding the decision gate specified
-below.
+(RTO backoff + AIMD aggregate bound). That mechanism is IMPLEMENTED
+2026-08-05 (posh#155, `remote/agent.rs`, behind the default-on
+`POSH_CONGESTION`) with the §9.3 re-measurement green — the M2 gate
+specified below is fully satisfied; M2 awaits only its design revision.
 Previously: ACCEPTED 2026-07-28 (M1-first sequencing approved; open
 questions 1 and 2 resolved — `posh-server agent` subcommand, 60 s linger
 default). Originally: DRAFT for review, 2026-07-28. This is the design doc #54's closing note

@@ -442,9 +442,21 @@ RTT-paced sending). This is unilateral sender policy — no wire change,
 no `ver` bump. Constants are implementation-chosen (the RFC 0007
 evolutionary metric-vector machinery is a candidate tuning path for
 them); the measurements above, reproducible via `just debug-mux-load`,
-are the regression bar. Implementation is tracked separately from this
-resolution and gates M2 (the design doc's milestone gate now reads on
-the mechanism existing, not merely on this decision being recorded).
+are the regression bar. IMPLEMENTED 2026-08-05 (posh#155,
+`remote/agent.rs`: per-channel exponential backoff capped at 8×, and the
+AIMD bound as a per-RTO-window token bucket that engages only below its
+256 KiB max — an uncongested sender is byte-identical to the pre-§9.2
+one; `POSH_CONGESTION=0` is the rollback switch). Measured effect,
+same harness: constrained-link retransmit ratio 10× → 3.75 with 5×
+fewer queue drops and 3.4× less wire traffic; bufferbloat retx 12.25 →
+1.42 with session-frame p50 4.1 s → 1.7 s; offered load now responds to
+loss (constant → 25/4.8/3.2 MB across 0/2/5%). Known trades, recorded:
+goodput on the constrained preset held ≈constant (the response bounds
+waste, it does not raise throughput on a lossy floor), AIMD
+underutilizes high-random-loss unconstrained links (80 KB/s at 5% — the
+classic loss-signal trade), and deep-queue standing delay is only
+bounded, not eliminated (a delay-based signal is out of §9.2's scope).
+M2's mechanism gate is satisfied.
 
 #### 9.3 Flow control
 
@@ -468,10 +480,12 @@ clocks throughput. The measured session-frame degradation under load
 saturates a constrained link at 1–8 sessions) is driven by the §9.2
 uncontrolled re-offer flooding the shared bottleneck queue — sender-side
 §4.1 ordering cannot help once the contention is in the network queue —
-not by missing receiver credit. Re-measure with the same harness after
-the §9.2 mechanism lands; this resolution is REOPENED if session-frame
-latency under load does not then recover. A future credit mechanism
-remains fenced behind §9.1 (a `ver` bump or new kind).
+not by missing receiver credit. Re-measured 2026-08-05 with the §9.2
+mechanism in place: session-frame latency under load RECOVERED — p50
+254 ms at 8 sessions + full bulk (control 188 ms; 401 ms pre-mechanism)
+and near-control 165 ms at 1 session, delivery 74% → 89% — so this
+resolution STANDS. A future credit mechanism remains fenced behind §9.1
+(a `ver` bump or new kind).
 
 #### 9.4 Key update
 
