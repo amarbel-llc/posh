@@ -2944,9 +2944,7 @@ mod tests {
         assert_eq!(mux_s.outgoing(150, 50).len(), 1); // streak -> 2
         // The peer finally receives and acks — base advances, streak resets.
         mux_c.on_instruction(first[0].0, &first[0].1);
-        for (id, wire) in mux_c.outgoing(151, 50) {
-            mux_s.on_instruction(id, &wire);
-        }
+        let _ = ferry(&mut mux_c, &mut mux_s, 151);
         // Fresh data goes out promptly (send_due), then its retx fires at
         // the PLAIN rto — the streak is gone.
         mux_s.queue_records(&[rec(1, RecordKind::Data, b"b")]);
@@ -2968,9 +2966,7 @@ mod tests {
         assert_eq!(mux_s.outgoing(150, 50).len(), 1); // streak -> 2
         // Confirmation arrives (the client's reply on the identifier).
         mux_c.on_instruction(first[0].0, &first[0].1);
-        for (id, wire) in mux_c.outgoing(151, 50) {
-            mux_s.on_instruction(id, &wire);
-        }
+        let _ = ferry(&mut mux_c, &mut mux_s, 151);
         // Later data retransmits at the plain rto — the streak died with
         // the confirmation, not with an ack (the outbox was empty).
         mux_s.queue_records(&[rec(1, RecordKind::Data, b"z")]);
@@ -3065,9 +3061,7 @@ mod tests {
         // The peer's ack lands in the SAME window as the cut: no recovery
         // from it (a cut window is not clean) — pin that first.
         mux_c.on_instruction(first[0].0, &first[0].1);
-        for (id, wire) in mux_c.outgoing(160, 50) {
-            mux_s.on_instruction(id, &wire);
-        }
+        let _ = ferry(&mut mux_c, &mut mux_s, 160);
         let _ = mux_s.outgoing(210, 50); // roll: progressed BUT cut => no AI
         assert_eq!(mux_s.cwnd, CWND_MAX / 2, "a cut window never recovers");
         // A fresh exchange in the NEW (clean) window: progress marked, and
@@ -3075,9 +3069,7 @@ mod tests {
         mux_s.queue_records(&[rec(1, RecordKind::Data, b"e")]);
         let second = mux_s.outgoing(211, 50); // send_due emission
         mux_c.on_instruction(second[0].0, &second[0].1);
-        for (id, wire) in mux_c.outgoing(220, 50) {
-            mux_s.on_instruction(id, &wire);
-        }
+        let _ = ferry(&mut mux_c, &mut mux_s, 220);
         assert!(mux_s.window_progress);
         let _ = mux_s.outgoing(270, 50); // clean + progressed => +32K
         assert_eq!(mux_s.cwnd, CWND_MAX / 2 + CWND_INCREMENT);
@@ -3100,9 +3092,7 @@ mod tests {
         let first = mux2.outgoing(100, 50);
         let mut mux_c = AgentChannelMux::new_client();
         mux_c.on_instruction(first[0].0, &first[0].1);
-        for (id, wire) in mux_c.outgoing(101, 50) {
-            mux2.on_instruction(id, &wire); // confirms the OPEN
-        }
+        let _ = ferry(&mut mux_c, &mut mux2, 101); // confirms the OPEN
         mux2.queue_records(&[rec(1, RecordKind::Close, b"")]);
         let _ = mux2.outgoing(110, 50); // terminal rides (send_due)
         let terminal_retx = mux2.outgoing(200, 50);
@@ -3183,9 +3173,7 @@ mod tests {
                 // path), so served channels drain instead of re-offering.
                 mux_c.on_instruction(id, &wire);
             }
-            for (id, wire) in mux_c.outgoing(now + 1, 50) {
-                mux_s.on_instruction(id, &wire);
-            }
+            let _ = ferry(&mut mux_c, &mut mux_s, now + 1);
             now += 50; // next window
         }
         let served = delivered.values().filter(|&&v| v >= AGENT_INSTRUCTION_DATA_MAX).count();
@@ -3225,9 +3213,7 @@ mod tests {
         assert_ne!(ch2_rec, 0, "the client adopted ch2");
         let _ = ch2_wire;
         mux_c.queue_records(&[rec(ch2_rec, RecordKind::Data, b"payload-needing-ack")]);
-        for (id, wire) in mux_c.outgoing(101, 50) {
-            mux_s.on_instruction(id, &wire);
-        }
+        let _ = ferry(&mut mux_c, &mut mux_s, 101);
         mux_s.queue_records(&[rec(1, RecordKind::Data, &bulk)]);
         // Congested to the floor; same window (no roll before the drain).
         mux_s.cwnd = CWND_FLOOR;
@@ -3299,9 +3285,7 @@ mod tests {
         mux_s.window_start = 100;
         let first = mux_s.outgoing(100, 50); // ch1 eats the whole budget
         mux_c.on_instruction(first[0].0, &first[0].1);
-        for (id, wire) in mux_c.outgoing(101, 50) {
-            mux_s.on_instruction(id, &wire);
-        }
+        let _ = ferry(&mut mux_c, &mut mux_s, 101);
         // ch2 arrives mid-window: send_due, but the budget is gone.
         mux_s.queue_records(&[rec(2, RecordKind::Open, b"")]);
         mux_s.queue_records(&[rec(2, RecordKind::Data, b"starved")]);
@@ -3329,9 +3313,7 @@ mod tests {
         // The client closes the channel: the server tombstones it with a
         // terminal echo owed.
         mux_c.queue_records(&[rec(1, RecordKind::Close, b"")]);
-        for (id, wire) in mux_c.outgoing(101, 50) {
-            mux_s.on_instruction(id, &wire);
-        }
+        let _ = ferry(&mut mux_c, &mut mux_s, 101);
         // Bulk on another channel exhausts the floor budget in-window.
         let bulk = vec![0x33u8; AGENT_INSTRUCTION_DATA_MAX];
         mux_s.queue_records(&[rec(2, RecordKind::Open, b"")]);
@@ -3341,9 +3323,7 @@ mod tests {
         // A straggler from the peer on the closed identifier re-owes the
         // echo (it was consumed by the close handshake already).
         mux_c.queue_records(&[rec(1, RecordKind::Data, b"straggler")]);
-        for (id, wire) in mux_c.outgoing(110, 50) {
-            mux_s.on_instruction(id, &wire);
-        }
+        let _ = ferry(&mut mux_c, &mut mux_s, 110);
         let sends = mux_s.outgoing(120, 50);
         let echo = sends
             .iter()
