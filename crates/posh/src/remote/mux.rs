@@ -257,7 +257,12 @@ pub const MUX_PROTO_STAMP: &str = "mux1/1";
 /// Upper bound on one mux IPC frame's payload. Legitimate payloads are a
 /// stamp + a few scalars (well under 1 KiB); the bound stops a hostile or
 /// confused peer from driving unbounded buffering via a huge length header.
-const MUX_MAX_FRAME_LEN: usize = 4096;
+/// M1's control-only protocol fit in 4 KiB; M2's `SessionFrame`/`SessionMsg`
+/// carry whole encoded `ServerFrame`/`ClientMessage` bodies (a Full keyframe
+/// of a large terminal runs to hundreds of KiB). Same-uid IPC under a
+/// hardened dir, so the bound is a sanity cap against a corrupt length
+/// prefix, not a security budget.
+const MUX_MAX_FRAME_LEN: usize = 4 * 1024 * 1024;
 
 /// Tags in the mux socket's own space (deliberately NOT `session/ipc::Tag`).
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -281,6 +286,27 @@ pub enum MuxTag {
     /// a ref the daemon never acked is an error, not a silent success
     /// (apply_mux_gate's fallback keys on exactly this).
     RefAck = 5,
+    /// Client → mux (M2): open a session channel to the RFC 0001 target
+    /// (UTF-8, whole payload). Implies this conn's session ref.
+    SessionOpen = 6,
+    /// Mux → client (M2): [`MuxSessionOpenAck`] — the granted wire-channel
+    /// ordinal, or a refusal reason (on which the client falls back to a
+    /// per-invocation connection).
+    SessionOpenAck = 7,
+    /// Client → mux (M2): one encoded `ClientMessage`, opaque to the mux —
+    /// relayed verbatim onto this conn's wire session channel.
+    SessionMsg = 8,
+    /// Mux → client (M2): [`MuxSessionFrame`] — the connection's live
+    /// `srtt_ms` (u32 LE; the prediction engine's trigger, which the
+    /// foreground process no longer owns a UDP socket to measure) followed
+    /// by one encoded `ServerFrame`, opaque (geometry, scrollback caps, and
+    /// codec selection pass through untouched).
+    SessionFrame = 9,
+    /// Either direction (M2): [`MuxSessionClose`] — a local detach, or the
+    /// wire channel's terminal surfacing (remote daemon exit; the payload
+    /// carries the exit-status path's bytes). Dropping the IPC conn implies
+    /// close.
+    SessionClose = 10,
 }
 
 impl MuxTag {
@@ -292,6 +318,11 @@ impl MuxTag {
             3 => MuxTag::Status,
             4 => MuxTag::StatusReply,
             5 => MuxTag::RefAck,
+            6 => MuxTag::SessionOpen,
+            7 => MuxTag::SessionOpenAck,
+            8 => MuxTag::SessionMsg,
+            9 => MuxTag::SessionFrame,
+            10 => MuxTag::SessionClose,
             _ => return None,
         })
     }
@@ -470,6 +501,101 @@ impl MuxHelloAck {
     }
 }
 
+/// `MuxTag::SessionOpenAck` payload (M2): `u8` granted flag, then either the
+/// `u64 LE` wire-channel ordinal or a UTF-8 refusal reason (to end of
+/// payload). A refusal is the client's cue to fall back to a per-invocation
+/// connection.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum MuxSessionOpenAck {
+    Granted { ordinal: u64 },
+    Refused { reason: String },
+}
+
+impl MuxSessionOpenAck {
+    pub fn encode(&self) -> Vec<u8> {
+        match self {
+            MuxSessionOpenAck::Granted { ordinal } => {
+                let mut out = Vec::with_capacity(9);
+                out.push(1);
+                out.extend_from_slice(&ordinal.to_le_bytes());
+                out
+            }
+            MuxSessionOpenAck::Refused { reason } => {
+                let mut out = Vec::with_capacity(1 + reason.len());
+                out.push(0);
+                out.extend_from_slice(reason.as_bytes());
+                out
+            }
+        }
+    }
+
+    pub fn decode(payload: &[u8]) -> Option<MuxSessionOpenAck> {
+        match payload.first()? {
+            1 => {
+                if payload.len() < 9 {
+                    return None;
+                }
+                Some(MuxSessionOpenAck::Granted {
+                    ordinal: u64::from_le_bytes(payload[1..9].try_into().ok()?),
+                })
+            }
+            0 => Some(MuxSessionOpenAck::Refused {
+                reason: String::from_utf8_lossy(&payload[1..]).into_owned(),
+            }),
+            _ => None,
+        }
+    }
+}
+
+/// `MuxTag::SessionFrame` payload (M2): `u32 LE srtt_ms` + the encoded
+/// `ServerFrame` bytes, opaque to the mux. The srtt rides every frame so the
+/// foreground client's prediction engine keeps its SRTT trigger without
+/// owning the UDP socket.
+pub fn encode_session_frame(srtt_ms: u32, body: &[u8]) -> Vec<u8> {
+    let mut out = Vec::with_capacity(4 + body.len());
+    out.extend_from_slice(&srtt_ms.to_le_bytes());
+    out.extend_from_slice(body);
+    out
+}
+
+pub fn decode_session_frame(payload: &[u8]) -> Option<(u32, &[u8])> {
+    if payload.len() < 4 {
+        return None;
+    }
+    Some((
+        u32::from_le_bytes(payload[..4].try_into().ok()?),
+        &payload[4..],
+    ))
+}
+
+/// `MuxTag::SessionClose` payload (M2): `u8` origin (0 = local detach,
+/// 1 = the wire channel's remote terminal) + the exit-status path's bytes
+/// (opaque, possibly empty).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct MuxSessionClose {
+    pub remote: bool,
+    pub payload: Vec<u8>,
+}
+
+impl MuxSessionClose {
+    pub fn encode(&self) -> Vec<u8> {
+        let mut out = Vec::with_capacity(1 + self.payload.len());
+        out.push(self.remote as u8);
+        out.extend_from_slice(&self.payload);
+        out
+    }
+
+    pub fn decode(payload: &[u8]) -> Option<MuxSessionClose> {
+        match payload.first()? {
+            0 | 1 => Some(MuxSessionClose {
+                remote: payload[0] == 1,
+                payload: payload[1..].to_vec(),
+            }),
+            _ => None,
+        }
+    }
+}
+
 /// One accepted IPC connection: framing reassembly plus the two per-conn
 /// facts the daemon tracks — hello completed, and whether this conn holds
 /// the (at most one) session ref that auto-drops on close.
@@ -625,8 +751,25 @@ fn process_ipc_conn(conn: &mut IpcConn, state: &mut MuxState, ctx: &MuxStatusCtx
                     return false;
                 }
             }
+            MuxTag::SessionOpen => {
+                if !conn.hello_ok {
+                    return false;
+                }
+                // M2 routing lands in the session-channel task; until this
+                // daemon serves it, an honest refusal sends the client to
+                // its per-invocation fallback rather than a hang.
+                let ack = MuxSessionOpenAck::Refused {
+                    reason: "session channels not served by this endpoint".into(),
+                };
+                if !send_mux_frame(conn, MuxTag::SessionOpenAck, &ack.encode()) {
+                    return false;
+                }
+            }
+            // M2 data/close before routing exists: ignore, keep the conn.
+            MuxTag::SessionMsg | MuxTag::SessionClose => {}
             // Mux → client verbs arriving FROM a peer: ignore, keep the conn.
-            MuxTag::HelloAck | MuxTag::StatusReply | MuxTag::RefAck => {}
+            MuxTag::HelloAck | MuxTag::StatusReply | MuxTag::RefAck
+            | MuxTag::SessionOpenAck | MuxTag::SessionFrame => {}
         }
     }
     open
@@ -1554,6 +1697,65 @@ mod tests {
         .encode();
         wire[0] = 9;
         assert_eq!(MuxHelloAck::decode(&wire), None);
+    }
+
+    #[test]
+    fn session_open_ack_roundtrips_ok_and_failure() {
+        let ok = MuxSessionOpenAck::Granted { ordinal: 0x1122_3344_5566 };
+        assert_eq!(MuxSessionOpenAck::decode(&ok.encode()), Some(ok.clone()));
+        let no = MuxSessionOpenAck::Refused { reason: "table full".into() };
+        assert_eq!(MuxSessionOpenAck::decode(&no.encode()), Some(no));
+        // Truncated grant and unknown flag byte both reject.
+        assert_eq!(MuxSessionOpenAck::decode(&[1, 0, 0]), None);
+        assert_eq!(MuxSessionOpenAck::decode(&[9]), None);
+        assert_eq!(MuxSessionOpenAck::decode(&[]), None);
+    }
+
+    #[test]
+    fn session_frame_prefixes_srtt_and_keeps_body_opaque() {
+        let body = b"\x00opaque server frame bytes\xff";
+        let wire = encode_session_frame(137, body);
+        let (srtt, out) = decode_session_frame(&wire).unwrap();
+        assert_eq!(srtt, 137);
+        assert_eq!(out, body);
+        // A frame near the M1 4 KiB bound (raised for M2) survives framing.
+        let big = vec![0xEEu8; 64 * 1024];
+        let framed = encode_mux_frame(MuxTag::SessionFrame, &encode_session_frame(9, &big));
+        let mut buf = MuxFrameBuffer::default();
+        buf.feed(&framed);
+        let f = buf.next().unwrap().unwrap();
+        assert_eq!(f.tag, MuxTag::SessionFrame);
+        assert_eq!(decode_session_frame(&f.payload).unwrap().1.len(), big.len());
+        // Truncation rejects.
+        assert_eq!(decode_session_frame(&[1, 2]), None);
+    }
+
+    #[test]
+    fn session_close_roundtrips_both_origins() {
+        let local = MuxSessionClose { remote: false, payload: Vec::new() };
+        assert_eq!(MuxSessionClose::decode(&local.encode()), Some(local));
+        let remote = MuxSessionClose { remote: true, payload: b"exit 3".to_vec() };
+        assert_eq!(MuxSessionClose::decode(&remote.encode()), Some(remote));
+        assert_eq!(MuxSessionClose::decode(&[]), None);
+        assert_eq!(MuxSessionClose::decode(&[7]), None, "unknown origin rejects");
+    }
+
+    #[test]
+    fn session_tags_roundtrip_through_the_frame_buffer() {
+        // SessionOpen's payload is the bare UTF-8 target; SessionMsg is
+        // opaque bytes — both ride the zmx framing unchanged, and an
+        // UNKNOWN tag between them is skipped (forward compatibility).
+        let mut buf = MuxFrameBuffer::default();
+        buf.feed(&encode_mux_frame(MuxTag::SessionOpen, b"box:dev"));
+        buf.feed(&[42, 3, 0, 0, 0, 1, 2, 3]); // unknown tag 42, skipped
+        buf.feed(&encode_mux_frame(MuxTag::SessionMsg, b"\x01client message"));
+        let open = buf.next().unwrap().unwrap();
+        assert_eq!(open.tag, MuxTag::SessionOpen);
+        assert_eq!(open.payload, b"box:dev");
+        let msg = buf.next().unwrap().unwrap();
+        assert_eq!(msg.tag, MuxTag::SessionMsg);
+        assert_eq!(msg.payload, b"\x01client message");
+        assert!(buf.next().unwrap().is_none());
     }
 
     #[test]
