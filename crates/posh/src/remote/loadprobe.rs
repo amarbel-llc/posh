@@ -88,6 +88,18 @@ impl LinkShape {
     pub fn wan_clean() -> LinkShape {
         LinkShape { delay_ms: 50, loss_pct: 0.0, bandwidth_bytes_per_s: 0, queue_bytes: 0, seed: 2 }
     }
+    /// The bufferbloat shape: 1 Mbit/s behind a DEEP (512 KiB) queue, no
+    /// loss — nothing bounds queue occupancy but the ack clock, so the srtt
+    /// series shows the standing queue agent bulk builds.
+    pub fn bufferbloat() -> LinkShape {
+        LinkShape {
+            delay_ms: 50,
+            loss_pct: 0.0,
+            bandwidth_bytes_per_s: 125_000,
+            queue_bytes: 512 * 1024,
+            seed: 5,
+        }
+    }
     /// The §9.2 decider: 150 ms one-way, 1% loss, 1 Mbit/s with a 64 KiB
     /// queue — the ~256 KB per-drain agent burst does not fit.
     pub fn constrained() -> LinkShape {
@@ -176,8 +188,10 @@ impl Shaper {
 /// The loopback UDP impairment relay: the client aims `Connection::client`
 /// at [`client_addr`](Self::client_addr); the relay forwards to the real
 /// server from its server-facing socket (whose address the server adopts as
-/// its roamed peer), and forwards replies back to the client address pinned
-/// from the client's first datagram. AEAD passes through untouched — the
+/// its roamed peer), and forwards replies back to the client address —
+/// re-pinned on every client datagram, which is harmless here because the
+/// bench client never roams, so it never changes within a run. AEAD passes
+/// through untouched — the
 /// relay never decrypts, so it cannot corrupt, only delay/drop/queue.
 struct LossyLink {
     client_addr: SocketAddr,
@@ -503,10 +517,7 @@ pub fn run_loaded_mux(
             for (chan, payload) in
                 crate::remote::agent::iteration_sends(beat, Some(&mut mux), now, conn.rto())
             {
-                let wire = channel::seal_on(true, chan, &payload);
-                for frag in fragmenter.make_fragments(&wire, sync::FRAGMENT_CONTENTS_MAX) {
-                    let _ = conn.send(&frag.to_bytes());
-                }
+                crate::remote::server::send_on_channel(&mut conn, &mut fragmenter, chan, &payload, true);
             }
         }
         stats
@@ -633,10 +644,7 @@ pub fn run_loaded_mux(
                 }
             }
             drain_bytes += payload.len();
-            let wire = channel::seal_on(true, chan, &payload);
-            for frag in fragmenter.make_fragments(&wire, sync::FRAGMENT_CONTENTS_MAX) {
-                let _ = conn.send(&frag.to_bytes());
-            }
+            crate::remote::server::send_on_channel(&mut conn, &mut fragmenter, chan, &payload, true);
         }
         if had_sends {
             drains += 1;
@@ -801,7 +809,7 @@ fn load_loss_step_response() {
 #[ignore = "load probe; run via `just debug-mux-load` (--ignored --nocapture)"]
 fn load_bufferbloat_srtt_inflation() {
     let quiet = run_loaded_mux(
-        LinkShape { delay_ms: 50, loss_pct: 0.0, bandwidth_bytes_per_s: 125_000, queue_bytes: 512 * 1024, seed: 11 },
+        LinkShape { seed: 11, ..LinkShape::bufferbloat() },
         2,
         0,
         BULK,
@@ -810,7 +818,7 @@ fn load_bufferbloat_srtt_inflation() {
     );
     quiet.print("bufferbloat control: 2 sessions, no bulk, 1Mbit/512KiB queue");
     let loaded = run_loaded_mux(
-        LinkShape { delay_ms: 50, loss_pct: 0.0, bandwidth_bytes_per_s: 125_000, queue_bytes: 512 * 1024, seed: 12 },
+        LinkShape { seed: 12, ..LinkShape::bufferbloat() },
         2,
         8,
         BULK,
