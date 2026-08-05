@@ -530,6 +530,12 @@ pub fn run_loaded_mux(
     let mut srtt_samples = Vec::new();
     let mut rto_samples = Vec::new();
     let mut last_sample = 0u64;
+    // The client heartbeat (mux_loop's role): with zero sessions nothing
+    // else ever transmits, and the server only learns its peer address from
+    // the first authentic client datagram (roaming adoption) — without this
+    // an agent-only run deadlocks silently on both sides. `None` = never
+    // sent, so the first beat goes immediately (the mux_loop trap note).
+    let mut last_beat: Option<u64> = None;
 
     let t0 = util::now_ms();
     let deadline_ms = t0 + secs * 1000;
@@ -599,6 +605,15 @@ pub fn run_loaded_mux(
                 *due = now + conn.send_interval();
                 frames_sent += 1;
             }
+        }
+        // Heartbeat: peer discovery + RTT sampling when no frame is due
+        // (the sole client traffic in an agent-only run). Too short for
+        // SESSION_FRAME_HEADER, so the remote never counts it as a frame.
+        if session_payloads.is_empty()
+            && last_beat.is_none_or(|t| now.saturating_sub(t) >= 1000)
+        {
+            last_beat = Some(now);
+            session_payloads.push(b"beat".to_vec());
         }
 
         // The §4.1 ordered drain: session instructions first, then the agent
@@ -690,6 +705,15 @@ fn load_smoke_lan_roundtrip() {
     assert!(r.frames_sent > 0, "producer never produced");
     assert!(r.frames_delivered > 0, "no session frame crossed the relay");
     assert!(r.agent_bytes_unique > 0, "no agent bytes crossed the relay");
+    // The agent-only shape: with zero sessions the client heartbeat is the
+    // only session traffic, and it alone must bootstrap peer discovery
+    // (the deadlock the first measurement run hit — every 0-session
+    // scenario sat at zero wire bytes because nothing ever transmitted).
+    let r = run_loaded_mux(LinkShape::lan(), 0, 1, 8 * 1024, 1, (63620, 63629));
+    assert!(
+        r.agent_bytes_unique > 0,
+        "agent-only run deadlocked: heartbeat never bootstrapped the peer"
+    );
 }
 
 /// Harness self-proof on a clean 50 ms link: the ack-clocked ceiling.
