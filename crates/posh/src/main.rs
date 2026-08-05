@@ -506,8 +506,9 @@ fn cmd_ssh_session(
         return remote::sshwrap::run_detached(&dest, &inner, &opts);
     }
     // Foreground roaming attach. Resolve agent forwarding (flag > env >
-    // default-on), then the M1 mux gate (POSH_MUX, default off): when
-    // selected AND forwarding resolved on, the per-destination mux endpoint
+    // default-on), then the mux gate (POSH_MUX, default ON since the FDR
+    // 0014 promotion; `=0` opts out): when selected AND forwarding resolved
+    // on, the per-destination mux endpoint
     // owns agent forwarding — ensured BEFORE the session bootstrap — and the
     // session's own connection runs with forwarding off (no `-A`, no
     // per-session srv endpoint). The handle holds this invocation's session
@@ -788,7 +789,8 @@ fn cmd_ssh(args: &[String], forward: Option<&remote::agent::ForwardFlag>) -> Res
     // Resolve agent forwarding for the roaming bare-host path; the explicit
     // `posh ssh` subcommand passes None and stays a thin wrapper (its None
     // source also means the mux gate below never spawns anything for it).
-    // POSH_MUX (M1, default off): with forwarding resolved on, the
+    // POSH_MUX (default ON since the FDR 0014 promotion; `=0` opts out):
+    // with forwarding resolved on, the
     // per-destination mux endpoint owns forwarding for this invocation — the
     // handle holds the session ref until return (Drop = auto-unref) — and
     // the roaming connection itself forwards nothing; any ensure failure
@@ -989,6 +991,11 @@ ENVIRONMENT
                     palette, mouse-wheel scroll-view). POSH_SESSION_FRAMES=0
                     (or false/off/no) restores the legacy raw-output path
                     (the wheel then passes through to the terminal's arrows).
+    POSH_MUX        Per-destination mux endpoint (FDR 0014, default on): one
+                    daemon per destination owns agent forwarding; sessions
+                    bootstrap with forwarding off. POSH_MUX=0 (or false/off/
+                    no) restores per-connection forwarding + the symlink
+                    election. Any endpoint failure falls back automatically.
     POSH_SERVER_NETWORK_TMOUT
                     Server exits after N seconds without client contact
                     (0 = never, the default)

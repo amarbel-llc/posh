@@ -25,9 +25,10 @@ client host makes it the sole agent-capable endpoint by construction.
 AgentChannelMux, sshwrap bootstrap, session/daemon.rs + session/ipc.rs
 patterns). No new dependencies, no async runtime.
 
-**Rollback:** M1 is gated behind `POSH_MUX=1` (opt-in, default off) until
-promotion; without it, invocations forward per-connection exactly as today.
-The gate is the single switch: off ⇒ no mux spawn, sessions keep `-A`.
+**Rollback:** M1 shipped gated behind `POSH_MUX=1` (opt-in, default off);
+PROMOTED default-on 2026-08-04 (FDR 0014 stable) — the rollback switch is
+now `POSH_MUX=0`. The gate remains the single switch: off ⇒ no mux spawn,
+sessions keep `-A`, byte-identical legacy.
 
 **Decided inputs (do not relitigate):** M1-first (2026-07-28);
 `posh-server agent` subcommand; `POSH_MUX_PERSIST` default 60 s; FDR 0014 §8

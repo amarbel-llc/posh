@@ -71,8 +71,8 @@ non-interactive PATH.
 	election as a full sibling of the per-connection endpoints, and
 	serves forwarded-agent connections as RFC 0011 *agent* channels
 	over the enveloped transport. Bootstrapped by the *posh*(1)
-	per-destination mux daemon (one per destination, behind the
-	client's _$POSH_MUX_); not normally typed by hand. Flags precede
+	per-destination mux daemon (one per destination, governed by the
+	client's default-on _$POSH_MUX_ gate); not normally typed by hand. Flags precede
 	the verb, like *new*. It exits after a minute of peer silence — an
 	agent-only connection with a never-returning peer has nothing left
 	to serve.

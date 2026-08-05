@@ -86,16 +86,24 @@ pub fn client_id() -> String {
     }
 }
 
-/// The M1 rollout gate (impl plan "Rollback"): `POSH_MUX` opts an invocation
-/// into the per-destination mux endpoint; default OFF until promotion, and
-/// the single switch — off means no mux spawn and sessions keep their own
-/// forwarding. Truthy values are the shared
-/// [`env_value_on`](crate::remote::sshwrap::env_value_on) set, the same
-/// spellings `POSH_CHANNELS` accepts.
+/// The promoted `POSH_MUX` gate (FDR 0014 stable bar): the per-destination
+/// mux endpoint is DEFAULT ON; `POSH_MUX=0` (or `false`/`off`/`no`) is the
+/// rollback switch — off means no mux spawn and sessions keep their own
+/// forwarding, byte-identical to the pre-M1 bootstrap. Same off-switch shape
+/// as `parse_frames_gate` (`session/daemon.rs`), deliberately duplicated
+/// rather than shared across the session/remote module boundary. On ensure
+/// failure the invocation falls back to per-connection forwarding
+/// ([`apply_mux_gate`]), so default-on never strands the user agentless.
+fn parse_mux_gate(value: Option<&str>) -> bool {
+    !matches!(
+        value.map(|v| v.trim().to_ascii_lowercase()).as_deref(),
+        Some("0" | "false" | "off" | "no")
+    )
+}
+
+/// Reads the [`parse_mux_gate`] decision from the environment.
 pub fn mux_selected() -> bool {
-    std::env::var("POSH_MUX")
-        .map(|v| crate::remote::sshwrap::env_value_on(&v))
-        .unwrap_or(false)
+    parse_mux_gate(std::env::var("POSH_MUX").ok().as_deref())
 }
 
 /// Maps every byte outside `[A-Za-z0-9._-]` to `-`. The one sanitizer behind
@@ -2180,6 +2188,77 @@ mod tests {
     }
 
     #[test]
+    fn spawned_daemon_that_dies_before_hello_falls_back_and_unlinks() {
+        // The default-on interop shape (promotion, FDR 0014): against a
+        // remote whose posh-server lacks the `agent` verb, run_daemon binds
+        // the socket, its grandchild's ssh bootstrap fails, and the error
+        // path unlinks the socket and exits without ever answering a hello.
+        // The spawner must surface an ensure error (=> apply_mux_gate falls
+        // back to per-connection forwarding) and leave NO socket behind, so
+        // the next invocation re-attempts a spawn instead of hitting a
+        // stale endpoint.
+        let dir = temp_base();
+        let path = mux_socket_path_in(&dir, "oldremote");
+        let mut spawns = 0;
+        let mut dying = None;
+        let mut spawn = |_: &str| {
+            spawns += 1;
+            // Bind-then-die, mirroring run_daemon's bootstrap-failure exit:
+            // accept the spawner's connect, close it unanswered, unlink.
+            let listener = UnixListener::bind(&path).unwrap();
+            let p = path.clone();
+            dying = Some(std::thread::spawn(move || {
+                let (stream, _) = listener.accept().unwrap();
+                drop(stream); // EOF before any HelloAck
+                std::fs::remove_file(&p).ok();
+            }));
+            Ok(MuxSpawn::Spawned)
+        };
+        let err = match ensure_mux_conn(
+            &dir,
+            "oldremote",
+            &mut spawn,
+            std::time::Duration::from_secs(8),
+            &dir.join("no-agent.sock"),
+        ) {
+            Ok(_) => panic!("a daemon that died before hello must be an error"),
+            Err(e) => e,
+        };
+        // EOF ("closed while awaiting HelloAck") or ECONNRESET ("HelloAck
+        // read: ...") depending on whether the hello bytes were still
+        // unread at close — either way an explicit error, never a silent
+        // success.
+        assert!(
+            err.to_string().contains("HelloAck"),
+            "the dead endpoint is an explicit hello-phase error, got: {err}"
+        );
+        dying.take().unwrap().join().unwrap();
+        assert!(!path.exists(), "the failed daemon's socket must be unlinked");
+
+        // Recovery: with the socket gone, the next ensure re-spawns — a
+        // healthy daemon this time — and succeeds.
+        assert_eq!(spawns, 1, "the failed attempt spawned exactly once");
+        let mut hold = None;
+        let mut respawn = |k: &str| {
+            hold = Some(start_inprocess_daemon(&dir, k, 1_000, (63480, 63489)));
+            Ok(MuxSpawn::Spawned)
+        };
+        let handle = ensure_mux_conn(
+            &dir,
+            "oldremote",
+            &mut respawn,
+            std::time::Duration::from_secs(8),
+            &dir.join("no-agent.sock"),
+        )
+        .unwrap();
+        assert_eq!(handle.state(), MuxConnState::Connected);
+        drop(handle);
+        let (daemon, _server) = hold.take().unwrap();
+        daemon.join().unwrap();
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    #[test]
     fn stamp_mismatch_starts_the_variant_endpoint() {
         use std::io::Write;
         let dir = temp_base();
@@ -2495,10 +2574,11 @@ mod tests {
 
     #[test]
     fn mux_gate_off_keeps_the_bootstrap_byte_identical() {
-        // The plan's Rollback contract: POSH_MUX off ⇒ the construction
-        // sites see exactly what resolve_agent_source produced, no ensure
-        // call, no handle — and the bootstrap wire string is byte-identical
-        // to today's (`-A` rides when forwarding resolved on).
+        // The opt-out contract (POSH_MUX=0, the post-promotion rollback
+        // switch): the construction sites see exactly what
+        // resolve_agent_source produced, no ensure call, no handle — and the
+        // bootstrap wire string is byte-identical to the pre-M1 legacy
+        // (`-A` rides when forwarding resolved on).
         let source = PathBuf::from("/run/user/1000/agent.sock");
         let (agent_source, handle) = apply_mux_gate(false, Some(source.clone()), |_| {
             panic!("mux off must never ensure an endpoint")
@@ -2569,16 +2649,23 @@ mod tests {
     }
 
     #[test]
-    fn posh_mux_accepts_the_shared_truthy_values() {
-        use crate::remote::sshwrap::env_value_on;
-        // POSH_MUX rides the same factored predicate as POSH_CHANNELS (no env
-        // mutation: the string predicate is pinned directly); the gate is
-        // default-off, so everything outside the truthy set stays off.
-        for v in ["1", "true", "TRUE", "on", "On", "yes", "YES"] {
-            assert!(env_value_on(v), "{v:?} must select the mux");
+    fn posh_mux_is_default_on_with_the_shared_off_switch() {
+        // Promotion (FDR 0014 stable bar): the gate is DEFAULT ON — unset,
+        // empty, and truthy spellings all select the mux; only the explicit
+        // off set disables it (no env mutation: the parser is pinned
+        // directly). Same off-switch convention as POSH_SESSION_FRAMES.
+        assert!(parse_mux_gate(None), "unset must select the mux");
+        for v in ["", "1", "true", "TRUE", "on", "On", "yes", "YES"] {
+            assert!(parse_mux_gate(Some(v)), "{v:?} must select the mux");
         }
-        for v in ["", "0", "false", "off", "no", "2", "enable"] {
-            assert!(!env_value_on(v), "{v:?} must leave the default-off gate off");
+        for v in ["0", "false", "off", "no", "FALSE", " off "] {
+            assert!(!parse_mux_gate(Some(v)), "{v:?} must switch the mux off");
+        }
+        // Convention switch pinned deliberately: pre-promotion these were
+        // outside env_value_on's truthy set and therefore OFF; under the
+        // default-on off-switch shape, unrecognized values are ON.
+        for v in ["2", "enable"] {
+            assert!(parse_mux_gate(Some(v)), "{v:?} is not the off switch");
         }
     }
 

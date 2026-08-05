@@ -88,15 +88,17 @@ acknowledged-throwaway interim; the definitive removal of the election race
 is the phase-2 mux (see More Information), where a single endpoint owns the
 socket by construction.
 
-That mux path now exists (FDR 0014 M1, 2026-07-29, `remote/mux.rs`) as the
-**opt-in forwarded-once mechanism**: with `POSH_MUX` set, one per-destination
-local daemon owns a single agent-only connection bootstrapping
-`posh-server agent`, sessions connect with their own forwarding off, and the
-remote binds a deterministic `agent/mux-<client-id>.sock` — so from one
-client host `agent/sock` has exactly one owner structurally, no election
-(across two client hosts the FDR 0014 most-recently-active election among
-mux endpoints applies). The per-connection election above remains the
-DEFAULT until `POSH_MUX` is promoted.
+That mux path now exists (FDR 0014 M1, 2026-07-29, `remote/mux.rs`) and is
+the **DEFAULT forwarded-once mechanism** since the 2026-08-04 `POSH_MUX`
+promotion: one per-destination local daemon owns a single agent-only
+connection bootstrapping `posh-server agent`, sessions connect with their
+own forwarding off, and the remote binds a deterministic
+`agent/mux-<client-id>.sock` — so from one client host `agent/sock` has
+exactly one owner structurally, no election (across two client hosts the
+FDR 0014 most-recently-active election among mux endpoints applies). The
+per-connection election above is now the opt-out (`POSH_MUX=0`) and
+mixed-version path, and the fallback whenever the endpoint cannot be
+reached or spawned.
 
 **On the wire**, three new RFC 0001 capability ids
 (`6 = AGENT_FORWARD`, `7 = AGENT_DATA`, `8 = AGENT_ACK`) carry a second

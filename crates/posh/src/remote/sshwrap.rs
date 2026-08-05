@@ -153,11 +153,11 @@ pub fn channels_selected() -> bool {
         .unwrap_or(false)
 }
 
-/// The shared truthy-env predicate ("1"/"true"/"on"/"yes", case-insensitive)
-/// behind [`channels_selected`] (`POSH_CHANNELS`) and
-/// [`mux_selected`](crate::remote::mux::mux_selected) (`POSH_MUX`), factored
-/// so it can be unit-tested without touching the (global, test-racy) process
-/// environment.
+/// The truthy-env predicate ("1"/"true"/"on"/"yes", case-insensitive) behind
+/// [`channels_selected`] (`POSH_CHANNELS`), factored so it can be unit-tested
+/// without touching the (global, test-racy) process environment. `POSH_MUX`
+/// no longer shares it: since the FDR 0014 promotion that gate is default-on
+/// with an off-switch shape (`parse_mux_gate`, `remote/mux.rs`).
 pub(crate) fn env_value_on(v: &str) -> bool {
     matches!(v.to_ascii_lowercase().as_str(), "1" | "true" | "on" | "yes")
 }

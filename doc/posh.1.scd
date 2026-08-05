@@ -274,26 +274,28 @@ _POSH_CHANNELS_
 	invokes the remote server with *--channels*, and the session stream
 	and forwarded agent connections ride multiplexed channels on one
 	sealed datagram flow. Default off; the baseline wire is unchanged
-	without it. Experimental; the per-destination connection mux built
-	on it is available behind _POSH_MUX_.
+	without it. The per-destination mux endpoint (_POSH_MUX_, default
+	on) always speaks the enveloped protocol on its own agent-only
+	connection regardless of this variable, which governs only the
+	session connections.
 
 _POSH_MUX_
-	Opt in to the per-destination mux endpoint for agent forwarding
-	(*1*, *true*, *on*, or *yes* — the same truthy set as
-	_POSH_CHANNELS_). One local daemon per destination then owns a
-	single agent-only RFC 0011 connection (bootstrapping
-	*posh-server agent* on the remote), and sessions connect with their
-	own forwarding off. Once every local invocation for a destination
-	opts in, the remote _agent/sock_ has exactly one owner per client
-	host by construction (FDR 0014) instead of an election among
-	connections; with mixed usage — some invocations without
-	_POSH_MUX_ — the mux endpoint instead participates in the
-	_agent/sock_ election as a full sibling of the remaining
-	per-connection endpoints (see *posh-server*(1)). Default off until
-	promotion; without it every connection forwards independently,
-	exactly as before. If the endpoint cannot be reached or spawned,
-	the invocation warns once and falls back to per-connection
-	forwarding.
+	The per-destination mux endpoint for agent forwarding, default ON
+	(FDR 0014): one local daemon per destination owns a single
+	agent-only RFC 0011 connection (bootstrapping *posh-server agent*
+	on the remote), and sessions connect with their own forwarding off.
+	With every local invocation for a destination on the default, the
+	remote _agent/sock_ has exactly one owner per client host by
+	construction instead of an election among connections; with mixed
+	usage — some invocations opted out — the mux endpoint instead
+	participates in the _agent/sock_ election as a full sibling of the
+	remaining per-connection endpoints (see *posh-server*(1)).
+	_POSH_MUX=0_ (or *false*, *off*, *no*) opts out: every connection
+	then forwards independently through the per-connection election,
+	exactly the pre-promotion behaviour. If the endpoint cannot be
+	reached or spawned (an older remote *posh-server* without the
+	*agent* verb included), the invocation warns once and falls back to
+	per-connection forwarding.
 
 _POSH_CLIENT_ID_
 	Override the client-host identity the mux endpoint reports to the

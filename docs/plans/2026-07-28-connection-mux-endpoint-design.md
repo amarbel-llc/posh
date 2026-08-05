@@ -1,9 +1,11 @@
 # The per-destination mux endpoint (github #54 phase 2) — design
 
 Status: M1 IMPLEMENTED 2026-07-29 (`remote/mux.rs` + the `posh-server agent`
-verb, behind the opt-in `POSH_MUX`; FDR 0014 promotion-criteria E2E green —
-`remote::mux::tests::agent_forward_mux_m1_two_sequential_invocations_one_owner_zero_handoff_window`).
-M2 (session sharing) remains gated on posh#143/#144 as specified below.
+verb; FDR 0014 promotion-criteria E2E green —
+`remote::mux::tests::agent_forward_mux_m1_two_sequential_invocations_one_owner_zero_handoff_window`),
+PROMOTED 2026-08-04: `POSH_MUX` is default-on (`=0` opts out; FDR 0014
+`stable`). M2 (session sharing) remains gated on posh#143/#144 as specified
+below.
 Previously: ACCEPTED 2026-07-28 (M1-first sequencing approved; open
 questions 1 and 2 resolved — `posh-server agent` subcommand, 60 s linger
 default). Originally: DRAFT for review, 2026-07-28. This is the design doc #54's closing note

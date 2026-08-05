@@ -520,10 +520,12 @@ mechanism is best designed against whatever handshake replaces it.
   server, client, and relay encode sites.
 - Ownership (§7): a second endpoint MUST NOT take over a live peer's bound
   `agent/sock` (the §8 configuration), and a single endpoint binds it directly
-  with no symlink present. IMPLEMENTED (mux M1, satisfiable only under the
-  opt-in `POSH_MUX` — the per-connection election remains the default until
-  promotion, and M1 retains `agent/sock` as a symlink so mux and legacy
-  endpoints elect as siblings): single-client-host sole ownership is proven by
+  with no symlink present. IMPLEMENTED (mux M1; `POSH_MUX` DEFAULT-ON since
+  the 2026-08-04 FDR 0014 promotion — the per-connection election is retained
+  for the `POSH_MUX=0` opt-out and mixed-version peers per this section's
+  conditional rule, and M1 keeps `agent/sock` a symlink so mux and legacy
+  endpoints elect as siblings; the direct bind stays a future decision gated
+  on retiring the opt-out): single-client-host sole ownership is proven by
   `remote::mux::tests::agent_forward_mux_m1_two_sequential_invocations_one_owner_zero_handoff_window`
   (the deterministically named mux socket is the sole owner, zero `srv-*`
   endpoints exist, the target never moves); no-takeover-from-a-live-peer by
@@ -537,7 +539,8 @@ mechanism is best designed against whatever handshake replaces it.
   the posh#152 interim repoint superseded it as
   `handoff_repoints_to_the_active_sibling_on_the_inactivity_edge` (asserting
   zero stale/absent time at the edge). That interim proof is NOT this bullet's
-  bar. IMPLEMENTED (mux M1, under `POSH_MUX` only):
+  bar. IMPLEMENTED (mux M1; the default path since the 2026-08-04 `POSH_MUX`
+  promotion):
   `remote::mux::tests::agent_forward_mux_m1_two_sequential_invocations_one_owner_zero_handoff_window`
   (`just debug-agent-e2e`) kills one of two forwarded invocations sharing the
   endpoint (ensured sequentially; the cold-start concurrent spawn race is
