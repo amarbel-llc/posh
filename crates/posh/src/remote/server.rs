@@ -249,8 +249,17 @@ struct SessionBridge {
     client_size: (u16, u16),
     acked_forwarded: u64,
     last_frame_num: u64,
-    /// Last (re)send of the held frame, for the RTO retransmit cadence.
+    /// Last (re)send of the held frame, for the RTO retransmit cadence. Kept
+    /// SEPARATE from `last_send` (the heartbeat clock): input-ack Empties
+    /// stamp `last_send`, and a shared clock would let a steady input stream
+    /// defer a lost frame's retransmit indefinitely (the same starvation
+    /// relay.rs's `last_agent_send` split guards against).
     last_retx: u64,
+    /// Last session send of ANY kind on this channel — the heartbeat clock
+    /// (relay `periodic_send` parity): an idle channel emits an Empty every
+    /// `HEARTBEAT_INTERVAL` so the client's "Last contact" liveness stays
+    /// fresh; without it a quiet mux session reads as dead.
+    last_send: u64,
     /// An input/resync ack is owed and no visible frame has carried it yet:
     /// emit an Empty ack frame so the client's input outbox drains without
     /// waiting for the next daemon frame.
@@ -316,8 +325,8 @@ pub(crate) fn mux_peer_loop(
         agent_mux.queue_records(&endpoint.tick(agent_peer_active, now));
 
         // Wake in time for the mux's fresh sends and RTO retransmissions
-        // (RFC 0011 §5), each bridge's held-frame retransmit, and the
-        // peer-timeout exit edge.
+        // (RFC 0011 §5), each bridge's held-frame retransmit and idle
+        // heartbeat, and the peer-timeout exit edge.
         let mut deadline = last_heard + peer_timeout;
         if let Some(d) = agent_mux.next_deadline(conn.rto()) {
             deadline = deadline.min(d.max(now));
@@ -327,6 +336,7 @@ pub(crate) fn mux_peer_loop(
                 if b.held.is_held() {
                     deadline = deadline.min((b.last_retx + conn.rto()).max(now));
                 }
+                deadline = deadline.min((b.last_send + HEARTBEAT_INTERVAL).max(now));
             }
         }
         let timeout = deadline.saturating_sub(now).min(1000) as i32;
@@ -482,6 +492,7 @@ pub(crate) fn mux_peer_loop(
                                 );
                             }
                             b.last_retx = now;
+                            b.last_send = now;
                         }
                     }
                     ipc::Tag::Output => {
@@ -529,6 +540,7 @@ pub(crate) fn mux_peer_loop(
                     );
                 }
                 b.last_retx = now;
+                b.last_send = now;
             }
             if b.ack_due && conn.has_remote() {
                 // An owed input ack with no visible frame to carry it: an
@@ -542,6 +554,23 @@ pub(crate) fn mux_peer_loop(
                     &empty.encode(),
                 );
                 b.ack_due = false;
+                b.last_send = now;
+            }
+            if conn.has_remote() && now.saturating_sub(b.last_send) >= HEARTBEAT_INTERVAL {
+                // Idle-channel heartbeat (relay `periodic_send` parity): an
+                // Empty carrying the last forwarded frame number and the
+                // current input ack, so a quiet session still proves the
+                // remote is alive and the client's "Last contact" banner
+                // stays down.
+                let empty = empty_ack_frame(b.last_frame_num, b.inbox.next_offset());
+                crate::remote::mux::send_session_wire(
+                    &mut conn,
+                    &mut fragmenter,
+                    b.chan,
+                    crate::remote::mux::SESSION_WIRE_DATA,
+                    &empty.encode(),
+                );
+                b.last_send = now;
             }
             if eof {
                 closed.push((i, exit_payload.unwrap_or_default()));
@@ -661,6 +690,10 @@ fn handle_session_instruction(
                             acked_forwarded: 0,
                             last_frame_num: 0,
                             last_retx: 0,
+                            // 0 = "never sent": the first heartbeat goes out
+                            // on the next iteration, so the client learns the
+                            // channel is live immediately.
+                            last_send: 0,
                             ack_due: false,
                         }));
                     }
@@ -3548,6 +3581,94 @@ mod tests {
             c == over && m.first() == Some(&crate::remote::mux::SESSION_WIRE_CLOSE)
         });
         assert_eq!(&m[1..], b"session channel table full");
+        h.join().unwrap();
+        std::fs::remove_dir_all(&base).ok();
+    }
+
+    /// relay `periodic_send` parity (the second half of the mux `sc list`/vim
+    /// wedge report): an IDLE session channel must still heartbeat an Empty
+    /// frame every `HEARTBEAT_INTERVAL`, or a quiet mux session hears NOTHING
+    /// — the client's "Last contact" banner comes up and the session reads as
+    /// dead even though every process is healthy.
+    #[test]
+    fn mux_peer_heartbeats_idle_session_channels() {
+        let base = peer_temp_base();
+        let (h, mut wire, daemons) = start_peer((63780, 63789), &base);
+        let mut frag = Fragmenter::new();
+        let mut asm = FragmentAssembly::new();
+        let chan = channel::ChannelId::new(false, channel::KIND_SESSION, 2);
+        peer_send(&mut wire, &mut frag, chan, crate::remote::mux::SESSION_WIRE_OPEN, b"hb");
+        peer_send(&mut wire, &mut frag, chan, crate::remote::mux::SESSION_WIRE_DATA, &cm(24, 80, b"", 0, 0));
+        wait_daemon(&daemons, 1);
+
+        // One visible daemon frame (a non-Empty body, so no later Empty can be
+        // mistaken for its retransmit), acked so nothing is held and no input
+        // ack is owed: the channel is fully idle from here.
+        let frame = sync::ServerFrame {
+            flags: 0,
+            caps: caps::own_table(&[]),
+            frame_num: 1,
+            input_ack: 0,
+            echo_ack: 0,
+            body: sync::FrameBody::Full(b"screen".to_vec()),
+        };
+        let mut out = Vec::new();
+        ipc::append_frame(&mut out, ipc::Tag::Frame, &frame.encode());
+        {
+            use std::io::Write;
+            let g = daemons.lock().unwrap();
+            (&g[0].1).write_all(&out).unwrap();
+        }
+        peer_recv_until(&mut wire, &mut asm, |c, m| {
+            c == chan
+                && m.first() == Some(&crate::remote::mux::SESSION_WIRE_DATA)
+                && sync::ServerFrame::decode(&m[1..]).is_ok_and(|f| f.frame_num == 1)
+        });
+        peer_send(&mut wire, &mut frag, chan, crate::remote::mux::SESSION_WIRE_DATA, &cm(24, 80, b"", 1, 0));
+
+        // Idle from the daemon side; the client half keeps its own keepalives
+        // flowing (as the real mux daemon does — and the harness peer_timeout
+        // is shorter than HEARTBEAT_INTERVAL), so the peer stays alive while
+        // we wait for ITS idle-channel heartbeat: an Empty carrying the last
+        // forwarded frame number.
+        let deadline = now_ms() + 8_000;
+        let mut last_keepalive = 0u64;
+        let hb = loop {
+            assert!(now_ms() < deadline, "idle-channel heartbeat never arrived");
+            if now_ms().saturating_sub(last_keepalive) >= 500 {
+                peer_send(
+                    &mut wire,
+                    &mut frag,
+                    chan,
+                    crate::remote::mux::SESSION_WIRE_DATA,
+                    &cm(24, 80, b"", 1, 0),
+                );
+                last_keepalive = now_ms();
+            }
+            match wire.recv() {
+                Ok(Some(payload)) => {
+                    let Ok(f) = sync::Fragment::from_bytes(&payload) else { continue };
+                    let Some(a) = asm.add(f) else { continue };
+                    let Some((c, m)) = channel::open_any_instruction(true, &a) else {
+                        continue;
+                    };
+                    if c == chan && m.first() == Some(&crate::remote::mux::SESSION_WIRE_DATA) {
+                        if let Ok(f) = sync::ServerFrame::decode(&m[1..]) {
+                            if f.frame_num == 1 && matches!(f.body, sync::FrameBody::Empty) {
+                                break f;
+                            }
+                        }
+                    }
+                }
+                Ok(None) => {}
+                Err(e) if e.kind() == std::io::ErrorKind::WouldBlock => {
+                    std::thread::sleep(std::time::Duration::from_millis(5));
+                }
+                Err(e) => panic!("test wire recv: {e}"),
+            }
+        };
+        assert!(matches!(hb.body, sync::FrameBody::Empty));
+        drop(daemons.lock().unwrap().remove(0));
         h.join().unwrap();
         std::fs::remove_dir_all(&base).ok();
     }
