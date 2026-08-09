@@ -1207,7 +1207,7 @@ debug-posh-remote-tail host file lines="40":
 #
 # start an instrumented mux-session attach in a detached tmux pane
 [group("debug")]
-debug-posh-mux-repro-start host="sasha@flic.ts.starbrandshoes.com" session="muxrepro" posh_bin="" server_cmd="":
+debug-posh-mux-repro-start host="posh-remote" session="muxrepro" posh_bin="" server_cmd="":
     #!/usr/bin/env bash
     set -euo pipefail
     dir="{{ justfile_directory() }}/.tmp/muxrepro"
@@ -1243,7 +1243,7 @@ debug-posh-mux-repro-keys *keys:
 # channel isolates a per-channel wedge from a whole-connection one. Inspect
 # with `tmux capture-pane -p -t posh-muxrepro:1`.
 [group("debug")]
-debug-posh-mux-repro-second host="sasha@flic.ts.starbrandshoes.com" session="muxrepro2":
+debug-posh-mux-repro-second host="posh-remote" session="muxrepro2":
     #!/usr/bin/env bash
     set -euo pipefail
     dir="{{ justfile_directory() }}/.tmp/muxrepro"
@@ -1318,7 +1318,7 @@ debug-posh-mux-repro-stop host="":
     set -uo pipefail
     tmux kill-session -t posh-muxrepro 2>/dev/null || true
     sleep 1
-    pkill -f 'posh sasha@.*:(muxrepro|muxfix)' 2>/dev/null || true
+    pkill -f 'posh [^ ]*:(muxrepro|muxfix)' 2>/dev/null || true
     rm -rf "{{ justfile_directory() }}/.tmp/muxrepro" "${XDG_RUNTIME_DIR:-/tmp}/posh-muxrepro"
     if [ -n "{{ host }}" ]; then
       ssh {{ host }} bash -s <<'EOF'

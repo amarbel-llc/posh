@@ -257,6 +257,27 @@ read-only, `debug` group):
   and the host's NAT/firewall posture (`tailscale netcheck`). A steady
   retransmit climb with ~0% measured loss points at the RTO margin
   (`RttEstimator::rto`, `remote/datagram.rs`), not the path.
+- `just debug-posh-mtu-probe <peer>` — measure a path's real datagram-size
+  ceiling with sized pings. The signature that matters: small sizes pass,
+  1280+-byte packets lose 100% — a tunnel path (tailscale MTU 1280) dropping
+  IP fragments. posh sizes fragments under the IPv6 minimum MTU
+  (`FRAGMENT_CONTENTS_MAX`, `remote/sync.rs`) precisely so this cannot eat
+  frames; "large frames vanish, small ones pass" means something regressed it.
+- `just debug-posh-remote-triage <host>` / `debug-posh-remote-tail <host>
+  <file>` / `debug-posh-remote-ps <host>` — read-only post-mortem sweep of a
+  REMOTE host's posh state over ssh: process table, socket-dir layout, panic
+  greps, log tails, coredump/journal artifacts. First stop when a remote
+  session "died" — note a session daemon's log prints the SHELL's pid
+  (`child.pid`), and the daemon itself carries its spawner's argv, so pgrep
+  output needs care before declaring a process dead.
+- `just debug-posh-mux-repro-start [host] [session] [posh_bin] [server_cmd]`
+  (+ `-keys`/`-capture`/`-second`/`-capture2`/`-stop [host]`) — drive a fully
+  instrumented `POSH_MUX_SESSIONS=1` attach inside a detached tmux pane:
+  send keystrokes, capture the screen, open a second channel on the same
+  connection, and tear the whole stack down (both ends) between runs.
+  `posh_bin`/`server_cmd` swap in a locally-built binary on both ends — but
+  ONLY after `-stop <host>`: a surviving mux daemon short-circuits the ssh
+  bootstrap and silently keeps the previous stack serving.
 
 ## Debugging a local session (wheel scrolls vs arrow keys)
 
