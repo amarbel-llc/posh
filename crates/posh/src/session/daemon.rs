@@ -354,17 +354,20 @@ impl ClientConn {
     /// coalescing) client, a malformed payload, or a producerless client is a
     /// no-op. Extracted (like `apply_init`) so the daemon-loop arm and the inline
     /// tests drive one path.
-    fn apply_frame_ack(&mut self, payload: &[u8]) {
+    /// Returns `true` when the ack carried `FRAME_ACK_RESYNC` and the base was
+    /// dropped — the caller ([`handle_frame_ack`]) owes the client an immediate
+    /// recovering `Full` keyframe.
+    fn apply_frame_ack(&mut self, payload: &[u8]) -> bool {
         // `Tag::FrameAck` is a not-self-acked verb: a reliable client self-acks in
         // `queue_frame` and never sends it, so ignore it here — that keeps a
         // reliable client's producer state provably untouched by this path. Gated
         // on the ADVERTISED cap (`self.coalesce`, not `coalescing()`): a toggle-OFF
         // ack must still be processed to flip the runtime state back.
         if !self.lossy && !self.coalesce {
-            return;
+            return false;
         }
         let Some((acked, flags)) = ipc::decode_frame_ack(payload) else {
-            return;
+            return false;
         };
         // Runtime coalescing toggle (posh#137). Only a `CAP_COALESCE` client can
         // flip it — a lossy relay ack must never touch it. Clearing the anchor on
@@ -377,14 +380,16 @@ impl ClientConn {
             }
         }
         let Some(producer) = self.producer.as_mut() else {
-            return;
+            return false;
         };
         if let Some(sb_total) = producer.ack(acked) {
             self.acked_sb_total = self.acked_sb_total.max(sb_total);
         }
         if flags & ipc::FRAME_ACK_RESYNC != 0 {
             producer.drop_acked_base();
+            return true;
         }
+        false
     }
 
     /// Whether this client advertised `CAP_SCROLLBACK` (RFC 0002 §1) on its
@@ -537,6 +542,30 @@ fn broadcast_output(clients: &mut [ClientConn], term: &Terminal, bcast: &[u8]) {
             // client wants scrollback and the terminal grew primary rows.
             c.maybe_queue_scrollback(term);
         }
+    }
+}
+
+/// The daemon-loop `Tag::FrameAck` arm, extracted so the inline tests drive
+/// the exact production path (like `apply_init`/`apply_frame_ack`): apply the
+/// ack against `c`'s producer, and when it carried `FRAME_ACK_RESYNC` ship the
+/// recovering `Full` keyframe IMMEDIATELY from `src` (the active broadcast
+/// source: the overlay terminal while one is up, else the live session).
+///
+/// The immediacy is load-bearing (the mux-session `sc list`/vim wedge): the
+/// resync's contract is "drop the base so the next frame is a Full", but on a
+/// static screen no next frame ever comes — the client already rejected the
+/// outstanding diffs (base-behind basemis, #95) and the relay/bridge cleared
+/// its held frame on the same RESYNC, so without this forced frame both ends
+/// sit silent forever. Mirrors the single-peer server's `force_frame = true`
+/// ("ships it even if the screen is static", server.rs).
+fn handle_frame_ack(c: &mut ClientConn, payload: &[u8], src: &Terminal) {
+    if c.apply_frame_ack(payload) {
+        c.queue_frame(
+            src.dump_vt(),
+            Snapshot::from_term(src),
+            src.is_alt_screen(),
+            (src.rows(), src.cols()),
+        );
     }
 }
 
@@ -1241,7 +1270,11 @@ fn daemon_loop(
                                 // also carries the runtime coalescing toggle. Shared
                                 // with the tests via `apply_frame_ack` (like
                                 // `apply_init`).
-                                Tag::FrameAck => c.apply_frame_ack(&frame.payload),
+                                Tag::FrameAck => handle_frame_ack(
+                                    c,
+                                    &frame.payload,
+                                    active_source(overlay.as_ref().map(|o| &o.term), term),
+                                ),
                                 // Output, Ack, Exit, and Frame are all
                                 // daemon->client only; ignore if received from
                                 // a client.
@@ -2789,6 +2822,47 @@ mod tests {
             }
             other => panic!("expected a checksummed Diff, got {other:?}"),
         }
+    }
+
+    /// The mux-session wedge (the `sc list`/vim hang): a `FRAME_ACK_RESYNC`
+    /// must ship the recovering `Full` IMMEDIATELY, with NO new PTY output.
+    /// `apply_frame_ack` alone only drops the base, so on a static screen the
+    /// promised Full never ships: the client already rejected the outstanding
+    /// diffs (base-behind basemis, #95), the relay/bridge cleared its held
+    /// frame on the RESYNC, and both ends sit silent forever. The single-peer
+    /// server ships it via `force_frame` (server.rs, "even if the screen is
+    /// static"); the daemon's `handle_frame_ack` must answer equivalently.
+    #[test]
+    fn frame_ack_resync_ships_recovering_full_without_new_output() {
+        let (rows, cols) = (24u16, 80u16);
+        let mut term = Terminal::with_scrollback(rows, cols, 1000);
+        fill_screen(&mut term);
+        let (mut c, _peer) = lossy_conn(rows, cols, &[]);
+
+        // Full #1 acked ⇒ base 1; the echo burst races ahead: #2 diffs vs 1.
+        assert!(c.queue_frame(term.dump_vt(), Snapshot::from_term(&term), false, (rows, cols)));
+        handle_frame_ack(&mut c, &ipc::encode_frame_ack(1, 0), &term);
+        term.process(b"echo burst ");
+        broadcast_output(std::slice::from_mut(&mut c), &term, b"<raw ignored>");
+
+        // The client's #95 resync request arrives; the screen is STATIC from
+        // here on (the shell is idle at a prompt).
+        handle_frame_ack(&mut c, &ipc::encode_frame_ack(2, ipc::FRAME_ACK_RESYNC), &term);
+
+        // The recovering Full must ALREADY be queued — no output will come to
+        // trigger one, and nothing else retransmits (the bridge cleared its
+        // held frame on the same RESYNC).
+        let bodies = decode_frame_bodies(&c.write_buf);
+        assert!(
+            matches!(bodies.last(), Some(FrameBody::Full(_))),
+            "a RESYNC on a static screen must ship the recovering Full at once, got {:?}",
+            bodies.last()
+        );
+        assert_eq!(
+            reconstruct(&c.write_buf, rows, cols),
+            Snapshot::from_term(&term),
+            "the forced keyframe re-establishes the wedged client at the live screen"
+        );
     }
 
     /// A RELIABLE client (no `CAP_LOSSY`) is unchanged: it self-acks with no
