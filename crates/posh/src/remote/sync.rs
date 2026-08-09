@@ -130,17 +130,22 @@ pub(crate) fn multi_fragment_payload() -> Vec<u8> {
     (0..3 * FRAGMENT_CONTENTS_MAX).map(|i| (i % 251) as u8).collect()
 }
 
-/// Upper bound on fragments per instruction (~11 MB of payload at MTU-sized
+/// Upper bound on fragments per instruction (~14 MB of payload at MTU-sized
 /// chunks): bounds allocation driven by a buggy or hostile authenticated
-/// peer, which could otherwise force a 32768-slot buffer per id.
-const MAX_FRAGMENTS: usize = 8192;
+/// peer, which could otherwise force a 32768-slot buffer per id. Sized UP
+/// alongside the `FRAGMENT_CONTENTS_MAX` MTU shrink so the maximum
+/// assemblable instruction (MAX_FRAGMENTS × contents) did not silently fall
+/// below the previous ~11 MB ceiling — an over-ceiling frame never
+/// reassembles and reads as an apply-stall — while staying under
+/// MAX_ASSEMBLY_BYTES so one maximal instruction never self-evicts.
+const MAX_FRAGMENTS: usize = 12288;
 
 /// RFC 0011 §4 bounds: how many instructions may assemble concurrently (the
 /// RFC floor is 4) and how many payload bytes may sit buffered across ALL of
 /// them. Exceeding either evicts the least-recently-updated assembly, never
 /// the one being fed. The byte bound deliberately exceeds one maximal
-/// instruction (MAX_FRAGMENTS × ~MTU ≈ 11 MB), so a single large frame can
-/// never need to self-evict.
+/// instruction (MAX_FRAGMENTS × contents ≈ 14 MB), so a single large frame
+/// can never need to self-evict.
 const MAX_ASSEMBLIES: usize = 8;
 const MAX_ASSEMBLY_BYTES: usize = 16 * 1024 * 1024;
 
@@ -867,6 +872,17 @@ mod tests {
             "a max fragment's IPv6 packet is {packet} bytes; paths at the \
              1280 IPv6 minimum MTU (tailscale) blackhole it"
         );
+    }
+
+    /// The per-instruction assembly ceiling must not regress below the
+    /// pre-MTU-resize maximum (8192 × 1362 ≈ 11 MB) — an over-ceiling frame
+    /// never reassembles and reads as an apply-stall — and must stay under
+    /// the total byte bound so one maximal instruction never self-evicts.
+    #[test]
+    fn fragment_ceiling_covers_the_pre_mtu_resize_maximum() {
+        let ceiling = MAX_FRAGMENTS * FRAGMENT_CONTENTS_MAX;
+        assert!(ceiling >= 8192 * 1362, "assemblable-frame ceiling regressed: {ceiling}");
+        assert!(ceiling <= MAX_ASSEMBLY_BYTES, "one maximal instruction must fit the byte bound");
     }
 
     #[test]

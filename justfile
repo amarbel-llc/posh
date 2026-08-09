@@ -1243,14 +1243,18 @@ debug-posh-mux-repro-keys *keys:
 # channel isolates a per-channel wedge from a whole-connection one. Inspect
 # with `tmux capture-pane -p -t posh-muxrepro:1`.
 [group("debug")]
-debug-posh-mux-repro-second host="posh-remote" session="muxrepro2":
+debug-posh-mux-repro-second host="posh-remote" session="muxrepro2" posh_bin="":
     #!/usr/bin/env bash
     set -euo pipefail
     dir="{{ justfile_directory() }}/.tmp/muxrepro"
     poshdir="${XDG_RUNTIME_DIR:-/tmp}/posh-muxrepro"
+    # Same posh_bin override as -start: when verifying a built binary, BOTH
+    # clients must run it or the second channel silently exercises the
+    # deployed build.
+    bin="{{ posh_bin }}"; [ -n "$bin" ] || bin="$HOME/.nix-profile/bin/posh"
     tmux new-window -t posh-muxrepro \
       "env POSH_MUX=1 POSH_MUX_SESSIONS=1 POSH_DEBUG_LOG=/tmp/posh-muxrepro2.log POSH_DIR=$poshdir \
-        ~/.nix-profile/bin/posh '{{ host }}:{{ session }}' 2>$dir/client2-stderr.log; \
+        $bin '{{ host }}:{{ session }}' 2>$dir/client2-stderr.log; \
         echo \"posh exited: \$?\"; sleep 3600"
     echo "second attach -> {{ host }}:{{ session }} (window :1)"
 

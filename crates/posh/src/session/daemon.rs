@@ -270,6 +270,20 @@ impl ClientConn {
     /// codec is selected from the negotiated caps (`CAP_MORPH` ⇒ MorphDelta) and,
     /// with `CAP_BASE_SUM`, the diff base's checksum is stamped so the far client
     /// can verify its base before applying (mirror of `server.rs`).
+    /// [`queue_frame`] with its inputs derived from one source terminal — the
+    /// per-client shape (mid-overlay attach replay, resync keyframe), kept in
+    /// one place so the frame-input contract cannot drift across call sites.
+    /// `broadcast_output` deliberately keeps its batched form: it derives the
+    /// inputs once and clones them per client.
+    fn queue_frame_from(&mut self, src: &Terminal) -> bool {
+        self.queue_frame(
+            src.dump_vt(),
+            Snapshot::from_term(src),
+            src.is_alt_screen(),
+            (src.rows(), src.cols()),
+        )
+    }
+
     fn queue_frame(&mut self, dump: Vec<u8>, snapshot: Snapshot, alt: bool, dims: (u16, u16)) -> bool {
         // Read the lossy-mode inputs before borrowing `producer` mutably. A
         // reliable client leaves all three false ⇒ today's exact behavior.
@@ -560,12 +574,7 @@ fn broadcast_output(clients: &mut [ClientConn], term: &Terminal, bcast: &[u8]) {
 /// ("ships it even if the screen is static", server.rs).
 fn handle_frame_ack(c: &mut ClientConn, payload: &[u8], src: &Terminal) {
     if c.apply_frame_ack(payload) {
-        c.queue_frame(
-            src.dump_vt(),
-            Snapshot::from_term(src),
-            src.is_alt_screen(),
-            (src.rows(), src.cols()),
-        );
+        c.queue_frame_from(src);
     }
 }
 
@@ -1386,18 +1395,7 @@ fn daemon_loop(
                 // exists — exactly the lazy guard `broadcast_output` uses — so a
                 // gate-off or non-capable client (the Phase 1 default, hit on
                 // every attach) pays only the single `dump_vt_flat` it always did.
-                let frame_inputs = c.producer.is_some().then(|| {
-                    (
-                        src.dump_vt(),
-                        Snapshot::from_term(src),
-                        src.is_alt_screen(),
-                        (src.rows(), src.cols()),
-                    )
-                });
-                let produced = match frame_inputs {
-                    Some((dump, snap, alt, dims)) => c.queue_frame(dump, snap, alt, dims),
-                    None => false,
-                };
+                let produced = c.producer.is_some() && c.queue_frame_from(src);
                 if !produced {
                     c.queue(Tag::Output, &src.dump_vt_flat());
                 }
