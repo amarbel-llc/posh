@@ -1135,6 +1135,179 @@ debug-posh-fetch-server host="posh-remote" pid="" dest="/tmp/posh-remote-server.
     scp -q {{ host }}:"$src" "{{ dest }}"
     ls -l "{{ dest }}"
 
+# Read-only sweep of a remote host's posh state after a crash/wedge: the process
+# table, the socket-dir layout, and the tail of every posh log under the
+# remote's XDG_RUNTIME_DIR/posh (session daemons, mux peers, roaming servers),
+# with any panic lines called out first. Ad-hoc triage lane for the
+# POSH_MUX_SESSIONS escape-sequence crash investigation.
+#
+# sweep a remote host's posh processes + logs for crash evidence
+[group("debug")]
+debug-posh-remote-triage host="posh-remote":
+    #!/usr/bin/env bash
+    set -euo pipefail
+    # The remote login shell may be fish; run the whole sweep under a remote
+    # bash -s so the loops parse.
+    ssh {{ host }} bash -s <<'EOF'
+    set -uo pipefail
+    dir="/run/user/$(id -u)/posh"
+    echo "== posh processes =="
+    pgrep -af posh || echo '(none)'
+    echo
+    echo "== $dir layout (mtime-sorted) =="
+    find "$dir" -printf '%T@ %M %s %p\n' 2>/dev/null | sort -rn | head -40 | cut -d' ' -f2-
+    echo
+    echo "== panic lines across every log =="
+    found=0
+    while read -r f; do found=1; echo "--- $f"; grep -a 'panic' "$f"; done \
+      < <(grep -la 'panic' -r "$dir" --include='*.log' 2>/dev/null)
+    [ "$found" = 1 ] || echo '(none)'
+    echo
+    echo "== recent crash artifacts (coredumpctl / user journal) =="
+    coredumpctl list --no-pager --since '2 days ago' 2>/dev/null | grep -iE 'posh|TIME' || echo '(no posh coredumps)'
+    journalctl --user --no-pager --since '2 days ago' 2>/dev/null | grep -iE 'posh.*(segfault|killed|oom|panic)|oom.*posh' | tail -20 || true
+    echo
+    echo "== system journal (oom-killer / segfaults; may need journal-group perms) =="
+    journalctl --no-pager --since '3 days ago' 2>/dev/null | grep -iE 'segfault.*posh|posh.*segfault|oom-kill|out of memory' | tail -20 \
+      || echo '(system journal unreadable or empty)'
+    echo
+    echo "== tail of each session/mux log (newest first, skipping client/server transport logs) =="
+    while read -r f; do echo "--- $f"; tail -25 "$f"; echo; done \
+      < <(find "$dir" -name '*.log' -not -name 'posh-client-*' -not -name 'posh-server-*' -printf '%T@ %p\n' 2>/dev/null | sort -rn | cut -d' ' -f2-)
+    exit 0
+    EOF
+
+# Tail one file under the remote host's XDG_RUNTIME_DIR/posh (or any absolute
+# path), with its mtime. Companion to debug-posh-remote-triage for pulling the
+# specific logs it surfaces (session daemon, mux peer, roaming server, client
+# sinks).
+#
+# tail one remote posh log by name
+[group("debug")]
+debug-posh-remote-tail host file lines="40":
+    #!/usr/bin/env bash
+    set -euo pipefail
+    ssh {{ host }} bash -s <<'EOF'
+    set -euo pipefail
+    f="{{ file }}"
+    [[ "$f" = /* ]] || f="/run/user/$(id -u)/posh/$f"
+    ls -l --time-style=full-iso "$f"
+    tail -{{ lines }} "$f"
+    EOF
+
+# The POSH_MUX_SESSIONS repro driver (investigating the sc-list/vim
+# hang-then-dead-server report): start an instrumented `posh <host>:<session>`
+# mux attach inside a detached tmux session, so triggers can be typed with
+# send-keys and the screen inspected with capture-pane, all headless. One
+# POSH_DEBUG_LOG path lights up every party (client + local mux daemon here,
+# agent peer + roaming server on the remote — the var rides the bootstrap);
+# an isolated POSH_DIR keeps the repro's mux daemon and sockets away from the
+# operator's real ones. The pane survives client exit so the exit code and
+# final screen are readable.
+#
+# start an instrumented mux-session attach in a detached tmux pane
+[group("debug")]
+debug-posh-mux-repro-start host="sasha@flic.ts.starbrandshoes.com" session="muxrepro":
+    #!/usr/bin/env bash
+    set -euo pipefail
+    dir="{{ justfile_directory() }}/.tmp/muxrepro"
+    # The isolated socket base must be SHORT (sockaddr_un SUN_LEN caps unix
+    # socket paths at ~107 bytes) — a worktree-nested dir is too long, so it
+    # lives under XDG_RUNTIME_DIR; everything else stays in the worktree.
+    poshdir="${XDG_RUNTIME_DIR:-/tmp}/posh-muxrepro"
+    mkdir -p "$dir" "$poshdir"
+    chmod 700 "$poshdir"
+    tmux kill-session -t posh-muxrepro 2>/dev/null || true
+    rm -f /tmp/posh-muxrepro.log
+    echo "== local posh: $(~/.nix-profile/bin/posh version 2>&1)"
+    echo "== remote posh: $(ssh {{ host }} posh version 2>&1)"
+    tmux new-session -d -s posh-muxrepro -x 120 -y 32 \
+      "env POSH_MUX=1 POSH_MUX_SESSIONS=1 POSH_DEBUG_LOG=/tmp/posh-muxrepro.log POSH_DIR=$poshdir \
+        ~/.nix-profile/bin/posh '{{ host }}:{{ session }}' 2>$dir/client-stderr.log; \
+        echo \"posh exited: \$?\"; sleep 3600"
+    echo "started tmux session posh-muxrepro -> {{ host }}:{{ session }}"
+
+# send keys into the mux-repro pane (tmux send-keys syntax, e.g. 'q' or Enter)
+[group("debug")]
+debug-posh-mux-repro-keys *keys:
+    tmux send-keys -t posh-muxrepro {{ keys }}
+
+# open a SECOND instrumented attach as another window of the repro tmux
+# session, riding the SAME mux daemon/connection (same POSH_DIR): the fresh
+# channel isolates a per-channel wedge from a whole-connection one. Inspect
+# with `tmux capture-pane -p -t posh-muxrepro:1`.
+[group("debug")]
+debug-posh-mux-repro-second host="sasha@flic.ts.starbrandshoes.com" session="muxrepro2":
+    #!/usr/bin/env bash
+    set -euo pipefail
+    dir="{{ justfile_directory() }}/.tmp/muxrepro"
+    poshdir="${XDG_RUNTIME_DIR:-/tmp}/posh-muxrepro"
+    tmux new-window -t posh-muxrepro \
+      "env POSH_MUX=1 POSH_MUX_SESSIONS=1 POSH_DEBUG_LOG=/tmp/posh-muxrepro2.log POSH_DIR=$poshdir \
+        ~/.nix-profile/bin/posh '{{ host }}:{{ session }}' 2>$dir/client2-stderr.log; \
+        echo \"posh exited: \$?\"; sleep 3600"
+    echo "second attach -> {{ host }}:{{ session }} (window :1)"
+
+# capture the second attach's pane + its stderr/log tails
+[group("debug")]
+debug-posh-mux-repro-capture2:
+    #!/usr/bin/env bash
+    set -uo pipefail
+    dir="{{ justfile_directory() }}/.tmp/muxrepro"
+    echo "== pane :1 =="
+    tmux capture-pane -p -t posh-muxrepro:1 || echo '(no window 1)'
+    echo
+    echo "== client2 stderr =="
+    tail -5 "$dir/client2-stderr.log" 2>/dev/null || true
+    echo
+    echo "== client2 POSH_DEBUG_LOG tail =="
+    tail -4 /tmp/posh-muxrepro2.log 2>/dev/null || echo '(no log yet)'
+    exit 0
+
+# snapshot the mux-repro: pane screen, repro-related pids, local log tails
+[group("debug")]
+debug-posh-mux-repro-capture:
+    #!/usr/bin/env bash
+    set -uo pipefail
+    dir="{{ justfile_directory() }}/.tmp/muxrepro"
+    echo "== pane (window 0) =="
+    tmux capture-pane -p -t posh-muxrepro:0 || echo '(no tmux session)'
+    echo
+    echo "== repro processes (client, mux daemon) =="
+    pgrep -af 'nix-profile/bin/posh|posh-server' || echo '(none)'
+    echo
+    echo "== client stderr =="
+    tail -5 "$dir/client-stderr.log" 2>/dev/null || true
+    echo
+    echo "== local POSH_DEBUG_LOG tail =="
+    tail -8 /tmp/posh-muxrepro.log 2>/dev/null || echo '(no log yet)'
+    echo
+    echo "== repro mux daemon log =="
+    tail -6 "${XDG_RUNTIME_DIR:-/tmp}/posh-muxrepro"/mux/*.log 2>/dev/null || echo '(no mux log yet)'
+    exit 0
+
+# snapshot the remote's posh/fish process tree (pid, parent, pgid, state,
+# start time) — run before/after a repro step to bracket exactly which process
+# died and when, and to spot orphaned shells left by a killed daemon
+[group("debug")]
+debug-posh-remote-ps host="posh-remote":
+    #!/usr/bin/env bash
+    set -euo pipefail
+    ssh {{ host }} bash -s <<'EOF'
+    set -uo pipefail
+    ps -eo pid,ppid,pgid,stat,lstart,args | grep -E 'posh|fish' | grep -vE 'grep|bash -s|sshd'
+    exit 0
+    EOF
+
+# tear down the mux-repro tmux session and its isolated POSH_DIR
+[group("debug")]
+debug-posh-mux-repro-stop:
+    #!/usr/bin/env bash
+    set -uo pipefail
+    tmux kill-session -t posh-muxrepro 2>/dev/null || true
+    rm -rf "{{ justfile_directory() }}/.tmp/muxrepro"
+    echo "stopped"
+
 # Build .#posh and copy its closure to a remote host, so the remote has the same
 # instrumented posh-server the local client will exec via POSH_SERVER_CMD. Run
 # after a code change; prints the store path. Non-interactive (no launch).
