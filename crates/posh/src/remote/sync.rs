@@ -31,9 +31,21 @@ pub use posh_proto::frame::{apply_diff, make_diff};
 // u16 with the final bit in the top bit and the fragment number below.
 
 pub const FRAG_HEADER_LEN: usize = 10;
-/// Max assembled-payload bytes per fragment: ~1400-byte datagrams minus the
-/// crypto overhead (24 bytes), packet timestamps (4) and fragment header.
-pub const FRAGMENT_CONTENTS_MAX: usize = 1400 - 24 - 4 - FRAG_HEADER_LEN;
+/// Max assembled-payload bytes per fragment, sized so one fragment's whole
+/// DATAGRAM fits the IPv6 minimum MTU (1280) — the floor every conformant
+/// path must carry without IP fragmentation. The budget: 1280 minus the IPv6
+/// (40) and UDP (8) headers, the crypto overhead (24), packet timestamps (4),
+/// and the fragment header.
+///
+/// The previous 1400-byte payload budget produced 1448-byte IPv6 packets;
+/// tunnel paths running at exactly MTU 1280 (tailscale/WireGuard) drop IP
+/// fragments outright, so those datagrams blackholed 100% — every session
+/// frame larger than one fragment (any real TUI redraw) silently vanished
+/// while small frames sailed through (the vim/`sc list` mux-session wedge's
+/// transport layer). Mosh sizes its datagrams under the same floor for the
+/// same reason. Receivers reassemble by header and accept any sender's
+/// fragment size, so this is sender-local and wire-compatible both ways.
+pub const FRAGMENT_CONTENTS_MAX: usize = 1280 - 40 - 8 - 24 - 4 - FRAG_HEADER_LEN;
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Fragment {
@@ -826,6 +838,28 @@ impl AgentStream {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// A maximum-size fragment's DATAGRAM must fit the IPv6 minimum MTU
+    /// (1280) — the floor every conformant path must carry WITHOUT IP
+    /// fragmentation. Tunnel paths (tailscale/WireGuard run at exactly MTU
+    /// 1280) drop IP fragments outright, so an oversized datagram is a 100%
+    /// blackhole there: with the old 1400-byte budget every session frame
+    /// bigger than one fragment (any real TUI redraw) silently vanished —
+    /// the vim/sc-list mux wedge's transport layer.
+    #[test]
+    fn max_fragment_datagram_fits_ipv6_min_mtu() {
+        let mut fr = Fragmenter::new();
+        let frags = fr.make_fragments(&vec![0u8; FRAGMENT_CONTENTS_MAX], FRAGMENT_CONTENTS_MAX);
+        assert_eq!(frags.len(), 1);
+        // Wire fragment + crypto overhead (24) + timestamps (4) = the UDP
+        // payload; + UDP (8) + IPv6 (40) headers = the on-path packet.
+        let packet = frags[0].to_bytes().len() + 24 + 4 + 8 + 40;
+        assert!(
+            packet <= 1280,
+            "a max fragment's IPv6 packet is {packet} bytes; paths at the \
+             1280 IPv6 minimum MTU (tailscale) blackhole it"
+        );
+    }
 
     #[test]
     fn fragment_roundtrip_single() {
