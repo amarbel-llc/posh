@@ -2982,9 +2982,7 @@ mod tests {
         let (chan, _) = recv_wire_until(&mut server, &mut assembly, |c, m| {
             c.ordinal() == ordinal && m.first() == Some(&SESSION_WIRE_OPEN)
         });
-        let big: Vec<u8> = (0..3 * sync::FRAGMENT_CONTENTS_MAX)
-            .map(|i| (i % 251) as u8)
-            .collect();
+        let big = sync::multi_fragment_payload();
         send_wire(&mut server, &mut fragmenter, chan, SESSION_WIRE_DATA, &big);
         loop {
             let f = read_client_frame(&mut ipc);

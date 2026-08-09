@@ -122,6 +122,14 @@ impl Fragmenter {
     }
 }
 
+/// Test fixture shared by the mux-leg regression tests: a payload spanning
+/// several fragments, with a non-constant byte pattern so a truncated or
+/// reordered reassembly cannot compare equal by accident.
+#[cfg(test)]
+pub(crate) fn multi_fragment_payload() -> Vec<u8> {
+    (0..3 * FRAGMENT_CONTENTS_MAX).map(|i| (i % 251) as u8).collect()
+}
+
 /// Upper bound on fragments per instruction (~11 MB of payload at MTU-sized
 /// chunks): bounds allocation driven by a buggy or hostile authenticated
 /// peer, which could otherwise force a 32768-slot buffer per id.

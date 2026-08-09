@@ -542,9 +542,16 @@ pub(crate) fn mux_peer_loop(
                 b.last_retx = now;
                 b.last_send = now;
             }
-            if b.ack_due && conn.has_remote() {
-                // An owed input ack with no visible frame to carry it: an
-                // Empty frame drains the client's input outbox promptly.
+            // One Empty serves two triggers: an OWED INPUT ACK with no
+            // visible frame to carry it (drain the client's input outbox
+            // promptly), and the IDLE-CHANNEL HEARTBEAT (relay
+            // `periodic_send` parity — a quiet session still proves the
+            // remote is alive, keeping the client's "Last contact" banner
+            // down). Both send the same frame: the last forwarded frame
+            // number plus the current input ack.
+            if conn.has_remote()
+                && (b.ack_due || now.saturating_sub(b.last_send) >= HEARTBEAT_INTERVAL)
+            {
                 let empty = empty_ack_frame(b.last_frame_num, b.inbox.next_offset());
                 crate::remote::mux::send_session_wire(
                     &mut conn,
@@ -554,22 +561,6 @@ pub(crate) fn mux_peer_loop(
                     &empty.encode(),
                 );
                 b.ack_due = false;
-                b.last_send = now;
-            }
-            if conn.has_remote() && now.saturating_sub(b.last_send) >= HEARTBEAT_INTERVAL {
-                // Idle-channel heartbeat (relay `periodic_send` parity): an
-                // Empty carrying the last forwarded frame number and the
-                // current input ack, so a quiet session still proves the
-                // remote is alive and the client's "Last contact" banner
-                // stays down.
-                let empty = empty_ack_frame(b.last_frame_num, b.inbox.next_offset());
-                crate::remote::mux::send_session_wire(
-                    &mut conn,
-                    &mut fragmenter,
-                    b.chan,
-                    crate::remote::mux::SESSION_WIRE_DATA,
-                    &empty.encode(),
-                );
                 b.last_send = now;
             }
             if eof {
@@ -3600,9 +3591,7 @@ mod tests {
         peer_send(&mut wire, &mut frag, chan, crate::remote::mux::SESSION_WIRE_DATA, &cm(24, 80, b"", 0, 0));
         wait_daemon(&daemons, 1);
 
-        let big: Vec<u8> = (0..3 * sync::FRAGMENT_CONTENTS_MAX)
-            .map(|i| (i % 251) as u8)
-            .collect();
+        let big = sync::multi_fragment_payload();
         let frame = sync::ServerFrame {
             flags: 0,
             caps: caps::own_table(&[]),
