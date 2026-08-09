@@ -3585,6 +3585,54 @@ mod tests {
         std::fs::remove_dir_all(&base).ok();
     }
 
+    /// A daemon frame LARGER than one wire fragment (a real TUI redraw — the
+    /// vim/sc-list case) must traverse the peer to the wire intact: the frame
+    /// is sealed then fragmented, and the far side reassembles it. Isolates
+    /// the peer→wire leg of the "large frames vanish" wedge.
+    #[test]
+    fn mux_peer_forwards_frames_larger_than_one_fragment() {
+        let base = peer_temp_base();
+        let (h, mut wire, daemons) = start_peer((63790, 63799), &base);
+        let mut frag = Fragmenter::new();
+        let mut asm = FragmentAssembly::new();
+        let chan = channel::ChannelId::new(false, channel::KIND_SESSION, 2);
+        peer_send(&mut wire, &mut frag, chan, crate::remote::mux::SESSION_WIRE_OPEN, b"big");
+        peer_send(&mut wire, &mut frag, chan, crate::remote::mux::SESSION_WIRE_DATA, &cm(24, 80, b"", 0, 0));
+        wait_daemon(&daemons, 1);
+
+        let big: Vec<u8> = (0..3 * sync::FRAGMENT_CONTENTS_MAX)
+            .map(|i| (i % 251) as u8)
+            .collect();
+        let frame = sync::ServerFrame {
+            flags: 0,
+            caps: caps::own_table(&[]),
+            frame_num: 1,
+            input_ack: 0,
+            echo_ack: 0,
+            body: sync::FrameBody::Full(big.clone()),
+        };
+        let mut out = Vec::new();
+        ipc::append_frame(&mut out, ipc::Tag::Frame, &frame.encode());
+        {
+            use std::io::Write;
+            let g = daemons.lock().unwrap();
+            (&g[0].1).write_all(&out).unwrap();
+        }
+        let (_, m) = peer_recv_until(&mut wire, &mut asm, |c, m| {
+            c == chan
+                && m.first() == Some(&crate::remote::mux::SESSION_WIRE_DATA)
+                && sync::ServerFrame::decode(&m[1..]).is_ok_and(|f| f.frame_num == 1)
+        });
+        let got = sync::ServerFrame::decode(&m[1..]).unwrap();
+        match got.body {
+            sync::FrameBody::Full(data) => assert_eq!(data, big, "body must arrive intact"),
+            other => panic!("expected the Full body, got {other:?}"),
+        }
+        drop(daemons.lock().unwrap().remove(0));
+        h.join().unwrap();
+        std::fs::remove_dir_all(&base).ok();
+    }
+
     /// relay `periodic_send` parity (the second half of the mux `sc list`/vim
     /// wedge report): an IDLE session channel must still heartbeat an Empty
     /// frame every `HEARTBEAT_INTERVAL`, or a quiet mux session hears NOTHING

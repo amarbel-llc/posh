@@ -2966,6 +2966,39 @@ mod tests {
         std::fs::remove_dir_all(&dir).ok();
     }
 
+    /// A wire session frame LARGER than one fragment (a real TUI redraw)
+    /// must reassemble in the mux daemon and reach the IPC conn intact —
+    /// isolates the wire→local-daemon→IPC leg of the "large frames vanish"
+    /// wedge (vim/sc-list screens are multi-fragment; echoes are not).
+    #[test]
+    fn session_frames_larger_than_one_fragment_route_to_ipc() {
+        use std::io::Write;
+        let dir = temp_base();
+        let (daemon, mut server) = start_inprocess_daemon(&dir, "m2big", 1_000, (63820, 63829));
+        let (mut ipc, ordinal) = ipc_open_session(&mux_socket_path_in(&dir, "m2big"), b"box:big");
+        let mut assembly = sync::FragmentAssembly::new();
+        let mut fragmenter = sync::Fragmenter::new();
+        ipc.write_all(&encode_mux_frame(MuxTag::SessionMsg, b"poke")).unwrap();
+        let (chan, _) = recv_wire_until(&mut server, &mut assembly, |c, m| {
+            c.ordinal() == ordinal && m.first() == Some(&SESSION_WIRE_OPEN)
+        });
+        let big: Vec<u8> = (0..3 * sync::FRAGMENT_CONTENTS_MAX)
+            .map(|i| (i % 251) as u8)
+            .collect();
+        send_wire(&mut server, &mut fragmenter, chan, SESSION_WIRE_DATA, &big);
+        loop {
+            let f = read_client_frame(&mut ipc);
+            if f.tag == MuxTag::SessionFrame {
+                let (_srtt, body) = decode_session_frame(&f.payload).unwrap();
+                assert_eq!(body, big, "the multi-fragment frame must arrive intact");
+                break;
+            }
+        }
+        drop(ipc);
+        daemon.join().unwrap();
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
     #[test]
     fn two_ipc_conns_get_disjoint_channels_and_isolated_frames() {
         let dir = temp_base();

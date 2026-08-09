@@ -1207,7 +1207,7 @@ debug-posh-remote-tail host file lines="40":
 #
 # start an instrumented mux-session attach in a detached tmux pane
 [group("debug")]
-debug-posh-mux-repro-start host="sasha@flic.ts.starbrandshoes.com" session="muxrepro":
+debug-posh-mux-repro-start host="sasha@flic.ts.starbrandshoes.com" session="muxrepro" posh_bin="" server_cmd="":
     #!/usr/bin/env bash
     set -euo pipefail
     dir="{{ justfile_directory() }}/.tmp/muxrepro"
@@ -1219,11 +1219,17 @@ debug-posh-mux-repro-start host="sasha@flic.ts.starbrandshoes.com" session="muxr
     chmod 700 "$poshdir"
     tmux kill-session -t posh-muxrepro 2>/dev/null || true
     rm -f /tmp/posh-muxrepro.log
-    echo "== local posh: $(~/.nix-profile/bin/posh version 2>&1)"
+    # Default: the deployed binaries on both ends. Pass posh_bin (a local
+    # client binary) + server_cmd (a remote posh-server path, e.g. from
+    # debug-posh-copy-server) to drive a locally-built fix end-to-end.
+    bin="{{ posh_bin }}"; [ -n "$bin" ] || bin="$HOME/.nix-profile/bin/posh"
+    echo "== local posh: $("$bin" version 2>&1)"
     echo "== remote posh: $(ssh {{ host }} posh version 2>&1)"
+    echo "== POSH_SERVER_CMD: '{{ server_cmd }}' (empty = remote PATH)"
     tmux new-session -d -s posh-muxrepro -x 120 -y 32 \
       "env POSH_MUX=1 POSH_MUX_SESSIONS=1 POSH_DEBUG_LOG=/tmp/posh-muxrepro.log POSH_DIR=$poshdir \
-        ~/.nix-profile/bin/posh '{{ host }}:{{ session }}' 2>$dir/client-stderr.log; \
+        POSH_SERVER_CMD='{{ server_cmd }}' \
+        $bin '{{ host }}:{{ session }}' 2>$dir/client-stderr.log; \
         echo \"posh exited: \$?\"; sleep 3600"
     echo "started tmux session posh-muxrepro -> {{ host }}:{{ session }}"
 
@@ -1299,14 +1305,45 @@ debug-posh-remote-ps host="posh-remote":
     exit 0
     EOF
 
-# tear down the mux-repro tmux session and its isolated POSH_DIR
+# Tear down the mux-repro: the tmux session, the LOCAL repro mux daemon (its
+# argv mirrors the client's, so after the tmux kill any surviving match is the
+# daemon), and the isolated POSH_DIR. With host given, also kill the repro
+# sessions and the repro-spawned agent peer on the remote — required between
+# runs that must NOT reuse the previous run's daemons (e.g. verifying a fixed
+# binary: a live mux daemon short-circuits the ssh bootstrap, so
+# POSH_SERVER_CMD never engages and the old remote stack keeps serving).
 [group("debug")]
-debug-posh-mux-repro-stop:
+debug-posh-mux-repro-stop host="":
     #!/usr/bin/env bash
     set -uo pipefail
     tmux kill-session -t posh-muxrepro 2>/dev/null || true
-    rm -rf "{{ justfile_directory() }}/.tmp/muxrepro"
+    sleep 1
+    pkill -f 'posh sasha@.*:(muxrepro|muxfix)' 2>/dev/null || true
+    rm -rf "{{ justfile_directory() }}/.tmp/muxrepro" "${XDG_RUNTIME_DIR:-/tmp}/posh-muxrepro"
+    if [ -n "{{ host }}" ]; then
+      ssh {{ host }} bash -s <<'EOF'
+    for s in muxrepro muxrepro2 muxfix muxfix2; do posh kill "$s" 2>/dev/null; done
+    pkill -f 'posh-server new --channels agent --client-id' 2>/dev/null
+    exit 0
+    EOF
+    fi
     echo "stopped"
+
+# Probe whether ~1400-byte datagrams actually traverse the path to a peer
+# (posh fragments to ~1400B; tailscale's MTU is 1280, so oversized datagrams
+# depend on IP-layer fragmentation the path may not deliver). Sends ICMP at
+# a fits-in-MTU size and at posh's datagram size, fragmentation permitted.
+#
+# probe the path MTU behavior toward a peer address
+[group("debug")]
+debug-posh-mtu-probe peer:
+    #!/usr/bin/env bash
+    set -uo pipefail
+    for size in 1152 1252 1372 1400; do
+      echo "== icmp payload $size (packet ~$((size + 48)) for v6) =="
+      ping -c 3 -W 2 -s "$size" "{{ peer }}" 2>&1 | tail -2
+    done
+    exit 0
 
 # Build .#posh and copy its closure to a remote host, so the remote has the same
 # instrumented posh-server the local client will exec via POSH_SERVER_CMD. Run
