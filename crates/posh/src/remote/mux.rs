@@ -1966,6 +1966,11 @@ fn hello_handshake(
 /// milliseconds over the unix socket; anything slower is effectively dead.
 const LS_STATUS_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(2);
 
+/// What [`mux_ls`] returns when no endpoint sockets exist — exported so the
+/// unified `posh list` view (#158) can suppress its mux section without
+/// string-matching a copy of this text.
+pub const MUX_LS_EMPTY: &str = "no mux endpoints\n";
+
 /// The #156 soak instrument: one status line per endpoint socket under the
 /// mux dir. See [`mux_ls_in`].
 pub fn mux_ls() -> Result<String> {
@@ -1988,7 +1993,7 @@ fn mux_ls_in(dir: &Path) -> Result<String> {
         .collect();
     keys.sort();
     if keys.is_empty() {
-        return Ok("no mux endpoints\n".to_string());
+        return Ok(MUX_LS_EMPTY.to_string());
     }
     let mut out = String::new();
     for key in keys {

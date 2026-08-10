@@ -124,14 +124,21 @@ Local persistence over Unix sockets.
 	parsing so _command_ is taken literally (it may itself contain
 	*--detach*). Detach key: *Ctrl-\\*.
 
-*list* [*--short*] [*-j*|*--json*] (aliases: *ls*, *l*)
+*list* [*--short*] [*-j*|*--json*] [*-w*|*--watch* [*--interval* _N_]] (aliases: *ls*, *l*)
 	List sessions in the group: name, pid, attached client count.
 	When stdout is a terminal the default output is a styled table
 	with a state-colored status dot (attached, detached, or stale)
-	and the working directory and command of each session; when
-	piped it is plain tab-separated lines, unchanged for scripts.
-	*--short* prints names only; *--json* prints a machine-readable
-	array. *posh list* _host_*:* lists sessions on a remote host
+	and the working directory and command of each session, followed
+	by any live per-destination mux endpoints (the *mux ls* lines) —
+	the unified "what is posh doing on this machine" view; when
+	piped it is plain tab-separated lines, unchanged for scripts,
+	with no mux section. *--short* prints names only; *--json*
+	prints a machine-readable array (both stay session-only —
+	scripts and the completion probe parse them). *--watch*
+	re-renders the unified view every _N_ seconds (*--interval*,
+	default 2) in the alternate screen: *q* (or Ctrl-C) quits, *r*
+	refreshes immediately; a resize is picked up on the next
+	render. *posh list* _host_*:* lists sessions on a remote host
 	(over a *BatchMode* ssh), printing each name host-prefixed so it
 	pastes back as a target. *posh -g* _group_ *list* _host_*:*
 	scopes the remote listing to _group_ (the probe runs *posh -g*

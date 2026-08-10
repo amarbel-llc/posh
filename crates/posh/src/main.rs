@@ -128,14 +128,21 @@ fn run() -> Result<()> {
                     }
                 }
             }
-            let format = if args.iter().any(|a| a == "--json" || a == "-j") {
-                ListFormat::Json
-            } else if args.iter().any(|a| a == "--short") {
-                ListFormat::Short
-            } else {
-                ListFormat::Default
-            };
-            session::cmd_list(&Config::new(&group)?, format)
+            let (format, watch, interval) = parse_list_args(args)?;
+            if watch {
+                return cmd_list_watch(&group, interval);
+            }
+            session::cmd_list(&Config::new(&group)?, format)?;
+            // The #158 unified view: mux endpoints under the session table,
+            // interactive default only — the machine formats (--short is
+            // the completion source, --json the stable shape) and piped
+            // default stay session-only for their existing parsers.
+            if format == ListFormat::Default && util::is_tty(libc::STDOUT_FILENO) {
+                if let Some(section) = mux_section() {
+                    print!("{section}");
+                }
+            }
+            Ok(())
         }
         "attach" | "a" => cmd_attach(&group, args),
         "kill" | "k" => {
@@ -856,6 +863,111 @@ fn cmd_ssh(args: &[String], forward: Option<&remote::agent::ForwardFlag>) -> Res
     remote::sshwrap::run(target, &tail, &opts)
 }
 
+/// `posh list`'s flag shape: format, watch mode, and the watch interval.
+/// Pure so the combinations are unit-tested: `--watch` renders the
+/// interactive table only (a machine format alongside it is an error),
+/// `--interval N` needs `--watch` and clamps to >= 1 s.
+fn parse_list_args(args: &[String]) -> Result<(ListFormat, bool, u64)> {
+    let format = if args.iter().any(|a| a == "--json" || a == "-j") {
+        ListFormat::Json
+    } else if args.iter().any(|a| a == "--short") {
+        ListFormat::Short
+    } else {
+        ListFormat::Default
+    };
+    let watch = args.iter().any(|a| a == "--watch" || a == "-w");
+    if watch && format != ListFormat::Default {
+        return Err(Error::from(
+            "--watch renders the interactive table (drop --json/--short)",
+        ));
+    }
+    let mut interval: u64 = 2;
+    if let Some(pos) = args.iter().position(|a| a == "--interval") {
+        if !watch {
+            return Err(Error::from("--interval needs --watch"));
+        }
+        interval = args
+            .get(pos + 1)
+            .and_then(|v| v.parse::<u64>().ok())
+            .ok_or_else(|| Error::from("usage: posh list --watch --interval <seconds>"))?
+            .max(1);
+    }
+    Ok((format, watch, interval))
+}
+
+/// The #158 mux half of the unified listing: the `posh mux ls` lines,
+/// prefixed with a separating blank line — `None` when there is nothing to
+/// show. An unreadable mux dir degrades to a note rather than failing the
+/// session listing.
+fn mux_section() -> Option<String> {
+    match remote::mux::mux_ls() {
+        Ok(s) if s == remote::mux::MUX_LS_EMPTY => None,
+        Ok(s) => Some(format!("\n{s}")),
+        Err(e) => Some(format!("\nmux endpoints unavailable: {e}\n")),
+    }
+}
+
+/// `posh list --watch [--interval N]` (#125/#158): the unified listing —
+/// session table + mux endpoints — re-rendered on an interval in the
+/// alternate screen (the FDR 0002 terminfo-aware smcup/rmcup pair). `q` or
+/// Ctrl-C quits, `r` refreshes immediately; a resize is picked up on the
+/// next render (the table reads the width each pass). Cbreak, not raw:
+/// per-key input while the renderers' plain `\n` output stays intact.
+fn cmd_list_watch(group: &str, interval_secs: u64) -> Result<()> {
+    if !util::is_tty(libc::STDOUT_FILENO) || !util::is_tty(libc::STDIN_FILENO) {
+        return Err(Error::from("--watch needs a terminal"));
+    }
+    let cfg = Config::new(group)?;
+    let cbreak = pty::CbreakMode::enable(libc::STDIN_FILENO)?;
+    let _ = util::write_all_retry(libc::STDOUT_FILENO, &remote::display::open(), 1000);
+    let result = list_watch_loop(&cfg, interval_secs);
+    let _ = util::write_all_retry(libc::STDOUT_FILENO, &remote::display::close(), 1000);
+    drop(cbreak);
+    result
+}
+
+fn list_watch_loop(cfg: &Config, interval_secs: u64) -> Result<()> {
+    use std::io::{Read as _, Write as _};
+    loop {
+        // Clear + home; the one-shot renderers then print into the alt
+        // screen exactly as they would to a fresh terminal.
+        print!("\x1b[2J\x1b[H");
+        session::cmd_list(cfg, ListFormat::Default)?;
+        if let Some(section) = mux_section() {
+            print!("{section}");
+        }
+        print!("\n[watch: q quit, r refresh, every {interval_secs}s]");
+        std::io::stdout().flush().ok();
+
+        let deadline = util::now_ms() + interval_secs * 1000;
+        'tick: loop {
+            let now = util::now_ms();
+            if now >= deadline {
+                break 'tick;
+            }
+            let mut fds = [util::pollfd(libc::STDIN_FILENO, libc::POLLIN)];
+            match util::poll(&mut fds, (deadline - now).min(1000) as i32) {
+                Ok(_) => {}
+                Err(e) if e.kind() == std::io::ErrorKind::Interrupted => continue,
+                Err(e) => return Err(e.into()),
+            }
+            if fds[0].revents & libc::POLLIN != 0 {
+                let mut b = [0u8; 64];
+                let n = std::io::stdin().lock().read(&mut b).unwrap_or(0);
+                for &c in &b[..n] {
+                    match c {
+                        // q, or Ctrl-C arriving as a byte (ISIG is off so
+                        // the alt-screen teardown stays ours).
+                        b'q' | b'Q' | 3 => return Ok(()),
+                        b'r' | b'R' => break 'tick,
+                        _ => {}
+                    }
+                }
+            }
+        }
+    }
+}
+
 /// `posh mux <verb>` — the per-destination mux endpoint surface (FDR 0014 /
 /// RFC 0011 §6). `ls` is the #156 soak instrument: one status line per
 /// endpoint under the mux dir, stale sockets flagged.
@@ -942,11 +1054,15 @@ SESSION COMMANDS (local persistence)
         command is taken literally (it may contain --detach). Detach key:
         Ctrl-\\.
 
-    list [--short] [-j|--json]                 (aliases: ls, l)
+    list [--short] [-j|--json] [-w|--watch [--interval N]]  (aliases: ls, l)
         List sessions in the group: name, pid, attached client count.
         A styled status table on a terminal; plain tab-separated lines
-        when piped. --short prints names only; --json prints a
-        machine-readable array.
+        when piped. On a terminal, live mux endpoints (see: mux ls)
+        render beneath the table — the unified \"what is posh doing\"
+        view. --short prints names only; --json prints a
+        machine-readable array (both stay session-only for scripts).
+        --watch re-renders the unified view every N seconds (default 2)
+        in the alternate screen: q quits, r refreshes immediately.
 
     run <name> [--] <command...>               (alias: r)
         Send a command to a session (created if needed) without attaching.
@@ -1375,6 +1491,39 @@ mod tests {
         assert!(!resolve_real_ssh_agent_forward(Some(false)));
         // Explicit -A is a no-op spelling of the default.
         assert!(resolve_real_ssh_agent_forward(Some(true)));
+    }
+
+    #[test]
+    fn parse_list_args_shapes() {
+        let a = |s: &[&str]| s.iter().map(|x| x.to_string()).collect::<Vec<_>>();
+        assert!(matches!(
+            parse_list_args(&a(&[])).unwrap(),
+            (ListFormat::Default, false, 2)
+        ));
+        assert!(matches!(
+            parse_list_args(&a(&["--json"])).unwrap(),
+            (ListFormat::Json, false, _)
+        ));
+        assert!(matches!(
+            parse_list_args(&a(&["--watch"])).unwrap(),
+            (ListFormat::Default, true, 2)
+        ));
+        assert!(matches!(
+            parse_list_args(&a(&["-w", "--interval", "7"])).unwrap(),
+            (_, true, 7)
+        ));
+        // A zero interval would busy-loop; clamp to 1 s.
+        assert!(matches!(
+            parse_list_args(&a(&["--watch", "--interval", "0"])).unwrap(),
+            (_, true, 1)
+        ));
+        // Watch renders the interactive table only; machine formats and a
+        // bare/garbled --interval are rejected, not silently ignored.
+        assert!(parse_list_args(&a(&["--watch", "--json"])).is_err());
+        assert!(parse_list_args(&a(&["--watch", "--short"])).is_err());
+        assert!(parse_list_args(&a(&["--interval", "5"])).is_err());
+        assert!(parse_list_args(&a(&["--watch", "--interval"])).is_err());
+        assert!(parse_list_args(&a(&["--watch", "--interval", "x"])).is_err());
     }
 
     #[test]

@@ -501,6 +501,8 @@ complete -c posh -n "__fish_seen_subcommand_from server" -a 'new relay agent' -d
 complete -c posh -n "__fish_seen_subcommand_from mux" -a ls -d 'List endpoint status lines'
 complete -c posh -n "__fish_seen_subcommand_from list" -l short -d 'Short output'
 complete -c posh -n "__fish_seen_subcommand_from list" -l json -s j -d 'JSON output'
+complete -c posh -n "__fish_seen_subcommand_from list" -l watch -s w -d 'Live-refresh the unified view'
+complete -c posh -n "__fish_seen_subcommand_from list" -l interval -d 'Watch refresh seconds' -r
 complete -c posh -n "__fish_seen_subcommand_from history" -l vt -d 'VT escape stream output'
 complete -c posh -n "__fish_seen_subcommand_from ssh" -a '(__posh_ssh_config_hosts)' -d 'Host'
 complete -c posh -n "__fish_seen_subcommand_from ssh" -a '(posh tailnet 2>/dev/null)' -d 'Tailnet peer'

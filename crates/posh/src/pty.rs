@@ -314,6 +314,47 @@ impl RawMode {
     }
 }
 
+/// RAII cbreak guard, the lighter sibling of [`RawMode`] for full-screen but
+/// line-rendered UIs (`posh list --watch`): per-key input (ICANON+ECHO off)
+/// with output post-processing INTACT, so the one-shot renderers' plain
+/// `\n` still returns the carriage. ISIG is cleared too — Ctrl-C arrives as
+/// byte 3 for the caller to handle, so teardown (alt-screen restore) stays
+/// in the caller's hands instead of a default SIGINT kill stranding it.
+pub struct CbreakMode {
+    fd: RawFd,
+    orig: libc::termios,
+}
+
+impl CbreakMode {
+    pub fn enable(fd: RawFd) -> Result<CbreakMode> {
+        // SAFETY: tcgetattr writes through a valid &mut termios before it
+        // is read; tcsetattr reads from a valid reference.
+        unsafe {
+            let mut orig: libc::termios = std::mem::zeroed();
+            if libc::tcgetattr(fd, &mut orig) != 0 {
+                return Err(Error::Msg("not a terminal".to_string()));
+            }
+            let mut cb = orig;
+            cb.c_lflag &= !(libc::ICANON | libc::ECHO | libc::ISIG);
+            cb.c_cc[libc::VMIN] = 0;
+            cb.c_cc[libc::VTIME] = 0;
+            if libc::tcsetattr(fd, libc::TCSANOW, &cb) != 0 {
+                return Err(std::io::Error::last_os_error().into());
+            }
+            Ok(CbreakMode { fd, orig })
+        }
+    }
+}
+
+impl Drop for CbreakMode {
+    fn drop(&mut self) {
+        // SAFETY: tcsetattr reads from a valid &termios.
+        unsafe {
+            libc::tcsetattr(self.fd, libc::TCSAFLUSH, &self.orig);
+        }
+    }
+}
+
 impl Drop for RawMode {
     fn drop(&mut self) {
         // SAFETY: tcsetattr reads from a valid &termios.
@@ -328,6 +369,43 @@ mod tests {
     use super::*;
     use std::io::Read;
     use std::os::fd::FromRawFd;
+
+    /// CbreakMode: per-key input (ICANON/ECHO/ISIG cleared) with output
+    /// post-processing INTACT (OPOST stays, unlike cfmakeraw) so the watch
+    /// view's plain `\n` renders; drop restores the original termios.
+    #[test]
+    fn cbreak_clears_input_flags_keeps_opost_and_restores() {
+        // SAFETY: openpty fills m/s with valid fds; tcgetattr writes a valid
+        // &mut termios. The fds intentionally leak for the test.
+        unsafe {
+            let (mut m, mut s) = (0, 0);
+            assert_eq!(
+                libc::openpty(
+                    &mut m,
+                    &mut s,
+                    std::ptr::null_mut(),
+                    std::ptr::null_mut(),
+                    std::ptr::null_mut(),
+                ),
+                0,
+                "openpty"
+            );
+            let _ = m;
+            let guard = CbreakMode::enable(s).unwrap();
+            let mut t: libc::termios = std::mem::zeroed();
+            assert_eq!(libc::tcgetattr(s, &mut t), 0);
+            assert_eq!(
+                t.c_lflag & (libc::ICANON | libc::ECHO | libc::ISIG),
+                0,
+                "per-key input, no echo, Ctrl-C as a byte"
+            );
+            assert_ne!(t.c_oflag & libc::OPOST, 0, "output processing intact");
+            drop(guard);
+            let mut r: libc::termios = std::mem::zeroed();
+            assert_eq!(libc::tcgetattr(s, &mut r), 0);
+            assert_ne!(r.c_lflag & libc::ICANON, 0, "drop restores the termios");
+        }
+    }
 
     /// `spawn_shell(cwd=...)` lands the child in that directory: run `pwd -P`
     /// (physical, getcwd-based, so it reflects the chdir rather than an inherited
