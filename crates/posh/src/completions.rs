@@ -77,7 +77,7 @@ _posh_completions() {
   cur="${COMP_WORDS[COMP_CWORD]}"
   prev="${COMP_WORDS[COMP_CWORD-1]}"
 
-  local commands="attach run detach detach-all fork groups tailnet list completions kill history server client ssh version help"
+  local commands="attach run detach detach-all fork groups tailnet list completions kill history server client ssh mux version help"
 
   # Handle -g/--group flag
   if [[ "$prev" == "-g" || "$prev" == "--group" ]]; then
@@ -162,6 +162,9 @@ _posh_completions() {
       # single-model relay), agent (FDR 0014 agent-only mux remote).
       COMPREPLY=($(compgen -W "new relay agent" -- "$cur"))
       ;;
+    mux)
+      COMPREPLY=($(compgen -W "ls" -- "$cur"))
+      ;;
     ssh)
       COMPREPLY=($(compgen -W "$(_posh_ssh_hosts | tr '\n' ' ') $(posh tailnet 2>/dev/null | tr '\n' ' ')" -- "$cur"))
       ;;
@@ -211,6 +214,7 @@ const ZSH_COMPLETIONS: &str = r#"_posh() {
         'completions:Shell completion scripts'
         'kill:Kill a session'
         'history:Output session scrollback'
+        'mux:Per-destination mux endpoint status'
         'server:Start a roaming remote server'
         'client:Connect to a posh server over UDP'
         'ssh:Start and connect to a remote server over ssh'
@@ -241,6 +245,9 @@ const ZSH_COMPLETIONS: &str = r#"_posh() {
           # Server verbs: new (default), relay (RFC 0008), agent (FDR 0014
           # agent-only mux remote).
           _values 'server verb' 'new' 'relay' 'agent'
+          ;;
+        mux)
+          _values 'mux verb' 'ls'
           ;;
         ssh)
           _posh_ssh_hosts
@@ -446,7 +453,7 @@ end
 
 complete -c posh -f
 
-set -l subcommands attach run detach detach-all fork groups tailnet list completions kill history server client ssh version help
+set -l subcommands attach run detach detach-all fork groups tailnet list completions kill history server client ssh mux version help
 set -l no_subcmd "not __fish_seen_subcommand_from $subcommands"
 
 complete -c posh -n $no_subcmd -s g -l group -d 'Session group' -r -a '(posh groups 2>/dev/null)'
@@ -462,6 +469,7 @@ complete -c posh -n $no_subcmd -a list -d 'List active sessions in group'
 complete -c posh -n $no_subcmd -a completions -d 'Shell completion scripts'
 complete -c posh -n $no_subcmd -a kill -d 'Kill a session'
 complete -c posh -n $no_subcmd -a history -d 'Output session scrollback'
+complete -c posh -n $no_subcmd -a mux -d 'Per-destination mux endpoint status'
 complete -c posh -n $no_subcmd -a server -d 'Start a roaming remote server'
 complete -c posh -n $no_subcmd -a client -d 'Connect to a posh server over UDP'
 complete -c posh -n $no_subcmd -a ssh -d 'Start and connect to a remote server over ssh'
@@ -490,6 +498,7 @@ complete -c posh -n "__fish_seen_subcommand_from completions" -a 'bash zsh fish'
 # single-model relay), agent (FDR 0014 agent-only mux remote).
 complete -c posh -n "__fish_seen_subcommand_from server" -a 'new relay agent' -d 'Server verb'
 
+complete -c posh -n "__fish_seen_subcommand_from mux" -a ls -d 'List endpoint status lines'
 complete -c posh -n "__fish_seen_subcommand_from list" -l short -d 'Short output'
 complete -c posh -n "__fish_seen_subcommand_from list" -l json -s j -d 'JSON output'
 complete -c posh -n "__fish_seen_subcommand_from history" -l vt -d 'VT escape stream output'
@@ -513,6 +522,7 @@ mod tests {
         "completions",
         "kill",
         "history",
+        "mux",
         "server",
         "client",
         "ssh",

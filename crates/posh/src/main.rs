@@ -180,6 +180,7 @@ fn run() -> Result<()> {
         }
         "server" => cmd_server(args),
         "client" => cmd_client(args),
+        "mux" => cmd_mux(args),
         "ssh" => cmd_ssh(args, None),
         // `posh rec ...` == the standalone `poshterity` binary: deterministic
         // recording replay (poshterity owns the logic; this is just an alias).
@@ -532,20 +533,12 @@ fn cmd_ssh_session(
                         // — fall through to the per-invocation path, like
                         // every other establishment failure.
                         Err(e) if e.to_string().contains("before establishing") => {
-                            eprintln!(
-                                "posh: mux session unavailable ({e}); falling back \
-                                 to a per-invocation connection"
-                            );
+                            warn_mux_fallback(&e);
                         }
                         Err(e) => return Err(e),
                     }
                 }
-                Err(e) => {
-                    eprintln!(
-                        "posh: mux session unavailable ({e}); falling back to a \
-                         per-invocation connection"
-                    );
-                }
+                Err(e) => warn_mux_fallback(&e),
             }
         }
     }
@@ -863,6 +856,30 @@ fn cmd_ssh(args: &[String], forward: Option<&remote::agent::ForwardFlag>) -> Res
     remote::sshwrap::run(target, &tail, &opts)
 }
 
+/// `posh mux <verb>` — the per-destination mux endpoint surface (FDR 0014 /
+/// RFC 0011 §6). `ls` is the #156 soak instrument: one status line per
+/// endpoint under the mux dir, stale sockets flagged.
+fn cmd_mux(args: &[String]) -> Result<()> {
+    match args.first().map(String::as_str) {
+        Some("ls" | "list" | "l") => {
+            print!("{}", remote::mux::mux_ls()?);
+            Ok(())
+        }
+        _ => Err(Error::from("usage: posh mux ls")),
+    }
+}
+
+/// The M2 fallback warning, durable for the soak (#156): greppable in the
+/// debug log when a sink is armed (`grep mux-fallback`), alongside the
+/// stderr line the user sees at attach time.
+fn warn_mux_fallback(e: &Error) {
+    let msg = format!(
+        "mux session unavailable ({e}); falling back to a per-invocation connection"
+    );
+    util::log_write("mux-fallback", &msg);
+    eprintln!("posh: {msg}");
+}
+
 /// Resolves the local agent socket to forward (FDR 0004) from the CLI flag plus
 /// $POSH_FORWARD_AGENT / $SSH_AUTH_SOCK, printing the explicit-`-A`-no-agent
 /// warning to stderr. Shared by the `host:session` and bare-`host` roaming
@@ -965,6 +982,13 @@ SESSION COMMANDS (local persistence)
 
     completions <shell>                        (alias: c)
         Print the completion script for bash, zsh, or fish.
+
+    mux ls
+        One status line per live per-destination mux endpoint (state, peer,
+        last-heard age, channels, refs, linger, congestion) — the
+        $POSH_MUX_SESSIONS soak health check. Sockets whose daemon died
+        without unlinking are flagged stale; a pre-upgrade daemon still
+        serving is labeled old-generation.
 
 REMOTE COMMANDS (roaming over encrypted UDP)
     server [new] [-p PORT[:PORT2]] [-4|-6] [-- command...]
@@ -1382,6 +1406,7 @@ mod tests {
             "server",
             "client",
             "ssh",
+            "mux ls",
         ] {
             assert!(HELP.contains(needle), "help missing {needle}");
         }

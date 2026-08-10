@@ -173,6 +173,21 @@ Local persistence over Unix sockets.
 	(session names for *attach* and the bare target position,
 	remote _host_*:* sessions, ssh hosts) without manual sourcing.
 
+*mux* *ls*
+	One status line per live per-destination mux endpoint: state,
+	peer address, last-heard age, channel count, session refs,
+	linger state, and the congestion summary (cwnd, cuts, deepest
+	backoff streak). The daily health check for a
+	_$POSH_MUX_SESSIONS_ soak. Probing rides the observer path — no
+	session ref is taken and the endpoint's linger clock is
+	untouched. A socket whose daemon died without unlinking is
+	flagged _stale_; a pre-upgrade daemon still serving its old
+	protocol generation is labeled _old-generation_. The complement
+	is the fallback breadcrumb: every "falling back to a
+	per-invocation connection" warning is also written to the debug
+	log (tag _mux-fallback_) when a sink is armed, so a soak's
+	fallback count is one grep.
+
 # REMOTE COMMANDS
 
 Roaming over encrypted UDP. See *posh-server*(1) and *posh-client*(1)

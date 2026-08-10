@@ -1962,6 +1962,62 @@ fn hello_handshake(
     Ok((buf, ack))
 }
 
+/// The `posh mux ls` probe bound: a live daemon answers hello + Status in
+/// milliseconds over the unix socket; anything slower is effectively dead.
+const LS_STATUS_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(2);
+
+/// The #156 soak instrument: one status line per endpoint socket under the
+/// mux dir. See [`mux_ls_in`].
+pub fn mux_ls() -> Result<String> {
+    mux_ls_in(&mux_dir()?)
+}
+
+/// Enumerates `<dir>/*.sock` (sorted; non-`.sock` entries — pidfiles, logs
+/// — are skipped) and probes each: a live daemon answers hello + `Status`
+/// on the OBSERVER path (no ref taken, the linger clock untouched) and its
+/// own one-liner is printed verbatim; a §6 stamp mismatch is labeled an
+/// old-generation daemon rather than probed further; a socket nothing
+/// answers on is flagged stale (a daemon that died without unlinking).
+fn mux_ls_in(dir: &Path) -> Result<String> {
+    let mut keys: Vec<String> = std::fs::read_dir(dir)
+        .map_err(|e| util::Error::Msg(format!("mux dir {}: {e}", dir.display())))?
+        .filter_map(|ent| {
+            let name = ent.ok()?.file_name().into_string().ok()?;
+            name.strip_suffix(".sock").map(str::to_string)
+        })
+        .collect();
+    keys.sort();
+    if keys.is_empty() {
+        return Ok("no mux endpoints\n".to_string());
+    }
+    let mut out = String::new();
+    for key in keys {
+        match probe_endpoint(&mux_socket_path_in(dir, &key)) {
+            Ok(line) => out.push_str(&line),
+            Err(e) => out.push_str(&format!("mux {key}: stale ({e})")),
+        }
+        out.push('\n');
+    }
+    Ok(out)
+}
+
+/// Hello + `Status` against one endpoint socket, bounded by
+/// [`LS_STATUS_TIMEOUT`]; returns the daemon's own status one-liner.
+fn probe_endpoint(path: &Path) -> Result<String> {
+    use std::io::Write;
+    let mut s = UnixStream::connect(path)?;
+    let (mut buf, ack) = hello_handshake(&mut s, LS_STATUS_TIMEOUT)?;
+    if ack.stamp != MUX_PROTO_STAMP {
+        return Ok(format!(
+            "mux {}: old-generation daemon (stamp {}, ours {})",
+            ack.key, ack.stamp, MUX_PROTO_STAMP
+        ));
+    }
+    s.write_all(&encode_mux_frame(MuxTag::Status, b""))?;
+    let frame = await_frame(&mut s, &mut buf, LS_STATUS_TIMEOUT, MuxTag::StatusReply)?;
+    Ok(String::from_utf8_lossy(&frame.payload).into_owned())
+}
+
 /// The invocation-seam gate (M1 Task 4.3): decides who owns agent
 /// forwarding for a remote invocation. Off, or with forwarding already
 /// resolved off, it is a pass-through — the construction sites see exactly
@@ -2733,6 +2789,28 @@ mod tests {
         // Multi-byte UTF-8: every byte outside the safe set maps to '-'.
         assert_eq!(sanitize_id("ü"), "--");
         assert_eq!(sanitize_id(""), "");
+    }
+
+    #[test]
+    fn mux_ls_reports_live_stale_and_empty() {
+        let dir = temp_base();
+        assert_eq!(mux_ls_in(&dir).unwrap(), "no mux endpoints\n");
+        // One live in-process daemon, one dead socket (bound then dropped —
+        // connect refused), one non-.sock sibling that must be skipped.
+        let (daemon, _server) = start_inprocess_daemon(&dir, "lslive", 2_500, (63660, 63669));
+        drop(UnixListener::bind(mux_socket_path_in(&dir, "lsdead")).unwrap());
+        std::fs::write(dir.join("lslive.pid"), b"1").unwrap();
+        let out = mux_ls_in(&dir).unwrap();
+        let lines: Vec<&str> = out.lines().collect();
+        assert_eq!(lines.len(), 2, "one line per socket, sorted: {out}");
+        assert!(lines[0].starts_with("mux lsdead: stale ("), "{out}");
+        assert!(lines[1].starts_with("mux lslive: state="), "{out}");
+        assert!(
+            lines[1].contains("refs=0") && lines[1].contains("cwnd="),
+            "the live line is the daemon's own status one-liner: {out}"
+        );
+        daemon.join().unwrap(); // observer probes never reset the linger
+        std::fs::remove_dir_all(&dir).ok();
     }
 
     #[test]
