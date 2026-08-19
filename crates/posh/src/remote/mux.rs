@@ -2118,6 +2118,75 @@ fn mux_ls_in(dir: &Path) -> Result<String> {
     Ok(out)
 }
 
+/// RFC 0013 §4 tuning lever: per-endpoint bound on a status-socket read. A
+/// live peer answers over a unix socket in microseconds; 200 ms flags a
+/// wedged one as stale without stalling the listing. Revisit against real
+/// contention (the design doc's change signal).
+const ENDPOINT_STATUS_TIMEOUT: std::time::Duration = std::time::Duration::from_millis(200);
+
+/// What [`endpoint_status_ls`] returns when no status sockets exist —
+/// exported like [`MUX_LS_EMPTY`] so the unified `posh list` view can
+/// suppress its remote-endpoints section without string-matching a copy.
+pub const ENDPOINT_LS_EMPTY: &str = "no remote endpoints\n";
+
+/// RFC 0013 §4 — the SERVER-host counterpart of [`mux_ls`]: one line per
+/// mux-peer status socket under this host's `agent/` dir (the endpoints
+/// serving OTHER client hosts' agents into this machine), each read
+/// connect → EOF. Answers "is the endpoint from host X alive, and how
+/// stale" locally, without touching the wire.
+pub fn endpoint_status_ls() -> Result<String> {
+    let env = |k: &str| std::env::var(k).ok();
+    let base = crate::session::resolve_socket_base(
+        env("POSH_DIR").as_deref(),
+        env("XDG_RUNTIME_DIR").as_deref(),
+        env("TMPDIR").as_deref(),
+        util::uid(),
+    );
+    endpoint_status_ls_in(&base.join("agent"))
+}
+
+/// The enumeration behind [`endpoint_status_ls`], pure-path so tests drive
+/// it against a temp dir. A missing dir is "no endpoints", not an error.
+fn endpoint_status_ls_in(dir: &Path) -> Result<String> {
+    let Ok(rd) = std::fs::read_dir(dir) else {
+        return Ok(ENDPOINT_LS_EMPTY.to_string());
+    };
+    let mut names: Vec<String> = rd
+        .filter_map(|ent| {
+            let name = ent.ok()?.file_name().into_string().ok()?;
+            name.strip_suffix(".status.sock").map(str::to_string)
+        })
+        .collect();
+    names.sort();
+    if names.is_empty() {
+        return Ok(ENDPOINT_LS_EMPTY.to_string());
+    }
+    let mut out = String::new();
+    for name in names {
+        match read_endpoint_status(&dir.join(format!("{name}.status.sock"))) {
+            Ok(line) => out.push_str(&format!("endpoint {name}: {}", line.trim_end())),
+            Err(e) => out.push_str(&format!("endpoint {name}: stale ({e})")),
+        }
+        out.push('\n');
+    }
+    Ok(out)
+}
+
+/// connect → read-to-EOF against one status socket, bounded by
+/// [`ENDPOINT_STATUS_TIMEOUT`]. An empty reply is an error (the peer
+/// accepted but said nothing — wedged, not merely slow).
+fn read_endpoint_status(path: &Path) -> Result<String> {
+    use std::io::Read as _;
+    let mut s = UnixStream::connect(path)?;
+    s.set_read_timeout(Some(ENDPOINT_STATUS_TIMEOUT))?;
+    let mut line = String::new();
+    s.read_to_string(&mut line)?;
+    if line.is_empty() {
+        return Err(util::Error::from("empty status reply"));
+    }
+    Ok(line)
+}
+
 /// Hello + `Status` against one endpoint socket, bounded by
 /// [`LS_STATUS_TIMEOUT`]; returns the daemon's own status one-liner.
 fn probe_endpoint(path: &Path) -> Result<String> {
@@ -2907,6 +2976,31 @@ mod tests {
         // Multi-byte UTF-8: every byte outside the safe set maps to '-'.
         assert_eq!(sanitize_id("ü"), "--");
         assert_eq!(sanitize_id(""), "");
+    }
+
+    #[test]
+    fn endpoint_status_ls_reports_live_stale_and_empty() {
+        use std::io::Write as _;
+        let dir = temp_base(); // stands in for the agent/ dir
+        assert_eq!(endpoint_status_ls_in(&dir).unwrap(), ENDPOINT_LS_EMPTY);
+        // Live: answered connect → one line → EOF (the RFC 0013 §4 shape).
+        let live = UnixListener::bind(dir.join("mux-alpha.status.sock")).unwrap();
+        let answer = std::thread::spawn(move || {
+            if let Ok((mut s, _)) = live.accept() {
+                let _ = s.write_all(b"posh 9.9.9 (cafef00) owns_agent_sock=true\n");
+            }
+        });
+        // Stale: bound then dropped — connect refused. And a non-status
+        // sibling (the agent socket itself) must be skipped.
+        drop(UnixListener::bind(dir.join("mux-beta.status.sock")).unwrap());
+        std::fs::write(dir.join("mux-alpha.sock"), b"").unwrap();
+        let out = endpoint_status_ls_in(&dir).unwrap();
+        answer.join().unwrap();
+        let lines: Vec<&str> = out.lines().collect();
+        assert_eq!(lines.len(), 2, "one line per status socket, sorted: {out}");
+        assert!(lines[0].starts_with("endpoint mux-alpha: posh 9.9.9"), "{out}");
+        assert!(lines[1].starts_with("endpoint mux-beta: stale ("), "{out}");
+        std::fs::remove_dir_all(&dir).ok();
     }
 
     #[test]

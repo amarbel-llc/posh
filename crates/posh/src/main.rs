@@ -141,6 +141,9 @@ fn run() -> Result<()> {
                 if let Some(section) = mux_section() {
                     print!("{section}");
                 }
+                if let Some(section) = endpoint_section() {
+                    print!("{section}");
+                }
             }
             Ok(())
         }
@@ -907,6 +910,18 @@ fn mux_section() -> Option<String> {
     }
 }
 
+/// The RFC 0013 §4 half of the unified listing: mux-peer status sockets
+/// under this host's `agent/` dir — the endpoints serving OTHER client
+/// hosts' forwarded agents into this machine. `None` when there are none;
+/// a probe failure degrades to a note like the mux section.
+fn endpoint_section() -> Option<String> {
+    match remote::mux::endpoint_status_ls() {
+        Ok(s) if s == remote::mux::ENDPOINT_LS_EMPTY => None,
+        Ok(s) => Some(format!("\n{s}")),
+        Err(e) => Some(format!("\nremote endpoints unavailable: {e}\n")),
+    }
+}
+
 /// `posh list --watch [--interval N]` (#125/#158): the unified listing —
 /// session table + mux endpoints — re-rendered on an interval in the
 /// alternate screen (the FDR 0002 terminfo-aware smcup/rmcup pair). `q` or
@@ -934,6 +949,9 @@ fn list_watch_loop(cfg: &Config, interval_secs: u64) -> Result<()> {
         print!("\x1b[2J\x1b[H");
         session::cmd_list(cfg, ListFormat::Default)?;
         if let Some(section) = mux_section() {
+            print!("{section}");
+        }
+        if let Some(section) = endpoint_section() {
             print!("{section}");
         }
         print!("\n[watch: q quit, r refresh, every {interval_secs}s]");
