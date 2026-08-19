@@ -14,6 +14,7 @@ use std::os::unix::net::{UnixListener, UnixStream};
 use std::path::{Path, PathBuf};
 
 use crate::remote::agent::{AgentChannelMux, AgentClient};
+use crate::remote::caps;
 use crate::remote::channel;
 use crate::remote::datagram::{Connection, Family};
 use crate::remote::sync::{self, AgentRecord, RecordKind, HEARTBEAT_INTERVAL};
@@ -711,18 +712,25 @@ struct MuxStatusCtx<'a> {
     /// The §9.2 congestion summary (`AgentChannelMux::congestion_summary`):
     /// live cwnd bytes, cumulative MD cuts, deepest backoff streak.
     congestion: (usize, u64, u32),
+    /// RFC 0013 §3: the remote endpoint's identity, once its heartbeat
+    /// answer landed — `mux ls`'s "what build is the far end" column.
+    remote_ident: Option<&'a caps::ServerIdent>,
 }
 
 /// The `MuxStatus` one-liner (FDR 0007 dump surface): peer addr, last-heard
 /// age, channel count, refs, linger state, §9.2 congestion summary.
 fn status_line(ctx: &MuxStatusCtx, state: &MuxState) -> String {
     format!(
-        "mux {key}: state={cs} peer={peer} heard={heard}ms channels={ch} refs={refs} linger={linger} cwnd={cwnd} cuts={cuts} streak_hwm={hwm}",
+        "mux {key}: state={cs} peer={peer} remote={remote} heard={heard}ms channels={ch} refs={refs} linger={linger} cwnd={cwnd} cuts={cuts} streak_hwm={hwm}",
         key = ctx.key,
         cs = ctx.conn_state.label(),
         peer = ctx
             .peer
             .map_or_else(|| "none".to_string(), |a| a.to_string()),
+        remote = ctx.remote_ident.map_or_else(
+            || "unknown".to_string(),
+            |id| format!("{} ({})", id.version, id.git_sha)
+        ),
         heard = ctx.heard_age_ms,
         ch = ctx.channels,
         refs = state.refs(),
@@ -1072,10 +1080,20 @@ pub fn run_daemon(
 /// instructions but counts them as authentic peer activity (they cleared the
 /// AEAD seal), which is exactly what keeps its `last_heard`/election marker
 /// fresh. Zero rows/cols and an empty input stream: there is no session.
-fn heartbeat_message() -> Vec<u8> {
+/// While no remote ident is held, the caps carry the RFC 0013 §3 identity
+/// request (the remote answers with one Empty frame; the request stops the
+/// moment the answer lands, so a steady-state heartbeat is caps-empty).
+fn heartbeat_message(request_ident: bool) -> Vec<u8> {
     sync::ClientMessage {
         flags: 0,
-        caps: Vec::new(),
+        caps: if request_ident {
+            vec![caps::Cap {
+                id: caps::CAP_SERVER_IDENT,
+                payload: vec![],
+            }]
+        } else {
+            Vec::new()
+        },
         acked_frame: 0,
         rows: 0,
         cols: 0,
@@ -1138,6 +1156,10 @@ fn mux_loop(
     // distinguishes "remote died" from a merely idle connection (an idle M1
     // remote legitimately sends nothing, so heard-age alone proves nothing).
     let mut recv_err_logged = false;
+    // RFC 0013 §3: the remote endpoint's identity — requested on every
+    // heartbeat until held, then reported on the status line (`mux ls`'s
+    // remote= column, the "what build is the far end" answer).
+    let mut remote_ident: Option<caps::ServerIdent> = None;
 
     loop {
         if util::take_flag(&util::SIGTERM_RECEIVED) {
@@ -1235,6 +1257,29 @@ fn mux_loop(
                             util::log_write("info", "mux wire recv recovered");
                         }
                         if chan.kind() != channel::KIND_AGENT {
+                            // RFC 0013 §3: the remote answers our heartbeat
+                            // ident request with an Empty frame on the
+                            // reserved channel (which otherwise carries
+                            // nothing daemon-ward).
+                            if chan == channel::SESSION_CHANNEL && remote_ident.is_none() {
+                                if let Ok(f) = sync::ServerFrame::decode(message) {
+                                    if let Some(cap) =
+                                        caps::find(&f.caps, caps::CAP_SERVER_IDENT)
+                                    {
+                                        if let Ok(id) = caps::decode_server_ident(&cap.payload)
+                                        {
+                                            util::log_write(
+                                                "info",
+                                                &format!(
+                                                    "remote endpoint: posh {} ({})",
+                                                    id.version, id.git_sha
+                                                ),
+                                            );
+                                            remote_ident = Some(id);
+                                        }
+                                    }
+                                }
+                            }
                             // M2 session channels (ordinal >= 2, the wire
                             // micro-envelope); ordinal 1 stays the bare
                             // heartbeat stream and is ignored as before.
@@ -1369,6 +1414,7 @@ fn mux_loop(
             channels: proxy.live_channel_count(),
             agent_source,
             congestion: agent_mux.congestion_summary(),
+            remote_ident: remote_ident.as_ref(),
         };
         // The FDR 0007 on-demand dump, mux-daemon shape: the same line
         // `posh mux ls` reports, appended to the daemon's own log. NOTE:
@@ -1589,7 +1635,7 @@ fn mux_loop(
             p.sends < SESSION_CLOSE_RETRANSMITS
         });
         let session_due = last_send.is_none_or(|t| now.saturating_sub(t) >= HEARTBEAT_INTERVAL);
-        let session = session_due.then(heartbeat_message);
+        let session = session_due.then(|| heartbeat_message(remote_ident.is_none()));
         if session.is_some() {
             last_send = Some(now);
         }
@@ -2459,6 +2505,7 @@ mod tests {
             channels: 0,
             agent_source: Path::new(TEST_CTX_SOURCE),
             congestion: (262_144, 0, 0),
+            remote_ident: None,
         }
     }
 
@@ -3046,6 +3093,48 @@ mod tests {
                 }
             }
         }
+    }
+
+    #[test]
+    fn daemon_requests_ident_and_reports_the_remote_build() {
+        use crate::remote::caps;
+        let dir = temp_base();
+        let (daemon, mut server) = start_inprocess_daemon(&dir, "ident", 3_000, (63970, 63979));
+        // While no remote ident is held, the heartbeat carries the RFC 0013
+        // §3 request on the reserved session channel.
+        let mut assembly = sync::FragmentAssembly::new();
+        let (_chan, _msg) = recv_wire_until(&mut server, &mut assembly, |c, m| {
+            c == channel::SESSION_CHANNEL
+                && sync::ClientMessage::decode(m)
+                    .is_ok_and(|cm| caps::find(&cm.caps, caps::CAP_SERVER_IDENT).is_some())
+        });
+        // Answer with one Empty frame carrying a distinctive ident.
+        let ident = caps::encode_server_ident(&caps::ServerIdent {
+            version: "9.9.9".into(),
+            git_sha: "cafef00".into(),
+            pid: 77,
+            start_unix_ms: 1,
+        });
+        let frame = sync::ServerFrame {
+            flags: 0,
+            caps: vec![ident],
+            frame_num: 0,
+            input_ack: 0,
+            echo_ack: 0,
+            body: sync::FrameBody::Empty,
+        };
+        let encoded = frame.encode();
+        let wire = channel::seal_on(true, channel::SESSION_CHANNEL, &encoded);
+        let mut fragmenter = sync::Fragmenter::new();
+        for frag in fragmenter.make_fragments(&wire, sync::FRAGMENT_CONTENTS_MAX) {
+            let _ = server.send(&frag.to_bytes());
+        }
+        // The status line reports the remote build (mux ls's new column).
+        let mut obs = ipc_observer(&mux_socket_path_in(&dir, "ident"));
+        wait_status_contains(&mut obs, "remote=9.9.9 (cafef00)");
+        drop(obs);
+        daemon.join().unwrap();
+        std::fs::remove_dir_all(&dir).ok();
     }
 
     #[test]

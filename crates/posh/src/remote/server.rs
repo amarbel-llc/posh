@@ -325,6 +325,10 @@ pub(crate) fn mux_peer_loop(
     // posh#161 observability: the moment the peer went silent, edge-logged
     // once per episode. `None` while the peer is active (or never heard).
     let mut silent_from: Option<u64> = None;
+    // RFC 0013 §3: our identity, answered onto the heartbeat channel when a
+    // daemon heartbeat requests it (once per sighting — the daemon stops
+    // requesting the moment it holds the ident).
+    let ident_cap = server_ident_cap();
 
     loop {
         if util::take_flag(&util::SIGTERM_RECEIVED) {
@@ -482,6 +486,15 @@ pub(crate) fn mux_peer_loop(
                                 &mut fragmenter,
                                 connect_daemon,
                             );
+                        } else if sync::ClientMessage::decode(message).is_ok_and(|m| {
+                            caps::find(&m.caps, caps::CAP_SERVER_IDENT).is_some()
+                        }) {
+                            // RFC 0013 §3: a daemon heartbeat requesting our
+                            // identity — answer with one Empty frame carrying
+                            // it on the same reserved channel.
+                            let mut reply = empty_ack_frame(0, 0);
+                            reply.caps.push(ident_cap.clone());
+                            send_payload(&mut conn, &mut fragmenter, &reply.encode(), true);
                         } else if !session_discard_logged {
                             // The bare ordinal-1 heartbeat stream carries
                             // nothing for this peer. Logged once, not per
@@ -3953,6 +3966,60 @@ mod tests {
             std::thread::sleep(std::time::Duration::from_millis(5));
         }
         assert!(detached, "wire CLOSE must reach the daemon as Tag::Detach");
+        h.join().unwrap();
+        std::fs::remove_dir_all(&base).ok();
+    }
+
+    #[test]
+    fn agent_only_peer_answers_ident_request_on_the_heartbeat_channel() {
+        let base = peer_temp_base();
+        let ukey = crate::remote::crypto::Key::random();
+        let (peer_conn, port) =
+            Connection::server((63950, 63959), &ukey, crate::remote::datagram::Family::Inet)
+                .unwrap();
+        let addr: std::net::SocketAddr = format!("127.0.0.1:{port}").parse().unwrap();
+        let mut wire = Connection::client(addr, &ukey).unwrap();
+        let endpoint = crate::remote::agent::AgentEndpoint::new_mux(&base, "peer-test").unwrap();
+        let h = std::thread::spawn(move || {
+            let mut connector =
+                |_: &str| -> Result<std::os::unix::net::UnixStream> { panic!("no sessions") };
+            mux_peer_loop(peer_conn, endpoint, 2_500, &mut connector);
+        });
+        // A daemon heartbeat: a bare ClientMessage on ordinal 1 whose caps
+        // carry the RFC 0013 §3 ident request.
+        let msg = ClientMessage {
+            flags: 0,
+            caps: vec![caps::Cap {
+                id: caps::CAP_SERVER_IDENT,
+                payload: vec![],
+            }],
+            acked_frame: 0,
+            rows: 0,
+            cols: 0,
+            input_base: 0,
+            input: Vec::new(),
+        };
+        let mut frag = Fragmenter::new();
+        let mut asm = FragmentAssembly::new();
+        let encoded = msg.encode();
+        let sealed = channel::seal_on(true, channel::SESSION_CHANNEL, &encoded);
+        for f in frag.make_fragments(&sealed, sync::FRAGMENT_CONTENTS_MAX) {
+            let _ = wire.send(&f.to_bytes());
+        }
+        // The answer: one Empty frame on the same channel carrying this
+        // build's identity.
+        let (_, payload) = peer_recv_until(&mut wire, &mut asm, |c, m| {
+            c == channel::SESSION_CHANNEL
+                && ServerFrame::decode(m)
+                    .is_ok_and(|f| caps::find(&f.caps, caps::CAP_SERVER_IDENT).is_some())
+        });
+        let frame = ServerFrame::decode(&payload).unwrap();
+        let ident = caps::decode_server_ident(
+            &caps::find(&frame.caps, caps::CAP_SERVER_IDENT).unwrap().payload,
+        )
+        .unwrap();
+        assert_eq!(ident.version, env!("POSH_VERSION"));
+        assert_eq!(ident.git_sha, env!("POSH_GIT_SHA"));
         h.join().unwrap();
         std::fs::remove_dir_all(&base).ok();
     }
