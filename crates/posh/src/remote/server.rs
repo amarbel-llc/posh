@@ -2217,7 +2217,7 @@ pub(crate) fn send_payload(
 /// loop: the compile-time version + git sha, the pid, and the wall clock at
 /// call time (callers invoke it at loop entry, so it is the process start
 /// for introspection purposes).
-fn server_ident_cap() -> caps::Cap {
+pub(crate) fn server_ident_cap() -> caps::Cap {
     let start_unix_ms = std::time::SystemTime::now()
         .duration_since(std::time::UNIX_EPOCH)
         .map(|d| d.as_millis() as u64)
@@ -2237,7 +2237,7 @@ fn server_ident_cap() -> caps::Cap {
 /// released `CAP_SERVER_STATE` (14). Pure, so the skew matrix pins that an
 /// unrequesting peer costs zero bytes and each requester is answered under
 /// its own id.
-fn introspection_extras(
+pub(crate) fn introspection_extras(
     wants_ident: bool,
     ident: &caps::Cap,
     wants_diag_224: bool,

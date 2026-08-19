@@ -595,6 +595,13 @@ fn relay_loop(
     // exactly as `server.rs` shares one `last_send` for retransmit + heartbeat.
     let mut held = HeldFrame::default();
     let mut last_send = 0u64;
+    // RFC 0013 introspection: parsed per-message like the other caps. The
+    // relay answers from its OWN transport state — content_caps never
+    // forwards these requests to the daemon.
+    let mut peer_wants_ident = false;
+    let mut peer_wants_diag = false; // legacy 224 (debug posture)
+    let mut peer_wants_state = false; // released 14
+    let ident_cap = crate::remote::server::server_ident_cap();
     // The agent-output empty carrier runs on its OWN clock, NOT `last_send`, so it
     // can never starve the held-frame RTO retransmit: `SEND_INTERVAL_MIN` (20ms) <
     // `MIN_RTO` (50ms), so a shared clock would let a continuously-pending agent
@@ -621,6 +628,8 @@ fn relay_loop(
             &mut agent_stream,
             agent_seen,
             agent.is_some(),
+            // Pre-loop: no client message parsed yet, so no requests.
+            &[],
             &mut held,
             &mut last_frame_num,
             &mut last_send,
@@ -762,6 +771,12 @@ fn relay_loop(
                             continue;
                         };
                         last_heard = now;
+                        // RFC 0013 introspection requests: per-message.
+                        peer_wants_ident =
+                            caps::find(&msg.caps, caps::CAP_SERVER_IDENT).is_some();
+                        peer_wants_diag = caps::find(&msg.caps, caps::CAP_DIAG).is_some();
+                        peer_wants_state =
+                            caps::find(&msg.caps, caps::CAP_SERVER_STATE).is_some();
                         // Agent forwarding (FDR 0004, Task 3.2): consume the peer's
                         // relay-TERMINATED agent caps into the stream + endpoint,
                         // lifted verbatim from `server.rs`. AGENT_FORWARD latches
@@ -888,6 +903,30 @@ fn relay_loop(
             }
         }
 
+        // RFC 0013: this iteration's introspection extras, computed once
+        // (post client-recv, so the request flags are fresh) and stamped
+        // onto forwarded frames AND the empty sends below — busy screens
+        // suppress empties, so frames must carry them too. The diag is the
+        // relay's own transport state (no Terminal/producer here): held
+        // count, forwarded frame number, and the agent endpoint's block.
+        let intro_caps = crate::remote::server::introspection_extras(
+            peer_wants_ident,
+            &ident_cap,
+            peer_wants_diag,
+            peer_wants_state,
+            &caps::ServerDiag {
+                current_num: last_frame_num,
+                acked_num: last_frame_num.saturating_sub(held.is_held() as u64),
+                term_gen: 0,
+                outstanding: held.is_held() as u32,
+                pty_open: true, // the daemon link is open while this loop runs
+                pid: std::process::id(),
+                agent: agent
+                    .as_ref()
+                    .map(|ep| ep.diag(agent_stream.sent_bytes(), agent_stream.queued_bytes())),
+            },
+        );
+
         // --- daemon -> UDP client ---
         if fds[1].revents & libc::POLLIN != 0 {
             match link.read.read_from(link.stream.as_raw_fd()) {
@@ -906,6 +945,7 @@ fn relay_loop(
                                     &mut agent_stream,
                                     agent_seen,
                                     agent.is_some(),
+                                    &intro_caps,
                                     &mut held,
                                     &mut last_frame_num,
                                     &mut last_send,
@@ -979,7 +1019,11 @@ fn relay_loop(
         // current agent caps (Task 3.2) so AGENT_FORWARD stays advertised and pending
         // AGENT_DATA/ACK flow even while the screen is idle. A fresh daemon frame this
         // iteration already stamped both clocks to `now`.
-        let out_agent_caps = agent_caps(&mut agent_stream, agent_seen, agent.is_some(), enveloped);
+        let mut out_agent_caps =
+            agent_caps(&mut agent_stream, agent_seen, agent.is_some(), enveloped);
+        // RFC 0013: idle screens deliver the introspection extras on the
+        // empty sends (the busy-screen path stamped them on frames above).
+        out_agent_caps.extend(intro_caps.iter().cloned());
         if conn.has_remote() {
             // Recompute the pending flag LIVE here (like `held.is_held()`), not from
             // the pre-poll snapshot used to size the timeout: this iteration's
@@ -1081,6 +1125,10 @@ fn forward_daemon_frame(
     agent_stream: &mut AgentStream,
     agent_seen: bool,
     has_agent: bool,
+    // RFC 0013: this iteration's introspection extras (ident/state while
+    // requested) — stamped here because a busy screen suppresses the empty
+    // sends that would otherwise carry them.
+    intro: &[Cap],
     held: &mut HeldFrame,
     last_frame_num: &mut u64,
     last_send: &mut u64,
@@ -1091,6 +1139,7 @@ fn forward_daemon_frame(
     let ack = inbox.next_offset();
     let mut out = rewrap(daemon_frame, frame_offset, ack, ack);
     out.caps.extend(agent_caps(agent_stream, agent_seen, has_agent, enveloped));
+    out.caps.extend(intro.iter().cloned());
     *last_frame_num = out.frame_num;
     held.hold(out.frame_num, out.encode());
     if conn.has_remote() {
@@ -1867,6 +1916,7 @@ mod tests {
         let mut saw_full = false;
         let mut saw_diff = false;
         let mut seen_cap_ids: Vec<u8> = Vec::new();
+        let mut seen_ident: Option<caps::ServerIdent> = None;
         let mut agent_mux = AgentChannelMux::new_client();
         let mut proxy = AgentClient::new(fake_sock.clone());
 
@@ -1906,10 +1956,21 @@ mod tests {
         let deadline = now_ms() + 15_000;
         while now_ms() < deadline {
             // client -> relay: the session message, sealed on its channel.
+            // RFC 0013: request the relay's identity + on-demand state via
+            // the released ids; the assertions below pin they are answered.
             let flags = if shutting { sync::CLIENT_FLAG_SHUTDOWN } else { 0 };
             let msg = ClientMessage {
                 flags,
-                caps: caps::own_table(&[]),
+                caps: caps::own_table(&[
+                    Cap {
+                        id: caps::CAP_SERVER_IDENT,
+                        payload: vec![],
+                    },
+                    Cap {
+                        id: caps::CAP_SERVER_STATE,
+                        payload: vec![],
+                    },
+                ]),
                 acked_frame,
                 rows,
                 cols,
@@ -1960,6 +2021,9 @@ mod tests {
                         for cap in &frame.caps {
                             if !seen_cap_ids.contains(&cap.id) {
                                 seen_cap_ids.push(cap.id);
+                            }
+                            if cap.id == caps::CAP_SERVER_IDENT {
+                                seen_ident = caps::decode_server_ident(&cap.payload).ok();
                             }
                         }
                         input_acked = input_acked.max(frame.input_ack);
@@ -2079,6 +2143,20 @@ mod tests {
                  saw {seen_cap_ids:?}"
             );
         }
+        // RFC 0013: the relay answered both introspection requests — the
+        // identity entry decodes to this build, and state came under the
+        // RELEASED id (14), never legacy 224 (nobody requested it).
+        let ident = seen_ident.expect("the relay never delivered CAP_SERVER_IDENT");
+        assert_eq!(ident.version, env!("POSH_VERSION"));
+        assert_eq!(ident.git_sha, env!("POSH_GIT_SHA"));
+        assert!(
+            seen_cap_ids.contains(&caps::CAP_SERVER_STATE),
+            "no CAP_SERVER_STATE on any relay frame; saw {seen_cap_ids:?}"
+        );
+        assert!(
+            !seen_cap_ids.contains(&caps::CAP_DIAG),
+            "state must ride the requested id, not legacy 224; saw {seen_cap_ids:?}"
+        );
 
         relay.join().unwrap().unwrap();
         std::fs::remove_dir_all(&base).ok();
