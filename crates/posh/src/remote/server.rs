@@ -896,6 +896,13 @@ pub(crate) fn server_loop(
     // CAP_DIAG (only in its debug posture) we attach our live frame/ack/pty state
     // to each frame so its SIGUSR2 dump can show the far side of a wedge.
     let mut peer_wants_diag = false;
+    // RFC 0013: the released on-demand state request (id 14, same payload as
+    // CAP_DIAG, answered under the id the peer asked with) and the identity
+    // request (id 13, attached while requested — the peer stops asking once
+    // it holds our ident, so this is zero-cost at steady state).
+    let mut peer_wants_state = false;
+    let mut peer_wants_ident = false;
+    let ident_cap = server_ident_cap();
     // Evolved-predictor metric forwarding (RFC 0007 §3): when the peer advertises
     // CAP_METRICS we attach the remote-host terminals, sampled at most every
     // METRICS_SAMPLE_INTERVAL ms (the /proc reads are not free).
@@ -1493,6 +1500,11 @@ pub(crate) fn server_loop(
                             caps::find(&msg.caps, caps::CAP_BASE_SUM).is_some();
                         // CAP_DIAG (#6): per-message, like the others.
                         peer_wants_diag = caps::find(&msg.caps, caps::CAP_DIAG).is_some();
+                        // RFC 0013 introspection requests: per-message too.
+                        peer_wants_state =
+                            caps::find(&msg.caps, caps::CAP_SERVER_STATE).is_some();
+                        peer_wants_ident =
+                            caps::find(&msg.caps, caps::CAP_SERVER_IDENT).is_some();
                         // CAP_METRICS (RFC 0007 §3): per-message, like the others.
                         peer_wants_metrics = caps::find(&msg.caps, caps::CAP_METRICS).is_some();
                         // A GP client wants the server-cost terminals (#11): turn
@@ -1895,13 +1907,16 @@ pub(crate) fn server_loop(
                         payload: vec![],
                     });
                 }
-                // Server transport-state piggyback (#6): mirror exactly the
-                // fields our own SIGUSR2 dump reports, so a client triaging a
-                // wedge sees whether the server is still producing frames,
-                // what it thinks is acked, how many are outstanding, whether
-                // its terminal is changing, and whether the shell is alive.
-                if peer_wants_diag {
-                    extras.push(caps::encode_server_diag(&caps::ServerDiag {
+                // Server transport-state piggyback (#6) + RFC 0013: mirror
+                // exactly the fields our own SIGUSR2 dump reports, so a
+                // client triaging a wedge sees whether the server is still
+                // producing frames, what it thinks is acked, how many are
+                // outstanding, whether its terminal is changing, and whether
+                // the shell is alive — attached under whichever id(s) the
+                // peer requested with (legacy 224 and/or released 14), plus
+                // the identity entry while requested.
+                if peer_wants_diag || peer_wants_state || peer_wants_ident {
+                    let diag = caps::ServerDiag {
                         current_num: producer.current_num(),
                         acked_num: producer.acked_num(),
                         term_gen: term.generation(),
@@ -1915,7 +1930,14 @@ pub(crate) fn server_loop(
                         agent: agent_endpoint.as_ref().map(|ep| {
                             ep.diag(agent_stream.sent_bytes(), agent_stream.queued_bytes())
                         }),
-                    }));
+                    };
+                    extras.extend(introspection_extras(
+                        peer_wants_ident,
+                        &ident_cap,
+                        peer_wants_diag,
+                        peer_wants_state,
+                        &diag,
+                    ));
                 }
                 // Evolved-predictor remote metrics (RFC 0007 §3): sample the
                 // host/app/proc signals (throttled — the /proc reads are not
@@ -2191,11 +2213,103 @@ pub(crate) fn send_payload(
     send_on_channel(conn, fragmenter, channel::SESSION_CHANNEL, payload, enveloped);
 }
 
+/// This process's [`caps::ServerIdent`] entry (RFC 0013 §1), built once per
+/// loop: the compile-time version + git sha, the pid, and the wall clock at
+/// call time (callers invoke it at loop entry, so it is the process start
+/// for introspection purposes).
+fn server_ident_cap() -> caps::Cap {
+    let start_unix_ms = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_millis() as u64)
+        .unwrap_or(0);
+    caps::encode_server_ident(&caps::ServerIdent {
+        version: env!("POSH_VERSION").into(),
+        git_sha: env!("POSH_GIT_SHA").into(),
+        pid: std::process::id(),
+        start_unix_ms,
+    })
+}
+
+/// The RFC 0013 introspection extras for one outgoing frame, given the
+/// peer's most recent message's requests: the identity entry while
+/// requested (§1), and the `ServerDiag` state under WHICHEVER id(s) the
+/// peer asked with — legacy `CAP_DIAG` (224, the debug posture) and/or the
+/// released `CAP_SERVER_STATE` (14). Pure, so the skew matrix pins that an
+/// unrequesting peer costs zero bytes and each requester is answered under
+/// its own id.
+fn introspection_extras(
+    wants_ident: bool,
+    ident: &caps::Cap,
+    wants_diag_224: bool,
+    wants_state_14: bool,
+    diag: &caps::ServerDiag,
+) -> Vec<caps::Cap> {
+    let mut out = Vec::new();
+    if wants_ident {
+        out.push(ident.clone());
+    }
+    if wants_diag_224 || wants_state_14 {
+        let payload = caps::encode_server_diag(diag).payload;
+        if wants_diag_224 {
+            out.push(caps::Cap {
+                id: caps::CAP_DIAG,
+                payload: payload.clone(),
+            });
+        }
+        if wants_state_14 {
+            out.push(caps::Cap {
+                id: caps::CAP_SERVER_STATE,
+                payload,
+            });
+        }
+    }
+    out
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
     use crate::remote::sync::InputOutbox;
     use crate::util;
+
+    #[test]
+    fn introspection_extras_follow_the_requested_ids() {
+        let ident = server_ident_cap();
+        let diag = caps::ServerDiag {
+            current_num: 7,
+            acked_num: 6,
+            term_gen: 5,
+            outstanding: 1,
+            pty_open: true,
+            pid: 1,
+            agent: None,
+        };
+        // No requests: nothing attached — the zero-steady-state bound.
+        assert!(introspection_extras(false, &ident, false, false, &diag).is_empty());
+        // Identity requested: exactly the ident cap, decodable, carrying
+        // this build's version + sha.
+        let e = introspection_extras(true, &ident, false, false, &diag);
+        assert_eq!(e.len(), 1);
+        assert_eq!(e[0].id, caps::CAP_SERVER_IDENT);
+        let got = caps::decode_server_ident(&e[0].payload).unwrap();
+        assert_eq!(got.version, env!("POSH_VERSION"));
+        assert_eq!(got.git_sha, env!("POSH_GIT_SHA"));
+        assert_eq!(got.pid, std::process::id());
+        // Released state request: answered under 14, never 224 (RFC 0013 §2).
+        let e = introspection_extras(false, &ident, false, true, &diag);
+        assert_eq!(e.len(), 1);
+        assert_eq!(e[0].id, caps::CAP_SERVER_STATE);
+        assert_eq!(caps::decode_server_diag(&e[0].payload).unwrap(), diag);
+        // Legacy debug posture keeps 224; both requested → both ids, one
+        // payload each.
+        let e = introspection_extras(false, &ident, true, true, &diag);
+        assert_eq!(e.len(), 2);
+        assert_eq!(e.iter().filter(|c| c.id == caps::CAP_DIAG).count(), 1);
+        assert_eq!(
+            e.iter().filter(|c| c.id == caps::CAP_SERVER_STATE).count(),
+            1
+        );
+    }
 
     /// Drives a real server_loop over loopback UDP: the PTY runs a shell
     /// that reads one line and exits, so a single test covers input
