@@ -431,6 +431,12 @@ pub(crate) fn mux_peer_loop(
                 PeerChannel::Awaiting { .. } => fds.push(util::pollfd(-1, 0)),
             }
         }
+        // RFC 0013 §4: the local status socket, polled last so the index
+        // math above is untouched.
+        let status_fd_idx = fds.len();
+        if let Some(l) = endpoint.status_listener() {
+            fds.push(util::pollfd(l.as_raw_fd(), libc::POLLIN));
+        }
         match util::poll(&mut fds, timeout) {
             Ok(_) => {}
             Err(e) if e.kind() == std::io::ErrorKind::Interrupted => continue,
@@ -445,6 +451,46 @@ pub(crate) fn mux_peer_loop(
         if agent_signalled {
             agent_mux.queue_records(&endpoint.accept_pending());
             agent_mux.queue_records(&endpoint.read_channels());
+        }
+
+        // RFC 0013 §4: answer each status connection with ONE line and
+        // close — connect → read-to-EOF, no protocol. The line is the
+        // SIGUSR2 shape plus our identity, so `posh ls` on this host reads
+        // the endpoint's health without touching the wire.
+        if fds
+            .get(status_fd_idx)
+            .is_some_and(|p| p.revents & libc::POLLIN != 0)
+        {
+            if let Some(l) = endpoint.status_listener() {
+                loop {
+                    match l.accept() {
+                        Ok((stream, _)) => {
+                            let d = endpoint.diag(0, 0);
+                            let line = format!(
+                                "posh {} ({}) pid={} peer={} heard={}ms agent_channels={} opened_total={} owns_agent_sock={} session_channels={}\n",
+                                env!("POSH_VERSION"),
+                                env!("POSH_GIT_SHA"),
+                                std::process::id(),
+                                conn.remote()
+                                    .map_or_else(|| "none".to_string(), |a| a.to_string()),
+                                now_ms().saturating_sub(last_heard),
+                                d.live_channels,
+                                d.next_channel_id.saturating_sub(1),
+                                d.symlink_ok,
+                                channels.len(),
+                            );
+                            let _ = util::write_all_retry(
+                                stream.as_raw_fd(),
+                                line.as_bytes(),
+                                100,
+                            );
+                        }
+                        Err(e) if e.kind() == std::io::ErrorKind::WouldBlock => break,
+                        Err(e) if e.kind() == std::io::ErrorKind::Interrupted => continue,
+                        Err(_) => break,
+                    }
+                }
+            }
         }
 
         // Client datagrams.
@@ -4020,6 +4066,20 @@ mod tests {
         .unwrap();
         assert_eq!(ident.version, env!("POSH_VERSION"));
         assert_eq!(ident.git_sha, env!("POSH_GIT_SHA"));
+        // RFC 0013 §4: the local status socket answers connect → one line →
+        // EOF with the same identity plus endpoint health.
+        {
+            use std::io::Read as _;
+            let mut s = std::os::unix::net::UnixStream::connect(
+                base.join("agent").join("mux-peer-test.status.sock"),
+            )
+            .unwrap();
+            s.set_read_timeout(Some(std::time::Duration::from_secs(8))).unwrap();
+            let mut line = String::new();
+            s.read_to_string(&mut line).unwrap();
+            assert!(line.contains(env!("POSH_GIT_SHA")), "status line: {line:?}");
+            assert!(line.contains("owns_agent_sock="), "status line: {line:?}");
+        }
         h.join().unwrap();
         std::fs::remove_dir_all(&base).ok();
     }

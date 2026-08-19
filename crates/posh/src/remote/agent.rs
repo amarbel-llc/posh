@@ -115,6 +115,16 @@ pub struct AgentEndpoint {
     /// `<base>/agent/sock` — the stable, symlinked `SSH_AUTH_SOCK` target.
     well_known: PathBuf,
     listener: UnixListener,
+    /// RFC 0013 §4 (mux-named endpoints only): the local status socket
+    /// `<stem>.status.sock` + its `<stem>.status.pid` liveness record —
+    /// connect → one status line → EOF, the host-local introspection query
+    /// `posh ls` reads. Best-effort: a bind failure logs and leaves `None`
+    /// (the endpoint itself is never gated on it). The pid record is
+    /// written BEFORE the bind (the same ordering as the agent socket), so
+    /// the existing GC rules reap a crashed peer's leftovers.
+    status_listener: Option<UnixListener>,
+    status_sock: Option<PathBuf>,
+    status_pidfile: Option<PathBuf>,
     channels: Vec<Channel>,
     next_channel_id: u32,
     last_tick: u64,
@@ -268,6 +278,35 @@ impl AgentEndpoint {
         let own_marker = dir.join(format!("{stem}.active"));
         let _ = std::fs::remove_file(&own_marker);
 
+        // RFC 0013 §4: the mux peer's local status socket, pid-recorded
+        // before the bind like the agent socket so the GC rules apply
+        // uniformly (`<stem>.status` is itself a `mux-`-prefixed stem).
+        // Best-effort: a failure degrades host-local introspection only.
+        let (mut status_listener, mut status_sock, mut status_pidfile) = (None, None, None);
+        if let Some(pid) = mux_pid {
+            let sock = dir.join(format!("{stem}.status.sock"));
+            let pidfile = dir.join(format!("{stem}.status.pid"));
+            let _ = std::fs::remove_file(&sock);
+            let bound = std::fs::write(&pidfile, pid.to_string())
+                .map_err(util::Error::from)
+                .and_then(|()| UnixListener::bind(&sock).map_err(util::Error::from))
+                .and_then(|l| {
+                    l.set_nonblocking(true)?;
+                    Ok(l)
+                });
+            match bound {
+                Ok(l) => {
+                    status_listener = Some(l);
+                    status_sock = Some(sock);
+                    status_pidfile = Some(pidfile);
+                }
+                Err(e) => {
+                    let _ = std::fs::remove_file(&pidfile);
+                    util::log_write("warn", &format!("status socket unavailable: {e}"));
+                }
+            }
+        }
+
         let endpoint = AgentEndpoint {
             dir: dir.clone(),
             stem,
@@ -276,6 +315,9 @@ impl AgentEndpoint {
             own_pidfile,
             well_known: dir.join("sock"),
             listener,
+            status_listener,
+            status_sock,
+            status_pidfile,
             channels: Vec::new(),
             next_channel_id: 1,
             last_tick: 0,
@@ -283,6 +325,13 @@ impl AgentEndpoint {
         };
         endpoint.claim_symlink()?;
         Ok(endpoint)
+    }
+
+    /// RFC 0013 §4: the local status listener (mux-named endpoints only;
+    /// `None` for srv endpoints or after a failed bind). The caller polls it
+    /// and answers each connection with one status line.
+    pub fn status_listener(&self) -> Option<&UnixListener> {
+        self.status_listener.as_ref()
     }
 
     /// The stable `SSH_AUTH_SOCK` path to export into the session shell (C5).
@@ -709,6 +758,14 @@ impl Drop for AgentEndpoint {
             }
         }
         let _ = std::fs::remove_file(&self.own_sock);
+        // The status socket + its liveness record follow the same
+        // remove-after-unlink ordering (RFC 0013 §4).
+        if let Some(p) = &self.status_sock {
+            let _ = std::fs::remove_file(p);
+        }
+        if let Some(p) = &self.status_pidfile {
+            let _ = std::fs::remove_file(p);
+        }
         // The posh#152 activity marker goes with the socket: a dead endpoint
         // must not advertise itself as a repoint target.
         self.remove_active_marker();
@@ -2430,9 +2487,23 @@ mod tests {
             std::fs::read_to_string(dir.join("mux-clienthost.pid")).unwrap(),
             own_pid().to_string()
         );
+        // RFC 0013 §4: the local status socket, pid-recorded like the agent
+        // socket so the GC rules apply to its leftovers too.
+        assert!(ep.status_listener().is_some());
+        assert!(dir.join("mux-clienthost.status.sock").exists());
+        assert_eq!(
+            std::fs::read_to_string(dir.join("mux-clienthost.status.pid")).unwrap(),
+            own_pid().to_string()
+        );
+        // Its own live status files survive the endpoint's GC sweep.
+        ep.gc_dead_sockets();
+        assert!(dir.join("mux-clienthost.status.sock").exists());
+        assert!(dir.join("mux-clienthost.status.pid").exists());
         drop(ep);
         assert!(!dir.join("mux-clienthost.sock").exists());
         assert!(!dir.join("mux-clienthost.pid").exists());
+        assert!(!dir.join("mux-clienthost.status.sock").exists());
+        assert!(!dir.join("mux-clienthost.status.pid").exists());
         assert!(std::fs::symlink_metadata(dir.join("sock")).is_err());
         std::fs::remove_dir_all(&base).ok();
     }
