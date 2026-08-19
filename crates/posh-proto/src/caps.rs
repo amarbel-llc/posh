@@ -109,6 +109,94 @@ pub const CAP_KITTY_KEYBOARD: u8 = 11;
 /// [`CAP_KITTY_KEYBOARD`]. See auto-memory posh-client-backlog-disconnect.
 pub const CAP_COALESCE: u8 = 12;
 
+/// Server identity (RFC 0013). Client entry (empty payload): "send me your
+/// identity" — advertised on every message while the client holds no ident
+/// (and again after a RESYNC), so delivery is reliable with zero steady-state
+/// cost once held. Server entry: an encoded [`ServerIdent`] (version, git
+/// sha, pid, start time), attached to frames while the request is advertised.
+/// The always-available half of server introspection: the About palette view
+/// answers "what build is the far end" from it.
+pub const CAP_SERVER_IDENT: u8 = 13;
+/// On-demand server state (RFC 0013): the RELEASED request id for the
+/// [`ServerDiag`] payload that experimental [`CAP_DIAG`] carries in a debug
+/// posture (posh#150 — shipping consumers must not ride the 224..=255 band).
+/// Client entry (empty payload): "attach your live state to frames" —
+/// advertised for a bounded window after the palette About command. Server
+/// entry: the [`ServerDiag`] payload, byte-identical to CAP_DIAG's, attached
+/// under whichever id the client requested with.
+pub const CAP_SERVER_STATE: u8 = 14;
+
+/// The static identity a server reports under [`CAP_SERVER_IDENT`]: what the
+/// operator's `posh version` would print on the far host, plus the process
+/// facts that anchor it to a specific run.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ServerIdent {
+    pub version: String,
+    pub git_sha: String,
+    pub pid: u32,
+    pub start_unix_ms: u64,
+}
+
+/// Format version of the [`ServerIdent`] payload; bumped on layout change,
+/// and an unknown value is REJECTED by [`decode_server_ident`] (the requester
+/// keeps its "unknown" display rather than misparsing a future layout).
+const SERVER_IDENT_FMT: u8 = 1;
+
+/// Encode a [`ServerIdent`] as its cap entry: fmt version, pid (u32 LE),
+/// start time (u64 LE), then the two length-prefixed strings. Strings are
+/// truncated to 80 bytes so the entry always fits the table's `len: u8`
+/// budget with room to spare.
+pub fn encode_server_ident(ident: &ServerIdent) -> Cap {
+    let clamp = |s: &str| -> Vec<u8> {
+        let mut b = s.as_bytes().to_vec();
+        b.truncate(80);
+        b
+    };
+    let (ver, sha) = (clamp(&ident.version), clamp(&ident.git_sha));
+    let mut payload = Vec::with_capacity(15 + ver.len() + sha.len());
+    payload.push(SERVER_IDENT_FMT);
+    payload.extend_from_slice(&ident.pid.to_le_bytes());
+    payload.extend_from_slice(&ident.start_unix_ms.to_le_bytes());
+    payload.push(ver.len() as u8);
+    payload.extend_from_slice(&ver);
+    payload.push(sha.len() as u8);
+    payload.extend_from_slice(&sha);
+    Cap {
+        id: CAP_SERVER_IDENT,
+        payload,
+    }
+}
+
+/// Decode a [`CAP_SERVER_IDENT`] payload. Errors on a short payload, a bad
+/// string length, or an unknown format version — the peer is authenticated,
+/// so a mismatch is corruption or a future layout, and the consumer keeps
+/// its previous (or absent) ident rather than trusting a misparse.
+pub fn decode_server_ident(payload: &[u8]) -> Result<ServerIdent> {
+    let err = || Error::from("malformed SERVER_IDENT payload");
+    if payload.len() < 14 || payload[0] != SERVER_IDENT_FMT {
+        return Err(err());
+    }
+    let pid = u32::from_le_bytes(payload[1..5].try_into().unwrap());
+    let start_unix_ms = u64::from_le_bytes(payload[5..13].try_into().unwrap());
+    let take_str = |off: usize| -> Result<(String, usize)> {
+        let len = *payload.get(off).ok_or_else(err)? as usize;
+        let end = off + 1 + len;
+        let bytes = payload.get(off + 1..end).ok_or_else(err)?;
+        Ok((String::from_utf8_lossy(bytes).into_owned(), end))
+    };
+    let (version, off) = take_str(13)?;
+    let (git_sha, end) = take_str(off)?;
+    if end != payload.len() {
+        return Err(err());
+    }
+    Ok(ServerIdent {
+        version,
+        git_sha,
+        pid,
+        start_unix_ms,
+    })
+}
+
 /// Mask a received [`CAP_KITTY_KEYBOARD`] payload to the valid low-5-bit flag
 /// range (RFC 0010 Security Considerations): a malformed or oversized payload is
 /// treated as "capability absent" (`None`), never trusted out of range.
@@ -542,6 +630,38 @@ pub fn decode_metrics(payload: &[u8]) -> Option<[f64; METRICS_FIELDS]> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn server_ident_roundtrips_and_rejects_truncation() {
+        let ident = ServerIdent {
+            version: "0.3.2".into(),
+            git_sha: "e76fb8f".into(),
+            pid: 4242,
+            start_unix_ms: 1_755_000_000_000,
+        };
+        let cap = encode_server_ident(&ident);
+        assert_eq!(cap.id, CAP_SERVER_IDENT);
+        assert_eq!(decode_server_ident(&cap.payload).unwrap(), ident);
+        for cut in 0..cap.payload.len() {
+            assert!(
+                decode_server_ident(&cap.payload[..cut]).is_err(),
+                "cut={cut} decoded"
+            );
+        }
+        // An unknown format version is rejected, not misparsed.
+        let mut future = cap.payload.clone();
+        future[0] = 2;
+        assert!(decode_server_ident(&future).is_err());
+    }
+
+    #[test]
+    fn introspection_cap_ids_are_released_band() {
+        assert_eq!(CAP_SERVER_IDENT, 13);
+        assert_eq!(CAP_SERVER_STATE, 14);
+        // posh#150: the shipping introspection path must NOT ride the
+        // 224..=255 experimental band CAP_DIAG sits in.
+        assert!(CAP_SERVER_IDENT < 224 && CAP_SERVER_STATE < 224);
+    }
 
     #[test]
     fn metrics_roundtrip_preserves_values_and_nan() {
