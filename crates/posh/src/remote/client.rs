@@ -268,6 +268,13 @@ fn wedge_debug_summary(st: &ClientState, now: u64) -> String {
 /// drift from the behavior it reports. Live congestion numbers stay on the
 /// mux `MuxStatus` line (`just debug-posh-dump`) — surfacing them here is a
 /// recorded follow-up, not a v1 row.
+/// RFC 0013 §2 tuning lever: how long the About command keeps requesting
+/// on-demand server state. 10 s covers several frame round-trips on any
+/// usable link while bounding the per-frame overhead; revisit if state
+/// blocks visibly inflate frames on slow links (the design doc's change
+/// signal).
+const STATE_REQUEST_WINDOW_MS: u64 = 10_000;
+
 fn about_summary(st: &ClientState) -> String {
     let gate = |name: &str, resolved: bool| {
         let src = match std::env::var(name) {
@@ -284,8 +291,38 @@ fn about_summary(st: &ClientState) -> String {
     // POSH_RELAY's parser lives in main.rs (`relay_enabled`; only "0"
     // disables — posh#154 tracks the cross-gate normalization).
     let relay_on = std::env::var("POSH_RELAY").as_deref() != Ok("0");
+    // RFC 0013: the far end's identity + the cached state report with its
+    // age. `unknown` covers both a pre-RFC-0013 server and a not-yet-
+    // delivered ident (the request is still riding our messages).
+    let remote = match &st.server_ident {
+        Some(id) => {
+            let now_wall = std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .map(|d| d.as_millis() as u64)
+                .unwrap_or(0);
+            format!(
+                "remote: posh {} ({}) pid={} up={}s",
+                id.version,
+                id.git_sha,
+                id.pid,
+                now_wall.saturating_sub(id.start_unix_ms) / 1000,
+            )
+        }
+        None => "remote: unknown (pre-RFC-0013 server, or not yet delivered)".to_string(),
+    };
+    let remote_state = match &st.last_server_diag {
+        Some(d) => format!(
+            "remote state: frames {}..{} outstanding={} pty_open={} (as of {}s ago)",
+            d.acked_num,
+            d.current_num,
+            d.outstanding,
+            d.pty_open,
+            now_ms().saturating_sub(st.last_server_diag_at) / 1000,
+        ),
+        None => "remote state: (requested; reopen About to refresh)".to_string(),
+    };
     format!(
-        "posh {} ({})\nmode: {mode}\n{}\n{}\n{}\n{}\n{}\n{}",
+        "posh {} ({})\n{remote}\n{remote_state}\nmode: {mode}\n{}\n{}\n{}\n{}\n{}\n{}",
         env!("POSH_VERSION"),
         env!("POSH_GIT_SHA"),
         gate("POSH_MUX", crate::remote::mux::mux_selected()),
@@ -581,10 +618,15 @@ fn dispatch_palette_action(
         "session.aboutinfo" => {
             // M2: version + connection mode + every gate's resolved value
             // and source — the "which env vars are live?" table.
+            // RFC 0013 §2: arm the bounded state-request window FIRST, and
+            // ask to send promptly so the request goes out — the dialog
+            // shows the cached remote report with its age; reopening About
+            // refreshes with what the window fetched.
+            st.state_request_until = now + STATE_REQUEST_WINDOW_MS;
             let summary = about_summary(st);
             util::log_write("aboutinfo", &summary);
             show_debug_info(st, "about / transport", &summary, now);
-            false
+            true
         }
         "client.suspend" => {
             suspend(st, raw);
@@ -980,6 +1022,17 @@ struct ClientState {
     /// dump so a wedge shows both sides. `None` until the server first reports
     /// (only when we advertised CAP_DIAG); never sent on a default session.
     last_server_diag: Option<caps::ServerDiag>,
+    /// When the latest `last_server_diag` report arrived (`now_ms` clock), so
+    /// the About view shows the cached state's age. 0 = never.
+    last_server_diag_at: u64,
+    /// RFC 0013: the far end's identity, requested on every message until
+    /// held (and re-requested after a resync — the server behind the address
+    /// may have been replaced). Backs the About "remote" section.
+    server_ident: Option<caps::ServerIdent>,
+    /// RFC 0013 §2: the palette-armed on-demand state window — the About
+    /// command arms it ([`STATE_REQUEST_WINDOW_MS`]); messages advertise
+    /// `CAP_SERVER_STATE` while `now_ms() <` this deadline. 0 = unarmed.
+    state_request_until: u64,
     /// SSH agent forwarding (FDR 0004): the local-agent proxy + the
     /// bidirectional agent byte stream, and whether the server has advertised
     /// AGENT_FORWARD yet (gates our own AGENT_DATA/ACK; caps don't persist, so
@@ -1084,6 +1137,9 @@ fn client_loop(
         forensic_captured: false,
         want_server_diag,
         last_server_diag: None,
+        last_server_diag_at: 0,
+        server_ident: None,
+        state_request_until: 0,
         // Agent forwarding (FDR 0004): the proxy forwards the resolved source
         // socket; `None` source == forwarding off this connection. The notice
         // (FDR 0004; #96) rides with the proxy — armed only when forwarding is
@@ -1968,9 +2024,21 @@ fn process_frame(st: &mut ClientState, frame: &ServerFrame) -> bool {
     // Server transport-state piggyback (#6): record the latest report when present
     // (only after we advertised CAP_DIAG). Keep the prior value on a malformed or
     // absent payload — the dump shows the most recent good report.
-    if let Some(cap) = caps::find(&frame.caps, caps::CAP_DIAG) {
+    // RFC 0013: the released id carries the same payload; either updates the
+    // cached report + its age stamp.
+    if let Some(cap) = caps::find(&frame.caps, caps::CAP_DIAG)
+        .or_else(|| caps::find(&frame.caps, caps::CAP_SERVER_STATE))
+    {
         if let Ok(d) = caps::decode_server_diag(&cap.payload) {
             st.last_server_diag = Some(d);
+            st.last_server_diag_at = now_ms();
+        }
+    }
+    // RFC 0013 §1: the identity, held once delivered (the request stops
+    // riding our messages the moment this is Some).
+    if let Some(cap) = caps::find(&frame.caps, caps::CAP_SERVER_IDENT) {
+        if let Ok(ident) = caps::decode_server_ident(&cap.payload) {
+            st.server_ident = Some(ident);
         }
     }
     // Scrollback stream v2 (RFC 0009 §1): adopt the server's epoch from its
@@ -2566,6 +2634,26 @@ fn outgoing_caps(st: &mut ClientState) -> Vec<caps::Cap> {
     if st.want_server_diag || st.agent.is_some() {
         extra.push(caps::Cap {
             id: caps::CAP_DIAG,
+            payload: vec![],
+        });
+    }
+    // RFC 0013: a resync drops the held identity FIRST (the server behind
+    // this address may have been replaced), then the request rides every
+    // message until an identity is held — reliable delivery, zero cost at
+    // steady state. The on-demand state request rides only while the
+    // palette-armed window is open.
+    if st.flags & sync::CLIENT_FLAG_RESYNC != 0 {
+        st.server_ident = None;
+    }
+    if st.server_ident.is_none() {
+        extra.push(caps::Cap {
+            id: caps::CAP_SERVER_IDENT,
+            payload: vec![],
+        });
+    }
+    if now_ms() < st.state_request_until {
+        extra.push(caps::Cap {
+            id: caps::CAP_SERVER_STATE,
             payload: vec![],
         });
     }
@@ -3243,10 +3331,48 @@ mod tests {
             s.matches("(env=").count() + s.matches("(default)").count() >= 6,
             "{s}"
         );
+        // The remote section is present even before any ident arrives.
+        assert!(s.contains("remote: unknown"), "{s}");
         let raw = pty_raw_mode();
         let mut st = st;
         let send = dispatch_palette_action(&mut st, &raw, "session.aboutinfo", &json!({}), 0);
-        assert!(!send, "about is client-local, no wire send");
+        assert!(
+            send,
+            "about arms the RFC 0013 state window and asks to send promptly"
+        );
+        assert_eq!(st.state_request_until, STATE_REQUEST_WINDOW_MS);
+    }
+
+    #[test]
+    fn introspection_requests_ride_until_satisfied_and_on_demand() {
+        let mut st = test_state(24, 80);
+        // Fresh state: the ident request rides; state only on demand.
+        let out = outgoing_caps(&mut st);
+        assert!(caps::find(&out, caps::CAP_SERVER_IDENT).is_some());
+        assert!(caps::find(&out, caps::CAP_SERVER_STATE).is_none());
+        // Ident held: the request stops (zero steady-state cost).
+        st.server_ident = Some(caps::ServerIdent {
+            version: "0.0.0".into(),
+            git_sha: "abcdef0".into(),
+            pid: 1,
+            start_unix_ms: 0,
+        });
+        let out = outgoing_caps(&mut st);
+        assert!(caps::find(&out, caps::CAP_SERVER_IDENT).is_none());
+        // A pending resync drops the held ident and re-requests — the server
+        // behind this address may have been replaced.
+        st.flags |= sync::CLIENT_FLAG_RESYNC;
+        let out = outgoing_caps(&mut st);
+        assert!(st.server_ident.is_none());
+        assert!(caps::find(&out, caps::CAP_SERVER_IDENT).is_some());
+        st.flags = 0;
+        // The armed window advertises the state request; disarming stops it.
+        st.state_request_until = u64::MAX;
+        let out = outgoing_caps(&mut st);
+        assert!(caps::find(&out, caps::CAP_SERVER_STATE).is_some());
+        st.state_request_until = 0;
+        let out = outgoing_caps(&mut st);
+        assert!(caps::find(&out, caps::CAP_SERVER_STATE).is_none());
     }
 
     #[test]
@@ -3603,6 +3729,9 @@ mod tests {
             forensic_captured: false,
             want_server_diag: false,
             last_server_diag: None,
+            last_server_diag_at: 0,
+            server_ident: None,
+            state_request_until: 0,
             agent: None,
             agent_stream: sync::AgentStream::new(),
             agent_seen: false,
