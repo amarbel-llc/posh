@@ -656,11 +656,11 @@ mod tests {
 
     #[test]
     fn introspection_cap_ids_are_released_band() {
+        // posh#150: the shipping introspection path must NOT ride the
+        // 224..=255 experimental band CAP_DIAG sits in — pinning the exact
+        // registry ids (13/14) pins the released-band placement with them.
         assert_eq!(CAP_SERVER_IDENT, 13);
         assert_eq!(CAP_SERVER_STATE, 14);
-        // posh#150: the shipping introspection path must NOT ride the
-        // 224..=255 experimental band CAP_DIAG sits in.
-        assert!(CAP_SERVER_IDENT < 224 && CAP_SERVER_STATE < 224);
     }
 
     #[test]
