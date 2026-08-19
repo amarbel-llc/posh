@@ -174,7 +174,22 @@ pub fn run_agent_only(
     // and any owned agent/sock claim.
     util::install_daemon_signal_handlers();
     let endpoint = crate::remote::agent::AgentEndpoint::from_env_mux(client_id)?;
+    // posh#161 observability: an always-on, APPENDING log beside the
+    // endpoint's own socket (`agent/mux-<client-id>.log` — per client host,
+    // stable across respawns, so successive episodes land in one timeline).
+    // Without it this process's exit — which takes the host's `agent/sock`
+    // with it — is invisible to a post-mortem.
+    let _ = util::log_init(&endpoint.own_sock_path().with_extension("log"));
+    util::log_write(
+        "info",
+        &format!(
+            "agent-only server started client_id={client_id} pid={} sock={}",
+            std::process::id(),
+            endpoint.own_sock_path().display()
+        ),
+    );
     agent_only_loop(conn, endpoint, PEER_TIMEOUT);
+    util::log_write("info", "agent-only server exiting");
     std::process::exit(0);
 }
 
@@ -307,21 +322,71 @@ pub(crate) fn mux_peer_loop(
     let mut channels: Vec<PeerChannel> = Vec::new();
     let mut last_heard = now_ms();
     let mut session_discard_logged = false;
+    // posh#161 observability: the moment the peer went silent, edge-logged
+    // once per episode. `None` while the peer is active (or never heard).
+    let mut silent_from: Option<u64> = None;
 
     loop {
         if util::take_flag(&util::SIGTERM_RECEIVED) {
+            let signo = util::LAST_SIGNAL.load(std::sync::atomic::Ordering::Acquire);
+            util::log_write(
+                "info",
+                &format!("{} received, winding down", util::signal_name(signo)),
+            );
             break; // SIGTERM/SIGHUP/SIGINT: wind down, Drop cleans up
         }
         let now = now_ms();
-        if now.saturating_sub(last_heard) >= peer_timeout {
-            break; // the peer roamed away and never came back
+        let heard_age = now.saturating_sub(last_heard);
+        if util::take_flag(&util::SIGUSR2_RECEIVED) {
+            // The FDR 0007 on-demand dump, agent-only shape: heard age +
+            // channel counts + whether we still own the stable path.
+            let d = endpoint.diag(0, 0);
+            util::log_write(
+                "status",
+                &format!(
+                    "agent-only: peer={} heard={heard_age}ms agent_channels={} opened_total={} owns_agent_sock={} session_channels={}",
+                    conn.remote()
+                        .map_or_else(|| "none".to_string(), |a| a.to_string()),
+                    d.live_channels,
+                    d.next_channel_id.saturating_sub(1),
+                    d.symlink_ok,
+                    channels.len(),
+                ),
+            );
+        }
+        if heard_age >= peer_timeout {
+            // The peer roamed away and never came back. This exit is what
+            // tears down the host's `agent/sock` (the endpoint's Drop), so
+            // name it — the posh#161 post-mortem hinges on this line.
+            util::log_write(
+                "info",
+                &format!("peer silent {heard_age}ms >= {peer_timeout}ms: exiting, releasing the agent endpoint"),
+            );
+            break;
         }
         // The endpoint's #152 maintenance + tick edges, gated exactly as
         // server_loop gates them: the stricter AGENT_PEER_ACTIVE window, so
         // a roamed-away peer releases/repoints agent/sock and fast-fails
         // open channels well before the exit timeout above.
-        let agent_peer_active = conn.has_remote()
-            && now.saturating_sub(last_heard) < crate::remote::agent::AGENT_PEER_ACTIVE;
+        let agent_peer_active =
+            conn.has_remote() && heard_age < crate::remote::agent::AGENT_PEER_ACTIVE;
+        // Edge-log silence episodes (once each way): entering the fast-fail
+        // window, and the peer's return. Gated on has_remote so the pre-first-
+        // datagram startup window is not reported as an outage.
+        if conn.has_remote() && !agent_peer_active && silent_from.is_none() {
+            silent_from = Some(last_heard);
+            util::log_write(
+                "info",
+                &format!("peer silent {heard_age}ms: agent service fast-failing (exit at {peer_timeout}ms)"),
+            );
+        } else if agent_peer_active {
+            if let Some(from) = silent_from.take() {
+                util::log_write(
+                    "info",
+                    &format!("peer resumed after ~{}ms silent", last_heard.saturating_sub(from)),
+                );
+            }
+        }
         agent_mux.queue_records(&endpoint.tick(agent_peer_active, now));
 
         // Wake in time for the mux's fresh sends and RTO retransmissions

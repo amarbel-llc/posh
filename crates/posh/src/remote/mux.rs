@@ -678,6 +678,9 @@ struct IpcConn {
     holds_ref: bool,
     conn_id: u64,
     session: Option<IpcSession>,
+    /// The client pid its `Hello` reported — attribution for the posh#161
+    /// ref-lifecycle log lines (which invocation pinned the daemon alive).
+    peer_pid: Option<u32>,
 }
 
 impl IpcConn {
@@ -689,6 +692,7 @@ impl IpcConn {
             holds_ref: false,
             conn_id,
             session: None,
+            peer_pid: None,
         }
     }
 }
@@ -805,6 +809,7 @@ fn process_ipc_conn(
                     return false;
                 }
                 conn.hello_ok = true;
+                conn.peer_pid = Some(hello.pid);
             }
             MuxTag::SessionRef => {
                 if !conn.hello_ok {
@@ -815,6 +820,7 @@ fn process_ipc_conn(
                 if !conn.holds_ref {
                     conn.holds_ref = true;
                     state.add_ref();
+                    log_ref_change("+ipc-ref", conn.peer_pid, state);
                 }
                 // Confirm registration — the client blocks on this before
                 // dropping its own forwarding. A duplicate is re-acked so a
@@ -861,11 +867,27 @@ fn process_ipc_conn(
     open
 }
 
+/// posh#161 observability: one log line per session-ref transition, so the
+/// daemon log answers "which invocations pinned this daemon alive" and "when
+/// did agent service actually stop" (refs=0 arms the linger with service off).
+fn log_ref_change(action: &str, pid: Option<u32>, state: &MuxState) {
+    util::log_write(
+        "info",
+        &format!(
+            "refs {action} (pid={}): refs={} linger={}",
+            pid.map_or_else(|| "?".to_string(), |p| p.to_string()),
+            state.refs(),
+            if state.lingering() { "armed" } else { "off" }
+        ),
+    );
+}
+
 /// Releases a departing conn's session ref (the auto-unref half of
 /// `MuxSessionRef`): the caller invokes this exactly once per dropped conn.
 fn drop_ipc_conn(conn: &IpcConn, state: &mut MuxState, now: u64) {
     if conn.holds_ref {
         state.unref(now);
+        log_ref_change("-conn-drop", conn.peer_pid, state);
     }
 }
 
@@ -1006,6 +1028,11 @@ pub fn run_daemon(
         util::log_write("error", &format!("mux daemon panic: {info}"));
     }));
     util::install_daemon_signal_handlers();
+    // SIGUSR2 appends a one-line status to the daemon's log (FDR 0007's dump
+    // surface, mux shape). Also load-bearing as a handler: without it the
+    // default disposition would TERMINATE the daemon — and with it every
+    // session's agent forwarding to this destination (posh#161 blast radius).
+    util::install_sigusr2_handler();
 
     let result = (|| -> Result<()> {
         let opts = mux_ssh_options(family, port_range);
@@ -1105,6 +1132,12 @@ fn mux_loop(
     // relay.rs's `wait_for_handshake` documents.)
     let mut last_send: Option<u64> = None;
     let mut last_heard: u64 = now_ms();
+    // posh#161 observability: wire recv errors, edge-logged once per episode.
+    // On a connected UDP socket an exited remote endpoint surfaces here as
+    // ECONNREFUSED (ICMP port unreachable) — the one client-side signal that
+    // distinguishes "remote died" from a merely idle connection (an idle M1
+    // remote legitimately sends nothing, so heard-age alone proves nothing).
+    let mut recv_err_logged = false;
 
     loop {
         if util::take_flag(&util::SIGTERM_RECEIVED) {
@@ -1197,6 +1230,10 @@ fn mux_loop(
                             continue;
                         };
                         last_heard = now_ms();
+                        if recv_err_logged {
+                            recv_err_logged = false;
+                            util::log_write("info", "mux wire recv recovered");
+                        }
                         if chan.kind() != channel::KIND_AGENT {
                             // M2 session channels (ordinal >= 2, the wire
                             // micro-envelope); ordinal 1 stays the bare
@@ -1257,6 +1294,11 @@ fn mux_loop(
                                             ci.holds_ref = false;
                                             let was = state.serviceable();
                                             state.unref(now_ms());
+                                            log_ref_change(
+                                                "-wire-close",
+                                                ci.peer_pid,
+                                                &state,
+                                            );
                                             if was && !state.serviceable() {
                                                 agent_mux
                                                     .queue_records(&proxy.close_all());
@@ -1293,7 +1335,16 @@ fn mux_loop(
                     }
                     Ok(None) => continue,
                     Err(e) if e.kind() == std::io::ErrorKind::WouldBlock => break,
-                    Err(_) => break,
+                    Err(e) => {
+                        if !recv_err_logged {
+                            recv_err_logged = true;
+                            util::log_write(
+                                "warn",
+                                &format!("mux wire recv error: {e} (remote endpoint gone?)"),
+                            );
+                        }
+                        break;
+                    }
                 }
             }
         }
@@ -1319,6 +1370,14 @@ fn mux_loop(
             agent_source,
             congestion: agent_mux.congestion_summary(),
         };
+        // The FDR 0007 on-demand dump, mux-daemon shape: the same line
+        // `posh mux ls` reports, appended to the daemon's own log. NOTE:
+        // heard= grows without bound on a healthy IDLE M1 connection (the
+        // remote sends nothing unprompted); the recv-error lines above are
+        // the remote-death signal, not this age.
+        if util::take_flag(&util::SIGUSR2_RECEIVED) {
+            util::log_write("status", &status_line(&ctx, &state));
+        }
         let mut i = conns.len().min(n_ipc);
         while i > 0 {
             i -= 1;
@@ -1379,6 +1438,7 @@ fn mux_loop(
                         if !conns[i].holds_ref {
                             conns[i].holds_ref = true;
                             state.add_ref();
+                            log_ref_change("+session-open", conns[i].peer_pid, &state);
                         }
                         conns[i].session = Some(IpcSession {
                             chan,
@@ -1425,6 +1485,7 @@ fn mux_loop(
                                 conns[i].holds_ref = false;
                                 let was = state.serviceable();
                                 state.unref(now);
+                                log_ref_change("-ipc-close", conns[i].peer_pid, &state);
                                 if was && !state.serviceable() {
                                     agent_mux.queue_records(&proxy.close_all());
                                 }
@@ -1497,10 +1558,15 @@ fn mux_loop(
                 payload: b"session open timed out (no answer from the remote peer)".to_vec(),
             };
             let _ = send_mux_frame(c, MuxTag::SessionClose, &close.encode());
+            util::log_write(
+                "warn",
+                "session open timed out (no answer from the remote peer)",
+            );
             if c.holds_ref {
                 c.holds_ref = false;
                 let was = state.serviceable();
                 state.unref(now);
+                log_ref_change("-open-timeout", c.peer_pid, &state);
                 if was && !state.serviceable() {
                     agent_mux.queue_records(&proxy.close_all());
                 }

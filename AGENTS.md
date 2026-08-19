@@ -251,6 +251,23 @@ read-only, `debug` group):
   tail rides every message until acked, i.e. what cumulative-only ack actually
   costs (posh#142). Needs client dumps taken while forwarding was active
   (`debug-posh-dump`, or the palette's agent info).
+- `just debug-posh-mux-log` — the LOCAL mux daemons' state (posh#161 triage):
+  `posh mux ls`, each daemon socket's pid, and each always-on `mux/<key>.log`
+  tail, where the ref-lifecycle lines (which invocations pin the daemon,
+  when agent service stopped), wire recv errors, and the SIGUSR2 status dump
+  land. READ heard= carefully: an idle M1 remote sends nothing unprompted, so
+  a big heard age is NORMAL — `mux wire recv error` (ECONNREFUSED) is the
+  remote-death evidence. The mux daemon now handles SIGUSR2 (status dump);
+  before the posh#161 instrumentation the signal KILLED it.
+- `just debug-posh-mux-silence-repro <host>` — drive the posh#161 sequence
+  deterministically: SIGSTOP the local mux daemon past the remote's 15 s
+  agent fast-fail and 60 s exit timeout, SIGCONT, then print both sides'
+  evidence (local mux log; the remote agent dir + its persistent
+  `agent/mux-<client-id>.log`, which journals the fast-fail edge, the
+  `agent/sock` unlink, and the exit reason). CAUTION: stalls agent forwarding
+  (and any POSH_MUX_SESSIONS channels on that daemon) for the duration, and
+  the daemon stays a dead-wire zombie afterward until every local invocation
+  for the destination exits — that stranding IS the bug being instrumented.
 - `just debug-posh-net <peer-100.x>` / `debug-posh-pathloss <peer-100.x>` —
   explain a high `retransmit` rate by probing the network path: direct vs
   DERP-relayed Tailscale link, real ICMP loss/latency, socket drop counters,

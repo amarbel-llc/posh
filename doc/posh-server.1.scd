@@ -79,7 +79,12 @@ non-interactive PATH.
 	client's default-on _$POSH_MUX_ gate); not normally typed by hand. Flags precede
 	the verb, like *new*. It exits after a minute of peer silence — an
 	agent-only connection with a never-returning peer has nothing left
-	to serve.
+	to serve. Its lifecycle is journaled to a persistent, appending
+	per-client-host log beside its socket,
+	_<base>/agent/mux-<ID>.log_: startup, peer-silence and resume
+	edges, _agent/sock_ claim/release transitions, and the exit reason
+	(peer timeout vs. signal) — the remote-side timeline for a
+	forwarded-agent outage post-mortem.
 
 	*--client-id* _ID_ is required: it is the client-host identity the
 	election reports and the socket is named after, restricted to
@@ -180,7 +185,11 @@ _POSH_WEDGE_CAPTURE_
 	needs no startup flag, so it introspects an already-running server
 	when a session has wedged: the peer address and last-heard age
 	distinguish a roam the server has not re-pinned from one-way packet
-	loss or a dead client.
+	loss or a dead client. An *agent* mux peer answers with its own
+	shape — peer address, heard age, live and cumulative agent channel
+	counts, whether it still owns _agent/sock_, and its session-channel
+	count — appended to its persistent per-client-host log (see *agent*
+	above).
 
 *SIGHUP*
 	Ignored, so a hangup on the bootstrap ssh channel never reaps the

@@ -290,9 +290,17 @@ impl AgentEndpoint {
         &self.well_known
     }
 
+    /// This endpoint's own bound socket (`agent/<stem>.sock`). The agent-only
+    /// server derives its per-client-id log path from it (posh#161).
+    pub fn own_sock_path(&self) -> &Path {
+        &self.own_sock
+    }
+
     /// Atomically points `agent/sock` at our own `<stem>.sock`.
     fn claim_symlink(&self) -> Result<()> {
-        self.point_symlink_at(&format!("{}.sock", self.stem))
+        self.point_symlink_at(&format!("{}.sock", self.stem))?;
+        util::log_write("info", &format!("agent/sock claimed -> {}.sock", self.stem));
+        Ok(())
     }
 
     /// Atomically points `agent/sock` at `target` (a dir-relative socket
@@ -454,9 +462,13 @@ impl AgentEndpoint {
         match self.freshest_active_sibling() {
             Some(target) => {
                 let _ = self.point_symlink_at(&target);
+                util::log_write("info", &format!("agent/sock released: repointed -> {target}"));
             }
             None => {
                 let _ = std::fs::remove_file(&self.well_known);
+                // The moment SSH_AUTH_SOCK starts failing ENOENT host-wide
+                // (posh#161's second error phase) — worth a line of its own.
+                util::log_write("info", "agent/sock released: unlinked (no active sibling)");
             }
         }
     }
@@ -623,6 +635,14 @@ impl AgentEndpoint {
                     out.push(close_record(ch.id));
                 }
             }
+            if !out.is_empty() {
+                // posh#161's FIRST error phase: in-flight agent requests die
+                // here ("communication with agent failed" / SIGPIPE).
+                util::log_write(
+                    "info",
+                    &format!("peer inactive: fast-failed {} open agent channel(s)", out.len()),
+                );
+            }
             self.reap_closed();
         }
         out
@@ -667,6 +687,7 @@ impl AgentEndpoint {
             };
             if dead {
                 let _ = std::fs::remove_file(&path);
+                util::log_write("info", &format!("agent gc: reaped {}", path.display()));
             }
         }
     }
@@ -681,6 +702,10 @@ impl Drop for AgentEndpoint {
         if let Ok(target) = std::fs::read_link(&self.well_known) {
             if self.dir.join(target) == self.own_sock {
                 let _ = std::fs::remove_file(&self.well_known);
+                util::log_write(
+                    "info",
+                    &format!("endpoint drop: unlinked agent/sock (pointed at {}.sock)", self.stem),
+                );
             }
         }
         let _ = std::fs::remove_file(&self.own_sock);

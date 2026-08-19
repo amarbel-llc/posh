@@ -50,9 +50,23 @@ The client writes to a **file, never the tty** — its stdout is the alternate-
 screen TUI and its stderr is the user's outer shell, so either would corrupt the
 display.
 
-`just debug-posh-dump <pid>` wraps the `kill -USR2` + tail. Implementation:
-`remote/diag.rs`; documented under SIGNALS in `posh-server`(1) / `posh-client`(1)
-and the debugging notes in this repo's `CLAUDE.md`.
+Since the posh#161 instrumentation the two mux halves answer `SIGUSR2` too,
+each to its own always-on log rather than the per-pid diag sink:
+
+- the **local mux daemon** (`remote/mux.rs::mux_loop`) appends the same status
+  line `posh mux ls` prints, to `<base>/mux/<key>.log`. Installing the handler
+  is itself load-bearing: without it the default disposition would *terminate*
+  the daemon — and with it agent forwarding for every session to that
+  destination.
+- the **agent-only remote** (`posh-server agent`, `remote/server.rs::
+  mux_peer_loop`) appends peer address, heard age, live/cumulative agent
+  channel counts, `agent/sock` ownership, and session-channel count, to its
+  persistent `agent/mux-<client-id>.log`.
+
+`just debug-posh-dump <pid>` wraps the `kill -USR2` + tail for the roaming
+server/client; `just debug-posh-mux-log` reads the mux daemon side.
+Implementation: `remote/diag.rs`; documented under SIGNALS in `posh-server`(1)
+/ `posh-client`(1) and the debugging notes in this repo's `CLAUDE.md`.
 
 ## Examples
 

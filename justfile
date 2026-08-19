@@ -1333,6 +1333,97 @@ debug-posh-mux-repro-stop host="":
     fi
     echo "stopped"
 
+# Read the LOCAL per-destination mux daemons' state (posh#161 triage): the
+# `posh mux ls` status lines, each daemon socket's owning pid, and each
+# daemon's always-on log — where the new ref-lifecycle (+ipc-ref/-conn-drop),
+# wire-recv-error, and SIGUSR2 status lines land. Read-only. NOTE: on a
+# healthy IDLE M1 connection the remote sends nothing unprompted, so a large
+# heard= age is NORMAL; the `mux wire recv error` lines (ECONNREFUSED = the
+# remote endpoint's port is gone) are the remote-death evidence, not the age.
+#
+# read local mux daemon status, pids, and log tails
+[group("debug")]
+debug-posh-mux-log lines="40":
+    #!/usr/bin/env bash
+    set -uo pipefail
+    uid="$(id -u)"
+    base="${POSH_DIR:-${XDG_RUNTIME_DIR:-/run/user/$uid}/posh}"
+    dir="$base/mux"
+    echo "== posh mux ls =="
+    posh mux ls || true
+    echo
+    echo "== daemon sockets -> pids =="
+    found=0
+    for s in "$dir"/*.sock; do
+      [ -e "$s" ] || continue
+      found=1
+      pid="$(ss -xlp 2>/dev/null | grep -F "$s" | grep -o 'pid=[0-9]*' | head -1 || true)"
+      echo "$s ${pid:-pid=?}"
+    done
+    [ "$found" = 1 ] || echo "(no mux sockets under $dir)"
+    echo
+    for f in "$dir"/*.log; do
+      [ -e "$f" ] || { echo "(no mux logs under $dir)"; break; }
+      echo "--- $f"
+      tail -n {{ lines }} "$f"
+      echo
+    done
+    exit 0
+
+# Drive the posh#161 sequence DETERMINISTICALLY, no network fault needed:
+# SIGSTOP the local mux daemon for <secs> (default 75 — past the remote's 15 s
+# agent fast-fail AND its 60 s PEER_TIMEOUT exit), then SIGCONT and print both
+# sides' evidence: the local mux log (recv errors after resume = the remote
+# port died) and the remote agent dir + its persistent mux-<client-id>.log
+# (the fast-fail edge, the agent/sock unlink, and the exit-reason line).
+# CAUTION — this stalls agent forwarding and any POSH_MUX_SESSIONS channels
+# riding this daemon for the duration (plain per-connection sessions are
+# unaffected), and until the reconnect gap is fixed the daemon stays a zombie
+# afterward: recovery needs every local invocation for the destination to
+# exit (refs=0 + linger) so a fresh spawn re-bootstraps.
+#
+# reproduce the posh#161 silence sequence against a live mux daemon
+[group("debug")]
+debug-posh-mux-silence-repro host secs="75" key="":
+    #!/usr/bin/env bash
+    set -euo pipefail
+    uid="$(id -u)"
+    base="${POSH_DIR:-${XDG_RUNTIME_DIR:-/run/user/$uid}/posh}"
+    dir="$base/mux"
+    k='{{ key }}'
+    if [ -z "$k" ]; then
+      socks=("$dir"/*.sock)
+      [ -e "${socks[0]}" ] || { echo "no mux daemon under $dir" >&2; exit 1; }
+      [ "${#socks[@]}" = 1 ] || { echo "several mux daemons under $dir; pass key=<name> (one of: ${socks[*]##*/})" >&2; exit 1; }
+      sock="${socks[0]}"
+    else
+      sock="$dir/$k.sock"
+      [ -e "$sock" ] || { echo "no such mux socket: $sock" >&2; exit 1; }
+    fi
+    pid="$(ss -xlp 2>/dev/null | grep -F "$sock" | grep -o 'pid=[0-9]*' | head -1 | cut -d= -f2 || true)"
+    [ -n "$pid" ] || { echo "cannot resolve the owning pid of $sock (ss -xlp)" >&2; exit 1; }
+    echo "== remote agent dir BEFORE (on {{ host }}) =="
+    ssh {{ host }} 'ls -l --time-style=full-iso "/run/user/$(id -u)/posh/agent/" 2>/dev/null || echo "(no agent dir)"'
+    echo
+    echo ">> SIGSTOP mux daemon pid=$pid ($sock) for {{ secs }}s…"
+    kill -STOP "$pid"
+    sleep '{{ secs }}'
+    kill -CONT "$pid"
+    echo ">> resumed; giving the daemon a beat, then dumping its status (SIGUSR2)"
+    sleep 2
+    kill -USR2 "$pid" 2>/dev/null || echo "(daemon died while stopped?)"
+    sleep 1
+    echo
+    echo "== local mux daemon log tail =="
+    tail -n 30 "${sock%.sock}.log" 2>/dev/null || echo "(no log at ${sock%.sock}.log)"
+    echo
+    echo "== remote agent dir AFTER =="
+    ssh {{ host }} 'ls -l --time-style=full-iso "/run/user/$(id -u)/posh/agent/" 2>/dev/null || echo "(no agent dir)"'
+    echo
+    echo "== remote agent-endpoint log (persists across the endpoint exit) =="
+    ssh {{ host }} 'tail -n 30 "/run/user/$(id -u)/posh/agent/"mux-*.log 2>/dev/null || echo "(no agent log — remote posh predates the posh#161 instrumentation?)"'
+    exit 0
+
 # Probe whether ~1400-byte datagrams actually traverse the path to a peer
 # (posh fragments to ~1400B; tailscale's MTU is 1280, so oversized datagrams
 # depend on IP-layer fragmentation the path may not deliver). Sends ICMP at

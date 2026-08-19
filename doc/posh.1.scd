@@ -193,7 +193,14 @@ Local persistence over Unix sockets.
 	is the fallback breadcrumb: every "falling back to a
 	per-invocation connection" warning is also written to the debug
 	log (tag _mux-fallback_) when a sink is armed, so a soak's
-	fallback count is one grep.
+	fallback count is one grep. The daemon also keeps an always-on
+	log beside its socket (_<base>/mux/<key>.log_): session-ref
+	transitions (which invocations hold it alive, and when agent
+	service stopped), wire receive errors (an exited remote endpoint
+	surfaces there as connection-refused — the remote-death signal an
+	idle connection's heard age cannot give, since an idle remote
+	legitimately sends nothing), and, on *SIGUSR2*, the same status
+	line *mux ls* prints.
 
 # REMOTE COMMANDS
 
