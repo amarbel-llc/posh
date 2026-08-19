@@ -259,6 +259,15 @@ read-only, `debug` group):
   a big heard age is NORMAL — `mux wire recv error` (ECONNREFUSED) is the
   remote-death evidence. The mux daemon now handles SIGUSR2 (status dump);
   before the posh#161 instrumentation the signal KILLED it.
+- **Server introspection (RFC 0013)** — "what build/state is the far end"
+  no longer needs `/proc` spelunking: the palette's *About / transport info*
+  shows the connected server's build + uptime (always) and its live state
+  (fetched on demand while the dialog's 10 s request window is armed);
+  `posh mux ls` shows each remote endpoint's build (`remote=`); and on a
+  host SERVING other machines' agents, `posh ls` lists each mux peer's
+  status line read from `agent/mux-<id>.status.sock` (connect → one line →
+  EOF). All additive caps (ids 13/14) — an old peer on either side just
+  reads `unknown`.
 - `just debug-posh-mux-silence-repro <host>` — drive the posh#161 sequence
   deterministically: SIGSTOP the local mux daemon past the remote's 15 s
   agent fast-fail and 60 s exit timeout, SIGCONT, then print both sides'

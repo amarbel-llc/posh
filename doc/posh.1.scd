@@ -129,7 +129,10 @@ Local persistence over Unix sockets.
 	When stdout is a terminal the default output is a styled table
 	with a state-colored status dot (attached, detached, or stale)
 	and the working directory and command of each session, followed
-	by any live per-destination mux endpoints (the *mux ls* lines) —
+	by any live per-destination mux endpoints (the *mux ls* lines)
+	and, on a host that SERVES other machines' forwarded agents, one
+	status line per mux-peer status socket (build, peer, heard age,
+	channel counts, _agent/sock_ ownership — RFC 0013 §4) —
 	the unified "what is posh doing on this machine" view; when
 	piped it is plain tab-separated lines, unchanged for scripts,
 	with no mux section. *--short* prints names only; *--json*
@@ -182,10 +185,12 @@ Local persistence over Unix sockets.
 
 *mux* *ls*
 	One status line per live per-destination mux endpoint: state,
-	peer address, last-heard age, channel count, session refs,
-	linger state, and the congestion summary (cwnd, cuts, deepest
-	backoff streak). The daily health check for a
-	_$POSH_MUX_SESSIONS_ soak. Probing rides the observer path — no
+	peer address, the remote endpoint's build (_remote=version
+	(sha)_, learned over the heartbeat identity exchange —
+	_unknown_ against a pre-RFC-0013 remote), last-heard age,
+	channel count, session refs, linger state, and the congestion
+	summary (cwnd, cuts, deepest backoff streak). The daily health
+	check for a _$POSH_MUX_SESSIONS_ soak. Probing rides the observer path — no
 	session ref is taken and the endpoint's linger clock is
 	untouched. A socket whose daemon died without unlinking is
 	flagged _stale_; a pre-upgrade daemon still serving its old

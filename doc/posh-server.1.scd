@@ -84,7 +84,15 @@ non-interactive PATH.
 	_<base>/agent/mux-<ID>.log_: startup, peer-silence and resume
 	edges, _agent/sock_ claim/release transitions, and the exit reason
 	(peer timeout vs. signal) — the remote-side timeline for a
-	forwarded-agent outage post-mortem.
+	forwarded-agent outage post-mortem. It also answers introspection
+	(RFC 0013): a daemon heartbeat requesting the server's identity
+	gets back its build (version, git sha, pid, start time) on the
+	same channel — what the client's *mux ls* shows as _remote=_ —
+	and a local status socket beside the agent one,
+	_<base>/agent/mux-<ID>.status.sock_, answers each connection with
+	one status line (identity, peer, heard age, channel counts,
+	_agent/sock_ ownership) and closes; the host's *posh list* reads
+	it as the remote-endpoints section.
 
 	*--client-id* _ID_ is required: it is the client-host identity the
 	election reports and the socket is named after, restricted to
