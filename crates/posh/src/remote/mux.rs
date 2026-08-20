@@ -437,6 +437,10 @@ pub enum MuxConnState {
     Connected = 1,
     /// Superseded (stamp mismatch) or winding down: serving no new refs.
     Draining = 2,
+    /// The wire died after a successful bootstrap (probe verdict or resume
+    /// gap, posh#162); the daemon is re-establishing it while still serving
+    /// refs. Forwarding resumes on the next successful establish.
+    Reconnecting = 3,
 }
 
 impl MuxConnState {
@@ -445,6 +449,7 @@ impl MuxConnState {
             0 => MuxConnState::Bootstrapping,
             1 => MuxConnState::Connected,
             2 => MuxConnState::Draining,
+            3 => MuxConnState::Reconnecting,
             _ => return None,
         })
     }
@@ -454,6 +459,7 @@ impl MuxConnState {
             MuxConnState::Bootstrapping => "bootstrapping",
             MuxConnState::Connected => "connected",
             MuxConnState::Draining => "draining",
+            MuxConnState::Reconnecting => "reconnecting",
         }
     }
 }
@@ -896,6 +902,96 @@ fn drop_ipc_conn(conn: &IpcConn, state: &mut MuxState, now: u64) {
     if conn.holds_ref {
         state.unref(now);
         log_ref_change("-conn-drop", conn.peer_pid, state);
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Wire liveness (posh#162): the probe-based death verdict and its triggers.
+// The 2026-08-20 incident proved socket errors cannot be the verdict — the
+// daemon heartbeated a closed remote port for over an hour without a single
+// recv error (posh#163 tracks where those errors go) — so liveness is decided
+// by a POSITIVE probe: once the wire is in doubt each heartbeat re-requests
+// the RFC 0013 §3 ident, and a live remote's answer (any sealed inbound)
+// clears the doubt. Everything here is pure and clock-free — the loop feeds
+// `now`/`last_heard`, the tests feed literals.
+
+/// Silence that puts the wire in doubt and starts the probe. Mirrors the
+/// remote's agent fast-fail window
+/// ([`AGENT_PEER_ACTIVE`](crate::remote::agent::AGENT_PEER_ACTIVE)): by the
+/// time we probe, a live-but-unheard-from remote has already begun
+/// fast-failing agent opens toward us.
+const PROBE_SILENCE_MS: u64 = 15_000;
+
+/// How long an unanswered probe rides before the dead verdict — a few
+/// heartbeat round trips past the first request.
+const PROBE_TIMEOUT_MS: u64 = 10_000;
+
+/// The wall-vs-monotonic gap that reads as a suspend (the monotonic clock
+/// freezes across one). Anything past a couple of missed heartbeats cannot
+/// be scheduler jitter.
+const SUSPEND_GAP_MIN_MS: u64 = 2 * HEARTBEAT_INTERVAL;
+
+/// The posh#162 probe state machine. Default state is "no doubt".
+#[derive(Debug, Default)]
+struct WireLiveness {
+    /// When the current probe episode began (the first in-doubt heartbeat).
+    probe_started: Option<u64>,
+}
+
+impl WireLiveness {
+    /// Sealed inbound arrived: the doubt (and any running probe) clears.
+    fn heard(&mut self) {
+        self.probe_started = None;
+    }
+
+    /// Whether THIS heartbeat should carry the ident request: true from the
+    /// moment silence crosses [`PROBE_SILENCE_MS`] until the doubt clears or
+    /// the verdict lands. Arms the probe deadline on the first true.
+    fn probe_due(&mut self, now: u64, last_heard: u64) -> bool {
+        if now.saturating_sub(last_heard) < PROBE_SILENCE_MS {
+            return false;
+        }
+        if self.probe_started.is_none() {
+            self.probe_started = Some(now);
+        }
+        true
+    }
+
+    /// The death verdict: a probe has run unanswered past its deadline.
+    fn dead(&self, now: u64) -> bool {
+        self.probe_started
+            .is_some_and(|t| now.saturating_sub(t) >= PROBE_TIMEOUT_MS)
+    }
+
+    /// Force the verdict NOW (the resume fast path: a suspend gap past the
+    /// remote's peer timeout proves the endpoint already exited) — backdates
+    /// the probe so [`dead`](Self::dead) reports true immediately.
+    fn condemn(&mut self, now: u64) {
+        self.probe_started = Some(now.saturating_sub(PROBE_TIMEOUT_MS));
+    }
+}
+
+/// The resume detector (posh#162 incident, Finding 2): `now_ms` is
+/// `Instant`-based (CLOCK_MONOTONIC) and freezes across suspend, so a
+/// wall-clock delta far beyond the monotonic delta between two loop
+/// iterations means the host slept in between. Returns the invisible gap
+/// once it crosses [`SUSPEND_GAP_MIN_MS`].
+fn suspend_gap(wall_delta_ms: u64, mono_delta_ms: u64) -> Option<u64> {
+    let gap = wall_delta_ms.saturating_sub(mono_delta_ms);
+    (gap >= SUSPEND_GAP_MIN_MS).then_some(gap)
+}
+
+/// Reconnect backoff (attempt 0 = the immediate first try). Ramps quickly
+/// while an ssh blip may clear, then caps at a minute so a long outage keeps
+/// retrying at a polite cadence for as long as refs are held (refs hitting
+/// zero mid-reconnect hands over to the normal linger/exit).
+fn reconnect_backoff_ms(attempt: u32) -> u64 {
+    match attempt {
+        0 => 0,
+        1 => 2_000,
+        2 => 5_000,
+        3 => 15_000,
+        _ => 60_000,
     }
 }
 
@@ -2423,6 +2519,7 @@ mod tests {
             MuxConnState::Bootstrapping,
             MuxConnState::Connected,
             MuxConnState::Draining,
+            MuxConnState::Reconnecting,
         ] {
             let ack = MuxHelloAck {
                 state,
@@ -2665,6 +2762,14 @@ mod tests {
         ] {
             assert!(line.contains(needle), "{needle:?} missing from {line:?}");
         }
+        // A reconnecting ctx renders its state truthfully (posh#162: the
+        // status must stop claiming `connected` on a dead wire).
+        let mut reconnecting = test_ctx("example.com-4");
+        reconnecting.conn_state = MuxConnState::Reconnecting;
+        assert!(
+            status_line(&reconnecting, &state).contains("state=reconnecting"),
+            "the Reconnecting label must reach the status line"
+        );
 
         // Dropping the IPC connection auto-unrefs (crashed client safety).
         drop(client);
@@ -2894,6 +2999,52 @@ mod tests {
         assert_eq!(parse_linger_ms(Some("0")), 0);
         assert_eq!(parse_linger_ms(Some("5")), 5_000);
         assert_eq!(parse_linger_ms(Some(" 120 ")), 120_000);
+    }
+
+    #[test]
+    fn wire_liveness_probes_after_silence_and_verdicts_on_deadline() {
+        let mut live = WireLiveness::default();
+        // Quiet but under the silence threshold: no probe, no verdict.
+        assert!(!live.probe_due(PROBE_SILENCE_MS - 1, 0));
+        assert!(!live.dead(PROBE_SILENCE_MS - 1));
+        // Threshold crossed: every heartbeat probes; the deadline arms once,
+        // at the FIRST in-doubt heartbeat, not per request.
+        assert!(live.probe_due(15_000, 0));
+        assert!(live.probe_due(18_000, 0));
+        assert!(!live.dead(15_000 + PROBE_TIMEOUT_MS - 1));
+        assert!(live.dead(15_000 + PROBE_TIMEOUT_MS), "unanswered past the deadline");
+        // An answer clears the doubt (and the armed deadline) entirely.
+        live.heard();
+        assert!(!live.dead(60_000));
+        assert!(!live.probe_due(60_000, 59_000));
+        // condemn(): the resume fast path is an immediate verdict.
+        live.condemn(70_000);
+        assert!(live.dead(70_000));
+    }
+
+    #[test]
+    fn suspend_gap_reads_only_a_frozen_monotonic_clock() {
+        assert_eq!(suspend_gap(1_000, 1_000), None, "clocks agree: no gap");
+        assert_eq!(
+            suspend_gap(SUSPEND_GAP_MIN_MS + 99, 100),
+            None,
+            "under two heartbeats of divergence is jitter"
+        );
+        assert_eq!(suspend_gap(SUSPEND_GAP_MIN_MS + 100, 100), Some(SUSPEND_GAP_MIN_MS));
+        // A real overnight suspend: hours of wall time, ms of monotonic —
+        // the posh#162 incident shape.
+        assert_eq!(suspend_gap(34_200_000, 50), Some(34_199_950));
+        assert_eq!(suspend_gap(100, 34_200_000), None, "mono ahead never reads as suspend");
+    }
+
+    #[test]
+    fn reconnect_backoff_ramps_and_caps() {
+        assert_eq!(reconnect_backoff_ms(0), 0, "the first retry is immediate");
+        assert_eq!(reconnect_backoff_ms(1), 2_000);
+        assert_eq!(reconnect_backoff_ms(2), 5_000);
+        assert_eq!(reconnect_backoff_ms(3), 15_000);
+        assert_eq!(reconnect_backoff_ms(4), 60_000);
+        assert_eq!(reconnect_backoff_ms(u32::MAX), 60_000, "capped forever");
     }
 
     /// A private 0700 base dir with a SHORT path (the `agent.rs` `temp_base`
