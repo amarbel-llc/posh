@@ -1938,10 +1938,21 @@ mod tests {
         // enveloped path.
         let consumer_deadline = now_ms() + 5_000;
         let mut consumer = loop {
-            if let Ok(s) = UnixStream::connect(&agent_sock) {
-                break s;
+            match UnixStream::connect(&agent_sock) {
+                Ok(s) => break s,
+                Err(e) => assert!(
+                    now_ms() < consumer_deadline,
+                    "agent/sock never became connectable: {e} \
+                     (path {agent_sock:?}, symlink exists: {}, target: {:?}, \
+                     relay thread finished: {}, dir: {:?})",
+                    agent_sock.symlink_metadata().is_ok(),
+                    std::fs::read_link(&agent_sock),
+                    relay.is_finished(),
+                    std::fs::read_dir(base.join("agent")).map(|d| d
+                        .filter_map(|e| e.ok().map(|e| e.file_name()))
+                        .collect::<Vec<_>>()),
+                ),
             }
-            assert!(now_ms() < consumer_deadline, "agent/sock never became connectable");
             std::thread::sleep(Duration::from_millis(20));
         };
         consumer.write_all(AGENT_REQUEST).unwrap();

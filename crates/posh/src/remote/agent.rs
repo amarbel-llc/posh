@@ -320,7 +320,14 @@ impl AgentEndpoint {
             status_pidfile,
             channels: Vec::new(),
             next_channel_id: 1,
-            last_tick: 0,
+            // Seed the slow-tick gate from NOW, not 0: the startup grace
+            // ("a fresh endpoint keeps its construction-time claim until the
+            // slow tick") is per-ENDPOINT. `now_ms()` is process-global, so
+            // a 0 seed gave zero grace to any endpoint constructed later
+            // than AGENT_SLOW_TICK_MS into the process — its first inactive
+            // tick released agent/sock before the peer's first datagram
+            // could arrive (surfaced by suite-order shift, posh#162 work).
+            last_tick: crate::util::now_ms(),
             last_peer_active: None,
         };
         endpoint.claim_symlink()?;
@@ -2227,6 +2234,35 @@ mod tests {
         assert!(
             std::fs::symlink_metadata(ep.sock_path()).is_err(),
             "the slow tick releases a peer that never appeared"
+        );
+        drop(ep);
+        std::fs::remove_dir_all(&base).ok();
+    }
+
+    // The startup grace above is per-ENDPOINT, not per-process: `now_ms()`
+    // is global (ms since the process's first call), so the old `last_tick:
+    // 0` seed gave ZERO grace to an endpoint constructed later than
+    // AGENT_SLOW_TICK_MS into the process — its very first inactive tick was
+    // a slow tick and released the construction claim before the peer's
+    // first datagram could arrive. (Surfaced as a deterministic suite-order
+    // failure of relay's enveloped test during the posh#162 work: a 4 s
+    // test shifted its construction past the 5 s mark.)
+    #[test]
+    fn construction_seeds_the_slow_tick_grace_from_now() {
+        let base = temp_base();
+        let mut ep = AgentEndpoint::new_with_id(&base, 1).unwrap();
+        let now = crate::util::now_ms();
+        assert!(
+            now.saturating_sub(ep.last_tick) < AGENT_SLOW_TICK_MS,
+            "last_tick must seed from construction time, not 0 (got {}, now {now})",
+            ep.last_tick
+        );
+        // The practical consequence: an immediate inactive tick at the REAL
+        // clock is still inside the grace — the construction claim survives.
+        ep.tick(false, now);
+        assert!(
+            ep.symlink_points_to_self(),
+            "an endpoint constructed late in a process keeps its startup grace"
         );
         drop(ep);
         std::fs::remove_dir_all(&base).ok();
