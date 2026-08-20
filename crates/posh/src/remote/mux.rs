@@ -1797,9 +1797,11 @@ fn mux_loop(
                         reconnect = None;
                         // A fresh wire: immediate first heartbeat (which
                         // re-requests the cleared ident) and a fresh silence
-                        // grace before any new probe.
+                        // grace before any new probe. now_ms(), not `now`:
+                        // the establish above can take seconds (ssh), and a
+                        // stale reading would eat into the grace.
                         last_send = None;
-                        last_heard = now;
+                        last_heard = now_ms();
                         liveness.heard();
                     }
                     Err(e) => {
@@ -3685,7 +3687,6 @@ mod tests {
 
         drop(ipc); // refs -> 0, linger 0: the daemon exits
         daemon.join().unwrap();
-        drop(server1);
         std::fs::remove_dir_all(&dir).ok();
     }
 
