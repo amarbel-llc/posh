@@ -1649,6 +1649,17 @@ debug-posh-list-table:
     target/debug/posh attach --detach beta -- sleep 60 >/dev/null
     script -qec "$PWD/target/debug/posh list" /dev/null
 
+# Run the INSTALLED posh's `list` against the real socket dir under a fake TTY
+# (util-linux `script`), so the tty-gated mux + remote-endpoints sections
+# (RFC 0013 §4) print headlessly. The agent dev-loop check for "which peers is
+# this host serving, on what build" — the isolated-table twin is
+# debug-posh-list-table.
+#
+# print the real host's posh list (mux + remote-endpoints sections) headlessly
+[group("debug")]
+debug-posh-ls:
+    script -qec "posh list" /dev/null
+
 # Spin up ONE fresh roaming server for hand-testing the command palette, with NO
 # ambient paths. Kills any lingering posh servers, builds the hermetic toolset
 # (absolute /nix/store paths; posh + posh-palette co-installed so Ctrl-^ finds the
