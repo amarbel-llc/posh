@@ -254,10 +254,18 @@ read-only, `debug` group):
 - `just debug-posh-mux-log` — the LOCAL mux daemons' state (posh#161 triage):
   `posh mux ls`, each daemon socket's pid, and each always-on `mux/<key>.log`
   tail, where the ref-lifecycle lines (which invocations pin the daemon,
-  when agent service stopped), wire recv errors, and the SIGUSR2 status dump
-  land. READ heard= carefully: an idle M1 remote sends nothing unprompted, so
-  a big heard age is NORMAL — `mux wire recv error` (ECONNREFUSED) is the
-  remote-death evidence. The mux daemon now handles SIGUSR2 (status dump);
+  when agent service stopped), wire recv errors, the posh#162 liveness edges
+  (`mux wire dead`, `resume gap`, per-attempt reconnect lines), and the
+  SIGUSR2 status dump land. READ heard= carefully: an idle M1 remote sends
+  nothing unprompted AND heard-age is CLOCK_MONOTONIC (frozen across
+  suspend), so it under-counts and proves nothing by itself. Since the
+  posh#162 reconnect, a silent wire is probed (ident re-request after 15 s,
+  dead verdict 10 s unanswered) and the daemon self-heals — a persistent
+  `state=reconnecting` with climbing attempt numbers means the REMOTE side
+  cannot be re-established (ssh path down, old posh-server without the
+  `agent` verb), not a wedged daemon. Do NOT rely on `mux wire recv error`
+  as the death signal: the 2026-08-20 incident produced none against a
+  closed port (posh#163). The mux daemon handles SIGUSR2 (status dump);
   before the posh#161 instrumentation the signal KILLED it.
 - **Server introspection (RFC 0013)** — "what build/state is the far end"
   no longer needs `/proc` spelunking: the palette's *About / transport info*
@@ -274,9 +282,11 @@ read-only, `debug` group):
   evidence (local mux log; the remote agent dir + its persistent
   `agent/mux-<client-id>.log`, which journals the fast-fail edge, the
   `agent/sock` unlink, and the exit reason). CAUTION: stalls agent forwarding
-  (and any POSH_MUX_SESSIONS channels on that daemon) for the duration, and
-  the daemon stays a dead-wire zombie afterward until every local invocation
-  for the destination exits — that stranding IS the bug being instrumented.
+  (and any POSH_MUX_SESSIONS channels on that daemon) for the duration.
+  Since the posh#162 reconnect the daemon is NOT stranded afterward: the
+  probe verdict (or the SIGCONT resume gap) condemns the dead wire and the
+  daemon re-bootstraps a fresh remote endpoint on its own — the repro now
+  demonstrates the self-heal rather than the historical zombie.
 - `just debug-posh-net <peer-100.x>` / `debug-posh-pathloss <peer-100.x>` —
   explain a high `retransmit` rate by probing the network path: direct vs
   DERP-relayed Tailscale link, real ICMP loss/latency, socket drop counters,

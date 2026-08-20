@@ -169,6 +169,34 @@ lingering (`MuxState::serviceable`), so no consent surface is required for
 it. Should a serviceable standing connection ever be wanted, THIS record
 must first specify its flag surface and consent semantics.
 
+### Wire reconnect (2026-08-20, posh#162): the endpoint survives remote loss
+
+The M1 daemon originally established its wire exactly once; a remote that
+timed out and exited (its 60 s peer silence — e.g. the client host
+suspending) left a zombie: a daemon serving refs forever, forwarding
+nothing, absorbing every new invocation, reporting `state=connected` and a
+stale `remote=` ident. The 2026-08-20 incident (documented on posh#162)
+proved the failure live for ten hours — and proved that **socket errors
+cannot be the death signal**: ~1500 heartbeats into a closed port produced
+zero recv errors (posh#163 tracks where they go).
+
+The fix, landed 2026-08-20: liveness is a **positive probe** — after 15 s
+of wire silence each heartbeat re-requests the RFC 0013 §3 ident (a held
+ident proves nothing about the wire staying alive), and 10 s unanswered is
+the dead verdict. A **resume fast path** detects suspend directly (wall
+clock racing the frozen CLOCK_MONOTONIC between loop iterations) and
+condemns the wire without a probe when the gap exceeds the remote's 60 s
+peer timeout — the endpoint has provably exited by then. On the verdict the
+daemon tears down channel state once (agent channels failed, M2 session
+conns get their SessionClose fallback cue, the held ident cleared), reports
+`reconnecting`, and re-runs the ssh establish on a capped backoff
+(0/2/5/15/60 s) for as long as refs are held — refs-to-zero still hands
+over to the normal linger/exit. The IPC surface keeps serving throughout,
+so invocations ride through remote loss, network outages, and
+suspend/resume with at most a forwarding blip.
+`remote::mux::tests::dead_wire_verdict_reconnects_and_relearns_the_ident`
+pins the whole cycle in-process.
+
 ### Decision (2026-07-28, RATIFIED): the two-client-host policy
 
 RFC 0011 §8 defers to this record the case single ownership does not cover: the
@@ -247,7 +275,11 @@ override remains unimplemented (MAY).
   versus today's per-connection endpoints, where one dying only loses its own
   election. Mitigated by the same respawn/liveness discipline the session
   daemons use, but it is a real trade of "many small independent owners" for "one
-  stable shared owner."
+  stable shared owner." The worst realization of this — the remote half dying
+  and the local daemon zombifying forever (posh#161/#162) — is closed by the
+  2026-08-20 wire reconnect above; the local daemon dying outright remains
+  covered by the spawner's respawn (a dead socket is reclaimed by the next
+  invocation).
 - **Single ownership holds per client host, not across two.** This is the
   limitation the chosen path does NOT remove, and it is now the substance of this
   record. One connection per client-host pair means one endpoint — but a user

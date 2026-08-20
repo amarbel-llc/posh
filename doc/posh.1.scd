@@ -184,13 +184,16 @@ Local persistence over Unix sockets.
 	remote _host_*:* sessions, ssh hosts) without manual sourcing.
 
 *mux* *ls*
-	One status line per live per-destination mux endpoint: state,
-	peer address, the remote endpoint's build (_remote=version
-	(sha)_, learned over the heartbeat identity exchange —
-	_unknown_ against a pre-RFC-0013 remote), last-heard age,
-	channel count, session refs, linger state, and the congestion
-	summary (cwnd, cuts, deepest backoff streak). The daily health
-	check for a _$POSH_MUX_SESSIONS_ soak. Probing rides the observer path — no
+	One status line per live per-destination mux endpoint: state
+	(_connected_, or _reconnecting_ while the daemon re-establishes
+	a wire it has judged dead), peer address, the remote endpoint's
+	build (_remote=version (sha)_, learned over the heartbeat
+	identity exchange — _unknown_ against a pre-RFC-0013 remote,
+	and again during a reconnect, when the held identity is
+	discarded until the new wire answers), last-heard age, channel
+	count, session refs, linger state, and the congestion summary
+	(cwnd, cuts, deepest backoff streak). The daily health check
+	for a _$POSH_MUX_SESSIONS_ soak. Probing rides the observer path — no
 	session ref is taken and the endpoint's linger clock is
 	untouched. A socket whose daemon died without unlinking is
 	flagged _stale_; a pre-upgrade daemon still serving its old
@@ -201,11 +204,19 @@ Local persistence over Unix sockets.
 	fallback count is one grep. The daemon also keeps an always-on
 	log beside its socket (_<base>/mux/<key>.log_): session-ref
 	transitions (which invocations hold it alive, and when agent
-	service stopped), wire receive errors (an exited remote endpoint
-	surfaces there as connection-refused — the remote-death signal an
-	idle connection's heard age cannot give, since an idle remote
-	legitimately sends nothing), and, on *SIGUSR2*, the same status
-	line *mux ls* prints.
+	service stopped), wire receive errors, the wire-liveness edges
+	(probe verdicts, resume gaps, each reconnect attempt and the
+	reconnected line), and, on *SIGUSR2*, the same status line
+	*mux ls* prints. A silent wire is judged by a positive probe,
+	not by socket errors or heard age: after 15 s of silence each
+	heartbeat re-requests the remote identity, and 10 s unanswered
+	condemns the wire — the daemon then reconnects on a capped
+	backoff for as long as invocations hold refs, so agent
+	forwarding survives remote loss, network outages, and
+	suspend/resume without a new session. A resume from suspend is
+	detected directly (wall clock racing the monotonic clock) and
+	skips straight to reconnecting when the gap exceeds the
+	remote's 60 s peer timeout.
 
 # REMOTE COMMANDS
 
