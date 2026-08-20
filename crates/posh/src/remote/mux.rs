@@ -931,43 +931,71 @@ const PROBE_TIMEOUT_MS: u64 = 10_000;
 /// be scheduler jitter.
 const SUSPEND_GAP_MIN_MS: u64 = 2 * HEARTBEAT_INTERVAL;
 
-/// The posh#162 probe state machine. Default state is "no doubt".
-#[derive(Debug, Default)]
+/// The posh#162 probe state machine. Fresh state is "no doubt"; the
+/// thresholds are fields so [`mux_loop`] tests can compress them
+/// ([`with_thresholds`](Self::with_thresholds)) while production takes the
+/// constants via `Default`.
+#[derive(Debug)]
 struct WireLiveness {
+    silence_ms: u64,
+    timeout_ms: u64,
     /// When the current probe episode began (the first in-doubt heartbeat).
     probe_started: Option<u64>,
 }
 
+impl Default for WireLiveness {
+    fn default() -> Self {
+        Self::with_thresholds(PROBE_SILENCE_MS, PROBE_TIMEOUT_MS)
+    }
+}
+
 impl WireLiveness {
+    fn with_thresholds(silence_ms: u64, timeout_ms: u64) -> Self {
+        WireLiveness {
+            silence_ms,
+            timeout_ms,
+            probe_started: None,
+        }
+    }
+
     /// Sealed inbound arrived: the doubt (and any running probe) clears.
     fn heard(&mut self) {
         self.probe_started = None;
     }
 
     /// Whether THIS heartbeat should carry the ident request: true from the
-    /// moment silence crosses [`PROBE_SILENCE_MS`] until the doubt clears or
-    /// the verdict lands. Arms the probe deadline on the first true.
+    /// moment the wire is in doubt (silence crossing the threshold, or an
+    /// explicit [`doubt`](Self::doubt)) until the doubt clears or the
+    /// verdict lands. Arms the probe deadline on the first true.
     fn probe_due(&mut self, now: u64, last_heard: u64) -> bool {
-        if now.saturating_sub(last_heard) < PROBE_SILENCE_MS {
+        if self.probe_started.is_some() {
+            return true;
+        }
+        if now.saturating_sub(last_heard) < self.silence_ms {
             return false;
         }
-        if self.probe_started.is_none() {
-            self.probe_started = Some(now);
-        }
+        self.probe_started = Some(now);
         true
+    }
+
+    /// Put the wire in doubt NOW (a resume gap short of the remote's peer
+    /// timeout): heartbeats probe immediately instead of waiting out the
+    /// silence threshold. Idempotent on an already-armed probe.
+    fn doubt(&mut self, now: u64) {
+        self.probe_started.get_or_insert(now);
     }
 
     /// The death verdict: a probe has run unanswered past its deadline.
     fn dead(&self, now: u64) -> bool {
         self.probe_started
-            .is_some_and(|t| now.saturating_sub(t) >= PROBE_TIMEOUT_MS)
+            .is_some_and(|t| now.saturating_sub(t) >= self.timeout_ms)
     }
 
     /// Force the verdict NOW (the resume fast path: a suspend gap past the
     /// remote's peer timeout proves the endpoint already exited) — backdates
     /// the probe so [`dead`](Self::dead) reports true immediately.
     fn condemn(&mut self, now: u64) {
-        self.probe_started = Some(now.saturating_sub(PROBE_TIMEOUT_MS));
+        self.probe_started = Some(now.saturating_sub(self.timeout_ms));
     }
 }
 
@@ -979,6 +1007,13 @@ impl WireLiveness {
 fn suspend_gap(wall_delta_ms: u64, mono_delta_ms: u64) -> Option<u64> {
     let gap = wall_delta_ms.saturating_sub(mono_delta_ms);
     (gap >= SUSPEND_GAP_MIN_MS).then_some(gap)
+}
+
+/// An in-flight reconnect (posh#162): the wire died; establish attempts
+/// ride [`reconnect_backoff_ms`] while the IPC surface keeps serving.
+struct Reconnect {
+    attempt: u32,
+    next_try: u64,
 }
 
 /// Reconnect backoff (attempt 0 = the immediate first try). Ramps quickly
@@ -1102,6 +1137,25 @@ fn mux_ssh_options(
 /// local agent socket the spawning invocation carries (design doc
 /// "Security": the endpoint inherits the spawner's resolved source).
 ///
+/// The daemon's wire-establish sequence (the posh#162 reconnect seam): the
+/// ssh bootstrap for `posh-server agent --client-id <id>` → address resolve
+/// → key decode → connected UDP socket. Factored from [`run_daemon`] so
+/// [`mux_loop`] can re-run it after a dead-wire verdict; tests inject their
+/// own closure (an in-process fake peer) at the same seam. Each attempt is
+/// bounded by the ssh [`MUX_BOOTSTRAP_CONNECT_TIMEOUT_SECS`].
+fn establish_wire(dest: &str, family: Family, port_range: Option<String>) -> Result<Connection> {
+    let opts = mux_ssh_options(family, port_range);
+    let tail = vec![
+        "agent".to_string(),
+        "--client-id".to_string(),
+        client_id(),
+    ];
+    let (host, port, key_b64) = crate::remote::sshwrap::bootstrap(dest, &tail, &opts)?;
+    let addr = crate::remote::client::resolve(&host, port, family)?;
+    let udp_key = crate::remote::crypto::Key::from_base64(key_b64.trim())?;
+    Connection::client(addr, &udp_key)
+}
+
 /// Returns in the SPAWNER only; the daemon grandchild exits the process.
 pub fn run_daemon(
     key: &str,
@@ -1139,21 +1193,24 @@ pub fn run_daemon(
     util::install_sigusr2_handler();
 
     let result = (|| -> Result<()> {
-        let opts = mux_ssh_options(family, port_range);
-        let tail = vec![
-            "agent".to_string(),
-            "--client-id".to_string(),
-            client_id(),
-        ];
-        let (host, port, key_b64) = crate::remote::sshwrap::bootstrap(dest, &tail, &opts)?;
-        let addr = crate::remote::client::resolve(&host, port, family)?;
-        let udp_key = crate::remote::crypto::Key::from_base64(key_b64.trim())?;
-        let conn = Connection::client(addr, &udp_key)?;
+        let conn = establish_wire(dest, family, port_range.clone())?;
+        let peer = conn
+            .remote()
+            .map_or_else(|| "unknown".to_string(), |a| a.to_string());
         util::log_write(
             "info",
-            &format!("mux daemon started key={key} dest={dest} peer={addr}"),
+            &format!("mux daemon started key={key} dest={dest} peer={peer}"),
         );
-        mux_loop(listener, conn, &agent_source, linger_ms_from_env(), key);
+        let mut reestablish = || establish_wire(dest, family, port_range.clone());
+        mux_loop(
+            listener,
+            conn,
+            &agent_source,
+            linger_ms_from_env(),
+            key,
+            &mut reestablish,
+            WireLiveness::default(),
+        );
         Ok(())
     })();
     let _ = std::fs::remove_file(&sock);
@@ -1217,6 +1274,8 @@ fn mux_loop(
     agent_source: &Path,
     linger_ms: u64,
     key: &str,
+    reestablish: &mut dyn FnMut() -> Result<Connection>,
+    mut liveness: WireLiveness,
 ) {
     let _ = listener.set_nonblocking(true);
     let mut fragmenter = sync::Fragmenter::new();
@@ -1254,8 +1313,16 @@ fn mux_loop(
     let mut recv_err_logged = false;
     // RFC 0013 §3: the remote endpoint's identity — requested on every
     // heartbeat until held, then reported on the status line (`mux ls`'s
-    // remote= column, the "what build is the far end" answer).
+    // remote= column, the "what build is the far end" answer). Cleared on a
+    // dead-wire verdict (posh#162: a held ident must not outlive its wire).
     let mut remote_ident: Option<caps::ServerIdent> = None;
+    // posh#162 wire liveness companions to the injected probe machine: the
+    // truthful connection state, the wall-vs-monotonic resume detector's
+    // previous readings, and the in-flight reconnect (None = wire trusted).
+    let mut conn_state = MuxConnState::Connected;
+    let mut reconnect: Option<Reconnect> = None;
+    let mut wall_prev = std::time::SystemTime::now();
+    let mut mono_prev = now_ms();
 
     loop {
         if util::take_flag(&util::SIGTERM_RECEIVED) {
@@ -1267,6 +1334,34 @@ fn mux_loop(
             break;
         }
         let now = now_ms();
+
+        // posh#162 resume detection: `now_ms` is CLOCK_MONOTONIC and freezes
+        // across suspend, so wall time racing ahead of it means the host
+        // slept. Past the remote's peer timeout the endpoint has PROVABLY
+        // exited (its clock kept running while ours froze) — condemn the
+        // wire and reconnect without waiting out a probe; a shorter gap only
+        // puts the wire in doubt (the remote may have survived it).
+        let wall_now = std::time::SystemTime::now();
+        let wall_delta = wall_now
+            .duration_since(wall_prev)
+            .map_or(0, |d| d.as_millis() as u64);
+        let mono_delta = now.saturating_sub(mono_prev);
+        wall_prev = wall_now;
+        mono_prev = now;
+        if reconnect.is_none() {
+            if let Some(gap) = suspend_gap(wall_delta, mono_delta) {
+                if gap >= crate::remote::server::PEER_TIMEOUT {
+                    util::log_write(
+                        "info",
+                        &format!("resume gap {gap}ms >= remote peer timeout: wire condemned"),
+                    );
+                    liveness.condemn(now);
+                } else {
+                    util::log_write("info", &format!("resume gap {gap}ms: probing the wire"));
+                    liveness.doubt(now);
+                }
+            }
+        }
 
         // Wake for the next heartbeat, the linger expiry, the agent mux's
         // fresh sends / RTO retransmissions (RFC 0011 §5), and the M2
@@ -1348,6 +1443,7 @@ fn mux_loop(
                             continue;
                         };
                         last_heard = now_ms();
+                        liveness.heard();
                         if recv_err_logged {
                             recv_err_logged = false;
                             util::log_write("info", "mux wire recv recovered");
@@ -1504,7 +1600,7 @@ fn mux_loop(
         // CONNECTION, never agent service).
         let ctx = MuxStatusCtx {
             key,
-            conn_state: MuxConnState::Connected,
+            conn_state,
             peer: conn.remote(),
             heard_age_ms: now.saturating_sub(last_heard),
             channels: proxy.live_channel_count(),
@@ -1646,6 +1742,83 @@ fn mux_loop(
             break;
         }
 
+        // posh#162 dead-wire verdict → reconnect. Teardown happens ONCE at
+        // the verdict: channel state is meaningless on a new wire (fresh
+        // AEAD key, fresh remote); M2 session conns get the SessionClose
+        // fallback cue exactly like the open-timeout path; agent-only refs
+        // stay held — they are what the reconnect serves.
+        if reconnect.is_none() && liveness.dead(now) {
+            util::log_write(
+                "warn",
+                &format!(
+                    "mux wire dead: probe unanswered (heard {}ms ago): reconnecting",
+                    now.saturating_sub(last_heard)
+                ),
+            );
+            let _ = proxy.close_all();
+            agent_mux = AgentChannelMux::new_client();
+            fragmenter = sync::Fragmenter::new();
+            assembly = sync::FragmentAssembly::new();
+            routes.clear();
+            pending_closes.clear();
+            remote_ident = None;
+            for c in &mut conns {
+                if c.session.take().is_none() {
+                    continue;
+                }
+                let close = MuxSessionClose {
+                    remote: true,
+                    payload: b"mux wire lost; reconnecting".to_vec(),
+                };
+                let _ = send_mux_frame(c, MuxTag::SessionClose, &close.encode());
+                if c.holds_ref {
+                    c.holds_ref = false;
+                    state.unref(now);
+                    log_ref_change("-wire-dead", c.peer_pid, &state);
+                }
+            }
+            conn_state = MuxConnState::Reconnecting;
+            liveness.heard(); // no re-verdicts while the reconnect runs
+            reconnect = Some(Reconnect { attempt: 0, next_try: now });
+        }
+        if let Some(r) = &mut reconnect {
+            if now >= r.next_try {
+                match reestablish() {
+                    Ok(new_conn) => {
+                        let peer = new_conn
+                            .remote()
+                            .map_or_else(|| "unknown".to_string(), |a| a.to_string());
+                        util::log_write(
+                            "info",
+                            &format!("mux wire reconnected peer={peer} (attempt {})", r.attempt),
+                        );
+                        conn = new_conn;
+                        conn_state = MuxConnState::Connected;
+                        reconnect = None;
+                        // A fresh wire: immediate first heartbeat (which
+                        // re-requests the cleared ident) and a fresh silence
+                        // grace before any new probe.
+                        last_send = None;
+                        last_heard = now;
+                        liveness.heard();
+                    }
+                    Err(e) => {
+                        util::log_write(
+                            "warn",
+                            &format!("mux reconnect attempt {} failed: {e}", r.attempt),
+                        );
+                        r.attempt = r.attempt.saturating_add(1);
+                        r.next_try = now.saturating_add(reconnect_backoff_ms(r.attempt));
+                    }
+                }
+            }
+        }
+        if reconnect.is_some() {
+            // No wire to send on: skip the send passes. The IPC surface
+            // above keeps serving (hellos answer `reconnecting`, refs land).
+            continue;
+        }
+
         // Sends, §4.1 order: session-channel maintenance first (open
         // retransmits until confirmed, pending closes on the RTO cadence),
         // then the heartbeat, then agent instructions.
@@ -1731,7 +1904,11 @@ fn mux_loop(
             p.sends < SESSION_CLOSE_RETRANSMITS
         });
         let session_due = last_send.is_none_or(|t| now.saturating_sub(t) >= HEARTBEAT_INTERVAL);
-        let session = session_due.then(|| heartbeat_message(remote_ident.is_none()));
+        // The RFC 0013 ident request doubles as the posh#162 liveness probe:
+        // it rides until the ident is held AND whenever the wire is in doubt
+        // (a held ident does not prove the wire is still alive).
+        let probing = liveness.probe_due(now, last_heard);
+        let session = session_due.then(|| heartbeat_message(remote_ident.is_none() || probing));
         if session.is_some() {
             last_send = Some(now);
         }
@@ -2909,7 +3086,17 @@ mod tests {
         let conn = Connection::client(addr, &key).unwrap();
         let daemon = {
             let agent_sock = agent_sock.clone();
-            std::thread::spawn(move || mux_loop(listener, conn, &agent_sock, 3_000, "test-dest"))
+            std::thread::spawn(move || {
+                mux_loop(
+                    listener,
+                    conn,
+                    &agent_sock,
+                    3_000,
+                    "test-dest",
+                    &mut || panic!("this test never reconnects"),
+                    WireLiveness::default(),
+                )
+            })
         };
 
         // IPC hello.
@@ -3017,7 +3204,16 @@ mod tests {
         live.heard();
         assert!(!live.dead(60_000));
         assert!(!live.probe_due(60_000, 59_000));
+        // doubt(): an explicit arm (small resume gap) probes immediately,
+        // silence threshold notwithstanding — and once armed, probe_due
+        // stays true even against a fresh last_heard reading.
+        live.heard();
+        live.doubt(65_000);
+        assert!(live.probe_due(65_000, 65_000));
+        assert!(!live.dead(65_000 + PROBE_TIMEOUT_MS - 1));
+        assert!(live.dead(65_000 + PROBE_TIMEOUT_MS));
         // condemn(): the resume fast path is an immediate verdict.
+        live.heard();
         live.condemn(70_000);
         assert!(live.dead(70_000));
     }
@@ -3232,7 +3428,17 @@ mod tests {
         let conn = Connection::client(addr, &ukey).unwrap();
         let agent = dir.join("no-agent.sock");
         let key = key.to_string();
-        let handle = std::thread::spawn(move || mux_loop(listener, conn, &agent, linger_ms, &key));
+        let handle = std::thread::spawn(move || {
+            mux_loop(
+                listener,
+                conn,
+                &agent,
+                linger_ms,
+                &key,
+                &mut || panic!("this test never reconnects"),
+                WireLiveness::default(),
+            )
+        });
         (handle, server_conn)
     }
 
@@ -3323,6 +3529,44 @@ mod tests {
         }
     }
 
+    /// Answers a heartbeat ident request from the test's remote peer: one
+    /// Empty frame carrying the given ident on the reserved session channel.
+    fn send_ident_frame(server: &mut Connection, version: &str, sha: &str) {
+        use crate::remote::caps;
+        let ident = caps::encode_server_ident(&caps::ServerIdent {
+            version: version.into(),
+            git_sha: sha.into(),
+            pid: 77,
+            start_unix_ms: 1,
+        });
+        let frame = sync::ServerFrame {
+            flags: 0,
+            caps: vec![ident],
+            frame_num: 0,
+            input_ack: 0,
+            echo_ack: 0,
+            body: sync::FrameBody::Empty,
+        };
+        let encoded = frame.encode();
+        let wire = channel::seal_on(true, channel::SESSION_CHANNEL, &encoded);
+        let mut fragmenter = sync::Fragmenter::new();
+        for frag in fragmenter.make_fragments(&wire, sync::FRAGMENT_CONTENTS_MAX) {
+            let _ = server.send(&frag.to_bytes());
+        }
+    }
+
+    /// Bounded wait for a heartbeat carrying the RFC 0013 ident request on
+    /// the reserved channel (the shape both the request-until-held phase and
+    /// the posh#162 probe produce).
+    fn recv_ident_request(server: &mut Connection, assembly: &mut sync::FragmentAssembly) {
+        use crate::remote::caps;
+        recv_wire_until(server, assembly, |c, m| {
+            c == channel::SESSION_CHANNEL
+                && sync::ClientMessage::decode(m)
+                    .is_ok_and(|cm| caps::find(&cm.caps, caps::CAP_SERVER_IDENT).is_some())
+        });
+    }
+
     /// Hello + SessionOpen over the IPC socket; returns the stream and the
     /// granted wire ordinal.
     fn ipc_open_session(path: &Path, target: &[u8]) -> (std::os::unix::net::UnixStream, u64) {
@@ -3342,43 +3586,106 @@ mod tests {
 
     #[test]
     fn daemon_requests_ident_and_reports_the_remote_build() {
-        use crate::remote::caps;
         let dir = temp_base();
         let (daemon, mut server) = start_inprocess_daemon(&dir, "ident", 3_000, (63970, 63979));
         // While no remote ident is held, the heartbeat carries the RFC 0013
-        // §3 request on the reserved session channel.
+        // §3 request on the reserved session channel. Answer with one Empty
+        // frame carrying a distinctive ident.
         let mut assembly = sync::FragmentAssembly::new();
-        let (_chan, _msg) = recv_wire_until(&mut server, &mut assembly, |c, m| {
-            c == channel::SESSION_CHANNEL
-                && sync::ClientMessage::decode(m)
-                    .is_ok_and(|cm| caps::find(&cm.caps, caps::CAP_SERVER_IDENT).is_some())
-        });
-        // Answer with one Empty frame carrying a distinctive ident.
-        let ident = caps::encode_server_ident(&caps::ServerIdent {
-            version: "9.9.9".into(),
-            git_sha: "cafef00".into(),
-            pid: 77,
-            start_unix_ms: 1,
-        });
-        let frame = sync::ServerFrame {
-            flags: 0,
-            caps: vec![ident],
-            frame_num: 0,
-            input_ack: 0,
-            echo_ack: 0,
-            body: sync::FrameBody::Empty,
-        };
-        let encoded = frame.encode();
-        let wire = channel::seal_on(true, channel::SESSION_CHANNEL, &encoded);
-        let mut fragmenter = sync::Fragmenter::new();
-        for frag in fragmenter.make_fragments(&wire, sync::FRAGMENT_CONTENTS_MAX) {
-            let _ = server.send(&frag.to_bytes());
-        }
+        recv_ident_request(&mut server, &mut assembly);
+        send_ident_frame(&mut server, "9.9.9", "cafef00");
         // The status line reports the remote build (mux ls's new column).
         let mut obs = ipc_observer(&mux_socket_path_in(&dir, "ident"));
         wait_status_contains(&mut obs, "remote=9.9.9 (cafef00)");
         drop(obs);
         daemon.join().unwrap();
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    /// The posh#162 reconnect cycle over the in-process harness: a held
+    /// ident, a permanently-silent peer, the compressed-threshold probe
+    /// verdict, a failed first establish attempt (the backoff path), and a
+    /// second fake peer proving the swapped wire live end-to-end — the
+    /// cleared ident is re-requested over it and the NEW remote's answer
+    /// lands on the status line.
+    #[test]
+    fn dead_wire_verdict_reconnects_and_relearns_the_ident() {
+        use std::io::Write;
+        use std::sync::atomic::{AtomicU32, Ordering};
+        use std::sync::Arc;
+
+        let dir = temp_base();
+        // Peer 1 (falls permanently silent) and peer 2 (the reconnect
+        // target) — distinct keys, so a swapped wire that still spoke to
+        // peer 1's key could never satisfy peer 2's assertions.
+        let ukey1 = crate::remote::crypto::Key::random();
+        let (mut server1, port1) =
+            Connection::server((63980, 63989), &ukey1, Family::Inet).unwrap();
+        let ukey2 = crate::remote::crypto::Key::random();
+        let (mut server2, port2) =
+            Connection::server((63980, 63989), &ukey2, Family::Inet).unwrap();
+
+        let listener = UnixListener::bind(mux_socket_path_in(&dir, "reconn")).unwrap();
+        let addr1 = format!("127.0.0.1:{port1}").parse().unwrap();
+        let conn = Connection::client(addr1, &ukey1).unwrap();
+        let agent = dir.join("no-agent.sock");
+        let attempts = Arc::new(AtomicU32::new(0));
+        let daemon = {
+            let attempts = Arc::clone(&attempts);
+            std::thread::spawn(move || {
+                let addr2 = format!("127.0.0.1:{port2}").parse().unwrap();
+                mux_loop(
+                    listener,
+                    conn,
+                    &agent,
+                    0, // linger 0: the IPC ref below is what pins the daemon
+                    "reconn",
+                    &mut || {
+                        // Attempt 0 fails (exercising the backoff schedule);
+                        // attempt 1 establishes toward peer 2.
+                        if attempts.fetch_add(1, Ordering::Relaxed) == 0 {
+                            return Err(util::Error::from("first attempt refused"));
+                        }
+                        Connection::client(addr2, &ukey2)
+                    },
+                    // Compressed thresholds: probe after 1 s of silence,
+                    // verdict 1 s unanswered — the production constants are
+                    // pinned by the WireLiveness unit test.
+                    WireLiveness::with_thresholds(1_000, 1_000),
+                )
+            })
+        };
+
+        // Pin the daemon with a real ref (linger 0 exits at refs=0).
+        let mut ipc = ipc_observer(&mux_socket_path_in(&dir, "reconn"));
+        ipc.write_all(&encode_mux_frame(MuxTag::SessionRef, b"")).unwrap();
+        assert_eq!(read_client_frame(&mut ipc).tag, MuxTag::RefAck);
+
+        // Phase 1: answer the ident request so an ident is HELD — the
+        // dead-wire verdict must then CLEAR it (the #162 staleness fix).
+        let mut assembly1 = sync::FragmentAssembly::new();
+        recv_ident_request(&mut server1, &mut assembly1);
+        send_ident_frame(&mut server1, "9.9.9", "cafef00");
+        wait_status_contains(&mut ipc, "remote=9.9.9 (cafef00)");
+
+        // Phase 2: peer 1 never speaks again. The probe arms, the verdict
+        // lands, attempt 0 fails, attempt 1 (post-backoff) swaps the wire —
+        // and the daemon's re-requests reach peer 2, proving the NEW
+        // connection both sends and receives.
+        let mut assembly2 = sync::FragmentAssembly::new();
+        recv_ident_request(&mut server2, &mut assembly2);
+        send_ident_frame(&mut server2, "8.8.8", "beefbee");
+        wait_status_contains(&mut ipc, "remote=8.8.8 (beefbee)");
+        wait_status_contains(&mut ipc, "state=connected");
+        assert_eq!(
+            attempts.load(Ordering::Relaxed),
+            2,
+            "one refused establish, then the successful one"
+        );
+
+        drop(ipc); // refs -> 0, linger 0: the daemon exits
+        daemon.join().unwrap();
+        drop(server1);
         std::fs::remove_dir_all(&dir).ok();
     }
 
@@ -3788,7 +4095,15 @@ mod tests {
         let daemon_conn = Connection::client(addr, &ukey).unwrap();
         let agent_path = agent_sock.clone();
         let daemon = std::thread::spawn(move || {
-            mux_loop(listener, daemon_conn, &agent_path, 1_000, "m2e2e")
+            mux_loop(
+                listener,
+                daemon_conn,
+                &agent_path,
+                1_000,
+                "m2e2e",
+                &mut || panic!("this test never reconnects"),
+                WireLiveness::default(),
+            )
         });
 
         // Two invocations through the real client half.
@@ -4269,7 +4584,15 @@ mod tests {
                             let agent = dir.join("no-agent.sock");
                             let k = k.to_string();
                             let daemon = std::thread::spawn(move || {
-                                mux_loop(listener, conn, &agent, 1_000, &k)
+                                mux_loop(
+                                    listener,
+                                    conn,
+                                    &agent,
+                                    1_000,
+                                    &k,
+                                    &mut || panic!("this test never reconnects"),
+                                    WireLiveness::default(),
+                                )
                             });
                             daemon_hold.lock().unwrap().push((daemon, server_conn));
                             Ok(MuxSpawn::Spawned)
@@ -4605,7 +4928,15 @@ mod tests {
             let agent_sock = real_agent_sock.clone();
             let k = k.to_string();
             daemon = Some(std::thread::spawn(move || {
-                mux_loop(listener, conn, &agent_sock, 1_000, &k)
+                mux_loop(
+                    listener,
+                    conn,
+                    &agent_sock,
+                    1_000,
+                    &k,
+                    &mut || panic!("this test never reconnects"),
+                    WireLiveness::default(),
+                )
             }));
             Ok(MuxSpawn::Spawned)
         };

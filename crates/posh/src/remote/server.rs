@@ -24,8 +24,10 @@ use crate::util::{self, now_ms, Result};
 
 const SHUTDOWN_GRACE: u64 = 10_000; // ms to wait for the final-state ack
 /// Silence after which the peer is forgotten (sending stops, the session
-/// stays alive waiting for the client to come back).
-const PEER_TIMEOUT: u64 = 60_000; // ms
+/// stays alive waiting for the client to come back). `pub(crate)`: the mux
+/// daemon's posh#162 resume fast path condemns its wire when a suspend gap
+/// exceeds this — the agent-only remote has provably exited by then.
+pub(crate) const PEER_TIMEOUT: u64 = 60_000; // ms
 /// Max rows per v2 scrollback body (RFC 0009 §2): chunks a long-disconnect
 /// resend into fragmentation-friendly frames; the cumulative repeat loop
 /// carries the rest forward as acks advance.
