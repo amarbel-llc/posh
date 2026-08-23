@@ -342,6 +342,17 @@ _POSH_MUX_
 	*agent* verb included), the invocation warns once and falls back to
 	per-connection forwarding.
 
+	While the endpoint owns forwarding, the session bootstrap still hands
+	the new session _SSH_AUTH_SOCK=<base>/agent/sock_ (the stable path the
+	endpoint claims, valid across endpoint respawns and wire reconnects)
+	— carried to the remote as the _POSH_AGENT_EXPORT=1_ prefix on the
+	bootstrap command, which an older *posh-server* ignores — and the
+	bootstrap *ssh* itself runs with *-a*: an OpenSSH-forwarded agent
+	socket in the session's environment would be a connection-bound
+	competitor that dies with the bootstrap's TCP connection, the very
+	dependency posh removes. An explicit *posh ssh -A* still forwards
+	the real agent on the bootstrap.
+
 _POSH_MUX_SESSIONS_
 	Opt in to M2 session sharing (*1*, *true*, *on*, or *yes*): a
 	named-session attach (_host:session_) then rides the mux endpoint's

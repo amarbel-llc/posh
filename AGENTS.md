@@ -166,6 +166,14 @@ the `eng-*(7)` manpages — read them with `man eng-versioning`,
   out — FDR 0014 promotion): one agent-only enveloped connection per
   destination owns agent forwarding, sessions bootstrap with forwarding off,
   and remote `agent/sock` ownership is structural from a single client host.
+  **Sessions still get `SSH_AUTH_SOCK=<base>/agent/sock` at birth**: with no
+  `-A` riding to `posh-server` the client sends the `POSH_AGENT_EXPORT=1`
+  env prefix instead (posh#161; `agent::session_auth_sock`, honored by
+  `server::run` + the relay; an older server ignores it), and every posh
+  bootstrap ssh under endpoint ownership runs with the real `-a` — an
+  sshd-forwarded socket in the session env is a connection-bound competitor
+  the host's login rendezvous latches onto. Triage "which agent does this
+  shell actually reach" with `just debug-posh-agent-resolve [pid|path]`.
   Any endpoint failure (old remote without the `agent` verb included) falls
   back to per-connection forwarding with a one-line warning. The FDR 0004
   symlink election code PERSISTS for the opt-out, mixed versions, and the

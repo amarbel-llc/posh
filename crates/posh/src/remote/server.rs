@@ -135,12 +135,16 @@ pub fn run(
     // client's COLORTERM) so color-by-$TERM tools (git, Charmbracelet TUIs)
     // aren't left colorless.
     let mut shell_env = crate::terminfo::session_env();
-    if let Some(ep) = &agent_endpoint {
-        // C5: a session created through a forwarding connection inherits
-        // SSH_AUTH_SOCK pointing at the stable agent/sock.
+    // C5: a session created through a forwarding connection inherits
+    // SSH_AUTH_SOCK pointing at the stable agent/sock — and so does one
+    // whose client parked forwarding on the mux endpoint (posh#161: the
+    // POSH_AGENT_EXPORT request; without it a mux-mode session was born
+    // with whatever the bootstrap ssh left in our env, typically an
+    // sshd-forwarded socket that dies with that TCP connection).
+    if let Some(sock) = crate::remote::agent::session_auth_sock(agent_endpoint.as_ref()) {
         shell_env.push((
             "SSH_AUTH_SOCK".to_string(),
-            ep.sock_path().to_string_lossy().into_owned(),
+            sock.to_string_lossy().into_owned(),
         ));
     }
     let child = pty::spawn_shell(command.as_deref(), rows, cols, &shell_env, None)?;

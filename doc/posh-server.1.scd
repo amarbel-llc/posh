@@ -129,6 +129,21 @@ _POSH_SERVER_SIGNAL_TMOUT_
 	_MOSH_SERVER_SIGNAL_TMOUT_ analog: a supervisor sends SIGUSR1 to
 	ask idle servers to wind down.
 
+_POSH_AGENT_EXPORT_
+	When truthy (*1*, *true*, *on*, *yes*), *new* (and its *relay* form)
+	hands the session shell _SSH_AUTH_SOCK=<base>/agent/sock_ — the
+	host's stable forwarded-agent path — WITHOUT standing up a
+	per-connection endpoint of its own. Set by the client on the bootstrap
+	command when its per-destination mux endpoint (FDR 0014, _$POSH_MUX_)
+	owns forwarding for the invocation, so no *-A* arrives yet the session
+	is still born pointing at the agent that endpoint serves; the path is
+	valid the moment any endpoint claims it and survives endpoint respawns
+	and wire reconnects underneath. An env prefix rather than a flag so a
+	server predating it stays bootstrappable (it simply ignores the
+	variable). With *-A* present this is redundant — the connection's own
+	endpoint names the same path. Not forwarded from the client's
+	environment; the client emits it itself.
+
 _POSH_ESCAPE_CMD_
 	The command the escape-to-shell overlay runs (FDR 0008), spawned in
 	the session's working directory when the client picks *Shell out* from

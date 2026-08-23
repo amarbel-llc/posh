@@ -271,10 +271,7 @@ pub(crate) fn run(
     // failure just leaves the session without forwarding rather than refusing it.
     let agent = if agent_forward {
         match AgentEndpoint::from_env() {
-            Ok(ep) => {
-                std::env::set_var("SSH_AUTH_SOCK", ep.sock_path());
-                Some(ep)
-            }
+            Ok(ep) => Some(ep),
             Err(e) => {
                 util::log_write("warn", &format!("agent forwarding disabled: {e}"));
                 None
@@ -283,6 +280,14 @@ pub(crate) fn run(
     } else {
         None
     };
+    // Seed the session's SSH_AUTH_SOCK into THIS process's env (inherited by
+    // the daemon at fork, see above): our own endpoint's path, or — posh#161,
+    // the mux endpoint owning forwarding (no `-A`, POSH_AGENT_EXPORT=1) —
+    // the stable agent/sock path without binding. Pre-fix the mux-mode
+    // session inherited the bootstrap ssh's sshd-forwarded socket instead.
+    if let Some(sock) = crate::remote::agent::session_auth_sock(agent.as_ref()) {
+        std::env::set_var("SSH_AUTH_SOCK", sock);
+    }
 
     // 2. Connect to / create the session and Init as a LOSSY, frame-capable
     //    client (mirror session/client.rs: cap-extended Init + a Tag::Resize
@@ -488,15 +493,16 @@ fn fallback_to_server(
     }
 
     // Mirror server::run: a resolved TERM/COLORTERM for the shell, plus
-    // SSH_AUTH_SOCK when agent forwarding stood up an endpoint. (`run` also seeded
+    // SSH_AUTH_SOCK when agent forwarding stood up an endpoint OR the client
+    // asked for the stable-path export (posh#161). (`run` also seeded
     // SSH_AUTH_SOCK into this process's env before connect_or_create, so a session
     // created here already inherited it; server_loop owns the endpoint and bridges
     // its bytes to the UDP client exactly as the legacy path does.)
     let mut shell_env = crate::terminfo::session_env();
-    if let Some(ep) = &agent {
+    if let Some(sock) = crate::remote::agent::session_auth_sock(agent.as_ref()) {
         shell_env.push((
             "SSH_AUTH_SOCK".to_string(),
-            ep.sock_path().to_string_lossy().into_owned(),
+            sock.to_string_lossy().into_owned(),
         ));
     }
     let child = pty::spawn_shell(Some(&inner), rows, cols, &shell_env, None)?;

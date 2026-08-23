@@ -34,6 +34,29 @@ pub struct SshOptions {
     /// per-destination endpoint for every invocation behind it (a pre-mux
     /// hang cost only its own invocation).
     pub connect_timeout_secs: Option<u32>,
+    /// posh#161: ask the remote to export the host's STABLE forwarded-agent
+    /// path (`<base>/agent/sock`) into the session shell WITHOUT standing
+    /// up a per-connection endpoint — the shape when the per-destination
+    /// mux endpoint (FDR 0014 M1) owns forwarding, so `agent_source` is
+    /// `None` (no `-A` rides to posh-server) yet the session must still be
+    /// born pointing at `agent/sock`. Carried as the `POSH_AGENT_EXPORT=1`
+    /// env prefix on the remote command, which an older server ignores (no
+    /// bootstrap failure across mixed versions) and a current one honors in
+    /// `server::run` / the relay.
+    pub agent_export: bool,
+}
+
+/// The env name carrying [`SshOptions::agent_export`] on the bootstrap remote
+/// command (posh#161). An env prefix rather than a server flag so a remote
+/// predating it stays bootstrappable (`cmd_server` rejects unknown flags).
+pub const AGENT_EXPORT_ENV: &str = "POSH_AGENT_EXPORT";
+
+/// Server side of [`AGENT_EXPORT_ENV`]: did the bootstrapping client ask
+/// for the stable agent path to be exported into the session shell?
+pub fn agent_export_requested() -> bool {
+    std::env::var(AGENT_EXPORT_ENV)
+        .map(|v| env_value_on(&v))
+        .unwrap_or(false)
 }
 
 /// What the wrapped server reported on stdout.
@@ -108,6 +131,13 @@ pub fn remote_command(
         cmd.push('=');
         cmd.push_str(&shell_quote(value));
         cmd.push(' ');
+    }
+    // posh#161: the stable-path export request rides as an env prefix like
+    // the locale vars (forward-compatible: an old server ignores it), AFTER
+    // them so the locale prefix string stays byte-identical when unset.
+    if opts.agent_export {
+        cmd.push_str(AGENT_EXPORT_ENV);
+        cmd.push_str("=1 ");
     }
     cmd.push_str(&server_command_head(
         std::env::var("POSH_SERVER_CMD").ok().as_deref(),
@@ -439,6 +469,7 @@ mod tests {
             real_ssh_agent_forward: None,
             channels: false,
             connect_timeout_secs: None,
+            agent_export: false,
         };
         // New contract (RFC 0008 §3): the caller owns the `--`; the legacy tail
         // leads with it, then the shell-quoted inner argv. Byte-identical output.
@@ -487,6 +518,7 @@ mod tests {
             real_ssh_agent_forward: None,
             channels: false,
             connect_timeout_secs: None,
+            agent_export: false,
         };
         let locale = vec![("LANG".to_string(), "en_US.UTF-8".to_string())];
         // The bare-host tail now carries its own leading `--` (caller-owned).
@@ -508,6 +540,7 @@ mod tests {
                 real_ssh_agent_forward: None,
                 channels: false,
                 connect_timeout_secs: None,
+                agent_export: false,
             },
             &[],
             &[],
@@ -529,6 +562,7 @@ mod tests {
             real_ssh_agent_forward: None,
             channels: false,
             connect_timeout_secs: None,
+            agent_export: false,
         };
         let tail: Vec<String> = ["relay", "-g", "grp", "dev", "--", "htop"]
             .iter()
@@ -550,6 +584,7 @@ mod tests {
             real_ssh_agent_forward: None,
             channels: false,
             connect_timeout_secs: None,
+            agent_export: false,
         };
         let tail: Vec<String> = ["relay", "dev"].iter().map(|s| s.to_string()).collect();
         assert_eq!(remote_command(&opts, &tail, &[]), "posh-server new 'relay' 'dev'");
@@ -566,6 +601,7 @@ mod tests {
             real_ssh_agent_forward: None,
             channels: false,
             connect_timeout_secs: None,
+            agent_export: false,
         };
         let tail: Vec<String> = ["relay", "-g", "grp", "dev"]
             .iter()
@@ -591,6 +627,7 @@ mod tests {
             real_ssh_agent_forward: None,
             channels: false,
             connect_timeout_secs: None,
+            agent_export: false,
         };
         let cmd = remote_command(&opts, &[], &[]);
         assert_eq!(cmd, "posh-server new -A -4 -p 60001:60999");
@@ -604,6 +641,7 @@ mod tests {
             real_ssh_agent_forward: None,
             channels: false,
             connect_timeout_secs: None,
+            agent_export: false,
         };
         assert_eq!(remote_command(&off, &[], &[]), "posh-server new");
     }
@@ -620,6 +658,7 @@ mod tests {
             real_ssh_agent_forward: None,
             channels: true,
             connect_timeout_secs: None,
+            agent_export: false,
         };
         let cmd = remote_command(&on, &[], &[]);
         assert!(cmd.contains(" --channels"), "flag missing: {cmd}");
@@ -632,9 +671,47 @@ mod tests {
             real_ssh_agent_forward: None,
             channels: false,
             connect_timeout_secs: None,
+            agent_export: false,
         };
         let cmd = remote_command(&off, &[], &[]);
         assert!(!cmd.contains("--channels"), "flag must be absent: {cmd}");
+    }
+
+    #[test]
+    fn remote_command_carries_agent_export_prefix_only_when_set() {
+        // posh#161: when the mux endpoint owns forwarding the session
+        // bootstrap carries NO -A (agent_source None) but must still ask the
+        // remote to export <base>/agent/sock into the session shell. The ask
+        // is an env PREFIX (an old server ignores it; a flag would fail the
+        // whole bootstrap as "unknown server option"), after the locale
+        // prefixes and before the server word.
+        let on = SshOptions {
+            family: Family::Auto,
+            port_range: None,
+            agent_source: None,
+            real_ssh_agent_forward: None,
+            channels: false,
+            connect_timeout_secs: None,
+            agent_export: true,
+        };
+        let locale = vec![("LANG".to_string(), "C.UTF-8".to_string())];
+        assert_eq!(
+            remote_command(&on, &[], &locale),
+            "LANG='C.UTF-8' POSH_AGENT_EXPORT=1 posh-server new"
+        );
+        assert_eq!(remote_command(&on, &[], &[]), "POSH_AGENT_EXPORT=1 posh-server new");
+
+        // Unset: byte-identical to before the field existed.
+        let off = SshOptions {
+            agent_export: false,
+            ..on
+        };
+        assert_eq!(remote_command(&off, &[], &locale), "LANG='C.UTF-8' posh-server new");
+
+        // The server-side reader accepts the same truthy spellings as the
+        // other opt-in gates and nothing else.
+        assert!(env_value_on("1") && env_value_on("true") && env_value_on("on"));
+        assert!(!env_value_on("0") && !env_value_on(""));
     }
 
     #[test]
@@ -648,6 +725,7 @@ mod tests {
             real_ssh_agent_forward: None,
             channels: false,
             connect_timeout_secs: None,
+            agent_export: false,
         };
         assert_eq!(ssh_args(&session), Vec::<String>::new());
 
@@ -661,6 +739,7 @@ mod tests {
             real_ssh_agent_forward: None,
             channels: true,
             connect_timeout_secs: Some(10),
+            agent_export: false,
         };
         assert_eq!(ssh_args(&mux), vec!["-4", "-o", "ConnectTimeout=10"]);
 
@@ -672,6 +751,7 @@ mod tests {
             real_ssh_agent_forward: Some(true),
             channels: false,
             connect_timeout_secs: None,
+            agent_export: false,
         };
         assert_eq!(ssh_args(&flags_only), vec!["-6", "-A"]);
     }
@@ -727,6 +807,7 @@ mod tests {
             real_ssh_agent_forward: None,
             channels: false,
             connect_timeout_secs: None,
+            agent_export: false,
         };
         let env = vec![
             ("TERM".to_string(), "xterm-kitty".to_string()),

@@ -197,6 +197,47 @@ suspend/resume with at most a forwarding blip.
 `remote::mux::tests::dead_wire_verdict_reconnects_and_relearns_the_ident`
 pins the whole cycle in-process.
 
+### Sessions reach the endpoint (2026-08-23, posh#161): the stable-path export
+
+The reconnect above kept `agent/sock` alive — and a live-host triage
+(`just debug-posh-agent-resolve`) then showed that **no session shell was
+pointed at it**. Under M1 the session bootstrap sends no `-A` to
+`posh-server` (`apply_mux_gate` moves ownership to the endpoint), and the
+`-A` arm was the ONLY place `server::run`/the relay exported
+`SSH_AUTH_SOCK=<base>/agent/sock` — so a mux-mode session was born with
+whatever the bootstrap ssh left in the server's environment. That was an
+sshd-forwarded agent socket: the bootstrap ssh carried the workstation's
+`ForwardAgent` config (the bare-host path even defaults the real ssh to
+`-A`), and the mux daemon's own bootstrap passed neither `-a` nor `-A`.
+The host's login-shell rendezvous (the eng fish hook's first-wins
+`ssh_client-agent.sock` symlink, posh#103's interim) then latched onto that
+socket for every shell on the host. Its lifetime is an ssh TCP connection
+(the workstation's ControlMaster) — the exact dependency posh exists to
+remove — so a link drop took every shell's agent with it (`ENOENT` on the
+dangling rendezvous, SIGPIPE mid-request), the endpoint's reconnect
+restored nothing anyone used, and the next login shell re-latched onto the
+NEW bootstrap's sshd socket ("works again after a new session"). Before
+the 2026-08-04 promotion, sessions exported `agent/sock` through the `-A`
+arm, which is how the rendezvous used to chain to posh's path.
+
+The fix, landed 2026-08-23: with the endpoint owning forwarding the client
+(1) asks the remote to export the stable path anyway — the
+`POSH_AGENT_EXPORT=1` env prefix on the bootstrap command, honored by
+`server::run` and the relay through `agent::session_auth_sock` (an env
+prefix, not a server flag, so an older remote stays bootstrappable by
+ignoring it) — and (2) runs the bootstrap ssh with the real `-a` (the
+mux daemon's bootstrap too), so no sshd-forwarded competitor exists in
+the session's environment at all; an explicit `posh ssh -A` still wins.
+`remote::agent::tests::session_auth_sock_prefers_own_endpoint_then_export_then_nothing`,
+`remote::sshwrap::tests::remote_command_carries_agent_export_prefix_only_when_set`,
+and `main::tests::resolve_real_ssh_agent_forward_defaults_on` pin the
+three halves. Residual, deliberately NOT posh's: a plain `ssh host` login
+still forwards the workstation's real agent and can latch the first-wins
+rendezvous onto that connection-bound socket ahead of posh's path — the
+rendezvous policy is eng's (tracked there), and posh#103 remains the
+end-state. The detached spawn (`posh host:session --detach`, FDR 0010)
+still inherits the spawning ssh's environment (posh#103's second case).
+
 ### Decision (2026-07-28, RATIFIED): the two-client-host policy
 
 RFC 0011 §8 defers to this record the case single ownership does not cover: the

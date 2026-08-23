@@ -1110,9 +1110,14 @@ fn socket_becomes_live(path: &Path) -> bool {
 const MUX_BOOTSTRAP_CONNECT_TIMEOUT_SECS: u32 = 10;
 
 /// The mux daemon's bootstrap [`SshOptions`](crate::remote::sshwrap::SshOptions):
-/// no `-A` (the agent verb IS forwarding), channels on (RFC 0011 §5 agent
-/// channels exist only enveloped), and the bounded ssh ConnectTimeout —
-/// factored from [`run_daemon`] so the call shape is pinned by test.
+/// no posh `-A` (the agent verb IS forwarding) AND an explicit real-ssh `-a`
+/// (posh#161: with neither flag the workstation's `ForwardAgent` config
+/// applied, so sshd stood up a forwarded-agent socket in the remote endpoint's
+/// env — a connection-bound competitor for the stable `agent/sock` that
+/// the host's login-shell rendezvous then latched onto), channels on (RFC
+/// 0011 §5 agent channels exist only enveloped), and the bounded ssh
+/// ConnectTimeout — factored from [`run_daemon`] so the call shape is pinned
+/// by test.
 fn mux_ssh_options(
     family: Family,
     port_range: Option<String>,
@@ -1121,9 +1126,10 @@ fn mux_ssh_options(
         family,
         port_range,
         agent_source: None, // the agent verb IS forwarding; no -A
-        real_ssh_agent_forward: None,
+        real_ssh_agent_forward: Some(false), // -a: no sshd-forwarded competitor
         channels: true, // RFC 0011 §6: selected on the bootstrap invocation
         connect_timeout_secs: Some(MUX_BOOTSTRAP_CONNECT_TIMEOUT_SECS),
+        agent_export: false, // no session here to export into
     }
 }
 
@@ -4653,6 +4659,7 @@ mod tests {
             real_ssh_agent_forward: None,
             channels: false,
             connect_timeout_secs: None,
+            agent_export: false,
         }
     }
 
@@ -4660,20 +4667,26 @@ mod tests {
     fn mux_bootstrap_ssh_argv_is_bounded_by_connect_timeout() {
         // The daemon's ssh bootstrap call shape: a hung destination must not
         // wedge the SHARED endpoint indefinitely, so the mux options carry
-        // the bounded ConnectTimeout — pinned at the argv seam.
+        // the bounded ConnectTimeout — pinned at the argv seam. posh#161:
+        // an explicit real-ssh `-a` rides too, so the workstation's
+        // ForwardAgent config can no longer stand up an sshd-forwarded
+        // socket in the remote endpoint's env (a connection-bound competitor
+        // for agent/sock that the host's login rendezvous latched onto).
         let opts = mux_ssh_options(Family::Auto, None);
         assert_eq!(
             crate::remote::sshwrap::ssh_args(&opts),
-            vec!["-o", "ConnectTimeout=10"]
+            vec!["-a", "-o", "ConnectTimeout=10"]
         );
-        // Family still rides ahead of the timeout, as in the session path.
+        // Family still rides ahead of the agent flag and timeout, as in the
+        // session path.
         let opts = mux_ssh_options(Family::Inet, Some("60000:61000".to_string()));
         assert_eq!(
             crate::remote::sshwrap::ssh_args(&opts),
-            vec!["-4", "-o", "ConnectTimeout=10"]
+            vec!["-4", "-a", "-o", "ConnectTimeout=10"]
         );
         assert!(opts.channels, "agent channels exist only enveloped");
         assert_eq!(opts.agent_source, None, "the agent verb IS forwarding; no -A");
+        assert!(!opts.agent_export, "no session to export into");
     }
 
     #[test]
