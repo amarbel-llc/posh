@@ -306,6 +306,21 @@ come back, and the mixed-version election depends on absent-means-dead.
 pin it. This is a deliberate step toward RFC 0011 §7's end state (the
 path as a bound name rather than an elected symlink).
 
+Two edges, one guarded and one accepted: (1) pid reuse — the persistent
+pid record can be arbitrarily old, and a pid-only liveness gate would
+read a recycled pid as a live foreign owner forever, poisoning the
+deterministic name with EADDRINUSE; the successor's bind therefore adds
+ONE connect probe of the contended socket at spawn (not the per-tick
+probing posh#147 removed) and reclaims when nothing accepts. (2) A
+STALLED-but-alive mux owner (SIGSTOP, wedged loop) that entered the
+kept state pins `agent/sock` at its fast-failing socket: a later-active
+sibling defers to the live pid, so healing waits on the owner's own
+tick (normally ≤ the posh#152 edge/5 s; unbounded only while the owner
+stays stopped). Accepted for now — the mux endpoint self-heals via the
+posh#162 reconnect, and `just debug-posh-agent-resolve` makes the state
+legible; revisit with RFC 0011 §7's bound name, where the question
+disappears.
+
 ### Decision (2026-07-28, RATIFIED): the two-client-host policy
 
 RFC 0011 §8 defers to this record the case single ownership does not cover: the

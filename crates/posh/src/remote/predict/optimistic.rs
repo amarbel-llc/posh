@@ -76,27 +76,47 @@ impl OptimisticPredictor {
         self.buf
             .overlays
             .retain(|row| row.cells.iter().any(|c| c.active));
-        // Judge the NEWEST acked prediction only (mosh's cull judges the
-        // last entry): older chain entries are frozen intermediate positions
-        // (only the newest cursor ever moves; an epoch bump freezes it and
-        // pushes a successor), so when one echo ack covers several epochs at
-        // once — routine on the slow links optimistic targets — the frame's
-        // cursor legitimately sits at the newest spot and every older entry
-        // "mismatches". Only the newest acked entry carries a verdict.
-        let newest_acked = self
-            .buf
-            .cursors
-            .iter()
-            .rev()
-            .map(|c| c.get_validity(fb, late_ack))
-            .find(|v| !matches!(v, Validity::Pending | Validity::Inactive));
-        if newest_acked == Some(Validity::IncorrectOrExpired) {
-            self.cursor_resets += 1;
-            self.buf.cursors.clear();
-        } else {
-            self.buf
+        // Judge the NEWEST prediction only, and only once IT is acked
+        // (mosh's cull judges `cursors.last()`): older chain entries are
+        // frozen intermediate positions (only the newest cursor ever moves;
+        // an epoch bump freezes it and pushes a successor), so both a
+        // batched ack covering several epochs and a MID-chain ack landing
+        // between entries legitimately leave older entries "mismatching"
+        // the frame while the chain's head is still right. A verdict exists
+        // only when the server has echoed past the head itself.
+        //
+        // An out-of-bounds head (the terminal shrank — a client resize, or
+        // a smallest-wins re-size on reattach) invalidates the chain but is
+        // NOT a server contradiction: clear silently, keep the FDR 0006
+        // mispredict gauge honest.
+        enum Verdict {
+            Contradicted,
+            Resized,
+        }
+        let verdict = self.buf.cursors.last().and_then(|c| {
+            if !c.active {
+                return None;
+            }
+            if c.row >= fb.rows || c.col >= fb.cols {
+                return Some(Verdict::Resized);
+            }
+            if late_ack >= c.expiration_frame
+                && (fb.cursor_row != c.row || fb.cursor_col != c.col)
+            {
+                return Some(Verdict::Contradicted);
+            }
+            None
+        });
+        match verdict {
+            Some(Verdict::Contradicted) => {
+                self.cursor_resets += 1;
+                self.buf.cursors.clear();
+            }
+            Some(Verdict::Resized) => self.buf.cursors.clear(),
+            None => self
+                .buf
                 .cursors
-                .retain(|c| c.get_validity(fb, late_ack) == Validity::Pending);
+                .retain(|c| c.get_validity(fb, late_ack) == Validity::Pending),
         }
     }
 }
@@ -261,8 +281,11 @@ mod tests {
         eng.render(&mut shown, &ReplaceRenderer);
         assert_eq!((shown.cursor_row, shown.cursor_col), (1, 1), "the chain's head is painted");
 
-        // The server echoes 'a' but leaves the cursor at column 10 (a prompt
-        // redraw); its echo ack covers 'a' only — the CR and 'b' are in flight.
+        // A MID-chain ack is not a verdict (mosh judges `cursors.last()`
+        // only): the server echoes 'a' with the cursor elsewhere while the
+        // CR and 'b' are still in flight — the truth about the chain's head
+        // is unknowable until ITS echo, so the head stays painted (bounded
+        // by one RTT) and nothing is counted.
         server.process(b"a\x1b[11G");
         let fb1 = Snapshot::from_term(&reparse(24, 80, &server.dump_vt()));
         assert_eq!((fb1.cursor_row, fb1.cursor_col), (0, 10));
@@ -270,19 +293,45 @@ mod tests {
         eng.cull(&fb1, 1100);
         let mut next = fb1.clone();
         eng.render(&mut next, &ReplaceRenderer);
+        assert_eq!((next.cursor_row, next.cursor_col), (1, 1), "head pending: no verdict yet");
+        assert_eq!(eng.stats().mispredict_resets, 0);
+
+        // Once the echo ack passes the HEAD and the frame's cursor sits
+        // elsewhere, the server has spoken: the whole chain goes, the reset
+        // is counted, and the next keystroke re-seeds from the frame.
+        server.process(b"\x1b[2;1Hb\x1b[2;11H");
+        let fb1b = Snapshot::from_term(&reparse(24, 80, &server.dump_vt()));
+        assert_eq!((fb1b.cursor_row, fb1b.cursor_col), (1, 10));
+        eng.on_server_frame(3, 3, 50);
+        eng.cull(&fb1b, 1150);
+        let mut next = fb1b.clone();
+        eng.render(&mut next, &ReplaceRenderer);
         assert_eq!(
             (next.cursor_row, next.cursor_col),
-            (0, 10),
-            "the server contradicted the acked prediction: the chained one must go too"
+            (1, 10),
+            "acked head contradicted: the chain is dropped"
         );
         assert_eq!(eng.stats().mispredict_resets, 1, "the reset is counted");
 
         // A subsequent keystroke re-seeds from the frame, not the dead chain.
         eng.set_frame_sent(3);
-        eng.on_user_byte(b'c', &fb1, 1200);
-        let mut again = fb1.clone();
+        eng.on_user_byte(b'c', &fb1b, 1200);
+        let mut again = fb1b.clone();
         eng.render(&mut again, &ReplaceRenderer);
-        assert_eq!((again.cursor_row, again.cursor_col), (0, 11));
+        assert_eq!((again.cursor_row, again.cursor_col), (1, 11));
+
+        // A shrink that strands the head out of bounds clears the chain
+        // SILENTLY: dropping positions a resize invalidated is hygiene, not
+        // a server contradiction — the A/B gauge must not count it.
+        let mut small = super::OptimisticPredictor::new(false);
+        type_chain(&mut small);
+        let shrunk = Snapshot::blank(1, 1);
+        small.on_server_frame(0, 0, 50);
+        small.cull(&shrunk, 1100);
+        assert_eq!(small.stats().mispredict_resets, 0, "resize is not a contradiction");
+        let mut tiny = shrunk.clone();
+        small.render(&mut tiny, &ReplaceRenderer);
+        assert_eq!((tiny.cursor_row, tiny.cursor_col), (0, 0), "no stale cursor painted");
 
         // And an acked prediction the server AGREES with retires quietly,
         // leaving the newer chained one in place.

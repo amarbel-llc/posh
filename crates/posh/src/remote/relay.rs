@@ -747,8 +747,13 @@ fn relay_loop(
         // Mature the echo ack FIRST, so everything sent this iteration (a
         // forwarded frame, an empty) carries it; if it advanced and no frame
         // carries it, an empty ack goes out below — the client's predictions
-        // can be validated even when the screen did not change.
-        let mut echo_advanced = echo.update(now);
+        // can be validated even when the screen did not change. NOT while a
+        // frame is outstanding (server_loop's force-ack guard): the client
+        // culls against its last APPLIED screen, and a matured ack racing a
+        // lost/held echo-bearing frame would judge correct predictions
+        // "contradicted" against a pre-echo screen. Held entries keep aging
+        // and mature the iteration after the frame is acked.
+        let mut echo_advanced = if held.is_held() { false } else { echo.update(now) };
 
         // --- UDP client -> daemon ---
         let mut winding_down = false;
@@ -1028,8 +1033,16 @@ fn relay_loop(
             }
         }
 
-        // Flush queued writes toward the daemon.
-        if fds[1].revents & libc::POLLOUT != 0 && !link.write.is_empty() {
+        // Flush queued writes toward the daemon. Deliberately NOT gated on
+        // POLLOUT (that flag is only ARMED when the buffer was non-empty at
+        // poll setup): bytes appended THIS iteration must get their flush
+        // attempt now, or the backpressure restamp below would fire on
+        // ordinary one-cycle write latency during steady typing and the echo
+        // ack would never mature — stalling exactly the prediction
+        // retirement it exists to time. The socket is non-blocking;
+        // WouldBlock leaves the remainder buffered (that IS backpressure)
+        // and POLLOUT wakes the loop to finish.
+        if !link.write.is_empty() {
             match (&link.stream).write(&link.write) {
                 Ok(n) => {
                     link.write.drain(..n);
@@ -1044,10 +1057,10 @@ fn relay_loop(
                 Err(e) => return Err(e.into()),
             }
         }
-        // Daemon backpressure: input still sitting in `link.write` has not
-        // reached the shell, so its echo grace period cannot have begun —
-        // restart the pending entries' clocks (they mature ECHO_TIMEOUT
-        // after the buffer last drained).
+        // GENUINE daemon backpressure: input still sitting in `link.write`
+        // after the flush attempt has not reached the shell, so its echo
+        // grace period cannot have begun — restart the pending entries'
+        // clocks (they mature ECHO_TIMEOUT after the buffer last drained).
         if !link.write.is_empty() {
             echo.restamp_pending(now);
         }

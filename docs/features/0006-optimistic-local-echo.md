@@ -151,6 +151,20 @@ collect against the criterion (echo leaks at password prompts, flicker,
 full-screen apps) before deciding whether `optimistic` becomes the default
 outright.
 
+**Known limitations of the cursor-verdict + matured-ack machinery** (from
+the same review): against an OLD posh-server whose relay still mirrors
+`echo_ack = input_ack` instantly, the strict cursor rule can fire on every
+frame that races an echo — mixed-version sessions are noisy for optimistic
+(they always were broken for it; the premature retirement predates this
+work) and their `mispredict_resets` numbers must be excluded from the A/B;
+posh#164's cutover design is the answer, not a client-side heuristic. The
+verdict now follows mosh exactly: only the chain's NEWEST entry, once the
+echo ack passes it, carries a verdict (a mid-chain ack proves nothing about
+the head, which stays painted for at most ~1 RTT), an out-of-bounds head
+(resize) clears silently without counting, and the relay/bridge defer echo
+maturation while a frame is outstanding — so a verdict is only ever formed
+against a screen that contains the echo it claims.
+
 ## Limitations
 
 - **ECHO-flip race.** The server's `ECHO`-off signal must reach the client

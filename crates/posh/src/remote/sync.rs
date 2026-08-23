@@ -379,8 +379,14 @@ impl EchoAck {
     /// non-empty; callers that write synchronously before recording (the
     /// roaming server's PTY write) never need it.
     pub fn restamp_pending(&mut self, now: u64) {
-        for (_, at) in self.pending.iter_mut() {
-            *at = now;
+        // Everything pending shares one restarted clock, and the ack is
+        // cumulative — so the restamped state collapses to a single entry at
+        // the highest offset. That also BOUNDS the deque under sustained
+        // backpressure (each input batch appends, each restamp collapses)
+        // instead of growing it one entry per batch with an O(n) walk.
+        if let Some(&(newest, _)) = self.pending.back() {
+            self.pending.clear();
+            self.pending.push_back((newest, now));
         }
     }
 
@@ -1693,6 +1699,18 @@ mod tests {
         assert_eq!(echo.ack(), 0);
         assert!(echo.update(1000 + ECHO_TIMEOUT - 10 + ECHO_TIMEOUT));
         assert_eq!(echo.ack(), 5);
+
+        // Sustained backpressure stays BOUNDED: append + restamp per batch
+        // collapses to one entry at the highest offset (the ack is
+        // cumulative), and maturing that entry acks everything at once.
+        let mut busy = EchoAck::new();
+        for i in 1..=100u64 {
+            busy.record(i, 2000 + i);
+            busy.restamp_pending(2000 + i);
+        }
+        assert_eq!(busy.pending.len(), 1, "restamp collapses the deque");
+        assert!(busy.update(2100 + ECHO_TIMEOUT));
+        assert_eq!(busy.ack(), 100);
     }
 
     #[test]

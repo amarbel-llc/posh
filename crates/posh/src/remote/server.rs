@@ -614,8 +614,11 @@ pub(crate) fn mux_peer_loop(
             let fd = b.link.stream.as_raw_fd();
             // Mature the echo ack FIRST (relay.rs ordering), so a frame
             // forwarded below carries it instead of being chased by a
-            // redundant Empty.
-            if b.echo.update(now) {
+            // redundant Empty — and, like the relay/server_loop, never while
+            // this channel's frame is outstanding: a matured ack racing a
+            // held echo-bearing frame would make the client cull correct
+            // predictions against a pre-echo screen.
+            if !b.held.is_held() && b.echo.update(now) {
                 b.ack_due = true;
             }
             let signalled = signalled_bridges.contains(&fd);
@@ -811,8 +814,17 @@ fn handle_session_instruction(
             // the opener stops retransmitting on the first instruction it
             // hears on the identifier. Without this, the two ends deadlock
             // — the local daemon queues messages until confirmed, and this
-            // peer has nothing to send until a message arrives.
-            let confirm = empty_ack_frame(0, 0, 0);
+            // peer has nothing to send until a message arrives. A duplicate
+            // confirm on an already-LINKED channel carries the bridge's
+            // current FLAG_ECHO: the client samples the optimistic-echo
+            // gate off every frame, so a bare-0 re-confirm arriving after
+            // echo frames are flowing would flip the gate off (FDR 0006).
+            let mut confirm = empty_ack_frame(0, 0, 0);
+            if let Some(PeerChannel::Linked(b)) =
+                idx.map(|i| &channels[i])
+            {
+                confirm.flags |= b.echo_flag;
+            }
             send_session_wire(conn, fragmenter, chan, SESSION_WIRE_DATA, &confirm.encode());
         }
         Some(&SESSION_WIRE_DATA) => {

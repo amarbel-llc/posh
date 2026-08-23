@@ -283,12 +283,24 @@ impl AgentEndpoint {
             // no new arbitration: clear only a dead (or self-pid-recorded,
             // i.e. previous-life) owner's leftovers; a live foreign owner
             // keeps the name and our bind fails EADDRINUSE below.
+            //
+            // Pid-reuse guard: the rendezvous now PERSISTS across exits, so
+            // the recorded pid can be arbitrarily old — once the kernel
+            // re-uses it for an unrelated process (which `pid_alive` cannot
+            // tell apart, and reads EPERM on another user's process as
+            // alive), a pid-only gate would refuse the reclaim FOREVER and
+            // poison the deterministic name with EADDRINUSE. So a
+            // live-looking recorded pid gets one connect probe of the socket
+            // itself, at SPAWN only (this is not the per-tick probing
+            // posh#147 removed — at worst it opens one phantom channel on a
+            // genuinely live foreign owner, once per endpoint spawn):
+            // nothing accepting ⇒ a leftover, reclaimed.
             Some(pid) => {
                 let dead_or_previous_life = match endpoint_pid(&dir, &stem) {
                     Some(recorded) => recorded == pid || !pid_alive(recorded),
                     None => true, // no liveness record ⇒ crash leftover
                 };
-                if dead_or_previous_life {
+                if dead_or_previous_life || crate::session::socket_is_dead(&own_sock) {
                     let _ = std::fs::remove_file(&own_sock);
                     std::fs::write(
                         own_pidfile.as_ref().expect("mux_pid implies pidfile"),
@@ -538,29 +550,35 @@ impl AgentEndpoint {
     /// discovering it owns the link is indistinguishable from having claimed
     /// it.
     fn release_symlink(&self) {
+        self.relinquish_symlink("agent/sock released");
+    }
+
+    /// The one relinquish policy, shared by the peer-inactive release and the
+    /// exit path (`Drop`) so the posh#161 rendezvous-persistence rules cannot
+    /// diverge between them: hand `agent/sock` to the freshest active sibling
+    /// when one exists; with nobody to hand it to, a MUX-named endpoint KEEPS
+    /// the link — its socket path is deterministic, the successor rebinds the
+    /// very same name, so the stable path stays pointed at it through the
+    /// outage (a consumer gets a fast connect failure instead of ENOENT, and
+    /// the path heals on its own; posh#161's second error phase was exactly
+    /// the old unlink: every shell's SSH_AUTH_SOCK went ENOENT host-wide for
+    /// a path that was about to come back) — while a pid-keyed srv socket,
+    /// whose name never comes back, still unlinks. No-op unless the link
+    /// currently points at us.
+    fn relinquish_symlink(&self, context: &str) {
         if !self.symlink_points_to_self() {
             return;
         }
         match self.freshest_active_sibling() {
             Some(target) => {
                 let _ = self.point_symlink_at(&target);
-                util::log_write("info", &format!("agent/sock released: repointed -> {target}"));
+                util::log_write("info", &format!("{context}: agent/sock repointed -> {target}"));
             }
-            // No sibling to hand off to. A MUX-named endpoint's socket path is
-            // deterministic — its successor rebinds the very same name — so
-            // the stable path stays POINTED AT IT through the outage: a
-            // consumer gets a fast connect failure instead of ENOENT, and the
-            // path heals on its own when the endpoint respawns. (posh#161's
-            // second error phase was exactly this unlink: every shell's
-            // SSH_AUTH_SOCK went ENOENT host-wide, and everything downstream —
-            // login-shell rendezvous checks, git signing — degraded on a path
-            // that was about to come back.) A pid-keyed srv socket never
-            // comes back under the same name, so it still unlinks.
             None if self.own_pidfile.is_some() => {
                 util::log_write(
                     "info",
                     &format!(
-                        "agent/sock kept -> {}.sock (no active sibling; \
+                        "{context}: agent/sock kept -> {}.sock (no active sibling; \
                          deterministic path, a successor rebinds it)",
                         self.stem
                     ),
@@ -568,7 +586,10 @@ impl AgentEndpoint {
             }
             None => {
                 let _ = std::fs::remove_file(&self.well_known);
-                util::log_write("info", "agent/sock released: unlinked (no active sibling)");
+                util::log_write(
+                    "info",
+                    &format!("{context}: agent/sock unlinked (no active sibling)"),
+                );
             }
         }
     }
@@ -808,45 +829,11 @@ impl AgentEndpoint {
 impl Drop for AgentEndpoint {
     fn drop(&mut self) {
         let mux_named = self.own_pidfile.is_some();
-        // If `agent/sock` still points at us, hand it to an active sibling
-        // when one exists. When nobody qualifies: a MUX-named endpoint KEEPS
-        // the link (and its dead socket file + pid record below) — the path
-        // is deterministic, the successor rebinds the same name, and a
-        // consumer meanwhile gets a fast connect failure instead of ENOENT
-        // (posh#161: the exit unlink made SSH_AUTH_SOCK vanish host-wide for
-        // the length of every reconnect). A pid-keyed srv socket never comes
-        // back under its name, so the srv shape keeps today's unlink.
-        if let Ok(target) = std::fs::read_link(&self.well_known) {
-            if self.dir.join(target) == self.own_sock {
-                match self.freshest_active_sibling() {
-                    Some(sibling) => {
-                        let _ = self.point_symlink_at(&sibling);
-                        util::log_write(
-                            "info",
-                            &format!("endpoint drop: agent/sock repointed -> {sibling}"),
-                        );
-                    }
-                    None if mux_named => util::log_write(
-                        "info",
-                        &format!(
-                            "endpoint drop: agent/sock kept -> {}.sock \
-                             (a successor rebinds the deterministic path)",
-                            self.stem
-                        ),
-                    ),
-                    None => {
-                        let _ = std::fs::remove_file(&self.well_known);
-                        util::log_write(
-                            "info",
-                            &format!(
-                                "endpoint drop: unlinked agent/sock (pointed at {}.sock)",
-                                self.stem
-                            ),
-                        );
-                    }
-                }
-            }
-        }
+        // One policy with the peer-inactive release (see `relinquish_symlink`):
+        // repoint to an active sibling, else a mux-named endpoint keeps the
+        // link (and its socket file + pid record below) for its successor,
+        // while srv unlinks.
+        self.relinquish_symlink("endpoint drop");
         // The status socket + its liveness record are introspection, not a
         // rendezvous — always removed (RFC 0013 §4, remove-after-unlink).
         if let Some(p) = &self.status_sock {
