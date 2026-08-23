@@ -300,7 +300,10 @@ read-only, `debug` group):
   agent fast-fail and 60 s exit timeout, SIGCONT, then print both sides'
   evidence (local mux log; the remote agent dir + its persistent
   `agent/mux-<client-id>.log`, which journals the fast-fail edge, the
-  `agent/sock` unlink, and the exit reason). CAUTION: stalls agent forwarding
+  `agent/sock` disposition ("kept" since the 2026-08-23 rendezvous
+  persistence — the symlink and the dead mux socket now SURVIVE outages so
+  consumers get a fast connect failure, never ENOENT; "unlinked" only from
+  pre-persistence builds), and the exit reason). CAUTION: stalls agent forwarding
   (and any POSH_MUX_SESSIONS channels on that daemon) for the duration.
   Since the posh#162 reconnect the daemon is NOT stranded afterward: the
   probe verdict (or the SIGCONT resume gap) condemns the dead wire and the

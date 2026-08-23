@@ -79,7 +79,12 @@ non-interactive PATH.
 	client's default-on _$POSH_MUX_ gate); not normally typed by hand. Flags precede
 	the verb, like *new*. It exits after a minute of peer silence — an
 	agent-only connection with a never-returning peer has nothing left
-	to serve. Its lifecycle is journaled to a persistent, appending
+	to serve. The rendezvous PERSISTS through that exit: with no active
+	sibling, _agent/sock_ stays pointed at the deterministic
+	_mux-<ID>.sock_, whose file and pid record stay on disk — a consumer
+	during the outage gets a fast connect failure instead of a missing
+	path, and the successor endpoint rebinds the same name in place, so
+	the path heals with no relinking. Its lifecycle is journaled to a persistent, appending
 	per-client-host log beside its socket,
 	_<base>/agent/mux-<ID>.log_: startup, peer-silence and resume
 	edges, _agent/sock_ claim/release transitions, and the exit reason

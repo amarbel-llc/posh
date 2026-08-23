@@ -546,10 +546,28 @@ impl AgentEndpoint {
                 let _ = self.point_symlink_at(&target);
                 util::log_write("info", &format!("agent/sock released: repointed -> {target}"));
             }
+            // No sibling to hand off to. A MUX-named endpoint's socket path is
+            // deterministic — its successor rebinds the very same name — so
+            // the stable path stays POINTED AT IT through the outage: a
+            // consumer gets a fast connect failure instead of ENOENT, and the
+            // path heals on its own when the endpoint respawns. (posh#161's
+            // second error phase was exactly this unlink: every shell's
+            // SSH_AUTH_SOCK went ENOENT host-wide, and everything downstream —
+            // login-shell rendezvous checks, git signing — degraded on a path
+            // that was about to come back.) A pid-keyed srv socket never
+            // comes back under the same name, so it still unlinks.
+            None if self.own_pidfile.is_some() => {
+                util::log_write(
+                    "info",
+                    &format!(
+                        "agent/sock kept -> {}.sock (no active sibling; \
+                         deterministic path, a successor rebinds it)",
+                        self.stem
+                    ),
+                );
+            }
             None => {
                 let _ = std::fs::remove_file(&self.well_known);
-                // The moment SSH_AUTH_SOCK starts failing ENOENT host-wide
-                // (posh#161's second error phase) — worth a line of its own.
                 util::log_write("info", "agent/sock released: unlinked (no active sibling)");
             }
         }
@@ -760,6 +778,18 @@ impl AgentEndpoint {
             else {
                 continue;
             };
+            // A dead mux endpoint's `<stem>.sock` + `<stem>.pid` are NOT
+            // garbage: the name is deterministic, the successor rebinds it in
+            // place, and `agent/sock` deliberately stays pointed at it across
+            // the outage (fast connect failure, never ENOENT). Its `.active`
+            // marker and `.status` files are still reaped — a dead endpoint
+            // must not look active or answer introspection scans.
+            let is_rendezvous = stem.starts_with("mux-")
+                && !stem.ends_with(".status")
+                && path.extension().is_none_or(|e| e != "active");
+            if is_rendezvous {
+                continue;
+            }
             let dead = match endpoint_pid(&self.dir, &stem) {
                 Some(pid) => !pid_alive(pid),
                 // An unparseable srv name is not ours to reap (unrelated
@@ -777,22 +807,48 @@ impl AgentEndpoint {
 
 impl Drop for AgentEndpoint {
     fn drop(&mut self) {
-        // Unlink our own socket. If `agent/sock` still points at us, remove it
-        // too — a later server's `tick` would otherwise see a dangling link
-        // and have to take over, and a client would get one failed connect in
-        // the meantime. Best-effort; a crash leaves it for GC + takeover.
+        let mux_named = self.own_pidfile.is_some();
+        // If `agent/sock` still points at us, hand it to an active sibling
+        // when one exists. When nobody qualifies: a MUX-named endpoint KEEPS
+        // the link (and its dead socket file + pid record below) — the path
+        // is deterministic, the successor rebinds the same name, and a
+        // consumer meanwhile gets a fast connect failure instead of ENOENT
+        // (posh#161: the exit unlink made SSH_AUTH_SOCK vanish host-wide for
+        // the length of every reconnect). A pid-keyed srv socket never comes
+        // back under its name, so the srv shape keeps today's unlink.
         if let Ok(target) = std::fs::read_link(&self.well_known) {
             if self.dir.join(target) == self.own_sock {
-                let _ = std::fs::remove_file(&self.well_known);
-                util::log_write(
-                    "info",
-                    &format!("endpoint drop: unlinked agent/sock (pointed at {}.sock)", self.stem),
-                );
+                match self.freshest_active_sibling() {
+                    Some(sibling) => {
+                        let _ = self.point_symlink_at(&sibling);
+                        util::log_write(
+                            "info",
+                            &format!("endpoint drop: agent/sock repointed -> {sibling}"),
+                        );
+                    }
+                    None if mux_named => util::log_write(
+                        "info",
+                        &format!(
+                            "endpoint drop: agent/sock kept -> {}.sock \
+                             (a successor rebinds the deterministic path)",
+                            self.stem
+                        ),
+                    ),
+                    None => {
+                        let _ = std::fs::remove_file(&self.well_known);
+                        util::log_write(
+                            "info",
+                            &format!(
+                                "endpoint drop: unlinked agent/sock (pointed at {}.sock)",
+                                self.stem
+                            ),
+                        );
+                    }
+                }
             }
         }
-        let _ = std::fs::remove_file(&self.own_sock);
-        // The status socket + its liveness record follow the same
-        // remove-after-unlink ordering (RFC 0013 §4).
+        // The status socket + its liveness record are introspection, not a
+        // rendezvous — always removed (RFC 0013 §4, remove-after-unlink).
         if let Some(p) = &self.status_sock {
             let _ = std::fs::remove_file(p);
         }
@@ -802,11 +858,14 @@ impl Drop for AgentEndpoint {
         // The posh#152 activity marker goes with the socket: a dead endpoint
         // must not advertise itself as a repoint target.
         self.remove_active_marker();
-        // The mux pid file goes LAST: while the socket exists its liveness
-        // record must too (write-before-bind, remove-after-unlink).
-        if let Some(pf) = &self.own_pidfile {
-            let _ = std::fs::remove_file(pf);
+        if !mux_named {
+            // srv shape: socket removed, nothing else to keep.
+            let _ = std::fs::remove_file(&self.own_sock);
         }
+        // The mux socket FILE and its pid record persist together (the pid
+        // now names a dead process, which is exactly what tells the
+        // successor's bind — and any takeover probe — that the leftover is
+        // reclaimable). For srv, the pid file never existed.
     }
 }
 
@@ -2592,11 +2651,57 @@ mod tests {
         assert!(dir.join("mux-clienthost.status.sock").exists());
         assert!(dir.join("mux-clienthost.status.pid").exists());
         drop(ep);
-        assert!(!dir.join("mux-clienthost.sock").exists());
-        assert!(!dir.join("mux-clienthost.pid").exists());
+        // The deterministic rendezvous PERSISTS through the exit (posh#161):
+        // agent/sock stays pointed at the mux socket, and the socket file +
+        // pid record stay for the successor's bind to reclaim in place —
+        // consumers get a fast connect failure, never ENOENT. Introspection
+        // files (status) and the activity marker do go.
+        assert!(dir.join("mux-clienthost.sock").exists(), "socket file kept");
+        assert!(dir.join("mux-clienthost.pid").exists(), "pid record kept");
         assert!(!dir.join("mux-clienthost.status.sock").exists());
         assert!(!dir.join("mux-clienthost.status.pid").exists());
-        assert!(std::fs::symlink_metadata(dir.join("sock")).is_err());
+        assert!(!dir.join("mux-clienthost.active").exists());
+        assert_eq!(
+            std::fs::read_link(dir.join("sock")).unwrap().to_str().unwrap(),
+            "mux-clienthost.sock",
+            "agent/sock kept across the endpoint exit"
+        );
+        std::fs::remove_dir_all(&base).ok();
+    }
+
+    #[test]
+    fn mux_rendezvous_survives_exit_and_a_successor_rebinds_it_in_place() {
+        // The posh#161 outage shape, end to end: the endpoint exits with no
+        // sibling (peer-silence exit / daemon death), the stable path stays
+        // pointed at the deterministic socket, a sibling's GC sweep leaves it
+        // alone, and the successor endpoint for the same client host rebinds
+        // the very same path — agent/sock never dangles and never moves.
+        let base = temp_base();
+        let dir = base.join("agent");
+        let ep = AgentEndpoint::new_mux(&base, "clienthost").unwrap();
+        drop(ep);
+        assert!(dir.join("mux-clienthost.sock").exists());
+
+        // A sibling srv endpoint's GC must not reap the dead rendezvous
+        // (pre-change it was "a crash leftover" and reaped).
+        let sibling = AgentEndpoint::new(&base).unwrap();
+        sibling.gc_dead_sockets();
+        assert!(
+            dir.join("mux-clienthost.sock").exists(),
+            "a dead mux rendezvous is not garbage"
+        );
+        assert!(dir.join("mux-clienthost.pid").exists());
+        drop(sibling);
+
+        // The successor rebinds the same name and agent/sock resolves live
+        // again with no relink of the well-known path itself required.
+        let successor = AgentEndpoint::new_mux(&base, "clienthost").unwrap();
+        assert_eq!(
+            std::fs::read_link(successor.sock_path()).unwrap().to_str().unwrap(),
+            "mux-clienthost.sock"
+        );
+        assert!(successor.own_sock.exists());
+        drop(successor);
         std::fs::remove_dir_all(&base).ok();
     }
 
@@ -2613,26 +2718,33 @@ mod tests {
     }
 
     #[test]
-    fn gc_reaps_dead_mux_endpoint_files() {
+    fn gc_spares_the_mux_rendezvous_but_reaps_its_markers_and_status_files() {
         let base = temp_base();
         let ep = AgentEndpoint::new(&base).unwrap();
         let dir = base.join("agent");
-        // A crashed mux endpoint: socket + marker + a pid file naming a dead
-        // pid — all three are leftovers.
+        // A dead mux endpoint's socket + pid record are a RENDEZVOUS, not
+        // garbage (posh#161): the deterministic name is rebound in place by
+        // the successor, and agent/sock stays pointed at it through the
+        // outage. Its activity marker and status files ARE leftovers — a
+        // dead endpoint must not look active or answer introspection scans.
         std::fs::write(dir.join("mux-dead.sock"), b"").unwrap();
         std::fs::write(dir.join("mux-dead.active"), b"1").unwrap();
         std::fs::write(dir.join("mux-dead.pid"), b"999999").unwrap();
-        // A mux socket with NO pid file is unprovably live (the pid file is
-        // written before the bind): a crash leftover, reaped too.
+        std::fs::write(dir.join("mux-dead.status.sock"), b"").unwrap();
+        std::fs::write(dir.join("mux-dead.status.pid"), b"999999").unwrap();
+        // Even a mux socket with NO pid file persists: the name alone is the
+        // rendezvous, and the successor's bind clears the leftover itself.
         std::fs::write(dir.join("mux-orphan.sock"), b"").unwrap();
-        // A LIVE mux sibling survives.
+        // A LIVE mux sibling survives untouched, of course.
         std::fs::write(dir.join("mux-live.sock"), b"").unwrap();
         std::fs::write(dir.join("mux-live.pid"), own_pid().to_string()).unwrap();
         ep.gc_dead_sockets();
-        assert!(!dir.join("mux-dead.sock").exists());
-        assert!(!dir.join("mux-dead.active").exists());
-        assert!(!dir.join("mux-dead.pid").exists());
-        assert!(!dir.join("mux-orphan.sock").exists());
+        assert!(dir.join("mux-dead.sock").exists(), "rendezvous socket kept");
+        assert!(dir.join("mux-dead.pid").exists(), "rendezvous pid record kept");
+        assert!(!dir.join("mux-dead.active").exists(), "stale marker reaped");
+        assert!(!dir.join("mux-dead.status.sock").exists(), "stale status socket reaped");
+        assert!(!dir.join("mux-dead.status.pid").exists());
+        assert!(dir.join("mux-orphan.sock").exists());
         assert!(dir.join("mux-live.sock").exists(), "a live mux sibling is not reaped");
         assert!(dir.join("mux-live.pid").exists());
         drop(ep);

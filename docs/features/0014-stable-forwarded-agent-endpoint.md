@@ -265,6 +265,32 @@ rendezvous policy is eng's (tracked there), and posh#103 remains the
 end-state. The detached spawn (`posh host:session --detach`, FDR 0010)
 still inherits the spawning ssh's environment (posh#103's second case).
 
+### The rendezvous persists through outages (2026-08-23, same day)
+
+Exporting the stable path exposed that it was not stable AS A PATH: the
+endpoint unlinked `agent/sock` on the 15 s peer-silence fast-fail and
+removed its own socket on exit, so during every outage/reconnect the
+exported `SSH_AUTH_SOCK` — and anything an operator had pointed at the
+path — failed **ENOENT** for a name that was about to come back
+(observed live: a login shell during an outage saw "not a socket",
+mislatched its rendezvous, and git signing broke). Since a MUX-named
+socket is deterministic — the successor endpoint rebinds the very same
+`agent/mux-<client-id>.sock`, and the bind already reclaims a
+dead-owner leftover — the deterministic shape now PERSISTS: on
+peer-inactive release and on exit with no active sibling, `agent/sock`
+stays pointed at the mux socket, the socket file and its (now
+dead-pid) liveness record stay on disk, and sibling GC leaves them
+alone (`.active` markers and `.status.*` files are still reaped). A
+consumer during the outage gets a fast connect failure instead of
+ENOENT, and the path heals with no relinks when the endpoint respawns.
+With an ACTIVE sibling the repoint handoff is unchanged, and pid-keyed
+`srv-*` endpoints keep the old unlink semantics — their names never
+come back, and the mixed-version election depends on absent-means-dead.
+`mux_rendezvous_survives_exit_and_a_successor_rebinds_it_in_place` and
+`gc_spares_the_mux_rendezvous_but_reaps_its_markers_and_status_files`
+pin it. This is a deliberate step toward RFC 0011 §7's end state (the
+path as a bound name rather than an elected symlink).
+
 ### Decision (2026-07-28, RATIFIED): the two-client-host policy
 
 RFC 0011 §8 defers to this record the case single ownership does not cover: the
