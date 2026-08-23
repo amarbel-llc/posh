@@ -184,6 +184,21 @@ impl PredictionModel {
             Some(other) => Err(format!("unknown prediction model ({other})")),
         }
     }
+
+    /// The model's user-facing spelling — the inverse of [`parse`](Self::parse),
+    /// so banners, the palette heading, and the `Echo:` command labels all
+    /// say the same word (`scratch`, not the Debug form `FromScratch`).
+    pub fn name(self) -> &'static str {
+        match self {
+            PredictionModel::Adaptive => "adaptive",
+            PredictionModel::Always => "always",
+            PredictionModel::Never => "never",
+            PredictionModel::Experimental => "experimental",
+            PredictionModel::Optimistic => "optimistic",
+            PredictionModel::Controller => "controller",
+            PredictionModel::FromScratch => "scratch",
+        }
+    }
 }
 
 /// Prediction render-style selection (`$POSH_PREDICTION_RENDER`).
@@ -223,7 +238,12 @@ impl RenderStyle {
 /// whether to stop gating them.
 pub const ESCALATE_SRTT_MS: f64 = 150.0;
 /// SRTT below which the link counts as recovered — hysteresis so a jittery
-/// link does not flap models (each switch repaints).
+/// link does not flap models (each switch repaints). Deliberately well
+/// under the escalate threshold: once escalated, a link that settles IN the
+/// band (say a 120 ms intercontinental baseline after a >150 ms burst) stays
+/// optimistic — optimistic is no worse there, and recovering at the escalate
+/// threshold would flap a link hovering around it. Only a genuinely fast
+/// link, or an explicit `Echo:` choice, ends an escalation.
 pub const DEESCALATE_SRTT_MS: f64 = 80.0;
 /// How long the SRTT must hold on one side before acting: long enough that a
 /// single retransmit spike does not escalate, short enough that a bad link
@@ -380,6 +400,18 @@ mod tests {
             "held fast for the recovery hold ⇒ back to adaptive"
         );
         assert!(!esc.escalated());
+
+        // In-band stickiness (by design): a link that escalates on a burst
+        // and then settles INSIDE the band never recovers on its own —
+        // optimistic is no worse at 120 ms, and recovering at the escalate
+        // threshold would flap a link hovering around it.
+        let mut sticky = EchoEscalation::new(true);
+        assert_eq!(sticky.tick(200.0, 0), None);
+        assert_eq!(sticky.tick(200.0, ESCALATE_HOLD_MS), Some(PredictionModel::Optimistic));
+        for t in 1..=100u64 {
+            assert_eq!(sticky.tick(120.0, ESCALATE_HOLD_MS + t * DEESCALATE_HOLD_MS), None);
+        }
+        assert!(sticky.escalated(), "in-band forever ⇒ stays escalated");
 
         // An explicit non-adaptive choice pins: the machine steps aside even
         // on a terrible link; choosing adaptive again hands control back,

@@ -273,8 +273,8 @@ _POSH_PREDICTION_MODEL_
 _POSH_ECHO_ESCALATE_
 	Slow-link echo escalation (adaptive → optimistic once the RTT holds
 	above 150 ms, back under 80 ms), default ON; _0_ opts out. The *Ctrl-^*
-	palette heading shows the live RTT/RTO and the echo model in effect.
-	See *posh-client*(1).
+	palette heading shows the live RTT and the echo model in effect
+	(_rtt 412ms · echo: optimistic (auto)_). See *posh-client*(1).
 
 _POSH_PREDICTION_RENDER_
 	How predicted cells are painted, independent of the model: _replace_

@@ -76,12 +76,21 @@ So the client now runs the A/B itself: with the model left on its default,
 wire's SRTT has held above 150 ms for 3 s, and back to `adaptive` after it
 has held under 80 ms for 15 s (hysteresis + asymmetric holds so a jittery
 link does not flap and a mid-outage good moment does not yank the echo).
-Any explicit model — `POSH_PREDICTION_MODEL`, or the palette's `Echo:`
-commands — pins and bypasses it; `Echo: adaptive` re-arms it.
-`POSH_ECHO_ESCALATE=0` opts out (default-on gate shape). The palette heading
-carries the live `rtt`/`rto` and `echo: optimistic (auto: slow link)` while
-escalated; "Show echo prediction stats" reports the state and thresholds;
-the switch is bannered and logged (`echo` tag) with the SRTT at the edge.
+Any explicit model — `POSH_PREDICTION_MODEL` (even `adaptive`: naming it
+is a choice, unlike leaving it unset), or the palette's `Echo:` commands —
+pins and bypasses it; the palette's `Echo: adaptive` is the one re-arm.
+`POSH_ECHO_ESCALATE=0` opts out (default-on gate shape). The machine acts
+only on a MEASURED SRTT (the estimator's 1000 ms pre-sample placeholder
+would otherwise escalate every fresh connection), and a link that settles
+between the thresholds stays escalated by design (optimistic is no worse at
+120 ms; recovering at the escalate threshold would flap). The palette
+heading carries the live `rtt` and `echo: optimistic (auto)` while
+escalated (kept under posh-palette's ~42 content columns); "Show echo
+prediction stats" reports the state and thresholds; each switch is
+bannered (never over a sticky wedge notice) and logged (`echo` tag) with
+the SRTT at the edge AND the outgoing model's outcome counters — the
+predictor is rebuilt on a switch, so that log line is where the A/B data
+survives.
 `remote::predict::tests::echo_escalation_holds_hysteresis_and_yields_to_explicit_choices`
 and
 `remote::client::tests::echo_set_pins_the_model_against_slow_link_escalation_and_adaptive_rearms`

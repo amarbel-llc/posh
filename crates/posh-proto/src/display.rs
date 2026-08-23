@@ -802,6 +802,13 @@ impl NotificationEngine {
         &self.message
     }
 
+    /// A permanent (sticky) message is up — one meant to persist until the
+    /// user acts (the wedge-forensics notice). Transient status banners
+    /// should not replace it: `set_message` overwrites unconditionally.
+    pub fn message_is_sticky(&self) -> bool {
+        self.message_expiration.is_none() && !self.message.is_empty()
+    }
+
     /// Clears an expired transient message.
     pub fn adjust(&mut self, now: u64) {
         if let Some(expiry) = self.message_expiration {

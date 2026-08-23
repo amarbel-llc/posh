@@ -87,17 +87,23 @@ _POSH_PREDICTION_MODEL_
 	keystrokes after Enter or any control key for a full round trip (the
 	tentative-epoch gate), which on a slow link is what the user feels, so
 	once the smoothed RTT has stayed above 150 ms for 3 s the client
-	switches to _optimistic_ — banner _echo: Optimistic (auto: slow link)_
-	— and back to _adaptive_ after the RTT has stayed under 80 ms for 15 s.
-	Any explicit model (this variable, or the palette's *Echo:* commands)
-	pins the choice; picking *Echo: adaptive* re-arms the escalation.
+	switches to _optimistic_ — banner _echo: optimistic (auto: slow link)_
+	— and back to _adaptive_ after the RTT has stayed under 80 ms for 15 s
+	(a link that settles between the two thresholds stays escalated:
+	optimistic is no worse there, and recovering at the escalate threshold
+	would flap). Any explicit model pins the choice and disables the
+	escalation — this variable, _adaptive_ included (naming it is a choice,
+	unlike leaving it unset), and the palette's *Echo:* commands — except
+	*Echo: adaptive* from the palette, which re-arms it.
 
 _POSH_ECHO_ESCALATE_
 	The slow-link auto-escalation above, default ON; _0_ (or *false*,
 	*off*, *no*) keeps the default model at plain _adaptive_ whatever the
-	RTT. The palette heading shows the live RTT and the model in effect
-	(_echo: optimistic (auto: slow link)_ while escalated), and *Show echo
-	prediction stats* reports the escalation state and thresholds.
+	RTT. The palette heading shows the live RTT and the model in effect —
+	_rtt 412ms · echo: optimistic (auto)_ while escalated — and *Show echo
+	prediction stats* reports the escalation state and thresholds; each
+	automatic switch is logged with the outgoing model's outcome counters
+	(the FDR 0006 A/B record).
 
 _POSH_PREDICTION_RENDER_
 	How predicted cells are painted, independent of the model: _replace_

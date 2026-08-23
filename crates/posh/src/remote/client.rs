@@ -65,7 +65,11 @@ fn apply_echo_model(st: &mut ClientState, next: PredictionModel, now: u64) {
     st.predict_model = next;
     st.stats.set_gp_active(is_gp_species(next));
     st.initialized = false;
-    st.notify.set_message(&format!("echo: {next:?}"), false, now);
+    // A sticky notice (the wedge-forensics banner, up until a keystroke)
+    // outranks this 1 s status line; set_message would clobber it.
+    if !st.notify.message_is_sticky() {
+        st.notify.set_message(&format!("echo: {}", next.name()), false, now);
+    }
 }
 
 /// Whether a prediction model is one of the evolved GP species (RFC 0007). The
@@ -162,13 +166,14 @@ fn palette_commands(server_log_on: bool, scroll_opt: bool) -> Value {
 
 /// The palette's heading (RFC 0005 `ui.show` `title`): the live link latency
 /// and the echo model in effect, so "how bad is this link and what is posh
-/// doing about it" costs zero keystrokes beyond opening the palette. SRTT and
-/// RTO are the wire's estimator (the same numbers "Show connection health"
-/// dumps); the echo label names an automatic slow-link switch as such.
-fn palette_title(srtt_ms: f64, rto_ms: u64, model: PredictionModel, auto_escalated: bool) -> String {
-    let model = format!("{model:?}").to_ascii_lowercase();
-    let auto = if auto_escalated { " (auto: slow link)" } else { "" };
-    format!("Commands · rtt {srtt_ms:.0}ms · rto {rto_ms}ms · echo: {model}{auto}")
+/// doing about it" costs zero keystrokes beyond opening the palette. SRTT is
+/// the wire's estimator (the same number "Show connection health" dumps,
+/// with the RTO and the rest); the echo label names an automatic slow-link
+/// switch as such. Kept under ~40 columns: posh-palette's panel is a fixed
+/// 46 columns with 2-column padding and word-wraps a longer heading.
+fn palette_title(srtt_ms: f64, model: PredictionModel, auto_escalated: bool) -> String {
+    let auto = if auto_escalated { " (auto)" } else { "" };
+    format!("rtt {srtt_ms:.0}ms · echo: {}{auto}", model.name())
 }
 
 /// Summon the command palette: spawn the renderer on first use, then show it.
@@ -179,12 +184,7 @@ fn open_palette(st: &mut ClientState) -> bool {
         st.palette = Palette::spawn(st.rows, st.cols);
     }
     let commands = palette_commands(st.server_log_on, st.scroll_opt);
-    let title = palette_title(
-        st.wire.srtt(),
-        st.wire.rto(),
-        st.predict_model,
-        st.echo_escalation.escalated(),
-    );
+    let title = palette_title(st.wire.srtt(), st.predict_model, st.echo_escalation.escalated());
     if let Some(p) = st.palette.as_mut() {
         // A persisted (spawned-then-closed) palette is not resized while closed,
         // so re-sync it to the current tty size before summoning — else it
@@ -713,7 +713,7 @@ pub fn run(
     std::env::remove_var("POSH_KEY");
     let key = Key::from_base64(key_str.trim())?;
 
-    let (model, render, predict_overwrite, grab_mouse) = client_env_config()?;
+    let (model, render, predict_overwrite, grab_mouse, echo_escalate) = client_env_config()?;
 
     let addr = resolve(host, port, family)?;
     let conn = Connection::client(addr, &key)?;
@@ -736,6 +736,7 @@ pub fn run(
         model,
         render,
         predict_overwrite,
+        echo_escalate,
         grab_mouse,
         &raw,
         addr.port(),
@@ -766,7 +767,7 @@ pub fn run_over_mux(
     host: &str,
 ) -> Result<i32> {
     util::check_utf8_locale("posh-client")?;
-    let (model, render, predict_overwrite, grab_mouse) = client_env_config()?;
+    let (model, render, predict_overwrite, grab_mouse, echo_escalate) = client_env_config()?;
 
     util::install_client_signal_handlers();
     util::install_sigusr2_handler();
@@ -777,6 +778,7 @@ pub fn run_over_mux(
         model,
         render,
         predict_overwrite,
+        echo_escalate,
         grab_mouse,
         &raw,
         0,
@@ -795,18 +797,30 @@ pub fn run_over_mux(
 /// Model selection: $POSH_PREDICTION_MODEL, falling back to the deprecated
 /// $POSH_PREDICTION alias. Render style: $POSH_PREDICTION_RENDER (default
 /// replace).
-fn client_env_config() -> Result<(PredictionModel, RenderStyle, bool, GrabMouse)> {
+fn client_env_config() -> Result<(PredictionModel, RenderStyle, bool, GrabMouse, bool)> {
     let model_env = std::env::var("POSH_PREDICTION_MODEL")
         .ok()
         .or_else(|| std::env::var("POSH_PREDICTION").ok());
     let model = PredictionModel::parse(model_env.as_deref()).map_err(Error::Msg)?;
+    // Slow-link escalation governs only the UN-PINNED default: a model named
+    // in the environment — `adaptive` included, which parses to the same
+    // variant as unset — is an explicit choice and pins (the palette's
+    // `Echo: adaptive` is the one re-arm affordance).
+    let echo_escalate = echo_escalation_governs(model_env.as_deref(), predict::escalation_selected());
     let render_env = std::env::var("POSH_PREDICTION_RENDER").ok();
     let render = RenderStyle::parse(render_env.as_deref()).map_err(Error::Msg)?;
     let predict_overwrite = std::env::var("POSH_PREDICTION_OVERWRITE")
         .map(|v| !v.is_empty())
         .unwrap_or(false);
     let grab_mouse = GrabMouse::parse(std::env::var("POSH_GRAB_MOUSE").ok().as_deref())?;
-    Ok((model, render, predict_overwrite, grab_mouse))
+    Ok((model, render, predict_overwrite, grab_mouse, echo_escalate))
+}
+
+/// Whether the slow-link escalation governs at startup: no model named in
+/// the environment (unset or empty) AND the `POSH_ECHO_ESCALATE` gate on.
+/// Pure so the env-pins rule is pinned without touching the process env.
+fn echo_escalation_governs(model_env: Option<&str>, gate_on: bool) -> bool {
+    gate_on && model_env.is_none_or(str::is_empty)
 }
 
 /// `pub(crate)` so the mux daemon (remote::mux, M1 Task 3) resolves its
@@ -1110,6 +1124,7 @@ fn client_loop(
     model: PredictionModel,
     render: RenderStyle,
     predict_overwrite: bool,
+    echo_escalate: bool,
     grab_mouse: GrabMouse,
     raw: &RawMode,
     port: u16,
@@ -1157,9 +1172,7 @@ fn client_loop(
         predict_model: model,
         predict_render: render,
         predict_overwrite,
-        echo_escalation: predict::EchoEscalation::new(
-            model == PredictionModel::Adaptive && predict::escalation_selected(),
-        ),
+        echo_escalation: predict::EchoEscalation::new(echo_escalate),
         last_metrics: predict::MetricVector::unavailable(),
         remote_metrics: [f64::NAN; caps::METRICS_FIELDS],
         notify: NotificationEngine::new(now),
@@ -2068,18 +2081,30 @@ fn process_frame(st: &mut ClientState, frame: &ServerFrame) -> bool {
         .then(|| st.echo_escalation.tick(st.wire.srtt(), now))
         .flatten();
     if let Some(next) = escalate_to {
-        apply_echo_model(st, next, now);
         let why = if next == PredictionModel::Optimistic {
             "slow link"
         } else {
             "link recovered"
         };
-        st.notify
-            .set_message(&format!("echo: {next:?} (auto: {why})"), false, now);
+        // The A/B record: apply_echo_model REBUILDS the predictor, so the
+        // outgoing model's outcome gauges vanish with it — write them out
+        // first, or a session that escalated and later recovered ends with
+        // only its last stretch on the books (FDR 0006's promotion data).
         util::log_write(
             "echo",
-            &format!("auto {why}: {next:?} (srtt {:.0}ms)", st.wire.srtt()),
+            &format!(
+                "auto {why}: {} -> {} (srtt {:.0}ms); outgoing stats:\n{}",
+                st.predict_model.name(),
+                next.name(),
+                st.wire.srtt(),
+                predict_debug_summary(st),
+            ),
         );
+        apply_echo_model(st, next, now);
+        if !st.notify.message_is_sticky() {
+            st.notify
+                .set_message(&format!("echo: {} (auto: {why})", next.name()), false, now);
+        }
     }
     // Remote PTY echo state for the optimistic-echo gate (FDR 0006).
     st.echo_on = frame.flags & sync::FLAG_ECHO != 0;
@@ -4042,7 +4067,7 @@ mod tests {
         let send = dispatch_palette_action(&mut st, &raw, "echo.set", &json!({ "model": "optimistic" }), 0);
         assert!(!send, "echo.set is client-local, no prompt send");
         assert_eq!(st.predict_model, PredictionModel::Optimistic);
-        assert!(st.notify.message().contains("Optimistic"), "banner names the new model");
+        assert!(st.notify.message().contains("optimistic"), "banner names the new model");
         assert!(!st.initialized, "swapping the predictor forces a clean repaint");
     }
 
@@ -4059,9 +4084,14 @@ mod tests {
         assert_eq!(esc.tick(400.0, predict::ESCALATE_HOLD_MS), Some(PredictionModel::Optimistic));
         st.echo_escalation = esc;
         st.predict_model = PredictionModel::Optimistic;
+        // The heading stays under posh-palette's ~42 content columns and
+        // spells the model the way the Echo: labels do.
+        let title = palette_title(412.4, PredictionModel::Optimistic, true);
+        assert_eq!(title, "rtt 412ms · echo: optimistic (auto)");
+        assert!(title.chars().count() <= 40, "{title}");
         assert_eq!(
-            palette_title(412.4, 1600, PredictionModel::Optimistic, true),
-            "Commands · rtt 412ms · rto 1600ms · echo: optimistic (auto: slow link)"
+            palette_title(12.0, PredictionModel::FromScratch, false),
+            "rtt 12ms · echo: scratch"
         );
         assert!(predict_debug_summary(&st).contains("escalated (optimistic)"));
 
@@ -4070,10 +4100,7 @@ mod tests {
         assert_eq!(st.predict_model, PredictionModel::Always);
         assert!(!st.echo_escalation.governing());
         assert!(!st.echo_escalation.escalated());
-        assert_eq!(
-            palette_title(412.4, 1600, PredictionModel::Always, false),
-            "Commands · rtt 412ms · rto 1600ms · echo: always"
-        );
+        assert_eq!(palette_title(412.4, PredictionModel::Always, false), "rtt 412ms · echo: always");
         assert!(predict_debug_summary(&st).contains("off (model pinned"));
 
         // `Echo: adaptive` hands control back, un-escalated (re-evaluates
@@ -4082,6 +4109,22 @@ mod tests {
         assert_eq!(st.predict_model, PredictionModel::Adaptive);
         assert_eq!(st.echo_escalation.governing(), predict::escalation_selected());
         assert!(!st.echo_escalation.escalated());
+
+        // A sticky notice (the wedge banner) outranks the auto banner: the
+        // model still swaps, the notice stays.
+        st.notify.set_message(WEDGE_BANNER, true, 0);
+        dispatch_palette_action(&mut st, &raw, "echo.set", &json!({ "model": "never" }), 0);
+        assert_eq!(st.predict_model, PredictionModel::Never);
+        assert_eq!(st.notify.message(), WEDGE_BANNER, "sticky banner not clobbered");
+
+        // At startup the ENV pins too — `POSH_PREDICTION_MODEL=adaptive` is
+        // an explicit choice even though it parses to the default variant;
+        // only unset/empty (with the gate on) arms the machine.
+        assert!(echo_escalation_governs(None, true));
+        assert!(echo_escalation_governs(Some(""), true));
+        assert!(!echo_escalation_governs(Some("adaptive"), true));
+        assert!(!echo_escalation_governs(Some("optimistic"), true));
+        assert!(!echo_escalation_governs(None, false), "gate off");
     }
 
     #[test]
