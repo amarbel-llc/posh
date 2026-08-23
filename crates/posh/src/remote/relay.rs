@@ -424,7 +424,7 @@ fn first_daemon_record(
         let now = util::now_ms();
         let due = last_hb.is_none_or(|t| now.saturating_sub(t) >= sync::HEARTBEAT_INTERVAL);
         if conn.has_remote() && due {
-            send_empty(conn, &mut hb_fragmenter, &idle_inbox, 0, 0, &[], enveloped);
+            send_empty(conn, &mut hb_fragmenter, &idle_inbox, 0, 0, 0, &[], enveloped);
             last_hb = Some(now);
         }
         // Wake in time for the next heartbeat even with no fd activity.
@@ -576,6 +576,12 @@ fn relay_loop(
     // grace period, so the client validates/retires predictions against a
     // frame that actually carries the echo. See `forward_daemon_frame`.
     let mut echo = sync::EchoAck::new();
+    // The last daemon frame's FLAG_ECHO (FDR 0006), re-stamped onto the
+    // relay's own Empties so they never flip the client's optimistic-echo
+    // gate off between visible frames.
+    let mut echo_flag: u8 = first_frame
+        .as_ref()
+        .map_or(0, |f| f.flags & sync::FLAG_ECHO);
     // Agent forwarding (FDR 0004, Task 3.2): the bidirectional agent byte stream
     // the relay TERMINATES, and the peer's per-message AGENT_FORWARD latch.
     // `agent_seen` gates our own AGENT_DATA/ACK emission (RFC 0001: never before
@@ -959,6 +965,7 @@ fn relay_loop(
                         Ok(Some(frame)) => match frame.tag {
                             Tag::Frame => {
                                 let daemon_frame = ServerFrame::decode(&frame.payload)?;
+                                echo_flag = daemon_frame.flags & sync::FLAG_ECHO;
                                 echo_advanced = false; // this frame carries the ack
                                 forward_daemon_frame(
                                     daemon_frame,
@@ -1090,6 +1097,7 @@ fn relay_loop(
                     &mut fragmenter,
                     &inbox,
                     echo.ack(),
+                    echo_flag,
                     last_frame_num,
                     &out_agent_caps,
                     enveloped,
@@ -1119,6 +1127,7 @@ fn relay_loop(
                     &mut fragmenter,
                     &inbox,
                     echo.ack(),
+                    echo_flag,
                     last_frame_num,
                     &out_agent_caps,
                     enveloped,
@@ -1225,17 +1234,22 @@ fn forward_daemon_frame(
 /// state, so the client reads the fresher acks/caps without disturbing its screen.
 /// Mirrors `server.rs`'s heartbeat empty-frame path. The caller has already
 /// confirmed a reachable peer.
+#[allow(clippy::too_many_arguments)]
 fn send_empty(
     conn: &mut Connection,
     fragmenter: &mut Fragmenter,
     inbox: &InputInbox,
     echo_ack: u64,
+    // The last daemon frame's FLAG_ECHO (FDR 0006): the client reads the
+    // optimistic-echo gate off EVERY frame's flags, so an Empty with a bare
+    // 0 would flip the gate off between visible frames.
+    flags: u8,
     frame_num: u64,
     extras: &[Cap],
     enveloped: bool,
 ) {
     let frame = ServerFrame {
-        flags: 0,
+        flags,
         caps: caps::own_table(extras),
         frame_num,
         input_ack: inbox.next_offset(),

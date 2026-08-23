@@ -128,6 +128,22 @@ fixed:
    defers — optimistic never argues with the server about where the cursor
    is). Counted in `mispredict_resets` as the A/B gauge.
 
+**Second A/B finding (2026-08-23, later the same day): "local echo has
+stopped entirely" on the escalated link (SRTT ~3.5 s).** The `ECHO`-flag
+gate this record specifies was never produced on the default path: the
+only writer of `FLAG_ECHO` was the roaming `server_loop` — the session
+DAEMON set `flags: 0` on every frame, so on the relay path the client's
+gate read "echo off" for the entire session and optimistic predicted
+nothing. The escalation therefore downgraded a slow link from
+working-adaptive to silently-dead-optimistic. Fixed: the daemon stamps the
+active pty's ECHO state onto every frame it produces (visible and
+scrollback; `ClientConn::echo_flag`, refreshed per loop iteration,
+overlay-aware like `server_loop`), and the relay and M2 bridge re-stamp
+the last daemon frame's `FLAG_ECHO` onto their own Empties — the client
+reads the gate off EVERY frame's flags, so a bare-0 Empty (heartbeat, ack
+carrier) flipped the gate off between visible frames. Log review of the
+incident session remains queued to confirm nothing else contributed.
+
 What this buys the promotion question: every slow-link session is now an
 A/B sample — `optimistic` in effect exactly where it matters, `adaptive`
 everywhere else — with the switch edges in the client log. Observations to

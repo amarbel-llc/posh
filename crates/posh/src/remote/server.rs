@@ -303,6 +303,10 @@ struct SessionBridge {
     /// to the daemon counts as echoed only after the grace period, so the
     /// client validates/retires predictions against a frame that carries it.
     echo: crate::remote::sync::EchoAck,
+    /// The last daemon frame's FLAG_ECHO (FDR 0006; relay.rs parity):
+    /// re-stamped onto this channel's Empties so they never flip the
+    /// client's optimistic-echo gate off between visible frames.
+    echo_flag: u8,
 }
 
 /// A channel the wire opened whose first `ClientMessage` (caps + geometry)
@@ -632,6 +636,7 @@ pub(crate) fn mux_peer_loop(
                         else {
                             continue;
                         };
+                        b.echo_flag = frame.flags & crate::remote::sync::FLAG_ECHO;
                         let out = crate::remote::relay::rewrap(
                             frame,
                             b.link.frame_offset,
@@ -717,8 +722,9 @@ pub(crate) fn mux_peer_loop(
             if conn.has_remote()
                 && (b.ack_due || now.saturating_sub(b.last_send) >= HEARTBEAT_INTERVAL)
             {
-                let empty =
+                let mut empty =
                     empty_ack_frame(b.last_frame_num, b.inbox.next_offset(), b.echo.ack());
+                empty.flags |= b.echo_flag;
                 crate::remote::mux::send_session_wire(
                     &mut conn,
                     &mut fragmenter,
@@ -853,6 +859,7 @@ fn handle_session_instruction(
                             last_send: 0,
                             ack_due: false,
                             echo: crate::remote::sync::EchoAck::new(),
+                            echo_flag: 0,
                         }));
                     }
                     Err(e) => {

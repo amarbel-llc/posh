@@ -170,6 +170,12 @@ struct ClientConn {
     bytes_drained: u64,
     last_drain_ms: u64,
     hiwater_mb: usize,
+    /// The ACTIVE pty's ECHO state as of this loop iteration, stamped onto
+    /// every frame this client is sent (FDR 0006: the optimistic-echo gate's
+    /// FLAG_ECHO — `server_loop` computes the same per send). Refreshed at
+    /// the top of each daemon iteration; 0 until the first refresh, so a
+    /// brand-new conn's replay frame errs toward echo-suppressed.
+    echo_flag: u8,
 }
 
 impl ClientConn {
@@ -314,7 +320,9 @@ impl ClientConn {
                 }
                 let frame_num = producer.current_num();
                 let bytes = ServerFrame {
-                    flags: 0,
+                    // FDR 0006: the active pty's ECHO state rides every
+                    // frame (RFC 0008 §2 keeps acks 0 here; flags are real).
+                    flags: self.echo_flag,
                     caps: caps::own_table(&[]),
                     frame_num,
                     input_ack: 0,
@@ -478,7 +486,7 @@ impl ClientConn {
             rows,
         };
         let bytes = ServerFrame {
-            flags: 0,
+            flags: self.echo_flag,
             caps: caps::own_table(&[]),
             frame_num,
             input_ack: 0,
@@ -1014,6 +1022,25 @@ fn daemon_loop(
             }
         }
 
+        // FDR 0006: stamp the ACTIVE pty's ECHO state onto every frame this
+        // iteration produces (`ClientConn::echo_flag` → the frames' FLAG_ECHO),
+        // exactly as `server_loop` computes `echo_flag` per send. Without
+        // this the daemon's frames never carried FLAG_ECHO at all, so on the
+        // relay path (the default bootstrap) the client's optimistic-echo
+        // gate read "echo off" for the whole session and the model predicted
+        // nothing — precisely where the slow-link escalation selects it.
+        let echo_flag = {
+            let active_master = overlay.as_ref().map(|o| o.child.master).unwrap_or(pty_fd);
+            if crate::pty::echo_on(active_master) {
+                crate::remote::sync::FLAG_ECHO
+            } else {
+                0
+            }
+        };
+        for c in clients.iter_mut() {
+            c.echo_flag = echo_flag;
+        }
+
         // New client connections.
         if fds[0].revents & err_events != 0 {
             util::log_write("error", "server socket error");
@@ -1043,6 +1070,7 @@ fn daemon_loop(
                     bytes_drained: 0,
                     last_drain_ms: util::now_ms(),
                     hiwater_mb: 0,
+                    echo_flag: 0,
                 });
             }
         }
@@ -1593,6 +1621,7 @@ mod tests {
             bytes_drained: 0,
             last_drain_ms: 0,
             hiwater_mb: 0,
+            echo_flag: 0,
         }
     }
 
@@ -1699,6 +1728,7 @@ mod tests {
             bytes_drained: 0,
             last_drain_ms: 0,
             hiwater_mb: 0,
+            echo_flag: 0,
         };
         let mut init = ipc::encode_resize(rows, cols).to_vec();
         init.extend_from_slice(&caps::encode_table(&caps::own_table(&[])));
@@ -1727,6 +1757,7 @@ mod tests {
             bytes_drained: 0,
             last_drain_ms: 0,
             hiwater_mb: 0,
+            echo_flag: 0,
         };
         let mut init = ipc::encode_resize(rows, cols).to_vec();
         init.extend_from_slice(&caps::encode_table(&caps::own_table(&[caps::Cap {
@@ -1922,6 +1953,7 @@ mod tests {
             bytes_drained: 0,
             last_drain_ms: 0,
             hiwater_mb: 0,
+            echo_flag: 0,
         };
         let mut init = ipc::encode_resize(24, 80).to_vec();
         init.extend_from_slice(&caps::encode_table(&caps::own_table(&[])));
@@ -1934,6 +1966,57 @@ mod tests {
         baseline.apply_init(&ipc::encode_resize(24, 80));
         baseline.maybe_enable_frames(true);
         assert!(baseline.producer.is_none(), "a non-capable client never gets a producer");
+    }
+
+    #[test]
+    fn frames_carry_the_daemons_echo_flag() {
+        // FDR 0006: the active pty's ECHO state rides every daemon frame —
+        // visible AND scrollback — as FLAG_ECHO (`echo_flag`, refreshed per
+        // loop iteration). Pre-fix the daemon never set the flag, so on the
+        // relay path (the default bootstrap) the client's optimistic-echo
+        // gate read "echo off" for entire sessions and the model predicted
+        // nothing — exactly where the slow-link escalation selects it.
+        let (rows, cols) = (24u16, 80u16);
+        let mut term = Terminal::with_scrollback(rows, cols, 1000);
+        fill_screen(&mut term);
+        let (mut c, _peer) = frame_capable_conn(rows, cols);
+        c.echo_flag = crate::remote::sync::FLAG_ECHO;
+        assert!(c.queue_frame(
+            term.dump_vt(),
+            Snapshot::from_term(&term),
+            term.is_alt_screen(),
+            (rows, cols),
+        ));
+        let mut fb = FrameBuffer::new();
+        fb.feed(&c.write_buf);
+        let mut saw = 0;
+        while let Some(frame) = fb.next().unwrap() {
+            let decoded = ServerFrame::decode(&frame.payload).unwrap();
+            assert_ne!(
+                decoded.flags & crate::remote::sync::FLAG_ECHO,
+                0,
+                "every frame carries the stamped FLAG_ECHO"
+            );
+            saw += 1;
+        }
+        assert!(saw > 0, "a frame was actually produced");
+
+        // And echo-off (a password prompt) stamps it back off.
+        c.write_buf.clear();
+        c.echo_flag = 0;
+        term.process(b"x");
+        assert!(c.queue_frame(
+            term.dump_vt(),
+            Snapshot::from_term(&term),
+            term.is_alt_screen(),
+            (rows, cols),
+        ));
+        let mut fb = FrameBuffer::new();
+        fb.feed(&c.write_buf);
+        while let Some(frame) = fb.next().unwrap() {
+            let decoded = ServerFrame::decode(&frame.payload).unwrap();
+            assert_eq!(decoded.flags & crate::remote::sync::FLAG_ECHO, 0);
+        }
     }
 
     #[test]
@@ -2075,6 +2158,7 @@ mod tests {
             bytes_drained: 0,
             last_drain_ms: 0,
             hiwater_mb: 0,
+            echo_flag: 0,
         };
         let mut init = ipc::encode_resize(rows, cols).to_vec();
         init.extend_from_slice(&caps::encode_table(&caps::own_table(&[])));
@@ -2288,6 +2372,7 @@ mod tests {
             bytes_drained: 0,
             last_drain_ms: 0,
             hiwater_mb: 0,
+            echo_flag: 0,
         };
         let mut init = ipc::encode_resize(rows, cols).to_vec();
         init.extend_from_slice(&caps::encode_table(&caps::own_table(&[caps::Cap {
@@ -2585,6 +2670,7 @@ mod tests {
             bytes_drained: 0,
             last_drain_ms: 0,
             hiwater_mb: 0,
+            echo_flag: 0,
         };
         let mut table = vec![caps::Cap {
             id: caps::CAP_LOSSY,
@@ -2950,6 +3036,7 @@ mod tests {
             bytes_drained: 0,
             last_drain_ms: 0,
             hiwater_mb: 0,
+            echo_flag: 0,
         };
         let mut init = ipc::encode_resize(rows, cols).to_vec();
         init.extend_from_slice(&caps::encode_table(&caps::own_table(&[caps::Cap {
@@ -3144,6 +3231,7 @@ mod tests {
             bytes_drained: 0,
             last_drain_ms: 0,
             hiwater_mb: 0,
+            echo_flag: 0,
         };
         let mut init = ipc::encode_resize(rows, cols).to_vec();
         init.extend_from_slice(&caps::encode_table(&caps::own_table(&[
