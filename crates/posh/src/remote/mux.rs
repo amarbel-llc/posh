@@ -54,14 +54,7 @@ pub fn dest_key(user: Option<&str>, host: &str, family: Family, port_range: Opti
 /// created 0700 and hardened with the shared #7 check (self-owned,
 /// symlink-rejecting) exactly like `<base>/agent/`.
 pub fn mux_dir() -> Result<PathBuf> {
-    let env = |k: &str| std::env::var(k).ok();
-    let base = crate::session::resolve_socket_base(
-        env("POSH_DIR").as_deref(),
-        env("XDG_RUNTIME_DIR").as_deref(),
-        env("TMPDIR").as_deref(),
-        util::uid(),
-    );
-    mux_dir_at(&base)
+    mux_dir_at(&crate::session::socket_base_from_env())
 }
 
 /// `<base>/mux/<key>.sock` — the endpoint socket for a destination key.
@@ -1110,14 +1103,11 @@ fn socket_becomes_live(path: &Path) -> bool {
 const MUX_BOOTSTRAP_CONNECT_TIMEOUT_SECS: u32 = 10;
 
 /// The mux daemon's bootstrap [`SshOptions`](crate::remote::sshwrap::SshOptions):
-/// no posh `-A` (the agent verb IS forwarding) AND an explicit real-ssh `-a`
-/// (posh#161: with neither flag the workstation's `ForwardAgent` config
-/// applied, so sshd stood up a forwarded-agent socket in the remote endpoint's
-/// env — a connection-bound competitor for the stable `agent/sock` that
-/// the host's login-shell rendezvous then latched onto), channels on (RFC
-/// 0011 §5 agent channels exist only enveloped), and the bounded ssh
-/// ConnectTimeout — factored from [`run_daemon`] so the call shape is pinned
-/// by test.
+/// no posh `-A` (the agent verb IS forwarding) and an explicit real-ssh `-a`
+/// (posh#161 — no sshd-forwarded competitor in the remote endpoint's env;
+/// see `SshOptions::agent_export`), channels on (RFC 0011 §5 agent channels
+/// exist only enveloped), and the bounded ssh ConnectTimeout — factored from
+/// [`run_daemon`] so the call shape is pinned by test.
 fn mux_ssh_options(
     family: Family,
     port_range: Option<String>,
@@ -2416,14 +2406,7 @@ pub const ENDPOINT_LS_EMPTY: &str = "no remote endpoints\n";
 /// connect → EOF. Answers "is the endpoint from host X alive, and how
 /// stale" locally, without touching the wire.
 pub fn endpoint_status_ls() -> Result<String> {
-    let env = |k: &str| std::env::var(k).ok();
-    let base = crate::session::resolve_socket_base(
-        env("POSH_DIR").as_deref(),
-        env("XDG_RUNTIME_DIR").as_deref(),
-        env("TMPDIR").as_deref(),
-        util::uid(),
-    );
-    endpoint_status_ls_in(&base.join("agent"))
+    endpoint_status_ls_in(&crate::session::socket_base_from_env().join("agent"))
 }
 
 /// The enumeration behind [`endpoint_status_ls`], pure-path so tests drive
@@ -4668,10 +4651,8 @@ mod tests {
         // The daemon's ssh bootstrap call shape: a hung destination must not
         // wedge the SHARED endpoint indefinitely, so the mux options carry
         // the bounded ConnectTimeout — pinned at the argv seam. posh#161:
-        // an explicit real-ssh `-a` rides too, so the workstation's
-        // ForwardAgent config can no longer stand up an sshd-forwarded
-        // socket in the remote endpoint's env (a connection-bound competitor
-        // for agent/sock that the host's login rendezvous latched onto).
+        // an explicit real-ssh `-a` rides too (no sshd-forwarded competitor
+        // in the remote endpoint's env).
         let opts = mux_ssh_options(Family::Auto, None);
         assert_eq!(
             crate::remote::sshwrap::ssh_args(&opts),

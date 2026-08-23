@@ -38,6 +38,19 @@ pub fn resolve_socket_base(
     PathBuf::from(format!("/tmp/posh-{uid}"))
 }
 
+/// [`resolve_socket_base`] fed from THIS process's environment — the one
+/// production reading every socket-dir consumer (session dirs, the agent
+/// endpoint, the mux dir, the diag sink) shares.
+pub fn socket_base_from_env() -> PathBuf {
+    let env = |k: &str| std::env::var(k).ok();
+    resolve_socket_base(
+        env("POSH_DIR").as_deref(),
+        env("XDG_RUNTIME_DIR").as_deref(),
+        env("TMPDIR").as_deref(),
+        util::uid(),
+    )
+}
+
 pub struct Config {
     pub socket_dir: PathBuf,
     pub group: String,
@@ -51,14 +64,8 @@ impl Config {
         if group.contains('/') || group.contains("..") {
             return Err(Error::Msg(format!("invalid group name: {group}")));
         }
-        let env = |k: &str| std::env::var(k).ok();
         let uid = util::uid();
-        let base = resolve_socket_base(
-            env("POSH_DIR").as_deref(),
-            env("XDG_RUNTIME_DIR").as_deref(),
-            env("TMPDIR").as_deref(),
-            uid,
-        );
+        let base = socket_base_from_env();
         // A pre-existing base (notably the world-writable `/tmp/posh-<uid>`
         // fallback) must be a real, private, self-owned directory — a
         // recursive create silently trusts whatever is already there, which
@@ -618,14 +625,7 @@ fn next_fork_name(cfg: &Config, base: &str) -> Result<String> {
 /// `posh groups`: list groups (socket-base subdirectories with at least one
 /// socket in them), sorted.
 pub fn cmd_groups() -> Result<()> {
-    let env = |k: &str| std::env::var(k).ok();
-    let uid = util::uid();
-    let base = resolve_socket_base(
-        env("POSH_DIR").as_deref(),
-        env("XDG_RUNTIME_DIR").as_deref(),
-        env("TMPDIR").as_deref(),
-        uid,
-    );
+    let base = socket_base_from_env();
     let Ok(entries) = std::fs::read_dir(&base) else {
         return Ok(()); // no base directory yet: no groups
     };

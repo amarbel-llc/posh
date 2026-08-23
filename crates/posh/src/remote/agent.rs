@@ -135,70 +135,39 @@ pub struct AgentEndpoint {
     last_peer_active: Option<bool>,
 }
 
-/// The session-dir base every agent path hangs off (production): the same
-/// `POSH_DIR > XDG_RUNTIME_DIR/posh > TMPDIR/posh-{uid} > /tmp/posh-{uid}`
-/// precedence as session sockets.
-fn base_from_env() -> PathBuf {
-    let env = |k: &str| std::env::var(k).ok();
-    crate::session::resolve_socket_base(
-        env("POSH_DIR").as_deref(),
-        env("XDG_RUNTIME_DIR").as_deref(),
-        env("TMPDIR").as_deref(),
-        util::uid(),
-    )
+/// `<base>/agent/sock` — the stable, symlinked `SSH_AUTH_SOCK` path every
+/// endpoint under `base` claims ([`AgentEndpoint::sock_path`]), computed
+/// WITHOUT binding anything. The one spelling of the well-known path.
+pub fn well_known_sock(base: &Path) -> PathBuf {
+    base.join("agent").join("sock")
 }
 
-/// `<base>/agent/sock` under the production base — the stable
-/// `SSH_AUTH_SOCK` path — computed WITHOUT binding anything. What a session
-/// is handed when some other process owns forwarding (the mux endpoint,
-/// posh#161): the path is valid the moment any endpoint claims it, and
-/// survives every endpoint respawn and wire reconnect underneath it.
-pub fn stable_sock_path_from_env() -> PathBuf {
-    base_from_env().join("agent").join("sock")
-}
-
-/// The `SSH_AUTH_SOCK` a freshly spawned session shell is born with (FDR
-/// 0004 C5, posh#161): this connection's own endpoint path when it forwards;
-/// else the stable path when the bootstrapping client asked for the export
-/// (`POSH_AGENT_EXPORT=1` — the mux endpoint owns forwarding, so no `-A`
-/// arrived, yet the session must still reach `agent/sock`); else nothing,
-/// and the shell inherits whatever the server process carries. The two
-/// non-`None` arms name the SAME path for a same-base endpoint; keeping the
-/// endpoint's own reading lets explicit-base harnesses stay truthful.
-pub fn session_auth_sock(endpoint: Option<&AgentEndpoint>) -> Option<PathBuf> {
-    session_auth_sock_from(
-        endpoint.map(|ep| ep.sock_path().to_path_buf()),
-        crate::remote::sshwrap::agent_export_requested(),
-        stable_sock_path_from_env,
-    )
-}
-
-/// The pure decision behind [`session_auth_sock`] (env-free, so it is unit
-/// tested without touching the process environment).
-fn session_auth_sock_from(
-    endpoint_sock: Option<PathBuf>,
-    export_requested: bool,
-    stable: impl FnOnce() -> PathBuf,
-) -> Option<PathBuf> {
-    match endpoint_sock {
-        Some(p) => Some(p),
-        None if export_requested => Some(stable()),
-        None => None,
-    }
+/// The `SSH_AUTH_SOCK` env entry a freshly spawned session shell is born
+/// with (FDR 0004 C5, posh#161): this connection's own endpoint path when it
+/// forwards; else, when the bootstrapping client asked for the export
+/// (`export`, the `POSH_AGENT_EXPORT` request — the mux endpoint owns
+/// forwarding, so no `-A` arrived, yet the session must still reach
+/// `agent/sock`), the well-known path under the production base; else
+/// `None`, and the shell inherits whatever the server process carries.
+pub fn session_auth_env(endpoint: Option<&AgentEndpoint>, export: bool) -> Option<(String, String)> {
+    let sock = endpoint
+        .map(|ep| ep.sock_path().to_path_buf())
+        .or_else(|| export.then(|| well_known_sock(&crate::session::socket_base_from_env())))?;
+    Some(("SSH_AUTH_SOCK".to_string(), sock.to_string_lossy().into_owned()))
 }
 
 impl AgentEndpoint {
     /// Builds the endpoint under the resolved session-dir base (production
-    /// path): see [`base_from_env`].
+    /// path): see [`crate::session::socket_base_from_env`].
     pub fn from_env() -> Result<AgentEndpoint> {
-        AgentEndpoint::new(&base_from_env())
+        AgentEndpoint::new(&crate::session::socket_base_from_env())
     }
 
     /// [`from_env`](Self::from_env) for a MUX-NAMED endpoint — the
     /// `posh-server agent` verb's production path (M1 Task 2,
     /// docs/plans/2026-07-28-mux-endpoint-m1-impl.md).
     pub fn from_env_mux(client_id: &str) -> Result<AgentEndpoint> {
-        AgentEndpoint::new_mux(&base_from_env(), client_id)
+        AgentEndpoint::new_mux(&crate::session::socket_base_from_env(), client_id)
     }
 
     /// Builds the endpoint under an explicit base dir (the seam the tests use
@@ -348,7 +317,7 @@ impl AgentEndpoint {
             own_sock,
             own_marker,
             own_pidfile,
-            well_known: dir.join("sock"),
+            well_known: well_known_sock(base),
             listener,
             status_listener,
             status_sock,
@@ -1991,36 +1960,31 @@ mod tests {
     }
 
     #[test]
-    fn session_auth_sock_prefers_own_endpoint_then_export_then_nothing() {
+    fn session_auth_env_prefers_own_endpoint_then_export_then_nothing() {
         // posh#161: the SSH_AUTH_SOCK a session shell is born with. (1) This
-        // connection forwards (an endpoint exists): its own stable path,
+        // connection forwards (an endpoint exists): its own well-known path,
         // whatever the export flag says. (2) No endpoint but the client
-        // asked for the export (the mux endpoint owns forwarding): the stable
-        // path computed without binding. (3) Neither: None — the shell
-        // inherits the server process env. Pre-fix, arm (2) was arm (3), so
-        // a mux-mode session never saw agent/sock at all.
-        let own = PathBuf::from("/run/user/1000/posh/agent/sock");
-        let stable = || PathBuf::from("/tmp/posh-1000/agent/sock");
-        assert_eq!(
-            session_auth_sock_from(Some(own.clone()), true, stable),
-            Some(own.clone())
-        );
-        assert_eq!(
-            session_auth_sock_from(Some(own.clone()), false, stable),
-            Some(own)
-        );
-        assert_eq!(session_auth_sock_from(None, true, stable), Some(stable()));
-        assert_eq!(
-            session_auth_sock_from(None, false, || unreachable!("no export ⇒ no base resolution")),
-            None
-        );
-
-        // The unbound stable path is <base>/agent/sock, the very path a
-        // bound endpoint claims (AgentEndpoint::sock_path) — pinned so the
-        // two readings can never drift apart.
+        // asked for the export (the mux endpoint owns forwarding): the
+        // well-known path under the production base, nothing bound. (3)
+        // Neither: None — the shell inherits the server process env.
+        // Pre-fix, arm (2) was arm (3): a mux-mode session never saw
+        // agent/sock at all.
         let base = temp_base();
         let ep = AgentEndpoint::new(&base).unwrap();
-        assert_eq!(ep.sock_path(), base.join("agent").join("sock"));
+        let own = ep.sock_path().to_string_lossy().into_owned();
+        assert_eq!(ep.sock_path(), well_known_sock(&base), "one spelling of the path");
+        for export in [true, false] {
+            assert_eq!(
+                session_auth_env(Some(&ep), export),
+                Some(("SSH_AUTH_SOCK".to_string(), own.clone()))
+            );
+        }
+        assert_eq!(session_auth_env(None, false), None);
+        let (name, exported) = session_auth_env(None, true).expect("export ⇒ a path");
+        assert_eq!(name, "SSH_AUTH_SOCK");
+        // Resolved from this process's env (not the test base): still the
+        // well-known shape under whatever base that is.
+        assert!(exported.ends_with("/agent/sock"), "{exported}");
         drop(ep);
         std::fs::remove_dir_all(&base).ok();
     }

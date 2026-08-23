@@ -222,16 +222,18 @@ arm, which is how the rendezvous used to chain to posh's path.
 
 The fix, landed 2026-08-23: with the endpoint owning forwarding the client
 (1) asks the remote to export the stable path anyway — the
-`POSH_AGENT_EXPORT=1` env prefix on the bootstrap command, honored by
-`server::run` and the relay through `agent::session_auth_sock` (an env
-prefix, not a server flag, so an older remote stays bootstrappable by
-ignoring it) — and (2) runs the bootstrap ssh with the real `-a` (the
-mux daemon's bootstrap too), so no sshd-forwarded competitor exists in
+`POSH_AGENT_EXPORT=1` env prefix on the bootstrap command, read once by
+`cmd_server` and honored by `server::run` and the relay through
+`agent::session_auth_env` (an env prefix, not a server flag, so an older
+remote stays bootstrappable by ignoring it) — and (2) runs the bootstrap
+ssh with the real `-a`, derived in `sshwrap::ssh_args` from that same
+export request unless the caller's flag was explicit (the mux daemon's
+bootstrap passes `-a` outright), so no sshd-forwarded competitor exists in
 the session's environment at all; an explicit `posh ssh -A` still wins.
-`remote::agent::tests::session_auth_sock_prefers_own_endpoint_then_export_then_nothing`,
-`remote::sshwrap::tests::remote_command_carries_agent_export_prefix_only_when_set`,
-and `main::tests::resolve_real_ssh_agent_forward_defaults_on` pin the
-three halves. Residual, deliberately NOT posh's: a plain `ssh host` login
+`remote::agent::tests::session_auth_env_prefers_own_endpoint_then_export_then_nothing`,
+`remote::sshwrap::tests::remote_command_carries_agent_export_prefix_only_when_set`
+(both halves at the sshwrap seam), and
+`main::tests::resolve_real_ssh_agent_forward_defaults_on` pin it. Residual, deliberately NOT posh's: a plain `ssh host` login
 still forwards the workstation's real agent and can latch the first-wins
 rendezvous onto that connection-bound socket ahead of posh's path — the
 rendezvous policy is eng's (tracked there), and posh#103 remains the

@@ -8,6 +8,7 @@ use std::process::{Command, Stdio};
 use crate::remote::datagram::Family;
 use crate::util::{Error, Result};
 
+#[derive(Clone)]
 pub struct SshOptions {
     pub family: Family,
     /// Server-side UDP port range, already validated ("P" or "P1:P2").
@@ -34,15 +35,24 @@ pub struct SshOptions {
     /// per-destination endpoint for every invocation behind it (a pre-mux
     /// hang cost only its own invocation).
     pub connect_timeout_secs: Option<u32>,
-    /// posh#161: ask the remote to export the host's STABLE forwarded-agent
-    /// path (`<base>/agent/sock`) into the session shell WITHOUT standing
-    /// up a per-connection endpoint — the shape when the per-destination
-    /// mux endpoint (FDR 0014 M1) owns forwarding, so `agent_source` is
-    /// `None` (no `-A` rides to posh-server) yet the session must still be
-    /// born pointing at `agent/sock`. Carried as the `POSH_AGENT_EXPORT=1`
-    /// env prefix on the remote command, which an older server ignores (no
-    /// bootstrap failure across mixed versions) and a current one honors in
-    /// `server::run` / the relay.
+    /// posh#161: the per-destination mux endpoint (FDR 0014 M1) owns
+    /// forwarding for this invocation, so `agent_source` is `None` (no `-A`
+    /// rides to posh-server) — yet the session must still be born with
+    /// `SSH_AUTH_SOCK=<base>/agent/sock`, the stable path that endpoint
+    /// claims (valid across endpoint respawns and wire reconnects). Two
+    /// consequences, both applied HERE so callers state only the fact:
+    /// `remote_command` asks the remote to export that path (the
+    /// `POSH_AGENT_EXPORT=1` env prefix — an older server ignores it, so no
+    /// bootstrap failure across mixed versions; a current one honors it in
+    /// `server::run` / the relay without binding an endpoint), and
+    /// `ssh_args` runs the bootstrap ssh with `-a` unless
+    /// `real_ssh_agent_forward` is explicit. The `-a` matters: with neither
+    /// flag the workstation's ssh-config `ForwardAgent` applies and sshd
+    /// stands up a forwarded-agent socket in the server's environment — a
+    /// connection-bound competitor (it dies with the bootstrap's TCP
+    /// connection, the very dependency posh removes) that a mux-mode session
+    /// inherited and the host's login-shell rendezvous then latched onto
+    /// (the posh#161 outage shape; FDR 0014 "Sessions reach the endpoint").
     pub agent_export: bool,
 }
 
@@ -54,9 +64,15 @@ pub const AGENT_EXPORT_ENV: &str = "POSH_AGENT_EXPORT";
 /// Server side of [`AGENT_EXPORT_ENV`]: did the bootstrapping client ask
 /// for the stable agent path to be exported into the session shell?
 pub fn agent_export_requested() -> bool {
-    std::env::var(AGENT_EXPORT_ENV)
-        .map(|v| env_value_on(&v))
-        .unwrap_or(false)
+    env_selected(AGENT_EXPORT_ENV)
+}
+
+/// Truthy opt-in env read ("1"/"true"/"on"/"yes", case-insensitive; unset or
+/// anything else = off) — the shape every opt-IN gate shares
+/// ([`channels_selected`], [`agent_export_requested`]); default-ON gates use
+/// `util::parse_default_on_gate` instead.
+pub(crate) fn env_selected(name: &str) -> bool {
+    std::env::var(name).map(|v| env_value_on(&v)).unwrap_or(false)
 }
 
 /// What the wrapped server reported on stdout.
@@ -178,9 +194,7 @@ pub fn remote_command(
 /// absent or anything else means baseline. Default OFF until the mux endpoint
 /// exists.
 pub fn channels_selected() -> bool {
-    std::env::var("POSH_CHANNELS")
-        .map(|v| env_value_on(&v))
-        .unwrap_or(false)
+    env_selected("POSH_CHANNELS")
 }
 
 /// The truthy-env predicate ("1"/"true"/"on"/"yes", case-insensitive) behind
@@ -256,10 +270,14 @@ pub(crate) fn ssh_args(opts: &SshOptions) -> Vec<String> {
         Family::Inet6 => args.push("-6".to_string()),
         Family::Auto => {}
     }
-    match opts.real_ssh_agent_forward {
-        Some(true) => args.push("-A".to_string()),
-        Some(false) => args.push("-a".to_string()),
-        None => {}
+    // posh#161: an export request means posh's own path serves the session,
+    // so the bootstrap ssh must not let sshd stand up a competing forwarded
+    // socket (ssh-config `ForwardAgent` would) — `-a` unless the caller's
+    // flag was explicit. The ONE place that rule lives.
+    match (opts.real_ssh_agent_forward, opts.agent_export) {
+        (Some(true), _) => args.push("-A".to_string()),
+        (Some(false), _) | (None, true) => args.push("-a".to_string()),
+        (None, false) => {}
     }
     if let Some(secs) = opts.connect_timeout_secs {
         args.push("-o".to_string());
@@ -701,12 +719,26 @@ mod tests {
         );
         assert_eq!(remote_command(&on, &[], &[]), "POSH_AGENT_EXPORT=1 posh-server new");
 
-        // Unset: byte-identical to before the field existed.
+        // The export also decides the bootstrap ssh's real-agent flag: `-a`
+        // unless the caller's flag was explicit (no sshd-forwarded
+        // competitor in the session's env; an explicit -A still wins).
+        assert_eq!(ssh_args(&on), vec!["-a"]);
+        assert_eq!(
+            ssh_args(&SshOptions {
+                real_ssh_agent_forward: Some(true),
+                ..on.clone()
+            }),
+            vec!["-A"]
+        );
+
+        // Unset: byte-identical to before the field existed, and the ssh argv
+        // says nothing (ssh-config default).
         let off = SshOptions {
             agent_export: false,
             ..on
         };
         assert_eq!(remote_command(&off, &[], &locale), "LANG='C.UTF-8' posh-server new");
+        assert_eq!(ssh_args(&off), Vec::<String>::new());
 
         // The server-side reader accepts the same truthy spellings as the
         // other opt-in gates and nothing else.

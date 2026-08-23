@@ -16,7 +16,6 @@ use std::net::SocketAddr;
 use std::os::unix::fs::DirBuilderExt;
 use std::path::PathBuf;
 
-use crate::session::resolve_socket_base;
 use crate::util;
 
 /// Server-side transport snapshot, copied out of `server_loop`'s locals when the
@@ -241,15 +240,7 @@ fn fmt_agent_diag(a: Option<&crate::remote::caps::AgentDiag>) -> String {
 /// Per-pid dump and forensic files live here beside the sockets, so they are
 /// discoverable by `just debug-posh-sockets` / `debug-posh-forensics`.
 fn sink_base() -> PathBuf {
-    let posh_dir = std::env::var("POSH_DIR").ok();
-    let xdg = std::env::var("XDG_RUNTIME_DIR").ok();
-    let tmpdir = std::env::var("TMPDIR").ok();
-    let base = resolve_socket_base(
-        posh_dir.as_deref(),
-        xdg.as_deref(),
-        tmpdir.as_deref(),
-        util::uid(),
-    );
+    let base = crate::session::socket_base_from_env();
     // The base may not exist for a bare roaming server (no local session ever
     // created it). Best-effort — the caller's open reports any real failure.
     let _ = std::fs::DirBuilder::new()

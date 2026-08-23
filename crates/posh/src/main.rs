@@ -283,6 +283,12 @@ fn cmd_server(args: &[String]) -> Result<()> {
     // the policy stays client-side; the server only learns the outcome). The
     // server then stands up the agent endpoint and exports SSH_AUTH_SOCK.
     let mut agent_forward = false;
+    // posh#161: the client's stable-path export request rides as an env
+    // prefix rather than a flag (`SshOptions::agent_export`) — read once here
+    // and scrubbed, so it is threaded explicitly like `-A` and never leaks
+    // into the session shell's inherited environment.
+    let agent_export = remote::sshwrap::agent_export_requested();
+    std::env::remove_var(remote::sshwrap::AGENT_EXPORT_ENV);
     // RFC 0011 §6: `--channels` selects the channel-envelope protocol.
     let mut channels = false;
     let mut i = 0;
@@ -315,7 +321,14 @@ fn cmd_server(args: &[String]) -> Result<()> {
             // are fully parsed by the time we branch. Everything after `relay` is
             // the relay verb's own `-g GROUP SESSION [-- cmd]`.
             "relay" => {
-                return cmd_server_relay(&rest[i + 1..], port_range, family, agent_forward, channels);
+                return cmd_server_relay(
+                    &rest[i + 1..],
+                    port_range,
+                    family,
+                    agent_forward,
+                    channels,
+                    agent_export,
+                );
             }
             // The per-destination mux remote peer (M2 of
             // docs/plans/2026-07-28-connection-mux-endpoint-design.md):
@@ -335,7 +348,7 @@ fn cmd_server(args: &[String]) -> Result<()> {
             other => return Err(Error::Msg(format!("unknown server option {other}"))),
         }
     }
-    remote::server::run(port_range, family, command, agent_forward, channels)
+    remote::server::run(port_range, family, command, agent_forward, channels, agent_export)
 }
 
 /// The `relay` server verb (RFC 0008 §3): the single-model frame relay. Parses
@@ -350,6 +363,7 @@ fn cmd_server_relay(
     family: Family,
     agent_forward: bool,
     channels: bool,
+    agent_export: bool,
 ) -> Result<()> {
     let mut group = "default".to_string();
     let mut session: Option<String> = None;
@@ -386,7 +400,7 @@ fn cmd_server_relay(
         return Ok(()); // the detached parent
     };
     let cfg = Config::new(&group)?;
-    remote::relay::run(conn, &cfg, &session, command, agent_forward, channels)
+    remote::relay::run(conn, &cfg, &session, command, agent_forward, channels, agent_export)
 }
 
 /// The `agent` server verb (M1 of
@@ -562,25 +576,21 @@ fn cmd_ssh_session(
     // per-session srv endpoint). The handle holds this invocation's session
     // ref until the function returns (Drop = auto-unref); any ensure failure
     // falls back to per-connection forwarding exactly as before.
-    let (agent_source, _mux_ref) = remote::mux::apply_mux_gate(
+    let (agent_source, mux_ref) = remote::mux::apply_mux_gate(
         remote::mux::mux_selected(),
         resolve_agent_source(forward_flag),
         |source| remote::mux::ensure_mux(&dest, Family::Auto, None, source),
     );
-    // posh#161: with the endpoint owning forwarding, the session still
-    // needs SSH_AUTH_SOCK=<base>/agent/sock at birth (export request), and
-    // the bootstrap ssh must NOT forward the real agent (-a): an
-    // sshd-forwarded socket in the session's env is a connection-bound
-    // competitor that outlives nothing but the bootstrap's TCP connection.
-    let mux_owned = _mux_ref.is_some();
     let opts = remote::sshwrap::SshOptions {
         family: Family::Auto,
         port_range: None,
         agent_source,
-        real_ssh_agent_forward: mux_owned.then_some(false),
+        real_ssh_agent_forward: None,
         channels: remote::sshwrap::channels_selected(),
         connect_timeout_secs: None,
-        agent_export: mux_owned,
+        // posh#161: the endpoint owns forwarding ⇒ the session still gets
+        // agent/sock, and the bootstrap ssh runs -a (see the field's doc).
+        agent_export: mux_ref.is_some(),
     };
     // Bootstrap selection (RFC 0008 §3): the single-model relay by default;
     // `POSH_RELAY=0` forces the legacy Architecture-A inner-`posh attach`
@@ -822,13 +832,11 @@ fn parse_ssh_args(args: &[String]) -> Result<SshArgs<'_>> {
 /// roaming paths' best-effort default (FDR 0004 §Interface — posh targets are
 /// overwhelmingly the user's own hosts); `-a` opts out for this connection;
 /// an explicit `-A` is accepted too but is a no-op spelling of the default.
-/// posh#161: when the mux endpoint OWNS forwarding the default flips to `-a`
-/// — posh's own agent path serves the session, and an sshd-forwarded socket
-/// in the session's env is a connection-bound competitor (it dies with the
-/// bootstrap's TCP connection, the very dependency posh removes); an explicit
-/// `-A` still wins.
-fn resolve_real_ssh_agent_forward(flag: Option<bool>, mux_owned: bool) -> bool {
-    flag.unwrap_or(!mux_owned)
+/// posh#161: when the mux endpoint OWNS forwarding there is no default of
+/// our own — `None`, and `sshwrap::ssh_args` derives `-a` from the export
+/// request (`SshOptions::agent_export`); an explicit flag still wins.
+fn resolve_real_ssh_agent_forward(flag: Option<bool>, mux_owned: bool) -> Option<bool> {
+    flag.or_else(|| (!mux_owned).then_some(true))
 }
 
 // `forward` is Some for the mosh-parity bare `posh host` roaming path (which
@@ -855,23 +863,19 @@ fn cmd_ssh(args: &[String], forward: Option<&remote::agent::ForwardFlag>) -> Res
     // handle holds the session ref until return (Drop = auto-unref) — and
     // the roaming connection itself forwards nothing; any ensure failure
     // falls back to per-connection forwarding exactly as before.
-    let (agent_source, _mux_ref) = remote::mux::apply_mux_gate(
+    let (agent_source, mux_ref) = remote::mux::apply_mux_gate(
         remote::mux::mux_selected(),
         forward.and_then(resolve_agent_source),
         |source| remote::mux::ensure_mux(target, family, port_range.as_deref(), source),
     );
-    // posh#161: endpoint-owned forwarding ⇒ export the stable path into the
-    // session and keep the real agent off the bootstrap ssh (see
-    // `resolve_real_ssh_agent_forward`).
-    let mux_owned = _mux_ref.is_some();
+    // posh#161: the endpoint owning forwarding ⇒ the session still gets
+    // agent/sock and the bootstrap ssh runs -a (see `SshOptions::agent_export`).
+    let mux_owned = mux_ref.is_some();
     let opts = remote::sshwrap::SshOptions {
         family,
         port_range,
         agent_source,
-        real_ssh_agent_forward: Some(resolve_real_ssh_agent_forward(
-            real_ssh_agent_forward,
-            mux_owned,
-        )),
+        real_ssh_agent_forward: resolve_real_ssh_agent_forward(real_ssh_agent_forward, mux_owned),
         channels: remote::sshwrap::channels_selected(),
         connect_timeout_secs: None,
         agent_export: mux_owned,
@@ -1525,17 +1529,17 @@ mod tests {
     fn resolve_real_ssh_agent_forward_defaults_on() {
         // No -a/-A given: default is on (-A), matching the roaming paths'
         // best-effort default (FDR 0004 §Interface).
-        assert!(resolve_real_ssh_agent_forward(None, false));
+        assert_eq!(resolve_real_ssh_agent_forward(None, false), Some(true));
         // Explicit -a opts out.
-        assert!(!resolve_real_ssh_agent_forward(Some(false), false));
+        assert_eq!(resolve_real_ssh_agent_forward(Some(false), false), Some(false));
         // Explicit -A is a no-op spelling of the default.
-        assert!(resolve_real_ssh_agent_forward(Some(true), false));
-        // posh#161: the mux endpoint owning forwarding flips the default to
-        // -a (no sshd-forwarded competitor in the session env); an explicit
-        // -A still wins, an explicit -a stays off.
-        assert!(!resolve_real_ssh_agent_forward(None, true));
-        assert!(resolve_real_ssh_agent_forward(Some(true), true));
-        assert!(!resolve_real_ssh_agent_forward(Some(false), true));
+        assert_eq!(resolve_real_ssh_agent_forward(Some(true), false), Some(true));
+        // posh#161: the mux endpoint owning forwarding leaves no default of
+        // ours (None — sshwrap derives -a from the export request); an
+        // explicit flag still wins either way.
+        assert_eq!(resolve_real_ssh_agent_forward(None, true), None);
+        assert_eq!(resolve_real_ssh_agent_forward(Some(true), true), Some(true));
+        assert_eq!(resolve_real_ssh_agent_forward(Some(false), true), Some(false));
     }
 
     #[test]

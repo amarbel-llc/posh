@@ -251,6 +251,7 @@ pub(crate) fn run(
     command: Option<Vec<String>>,
     agent_forward: bool,
     channels: bool,
+    agent_export: bool,
 ) -> Result<()> {
     // 1. Handshake: learn the UDP client's terminal size + advertised caps from
     //    its first datagram BEFORE connecting to the daemon, so the daemon Init
@@ -281,12 +282,13 @@ pub(crate) fn run(
         None
     };
     // Seed the session's SSH_AUTH_SOCK into THIS process's env (inherited by
-    // the daemon at fork, see above): our own endpoint's path, or — posh#161,
-    // the mux endpoint owning forwarding (no `-A`, POSH_AGENT_EXPORT=1) —
-    // the stable agent/sock path without binding. Pre-fix the mux-mode
-    // session inherited the bootstrap ssh's sshd-forwarded socket instead.
-    if let Some(sock) = crate::remote::agent::session_auth_sock(agent.as_ref()) {
-        std::env::set_var("SSH_AUTH_SOCK", sock);
+    // the daemon at fork, see above): our own endpoint's path, or the
+    // client's export request when the mux endpoint owns forwarding
+    // (posh#161; see `SshOptions::agent_export`). Resolved once; the legacy
+    // fallback below mirrors the same entry into its shell env.
+    let auth_env = crate::remote::agent::session_auth_env(agent.as_ref(), agent_export);
+    if let Some((name, value)) = &auth_env {
+        std::env::set_var(name, value);
     }
 
     // 2. Connect to / create the session and Init as a LOSSY, frame-capable
@@ -327,7 +329,7 @@ pub(crate) fn run(
         }
         FirstRecord::Output => {
             drop(link); // shed the dead frame-client before the fresh attach
-            fallback_to_server(conn, cfg, name, command, agent, rows, cols, channels)
+            fallback_to_server(conn, cfg, name, command, agent, auth_env, rows, cols, channels)
         }
         FirstRecord::Closed => Ok(()), // daemon vanished before any content
     }
@@ -474,6 +476,7 @@ fn fallback_to_server(
     name: &str,
     command: Option<Vec<String>>,
     agent: Option<AgentEndpoint>,
+    auth_env: Option<(String, String)>,
     rows: u16,
     cols: u16,
     channels: bool,
@@ -492,19 +495,14 @@ fn fallback_to_server(
         inner.extend(cmd.iter().cloned());
     }
 
-    // Mirror server::run: a resolved TERM/COLORTERM for the shell, plus
-    // SSH_AUTH_SOCK when agent forwarding stood up an endpoint OR the client
-    // asked for the stable-path export (posh#161). (`run` also seeded
-    // SSH_AUTH_SOCK into this process's env before connect_or_create, so a session
-    // created here already inherited it; server_loop owns the endpoint and bridges
-    // its bytes to the UDP client exactly as the legacy path does.)
+    // Mirror server::run: a resolved TERM/COLORTERM for the shell, plus the
+    // SSH_AUTH_SOCK entry `run` resolved (own endpoint or the posh#161 export).
+    // (`run` also seeded it into this process's env before connect_or_create,
+    // so a session created here already inherited it; server_loop owns the
+    // endpoint and bridges its bytes to the UDP client exactly as the legacy
+    // path does.)
     let mut shell_env = crate::terminfo::session_env();
-    if let Some(sock) = crate::remote::agent::session_auth_sock(agent.as_ref()) {
-        shell_env.push((
-            "SSH_AUTH_SOCK".to_string(),
-            sock.to_string_lossy().into_owned(),
-        ));
-    }
+    shell_env.extend(auth_env);
     let child = pty::spawn_shell(Some(&inner), rows, cols, &shell_env, None)?;
     util::set_nonblocking(child.master)?;
     server_loop(conn, child, rows, cols, agent, channels);

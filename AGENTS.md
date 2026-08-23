@@ -168,9 +168,10 @@ the `eng-*(7)` manpages — read them with `man eng-versioning`,
   and remote `agent/sock` ownership is structural from a single client host.
   **Sessions still get `SSH_AUTH_SOCK=<base>/agent/sock` at birth**: with no
   `-A` riding to `posh-server` the client sends the `POSH_AGENT_EXPORT=1`
-  env prefix instead (posh#161; `agent::session_auth_sock`, honored by
+  env prefix instead (posh#161; `agent::session_auth_env`, honored by
   `server::run` + the relay; an older server ignores it), and every posh
-  bootstrap ssh under endpoint ownership runs with the real `-a` — an
+  bootstrap ssh under endpoint ownership runs with the real `-a` (derived in
+  `sshwrap::ssh_args` from the export, unless the flag was explicit) — an
   sshd-forwarded socket in the session env is a connection-bound competitor
   the host's login rendezvous latches onto. Triage "which agent does this
   shell actually reach" with `just debug-posh-agent-resolve [pid|path]`.

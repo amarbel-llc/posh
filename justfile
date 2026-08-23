@@ -904,14 +904,10 @@ debug-posh-agent-resolve target="" samples="3" bound="10":
       # intermittent: one OK proves nothing about the next request.
       for _ in $(seq "{{ samples }}"); do
         t0=$(date +%s%N)
-        if out="$(SSH_AUTH_SOCK="$1" timeout "{{ bound }}" ssh-add -l 2>&1)"; then
-          rc=0
-        else
-          rc=$?
-        fi
+        out="$(SSH_AUTH_SOCK="$1" timeout "{{ bound }}" ssh-add -l 2>&1)"; rc=$?
         ms=$(( ($(date +%s%N) - t0) / 1000000 ))
         if [ "$rc" -eq 0 ]; then
-          echo "    probe: OK ($(printf '%s\n' "$out" | wc -l | tr -d ' ') key(s)) ${ms}ms"
+          echo "    probe: OK ($(grep -c . <<<"$out") key(s)) ${ms}ms"
         else
           echo "    probe: rc=$rc ${ms}ms ${out:+($out)}"
         fi
@@ -943,17 +939,27 @@ debug-posh-agent-resolve target="" samples="3" bound="10":
     done
     echo
     echo "== unix listeners backing agent sockets (kernel view) =="
+    # Same filter on both platforms; `ss` from PATH when present (the
+    # nixpkgs fallback costs an eval per run).
+    filter='posh/agent|/\.ssh/agent|ssh_client-agent|piggy'
     if [ "$(uname -s)" = Darwin ]; then
-      lsof -nP -U 2>/dev/null | grep -E 'agent|ssh' || echo "(none)"
+      lsof -nP -a -u "$(id -u)" -U 2>/dev/null | grep -E "$filter" \
+        || echo "(no matching listeners)"
+    elif command -v ss >/dev/null 2>&1; then
+      ss -xlp 2>/dev/null | grep -E "$filter" || echo "(no matching listeners)"
     else
       nix shell nixpkgs#iproute2 --command ss -xlp 2>/dev/null \
-        | grep -E 'posh/agent|/\.ssh/agent|ssh_client-agent|piggy' \
-        || echo "(no matching listeners)"
+        | grep -E "$filter" || echo "(no matching listeners)"
     fi
     echo
     echo "== socket files (a file with NO listener above is a dead leftover) =="
-    ls -la --time-style=full-iso "$HOME/.ssh/agent" 2>/dev/null || true
-    ls -la --time-style=full-iso "${XDG_RUNTIME_DIR:-/run/user/$(id -u)}/posh/agent" 2>/dev/null || true
+    # The same base precedence as the sibling recipes (POSH_DIR first).
+    base="${POSH_DIR:-${XDG_RUNTIME_DIR:-/run/user/$(id -u)}/posh}"
+    for d in "$HOME/.ssh/agent" "$base/agent"; do
+      [ -d "$d" ] || continue
+      # GNU ls gives full timestamps; BSD ls (macOS) falls back to -T.
+      ls -la --time-style=full-iso "$d" 2>/dev/null || ls -laT "$d" 2>/dev/null || true
+    done
 
 # Deep read-only state for ONE posh pid (from debug-posh-procs): its wait
 # channel + stack (blocked in which syscall?), state, and fd table (which UDP
