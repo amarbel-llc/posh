@@ -424,7 +424,7 @@ fn first_daemon_record(
         let now = util::now_ms();
         let due = last_hb.is_none_or(|t| now.saturating_sub(t) >= sync::HEARTBEAT_INTERVAL);
         if conn.has_remote() && due {
-            send_empty(conn, &mut hb_fragmenter, &idle_inbox, 0, &[], enveloped);
+            send_empty(conn, &mut hb_fragmenter, &idle_inbox, 0, 0, &[], enveloped);
             last_hb = Some(now);
         }
         // Wake in time for the next heartbeat even with no fd activity.
@@ -571,6 +571,11 @@ fn relay_loop(
     let mut fragmenter = Fragmenter::new();
     let mut assembly = FragmentAssembly::new();
     let mut inbox = InputInbox::new();
+    // Echo-ack maturity (mosh ECHO_TIMEOUT, as `server_loop` keeps it): input
+    // forwarded to the daemon counts as echoed into the screen only after the
+    // grace period, so the client validates/retires predictions against a
+    // frame that actually carries the echo. See `forward_daemon_frame`.
+    let mut echo = sync::EchoAck::new();
     // Agent forwarding (FDR 0004, Task 3.2): the bidirectional agent byte stream
     // the relay TERMINATES, and the peer's per-message AGENT_FORWARD latch.
     // `agent_seen` gates our own AGENT_DATA/ACK emission (RFC 0001: never before
@@ -629,6 +634,7 @@ fn relay_loop(
             &mut fragmenter,
             link.frame_offset,
             &inbox,
+            echo.ack(),
             &mut agent_stream,
             agent_seen,
             agent.is_some(),
@@ -684,6 +690,11 @@ fn relay_loop(
             if agent_out_pending {
                 deadline = deadline.min(last_agent_send + SEND_INTERVAL_MIN);
             }
+            // Wake when the next pending echo ack matures, so a static screen
+            // still delivers the ack the client's predictions wait on.
+            if let Some(wait) = echo.wait_time(now) {
+                deadline = deadline.min(now + wait);
+            }
             // RFC 0011 §5: wake in time for the agent mux's fresh sends and
             // RTO retransmissions even with no fd activity.
             if let Some(d) = agent_mux.as_ref().and_then(|m| m.next_deadline(conn.rto())) {
@@ -727,6 +738,11 @@ fn relay_loop(
             Err(e) => return Err(e.into()),
         }
         let now = util::now_ms();
+        // Mature the echo ack FIRST, so everything sent this iteration (a
+        // forwarded frame, an empty) carries it; if it advanced and no frame
+        // carries it, an empty ack goes out below — the client's predictions
+        // can be validated even when the screen did not change.
+        let mut echo_advanced = echo.update(now);
 
         // --- UDP client -> daemon ---
         let mut winding_down = false;
@@ -834,6 +850,9 @@ fn relay_loop(
                         // cumulative retransmit stream via InputInbox.
                         if let Some(new_input) = inbox.accept(msg.input_base, &msg.input) {
                             ipc::append_frame(&mut link.write, Tag::Input, new_input);
+                            // Handed to the daemon now: it matures into an
+                            // echo ack ECHO_TIMEOUT from here.
+                            echo.record(inbox.next_offset(), now);
                         }
                         // Drop the held frame once the client confirms it via the
                         // cumulative ack: it has the frame, nothing to retransmit.
@@ -940,12 +959,14 @@ fn relay_loop(
                         Ok(Some(frame)) => match frame.tag {
                             Tag::Frame => {
                                 let daemon_frame = ServerFrame::decode(&frame.payload)?;
+                                echo_advanced = false; // this frame carries the ack
                                 forward_daemon_frame(
                                     daemon_frame,
                                     &mut conn,
                                     &mut fragmenter,
                                     link.frame_offset,
                                     &inbox,
+                                    echo.ack(),
                                     &mut agent_stream,
                                     agent_seen,
                                     agent.is_some(),
@@ -965,6 +986,7 @@ fn relay_loop(
                                     &mut conn,
                                     &mut fragmenter,
                                     &inbox,
+                                    echo.ack(),
                                     last_frame_num,
                                     code,
                                     enveloped,
@@ -1051,11 +1073,16 @@ fn relay_loop(
                     send_payload(&mut conn, &mut fragmenter, bytes, enveloped);
                 }
                 last_send = now;
-            } else if due.heartbeat {
+            }
+            if (due.heartbeat && !due.retransmit) || echo_advanced {
+                // A matured echo ack rides an empty at once (server_loop's
+                // `force_ack`) — even beside a retransmit, whose held bytes
+                // were encoded with the older ack.
                 send_empty(
                     &mut conn,
                     &mut fragmenter,
                     &inbox,
+                    echo.ack(),
                     last_frame_num,
                     &out_agent_caps,
                     enveloped,
@@ -1070,6 +1097,7 @@ fn relay_loop(
                     &mut conn,
                     &mut fragmenter,
                     &inbox,
+                    echo.ack(),
                     last_frame_num,
                     &out_agent_caps,
                     enveloped,
@@ -1094,7 +1122,15 @@ fn relay_loop(
             // Push the queued Tag::Detach to the daemon (best-effort), then tell
             // the UDP client the transport is over.
             let _ = util::write_all_retry(link.stream.as_raw_fd(), &link.write, 100);
-            send_shutdown(&mut conn, &mut fragmenter, &inbox, last_frame_num, None, enveloped);
+            send_shutdown(
+                &mut conn,
+                &mut fragmenter,
+                &inbox,
+                echo.ack(),
+                last_frame_num,
+                None,
+                enveloped,
+            );
             return Ok(());
         }
 
@@ -1115,9 +1151,14 @@ fn relay_loop(
 /// steady loop and the pre-loop first-frame replay (which the path selection in
 /// `run` consumed off the daemon link).
 ///
-/// input_ack is the relay's own received-input offset; echo_ack mirrors it —
-/// TODO(3.1b): proper EchoAck maturity (mosh ECHO_TIMEOUT). The happy path has no
-/// optimistic-echo client, so acking received input as echoed is inert here.
+/// input_ack is the relay's own received-input offset; `echo_ack` is the
+/// matured echo ack (`EchoAck`, mosh ECHO_TIMEOUT) the loop maintains — input
+/// counts as echoed into the screen only once it has been with the daemon for
+/// the grace period. It used to mirror input_ack (the pre-FDR-0006 "no
+/// optimistic-echo client" shortcut): acking input as echoed the instant it
+/// arrived retired optimistic predictions BEFORE the frame carried the echo,
+/// snapping the cursor back to its pre-echo position until the real echo
+/// frame landed — the lingering-offset shape on a slow link.
 #[allow(clippy::too_many_arguments)]
 fn forward_daemon_frame(
     daemon_frame: ServerFrame,
@@ -1125,6 +1166,7 @@ fn forward_daemon_frame(
     fragmenter: &mut Fragmenter,
     frame_offset: u64,
     inbox: &InputInbox,
+    echo_ack: u64,
     // `&mut` for the posh#142 send counters; see `agent_caps`.
     agent_stream: &mut AgentStream,
     agent_seen: bool,
@@ -1140,8 +1182,7 @@ fn forward_daemon_frame(
     now: u64,
     enveloped: bool,
 ) {
-    let ack = inbox.next_offset();
-    let mut out = rewrap(daemon_frame, frame_offset, ack, ack);
+    let mut out = rewrap(daemon_frame, frame_offset, inbox.next_offset(), echo_ack);
     out.caps.extend(agent_caps(agent_stream, agent_seen, has_agent, enveloped));
     out.caps.extend(intro.iter().cloned());
     *last_frame_num = out.frame_num;
@@ -1167,17 +1208,17 @@ fn send_empty(
     conn: &mut Connection,
     fragmenter: &mut Fragmenter,
     inbox: &InputInbox,
+    echo_ack: u64,
     frame_num: u64,
     extras: &[Cap],
     enveloped: bool,
 ) {
-    let ack = inbox.next_offset();
     let frame = ServerFrame {
         flags: 0,
         caps: caps::own_table(extras),
         frame_num,
-        input_ack: ack,
-        echo_ack: ack,
+        input_ack: inbox.next_offset(),
+        echo_ack,
         body: FrameBody::Empty,
     };
     send_payload(conn, fragmenter, &frame.encode(), enveloped);
@@ -1191,6 +1232,7 @@ fn send_shutdown(
     conn: &mut Connection,
     fragmenter: &mut Fragmenter,
     inbox: &InputInbox,
+    echo_ack: u64,
     frame_num: u64,
     exit_code: Option<i32>,
     enveloped: bool,
@@ -1205,13 +1247,12 @@ fn send_shutdown(
         }],
         None => Vec::new(),
     };
-    let ack = inbox.next_offset();
     let frame = ServerFrame {
         flags: FLAG_SHUTDOWN,
         caps: caps::own_table(&extras),
         frame_num,
-        input_ack: ack,
-        echo_ack: ack,
+        input_ack: inbox.next_offset(),
+        echo_ack,
         body: FrameBody::Empty,
     };
     send_payload(conn, fragmenter, &frame.encode(), enveloped);
@@ -2201,6 +2242,11 @@ mod tests {
         applied_num: u64,
         acked_frame: u64,
         input_acked: u64,
+        /// The highest echo ack any frame carried (the matured one).
+        echo_acked: u64,
+        /// Whether some frame ever carried an echo ack BELOW its input ack —
+        /// the maturity gap the echo-ack tracker exists to create.
+        saw_echo_lag: bool,
         outbox: InputOutbox,
         // client knobs
         drop_incoming: usize,
@@ -2264,6 +2310,8 @@ mod tests {
                 applied_num: 0,
                 acked_frame: 0,
                 input_acked: 0,
+                echo_acked: 0,
+                saw_echo_lag: false,
                 outbox: InputOutbox::new(),
                 drop_incoming: 0,
                 pending_flags: 0,
@@ -2324,6 +2372,10 @@ mod tests {
                             continue; // simulate wire loss on the relay->client path
                         }
                         self.input_acked = self.input_acked.max(frame.input_ack);
+                        self.echo_acked = self.echo_acked.max(frame.echo_ack);
+                        if frame.echo_ack < frame.input_ack {
+                            self.saw_echo_lag = true;
+                        }
                         self.outbox.ack(self.input_acked);
                         match &frame.body {
                             FrameBody::Full(_) => self.saw_full = true,
@@ -2591,6 +2643,46 @@ mod tests {
         assert!(
             h.outbox.pending().is_empty(),
             "client outbox cleared by the heartbeat ack"
+        );
+        h.join();
+    }
+
+    /// The echo ack MATURES (mosh ECHO_TIMEOUT) instead of mirroring the input
+    /// ack: input the relay has just handed to the daemon is acked as received
+    /// at once, but as echoed only after the grace period — so the first ack
+    /// of fresh input carries `echo_ack < input_ack`, and the matured ack then
+    /// rides an Empty even on a static screen. Pre-fix both were equal, which
+    /// retired optimistic-echo predictions before the frame carried the echo
+    /// (the cursor snapped back to its pre-echo spot: the slow-link offset).
+    #[test]
+    fn echo_ack_matures_after_the_grace_period_not_on_receipt() {
+        let mut h = Harness::new();
+        h.outbox.push(b"echo\n");
+        let typed_len = 5u64;
+        let mut echoed = false;
+        let deadline = now_ms() + 20_000;
+        while now_ms() < deadline {
+            h.step();
+            // The shell "echoes" the moment the relay hands the input over:
+            // the daemon's frame is forwarded within the grace period, so it
+            // must carry the input ack but NOT yet the echo ack.
+            if !echoed && h.daemon_input.len() as u64 >= typed_len {
+                h.daemon_produce();
+                echoed = true;
+            }
+            // Static screen from here: only empties carry acks forward. Done
+            // once the matured echo ack has caught up with the input ack.
+            if echoed && h.echo_acked >= typed_len {
+                break;
+            }
+        }
+        assert!(echoed, "never reached the echo phase");
+        assert_eq!(h.input_acked, typed_len, "the input was acked as received");
+        assert_eq!(h.echo_acked, typed_len, "…and, later, as echoed");
+        assert!(
+            h.saw_echo_lag,
+            "the echo frame must have carried echo_ack < input_ack: the echo ack \
+             matures after ECHO_TIMEOUT instead of mirroring the input ack"
         );
         h.join();
     }

@@ -8,7 +8,7 @@
 
 use crate::remote::display::Snapshot;
 
-use super::overlay::OverlayBuffer;
+use super::overlay::{OverlayBuffer, Validity};
 use super::{PredictionRenderer, Predictor, PredictorStats};
 
 pub struct OptimisticPredictor {
@@ -18,6 +18,10 @@ pub struct OptimisticPredictor {
     /// Whether optimistic echo is currently safe (primary screen + remote PTY
     /// echoing). Set false to suppress; doing so resets the overlay.
     echo_safe: bool,
+    /// Cursor-prediction chains dropped because the server contradicted an
+    /// acked one (reported as `mispredict_resets`; the FDR 0006 A/B gauge for
+    /// "how often did optimistic's cursor argue with the server").
+    cursor_resets: u64,
 }
 
 impl OptimisticPredictor {
@@ -28,6 +32,7 @@ impl OptimisticPredictor {
             local_frame_acked: 0,
             local_frame_late_acked: 0,
             echo_safe: false,
+            cursor_resets: 0,
         }
     }
 
@@ -42,12 +47,24 @@ impl OptimisticPredictor {
             .count() as u64
     }
 
-    /// FDR 0006 optimistic retirement: drop overlay cells and cursor
-    /// predictions once the server frame has echoed past them
-    /// (`local_frame_late_acked >= expiration_frame`), so the authoritative
-    /// paint takes over. No epoch / credit / glitch logic — a gated ECHO means
-    /// the echo always arrives, so the ack reliably retires the overlay.
-    fn cull_optimistic(&mut self) {
+    /// FDR 0006 optimistic retirement: drop overlay cells once the server
+    /// frame has echoed past them (`local_frame_late_acked >=
+    /// expiration_frame`), so the authoritative paint takes over. No epoch /
+    /// credit / glitch logic for CELLS — a gated ECHO means the echo always
+    /// arrives, so the ack reliably retires the overlay, and a wrong cell is
+    /// simply overpainted.
+    ///
+    /// The CURSOR is held to a stricter rule. Cursor predictions chain (each
+    /// new one continues from the last predicted position), so when an acked
+    /// prediction turns out wrong — the server landed the cursor elsewhere: a
+    /// prompt redraw, an autosuggestion, the post-Enter prompt — every newer
+    /// prediction was built on the wrong spot and the visible cursor would sit
+    /// there until each was acked in turn (the lingering-offset shape on a
+    /// slow link). So once the server has spoken and disagreed, the whole
+    /// chain is dropped and the next keystroke re-seeds from the frame; an
+    /// acked prediction the server agrees with retires quietly. Optimistic
+    /// never argues with the server about where the cursor is.
+    fn cull_optimistic(&mut self, fb: &Snapshot) {
         let late_ack = self.local_frame_late_acked;
         for row in self.buf.overlays.iter_mut() {
             for cell in row.cells.iter_mut() {
@@ -59,7 +76,19 @@ impl OptimisticPredictor {
         self.buf
             .overlays
             .retain(|row| row.cells.iter().any(|c| c.active));
-        self.buf.cursors.retain(|c| late_ack < c.expiration_frame);
+        let contradicted = self
+            .buf
+            .cursors
+            .iter()
+            .any(|c| c.get_validity(fb, late_ack) == Validity::IncorrectOrExpired);
+        if contradicted {
+            self.cursor_resets += 1;
+            self.buf.cursors.clear();
+        } else {
+            self.buf
+                .cursors
+                .retain(|c| c.get_validity(fb, late_ack) == Validity::Pending);
+        }
     }
 }
 
@@ -93,8 +122,8 @@ impl Predictor for OptimisticPredictor {
         self.echo_safe = safe;
     }
 
-    fn cull(&mut self, _fb: &Snapshot, _now: u64) {
-        self.cull_optimistic();
+    fn cull(&mut self, fb: &Snapshot, _now: u64) {
+        self.cull_optimistic(fb);
     }
 
     fn render(&self, fb: &mut Snapshot, renderer: &dyn PredictionRenderer) {
@@ -128,7 +157,7 @@ impl Predictor for OptimisticPredictor {
                 .buf
                 .prediction_epoch
                 .saturating_sub(self.buf.confirmed_epoch),
-            mispredict_resets: 0,
+            mispredict_resets: self.cursor_resets,
             outcomes: (0, 0, 0),
             nocredit_reasons: (0, 0, 0),
             srtt_trigger: false,
@@ -182,6 +211,83 @@ mod tests {
             "echoed char's overlay must retire after the paint",
         );
         assert_eq!(shown_char(&h.display, 0, 2), 'l', "the real paint stands");
+    }
+
+    #[test]
+    fn optimistic_drops_every_cursor_prediction_once_the_server_contradicts_one() {
+        // The lingering-offset bug: cursor predictions CHAIN (each new one
+        // continues from the last predicted position), so when the server's
+        // echo lands the cursor somewhere else — a prompt redraw, an
+        // autosuggestion, the post-Enter prompt — retiring only the acked
+        // prediction leaves the newer ones painted where the chain went,
+        // and the visible cursor sits there until every one is acked. Once
+        // the server has spoken about a prediction and disagreed, the whole
+        // chain is wrong: drop it, and let the next keystroke re-seed from
+        // the frame. Cells stay optimistic; only the cursor defers.
+        use crate::remote::display::Snapshot;
+        use crate::remote::predict::test_support::reparse;
+        use crate::remote::predict::{Predictor, ReplaceRenderer};
+        use posh_term::Terminal;
+
+        let mut server = Terminal::with_scrollback(24, 80, 0);
+        server.process(b"$ ");
+        let fb0 = Snapshot::from_term(&reparse(24, 80, &server.dump_vt()));
+        assert_eq!((fb0.cursor_row, fb0.cursor_col), (0, 2));
+
+        // Within one epoch a single cursor prediction just moves; an epoch
+        // bump (Enter, any control key) pushes a NEW one that continues from
+        // the last predicted spot — that is the chain.
+        let type_chain = |eng: &mut super::OptimisticPredictor| {
+            eng.set_echo_safe(true);
+            eng.set_frame_sent(0);
+            eng.on_user_byte(b'a', &fb0, 1000); // cursor (0,3), expires at frame 1
+            eng.set_frame_sent(1);
+            eng.on_user_byte(b'\r', &fb0, 1005); // epoch bump: new cursor (1,0), exp 2
+            eng.set_frame_sent(2);
+            eng.on_user_byte(b'b', &fb0, 1010); // that cursor moves to (1,1), exp 3
+        };
+        let mut eng = super::OptimisticPredictor::new(false);
+        type_chain(&mut eng);
+        let mut shown = fb0.clone();
+        eng.render(&mut shown, &ReplaceRenderer);
+        assert_eq!((shown.cursor_row, shown.cursor_col), (1, 1), "the chain's head is painted");
+
+        // The server echoes 'a' but leaves the cursor at column 10 (a prompt
+        // redraw); its echo ack covers 'a' only — the CR and 'b' are in flight.
+        server.process(b"a\x1b[11G");
+        let fb1 = Snapshot::from_term(&reparse(24, 80, &server.dump_vt()));
+        assert_eq!((fb1.cursor_row, fb1.cursor_col), (0, 10));
+        eng.on_server_frame(1, 1, 50);
+        eng.cull(&fb1, 1100);
+        let mut next = fb1.clone();
+        eng.render(&mut next, &ReplaceRenderer);
+        assert_eq!(
+            (next.cursor_row, next.cursor_col),
+            (0, 10),
+            "the server contradicted the acked prediction: the chained one must go too"
+        );
+        assert_eq!(eng.stats().mispredict_resets, 1, "the reset is counted");
+
+        // A subsequent keystroke re-seeds from the frame, not the dead chain.
+        eng.set_frame_sent(3);
+        eng.on_user_byte(b'c', &fb1, 1200);
+        let mut again = fb1.clone();
+        eng.render(&mut again, &ReplaceRenderer);
+        assert_eq!((again.cursor_row, again.cursor_col), (0, 11));
+
+        // And an acked prediction the server AGREES with retires quietly,
+        // leaving the newer chained one in place.
+        let mut agree = super::OptimisticPredictor::new(false);
+        type_chain(&mut agree);
+        let mut server2 = Terminal::with_scrollback(24, 80, 0);
+        server2.process(b"$ a");
+        let fb2 = Snapshot::from_term(&reparse(24, 80, &server2.dump_vt()));
+        agree.on_server_frame(1, 1, 50);
+        agree.cull(&fb2, 1100);
+        let mut ok = fb2.clone();
+        agree.render(&mut ok, &ReplaceRenderer);
+        assert_eq!((ok.cursor_row, ok.cursor_col), (1, 1), "chain survives agreement");
+        assert_eq!(agree.stats().mispredict_resets, 0);
     }
 
     #[test]

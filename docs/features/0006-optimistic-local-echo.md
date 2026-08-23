@@ -96,6 +96,31 @@ and
 `remote::client::tests::echo_set_pins_the_model_against_slow_link_escalation_and_adaptive_rearms`
 pin it.
 
+**First A/B finding (2026-08-23, the same day): the cursor sat visibly
+offset from its real position on the escalated link.** Two causes, both
+fixed:
+
+1. The default relay bootstrap (RFC 0008 §3) stamped `echo_ack = input_ack`
+   — a `TODO(3.1b)` shortcut justified by "the happy path has no
+   optimistic-echo client". Acking input as echoed the instant the relay
+   received it retired optimistic's predictions BEFORE the frame carried the
+   echo: the predicted cursor was dropped, the display snapped back to the
+   frame's pre-echo cursor, and the real echo frame landed an RTT later — a
+   cursor that jumped backwards on every keystroke. The relay (and the M2
+   per-channel bridge) now keep mosh's `EchoAck` maturity, exactly as the
+   roaming `server_loop` always did; RFC 0008 §3 now says so. (Adaptive was
+   mis-validated by the same ack — a contributor to its nocredit/reset
+   noise, posh#91.)
+2. Optimistic never validated CURSOR predictions against the frame: it
+   retired them on ack only, so when the server contradicted an acked one (a
+   prompt redraw, an autosuggestion, the post-Enter prompt) the newer
+   predictions chained from the wrong spot stayed painted until each was
+   acked in turn. `OptimisticPredictor::cull` now drops the whole chain the
+   moment the server contradicts an acked prediction and re-seeds from the
+   frame on the next keystroke (cells stay optimistic; only the cursor
+   defers — optimistic never argues with the server about where the cursor
+   is). Counted in `mispredict_resets` as the A/B gauge.
+
 What this buys the promotion question: every slow-link session is now an
 A/B sample — `optimistic` in effect exactly where it matters, `adaptive`
 everywhere else — with the switch edges in the client log. Observations to

@@ -258,13 +258,17 @@ pub(crate) const MAX_SESSION_CHANNELS: usize = 16;
 /// An Empty `ServerFrame` carrying only acks — the session kind's ack
 /// vehicle (relay.rs::send_empty's shape, per channel): the OPEN
 /// confirmation and the prompt input ack are both this frame.
-fn empty_ack_frame(frame_num: u64, ack: u64) -> crate::remote::sync::ServerFrame {
+fn empty_ack_frame(
+    frame_num: u64,
+    input_ack: u64,
+    echo_ack: u64,
+) -> crate::remote::sync::ServerFrame {
     crate::remote::sync::ServerFrame {
         flags: 0,
         caps: caps::own_table(&[]),
         frame_num,
-        input_ack: ack,
-        echo_ack: ack,
+        input_ack,
+        echo_ack,
         body: crate::remote::sync::FrameBody::Empty,
     }
 }
@@ -295,6 +299,10 @@ struct SessionBridge {
     /// emit an Empty ack frame so the client's input outbox drains without
     /// waiting for the next daemon frame.
     ack_due: bool,
+    /// Echo-ack maturity (mosh ECHO_TIMEOUT; relay.rs parity): input handed
+    /// to the daemon counts as echoed only after the grace period, so the
+    /// client validates/retires predictions against a frame that carries it.
+    echo: crate::remote::sync::EchoAck,
 }
 
 /// A channel the wire opened whose first `ClientMessage` (caps + geometry)
@@ -422,6 +430,9 @@ pub(crate) fn mux_peer_loop(
                     deadline = deadline.min((b.last_retx + conn.rto()).max(now));
                 }
                 deadline = deadline.min((b.last_send + HEARTBEAT_INTERVAL).max(now));
+                if let Some(wait) = b.echo.wait_time(now) {
+                    deadline = deadline.min(now + wait);
+                }
             }
         }
         let timeout = deadline.saturating_sub(now).min(1000) as i32;
@@ -554,7 +565,7 @@ pub(crate) fn mux_peer_loop(
                             // RFC 0013 §3: a daemon heartbeat requesting our
                             // identity — answer with one Empty frame carrying
                             // it on the same reserved channel.
-                            let mut reply = empty_ack_frame(0, 0);
+                            let mut reply = empty_ack_frame(0, 0, 0);
                             reply.caps.push(ident_cap.clone());
                             send_payload(&mut conn, &mut fragmenter, &reply.encode(), true);
                         } else if !session_discard_logged {
@@ -615,9 +626,12 @@ pub(crate) fn mux_peer_loop(
                         else {
                             continue;
                         };
-                        let ack = b.inbox.next_offset();
-                        let out =
-                            crate::remote::relay::rewrap(frame, b.link.frame_offset, ack, ack);
+                        let out = crate::remote::relay::rewrap(
+                            frame,
+                            b.link.frame_offset,
+                            b.inbox.next_offset(),
+                            b.echo.ack(),
+                        );
                         b.last_frame_num = out.frame_num;
                         b.held.hold(out.frame_num, out.encode());
                         b.ack_due = false;
@@ -689,10 +703,16 @@ pub(crate) fn mux_peer_loop(
             // remote is alive, keeping the client's "Last contact" banner
             // down). Both send the same frame: the last forwarded frame
             // number plus the current input ack.
+            // A matured echo ack is owed the same way (relay/server_loop's
+            // force-ack): the client's predictions wait on it.
+            if b.echo.update(now) {
+                b.ack_due = true;
+            }
             if conn.has_remote()
                 && (b.ack_due || now.saturating_sub(b.last_send) >= HEARTBEAT_INTERVAL)
             {
-                let empty = empty_ack_frame(b.last_frame_num, b.inbox.next_offset());
+                let empty =
+                    empty_ack_frame(b.last_frame_num, b.inbox.next_offset(), b.echo.ack());
                 crate::remote::mux::send_session_wire(
                     &mut conn,
                     &mut fragmenter,
@@ -780,7 +800,7 @@ fn handle_session_instruction(
             // hears on the identifier. Without this, the two ends deadlock
             // — the local daemon queues messages until confirmed, and this
             // peer has nothing to send until a message arrives.
-            let confirm = empty_ack_frame(0, 0);
+            let confirm = empty_ack_frame(0, 0, 0);
             send_session_wire(conn, fragmenter, chan, SESSION_WIRE_DATA, &confirm.encode());
         }
         Some(&SESSION_WIRE_DATA) => {
@@ -826,6 +846,7 @@ fn handle_session_instruction(
                             // channel is live immediately.
                             last_send: 0,
                             ack_due: false,
+                            echo: crate::remote::sync::EchoAck::new(),
                         }));
                     }
                     Err(e) => {
@@ -892,6 +913,7 @@ fn bridge_client_message(b: &mut SessionBridge, msg: &crate::remote::sync::Clien
     if let Some(new_input) = b.inbox.accept(msg.input_base, &msg.input) {
         ipc::append_frame(&mut b.link.write, Tag::Input, new_input);
         b.ack_due = true;
+        b.echo.record(b.inbox.next_offset(), now_ms());
     }
     b.held.drop_if_acked(msg.acked_frame);
     let resync = msg.flags & crate::remote::sync::CLIENT_FLAG_RESYNC != 0;

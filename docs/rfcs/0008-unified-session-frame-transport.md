@@ -120,6 +120,17 @@ its reduced role). The relay:
 - MUST NOT require parsing content-capability frame bodies; unknown-id-skip
   applies, and the `ServerFrame` body is opaque to the relay except for the
   `flags` it must honor (e.g. shutdown).
+- MUST stamp its own `input_ack` and `echo_ack` onto every relayed
+  `ServerFrame` (the daemon sends 0 for both, §2): `input_ack` is the input
+  it has bridged to the daemon; `echo_ack` MUST lag it by the echo grace
+  period (mosh `ECHO_TIMEOUT`, `sync::EchoAck`) — input counts as echoed into
+  the screen only once it has been with the daemon long enough for the echo
+  to be in the frame. A matured `echo_ack` MUST be delivered promptly (an
+  Empty frame on a static screen), since the client's local-echo predictions
+  retire against it. Mirroring `input_ack` into `echo_ack` (the original
+  relay shape) retired optimistic-echo predictions before the frame carried
+  the echo. The M2 per-channel bridge (`posh-server mux`) follows the same
+  rule per channel.
 
 Because the relay holds no terminal model and its only per-session state is
 which Unix socket it is connected to, *retargeting* the relay at a different
