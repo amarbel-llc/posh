@@ -1037,6 +1037,13 @@ fn relay_loop(
                 Err(e) => return Err(e.into()),
             }
         }
+        // Daemon backpressure: input still sitting in `link.write` has not
+        // reached the shell, so its echo grace period cannot have begun —
+        // restart the pending entries' clocks (they mature ECHO_TIMEOUT
+        // after the buffer last drained).
+        if !link.write.is_empty() {
+            echo.restamp_pending(now);
+        }
 
         // The periodic-send decision (see `periodic_send`): retransmit + heartbeat
         // run on `last_send` (the frame-reliability clock); the agent-output carrier
@@ -1087,12 +1094,26 @@ fn relay_loop(
                     &out_agent_caps,
                     enveloped,
                 );
-                last_send = now;
+                // `last_send` is ALSO the held-frame retransmit clock
+                // (periodic_send), so an echo-only empty must not restamp it:
+                // steady typing matures an ack every ECHO_TIMEOUT — faster
+                // than any RTO — and would starve a lost frame's retransmit
+                // for as long as the typing continues (the same shared-clock
+                // starvation `last_agent_send` exists to prevent).
+                if due.heartbeat && !due.retransmit {
+                    last_send = now;
+                }
+                // The empty did carry the current agent caps, so the carrier
+                // need not repeat them this iteration.
+                last_agent_send = now;
             }
             // The carrier fires even while a visible frame is held or being
             // retransmitted (the held frame's bytes can't carry FRESH agent caps),
-            // and advances `last_agent_send` only — never `last_send`.
-            if due.agent_carrier {
+            // and advances `last_agent_send` only — never `last_send`. An
+            // echo/heartbeat empty this iteration already carried the same
+            // caps (it restamped `last_agent_send` above), so recompute the
+            // carrier's dueness rather than double-sending the same tail.
+            if due.agent_carrier && now.saturating_sub(last_agent_send) >= SEND_INTERVAL_MIN {
                 send_empty(
                     &mut conn,
                     &mut fragmenter,
@@ -2657,26 +2678,33 @@ mod tests {
     #[test]
     fn echo_ack_matures_after_the_grace_period_not_on_receipt() {
         let mut h = Harness::new();
-        h.outbox.push(b"echo\n");
-        let typed_len = 5u64;
-        let mut echoed = false;
+        // Observing the lag needs a frame forwarded inside the sub-50 ms
+        // grace window — a race against scheduler jitter for any single
+        // attempt — so each round types one more byte (opening a fresh
+        // window) and produces a frame the moment the relay forwards it,
+        // until one such frame is caught carrying the un-matured ack.
+        let mut typed_len = 0u64;
         let deadline = now_ms() + 20_000;
         while now_ms() < deadline {
-            h.step();
-            // The shell "echoes" the moment the relay hands the input over:
-            // the daemon's frame is forwarded within the grace period, so it
-            // must carry the input ack but NOT yet the echo ack.
-            if !echoed && h.daemon_input.len() as u64 >= typed_len {
-                h.daemon_produce();
-                echoed = true;
+            if !h.saw_echo_lag && h.daemon_input.len() as u64 >= typed_len {
+                h.outbox.push(b"x");
+                typed_len += 1;
+                h.step();
+                if h.daemon_input.len() as u64 >= typed_len {
+                    // The shell "echoes" the moment the relay hands the
+                    // input over: this frame is the fresh-window probe.
+                    h.daemon_produce();
+                }
+                continue;
             }
-            // Static screen from here: only empties carry acks forward. Done
-            // once the matured echo ack has caught up with the input ack.
-            if echoed && h.echo_acked >= typed_len {
+            h.step();
+            // Static screen once the lag was seen: only empties carry acks
+            // forward. Done when the matured echo ack has caught up.
+            if h.saw_echo_lag && h.echo_acked >= typed_len {
                 break;
             }
         }
-        assert!(echoed, "never reached the echo phase");
+        assert!(typed_len > 0, "never typed");
         assert_eq!(h.input_acked, typed_len, "the input was acked as received");
         assert_eq!(h.echo_acked, typed_len, "…and, later, as echoed");
         assert!(

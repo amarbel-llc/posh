@@ -1838,9 +1838,17 @@ fn process_user_input(st: &mut ClientState, buf: &[u8]) -> bool {
 
     // Any keystroke while scrolled returns to the live view (FDR 0005), then is
     // forwarded normally below — you are about to type at the prompt.
-    if !buf.is_empty() && st.scroll_offset > 0 {
+    let was_scrolled = !buf.is_empty() && st.scroll_offset > 0;
+    if was_scrolled {
         set_scroll(st, 0);
     }
+    // While scrolled, `last_drawn` holds the SCROLL VIEW, and the scroll
+    // compose path never culls while acks advance — so the first keystroke
+    // after scrollback must predict against an authoritative live snapshot,
+    // not the history rows: culling against the scroll view judges acked
+    // predictions "contradicted" (chain wipe, a bumped mispredict gauge) and
+    // seeds the next prediction from the scroll view's cursor.
+    let live_fb = was_scrolled.then(|| Snapshot::from_term(&st.server_term));
 
     // Don't predict for bulk pastes.
     let paste = buf.len() > 100;
@@ -1857,7 +1865,8 @@ fn process_user_input(st: &mut ClientState, buf: &[u8]) -> bool {
     let push = |st: &mut ClientState, byte: u8| {
         if !paste {
             st.predict.set_frame_sent(st.outbox.end_offset());
-            st.predict.on_user_byte(byte, &st.last_drawn, now);
+            let fb = live_fb.as_ref().unwrap_or(&st.last_drawn);
+            st.predict.on_user_byte(byte, fb, now);
         }
         st.outbox.push(&[byte]);
     };

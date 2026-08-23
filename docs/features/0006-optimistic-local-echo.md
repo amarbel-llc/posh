@@ -107,10 +107,17 @@ fixed:
    echo: the predicted cursor was dropped, the display snapped back to the
    frame's pre-echo cursor, and the real echo frame landed an RTT later — a
    cursor that jumped backwards on every keystroke. The relay (and the M2
-   per-channel bridge) now keep mosh's `EchoAck` maturity, exactly as the
-   roaming `server_loop` always did; RFC 0008 §3 now says so. (Adaptive was
-   mis-validated by the same ack — a contributor to its nocredit/reset
-   noise, posh#91.)
+   per-channel bridge) now keep mosh's `EchoAck` maturity like the roaming
+   `server_loop` always did, with two deliberate divergences from it: a
+   matured ack is delivered even while a frame is outstanding (the relay's
+   held bytes are pre-encoded with the older ack, where `server_loop`
+   re-encodes on retransmit and so gates its force-ack behind
+   no-outstanding-frame), and the queue-then-flush loops restamp pending
+   entries under daemon backpressure (`EchoAck::restamp_pending` — the
+   grace period counts from when the buffer last drained, since
+   `server_loop` writes to the PTY before recording and never queues).
+   RFC 0008 §3 now states the contract. (Adaptive was mis-validated by the
+   same mirrored ack — a contributor to its nocredit/reset noise, posh#91.)
 2. Optimistic never validated CURSOR predictions against the frame: it
    retired them on ack only, so when the server contradicted an acked one (a
    prompt redraw, an autosuggestion, the post-Enter prompt) the newer

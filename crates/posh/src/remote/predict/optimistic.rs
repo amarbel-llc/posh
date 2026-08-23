@@ -76,12 +76,21 @@ impl OptimisticPredictor {
         self.buf
             .overlays
             .retain(|row| row.cells.iter().any(|c| c.active));
-        let contradicted = self
+        // Judge the NEWEST acked prediction only (mosh's cull judges the
+        // last entry): older chain entries are frozen intermediate positions
+        // (only the newest cursor ever moves; an epoch bump freezes it and
+        // pushes a successor), so when one echo ack covers several epochs at
+        // once — routine on the slow links optimistic targets — the frame's
+        // cursor legitimately sits at the newest spot and every older entry
+        // "mismatches". Only the newest acked entry carries a verdict.
+        let newest_acked = self
             .buf
             .cursors
             .iter()
-            .any(|c| c.get_validity(fb, late_ack) == Validity::IncorrectOrExpired);
-        if contradicted {
+            .rev()
+            .map(|c| c.get_validity(fb, late_ack))
+            .find(|v| !matches!(v, Validity::Pending | Validity::Inactive));
+        if newest_acked == Some(Validity::IncorrectOrExpired) {
             self.cursor_resets += 1;
             self.buf.cursors.clear();
         } else {
@@ -288,6 +297,28 @@ mod tests {
         agree.render(&mut ok, &ReplaceRenderer);
         assert_eq!((ok.cursor_row, ok.cursor_col), (1, 1), "chain survives agreement");
         assert_eq!(agree.stats().mispredict_resets, 0);
+
+        // Batched acks: one frame's echo ack covering the WHOLE chain judges
+        // only the newest entry. The older entry's frozen intermediate spot
+        // (0,3) no longer matches the frame — that is not a contradiction,
+        // the chain simply completed; the frame's cursor agrees with its
+        // newest prediction.
+        let mut batch = super::OptimisticPredictor::new(false);
+        type_chain(&mut batch);
+        let mut server3 = Terminal::with_scrollback(24, 80, 0);
+        server3.process(b"$ a\r\nb");
+        let fb3 = Snapshot::from_term(&reparse(24, 80, &server3.dump_vt()));
+        assert_eq!((fb3.cursor_row, fb3.cursor_col), (1, 1));
+        batch.on_server_frame(3, 3, 50);
+        batch.cull(&fb3, 1100);
+        let mut done = fb3.clone();
+        batch.render(&mut done, &ReplaceRenderer);
+        assert_eq!((done.cursor_row, done.cursor_col), (1, 1));
+        assert_eq!(
+            batch.stats().mispredict_resets,
+            0,
+            "a completed chain is not a contradiction (the A/B gauge stays honest)"
+        );
     }
 
     #[test]

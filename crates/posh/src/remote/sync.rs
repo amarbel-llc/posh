@@ -370,6 +370,20 @@ impl EchoAck {
         self.acked
     }
 
+    /// Push every still-pending entry's clock to `now`: the bytes they cover
+    /// are still sitting in a userspace write buffer (daemon backpressure),
+    /// so their grace period has not really begun — maturing them on
+    /// record-time age would ack an echo the application has not even
+    /// received the input for. Callers that queue-then-flush (the relay,
+    /// the M2 bridge) call this on every iteration that leaves the buffer
+    /// non-empty; callers that write synchronously before recording (the
+    /// roaming server's PTY write) never need it.
+    pub fn restamp_pending(&mut self, now: u64) {
+        for (_, at) in self.pending.iter_mut() {
+            *at = now;
+        }
+    }
+
     /// Time until the next pending entry matures, for poll deadlines.
     pub fn wait_time(&self, now: u64) -> Option<u64> {
         self.pending
@@ -1664,6 +1678,21 @@ mod tests {
         assert_eq!(echo.wait_time(2000), None);
         // No double-advance.
         assert!(!echo.update(10_000));
+    }
+
+    #[test]
+    fn echo_ack_restamp_defers_maturity_under_backpressure() {
+        // Input recorded while its bytes still sit in a userspace buffer must
+        // not mature on record-time age: each restamp restarts the grace
+        // period, and maturity counts from the last restamp (≈ the last
+        // moment the buffer was seen non-empty).
+        let mut echo = EchoAck::new();
+        echo.record(5, 1000);
+        echo.restamp_pending(1000 + ECHO_TIMEOUT - 10);
+        assert!(!echo.update(1000 + ECHO_TIMEOUT), "restamped: not matured on record age");
+        assert_eq!(echo.ack(), 0);
+        assert!(echo.update(1000 + ECHO_TIMEOUT - 10 + ECHO_TIMEOUT));
+        assert_eq!(echo.ack(), 5);
     }
 
     #[test]

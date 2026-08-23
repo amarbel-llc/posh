@@ -93,7 +93,9 @@ for both transports. Over a reliable, ordered transport (the Unix socket):
 - The daemon MUST NOT apply datagram-only machinery: no fragmentation, no AEAD
   seal/replay header, no retransmission or RTO.
 - The `flags`, `frame_num`, and `input_ack` fields retain their meaning, but the
-  loss-recovery paths they drive are inert.
+  loss-recovery paths they drive are inert. The daemon MUST send `input_ack`
+  and `echo_ack` as 0: socket input is reliable, so the acks are meaningless
+  at this hop, and a §3 relay restamps both with its own values.
 - A client on a reliable transport MUST honor a negotiated `BASE_SUM` but SHOULD
   NOT need to request resyncs, since the base cannot diverge.
 

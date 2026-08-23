@@ -608,6 +608,12 @@ pub(crate) fn mux_peer_loop(
         for (i, chp) in channels.iter_mut().enumerate() {
             let PeerChannel::Linked(b) = chp else { continue };
             let fd = b.link.stream.as_raw_fd();
+            // Mature the echo ack FIRST (relay.rs ordering), so a frame
+            // forwarded below carries it instead of being chased by a
+            // redundant Empty.
+            if b.echo.update(now) {
+                b.ack_due = true;
+            }
             let signalled = signalled_bridges.contains(&fd);
             let mut eof = false;
             if signalled {
@@ -680,6 +686,11 @@ pub(crate) fn mux_peer_loop(
                     Err(_) => eof = true,
                 }
             }
+            // Daemon backpressure (relay.rs parity): queued input has not
+            // reached the shell, so its echo grace period restarts.
+            if !b.link.write.is_empty() {
+                b.echo.restamp_pending(now);
+            }
             if b.held.is_held()
                 && conn.has_remote()
                 && now.saturating_sub(b.last_retx) >= conn.rto()
@@ -703,11 +714,6 @@ pub(crate) fn mux_peer_loop(
             // remote is alive, keeping the client's "Last contact" banner
             // down). Both send the same frame: the last forwarded frame
             // number plus the current input ack.
-            // A matured echo ack is owed the same way (relay/server_loop's
-            // force-ack): the client's predictions wait on it.
-            if b.echo.update(now) {
-                b.ack_due = true;
-            }
             if conn.has_remote()
                 && (b.ack_due || now.saturating_sub(b.last_send) >= HEARTBEAT_INTERVAL)
             {
