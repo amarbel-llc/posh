@@ -265,6 +265,21 @@ rendezvous policy is eng's (tracked there), and posh#103 remains the
 end-state. The detached spawn (`posh host:session --detach`, FDR 0010)
 still inherits the spawning ssh's environment (posh#103's second case).
 
+### Decision (2026-08-23): the export is the spawn-time default; a host front may override
+
+Coordinated with the eng/piggy host-global agent-mux cutover (eng#295's
+long-term shape: a proxy-only mux owning the host's `SSH_AUTH_SOCK`,
+with this record's `agent/sock` as one upstream): posh's per-session
+export stays UNCONDITIONAL — posh must work on hosts with no such
+machinery, and host-management awareness is the wrong altitude for posh
+— and the precedence is plain env layering: the export is baked into the
+session shell's SPAWN environment, so a host-global front that sets
+`SSH_AUTH_SOCK` in shell init runs later and legitimately wins. On a
+managed host the front is therefore the sole front for every shell
+(posh sessions included, gaining its multi-upstream degrade-select); on
+an unmanaged host posh's direct export is the standing fallback. The
+posh endpoint path remains the canonical upstream either way.
+
 ### The rendezvous persists through outages (2026-08-23, same day)
 
 Exporting the stable path exposed that it was not stable AS A PATH: the
