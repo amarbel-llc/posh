@@ -208,6 +208,14 @@ the `eng-*(7)` manpages — read them with `man eng-versioning`,
   fd 3, composited onto the session `Snapshot`. It is the escape menu (echo,
   logging, shell-out, suspend, quit); `Ctrl-^ .` survives only as the
   renderer-unavailable emergency quit. `remote/client.rs` + `remote/palette.rs`.
+  Its heading carries the live `rtt`/`rto` and the echo model in effect
+  (`palette_title`). **Slow-link echo escalation (FDR 0006 A/B):** the
+  default `adaptive` model auto-switches to `optimistic` once SRTT holds
+  >150 ms for 3 s and back <80 ms for 15 s (`predict::EchoEscalation`,
+  `POSH_ECHO_ESCALATE=0` opts out); an explicit model pins, `Echo: adaptive`
+  re-arms. Note `always` ≈ `adaptive` on a slow link — both keep the
+  tentative-epoch gate; only `optimistic`/`experimental` show post-Enter
+  keystrokes before the round trip.
 
 ## Debugging a live / wedged roaming session
 

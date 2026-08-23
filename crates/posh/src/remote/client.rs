@@ -160,6 +160,17 @@ fn palette_commands(server_log_on: bool, scroll_opt: bool) -> Value {
     ])
 }
 
+/// The palette's heading (RFC 0005 `ui.show` `title`): the live link latency
+/// and the echo model in effect, so "how bad is this link and what is posh
+/// doing about it" costs zero keystrokes beyond opening the palette. SRTT and
+/// RTO are the wire's estimator (the same numbers "Show connection health"
+/// dumps); the echo label names an automatic slow-link switch as such.
+fn palette_title(srtt_ms: f64, rto_ms: u64, model: PredictionModel, auto_escalated: bool) -> String {
+    let model = format!("{model:?}").to_ascii_lowercase();
+    let auto = if auto_escalated { " (auto: slow link)" } else { "" };
+    format!("Commands · rtt {srtt_ms:.0}ms · rto {rto_ms}ms · echo: {model}{auto}")
+}
+
 /// Summon the command palette: spawn the renderer on first use, then show it.
 /// Returns whether it opened (false if the renderer can't be spawned, leaving
 /// the caller to fall back to the emergency-quit prefix).
@@ -168,13 +179,19 @@ fn open_palette(st: &mut ClientState) -> bool {
         st.palette = Palette::spawn(st.rows, st.cols);
     }
     let commands = palette_commands(st.server_log_on, st.scroll_opt);
+    let title = palette_title(
+        st.wire.srtt(),
+        st.wire.rto(),
+        st.predict_model,
+        st.echo_escalation.escalated(),
+    );
     if let Some(p) = st.palette.as_mut() {
         // A persisted (spawned-then-closed) palette is not resized while closed,
         // so re-sync it to the current tty size before summoning — else it
         // renders at the size it had when last open, misaligned against a
         // since-resized screen (posh#135).
         p.resize(st.rows, st.cols);
-        p.open("Commands", commands);
+        p.open(&title, commands);
         st.initialized = false; // repaint to show the overlay
         true
     } else {
@@ -434,9 +451,21 @@ fn predict_debug_summary(st: &ClientState) -> String {
     let ps = st.predict.stats();
     let (correct, nocredit, incorrect) = ps.outcomes;
     let mut out = format!(
-        "echo model: {:?}\noutcomes: correct={correct} nocredit={nocredit} incorrect={incorrect} \
+        "echo model: {:?}{}\nslow-link escalation: {} (srtt {:.0}ms; escalate >{:.0}ms held {}s, recover <{:.0}ms held {}s)\n\
+         outcomes: correct={correct} nocredit={nocredit} incorrect={incorrect} \
          resets={} epoch_lag={} shown_cells={} srtt_trigger={}",
         st.predict_model,
+        if st.echo_escalation.escalated() { " (auto: slow link)" } else { "" },
+        match (st.echo_escalation.governing(), st.echo_escalation.escalated()) {
+            (false, _) => "off (model pinned, or POSH_ECHO_ESCALATE=0)",
+            (true, false) => "armed (adaptive)",
+            (true, true) => "escalated (optimistic)",
+        },
+        st.wire.srtt(),
+        predict::ESCALATE_SRTT_MS,
+        predict::ESCALATE_HOLD_MS / 1000,
+        predict::DEESCALATE_SRTT_MS,
+        predict::DEESCALATE_HOLD_MS / 1000,
         ps.mispredict_resets,
         ps.epoch_lag,
         ps.shown_cells,
@@ -498,6 +527,11 @@ fn dispatch_palette_action(
                 .and_then(Value::as_str)
                 .and_then(|m| PredictionModel::parse(Some(m)).ok())
             {
+                // An explicit choice pins the model; choosing adaptive hands
+                // the slow-link escalation back its governance (un-escalated,
+                // so it re-evaluates from the live SRTT).
+                st.echo_escalation
+                    .on_explicit(model, predict::escalation_selected());
                 apply_echo_model(st, model, now);
             }
             false
@@ -931,6 +965,11 @@ struct ClientState {
     predict_model: PredictionModel,
     predict_render: RenderStyle,
     predict_overwrite: bool,
+    /// Slow-link auto-escalation of the default model to optimistic (FDR
+    /// 0006 A/B): governs only while the model is the un-pinned adaptive
+    /// default and `POSH_ECHO_ESCALATE` is on; ticked per server frame on
+    /// the wire's SRTT.
+    echo_escalation: predict::EchoEscalation,
     /// Latest metric vector (RFC 0007), reassembled each compose while a GP
     /// species is active; the seam the evolved program reads once wired.
     #[allow(dead_code)] // consumed once the GP program is wired (RFC 0007 §7)
@@ -1108,6 +1147,9 @@ fn client_loop(
         predict_model: model,
         predict_render: render,
         predict_overwrite,
+        echo_escalation: predict::EchoEscalation::new(
+            model == PredictionModel::Adaptive && predict::escalation_selected(),
+        ),
         last_metrics: predict::MetricVector::unavailable(),
         remote_metrics: [f64::NAN; caps::METRICS_FIELDS],
         notify: NotificationEngine::new(now),
@@ -2005,6 +2047,23 @@ fn process_frame(st: &mut ClientState, frame: &ServerFrame) -> bool {
     }
     st.predict
         .on_server_frame(frame.input_ack, frame.echo_ack, st.wire.send_interval());
+    // Slow-link escalation (FDR 0006 A/B): the default adaptive model hands
+    // over to optimistic once the SRTT has held past the threshold, and
+    // back when the link recovers. Banners name the switch as automatic.
+    if let Some(next) = st.echo_escalation.tick(st.wire.srtt(), now) {
+        apply_echo_model(st, next, now);
+        let why = if next == PredictionModel::Optimistic {
+            "slow link"
+        } else {
+            "link recovered"
+        };
+        st.notify
+            .set_message(&format!("echo: {next:?} (auto: {why})"), false, now);
+        util::log_write(
+            "echo",
+            &format!("auto {why}: {next:?} (srtt {:.0}ms)", st.wire.srtt()),
+        );
+    }
     // Remote PTY echo state for the optimistic-echo gate (FDR 0006).
     st.echo_on = frame.flags & sync::FLAG_ECHO != 0;
     // Server debug-logging state for the palette's "Server debug logging" label (#3).
@@ -3699,6 +3758,7 @@ mod tests {
             renderer: predict::build(PredictionModel::Never, RenderStyle::Replace, false).1,
             predict_model: PredictionModel::Never,
             predict_render: RenderStyle::Replace,
+            echo_escalation: predict::EchoEscalation::new(false),
             last_metrics: predict::MetricVector::unavailable(),
             remote_metrics: [f64::NAN; caps::METRICS_FIELDS],
             predict_overwrite: false,
@@ -3967,6 +4027,44 @@ mod tests {
         assert_eq!(st.predict_model, PredictionModel::Optimistic);
         assert!(st.notify.message().contains("Optimistic"), "banner names the new model");
         assert!(!st.initialized, "swapping the predictor forces a clean repaint");
+    }
+
+    #[test]
+    fn echo_set_pins_the_model_against_slow_link_escalation_and_adaptive_rearms() {
+        // The palette's explicit choices and the FDR 0006 slow-link
+        // auto-escalation share one rule: explicit pins, adaptive re-arms.
+        let raw = pty_raw_mode();
+        let mut st = test_state(3, 30);
+        // Escalate by hand (the pure machine is pinned in predict::tests):
+        // the header names it automatic; the stats dialog says so too.
+        let mut esc = predict::EchoEscalation::new(true);
+        assert_eq!(esc.tick(400.0, 0), None);
+        assert_eq!(esc.tick(400.0, predict::ESCALATE_HOLD_MS), Some(PredictionModel::Optimistic));
+        st.echo_escalation = esc;
+        st.predict_model = PredictionModel::Optimistic;
+        assert_eq!(
+            palette_title(412.4, 1600, PredictionModel::Optimistic, true),
+            "Commands · rtt 412ms · rto 1600ms · echo: optimistic (auto: slow link)"
+        );
+        assert!(predict_debug_summary(&st).contains("escalated (optimistic)"));
+
+        // An explicit `Echo: always` pins: the machine stops governing.
+        dispatch_palette_action(&mut st, &raw, "echo.set", &json!({ "model": "always" }), 0);
+        assert_eq!(st.predict_model, PredictionModel::Always);
+        assert!(!st.echo_escalation.governing());
+        assert!(!st.echo_escalation.escalated());
+        assert_eq!(
+            palette_title(412.4, 1600, PredictionModel::Always, false),
+            "Commands · rtt 412ms · rto 1600ms · echo: always"
+        );
+        assert!(predict_debug_summary(&st).contains("off (model pinned"));
+
+        // `Echo: adaptive` hands control back, un-escalated (re-evaluates
+        // from the live SRTT) — iff the gate is on, which the default is.
+        dispatch_palette_action(&mut st, &raw, "echo.set", &json!({ "model": "adaptive" }), 0);
+        assert_eq!(st.predict_model, PredictionModel::Adaptive);
+        assert_eq!(st.echo_escalation.governing(), predict::escalation_selected());
+        assert!(!st.echo_escalation.escalated());
     }
 
     #[test]

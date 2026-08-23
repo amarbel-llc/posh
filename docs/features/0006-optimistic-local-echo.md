@@ -58,6 +58,42 @@ A `vim` session — the alternate screen is active, so optimistic echo is
 suppressed and navigation keys never flash a literal character before the app
 repaints.
 
+## Slow-link auto-escalation (2026-08-23): the A/B, run live
+
+The promotion criterion above asks for an A/B against `adaptive` over a real
+~100 ms link. A field report ("this link should be using local echo
+prediction exclusively, the latency is very bad") surfaced a fact worth
+recording: on a slow link `adaptive` and `always` paint the SAME thing —
+adaptive's `srtt_trigger` is already on past mosh's 30 ms threshold, and
+both keep the tentative-epoch gate, so the first keystrokes after Enter or
+any control key stay hidden for a full RTT. That gap is what a slow-link
+user feels, and `optimistic` is the one model that removes it while keeping
+the ECHO-off / alt-screen gates (mosh's `experimental` shows tentative
+cells but has no ECHO gate).
+
+So the client now runs the A/B itself: with the model left on its default,
+`predict::EchoEscalation` switches the session to `optimistic` once the
+wire's SRTT has held above 150 ms for 3 s, and back to `adaptive` after it
+has held under 80 ms for 15 s (hysteresis + asymmetric holds so a jittery
+link does not flap and a mid-outage good moment does not yank the echo).
+Any explicit model — `POSH_PREDICTION_MODEL`, or the palette's `Echo:`
+commands — pins and bypasses it; `Echo: adaptive` re-arms it.
+`POSH_ECHO_ESCALATE=0` opts out (default-on gate shape). The palette heading
+carries the live `rtt`/`rto` and `echo: optimistic (auto: slow link)` while
+escalated; "Show echo prediction stats" reports the state and thresholds;
+the switch is bannered and logged (`echo` tag) with the SRTT at the edge.
+`remote::predict::tests::echo_escalation_holds_hysteresis_and_yields_to_explicit_choices`
+and
+`remote::client::tests::echo_set_pins_the_model_against_slow_link_escalation_and_adaptive_rearms`
+pin it.
+
+What this buys the promotion question: every slow-link session is now an
+A/B sample — `optimistic` in effect exactly where it matters, `adaptive`
+everywhere else — with the switch edges in the client log. Observations to
+collect against the criterion (echo leaks at password prompts, flicker,
+full-screen apps) before deciding whether `optimistic` becomes the default
+outright.
+
 ## Limitations
 
 - **ECHO-flip race.** The server's `ECHO`-off signal must reach the client

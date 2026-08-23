@@ -266,7 +266,15 @@ _POSH_PREDICTION_MODEL_
 	Local-echo prediction model: _always_, _never_, _adaptive_
 	(default), _experimental_, or _optimistic_ (FDR 0006: echo
 	immediately and correct on the next paint; ECHO/alt-screen gated).
-	_POSH_PREDICTION_ is a deprecated alias. See *posh-client*(1).
+	The default auto-escalates to _optimistic_ on a slow link
+	(_POSH_ECHO_ESCALATE_, default on). _POSH_PREDICTION_ is a deprecated
+	alias. See *posh-client*(1).
+
+_POSH_ECHO_ESCALATE_
+	Slow-link echo escalation (adaptive → optimistic once the RTT holds
+	above 150 ms, back under 80 ms), default ON; _0_ opts out. The *Ctrl-^*
+	palette heading shows the live RTT/RTO and the echo model in effect.
+	See *posh-client*(1).
 
 _POSH_PREDICTION_RENDER_
 	How predicted cells are painted, independent of the model: _replace_

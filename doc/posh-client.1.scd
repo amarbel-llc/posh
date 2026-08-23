@@ -82,6 +82,23 @@ _POSH_PREDICTION_MODEL_
 	the remote PTY's ECHO flag and alt-screen. _POSH_PREDICTION_ is a
 	deprecated alias, honored when _POSH_PREDICTION_MODEL_ is unset.
 
+	The default _adaptive_ auto-escalates on a slow link (see
+	_POSH_ECHO_ESCALATE_): _adaptive_ and _always_ both hide the first
+	keystrokes after Enter or any control key for a full round trip (the
+	tentative-epoch gate), which on a slow link is what the user feels, so
+	once the smoothed RTT has stayed above 150 ms for 3 s the client
+	switches to _optimistic_ — banner _echo: Optimistic (auto: slow link)_
+	— and back to _adaptive_ after the RTT has stayed under 80 ms for 15 s.
+	Any explicit model (this variable, or the palette's *Echo:* commands)
+	pins the choice; picking *Echo: adaptive* re-arms the escalation.
+
+_POSH_ECHO_ESCALATE_
+	The slow-link auto-escalation above, default ON; _0_ (or *false*,
+	*off*, *no*) keeps the default model at plain _adaptive_ whatever the
+	RTT. The palette heading shows the live RTT and the model in effect
+	(_echo: optimistic (auto: slow link)_ while escalated), and *Show echo
+	prediction stats* reports the escalation state and thresholds.
+
 _POSH_PREDICTION_RENDER_
 	How predicted cells are painted, independent of the model: _replace_
 	(default; the model's own look — replace the glyph, underline on a

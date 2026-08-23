@@ -207,6 +207,118 @@ impl RenderStyle {
     }
 }
 
+// ---------------------------------------------------------------------------
+// Slow-link echo escalation (FDR 0006's A/B, run live): with the model left
+// on its default, a link whose SRTT holds past a threshold switches the
+// session to `optimistic` — the one model that removes the tentative-epoch
+// gap (the first keystrokes after Enter / any control key hidden for a full
+// RTT; `always` keeps that gap, so on a slow link it shows nothing adaptive
+// does not) — and switches back when the link recovers. Explicit choices
+// (env model, palette `echo.set`) pin the model and bypass this. Pure and
+// clock-free: the client feeds `srtt`/`now`, tests feed literals.
+
+/// SRTT above which the link counts as slow (an RTT the user feels on every
+/// keystroke that adaptive leaves hidden). Well clear of mosh's 30 ms SRTT
+/// trigger — that one decides whether to SHOW predictions; this decides
+/// whether to stop gating them.
+pub const ESCALATE_SRTT_MS: f64 = 150.0;
+/// SRTT below which the link counts as recovered — hysteresis so a jittery
+/// link does not flap models (each switch repaints).
+pub const DEESCALATE_SRTT_MS: f64 = 80.0;
+/// How long the SRTT must hold on one side before acting: long enough that a
+/// single retransmit spike does not escalate, short enough that a bad link
+/// is fixed within a few keystrokes.
+pub const ESCALATE_HOLD_MS: u64 = 3_000;
+/// Recovery is slower than escalation: a link that looked good for a moment
+/// mid-outage should not yank optimistic echo away.
+pub const DEESCALATE_HOLD_MS: u64 = 15_000;
+
+/// The `POSH_ECHO_ESCALATE` gate (default ON; `0`/`false`/`off`/`no` opt out
+/// — the `POSH_MUX` off-switch shape): whether the default adaptive model
+/// may auto-escalate to optimistic on a slow link.
+pub fn escalation_selected() -> bool {
+    crate::util::parse_default_on_gate(std::env::var("POSH_ECHO_ESCALATE").ok().as_deref())
+}
+
+/// The escalation state machine. `governing` is false once the user pinned a
+/// model explicitly (or the gate is off); `escalated` is whether the switch
+/// to optimistic is currently in effect (what the palette header reports as
+/// `echo: optimistic (auto: slow link)`).
+#[derive(Debug)]
+pub struct EchoEscalation {
+    governing: bool,
+    escalated: bool,
+    slow_since: Option<u64>,
+    fast_since: Option<u64>,
+}
+
+impl EchoEscalation {
+    /// `governing`: the default (adaptive) model is in effect and the
+    /// `POSH_ECHO_ESCALATE` gate is on.
+    pub fn new(governing: bool) -> EchoEscalation {
+        EchoEscalation {
+            governing,
+            escalated: false,
+            slow_since: None,
+            fast_since: None,
+        }
+    }
+
+    /// Whether the auto switch to optimistic is currently applied.
+    pub fn escalated(&self) -> bool {
+        self.escalated
+    }
+
+    /// Whether this machine decides the model at all.
+    pub fn governing(&self) -> bool {
+        self.governing
+    }
+
+    /// The user chose a model: `Adaptive` hands control back to the machine
+    /// (fresh, un-escalated — it re-evaluates from the live SRTT); anything
+    /// else pins that model and the machine steps aside.
+    pub fn on_explicit(&mut self, model: PredictionModel, gate_on: bool) {
+        *self = EchoEscalation::new(gate_on && model == PredictionModel::Adaptive);
+    }
+
+    /// Feed one SRTT reading. Returns the model to switch to when the hold
+    /// on one side of the hysteresis band has elapsed: `Some(Optimistic)` to
+    /// escalate, `Some(Adaptive)` to recover, `None` to leave things be.
+    pub fn tick(&mut self, srtt_ms: f64, now: u64) -> Option<PredictionModel> {
+        if !self.governing {
+            return None;
+        }
+        if srtt_ms > ESCALATE_SRTT_MS {
+            self.fast_since = None;
+            if self.escalated {
+                return None;
+            }
+            let since = *self.slow_since.get_or_insert(now);
+            if now.saturating_sub(since) >= ESCALATE_HOLD_MS {
+                self.escalated = true;
+                self.slow_since = None;
+                return Some(PredictionModel::Optimistic);
+            }
+        } else if srtt_ms < DEESCALATE_SRTT_MS {
+            self.slow_since = None;
+            if !self.escalated {
+                return None;
+            }
+            let since = *self.fast_since.get_or_insert(now);
+            if now.saturating_sub(since) >= DEESCALATE_HOLD_MS {
+                self.escalated = false;
+                self.fast_since = None;
+                return Some(PredictionModel::Adaptive);
+            }
+        } else {
+            // Inside the band: neither side's hold accumulates.
+            self.slow_since = None;
+            self.fast_since = None;
+        }
+        None
+    }
+}
+
 /// Combines a parsed model + render style into the boxed trait objects the
 /// client holds. `predict_overwrite` (mosh insert-vs-overwrite) threads into
 /// the model.
@@ -231,6 +343,57 @@ pub fn build(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn echo_escalation_holds_hysteresis_and_yields_to_explicit_choices() {
+        let mut esc = EchoEscalation::new(true);
+        // Below the band: nothing, ever.
+        assert_eq!(esc.tick(40.0, 0), None);
+        assert_eq!(esc.tick(40.0, 100_000), None);
+        assert!(!esc.escalated());
+
+        // Slow, but not yet for the hold: no switch; one fast reading inside
+        // the band does not reset the slow clock, a reading BELOW the band does.
+        assert_eq!(esc.tick(400.0, 100_000), None);
+        assert_eq!(esc.tick(400.0, 100_000 + ESCALATE_HOLD_MS - 1), None);
+        assert_eq!(esc.tick(120.0, 100_000 + ESCALATE_HOLD_MS - 1), None, "in-band resets");
+        assert_eq!(esc.tick(400.0, 110_000), None, "slow clock restarts");
+        assert_eq!(
+            esc.tick(400.0, 110_000 + ESCALATE_HOLD_MS),
+            Some(PredictionModel::Optimistic),
+            "held slow for the hold ⇒ escalate"
+        );
+        assert!(esc.escalated());
+        // Still slow: no repeated switch.
+        assert_eq!(esc.tick(400.0, 200_000), None);
+
+        // A brief dip below the band does not de-escalate until the longer
+        // recovery hold elapses — a mid-outage good moment must not yank it.
+        assert_eq!(esc.tick(50.0, 200_000), None);
+        assert_eq!(esc.tick(50.0, 200_000 + DEESCALATE_HOLD_MS - 1), None);
+        assert_eq!(esc.tick(400.0, 200_000 + DEESCALATE_HOLD_MS), None, "slow again: recovery clock reset");
+        assert!(esc.escalated());
+        assert_eq!(esc.tick(50.0, 300_000), None);
+        assert_eq!(
+            esc.tick(50.0, 300_000 + DEESCALATE_HOLD_MS),
+            Some(PredictionModel::Adaptive),
+            "held fast for the recovery hold ⇒ back to adaptive"
+        );
+        assert!(!esc.escalated());
+
+        // An explicit non-adaptive choice pins: the machine steps aside even
+        // on a terrible link; choosing adaptive again hands control back,
+        // un-escalated, and the gate being off keeps it aside.
+        esc.on_explicit(PredictionModel::Always, true);
+        assert!(!esc.governing());
+        assert_eq!(esc.tick(900.0, 400_000), None);
+        assert_eq!(esc.tick(900.0, 400_000 + ESCALATE_HOLD_MS), None);
+        esc.on_explicit(PredictionModel::Adaptive, true);
+        assert!(esc.governing() && !esc.escalated());
+        esc.on_explicit(PredictionModel::Adaptive, false);
+        assert!(!esc.governing(), "gate off ⇒ never governs");
+        assert_eq!(esc.tick(900.0, 500_000 + ESCALATE_HOLD_MS), None);
+    }
 
     #[test]
     fn prediction_model_parsing() {
