@@ -176,6 +176,14 @@ impl RttEstimator {
     pub fn srtt(&self) -> f64 {
         self.srtt
     }
+
+    /// Whether `srtt` reflects at least one real sample — until then it is
+    /// the 1000 ms RFC 6298 placeholder, which policy that keys off "the
+    /// link is slow" (the slow-link echo escalation) must not mistake for a
+    /// measurement.
+    pub fn measured(&self) -> bool {
+        self.hit
+    }
 }
 
 pub struct Connection {
@@ -287,6 +295,12 @@ impl Connection {
     /// Smoothed RTT in milliseconds (mosh SRTT). Surfaced for the stats log.
     pub fn srtt(&self) -> f64 {
         self.rtt.srtt()
+    }
+
+    /// Whether [`srtt`](Self::srtt) is a measurement rather than the
+    /// pre-first-sample placeholder (see [`RttEstimator::measured`]).
+    pub fn srtt_measured(&self) -> bool {
+        self.rtt.measured()
     }
 
     /// Cumulative sealed-datagram bytes sent / received on the wire.
@@ -406,7 +420,13 @@ mod tests {
     #[test]
     fn rtt_first_sample_initializes() {
         let mut est = RttEstimator::new();
+        // Pre-sample the estimator reports the 1000 ms placeholder and says
+        // so: the slow-link echo escalation keys off `measured`, else every
+        // fresh connection would count as slow for its first 3 s.
+        assert!(!est.measured());
+        assert_eq!(est.srtt(), 1000.0);
         est.sample(100.0);
+        assert!(est.measured());
         assert_eq!(est.srtt, 100.0);
         assert_eq!(est.rto(), 300); // 100 + 4 * 50
     }

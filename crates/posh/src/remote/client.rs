@@ -866,6 +866,16 @@ impl Wire {
             Wire::Mux(t) => t.srtt(),
         }
     }
+    /// Whether `srtt` is a real measurement: the UDP estimator's first
+    /// sample has landed, or (mux) a frame has carried the daemon's hint —
+    /// before that the value is a placeholder the slow-link escalation must
+    /// not act on.
+    fn srtt_measured(&self) -> bool {
+        match self {
+            Wire::Udp(c) => c.srtt_measured(),
+            Wire::Mux(t) => t.established(),
+        }
+    }
     fn rto(&self) -> u64 {
         match self {
             Wire::Udp(c) => c.rto(),
@@ -2050,7 +2060,14 @@ fn process_frame(st: &mut ClientState, frame: &ServerFrame) -> bool {
     // Slow-link escalation (FDR 0006 A/B): the default adaptive model hands
     // over to optimistic once the SRTT has held past the threshold, and
     // back when the link recovers. Banners name the switch as automatic.
-    if let Some(next) = st.echo_escalation.tick(st.wire.srtt(), now) {
+    // Only a MEASURED srtt counts — the estimator's 1000 ms pre-sample
+    // placeholder would otherwise escalate every fresh connection.
+    let escalate_to = st
+        .wire
+        .srtt_measured()
+        .then(|| st.echo_escalation.tick(st.wire.srtt(), now))
+        .flatten();
+    if let Some(next) = escalate_to {
         apply_echo_model(st, next, now);
         let why = if next == PredictionModel::Optimistic {
             "slow link"
