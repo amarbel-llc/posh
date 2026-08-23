@@ -870,6 +870,91 @@ debug-posh-sockets:
       fi
     done
 
+# Which agent does a shell ACTUALLY reach? posh#161 triage: the session shell's
+# SSH_AUTH_SOCK is usually a rendezvous symlink (the eng fish login hook's
+# ~/.local/state/ssh/ssh_client-agent.sock) that may point at posh's stable
+# agent/sock OR at a bootstrap ssh's sshd-forwarded socket — and `test -S`
+# passes for a dead socket file, so the symlink can look "live" while nothing
+# answers. This walks the chain hop by hop (readlink), probes each hop with a
+# bounded `ssh-add -l` (0 = keys, 1 = agent but no keys, 2 = no agent), and
+# maps the unix listeners under agent/ and ~/.ssh/agent to their pids. `target`
+# is a pid (read THAT process's SSH_AUTH_SOCK from /proc — e.g. a session
+# shell's), a socket path (probe that chain directly — e.g. posh's stable
+# `agent/sock`), or empty for this shell's own SSH_AUTH_SOCK.
+#
+# resolve and probe a shell's / pid's / path's SSH_AUTH_SOCK chain hop by hop
+[group("debug")]
+debug-posh-agent-resolve target="" samples="3" bound="10":
+    #!/usr/bin/env bash
+    set -uo pipefail
+    sock="${SSH_AUTH_SOCK:-}"
+    case "{{ target }}" in
+      "") echo "this shell: SSH_AUTH_SOCK=${sock:-(unset)}" ;;
+      /*) sock="{{ target }}"; echo "path: $sock" ;;
+      *)
+        sock="$(tr '\0' '\n' </proc/{{ target }}/environ 2>/dev/null \
+          | sed -n 's/^SSH_AUTH_SOCK=//p')"
+        echo "pid {{ target }}: SSH_AUTH_SOCK=${sock:-(unset)}" ;;
+    esac
+    probe() {
+      # `ssh-add -l` exit code: 0 keys listed, 1 agent reachable but empty,
+      # 2 cannot contact the agent; 124 = the bound tripped (an agent that
+      # LISTENS but never answers — the half-dead forwarded-socket shape).
+      # Timed, and repeated `samples` times, because the failure is
+      # intermittent: one OK proves nothing about the next request.
+      for _ in $(seq "{{ samples }}"); do
+        t0=$(date +%s%N)
+        if out="$(SSH_AUTH_SOCK="$1" timeout "{{ bound }}" ssh-add -l 2>&1)"; then
+          rc=0
+        else
+          rc=$?
+        fi
+        ms=$(( ($(date +%s%N) - t0) / 1000000 ))
+        if [ "$rc" -eq 0 ]; then
+          echo "    probe: OK ($(printf '%s\n' "$out" | wc -l | tr -d ' ') key(s)) ${ms}ms"
+        else
+          echo "    probe: rc=$rc ${ms}ms ${out:+($out)}"
+        fi
+      done
+    }
+    hop="$sock"; n=0
+    while [ -n "$hop" ] && [ "$n" -lt 8 ]; do
+      n=$((n + 1))
+      if [ -L "$hop" ]; then
+        tgt="$(readlink "$hop")"
+        case "$tgt" in /*) ;; *) tgt="$(dirname "$hop")/$tgt" ;; esac
+        if [ -e "$hop" ]; then
+          echo "  [$n] $hop -> $tgt (symlink)"
+        else
+          echo "  [$n] $hop -> $tgt (DANGLING symlink: ENOENT on connect)"
+        fi
+        hop="$tgt"
+      elif [ -S "$hop" ]; then
+        echo "  [$n] $hop (socket file)"
+        probe "$hop"
+        break
+      elif [ -e "$hop" ]; then
+        echo "  [$n] $hop (exists but is not a socket)"
+        break
+      else
+        echo "  [$n] $hop (missing)"
+        break
+      fi
+    done
+    echo
+    echo "== unix listeners backing agent sockets (kernel view) =="
+    if [ "$(uname -s)" = Darwin ]; then
+      lsof -nP -U 2>/dev/null | grep -E 'agent|ssh' || echo "(none)"
+    else
+      nix shell nixpkgs#iproute2 --command ss -xlp 2>/dev/null \
+        | grep -E 'posh/agent|/\.ssh/agent|ssh_client-agent|piggy' \
+        || echo "(no matching listeners)"
+    fi
+    echo
+    echo "== socket files (a file with NO listener above is a dead leftover) =="
+    ls -la --time-style=full-iso "$HOME/.ssh/agent" 2>/dev/null || true
+    ls -la --time-style=full-iso "${XDG_RUNTIME_DIR:-/run/user/$(id -u)}/posh/agent" 2>/dev/null || true
+
 # Deep read-only state for ONE posh pid (from debug-posh-procs): its wait
 # channel + stack (blocked in which syscall?), state, and fd table (which UDP
 # socket + which PTY master it holds). This is how you localize *where* a wedged
