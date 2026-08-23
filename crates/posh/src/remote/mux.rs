@@ -105,9 +105,7 @@ pub fn mux_selected() -> bool {
 /// per-invocation on any failure. Promotion to default-on is a later dated
 /// decision.
 pub fn mux_sessions_selected() -> bool {
-    std::env::var("POSH_MUX_SESSIONS")
-        .map(|v| crate::remote::sshwrap::env_value_on(&v))
-        .unwrap_or(false)
+    crate::remote::sshwrap::env_selected("POSH_MUX_SESSIONS")
 }
 
 /// Maps every byte outside `[A-Za-z0-9._-]` to `-`. The one sanitizer behind

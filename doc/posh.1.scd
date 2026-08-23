@@ -351,7 +351,12 @@ _POSH_MUX_
 	socket in the session's environment would be a connection-bound
 	competitor that dies with the bootstrap's TCP connection, the very
 	dependency posh removes. An explicit *posh ssh -A* still forwards
-	the real agent on the bootstrap.
+	the real agent on the bootstrap. A remote *posh-server* that has the
+	*agent* verb but predates the export acknowledges nothing, and the
+	client then warns once that the session has no forwarded agent until
+	the remote is upgraded (_POSH_MUX=0_ restores per-connection
+	forwarding meanwhile) — the one mixed-version shape this makes
+	worse than before, surfaced rather than silent.
 
 _POSH_MUX_SESSIONS_
 	Opt in to M2 session sharing (*1*, *true*, *on*, or *yes*): a

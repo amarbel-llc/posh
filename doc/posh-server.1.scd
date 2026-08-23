@@ -112,7 +112,10 @@ POSH CONNECT <port> <key>
 
 where _<key>_ is the base64 session key. When the bootstrap ssh knows
 the connecting address (from _$SSH_CONNECTION_) it also prints a
-*POSH IP* _<addr>_ line. The client reads the key from the environment
+*POSH IP* _<addr>_ line, and when it honored a _$POSH_AGENT_EXPORT_
+request, a bare *POSH AGENT_EXPORT* line — both before *POSH CONNECT*,
+which ends the client's parse; a client that does not know a *POSH* line
+ignores it. The client reads the key from the environment
 (_$POSH_KEY_), never the command line — see *posh-client*(1).
 
 # ENVIRONMENT
@@ -140,9 +143,15 @@ _POSH_AGENT_EXPORT_
 	valid the moment any endpoint claims it and survives endpoint respawns
 	and wire reconnects underneath. An env prefix rather than a flag so a
 	server predating it stays bootstrappable (it simply ignores the
-	variable). With *-A* present this is redundant — the connection's own
-	endpoint names the same path. Not forwarded from the client's
-	environment; the client emits it itself.
+	variable). A server that honors it prints *POSH AGENT_EXPORT* on the
+	handshake stream before *POSH CONNECT* (see *HANDSHAKE*), so the
+	client can tell; with *-A* present the request is redundant — the
+	connection's own endpoint names the same path. Not forwarded from the
+	client's environment; the client emits it itself, and the server
+	scrubs it before spawning the session. The *mux*/*agent* peer seeds the
+	same path into its own environment unconditionally (it owns the
+	endpoint), so the sessions it creates for M2 session channels are born
+	on it too.
 
 _POSH_ESCAPE_CMD_
 	The command the escape-to-shell overlay runs (FDR 0008), spawned in

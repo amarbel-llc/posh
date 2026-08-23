@@ -289,6 +289,13 @@ fn cmd_server(args: &[String]) -> Result<()> {
     // into the session shell's inherited environment.
     let agent_export = remote::sshwrap::agent_export_requested();
     std::env::remove_var(remote::sshwrap::AGENT_EXPORT_ENV);
+    if agent_export {
+        // Acknowledge on the handshake stream (before `POSH CONNECT`, which
+        // ends the client's parse) so the client can tell an honoring server
+        // from one that silently ignored the prefix — an old client ignores
+        // this line just as an old server ignores the prefix.
+        println!("{}", remote::sshwrap::AGENT_EXPORT_ACK_LINE);
+    }
     // RFC 0011 §6: `--channels` selects the channel-envelope protocol.
     let mut channels = false;
     let mut i = 0;

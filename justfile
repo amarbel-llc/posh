@@ -892,24 +892,36 @@ debug-posh-agent-resolve target="" samples="3" bound="10":
       "") echo "this shell: SSH_AUTH_SOCK=${sock:-(unset)}" ;;
       /*) sock="{{ target }}"; echo "path: $sock" ;;
       *)
-        sock="$(tr '\0' '\n' </proc/{{ target }}/environ 2>/dev/null \
-          | sed -n 's/^SSH_AUTH_SOCK=//p')"
+        # An unreadable environ (no /proc on macOS, a foreign-uid or dead
+        # pid) must not read as "this shell has no agent".
+        if [ ! -r "/proc/{{ target }}/environ" ]; then
+          echo "pid {{ target }}: /proc/{{ target }}/environ is not readable (no /proc, dead pid, or another uid)"
+          exit 1
+        fi
+        sock="$(tr '\0' '\n' </proc/{{ target }}/environ | sed -n 's/^SSH_AUTH_SOCK=//p')"
         echo "pid {{ target }}: SSH_AUTH_SOCK=${sock:-(unset)}" ;;
     esac
+    # Portable bound + timer: macOS has no `timeout` (coreutils' gtimeout)
+    # and no `date %N`; bash 5's EPOCHREALTIME covers both platforms.
+    bound_cmd="$(command -v timeout || command -v gtimeout || true)"
+    [ -n "$bound_cmd" ] || echo "(no timeout/gtimeout on PATH: probes run unbounded)"
+    now_ms() { printf '%s' "${EPOCHREALTIME/./}" | cut -c1-13; }
     probe() {
       # `ssh-add -l` exit code: 0 keys listed, 1 agent reachable but empty,
       # 2 cannot contact the agent; 124 = the bound tripped (an agent that
       # LISTENS but never answers — the half-dead forwarded-socket shape).
       # Timed, and repeated `samples` times, because the failure is
-      # intermittent: one OK proves nothing about the next request.
+      # intermittent: one OK proves nothing about the next request — but
+      # one timeout already IS the verdict, so stop there.
       for _ in $(seq "{{ samples }}"); do
-        t0=$(date +%s%N)
-        out="$(SSH_AUTH_SOCK="$1" timeout "{{ bound }}" ssh-add -l 2>&1)"; rc=$?
-        ms=$(( ($(date +%s%N) - t0) / 1000000 ))
+        t0=$(now_ms)
+        out="$(SSH_AUTH_SOCK="$1" ${bound_cmd:+"$bound_cmd" "{{ bound }}"} ssh-add -l 2>&1)"; rc=$?
+        ms=$(( $(now_ms) - t0 ))
         if [ "$rc" -eq 0 ]; then
           echo "    probe: OK ($(grep -c . <<<"$out") key(s)) ${ms}ms"
         else
           echo "    probe: rc=$rc ${ms}ms ${out:+($out)}"
+          [ "$rc" -eq 124 ] && break
         fi
       done
     }
@@ -940,8 +952,9 @@ debug-posh-agent-resolve target="" samples="3" bound="10":
     echo
     echo "== unix listeners backing agent sockets (kernel view) =="
     # Same filter on both platforms; `ss` from PATH when present (the
-    # nixpkgs fallback costs an eval per run).
-    filter='posh/agent|/\.ssh/agent|ssh_client-agent|piggy'
+    # nixpkgs fallback costs an eval per run). `posh(-<uid>)?/agent` covers
+    # every resolve_socket_base arm (XDG `posh/`, TMPDIR//tmp `posh-<uid>/`).
+    filter='posh(-[0-9]+)?/agent|/\.ssh/agent|ssh_client-agent|piggy'
     if [ "$(uname -s)" = Darwin ]; then
       lsof -nP -a -u "$(id -u)" -U 2>/dev/null | grep -E "$filter" \
         || echo "(no matching listeners)"
@@ -953,10 +966,17 @@ debug-posh-agent-resolve target="" samples="3" bound="10":
     fi
     echo
     echo "== socket files (a file with NO listener above is a dead leftover) =="
-    # The same base precedence as the sibling recipes (POSH_DIR first).
-    base="${POSH_DIR:-${XDG_RUNTIME_DIR:-/run/user/$(id -u)}/posh}"
-    for d in "$HOME/.ssh/agent" "$base/agent"; do
-      [ -d "$d" ] || continue
+    # Every resolve_socket_base candidate (the debug-posh-sockets list), not
+    # just the XDG arm — a host without XDG_RUNTIME_DIR lives under
+    # $TMPDIR/posh-<uid> or /tmp/posh-<uid>.
+    uid="$(id -u)"
+    for d in "$HOME/.ssh/agent" \
+      "${POSH_DIR:+$POSH_DIR/agent}" \
+      "${XDG_RUNTIME_DIR:+$XDG_RUNTIME_DIR/posh/agent}" \
+      "${TMPDIR:+$TMPDIR/posh-$uid/agent}" \
+      "/tmp/posh-$uid/agent"; do
+      [ -n "$d" ] && [ -d "$d" ] || continue
+      echo "-- $d"
       # GNU ls gives full timestamps; BSD ls (macOS) falls back to -T.
       ls -la --time-style=full-iso "$d" 2>/dev/null || ls -laT "$d" 2>/dev/null || true
     done

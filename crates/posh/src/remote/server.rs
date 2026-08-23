@@ -139,10 +139,15 @@ pub fn run(
     // C5: the session is born with SSH_AUTH_SOCK=agent/sock — through this
     // connection's own endpoint, or the client's export request when the
     // mux endpoint owns forwarding (posh#161; see `SshOptions::agent_export`).
-    shell_env.extend(crate::remote::agent::session_auth_env(
-        agent_endpoint.as_ref(),
-        agent_export,
-    ));
+    // Seeded into THIS process's env as well (the relay's pattern), so every
+    // child — the shell, the FDR 0008 escape-to-shell overlay, anything
+    // added later — shares the one value instead of the bootstrap's.
+    if let Some((name, value)) =
+        crate::remote::agent::session_auth_env(agent_endpoint.as_ref(), agent_export)
+    {
+        std::env::set_var(&name, &value);
+        shell_env.push((name, value));
+    }
     let child = pty::spawn_shell(command.as_deref(), rows, cols, &shell_env, None)?;
     util::set_nonblocking(child.master)?;
 
@@ -176,6 +181,15 @@ pub fn run_agent_only(
     // and any owned agent/sock claim.
     util::install_daemon_signal_handlers();
     let endpoint = crate::remote::agent::AgentEndpoint::from_env_mux(client_id)?;
+    // posh#161: this process OWNS agent/sock, and the M2 channel table
+    // creates sessions from here (`connect_named_daemon` → the daemon
+    // double-forks inheriting our env) — seed SSH_AUTH_SOCK so those sessions
+    // are born on the stable path too. Nothing else exports it here: the mux
+    // bootstrap ssh runs -a, so without this the M2 opt-in sessions would
+    // inherit no agent socket at all.
+    if let Some((name, value)) = crate::remote::agent::session_auth_env(Some(&endpoint), false) {
+        std::env::set_var(name, value);
+    }
     // posh#161 observability: an always-on, APPENDING log beside the
     // endpoint's own socket (`agent/mux-<client-id>.log` — per client host,
     // stable across respawns, so successive episodes land in one timeline).

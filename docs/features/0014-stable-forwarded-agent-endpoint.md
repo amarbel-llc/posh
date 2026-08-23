@@ -233,7 +233,32 @@ the session's environment at all; an explicit `posh ssh -A` still wins.
 `remote::agent::tests::session_auth_env_prefers_own_endpoint_then_export_then_nothing`,
 `remote::sshwrap::tests::remote_command_carries_agent_export_prefix_only_when_set`
 (both halves at the sshwrap seam), and
-`main::tests::resolve_real_ssh_agent_forward_defaults_on` pin it. Residual, deliberately NOT posh's: a plain `ssh host` login
+`main::tests::resolve_real_ssh_agent_forward_defaults_on` pin it. The
+`posh-server mux`/`agent` peer seeds the same path into its own process
+env (it owns the endpoint; the M2 session channels create sessions from
+that process, and its bootstrap now runs `-a` too), and `server::run`
+seeds the process env as the relay always did, so the FDR 0008 overlay
+shell inherits the same value.
+
+Review-surfaced limits, recorded rather than engineered away: (1) the
+mixed-version window — a remote with the `agent` verb but predating the
+export (built between the 2026-08-04 promotion and this fix) ignores the
+prefix while the client already ran `-a`, so that session has NO agent
+where it previously inherited the (flaky) sshd socket; the server
+acknowledges an honored export with a `POSH AGENT_EXPORT` handshake line
+and the client warns once when the ack is missing
+(`sshwrap::export_unacked_warning`), which is surfacing, not fallback —
+posh#164's cutover design is the real answer. (2) The exported path is
+resolved from the session login's env while the endpoint claimed it from
+the mux bootstrap's; same user, same host normally agree, but a host whose
+base falls through to a per-login `TMPDIR` would not, and nothing binds
+what the export names — a `warn` breadcrumb fires when the path is absent
+at spawn (also the benign "endpoint reconnecting / not yet claimed" case,
+where the path becomes valid on its own). (3) The `-a` rule is derived in
+`ssh_args` from `(real_ssh_agent_forward, agent_export)`; a caller passing
+an explicit `Some(true)` alongside the export gets `-A`, by design — the
+`Option<bool>` cannot distinguish a default from an operator flag, so
+`cmd_ssh` returns `None` under ownership. Residual, deliberately NOT posh's: a plain `ssh host` login
 still forwards the workstation's real agent and can latch the first-wins
 rendezvous onto that connection-bound socket ahead of posh's path — the
 rendezvous policy is eng's (tracked there), and posh#103 remains the

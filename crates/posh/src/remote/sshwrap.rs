@@ -75,12 +75,34 @@ pub(crate) fn env_selected(name: &str) -> bool {
     std::env::var(name).map(|v| env_value_on(&v)).unwrap_or(false)
 }
 
+/// The server's handshake acknowledgement of [`AGENT_EXPORT_ENV`] (posh#161):
+/// printed before `POSH CONNECT` by a `cmd_server` that honored the prefix.
+/// Its ABSENCE under an export request means the remote predates the export
+/// — and since the client ran the bootstrap ssh with `-a` on the strength of
+/// that request, the session was born with no forwarded agent at all: the
+/// one mixed-version shape this change makes WORSE than before, so it is
+/// surfaced loudly ([`export_unacked_warning`]) instead of silently.
+pub const AGENT_EXPORT_ACK_LINE: &str = "POSH AGENT_EXPORT";
+
+/// The warning for an export request the remote did not acknowledge; `None`
+/// when nothing was requested or the remote answered.
+pub fn export_unacked_warning(requested: bool, acked: bool) -> Option<&'static str> {
+    (requested && !acked).then_some(
+        "posh: remote posh-server predates the stable agent-path export \
+         (POSH_AGENT_EXPORT): this session has no forwarded agent until the \
+         remote is upgraded — POSH_MUX=0 restores per-connection forwarding meanwhile",
+    )
+}
+
 /// What the wrapped server reported on stdout.
 #[derive(Debug, Default, PartialEq, Eq)]
 pub struct ServerReport {
     pub ip: Option<String>,
     pub port: Option<u16>,
     pub key: Option<String>,
+    /// The remote acknowledged the agent-path export request
+    /// ([`AGENT_EXPORT_ACK_LINE`]).
+    pub agent_export: bool,
 }
 
 impl ServerReport {
@@ -88,6 +110,10 @@ impl ServerReport {
     /// not part of the protocol (motd etc., to be passed through), true
     /// once the CONNECT line arrived (parsing is finished).
     pub fn feed(&mut self, line: &str) -> Result<bool> {
+        if line.trim_end() == AGENT_EXPORT_ACK_LINE {
+            self.agent_export = true;
+            return Ok(false);
+        }
         if let Some(rest) = line.strip_prefix("POSH IP ") {
             let ip = rest.trim();
             if ip.is_empty() || ip.contains(char::is_whitespace) {
@@ -325,6 +351,9 @@ pub fn bootstrap(
              (is posh-server on the server's non-interactive PATH?)",
         ));
     };
+    if let Some(warning) = export_unacked_warning(opts.agent_export, report.agent_export) {
+        eprintln!("{warning}");
+    }
 
     // Prefer the address the server reported (third field of its
     // $SSH_CONNECTION: the IP we actually reached it on); fall back to
@@ -424,6 +453,32 @@ mod tests {
         assert_eq!(parse_connect("60001 shortkey"), None);
         assert_eq!(parse_connect("notaport AAAAAAAAAAAAAAAAAAAAAA"), None);
         assert_eq!(parse_connect("60001 AAAAAAAAAAAAAAAAAAAAAA extra"), None);
+    }
+
+    #[test]
+    fn agent_export_ack_rides_the_handshake_and_its_absence_warns() {
+        // posh#161 mixed-version guard: a server that honored the export
+        // prints the ack BEFORE POSH CONNECT; the client parses it as a
+        // non-terminal protocol line (not passed through as motd). A server
+        // that ignored the prefix prints nothing, and since the client ran
+        // the bootstrap ssh with -a on the strength of the request, that is
+        // the one case the change makes worse — it must warn, not be silent.
+        let mut report = ServerReport::default();
+        assert!(!report.feed(AGENT_EXPORT_ACK_LINE).unwrap(), "non-terminal");
+        assert!(report.agent_export);
+        assert!(report.feed("POSH CONNECT 60001 AAAAAAAAAAAAAAAAAAAAAA").unwrap());
+        assert!(report.agent_export, "the ack survives the CONNECT line");
+
+        let mut silent = ServerReport::default();
+        assert!(silent.feed("POSH CONNECT 60001 AAAAAAAAAAAAAAAAAAAAAA").unwrap());
+        assert!(!silent.agent_export);
+
+        assert!(export_unacked_warning(true, false).is_some());
+        assert!(export_unacked_warning(true, true).is_none());
+        assert!(export_unacked_warning(false, false).is_none(), "nothing requested");
+        // An old CLIENT meets the ack line harmlessly: it is a `POSH ` line,
+        // so the bootstrap loop neither prints nor fails on it.
+        assert!(AGENT_EXPORT_ACK_LINE.starts_with("POSH "));
     }
 
     #[test]

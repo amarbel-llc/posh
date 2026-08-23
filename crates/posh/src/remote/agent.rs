@@ -150,9 +150,31 @@ pub fn well_known_sock(base: &Path) -> PathBuf {
 /// `agent/sock`), the well-known path under the production base; else
 /// `None`, and the shell inherits whatever the server process carries.
 pub fn session_auth_env(endpoint: Option<&AgentEndpoint>, export: bool) -> Option<(String, String)> {
-    let sock = endpoint
-        .map(|ep| ep.sock_path().to_path_buf())
-        .or_else(|| export.then(|| well_known_sock(&crate::session::socket_base_from_env())))?;
+    let sock = match endpoint {
+        Some(ep) => ep.sock_path().to_path_buf(),
+        None if export => {
+            // The exported path is resolved from THIS login's env while the
+            // endpoint that claims it was spawned from the mux bootstrap's —
+            // the same user on the same host normally agrees, but a host
+            // whose base falls through to a per-login TMPDIR would not, and
+            // unlike the `-A` arm nothing here binds what it exports. Not
+            // fatal (the endpoint may simply not have claimed yet, or is
+            // reconnecting), but worth a breadcrumb when it is absent.
+            let sock = well_known_sock(&crate::session::socket_base_from_env());
+            if !sock.exists() {
+                util::log_write(
+                    "warn",
+                    &format!(
+                        "exporting SSH_AUTH_SOCK={} but nothing is there yet \
+                         (endpoint not claimed / reconnecting, or a base mismatch)",
+                        sock.display()
+                    ),
+                );
+            }
+            sock
+        }
+        None => return None,
+    };
     Some(("SSH_AUTH_SOCK".to_string(), sock.to_string_lossy().into_owned()))
 }
 
