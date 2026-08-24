@@ -47,6 +47,19 @@ fn run() -> Result<()> {
         return cmd_server(&argv);
     }
 
+    // FDR 0015: the package also installs `bin/ph -> posh`; invoked as `ph`, the
+    // front-door router owns the whole argv (its own `-g` plus the terse
+    // colon-discriminator grammar), so it returns before posh's global flag loop.
+    let invoked_as_ph = std::env::args()
+        .next()
+        .as_deref()
+        .map(std::path::Path::new)
+        .and_then(|p| p.file_name())
+        .is_some_and(|n| n == "ph");
+    if invoked_as_ph {
+        return cmd_ph(&argv);
+    }
+
     let mut group = std::env::var("POSH_GROUP").unwrap_or_else(|_| "default".to_string());
     // SSH agent forwarding (FDR 0004): the client-side flag, highest precedence
     // in `resolve_forward_policy`. Only the roaming `host:session` path acts on
@@ -346,6 +359,123 @@ fn cmd_start(group: &str, args: &[String]) -> Result<()> {
         StartClass::Remote => Err(Error::from(
             "posh start: remote targets are not yet supported; use `posh host:session`",
         )),
+    }
+}
+
+/// How a `ph` target token resolves (FDR 0015). The colon is the sole
+/// local-vs-host discriminator (a no-colon token is always local); `+` after the
+/// colon is the new-session sigil. Picker forms (bare `ph`, `ph host:`) are
+/// deferred to FDR 0016.
+#[derive(Debug, PartialEq, Eq)]
+enum PhRoute {
+    PickerAll,
+    PickerHost { host: String },
+    LocalNew { group: Option<String> },
+    LocalResolve { group: Option<String>, session: String },
+    RemoteNew { host: String },
+    RemoteResolve {
+        user: Option<String>,
+        host: String,
+        group: Option<String>,
+        session: String,
+    },
+}
+
+/// Parse a `ph` target token. A no-colon token is ALWAYS a local session — this
+/// bypasses `Target::parse`'s `.`/`@` host inference, which is the whole point of
+/// `ph`'s colon-discriminator grammar.
+fn ph_parse(token: Option<&str>) -> PhRoute {
+    let Some(t) = token else {
+        return PhRoute::PickerAll;
+    };
+    if !t.contains(':') {
+        return PhRoute::LocalResolve { group: None, session: t.to_string() };
+    }
+    match target::Target::parse(t) {
+        target::Target::Local { group, session } if session == "+" => {
+            PhRoute::LocalNew { group }
+        }
+        target::Target::Local { group, session } => PhRoute::LocalResolve { group, session },
+        target::Target::Host { host, .. } => PhRoute::PickerHost { host },
+        target::Target::RemoteSession { host, session, .. } if session == "+" => {
+            PhRoute::RemoteNew { host }
+        }
+        target::Target::RemoteSession { user, host, group, session } => {
+            PhRoute::RemoteResolve { user, host, group, session }
+        }
+        // Unreachable on the colon path (LocalSession is bare-word only); the arm
+        // keeps the match total.
+        target::Target::LocalSession { name } => {
+            PhRoute::LocalResolve { group: None, session: name }
+        }
+    }
+}
+
+/// Parse `ph` argv: an optional `-g GROUP` plus at most one target token.
+fn parse_ph_args(argv: &[String]) -> Result<(String, Option<&str>)> {
+    let mut group = std::env::var("POSH_GROUP").unwrap_or_else(|_| "default".to_string());
+    let mut token = None;
+    let mut i = 0;
+    while i < argv.len() {
+        match argv[i].as_str() {
+            "-g" | "--group" => {
+                group = argv
+                    .get(i + 1)
+                    .ok_or_else(|| Error::from("--group requires a value"))?
+                    .clone();
+                i += 2;
+            }
+            t if token.is_none() => {
+                token = Some(t);
+                i += 1;
+            }
+            _ => return Err(Error::from("ph: too many arguments")),
+        }
+    }
+    Ok((group, token))
+}
+
+/// `ph`: the FDR 0015 front-door. Resolves a target and routes to `posh start`
+/// (absent) or `posh attach` (present); the picker forms are deferred to FDR
+/// 0016 and error with guidance (the non-TTY discipline). Remote auto-id
+/// (`host:+`) is a later slice.
+fn cmd_ph(argv: &[String]) -> Result<()> {
+    let (group, token) = parse_ph_args(argv)?;
+    match ph_parse(token) {
+        PhRoute::PickerAll => Err(Error::from(
+            "ph: interactive picker not yet available (FDR 0016); use `ph <name>` \
+             (local), `ph host:session` (remote), or `ph :+` (new)",
+        )),
+        PhRoute::PickerHost { host } => Err(Error::Msg(format!(
+            "ph: interactive picker not yet available (FDR 0016); use `ph {host}:session` \
+             or `ph {host}:+` (new)"
+        ))),
+        PhRoute::LocalNew { group: g } => cmd_start(g.as_deref().unwrap_or(&group), &[]),
+        PhRoute::LocalResolve { group: g, session } => {
+            let grp = g.as_deref().unwrap_or(&group);
+            let cfg = Config::new(grp)?;
+            let path = cfg.socket_path(&session)?;
+            // Existing (and live) ⇒ attach; absent or stale ⇒ strict create. This
+            // is the load-bearing routing: ph calls attach ONLY on a live session,
+            // so it stays correct after the Phase-B strict-attach flip.
+            if session::session_socket_exists(&path) && !session::socket_is_dead(&path) {
+                cmd_attach(grp, std::slice::from_ref(&session))
+            } else {
+                cmd_start(grp, std::slice::from_ref(&session))
+            }
+        }
+        PhRoute::RemoteNew { host } => Err(Error::Msg(format!(
+            "ph: remote auto-id (`{host}:+`) is not yet supported; use `ph {host}:name`"
+        ))),
+        PhRoute::RemoteResolve { user, host, group: g, session } => cmd_ssh_session(
+            user,
+            host,
+            g,
+            &group,
+            session,
+            &[],
+            &remote::agent::ForwardFlag::Unset,
+        ),
     }
 }
 
@@ -1641,6 +1771,44 @@ mod tests {
         );
         assert_eq!(classify_start_target(Some("box:dev")), Remote);
         assert_eq!(classify_start_target(Some("user@box:dev")), Remote);
+    }
+
+    #[test]
+    fn ph_parse_cases() {
+        use PhRoute::*;
+        assert_eq!(ph_parse(None), PickerAll);
+        // No colon -> ALWAYS local, even a dotted or @ token (the colon rule).
+        assert_eq!(
+            ph_parse(Some("web")),
+            LocalResolve { group: None, session: "web".into() }
+        );
+        assert_eq!(
+            ph_parse(Some("box.com")),
+            LocalResolve { group: None, session: "box.com".into() }
+        );
+        // `:+` / `:g/+` -> local new.
+        assert_eq!(ph_parse(Some(":+")), LocalNew { group: None });
+        assert_eq!(
+            ph_parse(Some(":work/+")),
+            LocalNew { group: Some("work".into()) }
+        );
+        // `:name` -> local resolve.
+        assert_eq!(
+            ph_parse(Some(":dev")),
+            LocalResolve { group: None, session: "dev".into() }
+        );
+        // `host:` -> host picker; `host:+` -> remote new; `host:session` -> resolve.
+        assert_eq!(ph_parse(Some("box:")), PickerHost { host: "box".into() });
+        assert_eq!(ph_parse(Some("box:+")), RemoteNew { host: "box".into() });
+        assert_eq!(
+            ph_parse(Some("user@box:g/dev")),
+            RemoteResolve {
+                user: Some("user".into()),
+                host: "box".into(),
+                group: Some("g".into()),
+                session: "dev".into()
+            }
+        );
     }
 
     #[test]

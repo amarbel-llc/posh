@@ -202,3 +202,48 @@ fn start_detach_autoid_creates_session() {
     let _ = posh(&dir, &["kill", "s-1"]);
     let _ = std::fs::remove_dir_all(&dir);
 }
+
+#[test]
+fn ph_argv0_routes_and_defers_picker() {
+    let dir = test_dir("posh-itest-ph");
+    std::fs::create_dir_all(&dir).unwrap();
+
+    // A `ph` symlink to the posh binary exercises the argv[0] front-door
+    // (busybox-style multi-call: argv[0] is the invoking name, not the target).
+    let ph = dir.join("ph");
+    let _ = std::fs::remove_file(&ph);
+    std::os::unix::fs::symlink(env!("CARGO_BIN_EXE_posh"), &ph).unwrap();
+    let run = |args: &[&str]| {
+        Command::new(&ph)
+            .args(args)
+            .env("POSH_DIR", &dir)
+            .env_remove("POSH_SESSION")
+            .env_remove("POSH_GROUP")
+            .output()
+            .expect("run ph")
+    };
+
+    // Bare `ph` -> the picker is deferred (FDR 0016): a non-zero error, no hang.
+    let out = run(&[]);
+    assert!(!out.status.success(), "bare ph should defer: {out:?}");
+    assert!(
+        String::from_utf8_lossy(&out.stderr).contains("picker not yet available"),
+        "bare ph stderr: {}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+
+    // `ph box:` (host picker) -> deferred.
+    let out = run(&["box:"]);
+    assert!(!out.status.success(), "ph host: should defer: {out:?}");
+
+    // `ph box:+` (remote auto-id) -> not yet supported.
+    let out = run(&["box:+"]);
+    assert!(!out.status.success(), "ph host:+ should error: {out:?}");
+    assert!(
+        String::from_utf8_lossy(&out.stderr).contains("not yet supported"),
+        "ph host:+ stderr: {}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+
+    let _ = std::fs::remove_dir_all(&dir);
+}

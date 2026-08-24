@@ -263,6 +263,9 @@
           # See eng-manpages(7).
           postInstall = ''
             ln -s posh $out/bin/posh-server
+            # FDR 0015: the `ph` front-door is the same binary, routed by argv[0]
+            # (like posh-server); `bin/ph <target>` resolves start-vs-attach.
+            ln -s posh $out/bin/ph
             # Shell completions are embedded in the binary (completions.rs,
             # `posh completions <shell>`); install them into the vendor
             # completion dirs so bash/zsh/fish auto-load them and
