@@ -3370,7 +3370,10 @@ mod tests {
         let lines: Vec<&str> = out.lines().collect();
         assert_eq!(lines.len(), 2, "one line per socket, sorted: {out}");
         assert!(lines[0].starts_with("mux lsdead: stale ("), "{out}");
-        assert!(lines[1].starts_with("mux lslive: state="), "{out}");
+        // The live line leads with the daemon's own build (self=) — the
+        // field whose ABSENCE marks a stale pre-upgrade daemon.
+        assert!(lines[1].starts_with("mux lslive: self="), "{out}");
+        assert!(lines[1].contains(" state="), "{out}");
         assert!(
             lines[1].contains("refs=0") && lines[1].contains("cwnd="),
             "the live line is the daemon's own status one-liner: {out}"
