@@ -219,7 +219,8 @@ fn run() -> Result<()> {
         // recording replay (poshterity owns the logic; this is just an alias).
         "rec" => poshterity::cli::run(args).map_err(Error::from),
         name if !name.starts_with('-') => match target::Target::parse(name) {
-            // Bare `posh <name>` attaches (creating the session if needed).
+            // Bare `posh <name>` attaches an existing local session (strict,
+            // FDR 0015 Phase B); `posh start` / `ph` create.
             target::Target::LocalSession { .. } => cmd_attach(&group, rest),
             // `posh :grp/dev` — explicit local, with optional group.
             target::Target::Local { group: g, session } => {
@@ -378,10 +379,11 @@ fn cmd_start(group: &str, args: &[String]) -> Result<()> {
 #[derive(Debug, PartialEq, Eq)]
 enum PhRoute {
     PickerAll,
-    PickerHost { host: String },
+    PickerHost { user: Option<String>, host: String },
+    HostNeedsSession { user: Option<String>, host: String },
     LocalNew { group: Option<String> },
     LocalResolve { group: Option<String>, session: String },
-    RemoteNew { host: String },
+    RemoteNew { user: Option<String>, host: String, group: Option<String> },
     RemoteResolve {
         user: Option<String>,
         host: String,
@@ -390,32 +392,42 @@ enum PhRoute {
     },
 }
 
-/// Parse a `ph` target token. A no-colon token is ALWAYS a local session — this
-/// bypasses `Target::parse`'s `.`/`@` host inference, which is the whole point of
-/// `ph`'s colon-discriminator grammar.
+/// Render a `ph` destination for a message: `user@host` or bare `host`.
+fn ph_dest(user: Option<&str>, host: &str) -> String {
+    match user {
+        Some(u) => format!("{u}@{host}"),
+        None => host.to_string(),
+    }
+}
+
+/// Parse a `ph` target token (FDR 0015). The colon is the local-vs-host
+/// discriminator: a plain bare word is a local session, while a token posh reads
+/// as a *host* (`box.com`, `user@host`, IPv6) needs a `:session` — a trailing
+/// `:` (`host:`) is the deferred picker, a bare host-looking token is a
+/// forgotten-session hint (routed cleanly rather than through `posh start`).
 fn ph_parse(token: Option<&str>) -> PhRoute {
     let Some(t) = token else {
         return PhRoute::PickerAll;
     };
-    if !t.contains(':') {
-        return PhRoute::LocalResolve { group: None, session: t.to_string() };
-    }
     match target::Target::parse(t) {
+        target::Target::LocalSession { name } => {
+            PhRoute::LocalResolve { group: None, session: name }
+        }
         target::Target::Local { group, session } if session == "+" => {
             PhRoute::LocalNew { group }
         }
         target::Target::Local { group, session } => PhRoute::LocalResolve { group, session },
-        target::Target::Host { host, .. } => PhRoute::PickerHost { host },
-        target::Target::RemoteSession { host, session, .. } if session == "+" => {
-            PhRoute::RemoteNew { host }
+        // `host:` (trailing colon) is the host-scoped picker (FDR 0016); a bare
+        // host-looking token forgot its `:session`.
+        target::Target::Host { user, host } if t.ends_with(':') => {
+            PhRoute::PickerHost { user, host }
+        }
+        target::Target::Host { user, host } => PhRoute::HostNeedsSession { user, host },
+        target::Target::RemoteSession { user, host, group, session } if session == "+" => {
+            PhRoute::RemoteNew { user, host, group }
         }
         target::Target::RemoteSession { user, host, group, session } => {
             PhRoute::RemoteResolve { user, host, group, session }
-        }
-        // Unreachable on the colon path (LocalSession is bare-word only); the arm
-        // keeps the match total.
-        target::Target::LocalSession { name } => {
-            PhRoute::LocalResolve { group: None, session: name }
         }
     }
 }
@@ -455,10 +467,20 @@ fn cmd_ph(argv: &[String]) -> Result<()> {
             "ph: interactive picker not yet available (FDR 0016); use `ph <name>` \
              (local), `ph host:session` (remote), or `ph :+` (new)",
         )),
-        PhRoute::PickerHost { host } => Err(Error::Msg(format!(
-            "ph: interactive picker not yet available (FDR 0016); use `ph {host}:session` \
-             or `ph {host}:+` (new)"
-        ))),
+        PhRoute::PickerHost { user, host } => {
+            let dest = ph_dest(user.as_deref(), &host);
+            Err(Error::Msg(format!(
+                "ph: interactive picker not yet available (FDR 0016); use `ph {dest}:session` \
+                 or `ph {dest}:+` (new)"
+            )))
+        }
+        PhRoute::HostNeedsSession { user, host } => {
+            let dest = ph_dest(user.as_deref(), &host);
+            Err(Error::Msg(format!(
+                "ph: `{dest}` is a host with no session — use `ph {dest}:session` \
+                 (a durable session on that host)"
+            )))
+        }
         PhRoute::LocalNew { group: g } => cmd_start(g.as_deref().unwrap_or(&group), &[]),
         PhRoute::LocalResolve { group: g, session } => {
             let grp = g.as_deref().unwrap_or(&group);
@@ -466,16 +488,19 @@ fn cmd_ph(argv: &[String]) -> Result<()> {
             let path = cfg.socket_path(&session)?;
             // Existing (and live) ⇒ attach; absent or stale ⇒ strict create. This
             // is the load-bearing routing: ph calls attach ONLY on a live session,
-            // so it stays correct after the Phase-B strict-attach flip.
+            // so it stays correct with the strict-attach default (Phase B).
             if session::session_socket_exists(&path) && !session::socket_is_dead(&path) {
                 cmd_attach(grp, std::slice::from_ref(&session))
             } else {
                 cmd_start(grp, std::slice::from_ref(&session))
             }
         }
-        PhRoute::RemoteNew { host } => Err(Error::Msg(format!(
-            "ph: remote auto-id (`{host}:+`) is not yet supported; use `ph {host}:name`"
-        ))),
+        PhRoute::RemoteNew { user, host, group: _ } => {
+            let dest = ph_dest(user.as_deref(), &host);
+            Err(Error::Msg(format!(
+                "ph: remote auto-id (`{dest}:+`) is not yet supported; use `ph {dest}:name`"
+            )))
+        }
         PhRoute::RemoteResolve { user, host, group: g, session } => cmd_ssh_session(
             user,
             host,
@@ -901,11 +926,14 @@ fn parse_remote_session_extra(extra: &[String]) -> (bool, &[String]) {
     (detached, command)
 }
 
-/// The inner `posh [-g GROUP] attach SESSION [--detach] [command...]` argv
-/// that rides the remote host — under `posh-server new` for the foreground
-/// roaming attach, or directly over ssh for a detached spawn (#67). `--detach`
-/// lands after SESSION (where the remote `posh attach` recognizes it) and
-/// before the create-command.
+/// The inner `posh [-g GROUP] attach SESSION [--create|--detach] [command...]`
+/// argv that rides the remote host — under `posh-server new` for the foreground
+/// legacy roaming attach, or directly over ssh for a detached spawn (#67). The
+/// FOREGROUND inner attach carries `--create` (FDR 0015 Phase B: a bare remote
+/// attach is strict, so create-or-attach must be explicit — safe because Phase A
+/// `--create` is deployed fleet-wide before Phase B). `--detach` is its own
+/// create-or-ensure and needs no `--create`. The flag lands after SESSION, where
+/// the remote `posh attach` recognizes it, and before the create-command.
 fn remote_session_argv(
     group: Option<&str>,
     session: &str,
@@ -921,6 +949,8 @@ fn remote_session_argv(
     argv.push(session.into());
     if detached {
         argv.push("--detach".into());
+    } else {
+        argv.push("--create".into());
     }
     argv.extend_from_slice(command);
     argv
@@ -1331,11 +1361,11 @@ GLOBAL OPTIONS
 
 SESSION COMMANDS (local persistence)
     attach [--detach] [--create] <name> [--] [command...]  (alias: a)
-        Attach to a session, creating it (running command, default $SHELL)
-        if needed. With --detach, ensure the session exists, print status,
-        and exit without attaching. --create is the explicit create-or-attach
-        form (FDR 0015). A `--` ends option parsing so the command is taken
-        literally (it may contain --detach). Detach key: Ctrl-\\.
+        Attach to an EXISTING session; errors if it is absent (use `start`,
+        or --create). With --create, create-or-attach (running command,
+        default $SHELL, when created). With --detach, ensure the session
+        exists, print status, and exit without attaching. A `--` ends option
+        parsing so the command is taken literally. Detach key: Ctrl-\\.
 
     start [--detach] [target] [--] [command...]  (alias: s)
         Create a durable session and attach. Errors if a named session
@@ -1563,10 +1593,11 @@ mod tests {
 
     #[test]
     fn remote_session_argv_foreground_and_detached() {
-        // Foreground attach is unchanged: `posh -g grp attach dev htop`.
+        // Foreground attach CREATES (FDR 0015 Phase B): the inner attach carries
+        // --create so a strict-attach remote still creates the session.
         assert_eq!(
             remote_session_argv(Some("grp"), "dev", false, &["htop".into()]),
-            ["posh", "-g", "grp", "attach", "dev", "htop"].map(String::from)
+            ["posh", "-g", "grp", "attach", "dev", "--create", "htop"].map(String::from)
         );
         // #67 detached spawn: --detach sits after SESSION, before the command.
         assert_eq!(
@@ -1632,11 +1663,12 @@ mod tests {
             foreground_server_tail(true, Some("grp"), "dev", &cmd),
             ["relay", "-g", "grp", "dev", "--", "htop"].map(String::from)
         );
-        // POSH_RELAY=0: the legacy `-- posh -g GROUP attach SESSION [cmd]` tail,
-        // its leading `--` now caller-owned. Wire shape unchanged from pre-relay.
+        // POSH_RELAY=0: the legacy `-- posh -g GROUP attach SESSION --create [cmd]`
+        // tail, its leading `--` caller-owned. The foreground inner attach carries
+        // --create (FDR 0015 Phase B: a strict remote must be told to create).
         assert_eq!(
             foreground_server_tail(false, Some("grp"), "dev", &cmd),
-            ["--", "posh", "-g", "grp", "attach", "dev", "htop"].map(String::from)
+            ["--", "posh", "-g", "grp", "attach", "dev", "--create", "htop"].map(String::from)
         );
         // Default group (None) omits `-g` in both bootstraps; no command ⇒ no `--`
         // tail on the relay side.
@@ -1646,7 +1678,7 @@ mod tests {
         );
         assert_eq!(
             foreground_server_tail(false, None, "dev", &[]),
-            ["--", "posh", "attach", "dev"].map(String::from)
+            ["--", "posh", "attach", "dev", "--create"].map(String::from)
         );
     }
 
@@ -1786,14 +1818,23 @@ mod tests {
     fn ph_parse_cases() {
         use PhRoute::*;
         assert_eq!(ph_parse(None), PickerAll);
-        // No colon -> ALWAYS local, even a dotted or @ token (the colon rule).
+        // A plain bare word is local.
         assert_eq!(
             ph_parse(Some("web")),
             LocalResolve { group: None, session: "web".into() }
         );
+        // A no-colon host-looking token needs a session (guide cleanly rather
+        // than route it through posh start's remote classifier).
         assert_eq!(
             ph_parse(Some("box.com")),
-            LocalResolve { group: None, session: "box.com".into() }
+            HostNeedsSession { user: None, host: "box.com".into() }
+        );
+        assert_eq!(
+            ph_parse(Some("sasha@flac.ts.example.com")),
+            HostNeedsSession {
+                user: Some("sasha".into()),
+                host: "flac.ts.example.com".into()
+            }
         );
         // `:+` / `:g/+` -> local new.
         assert_eq!(ph_parse(Some(":+")), LocalNew { group: None });
@@ -1806,9 +1847,16 @@ mod tests {
             ph_parse(Some(":dev")),
             LocalResolve { group: None, session: "dev".into() }
         );
-        // `host:` -> host picker; `host:+` -> remote new; `host:session` -> resolve.
-        assert_eq!(ph_parse(Some("box:")), PickerHost { host: "box".into() });
-        assert_eq!(ph_parse(Some("box:+")), RemoteNew { host: "box".into() });
+        // `host:` (trailing colon) -> picker; `host:+` -> remote new;
+        // `host:session` -> remote resolve.
+        assert_eq!(
+            ph_parse(Some("box:")),
+            PickerHost { user: None, host: "box".into() }
+        );
+        assert_eq!(
+            ph_parse(Some("box:+")),
+            RemoteNew { user: None, host: "box".into(), group: None }
+        );
         assert_eq!(
             ph_parse(Some("user@box:g/dev")),
             RemoteResolve {

@@ -163,11 +163,12 @@ List, with and without workers:
   `box:` was a plain roaming shell and `:` was `LocalSession{":"}`; both now open
   pickers. And `posh attach`/bare-word is no longer *attach-or-create* — that
   ergonomic moves to `ph` (FDR 0015) while `posh attach` becomes strict attach
-  and `posh start` is the create verb. RFC 0001 §1 and RFC 0008 still describe
-  the legacy attach-or-create forms; those normative records are amended (in
-  RFC 0008's amendments) when the strict split lands. There is no flag day for
-  the *wire* (negotiated); the CLI meaning changes. The explicit non-interactive
-  attach is `posh attach box:name`, the explicit create is `posh start box:name`.
+  and `posh start` is the create verb. The strict split has **landed** (FDR 0015
+  Phase B): bare `posh attach` now errors on an absent session. RFC 0001 §1's
+  `LocalSession` note is updated to strict here; RFC 0008's fuller grammar
+  amendment remains a follow-up. There is no flag day for the *wire*
+  (negotiated); the CLI meaning changed. The explicit non-interactive attach is
+  `posh attach box:name`, the explicit create is `posh start box:name`.
 - **`--ephemeral` may ship later.** The durable default is the feature; the
   explicit throwaway opt-out is small but deferrable if it slips the first cut.
 - **No multi-host aggregated list in v1.** `posh list box:` queries one host;

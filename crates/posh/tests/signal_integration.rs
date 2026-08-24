@@ -265,7 +265,7 @@ fn attach_client_exits_with_session_exit_status() {
 
     let (master, slave) = open_pty_pair();
     let mut cmd = posh_cmd();
-    cmd.args(["attach", "exitstatus", "sh", "-c", "read x; exit 7"])
+    cmd.args(["attach", "--create", "exitstatus", "sh", "-c", "read x; exit 7"])
         .env("POSH_DIR", &dir)
         .env_remove("POSH_SESSION")
         .env_remove("POSH_GROUP");
@@ -298,7 +298,7 @@ fn attach_takes_over_and_restores_the_alt_screen() {
     let mut cmd = posh_cmd();
     // No $TERM: the terminfo lookup falls back to the hardcoded 1049
     // bracket, making the expected bytes machine-independent.
-    cmd.args(["attach", "takeover", "sh", "-c", "read x; exit 0"])
+    cmd.args(["attach", "--create", "takeover", "sh", "-c", "read x; exit 0"])
         .env("POSH_DIR", &dir)
         .env_remove("POSH_SESSION")
         .env_remove("POSH_GROUP")
@@ -355,7 +355,7 @@ fn no_init_skips_the_alt_screen_takeover() {
 
     let (master, slave) = open_pty_pair();
     let mut cmd = posh_cmd();
-    cmd.args(["--no-init", "attach", "noinit", "sh", "-c", "read x; exit 0"])
+    cmd.args(["--no-init", "attach", "--create", "noinit", "sh", "-c", "read x; exit 0"])
         .env("POSH_DIR", &dir)
         .env_remove("POSH_SESSION")
         .env_remove("POSH_GROUP")

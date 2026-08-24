@@ -63,11 +63,14 @@ to strict attach.
 
 ### Grammar
 
-The **colon is the sole local-vs-host discriminator**. A bare word (no colon) is
-*always* a local session; a host is *always* written with a colon. There is no
-bare `ph <host>` form — this is a deliberate, clean divergence from `posh`'s
-`.`/`@`/`:` heuristic, trading one convenience (typing a bare hostname) for zero
-ambiguity in the highest-frequency command.
+The **colon is the local-vs-host discriminator**. A plain bare word (no colon) is
+a local session; a host is written with a colon (`host:session`). A no-colon
+token that `posh` would read as a host (`box.com`, `user@host`, IPv6) has no
+session, so `ph` guides you to `ph host:session` rather than silently making a
+weirdly-named local session. There is no bare `ph <host>` roaming form — a
+deliberate divergence from `posh`'s `.`/`@`/`:` heuristic (FDR 0011 removed the
+ephemeral roaming shell), trading one convenience for zero ambiguity in the
+highest-frequency command.
 
 | invocation | meaning | routes to | stage |
 |---|---|---|---|

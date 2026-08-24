@@ -236,14 +236,37 @@ fn ph_argv0_routes_and_defers_picker() {
     let out = run(&["box:"]);
     assert!(!out.status.success(), "ph host: should defer: {out:?}");
 
-    // `ph box:+` (remote auto-id) -> not yet supported.
-    let out = run(&["box:+"]);
+    // `ph box:+` (remote auto-id) -> not yet supported, and keeps the user.
+    let out = run(&["me@box:+"]);
     assert!(!out.status.success(), "ph host:+ should error: {out:?}");
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    assert!(stderr.contains("not yet supported"), "ph host:+ stderr: {stderr}");
+    assert!(stderr.contains("me@box"), "ph host:+ should keep the user: {stderr}");
+
+    // `ph user@host` (no colon, host-looking) -> a clean host-needs-session hint,
+    // NOT posh start's remote-target error.
+    let out = run(&["me@nohost.example.com"]);
+    assert!(!out.status.success(), "ph @host should guide: {out:?}");
     assert!(
-        String::from_utf8_lossy(&out.stderr).contains("not yet supported"),
-        "ph host:+ stderr: {}",
+        String::from_utf8_lossy(&out.stderr).contains("host with no session"),
+        "ph @host stderr: {}",
         String::from_utf8_lossy(&out.stderr)
     );
+
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+#[test]
+fn attach_strict_errors_on_absent_session() {
+    let dir = test_dir("posh-itest-attach-strict");
+    std::fs::create_dir_all(&dir).unwrap();
+
+    // Phase B (FDR 0015): bare `posh attach <absent>` errors (no create) — and
+    // errors before any tty use, so no PTY is needed.
+    let out = posh(&dir, &["attach", "ghost"]);
+    assert!(!out.status.success(), "strict attach should fail: {out:?}");
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    assert!(stderr.contains("no session"), "strict attach stderr: {stderr}");
 
     let _ = std::fs::remove_dir_all(&dir);
 }

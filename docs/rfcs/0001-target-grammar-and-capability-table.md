@@ -53,7 +53,8 @@ The normative model is the parser's result type:
 
 ```rust
 enum Target {
-    /// Bare word: local session, attach-or-create (legacy form).
+    /// Bare word: local session. Strict attach — `posh <name>` errors if it is
+    /// absent (FDR 0015 Phase B); `posh start` / `ph` create.
     LocalSession { name: String },
     /// `:session` / `:group/session`: explicit local.
     Local { group: Option<String>, session: String },

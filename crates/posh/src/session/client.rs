@@ -114,7 +114,7 @@ pub fn cmd_attach(
     name: &str,
     command: Option<Vec<String>>,
     detach_flag: bool,
-    _create_flag: bool,
+    create_flag: bool,
 ) -> Result<()> {
     if !detach_flag && std::env::var_os("POSH_SESSION").is_some() {
         return Err(Error::from(
@@ -126,13 +126,16 @@ pub fn cmd_attach(
         return ensure_detached(cfg, name, command);
     }
 
-    // Phase A (FDR 0015): `posh attach` stays create-or-attach for BOTH the bare
-    // and the explicit `--create` form, so clown's `posh attach {id}` keeps
-    // working while it migrates to `--create`. Phase B flips the bare form
-    // (`_create_flag == false`) to a strict attach that errors on an absent
-    // session; `--create` stays this lenient create-or-attach path.
-    // The relay (remote::relay) shares this ensure-then-connect path.
-    let stream = crate::session::connect_or_create(cfg, name, command)?;
+    // Phase B (FDR 0015): bare `posh attach` is STRICT — attach an existing
+    // session, error if it is absent. `--create` is the explicit create-or-attach
+    // form (clown and other create-if-missing consumers use it). The relay
+    // (remote::relay) uses connect_or_create directly, so remote host:session
+    // stays create-or-attach.
+    let stream = if create_flag {
+        crate::session::connect_or_create(cfg, name, command)?
+    } else {
+        crate::session::attach_existing(cfg, name)?
+    };
     run_interactive(stream)
 }
 

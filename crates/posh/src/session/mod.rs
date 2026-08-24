@@ -124,6 +124,19 @@ pub(crate) fn connect_or_create(
     UnixStream::connect(&path).map_err(|e| Error::Msg(format!("connect {}: {e}", path.display())))
 }
 
+/// Attach to an EXISTING local session, erroring if it is absent or dead
+/// (strict `posh attach`, FDR 0015 Phase B). Unlike [`connect_or_create`] it
+/// never spawns a daemon — creation is `posh start` / `posh attach --create`.
+pub(crate) fn attach_existing(cfg: &Config, name: &str) -> Result<UnixStream> {
+    let path = cfg.socket_path(name)?;
+    if !session_socket_exists(&path) || socket_is_dead(&path) {
+        return Err(Error::Msg(format!(
+            "no session \"{name}\" (use `posh start {name}`, or `posh attach --create {name}`)"
+        )));
+    }
+    UnixStream::connect(&path).map_err(|e| Error::Msg(format!("connect {}: {e}", path.display())))
+}
+
 pub fn session_socket_exists(path: &Path) -> bool {
     match std::fs::symlink_metadata(path) {
         Ok(meta) => meta.file_type().is_socket(),

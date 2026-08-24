@@ -39,8 +39,8 @@ local-session name):
 
 _name_
 	A bare word with no _@_, _._, or _:_ is a *local session*:
-	attach to it, creating it if needed. Shorthand for
-	*posh attach* _name_.
+	attach to it (strict — errors if absent; *start* / *ph* create).
+	Shorthand for *posh attach* _name_.
 
 *:*_session_, *:*_group_/_session_
 	A leading colon is an *explicit local* session, optionally
@@ -138,12 +138,11 @@ a *-A* there is the real *ssh* flag, not posh forwarding.
 Local persistence over Unix sockets.
 
 *attach* [*--detach*] [*--create*] _name_ [*--*] [_command_...] (alias: *a*)
-	Attach to a session, creating it (running _command_, default
-	_$SHELL_) if needed. With *--detach*, ensure the session exists,
-	print status, and exit without attaching. *--create* is the
-	explicit create-or-attach form (FDR 0015). A *--* ends option
-	parsing so _command_ is taken literally (it may itself contain
-	*--detach*). Detach key: *Ctrl-\\*.
+	Attach to an *existing* session; errors if it is absent (use *start*,
+	or *--create*). With *--create*, create-or-attach (running _command_,
+	default _$SHELL_, when created). With *--detach*, ensure the session
+	exists, print status, and exit without attaching. A *--* ends option
+	parsing so _command_ is taken literally. Detach key: *Ctrl-\\*.
 
 *start* [*--detach*] [_target_] [*--*] [_command_...] (alias: *s*)
 	Create a durable session (running _command_, default _$SHELL_) and
