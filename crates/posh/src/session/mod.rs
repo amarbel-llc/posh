@@ -632,6 +632,17 @@ fn next_fork_name(cfg: &Config, base: &str) -> Result<String> {
     Err(Error::from("too many sessions"))
 }
 
+/// The base for `posh start` / `ph :+` auto-id sessions: `s-1`, `s-2`, … The id
+/// is opaque by design — a durable session is picked by its RFC 0013 §5 activity
+/// label, not this key (FDR 0015).
+pub(crate) const AUTOID_BASE: &str = "s";
+
+/// The next free auto-id session name (first unoccupied `s-N` slot), reusing the
+/// same free-slot search as [`next_fork_name`].
+pub(crate) fn next_autoid(cfg: &Config) -> Result<String> {
+    next_fork_name(cfg, AUTOID_BASE)
+}
+
 /// `posh groups`: list groups (socket-base subdirectories with at least one
 /// socket in them), sorted.
 pub fn cmd_groups() -> Result<()> {

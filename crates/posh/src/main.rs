@@ -148,6 +148,7 @@ fn run() -> Result<()> {
             Ok(())
         }
         "attach" | "a" => cmd_attach(&group, args),
+        "start" | "s" => cmd_start(&group, args),
         "kill" | "k" => {
             let name = args
                 .first()
@@ -222,29 +223,67 @@ fn run() -> Result<()> {
 }
 
 fn cmd_attach(group: &str, args: &[String]) -> Result<()> {
-    let (detach_flag, name, command) = parse_attach_args(args)?;
+    let (detach_flag, create_flag, name, command) = parse_attach_args(args)?;
     let command = (!command.is_empty()).then(|| command.to_vec());
-    session::client::cmd_attach(&Config::new(group)?, name, command, detach_flag)
+    session::client::cmd_attach(&Config::new(group)?, name, command, detach_flag, create_flag)
 }
 
-/// Parse `attach` args as `[--detach] <name> [--detach] [--] [command...]`.
-/// `--detach` is recognized only as an option around the name (either side);
-/// a single `--` ends option parsing so the create-command is OPAQUE — it may
-/// itself contain `--detach` or `--`, matching `posh run` and the remote
-/// namespace path. (Previously `--detach` was scanned across the whole arg
-/// list, silently swallowing one inside the command, and a `--` separator was
-/// passed through as a literal command word.)
-fn parse_attach_args(args: &[String]) -> Result<(bool, &str, &[String])> {
+/// Parse `attach` args as `[--detach|--create]... <name> [--detach|--create]...
+/// [--] [command...]`. `--detach` and `--create` are recognized only as options
+/// around the name (either side); a single `--` ends option parsing so the
+/// create-command is OPAQUE — it may itself contain `--detach`/`--create`/`--`,
+/// matching `posh run` and the remote namespace path. `--create` is FDR 0015's
+/// explicit create-or-attach form (clown's migration target); in Phase A it is
+/// behaviourally identical to the bare form, which stays create-or-attach.
+fn parse_attach_args(args: &[String]) -> Result<(bool, bool, &str, &[String])> {
     let mut detach = false;
+    let mut create = false;
     let mut i = 0;
-    while args.get(i).map(String::as_str) == Some("--detach") {
-        detach = true;
+    while let Some(f @ ("--detach" | "--create")) = args.get(i).map(String::as_str) {
+        if f == "--detach" {
+            detach = true;
+        } else {
+            create = true;
+        }
         i += 1;
     }
     let name = args
         .get(i)
         .ok_or_else(|| Error::from("attach requires a session name"))?;
     i += 1;
+    while let Some(f @ ("--detach" | "--create")) = args.get(i).map(String::as_str) {
+        if f == "--detach" {
+            detach = true;
+        } else {
+            create = true;
+        }
+        i += 1;
+    }
+    if args.get(i).map(String::as_str) == Some("--") {
+        i += 1;
+    }
+    Ok((detach, create, name, &args[i..]))
+}
+
+/// Parse `start` args as `[--detach]... [target] [--detach]... [--] [command...]`.
+/// Unlike attach, the target is OPTIONAL — absent (or a leading `--`) means an
+/// auto-id session (`posh start` / `posh start -- cmd`). `--` ends option parsing
+/// so the create-command stays opaque.
+fn parse_start_args(args: &[String]) -> (bool, Option<&str>, &[String]) {
+    let mut detach = false;
+    let mut i = 0;
+    while args.get(i).map(String::as_str) == Some("--detach") {
+        detach = true;
+        i += 1;
+    }
+    // A `--` here (or the end of args) means "no target": an auto-id session.
+    let target = match args.get(i).map(String::as_str) {
+        None | Some("--") => None,
+        Some(t) => {
+            i += 1;
+            Some(t)
+        }
+    };
     while args.get(i).map(String::as_str) == Some("--detach") {
         detach = true;
         i += 1;
@@ -252,7 +291,62 @@ fn parse_attach_args(args: &[String]) -> Result<(bool, &str, &[String])> {
     if args.get(i).map(String::as_str) == Some("--") {
         i += 1;
     }
-    Ok((detach, name, &args[i..]))
+    (detach, target, &args[i..])
+}
+
+/// How a `posh start` target resolves. Remote targets are deferred in Phase A
+/// (create a remote session via `posh host:session`); the strict local create is
+/// the slice-A deliverable.
+#[derive(Debug, PartialEq, Eq)]
+enum StartClass {
+    LocalAuto { group: Option<String> },
+    LocalNamed { group: Option<String>, session: String },
+    Remote,
+}
+
+/// Classify a `posh start` target. `None` and `:+` (and `:g/+`) mean auto-id; a
+/// bare word or `:name` is a named local session; anything that parses to a host
+/// is `Remote`. Bare `+` (no colon) is a literal local name, consistent with the
+/// colon-is-the-new-session-sigil rule (canonical new is `:+`).
+fn classify_start_target(target: Option<&str>) -> StartClass {
+    match target {
+        None => StartClass::LocalAuto { group: None },
+        Some(t) => match target::Target::parse(t) {
+            target::Target::LocalSession { name } => {
+                StartClass::LocalNamed { group: None, session: name }
+            }
+            target::Target::Local { group, session } if session == "+" => {
+                StartClass::LocalAuto { group }
+            }
+            target::Target::Local { group, session } => {
+                StartClass::LocalNamed { group, session }
+            }
+            _ => StartClass::Remote,
+        },
+    }
+}
+
+/// `posh start`: create a durable session and attach (FDR 0015). Local targets
+/// use the strict create (`cmd_start_local`); an auto-id target picks the next
+/// free `s-N`. Remote start is deferred to a later slice — a remote target routes
+/// the user to the existing create-or-attach `posh host:session` form.
+fn cmd_start(group: &str, args: &[String]) -> Result<()> {
+    let (detach, target, command_slice) = parse_start_args(args);
+    let command = (!command_slice.is_empty()).then(|| command_slice.to_vec());
+    match classify_start_target(target) {
+        StartClass::LocalAuto { group: g } => {
+            let cfg = Config::new(g.as_deref().unwrap_or(group))?;
+            let name = session::next_autoid(&cfg)?;
+            session::client::cmd_start_local(&cfg, &name, command, detach)
+        }
+        StartClass::LocalNamed { group: g, session } => {
+            let cfg = Config::new(g.as_deref().unwrap_or(group))?;
+            session::client::cmd_start_local(&cfg, &session, command, detach)
+        }
+        StartClass::Remote => Err(Error::from(
+            "posh start: remote targets are not yet supported; use `posh host:session`",
+        )),
+    }
 }
 
 fn cmd_history(group: &str, args: &[String]) -> Result<()> {
@@ -1097,12 +1191,20 @@ GLOBAL OPTIONS
         `poshterity replay FILE` / `posh rec replay FILE`.
 
 SESSION COMMANDS (local persistence)
-    attach [--detach] <name> [--] [command...]  (alias: a)
+    attach [--detach] [--create] <name> [--] [command...]  (alias: a)
         Attach to a session, creating it (running command, default $SHELL)
         if needed. With --detach, ensure the session exists, print status,
-        and exit without attaching. A `--` ends option parsing so the
-        command is taken literally (it may contain --detach). Detach key:
-        Ctrl-\\.
+        and exit without attaching. --create is the explicit create-or-attach
+        form (FDR 0015). A `--` ends option parsing so the command is taken
+        literally (it may contain --detach). Detach key: Ctrl-\\.
+
+    start [--detach] [target] [--] [command...]  (alias: s)
+        Create a durable session and attach. Errors if a named session
+        already exists (use `attach`). With no target (or `:+`), create a
+        new auto-id session (s-1, s-2, ...), picked later by its activity
+        label. With --detach, ensure-and-return (idempotent, like
+        `attach --detach`). Remote targets are not yet supported here — use
+        `posh host:session`.
 
     list [--short] [-j|--json] [-w|--watch [--interval N]]  (aliases: ls, l)
         List sessions in the group: name, pid, attached client count.
@@ -1443,21 +1545,21 @@ mod tests {
 
         // Name only.
         let a = v(&["dev"]);
-        let (d, n, c) = parse_attach_args(&a).unwrap();
+        let (d, _create, n, c) = parse_attach_args(&a).unwrap();
         assert!(!d);
         assert_eq!(n, "dev");
         assert!(c.is_empty());
 
         // Leading --detach (the form the integration tests and clown use).
         let a = v(&["--detach", "dev", "sleep", "300"]);
-        let (d, n, c) = parse_attach_args(&a).unwrap();
+        let (d, _create, n, c) = parse_attach_args(&a).unwrap();
         assert!(d);
         assert_eq!(n, "dev");
         assert_eq!(c, &v(&["sleep", "300"])[..]);
 
         // Post-name --detach (the remote inner-argv form).
         let a = v(&["dev", "--detach", "worker"]);
-        let (d, n, c) = parse_attach_args(&a).unwrap();
+        let (d, _create, n, c) = parse_attach_args(&a).unwrap();
         assert!(d);
         assert_eq!(n, "dev");
         assert_eq!(c, &v(&["worker"])[..]);
@@ -1465,21 +1567,80 @@ mod tests {
         // The #1 fix: a `--` makes the command OPAQUE, so a `--detach` inside
         // it is preserved as a command word, not swallowed as the flag.
         let a = v(&["dev", "--detach", "--", "worker", "--detach"]);
-        let (d, n, c) = parse_attach_args(&a).unwrap();
+        let (d, _create, n, c) = parse_attach_args(&a).unwrap();
         assert!(d);
         assert_eq!(n, "dev");
         assert_eq!(c, &v(&["worker", "--detach"])[..]);
 
         // A `--` separator without `--detach`: opaque command, no detach.
         let a = v(&["dev", "--", "vim", "-u", "NONE"]);
-        let (d, n, c) = parse_attach_args(&a).unwrap();
+        let (d, _create, n, c) = parse_attach_args(&a).unwrap();
         assert!(!d);
         assert_eq!(n, "dev");
         assert_eq!(c, &v(&["vim", "-u", "NONE"])[..]);
 
+        // --create parses as a flag on either side of the name (FDR 0015).
+        let a = v(&["--create", "dev"]);
+        let (d, cr, n, _c) = parse_attach_args(&a).unwrap();
+        assert!(!d && cr && n == "dev");
+        let a = v(&["dev", "--create", "--detach"]);
+        let (d, cr, n, _c) = parse_attach_args(&a).unwrap();
+        assert!(d && cr && n == "dev");
+
         // Missing name is an error (with or without a leading flag).
         assert!(parse_attach_args(&v(&[])).is_err());
         assert!(parse_attach_args(&v(&["--detach"])).is_err());
+    }
+
+    #[test]
+    fn parse_start_args_grammar() {
+        let v = |xs: &[&str]| -> Vec<String> { xs.iter().map(|s| s.to_string()).collect() };
+        // No args -> auto-id (no target), no detach, no command.
+        let a = v(&[]);
+        let (d, t, c) = parse_start_args(&a);
+        assert!(!d && t.is_none() && c.is_empty());
+        // Leading --detach, still no target.
+        let a = v(&["--detach"]);
+        let (d, t, c) = parse_start_args(&a);
+        assert!(d && t.is_none() && c.is_empty());
+        // A leading `--` means "no target"; the rest is an opaque command.
+        let a = v(&["--", "vim"]);
+        let (d, t, c) = parse_start_args(&a);
+        assert!(!d && t.is_none() && c == ["vim"]);
+        // Named target, then a command after `--`.
+        let a = v(&["dev", "--", "htop"]);
+        let (d, t, c) = parse_start_args(&a);
+        assert!(!d && t == Some("dev") && c == ["htop"]);
+        // --detach around the target.
+        let a = v(&["--detach", "dev"]);
+        let (d, t, c) = parse_start_args(&a);
+        assert!(d && t == Some("dev") && c.is_empty());
+    }
+
+    #[test]
+    fn classify_start_target_cases() {
+        use StartClass::*;
+        assert_eq!(classify_start_target(None), LocalAuto { group: None });
+        assert_eq!(classify_start_target(Some(":+")), LocalAuto { group: None });
+        assert_eq!(
+            classify_start_target(Some(":work/+")),
+            LocalAuto { group: Some("work".into()) }
+        );
+        assert_eq!(
+            classify_start_target(Some("dev")),
+            LocalNamed { group: None, session: "dev".into() }
+        );
+        // Bare `+` (no colon) is a literal local name; canonical new is `:+`.
+        assert_eq!(
+            classify_start_target(Some("+")),
+            LocalNamed { group: None, session: "+".into() }
+        );
+        assert_eq!(
+            classify_start_target(Some(":work/dev")),
+            LocalNamed { group: Some("work".into()), session: "dev".into() }
+        );
+        assert_eq!(classify_start_target(Some("box:dev")), Remote);
+        assert_eq!(classify_start_target(Some("user@box:dev")), Remote);
     }
 
     #[test]
@@ -1599,6 +1760,7 @@ mod tests {
     fn help_covers_all_commands_and_env() {
         for needle in [
             "attach",
+            "start",
             "list",
             "run",
             "fork",

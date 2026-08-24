@@ -119,3 +119,86 @@ fn run_sends_command_into_new_session() {
 
     let _ = std::fs::remove_dir_all(&dir);
 }
+
+#[test]
+fn start_detach_creates_then_idempotent() {
+    let dir = test_dir("posh-itest-start");
+    std::fs::create_dir_all(&dir).unwrap();
+
+    // `start --detach` creates the session and returns (the FDR 0010 ensure,
+    // shared with `attach --detach`).
+    let out = posh(&dir, &["start", "--detach", "stest", "sleep", "300"]);
+    assert!(out.status.success(), "start --detach failed: {out:?}");
+    let stdout = String::from_utf8_lossy(&out.stdout);
+    assert!(
+        stdout.contains("session \"stest\" created"),
+        "start output: {stdout}"
+    );
+
+    // A re-spawn is idempotent.
+    let out = posh(&dir, &["start", "--detach", "stest"]);
+    let stdout = String::from_utf8_lossy(&out.stdout);
+    assert!(
+        stdout.contains("session \"stest\" already exists"),
+        "start re-spawn output: {stdout}"
+    );
+
+    let _ = posh(&dir, &["kill", "stest"]);
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+#[test]
+fn start_strict_errors_on_existing_session() {
+    let dir = test_dir("posh-itest-start-strict");
+    std::fs::create_dir_all(&dir).unwrap();
+
+    // Create it detached, then a plain `start` of the same name must error
+    // (strict create) — and it errors BEFORE touching a tty, so no PTY needed.
+    let out = posh(&dir, &["start", "--detach", "dup", "sleep", "300"]);
+    assert!(out.status.success(), "start --detach failed: {out:?}");
+
+    let out = posh(&dir, &["start", "dup"]);
+    assert!(
+        !out.status.success(),
+        "strict start should have failed: {out:?}"
+    );
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    assert!(
+        stderr.contains("already exists"),
+        "strict start stderr: {stderr}"
+    );
+
+    let _ = posh(&dir, &["kill", "dup"]);
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+#[test]
+fn start_detach_autoid_creates_session() {
+    let dir = test_dir("posh-itest-start-autoid");
+    std::fs::create_dir_all(&dir).unwrap();
+
+    // No target -> an auto-id `s-N` session (first free slot is s-1).
+    let out = posh(&dir, &["start", "--detach", "--", "sleep", "300"]);
+    assert!(
+        out.status.success(),
+        "start --detach (auto-id) failed: {out:?}"
+    );
+    let stdout = String::from_utf8_lossy(&out.stdout);
+    assert!(
+        stdout.contains("session \"s-1\" created"),
+        "auto-id start output: {stdout}"
+    );
+
+    wait_for(
+        || {
+            let out = posh(&dir, &["list", "--short"]);
+            String::from_utf8_lossy(&out.stdout)
+                .lines()
+                .any(|l| l == "s-1")
+        },
+        "auto-id session to appear in list",
+    );
+
+    let _ = posh(&dir, &["kill", "s-1"]);
+    let _ = std::fs::remove_dir_all(&dir);
+}

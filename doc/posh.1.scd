@@ -117,12 +117,22 @@ a *-A* there is the real *ssh* flag, not posh forwarding.
 
 Local persistence over Unix sockets.
 
-*attach* [*--detach*] _name_ [*--*] [_command_...] (alias: *a*)
+*attach* [*--detach*] [*--create*] _name_ [*--*] [_command_...] (alias: *a*)
 	Attach to a session, creating it (running _command_, default
 	_$SHELL_) if needed. With *--detach*, ensure the session exists,
-	print status, and exit without attaching. A *--* ends option
+	print status, and exit without attaching. *--create* is the
+	explicit create-or-attach form (FDR 0015). A *--* ends option
 	parsing so _command_ is taken literally (it may itself contain
 	*--detach*). Detach key: *Ctrl-\\*.
+
+*start* [*--detach*] [_target_] [*--*] [_command_...] (alias: *s*)
+	Create a durable session (running _command_, default _$SHELL_) and
+	attach. Unlike *attach* this is strict: it errors if a named session
+	already exists (use *attach*). With no _target_ (or *:+*), create a
+	new auto-id session (_s-1_, _s-2_, ...), selected later by its
+	activity label. With *--detach*, ensure-and-return, idempotent like
+	*attach --detach*. Remote targets are not yet supported here; use
+	*posh* _host_*:*_session_.
 
 *list* [*--short*] [*-j*|*--json*] [*-w*|*--watch* [*--interval* _N_]] (aliases: *ls*, *l*)
 	List sessions in the group: name, pid, attached client count.

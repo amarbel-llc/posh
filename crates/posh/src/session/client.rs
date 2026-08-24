@@ -68,31 +68,24 @@ fn restore_seq(bracket: &Option<(Vec<u8>, Vec<u8>)>) -> Vec<u8> {
     out
 }
 
-pub fn cmd_attach(
-    cfg: &Config,
-    name: &str,
-    command: Option<Vec<String>>,
-    detach_flag: bool,
-) -> Result<()> {
-    if !detach_flag && std::env::var_os("POSH_SESSION").is_some() {
-        return Err(Error::from(
-            "cannot attach to a session from within a session",
-        ));
+/// The `--detach` idempotent ensure (FDR 0010): create-or-ensure the session and
+/// return without attaching. Shared by `posh attach --detach` and
+/// `posh start --detach`. The "created" / "already exists" wording is asserted
+/// by the integration suite — keep it byte-for-byte.
+fn ensure_detached(cfg: &Config, name: &str, command: Option<Vec<String>>) -> Result<()> {
+    let created = daemon::ensure_session(cfg, name, command)?;
+    if created {
+        println!("session \"{name}\" created");
+    } else {
+        println!("session \"{name}\" already exists");
     }
+    Ok(())
+}
 
-    if detach_flag {
-        let created = daemon::ensure_session(cfg, name, command)?;
-        if created {
-            println!("session \"{name}\" created");
-        } else {
-            println!("session \"{name}\" already exists");
-        }
-        return Ok(());
-    }
-
-    // The relay (remote::relay) shares this ensure-then-connect path.
-    let stream = crate::session::connect_or_create(cfg, name, command)?;
-
+/// The interactive attach tail: install signal handlers, take over the
+/// alternate screen, run the client loop, restore, and propagate the shell's
+/// exit status. Shared by `cmd_attach` and `cmd_start_local`.
+fn run_interactive(stream: UnixStream) -> Result<()> {
     // Handlers go in before raw mode and the takeover write: the first
     // byte on the tty is the outside world's readiness signal, and a
     // SIGTERM racing it must find the handler installed, not the default
@@ -114,6 +107,66 @@ pub fn cmd_attach(
         Ok(_) => Ok(()),
         Err(e) => Err(e),
     }
+}
+
+pub fn cmd_attach(
+    cfg: &Config,
+    name: &str,
+    command: Option<Vec<String>>,
+    detach_flag: bool,
+    _create_flag: bool,
+) -> Result<()> {
+    if !detach_flag && std::env::var_os("POSH_SESSION").is_some() {
+        return Err(Error::from(
+            "cannot attach to a session from within a session",
+        ));
+    }
+
+    if detach_flag {
+        return ensure_detached(cfg, name, command);
+    }
+
+    // Phase A (FDR 0015): `posh attach` stays create-or-attach for BOTH the bare
+    // and the explicit `--create` form, so clown's `posh attach {id}` keeps
+    // working while it migrates to `--create`. Phase B flips the bare form
+    // (`_create_flag == false`) to a strict attach that errors on an absent
+    // session; `--create` stays this lenient create-or-attach path.
+    // The relay (remote::relay) shares this ensure-then-connect path.
+    let stream = crate::session::connect_or_create(cfg, name, command)?;
+    run_interactive(stream)
+}
+
+/// `posh start`: create a durable session (strict — errors if a named session is
+/// already live), then attach. `--detach` is the idempotent ensure shared with
+/// attach (FDR 0010), so a re-spawn is a no-op. FDR 0015.
+pub fn cmd_start_local(
+    cfg: &Config,
+    name: &str,
+    command: Option<Vec<String>>,
+    detach_flag: bool,
+) -> Result<()> {
+    if !detach_flag && std::env::var_os("POSH_SESSION").is_some() {
+        return Err(Error::from(
+            "cannot start a session from within a session",
+        ));
+    }
+
+    if detach_flag {
+        return ensure_detached(cfg, name, command);
+    }
+
+    // Strict create: `ensure_session` returns false when the session is already
+    // live, which for `start` is an error (unlike attach's create-or-attach).
+    let created = daemon::ensure_session(cfg, name, command)?;
+    if !created {
+        return Err(Error::Msg(format!(
+            "session \"{name}\" already exists (use `posh attach {name}`)"
+        )));
+    }
+    let path = cfg.socket_path(name)?;
+    let stream = UnixStream::connect(&path)
+        .map_err(|e| Error::Msg(format!("connect {}: {e}", path.display())))?;
+    run_interactive(stream)
 }
 
 /// The detach key Ctrl-\ in raw C0 and its kitty keyboard CSI-u forms (base key
