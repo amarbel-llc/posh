@@ -27,7 +27,7 @@ stays attached for the life of the connection. There was no way to express
 promptly" — the gap between posh's remote story and first-class remote
 workers. A remote session manager (spinclass FDR 0006, clown) needs exactly
 that fire-and-return primitive to launch workers it will reattach to later,
-mirroring its local `posh attach <id> --detach <entry>` spawn.
+mirroring its local `posh start <id> --detach <entry>` spawn.
 
 ## Interface
 
@@ -38,13 +38,13 @@ A leading `--detach` on the remote namespace form requests a detached spawn:
 It creates-or-ensures the session on the host (running `command`, default
 `$SHELL`) and returns promptly, **without** attaching or standing up the
 roaming transport. Concretely it execs the inner
-`posh [-g GROUP] attach SESSION --detach [command...]` *directly* over ssh —
-no `posh-server new`, no UDP client — so the remote `posh attach --detach`
+`posh [-g GROUP] start SESSION --detach [command...]` *directly* over ssh —
+no `posh-server new`, no UDP client — so the remote `posh start --detach`
 double-forks a session daemon on the host and exits, and the ssh call returns
 with that command's exit status. The session keeps running as a daemon on the
 host; a later foreground `posh host:[group/]session` (no `--detach`) attaches
 to that same session through a fresh, disposable transport pair. This is the
-remote analog of local `posh attach <name> --detach`.
+remote analog of local `posh start <name> --detach`.
 
 **`--detach` must lead** the post-target args (a `--detach` after the command
 separator is part of the command). An optional single `--` after `--detach`
@@ -52,9 +52,12 @@ separates posh from an opaque create-command; or omit it and the command
 starts at the first non-flag token. Both `posh host:id --detach -- cmd` and
 `posh host:id --detach cmd` work.
 
-**Idempotent.** Re-running a spawn for a live session is a no-op: the remote
-`posh attach --detach` reports `session "<id>" already exists` (vs. `created`)
-and ignores the command, exiting 0. The status line is passed through on
+**Idempotent — `--detach` makes `start` an ensure.** Re-running a spawn for a
+live session is a no-op: the remote `posh start --detach` reports
+`session "<id>" already exists` (vs. `created`) and ignores the command, exiting
+0. So the `--detach` spawn is a create-if-absent **ensure**, distinct from a
+foreground `posh start`, which errors if the named session already exists (the
+FDR 0011 / FDR 0015 strict verbs). The status line is passed through on
 stdout; stderr and stdin are inherited so ssh auth prompts still reach the
 user's terminal.
 

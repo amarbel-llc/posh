@@ -85,7 +85,8 @@ RFC 0008 §3): each session channel is one DaemonLink in the remote peer's
 channel table, the §3 contract applied per channel, unchanged. Bare-host
 ephemeral shells (`posh user@host`, remote-PTY-owning) keep per-invocation
 connections; they MAY later ride the mux as auto-named "default" durable
-sessions (the FDR 0011 unification direction) — a future milestone, not
+sessions (the FDR 0011 unification direction, now specified in FDR 0015 — the
+`ph` front-door + durable auto-id sessions) — a future milestone, not
 M2. Relay retargeting (FDR 0012) remains a later feature on top of this
 infrastructure. The session-daemon socket protocol (`session/ipc.rs`
 `Tag`s) is untouched.

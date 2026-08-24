@@ -8,9 +8,10 @@ promotion-criteria: >
   skew matrix, reliable-as-degenerate property test) are green. The double-model
   inner-attach path still exists behind the POSH_SESSION_FRAMES rollback switch
   (RFC 0008 §6; the remote-bootstrap half is POSH_RELAY).
-  experimental -> testing: `posh attach` (picker + host-scoped + attach-or-create),
-  `posh list` (unified, worker-filtered, spinclass-styled), and the command
-  palette on a local session are all in daily use on both fleet hosts.
+  experimental -> testing: `posh start`/`posh attach` (strict primitives), `ph`
+  (the create-or-attach front-door + picker; FDR 0015), `posh list` (unified,
+  worker-filtered, spinclass-styled), and the command palette on a local session
+  are all in daily use on both fleet hosts.
   testing -> accepted: two weeks of daily cross-host use with no fallback to the
   Tag::Output / inner-attach path, and a spinclass/clown remote worker created
   and reattached through the unified interface.
@@ -47,19 +48,28 @@ second PTY, no second model). The reliable socket is the lossless degenerate of
 the datagram protocol, so local attach gains morph, scrollback-sync, and the
 command palette for free. See RFC 0008 for the wire contract.
 
-**`posh attach` is the one entry point** (`posh <target>` remains sugar for it):
+**`posh start` and `posh attach` are the strict primitives** (`ph` — FDR 0015 —
+is the create-or-attach front-door over them; `posh <target>` remains sugar for
+`posh attach`):
 
-    posh attach box:dev          attach-or-create session dev on box
-    posh attach :dev / dev       local session dev (attach-or-create)
+    posh start box:dev           create session dev on box (errors if it exists)
+    posh attach box:dev          attach session dev on box (errors if absent)
+    posh start box: / posh start :   create a new auto-id session (host / local)
+    posh attach :dev / dev       attach local session dev
     posh attach box:             host-only -> TTY picker scoped to box's sessions
     posh attach user@box:        same, explicit user
     posh attach :                local host -> picker scoped to local sessions
     posh attach                  no target -> picker over local + remote sessions
-    posh attach --ephemeral box  opt into a non-durable throwaway shell
+    posh start --ephemeral       opt into a non-durable throwaway shell
+
+The strict `posh` verbs never guess: `start` only creates, `attach` only
+attaches. The create-or-attach ergonomic (resolve the target, dispatch to
+whichever) lives in `ph` (FDR 0015), not in `posh`.
 
 The no/partial-target picker is a TTY-gated charmbracelet list (the spinclass
 `internal/sessionpick` pattern) offering existing sessions and "create new",
-filterable, with each row labelled by the session's description. **When stdin is
+filterable, with each row labelled by the session's description (or its frontmost
+activity label when no description is set — RFC 0013 §5). **When stdin is
 not a TTY the picker never launches** — it errors with the candidate list so
 scripts and command substitution stay deterministic.
 
@@ -68,12 +78,22 @@ bare host (`posh box`) opens the host-scoped picker rather than spawning a
 throwaway shell. `--ephemeral` is the explicit, documented opt-out (no daemon,
 dies with the transport) and the rollback anchor.
 
+**A terse front-door and an explicit create verb.** `ph` (FDR 0015) is the
+two-character front-door over this interface: it resolves a target against the
+listing and routes to `posh attach` or to `posh start` — the explicit create
+verb, and the only path to an **auto-id durable session** (`ph box:+`), selected
+later by its activity label rather than a typed name (RFC 0013 §5). A durable
+*remote* session rides the M2 mux (`POSH_MUX_SESSIONS`, RFC 0011) and inherits
+its wire-reconnect survival, so a mux-wire blip stalls and reattaches rather than
+dropping the client to a shell.
+
 **`posh list` is unified and spinclass-styled.** It lists local and remote
 sessions and **hides remotely-spawned detached workers by default**; `--workers`
 includes them (mirroring spinclass's `running-detached` filtering). Output
 modes mirror `sc list`: tab-separated plain text for non-TTY/pipes, a styled
 lipgloss table on an interactive TTY, `--format json`, and a live-refreshing
-`--watch` view. Columns: session URI, status, last-activity, cwd, description.
+`--watch` view. Columns: session URI, status, activity (frontmost title/process,
+RFC 0013 §5), last-activity, cwd, description.
 
 **Sessions carry a settable description.** A short label (spinclass parity)
 shown in both `list` and the picker, so an attach target reads as "deploy
@@ -90,7 +110,7 @@ double-model plumbing under that, it does not add a new addressing scheme.
 Start a session on a laptop, roam, pick it up from a desktop — and the palette
 works on both, including when the desktop is the same host (local transport):
 
-    laptop$ posh attach box:dev        # creates dev on box, attaches
+    laptop$ posh start box:dev         # create dev on box and attach
     laptop$ Ctrl-^                     # command palette (now also local)
     laptop$ Ctrl-\                     # detach
     desktop$ posh attach box:dev       # same session, full replay
@@ -106,7 +126,7 @@ Pick a session interactively, scoped to a host:
 
 Spawn a spinclass/clown worker remotely, reattach later through one interface:
 
-    $ posh attach -g spinclass box:w1 --detach -- worker --serve
+    $ posh start -g spinclass box:w1 --detach -- worker --serve
     $ posh attach box:spinclass/w1     # reattach the running worker
 
 List, with and without workers:
@@ -139,11 +159,15 @@ List, with and without workers:
   history (e.g. kitty, negotiated via the reserved `TERM_FEATURES` capability)
   is tracked as **#104**. This must be resolved in Phase 2 when the local client
   gains frame consumption — it does not affect Phase 1 (inert infrastructure).
-- **The grammar revision changes two RFC 0001 forms.** `box:` was a plain
-  roaming shell and `:` was `LocalSession{":"}`; both now open pickers. There
-  is no flag day for the *wire* (negotiated), but the *CLI* meaning of these
-  two forms changes; the explicit non-interactive path is `posh attach
-  box:name`. Spelled out in RFC 0008's amendments.
+- **The grammar revision changes RFC 0001 forms and the create semantics.**
+  `box:` was a plain roaming shell and `:` was `LocalSession{":"}`; both now open
+  pickers. And `posh attach`/bare-word is no longer *attach-or-create* — that
+  ergonomic moves to `ph` (FDR 0015) while `posh attach` becomes strict attach
+  and `posh start` is the create verb. RFC 0001 §1 and RFC 0008 still describe
+  the legacy attach-or-create forms; those normative records are amended (in
+  RFC 0008's amendments) when the strict split lands. There is no flag day for
+  the *wire* (negotiated); the CLI meaning changes. The explicit non-interactive
+  attach is `posh attach box:name`, the explicit create is `posh start box:name`.
 - **`--ephemeral` may ship later.** The durable default is the feature; the
   explicit throwaway opt-out is small but deferrable if it slips the first cut.
 - **No multi-host aggregated list in v1.** `posh list box:` queries one host;
@@ -180,6 +204,16 @@ List, with and without workers:
   (kitty) integration future.
 - **#75** — the posh-proto extraction (`framereplay`, shared codecs) the daemon
   frame engine builds on.
+- **FDR 0015** (`0015-ph-front-door.md`) — the terse `ph` front-door over this
+  interface, the `posh start` create verb, the `:+` auto-id sigil, and shell
+  completion.
+- **FDR 0016** (`0016-cross-host-session-switcher.md`) — the palette-as-picker /
+  cross-host switcher the no/partial-target picker grows into.
+- **RFC 0013 §5** (`docs/rfcs/0013-server-introspection-caps.md`) — the frontmost
+  activity-label capability that labels list rows and makes auto-id sessions
+  selectable.
+- **RFC 0011** (`docs/rfcs/0011-multiplexed-datagram-channels.md`) — the M2 mux
+  durable remote sessions ride, with wire-reconnect survival.
 - **FDR 0012** (`0012-session-layer-collapse.md`) — a capability this
   unification unlocks at its tail: once `posh-server` is the RFC 0008 §3 relay,
   a remote client can collapse into an inner local session (the clown/spinclass
