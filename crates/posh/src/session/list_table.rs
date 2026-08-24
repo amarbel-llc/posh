@@ -147,16 +147,18 @@ fn legend() -> (String, usize) {
 }
 
 /// One table row, content unstyled so columns can be measured and
-/// truncated before styling. `dim_cmd` marks the CMD column as secondary
-/// text (the stale-socket error message rides there).
+/// truncated before styling. `dim_activity` marks the ACTIVITY column as
+/// secondary text (the stale-socket error message rides there).
 struct Row {
     name: String,
     status: StatusCell,
     pid: String,
     clients: String,
     dir: String,
-    cmd: String,
-    dim_cmd: bool,
+    /// The RFC 0013 §5 activity label, or the launch command when no activity
+    /// is known (a pre-activity daemon or an unreachable session).
+    activity: String,
+    dim_activity: bool,
 }
 
 fn row(s: &SessionEntry, current: Option<&str>, home: Option<&str>) -> Row {
@@ -168,8 +170,8 @@ fn row(s: &SessionEntry, current: Option<&str>, home: Option<&str>) -> Row {
             pid: String::new(),
             clients: String::new(),
             dir: String::new(),
-            cmd: format!("{err} (cleaning up)"),
-            dim_cmd: true,
+            activity: format!("{err} (cleaning up)"),
+            dim_activity: true,
         };
     }
     Row {
@@ -178,15 +180,15 @@ fn row(s: &SessionEntry, current: Option<&str>, home: Option<&str>) -> Row {
         pid: s.pid.map(|p| p.to_string()).unwrap_or_default(),
         clients: s.clients.map(|c| c.to_string()).unwrap_or_default(),
         dir: abbrev_home(s.cwd.as_deref().unwrap_or(""), home),
-        cmd: s.cmd.clone().unwrap_or_default(),
-        dim_cmd: false,
+        activity: s.activity.clone().or_else(|| s.cmd.clone()).unwrap_or_default(),
+        dim_activity: false,
     }
 }
 
-const HEADERS: [&str; 6] = ["NAME", "STATUS", "PID", "CLIENTS", "STARTED IN", "CMD"];
-/// 0-based indexes of the flexible columns, shrunk (CMD first) when the
+const HEADERS: [&str; 6] = ["NAME", "STATUS", "PID", "CLIENTS", "STARTED IN", "ACTIVITY"];
+/// 0-based indexes of the flexible columns, shrunk (ACTIVITY first) when the
 /// table overflows the terminal; every other column is content-sized.
-const CMD_COL: usize = 5;
+const ACTIVITY_COL: usize = 5;
 const DIR_COL: usize = 4;
 /// Narrowest a flexible column shrinks to before we give up and overflow.
 const MIN_FLEX: usize = 8;
@@ -200,7 +202,7 @@ fn column_widths(rows: &[Row], mut w: [usize; 6]) -> [usize; 6] {
         w[2] = w[2].max(width(&r.pid));
         w[3] = w[3].max(width(&r.clients));
         w[4] = w[4].max(width(&r.dir));
-        w[5] = w[5].max(width(&r.cmd));
+        w[5] = w[5].max(width(&r.activity));
     }
     w
 }
@@ -217,7 +219,7 @@ fn fit(mut cols: [usize; 6], term_cols: usize) -> [usize; 6] {
     if term_cols == 0 {
         return cols;
     }
-    for col in [CMD_COL, DIR_COL] {
+    for col in [ACTIVITY_COL, DIR_COL] {
         let over = table_width(&cols).saturating_sub(term_cols);
         if over == 0 {
             return cols;
@@ -285,23 +287,23 @@ pub(super) fn render(
 
     for r in &rows {
         let (dir, dir_width) = truncate(&r.dir, cols[DIR_COL]);
-        let (cmd, cmd_width) = truncate(&r.cmd, cols[CMD_COL]);
+        let (activity, activity_width) = truncate(&r.activity, cols[ACTIVITY_COL]);
         let widths = [
             width(&r.name),
             r.status.width,
             width(&r.pid),
             width(&r.clients),
             dir_width,
-            cmd_width,
+            activity_width,
         ];
-        let cmd = if r.dim_cmd { paint(DIM, &cmd) } else { cmd };
+        let activity = if r.dim_activity { paint(DIM, &activity) } else { activity };
         let cells = [
             r.name.clone(),
             r.status.text.clone(),
             r.pid.clone(),
             r.clients.clone(),
             dir,
-            cmd,
+            activity,
         ];
         out.push_str(&line(&cells, &widths, &cols));
         out.push('\n');
@@ -441,7 +443,7 @@ mod tests {
     }
 
     #[test]
-    fn stale_row_carries_error_in_cmd_column() {
+    fn stale_row_carries_error_in_activity_column() {
         let out = render(&[stale("old")], None, 0, None);
         assert!(strip_ansi(&out).contains("connection refused (cleaning up)"));
     }
@@ -456,10 +458,10 @@ mod tests {
     }
 
     #[test]
-    fn narrow_terminal_shrinks_cmd_then_dir() {
+    fn narrow_terminal_shrinks_activity_then_dir() {
         let long = || {
             let mut e = entry("dev", 1);
-            e.cmd = Some("a-very-long-create-command --with flags".to_string());
+            e.activity = Some("a-very-long-foreground-command --with flags".to_string());
             e.cwd = Some("/deeply/nested/working/directory/path".to_string());
             e
         };
