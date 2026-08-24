@@ -382,8 +382,13 @@ _POSH_MUX_SESSIONS_
 	until promotion; requires _POSH_MUX_ on and agent forwarding
 	resolved on. Any failure (endpoint unreachable, channel refused,
 	an older remote) falls back to a per-invocation connection with a
-	one-line warning. Bare-host roaming shells (*posh user@host*) are
-	unaffected.
+	one-line warning. Once riding the mux, a session SURVIVES a wire
+	outage: when the endpoint's wire is judged dead and reconnects,
+	the daemon retains the channel and reattaches it to the surviving
+	remote session — the screen stalls with the *Last contact N ago*
+	banner and resumes when the wire returns, the same roaming
+	behaviour as a per-invocation connection. Bare-host roaming shells
+	(*posh user@host*) are unaffected.
 
 _POSH_CONGESTION_
 	The RFC 0011 sender-side congestion response for agent channels,

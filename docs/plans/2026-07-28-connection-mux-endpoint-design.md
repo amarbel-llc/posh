@@ -106,6 +106,31 @@ The review's sequencing conclusion, restated: the wire increment (envelope +
 agent kind + single session channel) is necessary for both milestones but
 closes nothing by itself; M1 is the shortest path to closing posh#136.
 
+### Reconnect durability (added 2026-08-24)
+
+A promotion prerequisite surfaced while the fleet was about to move onto
+`POSH_MUX_SESSIONS` by default: a riding session channel must SURVIVE the mux
+wire's death+reconnect (posh#162 seam), not drop. Originally the dead-wire
+verdict tore down every riding session and synthesized a per-session close, so
+the foreground client — which treats an established channel's close as a
+server-side shutdown — exited to the local shell; a single link blip killed
+every terminal on the link at once, a regression of the FDR 0003 roaming
+story worst on the lossy links posh exists for. The fix keeps the client
+untouched (mosh-parity): on the verdict the daemon RETAINS each session
+channel, resets it to unconfirmed with its ref held, and the existing
+open-until-confirmed pass re-drives the OPEN with the stored target on the
+fresh wire, reattaching to the surviving remote session daemon
+(`connect_or_create` idempotency). The client is sent nothing; frames stall,
+the transport-agnostic "Last contact N ago" banner counts up, and the reattach
+repaint clears it — exactly the baseline per-invocation UDP experience. The
+wire-lost vs genuine-end distinction is structural (a real end is a relayed
+`SESSION_WIRE_CLOSE`; a wire death sends the client nothing), and a remote that
+never answers the re-OPEN falls to the existing open-timeout give-up (a real
+close the client exits on). Pinned by
+`remote::mux::tests::a_riding_session_survives_the_wire_death_and_reattaches`.
+This satisfies the "kill/reattach" leg of the promotion criteria above for the
+wire-outage case (as distinct from a deliberate client teardown).
+
 ### The FDR 0014 policy M1 needs
 
 RFC 0011 §5 binds agent serviceability to "an open `session` channel on the

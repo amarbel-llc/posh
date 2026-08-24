@@ -1748,11 +1748,19 @@ fn mux_loop(
             break;
         }
 
-        // posh#162 dead-wire verdict → reconnect. Teardown happens ONCE at
-        // the verdict: channel state is meaningless on a new wire (fresh
-        // AEAD key, fresh remote); M2 session conns get the SessionClose
-        // fallback cue exactly like the open-timeout path; agent-only refs
-        // stay held — they are what the reconnect serves.
+        // posh#162 dead-wire verdict → reconnect. Wire-scoped state is torn
+        // down ONCE at the verdict (a fresh AEAD key + fresh remote make it
+        // meaningless), but M2 session channels are RETAINED across the
+        // reconnect (posh durability): each is reset to unconfirmed with its
+        // ref kept, so the open-until-confirmed pass re-drives its OPEN with
+        // the stored target on the new wire and re-attaches to the surviving
+        // remote session daemon. The client is sent nothing — frames stall,
+        // its "Last contact N ago" banner counts up, and the reattach repaint
+        // clears it (mosh-parity; a wire blip is invisible, exactly as on the
+        // baseline per-invocation UDP path). Agent-only refs likewise stay
+        // held — refs are what the reconnect serves. A remote that never
+        // answers the re-OPEN is caught by the open-timeout give-up below (a
+        // real SessionClose the client then exits on).
         if reconnect.is_none() && liveness.dead(now) {
             util::log_write(
                 "warn",
@@ -1769,19 +1777,19 @@ fn mux_loop(
             pending_closes.clear();
             remote_ident = None;
             for c in &mut conns {
-                if c.session.take().is_none() {
+                let Some(s) = c.session.as_mut() else {
                     continue;
-                }
-                let close = MuxSessionClose {
-                    remote: true,
-                    payload: b"mux wire lost; reconnecting".to_vec(),
                 };
-                let _ = send_mux_frame(c, MuxTag::SessionClose, &close.encode());
-                if c.holds_ref {
-                    c.holds_ref = false;
-                    state.unref(now);
-                    log_ref_change("-wire-dead", c.peer_pid, &state);
-                }
+                // Retain-and-reset: the open-until-confirmed pass re-drives
+                // this OPEN with s.target on the fresh wire. Re-arm the route
+                // that routes.clear() above wiped (this MUST run after that
+                // clear), give it a fresh retransmit budget, and fire the OPEN
+                // on the first post-reconnect iteration. holds_ref stays true
+                // — the ref keeps the daemon alive to reattach.
+                s.confirmed = false;
+                s.open_sends = 0;
+                s.last_open_send = None;
+                routes.insert(s.chan, c.conn_id);
             }
             conn_state = MuxConnState::Reconnecting;
             liveness.heard(); // no re-verdicts while the reconnect runs
@@ -4195,6 +4203,192 @@ mod tests {
         agent_thread.join().unwrap();
         daemon.join().unwrap();
         peer.join().unwrap();
+        std::fs::remove_dir_all(&local_base).ok();
+        std::fs::remove_dir_all(&remote_base).ok();
+    }
+
+    /// A riding M2 session channel SURVIVES a mux-wire death+reconnect: on
+    /// the dead-wire verdict the daemon RETAINS the channel (does not tear it
+    /// down, sends the client no close), re-drives its OPEN on the fresh wire,
+    /// and reattaches — the client transport receives its frame from the
+    /// SECOND peer having NEVER seen a `Closed`. The pre-fix code synthesized
+    /// a per-session close on the verdict, so `next_frame` (which panics on
+    /// `Closed`) is the before/after guard, and `session_channels=1` after the
+    /// swap proves the retention directly. Peer 1 is a silent server (the wire
+    /// simply dies); peer 2 is a real `mux_peer_loop` reached via the
+    /// reconnect closure, serving the re-driven open + the queued keystroke.
+    #[test]
+    fn a_riding_session_survives_the_wire_death_and_reattaches() {
+        use std::io::Write;
+        use std::os::fd::AsRawFd as _;
+        use std::sync::atomic::{AtomicU32, Ordering};
+        use std::sync::Arc;
+
+        let local_base = temp_base();
+        let remote_base = temp_base();
+
+        // Peer 1: a silent server. The daemon's wire connects to it but it
+        // never answers, so the compressed-liveness probe condemns the wire.
+        let ukey1 = crate::remote::crypto::Key::random();
+        let (_server1, port1) = Connection::server((63670, 63679), &ukey1, Family::Inet).unwrap();
+
+        // Peer 2: a real mux_peer_loop. Its fake per-target daemon answers
+        // every Tag::Input with a frame in the 300+ range, so a frame from
+        // peer 2 is unmistakably post-reattach.
+        let ukey2 = crate::remote::crypto::Key::random();
+        let (server2, port2) = Connection::server((63670, 63679), &ukey2, Family::Inet).unwrap();
+        let endpoint2 = crate::remote::agent::AgentEndpoint::new_mux(&remote_base, "reattach").unwrap();
+        let peer2 = std::thread::spawn(move || {
+            let mut connector = |_target: &str| {
+                let (peer_side, daemon_side) = UnixStream::pair().unwrap();
+                peer_side.set_nonblocking(true).unwrap();
+                std::thread::spawn(move || {
+                    let mut buf = crate::session::ipc::FrameBuffer::new();
+                    let mut inputs = 0u64;
+                    daemon_side
+                        .set_read_timeout(Some(std::time::Duration::from_millis(50)))
+                        .ok();
+                    let deadline = util::now_ms() + 20_000;
+                    while util::now_ms() < deadline {
+                        let _ = buf.read_from(daemon_side.as_raw_fd());
+                        let mut wrote = false;
+                        while let Ok(Some(rec)) = buf.next() {
+                            match rec.tag {
+                                crate::session::ipc::Tag::Input => {
+                                    inputs += 1;
+                                    let frame = sync::ServerFrame {
+                                        flags: 0,
+                                        caps: crate::remote::caps::own_table(&[]),
+                                        frame_num: 300 + inputs,
+                                        input_ack: 0,
+                                        echo_ack: 0,
+                                        body: sync::FrameBody::Empty,
+                                    };
+                                    let mut out = Vec::new();
+                                    crate::session::ipc::append_frame(
+                                        &mut out,
+                                        crate::session::ipc::Tag::Frame,
+                                        &frame.encode(),
+                                    );
+                                    if (&daemon_side).write_all(&out).is_err() {
+                                        return;
+                                    }
+                                    wrote = true;
+                                }
+                                crate::session::ipc::Tag::Detach => return,
+                                _ => {}
+                            }
+                        }
+                        if !wrote {
+                            std::thread::sleep(std::time::Duration::from_millis(5));
+                        }
+                    }
+                });
+                Ok(peer_side)
+            };
+            // Generous peer timeout: the daemon only reaches peer 2 ~2 s after
+            // the verdict (immediate attempt 0 fails, backoff(1) = 2 s), so
+            // peer 2 must outlive the idle pre-connect window.
+            crate::remote::server::mux_peer_loop(server2, endpoint2, 30_000, &mut connector);
+        });
+
+        // The local mux daemon: compressed liveness so the silent peer 1 is
+        // condemned in ~2 s, and a reconnect closure that fails once (the
+        // backoff path) then swaps to peer 2.
+        let dir = local_base.clone();
+        let listener = UnixListener::bind(mux_socket_path_in(&dir, "reattach")).unwrap();
+        let agent_sock = dir.join("no-agent.sock");
+        let addr1 = format!("127.0.0.1:{port1}").parse().unwrap();
+        let daemon_conn = Connection::client(addr1, &ukey1).unwrap();
+        let attempts = Arc::new(AtomicU32::new(0));
+        let daemon = {
+            let attempts = Arc::clone(&attempts);
+            let agent_sock = agent_sock.clone();
+            std::thread::spawn(move || {
+                let addr2 = format!("127.0.0.1:{port2}").parse().unwrap();
+                mux_loop(
+                    listener,
+                    daemon_conn,
+                    &agent_sock,
+                    2_000,
+                    "reattach",
+                    &mut || {
+                        if attempts.fetch_add(1, Ordering::Relaxed) == 0 {
+                            return Err(util::Error::from("first attempt refused"));
+                        }
+                        Connection::client(addr2, &ukey2)
+                    },
+                    WireLiveness::with_thresholds(1_000, 1_000),
+                )
+            })
+        };
+
+        // Open one session through the real client half and queue a keystroke
+        // (it rides on reattach), all before the ~2 s verdict. The open is an
+        // IPC-only grant, so it returns without the wire ever serving it —
+        // `established()` is false until a frame lands.
+        let mut spawn = |_: &str| -> Result<MuxSpawn> { panic!("daemon is live") };
+        let timeout = std::time::Duration::from_secs(8);
+        let h = ensure_mux_conn(&dir, "reattach", &mut spawn, timeout, &agent_sock).unwrap();
+        let mut t = h.open_session("default/x").unwrap();
+        assert!(!t.established(), "no frame yet: peer 1 never served the open");
+        let input = sync::ClientMessage {
+            flags: 0,
+            caps: crate::remote::caps::own_table(&[]),
+            acked_frame: 0,
+            rows: 24,
+            cols: 80,
+            input_base: 0,
+            input: b"x".to_vec(),
+        }
+        .encode();
+        t.send_msg(&input);
+
+        // The wire dies (silent peer 1); the daemon RETAINS the session and
+        // reconnects to peer 2, which serves the re-driven open + the queued
+        // keystroke. The client transport receives frame 301 having NEVER seen
+        // a Closed — next_frame panics on Closed, so this is the before/after
+        // guard against the pre-fix per-session teardown.
+        let next_frame = |t: &mut MuxSessionTransport, min: u64| -> sync::ServerFrame {
+            let deadline = util::now_ms() + 15_000;
+            loop {
+                assert!(util::now_ms() < deadline, "reattached frame never arrived");
+                match t.next_event() {
+                    Some(MuxSessionEvent::Frame(b)) => {
+                        let f = sync::ServerFrame::decode(&b).unwrap();
+                        if f.frame_num >= min {
+                            return f;
+                        }
+                    }
+                    Some(MuxSessionEvent::Closed(p)) => {
+                        panic!("the client was sent a close across the wire reconnect: {p:?}")
+                    }
+                    None => std::thread::sleep(std::time::Duration::from_millis(5)),
+                }
+            }
+        };
+        let f = next_frame(&mut t, 300);
+        assert_eq!(
+            f.frame_num, 301,
+            "the retained session reattached to peer 2 and delivered its frame"
+        );
+        assert!(t.established(), "the reattached session is now established");
+        assert_eq!(
+            attempts.load(Ordering::Relaxed),
+            2,
+            "one refused establish, then the successful swap to peer 2"
+        );
+
+        // The daemon still holds the channel — retention across the verdict,
+        // not a client re-open (session_channels would read 0 on the old code
+        // once the verdict tore the session down).
+        let mut obs = ipc_observer(&mux_socket_path_in(&dir, "reattach"));
+        wait_status_contains(&mut obs, "session_channels=1 ");
+
+        drop(obs);
+        drop(t);
+        daemon.join().unwrap();
+        peer2.join().unwrap();
         std::fs::remove_dir_all(&local_base).ok();
         std::fs::remove_dir_all(&remote_base).ok();
     }

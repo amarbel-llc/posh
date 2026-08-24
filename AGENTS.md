@@ -186,8 +186,19 @@ the `eng-*(7)` manpages — read them with `man eng-versioning`,
   routes whole messages; the remote `posh-server mux` channel table applies
   the §3 relay contract per channel; `remote/client.rs`'s `Wire` seam keeps
   prediction/rendering in the foreground process), falling back
-  per-invocation on any failure. The palette's *About / transport info*
-  command shows the mode and every gate's resolved value.
+  per-invocation on any failure. **A riding session SURVIVES a mux-wire
+  death+reconnect** (posh#162 seam): on the dead-wire verdict the daemon
+  RETAINS each session channel (does not tear it down, sends the client no
+  close) with its ref held, and the open-until-confirmed pass re-drives the
+  OPEN with the stored target on the fresh wire — reattaching to the surviving
+  remote session daemon (`connect_or_create` is idempotent). The client is
+  sent nothing: frames stall, the transport-agnostic "Last contact N ago"
+  banner counts up, and the reattach repaint clears it — mosh-parity, a wire
+  blip is invisible exactly as on the baseline per-invocation UDP path
+  (`mux.rs` wire-dead verdict block; a remote that never answers the re-OPEN
+  is caught by the open-timeout give-up, a real close the client exits on).
+  The palette's *About / transport info* command shows the mode and every
+  gate's resolved value.
 - **posh-term is pure state:** feed PTY bytes via `Terminal::process`, read
   the screen via `screen()`/`dump_vt()`/`dump_text()`, drain query replies
   via `take_responses()`. `generation()` bumps on every visible change;
