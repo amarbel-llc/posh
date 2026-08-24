@@ -1,6 +1,7 @@
 //! Local session persistence (zmx port): daemon-per-session over Unix
 //! sockets, organized into groups under a socket directory.
 
+mod activity;
 pub mod client;
 pub mod daemon;
 pub mod ipc;
@@ -265,6 +266,9 @@ struct SessionEntry {
     error: Option<String>,
     cmd: Option<String>,
     cwd: Option<String>,
+    /// RFC 0013 §5 activity label (`title · process`); `None` from a
+    /// pre-activity daemon or an unreachable session.
+    activity: Option<String>,
 }
 
 pub fn cmd_list(cfg: &Config, format: ListFormat) -> Result<()> {
@@ -293,6 +297,7 @@ pub fn cmd_list(cfg: &Config, format: ListFormat) -> Result<()> {
                     error: None,
                     cmd: (!cmd.is_empty()).then_some(cmd),
                     cwd: (!probe.info.cwd.is_empty()).then_some(probe.info.cwd),
+                    activity: (!probe.info.activity.is_empty()).then_some(probe.info.activity),
                 })
             }
             Err(e) => {
@@ -303,6 +308,7 @@ pub fn cmd_list(cfg: &Config, format: ListFormat) -> Result<()> {
                     error: Some(e.to_string()),
                     cmd: None,
                     cwd: None,
+                    activity: None,
                 });
                 cleanup_stale_socket(&path);
             }
@@ -374,6 +380,10 @@ fn json_list(sessions: &[SessionEntry], current: Option<&str>) -> String {
             if let Some(cmd) = &s.cmd {
                 out.push_str(",\"cmd\":");
                 out.push_str(&json_string(cmd));
+            }
+            if let Some(activity) = &s.activity {
+                out.push_str(",\"activity\":");
+                out.push_str(&json_string(activity));
             }
             out.push_str(&format!(",\"current\":{is_current}"));
         }
@@ -696,6 +706,7 @@ mod tests {
                 error: None,
                 cmd: Some("htop -d 10".to_string()),
                 cwd: Some("/home/user".to_string()),
+                activity: Some("vim ~/notes".to_string()),
             },
             SessionEntry {
                 name: "broken".to_string(),
@@ -704,6 +715,7 @@ mod tests {
                 error: Some("ConnectionRefused".to_string()),
                 cmd: None,
                 cwd: None,
+                activity: None,
             },
             SessionEntry {
                 name: "minimal".to_string(),
@@ -712,6 +724,7 @@ mod tests {
                 error: None,
                 cmd: None,
                 cwd: None,
+                activity: None,
             },
         ];
         let json = json_list(&sessions, Some("minimal"));
@@ -720,7 +733,7 @@ mod tests {
             concat!(
                 "[",
                 "{\"name\":\"alpha\",\"pid\":1234,\"clients\":2,",
-                "\"cwd\":\"/home/user\",\"cmd\":\"htop -d 10\",\"current\":false},",
+                "\"cwd\":\"/home/user\",\"cmd\":\"htop -d 10\",\"activity\":\"vim ~/notes\",\"current\":false},",
                 "{\"name\":\"broken\",\"error\":true,\"status\":\"ConnectionRefused\"},",
                 "{\"name\":\"minimal\",\"pid\":9,\"clients\":0,\"current\":true}",
                 "]"
@@ -748,6 +761,7 @@ mod tests {
             error: None,
             cmd: None,
             cwd: None,
+            activity: None,
         }];
         let json = json_list(&sessions, None);
         assert!(json.contains("\"current\":false"));

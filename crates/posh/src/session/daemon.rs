@@ -1272,11 +1272,19 @@ fn daemon_loop(
                                 }
                                 Tag::Kill => break 'daemon,
                                 Tag::Info => {
+                                    // RFC 0013 §5 activity label: the pty's
+                                    // foreground-process command plus the
+                                    // terminal title the shell/app set.
+                                    let activity = super::activity::compose(
+                                        crate::pty::foreground_command(pty_fd).as_deref(),
+                                        term.title(),
+                                    );
                                     let info = SessionInfo {
                                         clients: (total_clients - 1) as u64,
                                         pid: child.pid,
                                         cmd: info_cmd.to_string(),
                                         cwd: cwd.to_string(),
+                                        activity,
                                     };
                                     c.queue(Tag::Info, &info.encode());
                                 }

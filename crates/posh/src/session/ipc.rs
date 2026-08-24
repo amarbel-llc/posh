@@ -239,6 +239,12 @@ impl FrameBuffer {
 
 pub const MAX_CMD_LEN: usize = 256;
 pub const MAX_CWD_LEN: usize = 256;
+pub const MAX_ACTIVITY_LEN: usize = 256;
+/// The fixed core record (clients, pid, cmd, cwd). A newer daemon APPENDS an
+/// activity label after this core (a u16 length prefix + up to MAX_ACTIVITY_LEN
+/// bytes, RFC 0013 §5); `decode` tolerates its absence so a core-only record
+/// from a pre-activity daemon still decodes (label reads empty). The encoded
+/// length is INFO_LEN + 2 + label for a newer record.
 pub const INFO_LEN: usize = 8 + 4 + 2 + 2 + MAX_CMD_LEN + MAX_CWD_LEN;
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -247,6 +253,9 @@ pub struct SessionInfo {
     pub pid: i32,
     pub cmd: String,
     pub cwd: String,
+    /// The RFC 0013 §5 activity label (`title · process`, or empty). Appended
+    /// after the fixed core on the wire; empty from a pre-activity daemon.
+    pub activity: String,
 }
 
 impl SessionInfo {
@@ -268,7 +277,7 @@ impl SessionInfo {
     }
 
     pub fn encode(&self) -> Vec<u8> {
-        let mut out = Vec::with_capacity(INFO_LEN);
+        let mut out = Vec::with_capacity(INFO_LEN + 2 + MAX_ACTIVITY_LEN);
         let cmd = self.cmd.as_bytes();
         let cwd = self.cwd.as_bytes();
         let cmd_len = cmd.len().min(MAX_CMD_LEN);
@@ -281,11 +290,21 @@ impl SessionInfo {
         out.resize(16 + MAX_CMD_LEN, 0);
         out.extend_from_slice(&cwd[..cwd_len]);
         out.resize(INFO_LEN, 0);
+        // Activity label appended after the fixed core (RFC 0013 §5). A newer
+        // client's `decode` reads it; a pre-activity client that demanded
+        // exactly INFO_LEN bytes ignores it (acceptable for local same-machine
+        // probing — a new daemon read by an old `posh list` is not a realistic
+        // local skew, unlike the old-daemon/new-client upgrade case that
+        // `decode` handles).
+        let act = self.activity.as_bytes();
+        let act_len = act.len().min(MAX_ACTIVITY_LEN);
+        out.extend_from_slice(&(act_len as u16).to_le_bytes());
+        out.extend_from_slice(&act[..act_len]);
         out
     }
 
     pub fn decode(payload: &[u8]) -> Option<SessionInfo> {
-        if payload.len() != INFO_LEN {
+        if payload.len() < INFO_LEN {
             return None;
         }
         let clients = u64::from_le_bytes(payload[0..8].try_into().ok()?);
@@ -297,11 +316,25 @@ impl SessionInfo {
         let cmd = String::from_utf8_lossy(&payload[16..16 + cmd_len]).into_owned();
         let cwd_start = 16 + MAX_CMD_LEN;
         let cwd = String::from_utf8_lossy(&payload[cwd_start..cwd_start + cwd_len]).into_owned();
+        // The activity label (RFC 0013 §5) is appended after the fixed core by a
+        // newer daemon; a pre-activity record ends at INFO_LEN and reads empty.
+        let tail = &payload[INFO_LEN..];
+        let activity = if tail.len() >= 2 {
+            let len = (u16::from_le_bytes([tail[0], tail[1]]) as usize).min(MAX_ACTIVITY_LEN);
+            if tail.len() >= 2 + len {
+                String::from_utf8_lossy(&tail[2..2 + len]).into_owned()
+            } else {
+                String::new()
+            }
+        } else {
+            String::new()
+        };
         Some(SessionInfo {
             clients,
             pid,
             cmd,
             cwd,
+            activity,
         })
     }
 }
@@ -457,9 +490,10 @@ mod tests {
             pid: 4242,
             cmd: "htop -d 10".to_string(),
             cwd: "/home/user/project".to_string(),
+            activity: "htop".to_string(),
         };
         let bytes = info.encode();
-        assert_eq!(bytes.len(), INFO_LEN);
+        assert_eq!(bytes.len(), INFO_LEN + 2 + "htop".len());
         assert_eq!(SessionInfo::decode(&bytes), Some(info));
     }
 
@@ -477,6 +511,7 @@ mod tests {
             pid: 1,
             cmd: argv.join("\0"),
             cwd: String::new(),
+            activity: String::new(),
         };
         let decoded = SessionInfo::decode(&info.encode()).unwrap();
         assert_eq!(decoded.cmd_argv(), argv);
@@ -490,9 +525,45 @@ mod tests {
             pid: 1,
             cmd: "x".repeat(400),
             cwd: "y".repeat(300),
+            activity: "z".repeat(400),
         };
         let decoded = SessionInfo::decode(&info.encode()).unwrap();
         assert_eq!(decoded.cmd.len(), MAX_CMD_LEN);
         assert_eq!(decoded.cwd.len(), MAX_CWD_LEN);
+        assert_eq!(decoded.activity.len(), MAX_ACTIVITY_LEN);
+    }
+
+    #[test]
+    fn info_activity_roundtrip() {
+        let info = SessionInfo {
+            clients: 0,
+            pid: 1,
+            cmd: "bash".to_string(),
+            cwd: String::new(),
+            activity: "~/notes · vim".to_string(),
+        };
+        assert_eq!(
+            SessionInfo::decode(&info.encode()).unwrap().activity,
+            "~/notes · vim"
+        );
+    }
+
+    #[test]
+    fn info_decodes_legacy_core_without_activity() {
+        // A pre-activity daemon (RFC 0013 §5) sends exactly the fixed core; a
+        // newer client must still decode it, with an empty activity label.
+        let info = SessionInfo {
+            clients: 1,
+            pid: 7,
+            cmd: "bash".to_string(),
+            cwd: "/tmp".to_string(),
+            activity: "dropped".to_string(),
+        };
+        let mut core = info.encode();
+        core.truncate(INFO_LEN); // drop the appended activity, as an old daemon would
+        let decoded = SessionInfo::decode(&core).unwrap();
+        assert_eq!(decoded.activity, "");
+        assert_eq!(decoded.cmd, "bash");
+        assert_eq!(decoded.cwd, "/tmp");
     }
 }

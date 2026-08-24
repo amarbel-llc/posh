@@ -51,6 +51,29 @@ pub fn foreground_pgid(fd: RawFd) -> Option<libc::pid_t> {
     (pgid > 0).then_some(pgid)
 }
 
+/// The command name of the pty's foreground process-group leader
+/// (`/proc/<pgid>/comm`) — the app the user is interacting with (`vim` at a vim
+/// prompt, the shell's own name at an idle prompt). Builds on
+/// [`foreground_pgid`]; the RFC 0013 §5 activity label's process half. `None`
+/// when `fd` is not a tty, has no foreground group, or off Linux.
+pub fn foreground_command(fd: RawFd) -> Option<String> {
+    read_comm(foreground_pgid(fd)?)
+}
+
+/// The command name of a process (`/proc/<pid>/comm`), trimmed. `None` off Linux
+/// or when the process is gone.
+#[cfg(target_os = "linux")]
+fn read_comm(pid: libc::pid_t) -> Option<String> {
+    let s = std::fs::read_to_string(format!("/proc/{pid}/comm")).ok()?;
+    let t = s.trim();
+    (!t.is_empty()).then(|| t.to_string())
+}
+
+#[cfg(not(target_os = "linux"))]
+fn read_comm(_pid: libc::pid_t) -> Option<String> {
+    None
+}
+
 pub struct PtyChild {
     pub master: RawFd,
     pub pid: libc::pid_t,

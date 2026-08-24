@@ -381,6 +381,7 @@ mod tests {
             error: None,
             cmd: Some("fish".to_string()),
             cwd: Some("/home/u/eng".to_string()),
+            activity: Some("nvim".to_string()),
         }
     }
 
@@ -392,6 +393,7 @@ mod tests {
             error: Some("connection refused".to_string()),
             cmd: None,
             cwd: None,
+            activity: None,
         }
     }
 
