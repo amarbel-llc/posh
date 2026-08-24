@@ -71,6 +71,26 @@ _name_
 	maps onto. Agent forwarding (FDR 0004) rides the later foreground
 	attach, not the spawn.
 
+# THE ph FRONT-DOOR
+
+*ph* is a terse front-door for *start* and *attach*, installed as a
+sibling command (FDR 0015). Unlike posh's grammar, *ph* treats the colon
+as the *sole* local-vs-host discriminator — a bare word is *always* a
+local session.
+
+*ph* _name_
+	Create-or-attach the local session _name_ — routes to *start* when
+	it is absent, *attach* when it is live.
+
+*ph* _host_*:*_session_
+	Create-or-attach _session_ on _host_.
+
+*ph* *:+*
+	Create a new auto-id local session (see *start*).
+
+The bare *ph* and *ph* _host_*:* pickers (FDR 0016) and remote auto-id
+(*ph* _host_*:+*) are not yet available and error with guidance.
+
 # GLOBAL OPTIONS
 
 *-g*, *--group* _GROUP_

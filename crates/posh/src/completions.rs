@@ -508,6 +508,93 @@ complete -c posh -n "__fish_seen_subcommand_from ssh" -a '(__posh_ssh_config_hos
 complete -c posh -n "__fish_seen_subcommand_from ssh" -a '(posh tailnet 2>/dev/null)' -d 'Tailnet peer'
 "#;
 
+/// The `ph` front-door completion (FDR 0015). fish only for now (the prioritized
+/// shell); bash is a follow-up. `None` for a shell without a ph script yet.
+pub fn ph_script(shell: Shell) -> Option<&'static str> {
+    match shell {
+        Shell::Fish => Some(PH_FISH_COMPLETIONS),
+        Shell::Bash | Shell::Zsh => None,
+    }
+}
+
+const PH_FISH_COMPLETIONS: &str = r#"function __ph_ssh_config_hosts
+    for file in ~/.ssh/config ~/.ssh/config.d/* ~/.ssh/conf.d/*
+        test -r $file; or continue
+        string replace -rf '^\s*[Hh]ost\s+' '' <$file | string split ' ' | string match -rv '[*?!]'
+    end | sort -u
+end
+
+function __ph_cmdline_group
+    set -l tokens (commandline -opc)
+    set -l i 1
+    set -l n (count $tokens)
+    while test $i -le $n
+        switch $tokens[$i]
+            case -g --group
+                test (math $i + 1) -le $n; and echo $tokens[(math $i + 1)]; and return
+        end
+        set i (math $i + 1)
+    end
+    if set -q POSH_GROUP
+        echo $POSH_GROUP
+    else
+        echo default
+    end
+end
+
+function __ph_hosts
+    # ssh config aliases + tailnet peers, each suffixed `:` so a completed host
+    # becomes the `host:` form the ph grammar expects.
+    begin
+        __ph_ssh_config_hosts
+        posh tailnet 2>/dev/null
+    end | sort -u | string replace -r '$' ':'
+end
+
+function __ph_remote_sessions
+    set -l host $argv[1]
+    set -l group $argv[2]
+    set -l cache_dir $HOME/.cache/posh
+    set -q XDG_CACHE_HOME; and set cache_dir $XDG_CACHE_HOME/posh
+    set -l cache $cache_dir/sessions-$host
+    set -l gflag
+    if test -n "$group" -a "$group" != default
+        set gflag -g $group
+        set cache $cache-$group
+    end
+    if test -z "$(find $cache -newermt '-30 seconds' 2>/dev/null)"
+        mkdir -p $cache_dir
+        ssh -o BatchMode=yes -o ConnectTimeout=2 $host posh $gflag list --short >$cache.new 2>/dev/null
+        and mv $cache.new $cache
+    end
+    cat $cache 2>/dev/null
+end
+
+function __ph_complete_remote_target
+    # host:<Tab> -> host:session candidates plus the host:+ new-session sigil.
+    set -l m (string match -r '^([^:\[]+):(.*)$' -- (commandline -ct)); or return
+    set -l host $m[2]
+    set -l rest $m[3]
+    if string match -q '*/*' -- $rest
+        set -l group (string split -m1 / $rest)[1]
+        __ph_remote_sessions $host $group | string replace -r '^' "$host:$group/"
+    else
+        __ph_remote_sessions $host (__ph_cmdline_group) | string replace -r '^' "$host:"
+        echo "$host:+"
+    end
+end
+
+# ph takes a single target token (no subcommands). Complete local session
+# names, ssh/tailnet hosts (as `host:`), the remote session names after a
+# `host:`, and the `:+` new-local-session sigil.
+complete -c ph -f
+complete -c ph -s g -l group -d 'Session group' -r -a '(posh groups 2>/dev/null)'
+complete -c ph -a '(posh list --short 2>/dev/null)' -d 'Local session'
+complete -c ph -a '(__ph_hosts)' -d 'Host'
+complete -c ph -a '(__ph_complete_remote_target)' -d 'Remote session'
+complete -c ph -a ':+' -d 'New local auto-id session'
+"#;
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -692,6 +779,44 @@ mod tests {
         assert!(
             out.status.success(),
             "fish --no-execute rejected the completion script: {}",
+            String::from_utf8_lossy(&out.stderr)
+        );
+    }
+
+    #[test]
+    fn ph_fish_script_covers_targets() {
+        let s = ph_script(Shell::Fish).expect("fish ph script");
+        for needle in [
+            "complete -c ph",
+            "posh list --short",
+            "__ph_ssh_config_hosts",
+            "posh tailnet",
+            "BatchMode=yes",
+            ":+",
+        ] {
+            assert!(s.contains(needle), "ph fish script missing {needle}");
+        }
+        // bash/zsh ph completions are a follow-up (fish is prioritized).
+        assert!(ph_script(Shell::Bash).is_none());
+        assert!(ph_script(Shell::Zsh).is_none());
+    }
+
+    #[test]
+    fn ph_fish_script_parses() {
+        use std::process::Command;
+        let s = ph_script(Shell::Fish).unwrap();
+        let path = std::env::temp_dir().join("posh-ph-completions-parse-check.fish");
+        if std::fs::write(&path, s).is_err() {
+            return;
+        }
+        let Ok(out) = Command::new("fish").arg("--no-execute").arg(&path).output() else {
+            let _ = std::fs::remove_file(&path);
+            return;
+        };
+        let _ = std::fs::remove_file(&path);
+        assert!(
+            out.status.success(),
+            "fish --no-execute rejected the ph script: {}",
             String::from_utf8_lossy(&out.stderr)
         );
     }

@@ -196,10 +196,19 @@ fn run() -> Result<()> {
         "completions" | "c" => {
             let shell_arg = args
                 .first()
-                .ok_or_else(|| Error::from("usage: posh completions <bash|zsh|fish>"))?;
+                .ok_or_else(|| Error::from("usage: posh completions <bash|zsh|fish> [ph]"))?;
             let shell = completions::Shell::from_str(shell_arg)
                 .ok_or_else(|| Error::Msg(format!("unknown shell {shell_arg} (bash, zsh, or fish)")))?;
-            println!("{}", shell.script());
+            // `posh completions <shell> ph` emits the ph front-door completion
+            // (FDR 0015); without the `ph` arg it emits posh's own.
+            if args.get(1).map(String::as_str) == Some("ph") {
+                let script = completions::ph_script(shell).ok_or_else(|| {
+                    Error::from("ph completions are available for fish (bash is a follow-up)")
+                })?;
+                println!("{script}");
+            } else {
+                println!("{}", shell.script());
+            }
             Ok(())
         }
         "server" => cmd_server(args),

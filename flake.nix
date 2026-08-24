@@ -275,6 +275,9 @@
               --bash <($out/bin/posh completions bash) \
               --zsh <($out/bin/posh completions zsh) \
               --fish <($out/bin/posh completions fish)
+            # FDR 0015: the ph front-door completion (fish; bash is a follow-up).
+            installShellCompletion --cmd ph \
+              --fish <($out/bin/posh completions fish ph)
             for f in doc/*.scd; do
               stem="$(basename "$f" .scd)"          # e.g. posh.1
               section="''${stem##*.}"               # 1
