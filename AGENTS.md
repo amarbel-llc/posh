@@ -290,7 +290,10 @@ read-only, `debug` group):
   no longer needs `/proc` spelunking: the palette's *About / transport info*
   shows the connected server's build + uptime (always) and its live state
   (fetched on demand while the dialog's 10 s request window is armed);
-  `posh mux ls` shows each remote endpoint's build (`remote=`); and on a
+  `posh mux ls` shows each daemon's own build (`self=` — a long-lived
+  daemon keeps running pre-upgrade code; a line without `self=` IS the
+  stale-daemon verdict), its remote endpoint's build (`remote=`), and its
+  live M2 session-channel count (`session_channels=`); and on a
   host SERVING other machines' agents, `posh ls` lists each mux peer's
   status line read from `agent/mux-<id>.status.sock` (connect → one line →
   EOF). All additive caps (ids 13/14) — an old peer on either side just

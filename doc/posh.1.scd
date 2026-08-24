@@ -184,15 +184,22 @@ Local persistence over Unix sockets.
 	remote _host_*:* sessions, ssh hosts) without manual sourcing.
 
 *mux* *ls*
-	One status line per live per-destination mux endpoint: state
-	(_connected_, or _reconnecting_ while the daemon re-establishes
-	a wire it has judged dead), peer address, the remote endpoint's
+	One status line per live per-destination mux endpoint: the
+	daemon's own build (_self=version (sha)_ — the code the
+	long-lived daemon actually runs, which a binary upgrade on disk
+	does not change; absent on a pre-self-ident daemon, which is
+	itself the "stale daemon" verdict), state (_connected_, or
+	_reconnecting_ while the daemon re-establishes a wire it has
+	judged dead), peer address, the remote endpoint's
 	build (_remote=version (sha)_, learned over the heartbeat
 	identity exchange — _unknown_ against a pre-RFC-0013 remote,
 	and again during a reconnect, when the held identity is
-	discarded until the new wire answers), last-heard age, channel
-	count, session refs, linger state, and the congestion summary
-	(cwnd, cuts, deepest backoff streak). The daily health check
+	discarded until the new wire answers), last-heard age, agent
+	channel count, the count of _$POSH_MUX_SESSIONS_ session
+	channels riding the wire (_session_channels=_ — zero here while
+	sessions were requested means every one fell back to its own
+	per-connection transport), session refs, linger state, and the
+	congestion summary (cwnd, cuts, deepest backoff streak). The daily health check
 	for a _$POSH_MUX_SESSIONS_ soak. Probing rides the observer path — no
 	session ref is taken and the endpoint's linger clock is
 	untouched. A socket whose daemon died without unlinking is

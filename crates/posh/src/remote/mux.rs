@@ -712,14 +712,24 @@ struct MuxStatusCtx<'a> {
     /// RFC 0013 §3: the remote endpoint's identity, once its heartbeat
     /// answer landed — `mux ls`'s "what build is the far end" column.
     remote_ident: Option<&'a caps::ServerIdent>,
+    /// Live M2 session channels riding this daemon's wire (confirmed or
+    /// not) — the client-host mirror of the remote endpoint status line's
+    /// `session_channels=`. Zero on a daemon that only carries agents,
+    /// which is how "my terminals asked for mux sessions but none ride"
+    /// reads from `mux ls` alone.
+    session_channels: usize,
 }
 
-/// The `MuxStatus` one-liner (FDR 0007 dump surface): peer addr, last-heard
-/// age, channel count, refs, linger state, §9.2 congestion summary.
+/// The `MuxStatus` one-liner (FDR 0007 dump surface): the daemon's OWN
+/// build (`self=` — a long-lived daemon keeps running the code it was
+/// spawned with, so "what's on disk" answers nothing about it), peer addr,
+/// remote build, last-heard age, channel counts (agent + M2 session), refs,
+/// linger state, §9.2 congestion summary.
 fn status_line(ctx: &MuxStatusCtx, state: &MuxState) -> String {
     format!(
-        "mux {key}: state={cs} peer={peer} remote={remote} heard={heard}ms channels={ch} refs={refs} linger={linger} cwnd={cwnd} cuts={cuts} streak_hwm={hwm}",
+        "mux {key}: self={slf} state={cs} peer={peer} remote={remote} heard={heard}ms channels={ch} session_channels={sess} refs={refs} linger={linger} cwnd={cwnd} cuts={cuts} streak_hwm={hwm}",
         key = ctx.key,
+        slf = format_args!("{} ({})", env!("POSH_VERSION"), env!("POSH_GIT_SHA")),
         cs = ctx.conn_state.label(),
         peer = ctx
             .peer
@@ -730,6 +740,7 @@ fn status_line(ctx: &MuxStatusCtx, state: &MuxState) -> String {
         ),
         heard = ctx.heard_age_ms,
         ch = ctx.channels,
+        sess = ctx.session_channels,
         refs = state.refs(),
         linger = if state.lingering() { "armed" } else { "off" },
         cwnd = ctx.congestion.0,
@@ -1601,6 +1612,7 @@ fn mux_loop(
             agent_source,
             congestion: agent_mux.congestion_summary(),
             remote_ident: remote_ident.as_ref(),
+            session_channels: conns.iter().filter(|c| c.session.is_some()).count(),
         };
         // The FDR 0007 on-demand dump, mux-daemon shape: the same line
         // `posh mux ls` reports, appended to the daemon's own log. NOTE:
@@ -2838,6 +2850,7 @@ mod tests {
             agent_source: Path::new(TEST_CTX_SOURCE),
             congestion: (262_144, 0, 0),
             remote_ident: None,
+            session_channels: 0,
         }
     }
 
@@ -2919,8 +2932,13 @@ mod tests {
         assert!(!line.contains('\n'), "one line: {line:?}");
         for needle in [
             "example.com-4",
+            // The daemon's OWN build: a long-lived daemon answers with the
+            // code it runs, not what's on disk — the "is this daemon stale"
+            // introspection question.
+            concat!("self=", env!("POSH_VERSION"), " (", env!("POSH_GIT_SHA"), ")"),
             "refs=1",
             "channels=0",
+            "session_channels=0",
             "heard=12ms",
             "cwnd=262144",
             "cuts=0",
@@ -3685,6 +3703,10 @@ mod tests {
         assert!(ordinal >= 2, "ordinal 1 is the reserved heartbeat stream, got {ordinal}");
         let mut obs = ipc_observer(&mux_socket_path_in(&dir, "m2open"));
         wait_status_contains(&mut obs, "refs=1 ");
+        // The status line counts the riding session channel — the client-host
+        // mirror of the endpoint's `session_channels=` (how "did my terminals
+        // actually take the mux" reads from `mux ls`).
+        wait_status_contains(&mut obs, "session_channels=1 ");
         // The wire OPEN carries the target (RFC 0011 §3.3), retransmitted
         // until confirmed — the remote peer sees it.
         let mut assembly = sync::FragmentAssembly::new();
@@ -3697,6 +3719,7 @@ mod tests {
         assert_eq!(chan.ordinal(), ordinal);
         drop(ipc);
         wait_status_contains(&mut obs, "refs=0 ");
+        wait_status_contains(&mut obs, "session_channels=0 ");
         drop(obs);
         daemon.join().unwrap();
         std::fs::remove_dir_all(&dir).ok();
