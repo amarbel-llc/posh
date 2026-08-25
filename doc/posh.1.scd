@@ -88,8 +88,11 @@ local session.
 *ph* *:+*
 	Create a new auto-id local session (see *start*).
 
-The bare *ph* and *ph* _host_*:* pickers (FDR 0016) and remote auto-id
-(*ph* _host_*:+*) are not yet available and error with guidance.
+*ph* _host_*:+*
+	Create a new auto-id session on _host_ (first free _s-N_).
+
+The bare *ph* and *ph* _host_*:* pickers (FDR 0016) are not yet available and
+error with guidance.
 
 # GLOBAL OPTIONS
 

@@ -236,12 +236,18 @@ fn ph_argv0_routes_and_defers_picker() {
     let out = run(&["box:"]);
     assert!(!out.status.success(), "ph host: should defer: {out:?}");
 
-    // `ph box:+` (remote auto-id) -> not yet supported, and keeps the user.
-    let out = run(&["me@box:+"]);
-    assert!(!out.status.success(), "ph host:+ should error: {out:?}");
-    let stderr = String::from_utf8_lossy(&out.stderr);
-    assert!(stderr.contains("not yet supported"), "ph host:+ stderr: {stderr}");
-    assert!(stderr.contains("me@box"), "ph host:+ should keep the user: {stderr}");
+    // `ph host:+` (remote auto-id) now ATTEMPTS the remote (it was deferred);
+    // an unreachable host fails fast (resolution) rather than hanging.
+    let out = run(&["me@nohost.invalid:+"]);
+    assert!(
+        !out.status.success(),
+        "ph host:+ on an unreachable host should fail: {out:?}"
+    );
+    assert!(
+        !String::from_utf8_lossy(&out.stderr).contains("not yet supported"),
+        "ph host:+ should be implemented now: {}",
+        String::from_utf8_lossy(&out.stderr)
+    );
 
     // `ph user@host` (no colon, host-looking) -> a clean host-needs-session hint,
     // NOT posh start's remote-target error.

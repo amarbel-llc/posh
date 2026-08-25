@@ -495,11 +495,14 @@ fn cmd_ph(argv: &[String]) -> Result<()> {
                 cmd_start(grp, std::slice::from_ref(&session))
             }
         }
-        PhRoute::RemoteNew { user, host, group: _ } => {
-            let dest = ph_dest(user.as_deref(), &host);
-            Err(Error::Msg(format!(
-                "ph: remote auto-id (`{dest}:+`) is not yet supported; use `ph {dest}:name`"
-            )))
+        PhRoute::RemoteNew { user, host, group: g } => {
+            // Query the host's sessions, pick the first free s-N, and create it
+            // (cmd_ssh_session create-or-attaches; the id is free, so it creates).
+            let grp = g.clone().unwrap_or_else(|| group.clone());
+            let names = remote_session_names(user.as_deref(), &host, &grp)?;
+            let id = first_free_autoid(&names)
+                .ok_or_else(|| Error::from("ph: too many remote sessions"))?;
+            cmd_ssh_session(user, host, g, &group, id, &[], &remote::agent::ForwardFlag::Unset)
         }
         PhRoute::RemoteResolve { user, host, group: g, session } => cmd_ssh_session(
             user,
@@ -1002,8 +1005,11 @@ fn remote_list_line(prefix: &str, group: &str, name: &str) -> String {
     }
 }
 
-fn cmd_list_remote(user: Option<String>, host: String, group: &str) -> Result<()> {
-    let argv = remote_list_argv(user.as_deref(), &host, group);
+/// Fetch a remote host's session names via `posh list host: --short` over ssh
+/// (group-scoped like the list path). Forwards the remote's stderr on failure.
+/// Shared by `cmd_list_remote` and `ph host:+` auto-id slot selection.
+fn remote_session_names(user: Option<&str>, host: &str, group: &str) -> Result<Vec<String>> {
+    let argv = remote_list_argv(user, host, group);
     let out = std::process::Command::new(&argv[0])
         .args(&argv[1..])
         .output()
@@ -1013,15 +1019,30 @@ fn cmd_list_remote(user: Option<String>, host: String, group: &str) -> Result<()
         let _ = std::io::stderr().write_all(&out.stderr);
         return Err(Error::Msg(format!("remote list failed on {host}")));
     }
+    Ok(String::from_utf8_lossy(&out.stdout)
+        .lines()
+        .filter(|l| !l.is_empty())
+        .map(str::to_string)
+        .collect())
+}
+
+/// The first free `s-N` auto-id not present in `used` — the remote sibling of
+/// `session::next_autoid`, for `ph host:+`. `None` past the 999 cap.
+fn first_free_autoid(used: &[String]) -> Option<String> {
+    (1..1000u32)
+        .map(|i| format!("s-{i}"))
+        .find(|c| !used.iter().any(|u| u == c))
+}
+
+fn cmd_list_remote(user: Option<String>, host: String, group: &str) -> Result<()> {
+    let names = remote_session_names(user.as_deref(), &host, group)?;
     // Every printed name is itself a valid RemoteSession target.
     let prefix = match &user {
         Some(u) => format!("{u}@{host}"),
         None => host.clone(),
     };
-    for line in String::from_utf8_lossy(&out.stdout).lines() {
-        if !line.is_empty() {
-            println!("{}", remote_list_line(&prefix, group, line));
-        }
+    for name in names {
+        println!("{}", remote_list_line(&prefix, group, &name));
     }
     Ok(())
 }
@@ -1866,6 +1887,17 @@ mod tests {
                 session: "dev".into()
             }
         );
+    }
+
+    #[test]
+    fn first_free_autoid_skips_used_slots() {
+        assert_eq!(first_free_autoid(&[]), Some("s-1".into()));
+        assert_eq!(
+            first_free_autoid(&["s-1".into(), "s-2".into(), "other".into()]),
+            Some("s-3".into())
+        );
+        // A gap is filled: s-1 is free even when s-2 is taken.
+        assert_eq!(first_free_autoid(&["s-2".into()]), Some("s-1".into()));
     }
 
     #[test]
