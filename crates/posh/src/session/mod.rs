@@ -143,9 +143,93 @@ pub(crate) fn read_status_socket(path: &Path) -> Result<String> {
     Ok(out)
 }
 
+/// The Architecture-A roaming servers' status sockets live under
+/// `<base>/remote/<pid>.status.sock` (RFC 0014 §4.1) — no group, no session
+/// name; the pid is the identity and `session=remote-<pid>` is what the
+/// server reports.
+pub(crate) fn remote_status_dir() -> PathBuf {
+    socket_base_from_env().join("remote")
+}
+
+/// `remote-<pid>` (the server's own `session=` spelling) or a bare pid,
+/// as `posh status` accepts for an Architecture-A server.
+pub(crate) fn remote_pid_from_name(name: &str) -> Option<u32> {
+    name.strip_prefix("remote-").unwrap_or(name).parse().ok()
+}
+
+/// Whether a pid names a live process (`kill(pid, 0)`; EPERM counts as
+/// alive — it exists, just not ours).
+fn process_alive(pid: u32) -> bool {
+    // SAFETY: kill with signal 0 performs no action beyond the existence /
+    // permission check; a stale pid can at worst return ESRCH.
+    let rc = unsafe { libc::kill(pid as libc::pid_t, 0) };
+    rc == 0 || std::io::Error::last_os_error().raw_os_error() == Some(libc::EPERM)
+}
+
+/// What [`remote_status_ls`] returns when no remote status sockets exist,
+/// exported so the unified `posh list` view can suppress its section.
+pub const REMOTE_LS_EMPTY: &str = "no remote sessions\n";
+
+/// The `posh ls` "remote sessions" section (RFC 0014 §4.3): one line per
+/// Architecture-A server status socket under `remote/`, condensed like the
+/// table's ECHO column. A socket whose `.status.pid` process is gone is
+/// reaped (the same rule as the mux status sockets); one whose process is
+/// alive but does not answer reads `stale`.
+pub fn remote_status_ls() -> Result<String> {
+    remote_status_ls_in(&remote_status_dir())
+}
+
+/// Pure-path enumeration behind [`remote_status_ls`]; a missing dir is
+/// "no remote sessions", not an error.
+pub(crate) fn remote_status_ls_in(dir: &Path) -> Result<String> {
+    let Ok(rd) = std::fs::read_dir(dir) else {
+        return Ok(REMOTE_LS_EMPTY.to_string());
+    };
+    let mut pids: Vec<u32> = rd
+        .filter_map(|ent| {
+            let name = ent.ok()?.file_name().into_string().ok()?;
+            name.strip_suffix(STATUS_SOCK_SUFFIX)?.parse().ok()
+        })
+        .collect();
+    pids.sort_unstable();
+    let mut out = String::new();
+    for pid in pids {
+        let sock = dir.join(format!("{pid}{STATUS_SOCK_SUFFIX}"));
+        match read_status_socket(&sock) {
+            Ok(response) => {
+                out.push_str(&format!("remote {pid}: {}\n", remote_line_summary(&response)));
+            }
+            Err(e) if !process_alive(pid) => {
+                let _ = std::fs::remove_file(&sock);
+                let _ = std::fs::remove_file(dir.join(format!("{pid}.status.pid")));
+                util::log_write("warn", &format!("reaped dead remote status socket {}: {e}", sock.display()));
+            }
+            Err(e) => out.push_str(&format!("remote {pid}: {e}\n")),
+        }
+    }
+    if out.is_empty() {
+        return Ok(REMOTE_LS_EMPTY.to_string());
+    }
+    Ok(out)
+}
+
+/// `activity=<label> echo=<summary>` from a §4.2 response — the same
+/// condensation `posh ls`'s table applies, for the remote section's lines.
+fn remote_line_summary(response: &str) -> String {
+    let activity = response
+        .lines()
+        .next()
+        .and_then(|l| l.split_once(" activity="))
+        .map(|(_, v)| v.trim())
+        .unwrap_or("?");
+    format!("activity={activity} echo={}", echo_summary(response))
+}
+
 /// `posh status [session]` (RFC 0014 §4.3): print the session's status
 /// response. With no name it reads the ENCLOSING session (`$POSH_SESSION`),
 /// failing with a one-line error naming the variable when not inside one.
+/// `remote-<pid>` or a bare pid that names no group session reads an
+/// Architecture-A server's socket under `remote/` instead.
 pub fn cmd_status(cfg: &Config, name: Option<&str>) -> Result<()> {
     let name = match name {
         Some(n) => n.to_string(),
@@ -153,10 +237,14 @@ pub fn cmd_status(cfg: &Config, name: Option<&str>) -> Result<()> {
             Error::from("posh status: not inside a session (POSH_SESSION is unset); name one")
         })?,
     };
-    let path = cfg.status_socket_path(&name);
-    if !session_socket_exists(&cfg.socket_path(&name)?) {
-        return Err(Error::Msg(format!("session does not exist session_name={name}")));
-    }
+    let session_exists = session_socket_exists(&cfg.socket_path(&name)?);
+    let path = match (session_exists, remote_pid_from_name(&name)) {
+        (false, Some(pid)) => remote_status_dir().join(format!("{pid}{STATUS_SOCK_SUFFIX}")),
+        (false, None) => {
+            return Err(Error::Msg(format!("session does not exist session_name={name}")));
+        }
+        (true, _) => cfg.status_socket_path(&name),
+    };
     match read_status_socket(&path) {
         Ok(text) => {
             print!("{text}");
@@ -917,6 +1005,50 @@ mod tests {
         }];
         let json = json_list(&sessions, None);
         assert!(json.contains("\"current\":false"));
+    }
+
+    /// `posh status` addresses an Architecture-A server as `remote-<pid>`
+    /// (the reported `session=`) or a bare pid; anything else is a name.
+    #[test]
+    fn remote_pid_from_name_accepts_both_spellings() {
+        assert_eq!(remote_pid_from_name("remote-4242"), Some(4242));
+        assert_eq!(remote_pid_from_name("4242"), Some(4242));
+        assert_eq!(remote_pid_from_name("dev"), None);
+        assert_eq!(remote_pid_from_name("remote-x"), None);
+    }
+
+    /// The remote section: a live socket is condensed, a socket whose pid is
+    /// dead is reaped (sock + pid record), an empty dir reads empty.
+    #[test]
+    fn remote_status_ls_condenses_live_and_reaps_dead() {
+        use std::io::Write as _;
+        use std::os::unix::net::UnixListener;
+        let dir = PathBuf::from(format!("/tmp/posh-remotels-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        assert_eq!(remote_status_ls_in(&dir).unwrap(), REMOTE_LS_EMPTY);
+        // Live: our own pid answers.
+        let me = std::process::id();
+        let live = UnixListener::bind(dir.join(format!("{me}.status.sock"))).unwrap();
+        std::fs::write(dir.join(format!("{me}.status.pid")), me.to_string()).unwrap();
+        let answer = std::thread::spawn(move || {
+            if let Ok((mut s, _)) = live.accept() {
+                let _ = s.write_all(
+                    b"session=remote-1 group=remote daemon=1(a) pid=1 frames=on echo_flag=1 alt_screen=0 clients=1 activity=\"vim\"\n\
+                      client pid=7 build=1(a) echo=optimistic control=auto-escalated srtt=412\n",
+                );
+            }
+        });
+        // Dead: a bound-then-dropped socket for a pid that cannot exist.
+        let dead: u32 = 4_000_000;
+        drop(UnixListener::bind(dir.join(format!("{dead}.status.sock"))).unwrap());
+        std::fs::write(dir.join(format!("{dead}.status.pid")), dead.to_string()).unwrap();
+        let out = remote_status_ls_in(&dir).unwrap();
+        answer.join().unwrap();
+        assert_eq!(out, format!("remote {me}: activity=\"vim\" echo=optimistic auto-escalated 412ms\n"));
+        assert!(!dir.join(format!("{dead}.status.sock")).exists(), "dead socket reaped");
+        assert!(!dir.join(format!("{dead}.status.pid")).exists(), "dead pid record reaped");
+        let _ = std::fs::remove_dir_all(&dir);
     }
 
     /// RFC 0014 §4.3: the `posh ls` ECHO column condenses the status

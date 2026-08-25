@@ -163,7 +163,9 @@ Local persistence over Unix sockets.
 	the working directory and command of each session, and an ECHO
 	column condensing the first attached client's echo model, control,
 	and rtt from the session's status socket (see *status*; empty for a
-	daemon that predates RFC 0014), followed
+	daemon that predates RFC 0014), followed by a "remote" section listing
+	each roaming server this host serves directly (no daemon) with its
+	activity and echo summary, and
 	by any live per-destination mux endpoints (the *mux ls* lines)
 	and, on a host that SERVES other machines' forwarded agents, one
 	status line per mux-peer status socket (build, peer, heard age,
@@ -210,7 +212,10 @@ Local persistence over Unix sockets.
 	attached through a relay shows the roaming client as the origin and
 	the relay as _via=relay_. With no _name_ the enclosing session
 	(_$POSH_SESSION_) is read — from inside a session this answers "which
-	echo mode is the terminal I am viewed through actually in". A daemon
+	echo mode is the terminal I am viewed through actually in". A roaming
+	server that owns its PTY directly (no session daemon) has no name: address
+	it as _remote-_++_pid_ (the _session=_ value it reports) or a bare _pid_,
+	which reads its socket under the base directory's _remote/_. A daemon
 	that predates RFC 0014 has no status socket and reports _stale_; a
 	client that reported nothing renders _echo=unknown_, distinct from
 	_echo=none_ (a client that reported it has no predictor).

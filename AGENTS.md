@@ -327,10 +327,11 @@ read-only, `debug` group):
   the same response on `<base>/remote/<pid>.status.sock` and in its SIGUSR2
   dump; the M2 bridge forwards like the relay; `posh ls` condenses each
   session's first client line into an ECHO column (`optimistic
-  auto-escalated 412ms`, `unknown`, `-`; `echo_summary`). NOT covered: §5
-  UPSTREAM (dead until FDR 0012 or a nesting-guard change), and `posh ls`
-  does not list the `remote/` sockets (`posh status` needs the session
-  name, so an Arch-A server is reachable only via its dump today).
+  auto-escalated 412ms`, `unknown`, `-`; `echo_summary`) and appends a
+  "remote N: activity=… echo=…" section for the `remote/` sockets (dead-pid
+  leftovers reaped); `posh status remote-<pid>` / `posh status <pid>`
+  reads an Arch-A server directly. NOT covered: §5 UPSTREAM (dead until
+  FDR 0012 or a nesting-guard change).
 - `just debug-posh-mux-silence-repro <host>` — drive the posh#161 sequence
   deterministically: SIGSTOP the local mux daemon past the remote's 15 s
   agent fast-fail and 60 s exit timeout, SIGCONT, then print both sides'

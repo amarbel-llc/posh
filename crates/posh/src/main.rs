@@ -157,6 +157,9 @@ fn run() -> Result<()> {
                 if let Some(section) = endpoint_section() {
                     print!("{section}");
                 }
+                if let Some(section) = remote_section() {
+                    print!("{section}");
+                }
             }
             Ok(())
         }
@@ -1251,6 +1254,18 @@ fn endpoint_section() -> Option<String> {
     }
 }
 
+/// The RFC 0014 §4.3 remote half of the unified listing: Architecture-A
+/// roaming servers' status sockets under `remote/` — sessions this host
+/// serves directly (no daemon), condensed to activity + echo. `None` when
+/// there are none; a probe failure degrades to a note like the others.
+fn remote_section() -> Option<String> {
+    match session::remote_status_ls() {
+        Ok(s) if s == session::REMOTE_LS_EMPTY => None,
+        Ok(s) => Some(format!("\n{s}")),
+        Err(e) => Some(format!("\nremote sessions unavailable: {e}\n")),
+    }
+}
+
 /// `posh list --watch [--interval N]` (#125/#158): the unified listing —
 /// session table + mux endpoints — re-rendered on an interval in the
 /// alternate screen (the FDR 0002 terminfo-aware smcup/rmcup pair). `q` or
@@ -1281,6 +1296,9 @@ fn list_watch_loop(cfg: &Config, interval_secs: u64) -> Result<()> {
             print!("{section}");
         }
         if let Some(section) = endpoint_section() {
+            print!("{section}");
+        }
+        if let Some(section) = remote_section() {
             print!("{section}");
         }
         print!("\n[watch: q quit, r refresh, every {interval_secs}s]");
