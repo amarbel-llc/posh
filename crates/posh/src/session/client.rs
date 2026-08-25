@@ -16,6 +16,7 @@ use crate::remote::introspect;
 use crate::remote::kittykeys::{match_kitty_seqs, KittyMatch, ESCAPE_KEY, KITTY_PALETTE_SEQS};
 use crate::remote::palette::{composite_palette, Palette, PaletteEvent};
 use crate::remote::scrollview;
+use crate::remote::stats::{FrameKind, PredictSample, Stats};
 use crate::remote::sync::{FrameBody, ScrollbackRing, ServerFrame};
 use crate::session::ipc::{self, FrameBuffer, Tag};
 use crate::session::{daemon, Config};
@@ -324,6 +325,12 @@ struct FrameRenderer {
     /// `Tag::Output` be overwritten by the first `Full` keyframe, and a `Diff`
     /// land cleanly after a SIGCONT re-enter.
     initialized: bool,
+    /// The `[stats]` collector (posh#171 item 3, local/remote parity): the
+    /// same frame / apply-histogram / render / loop-timing records the roaming
+    /// client writes under `POSH_DEBUG_LOG`, so `just debug-posh-log-gaps` /
+    /// `-loss` triage a LOCAL session too. Transport fields the socket has no
+    /// analogue for (srtt/rto/send_interval, prediction) are reported as zero.
+    stats: Stats,
     /// The wheel intent of the last live compose, so the shared renderer can
     /// tear the wheel-grab down (or re-arm it) on a want_wheel transition that
     /// isn't also a mouse_mode change — e.g. an app entering the alt-screen
@@ -385,6 +392,7 @@ impl FrameRenderer {
             scroll_opt: true,
             rows,
             cols,
+            stats: Stats::new(),
         }
     }
 
@@ -488,10 +496,29 @@ impl FrameRenderer {
             Ok(f) => f,
             Err(e) => return (Err(e.into()), None),
         };
+        // `[stats]` (posh#171): the frame's kind + arrival, then the apply
+        // outcome at each classification below — the roaming client's shape.
+        self.stats.record_frame_arrival(util::now_ms());
+        let (kind, base) = match &frame.body {
+            FrameBody::Full(_) => (FrameKind::Full, frame.frame_num),
+            FrameBody::Diff { base, .. } => (FrameKind::Diff, *base),
+            FrameBody::Morph { base, .. } => (FrameKind::Morph, *base),
+            FrameBody::Scrollback { base, .. } => (FrameKind::Scrollback, *base),
+            FrameBody::Scrollback2 { .. } => (FrameKind::Scrollback, frame.frame_num),
+            FrameBody::Empty => (FrameKind::None, frame.frame_num),
+        };
+        match kind {
+            FrameKind::Full => self.stats.record_frame_full(),
+            FrameKind::Diff | FrameKind::Morph => self.stats.record_frame_diff(),
+            FrameKind::Scrollback => self.stats.record_frame_scrollback(),
+            FrameKind::None => self.stats.record_frame_empty(),
+        }
+        self.stats.record_apply_rx(frame.frame_num, base, kind);
         // Stale retransmission: a frame older than what we hold. Re-ack our newer
         // state, do not reapply. (Degenerate on a reliable socket, kept for parity
         // and so a superseded retransmit can never regress the model.)
         if frame.frame_num < self.applied_num {
+            self.stats.record_apply_stale();
             return (Ok(Vec::new()), Some((self.applied_num, 0)));
         }
         // Scrollback growth (RFC 0002 §3): append rows to the local ring without
@@ -499,14 +526,17 @@ impl FrameRenderer {
         // base; otherwise re-ack our state (never a fatal path).
         if let FrameBody::Scrollback { base, rows } = &frame.body {
             if frame.frame_num == self.applied_num {
+                self.stats.record_apply_dup();
                 return (Ok(Vec::new()), Some((self.applied_num, 0)));
             }
             if *base != self.applied_num {
+                self.stats.record_apply_basemis();
                 return (Ok(Vec::new()), Some((self.applied_num, 0)));
             }
             let grew = rows.len();
             self.scrollback.append(rows);
             self.applied_num = frame.frame_num;
+            self.stats.record_apply_advanced();
             // While scrolled up, keep the frozen viewport anchored on the same
             // content as new rows arrive (FDR 0005: output accumulates but does
             // not yank to the bottom), then repaint the scroll-view — the local
@@ -544,23 +574,31 @@ impl FrameRenderer {
                 } else {
                     0
                 };
+                self.stats.record_apply_basemis();
                 return (Ok(Vec::new()), Some((self.applied_num, flags)));
             }
         }
         // Duplicate of the frame we already hold: re-ack, do not reapply.
         if frame.frame_num == self.applied_num {
+            self.stats.record_apply_dup();
             return (Ok(Vec::new()), Some((self.applied_num, 0)));
         }
-        match self.applier.apply(
+        let apply_start = self.stats.instrument().then(std::time::Instant::now);
+        let outcome = self.applier.apply(
             self.rows,
             self.cols,
             &self.applied_data,
             &mut self.server_term,
             &frame.body,
-        ) {
+        );
+        if let Some(t) = apply_start {
+            self.stats.record_apply_us(t.elapsed().as_micros() as u64);
+        }
+        match outcome {
             ApplyOutcome::Advanced { dump } => {
                 self.applied_data = dump;
                 self.applied_num = frame.frame_num;
+                self.stats.record_apply_advanced();
             }
             ApplyOutcome::AdvancedNoDump => {
                 // The applier advanced the model in place without re-dumping it
@@ -569,16 +607,21 @@ impl FrameRenderer {
                 // would read it. DumpDiff never returns this in Phase 1, but
                 // handle it generically so a later codec swap is inert here.
                 self.applied_num = frame.frame_num;
+                self.stats.record_apply_advanced();
             }
             // NoChange: the frame reproduced the current screen (applied_num does
             // NOT advance); re-ack our true state.
-            ApplyOutcome::NoChange => return (Ok(Vec::new()), Some((self.applied_num, 0))),
+            ApplyOutcome::NoChange => {
+                self.stats.record_apply_nochange();
+                return (Ok(Vec::new()), Some((self.applied_num, 0)));
+            }
             // Undecodable diff against a MATCHING base (base == applied_num but the
             // prefix/suffix overruns our dump — the #94 short-base class). Do NOT
             // die: re-ack + request a Full, exactly like the UDP client. Leave a
             // forensic breadcrumb (posh#137); lazily open the default per-pid sink
             // since clown launches us without POSH_DEBUG_LOG.
             ApplyOutcome::ReackAndWait => {
+                self.stats.record_apply_reack();
                 crate::remote::diag::enable_logging("client");
                 util::log_write(
                     "wedge",
@@ -957,6 +1000,8 @@ fn client_loop(stream: UnixStream, enter: &[u8], raw: &RawMode) -> Result<i32> {
     let mut sock_write_buf: Vec<u8> = Vec::with_capacity(4096);
     let mut stdout_buf: Vec<u8> = Vec::with_capacity(4096);
     let mut read_buf = FrameBuffer::new();
+    // Socket byte counters for the `[stats]` bandwidth fields (posh#171).
+    let (mut bytes_rx, mut bytes_tx) = (0u64, 0u64);
     let mut escape_matcher = EscapeKeyMatcher::default();
     let mut stream_writer = &stream;
 
@@ -1144,11 +1189,19 @@ fn client_loop(stream: UnixStream, enter: &[u8], raw: &RawMode) -> Result<i32> {
         // and this poll sets the flag without an EINTR; an infinite poll
         // would then sit raw-mode until unrelated activity. One wakeup per
         // second bounds that race (the remote loop does the same).
+        // `[stats]` loop timing (posh#171): idle = the poll wait, busy = the
+        // rest of the iteration; gated on the collector being enabled so the
+        // default session never touches the clock.
+        let timing = frame_renderer
+            .as_ref()
+            .is_some_and(|fr| fr.stats.enabled())
+            .then(std::time::Instant::now);
         match util::poll(&mut fds, 1000) {
             Ok(_) => {}
             Err(e) if e.kind() == std::io::ErrorKind::Interrupted => continue,
             Err(e) => break 'client Err(e.into()),
         }
+        let idle_us = timing.map_or(0, |t| t.elapsed().as_micros() as u64);
 
         // stdin -> daemon
         if fds[0].revents & (libc::POLLIN | err_events) != 0 {
@@ -1228,7 +1281,8 @@ fn client_loop(stream: UnixStream, enter: &[u8], raw: &RawMode) -> Result<i32> {
         if fds[1].revents & libc::POLLIN != 0 {
             match read_buf.read_from(sock_fd) {
                 Ok(0) => break 'client Ok(0),
-                Ok(_) => loop {
+                Ok(n) => loop {
+                    bytes_rx += n as u64;
                     match read_buf.next() {
                         Ok(Some(frame)) => match frame.tag {
                             Tag::Output if !frame.payload.is_empty() => {
@@ -1255,6 +1309,9 @@ fn client_loop(stream: UnixStream, enter: &[u8], raw: &RawMode) -> Result<i32> {
                                     Ok(bytes) => bytes,
                                     Err(e) => break 'client Err(e),
                                 };
+                                if !bytes.is_empty() {
+                                    fr.stats.record_render(bytes.len());
+                                }
                                 stdout_buf.extend_from_slice(&bytes);
                                 // posh#137/#87: ack our TRUE applied_num (+ any
                                 // RESYNC flag) so a coalescing daemon (which
@@ -1364,6 +1421,7 @@ fn client_loop(stream: UnixStream, enter: &[u8], raw: &RawMode) -> Result<i32> {
             match stream_writer.write(&sock_write_buf) {
                 Ok(n) => {
                     sock_write_buf.drain(..n);
+                    bytes_tx += n as u64;
                 }
                 Err(e) if e.kind() == std::io::ErrorKind::WouldBlock => {}
                 Err(e)
@@ -1389,8 +1447,43 @@ fn client_loop(stream: UnixStream, enter: &[u8], raw: &RawMode) -> Result<i32> {
         if fds[1].revents & err_events != 0 {
             break 'client Ok(0);
         }
+
+        // `[stats]` (posh#171): the wedge watchdog line + the 1 s periodic
+        // client summary, the same records the roaming client writes, so a
+        // local session's log triages with `debug-posh-log-gaps` / `-loss`.
+        if let Some(fr) = frame_renderer.as_mut() {
+            let now = util::now_ms();
+            fr.stats
+                .check_wedge(now, fr.server_term.generation(), fr.applied_num, "dumpdiff");
+            if let Some(t) = timing {
+                let total = t.elapsed().as_micros() as u64;
+                fr.stats.record_loop_iter(total.saturating_sub(idle_us), idle_us);
+            }
+            fr.stats.flush_client(
+                now,
+                0.0,
+                0,
+                0,
+                PredictSample::default(),
+                false,
+                bytes_rx,
+                bytes_tx,
+            );
+        }
     };
 
+    if let Some(fr) = frame_renderer.as_mut() {
+        fr.stats.final_client(
+            util::now_ms(),
+            0.0,
+            0,
+            0,
+            PredictSample::default(),
+            false,
+            bytes_rx,
+            bytes_tx,
+        );
+    }
     // Tear down the palette renderer (if any) on every loop exit — detach,
     // session end, signal, or error.
     if let Some(p) = palette.take() {
@@ -1726,6 +1819,56 @@ mod tests {
     /// equals the daemon screen (apply correctness), and an outer terminal fed
     /// the RENDERED escape stream shows the same grid + cursor (render
     /// correctness), across a `Full` keyframe then a `Diff`.
+    /// posh#171 item 3: the local FrameRenderer keeps the same apply
+    /// histogram the roaming client logs — a Full advances, a stale retransmit
+    /// is stale, a Diff at the wrong base is basemis, a duplicate is dup.
+    #[test]
+    fn frame_renderer_records_the_apply_histogram() {
+        let (rows, cols) = (4u16, 20u16);
+        let mut fr = FrameRenderer::new(rows, cols);
+        let full = |num: u64, text: &[u8]| {
+            let mut t = Terminal::new(rows, cols);
+            t.process(text);
+            ServerFrame {
+                flags: 0,
+                caps: caps::own_table(&[]),
+                frame_num: num,
+                input_ack: 0,
+                echo_ack: 0,
+                body: FrameBody::Full(t.dump_vt()),
+            }
+            .encode()
+        };
+        assert!(fr.render_frame(&full(1, b"one"), None).is_ok());
+        assert!(fr.render_frame(&full(2, b"two"), None).is_ok());
+        // Stale: an older frame after we hold 2.
+        assert!(fr.render_frame(&full(1, b"one"), None).is_ok());
+        // Duplicate of 2.
+        assert!(fr.render_frame(&full(2, b"two"), None).is_ok());
+        // A Diff anchored at base 1 while we hold 2: base mismatch.
+        let diff = ServerFrame {
+            flags: 0,
+            caps: caps::own_table(&[]),
+            frame_num: 3,
+            input_ack: 0,
+            echo_ack: 0,
+            body: FrameBody::Diff {
+                base: 1,
+                base_sum: None,
+                diff: vec![],
+            },
+        }
+        .encode();
+        assert!(fr.render_frame(&diff, None).is_ok());
+        let a = fr.stats.apply_snapshot();
+        assert_eq!((a.advanced, a.stale, a.dup, a.basemis), (2, 1, 1, 1), "{a:?}");
+        assert_eq!(a.last_rx_num, 3);
+        assert_eq!(a.last_rx_base, 1);
+        assert_eq!(a.last_rx_body, FrameKind::Diff);
+        let l = fr.stats.link_snapshot();
+        assert_eq!((l.frames_total, l.frames_full, l.frames_diff), (5, 4, 1));
+    }
+
     #[test]
     fn frame_renderer_reproduces_the_daemon_screen() {
         let (rows, cols) = (24u16, 80u16);

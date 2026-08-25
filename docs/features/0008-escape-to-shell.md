@@ -1,6 +1,6 @@
 ---
 status: experimental
-date: 2026-06-20
+date: 2026-08-25
 ---
 
 # Escape to shell (Ctrl-^ s)
@@ -77,9 +77,15 @@ Remap the trigger to the vi/less convention:
   again is ignored (the server's already-in-overlay guard).
 - **Request loss.** `CLIENT_FLAG_ESCAPE` is one-shot (cleared after one send), so
   a dropped request datagram just means the user presses `Ctrl-^ s` again.
-- **Roaming only (for now).** The session-attach client (`session/client.rs`),
-  where a client-local spawn would suffice, is a tracked follow-up
-  (amarbel-llc/posh#85).
+- ~~**Roaming only (for now).**~~ Resolved (FDR 0011 Phase 2.4b, posh#85):
+  the session daemon carries the same overlay (`session/daemon.rs`, the
+  `Overlay` struct + source/sink swap generalized from the roaming server),
+  summoned by the local client's palette *Shell out* over the `Tag::Shell`
+  IPC verb (`session/client.rs`), with `FLAG_OVERLAY` on its frames. The
+  overlay is daemon-side, not client-local, so a relayed roaming client and a
+  local attach share one mechanism and one cwd rule. Both paths read
+  `$POSH_ESCAPE_CMD` from the process owning the PTY (the daemon inherits it
+  from `posh start`/the first attach's environment).
 
 ## More Information
 

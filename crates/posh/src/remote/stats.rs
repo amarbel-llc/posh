@@ -212,7 +212,7 @@ impl FrameKind {
 /// Snapshot of the client apply-path histogram + last received frame, for the
 /// SIGUSR2 dump (#wedge debuggability). A climbing `basemis` together with a
 /// frozen visible model (`term_gen`) is the apply-stall fingerprint.
-#[derive(Clone, Copy, Default)]
+#[derive(Clone, Copy, Debug, Default)]
 pub struct ApplySnapshot {
     pub advanced: u64,
     pub stale: u64,
