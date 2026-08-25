@@ -12,6 +12,7 @@ use crate::pty::{self, RawMode};
 use crate::remote::caps;
 use crate::remote::display::{self, Snapshot};
 use crate::remote::framesync::{ApplyOutcome, FrameApplier, FrameSync};
+use crate::remote::introspect;
 use crate::remote::kittykeys::{match_kitty_seqs, KittyMatch, ESCAPE_KEY, KITTY_PALETTE_SEQS};
 use crate::remote::palette::{composite_palette, Palette, PaletteEvent};
 use crate::remote::scrollview;
@@ -902,6 +903,20 @@ fn suspend(raw: &RawMode) {
 /// left our alternate screen while we were stopped. `raw` is the tty's raw-mode
 /// guard, borrowed for the palette's Suspend command (temporary restore + re-arm
 /// around `SIGSTOP`).
+/// This local-attach client's RFC 0014 §1 identity: build, pid, and the wall
+/// clock at attach (the process start for introspection purposes).
+fn local_client_ident() -> introspect::Ident {
+    introspect::Ident {
+        version: env!("POSH_VERSION").into(),
+        git_sha: env!("POSH_GIT_SHA").into(),
+        pid: std::process::id(),
+        start_unix_ms: std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map(|d| d.as_millis() as u64)
+            .unwrap_or(0),
+    }
+}
+
 /// Whether the local client advertises `CAP_COALESCE` (posh#137). Default OFF
 /// (opt-IN) — the kill-switch after coalescing was found to wedge live sessions
 /// (base desync -> `ReackAndWait`). Enable with `POSH_COALESCE=1`/`on`/`true`
@@ -988,6 +1003,15 @@ fn client_loop(stream: UnixStream, enter: &[u8], raw: &RawMode) -> Result<i32> {
             payload: vec![0x1f],
         });
     }
+    // RFC 0014 §1/§2: our identity and state, unsolicited. This client has no
+    // predictor, so the state is the `echo_model = 0` report — sent anyway, so
+    // `posh status` reads `echo=none` (reported) rather than `echo=unknown`
+    // (an old client that said nothing). Init-only: with no predictor nothing
+    // in the state ever changes, so there is no heartbeat to send.
+    extra_caps.push(introspect::encode_client_ident(&local_client_ident()));
+    extra_caps.push(introspect::encode_client_state(
+        &introspect::ClientIntrospection::default(),
+    ));
     init_payload.extend_from_slice(&caps::encode_table(&caps::own_table(&extra_caps)));
     ipc::append_frame(&mut sock_write_buf, Tag::Init, &init_payload);
     // Re-assert the size via Tag::Resize: a pre-#100 daemon runs the strict

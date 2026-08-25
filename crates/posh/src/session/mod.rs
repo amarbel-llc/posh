@@ -106,6 +106,66 @@ impl Config {
         self.socket_dir
             .join(format!("{}.log", util::encode_session_name(name)))
     }
+
+    /// The session's RFC 0014 §4.1 status socket, beside the session socket:
+    /// connect → the §4.2 response → EOF. Its `.status.pid` sibling is the
+    /// liveness record written before the bind.
+    pub fn status_socket_path(&self, name: &str) -> PathBuf {
+        self.socket_dir
+            .join(format!("{}{STATUS_SOCK_SUFFIX}", util::encode_session_name(name)))
+    }
+}
+
+/// Suffix of a session's status socket (RFC 0014 §4.1). Every scan of the
+/// group dir that treats "a socket" as "a session" MUST skip these — a status
+/// socket answers text, not the session IPC, so probing it as a session
+/// reads as a corrupt daemon.
+pub const STATUS_SOCK_SUFFIX: &str = ".status.sock";
+
+/// Whether a group-dir entry name is a status socket rather than a session.
+pub(crate) fn is_status_socket_name(encoded: &str) -> bool {
+    encoded.ends_with(STATUS_SOCK_SUFFIX)
+}
+
+/// Read one status-socket response (RFC 0013 §4 / RFC 0014 §4.1 shape:
+/// connect → lines → EOF). Connect-refused or an empty answer is `stale`.
+pub(crate) fn read_status_socket(path: &Path) -> Result<String> {
+    use std::io::Read as _;
+    let mut s = UnixStream::connect(path)
+        .map_err(|e| Error::Msg(format!("stale ({e})")))?;
+    let _ = s.set_read_timeout(Some(std::time::Duration::from_secs(2)));
+    let mut out = String::new();
+    s.read_to_string(&mut out)
+        .map_err(|e| Error::Msg(format!("stale (read: {e})")))?;
+    if out.trim().is_empty() {
+        return Err(Error::from("stale (empty answer)"));
+    }
+    Ok(out)
+}
+
+/// `posh status [session]` (RFC 0014 §4.3): print the session's status
+/// response. With no name it reads the ENCLOSING session (`$POSH_SESSION`),
+/// failing with a one-line error naming the variable when not inside one.
+pub fn cmd_status(cfg: &Config, name: Option<&str>) -> Result<()> {
+    let name = match name {
+        Some(n) => n.to_string(),
+        None => std::env::var("POSH_SESSION").ok().filter(|s| !s.is_empty()).ok_or_else(|| {
+            Error::from("posh status: not inside a session (POSH_SESSION is unset); name one")
+        })?,
+    };
+    let path = cfg.status_socket_path(&name);
+    if !session_socket_exists(&cfg.socket_path(&name)?) {
+        return Err(Error::Msg(format!("session does not exist session_name={name}")));
+    }
+    match read_status_socket(&path) {
+        Ok(text) => {
+            print!("{text}");
+            Ok(())
+        }
+        Err(e) => Err(Error::Msg(format!(
+            "session {name}: status socket {e} — the daemon predates RFC 0014 or is wedged"
+        ))),
+    }
 }
 
 /// Ensure the named session exists (spawning a detached daemon when it does
@@ -298,6 +358,9 @@ pub fn cmd_list(cfg: &Config, format: ListFormat) -> Result<()> {
             continue;
         }
         let encoded = entry.file_name().to_string_lossy().into_owned();
+        if is_status_socket_name(&encoded) {
+            continue;
+        }
         let name = util::decode_session_name(&encoded);
         let path = entry.path();
         match probe_session(&path) {
@@ -526,7 +589,7 @@ pub fn cmd_detach_all(cfg: &Config) -> Result<()> {
         let Ok(file_type) = entry.file_type() else {
             continue;
         };
-        if !file_type.is_socket() {
+        if !file_type.is_socket() || is_status_socket_name(&entry.file_name().to_string_lossy()) {
             continue;
         }
         let path = entry.path();

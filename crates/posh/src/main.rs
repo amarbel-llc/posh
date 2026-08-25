@@ -160,6 +160,19 @@ fn run() -> Result<()> {
             }
             Ok(())
         }
+        // `posh status [session]` (RFC 0014 §4.3): the session's status
+        // socket — daemon build, gates, and every attached client's echo
+        // model / control / srtt / build. With no argument it reads the
+        // ENCLOSING session via $POSH_SESSION/$POSH_GROUP, the in-session
+        // "what echo mode am I being viewed through" answer.
+        "status" | "st" => {
+            let name = args.iter().find(|a| !a.starts_with('-')).map(String::as_str);
+            let group = match name {
+                Some(_) => group,
+                None => std::env::var("POSH_GROUP").unwrap_or(group),
+            };
+            session::cmd_status(&Config::new(&group)?, name)
+        }
         "attach" | "a" => cmd_attach(&group, args),
         "start" | "s" => cmd_start(&group, args),
         "kill" | "k" => {
@@ -1422,6 +1435,12 @@ SESSION COMMANDS (local persistence)
     detach-all                                 (alias: da)
         Detach all clients from all sessions in the group.
 
+    status [name]                              (alias: st)
+        Print the session's status: daemon build, gates, and every attached
+        client's echo model, control (auto/pinned), rtt, and build. With no
+        name, the enclosing session ($POSH_SESSION) — the in-session answer
+        to: which echo mode am I being viewed through? (RFC 0014)
+
     kill <name>                                (alias: k)
         Kill a session, its shell, and all attached clients.
 
@@ -2023,6 +2042,7 @@ mod tests {
             "fork",
             "detach",
             "detach-all",
+            "status",
             "kill",
             "groups",
             "history",

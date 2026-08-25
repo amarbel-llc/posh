@@ -186,12 +186,15 @@ client (the 2026-08-23 `flags: 0` incident, FDR 0006).
   and MUST discard them when the client detaches, times out, or is replaced on
   resync.
 - A relay (RFC 0008 §3) and a mux per-channel bridge (RFC 0011) MUST forward
-  both entries from the roaming client to the daemon in their own
-  `Tag::Init`/subsequent client messages, unchanged and under the same ids, so
-  the daemon retains the *originating* client's state. The relay is itself a
-  daemon client and additionally reports its own `CLIENT_IDENT`; the daemon
-  MUST keep both, keyed by originating pid, and present the relay as the
-  attachment and the roaming client as its origin.
+  both entries from the roaming client to the daemon unchanged and under the
+  same ids, so the daemon retains the *originating* client's state. On the
+  session IPC this is the `Tag::ClientCaps` verb (id 15): its payload is an
+  RFC 0001 cap table holding exactly the forwarded entries, sent whenever they
+  ride a client message (the client's own cadence bounds the cost). The relay
+  is itself a daemon client and reports its own `CLIENT_IDENT` on its
+  `Tag::Init`; the daemon treats an Init identity as the *attachment's* and a
+  `ClientCaps` identity with a different pid as the *origin*, presenting the
+  attachment as `via=relay`.
 - A serving side MUST NOT use any `CLIENT_STATE` field for behavior. It is
   display and diagnostic data; in particular a server MUST NOT gate `FLAG_ECHO`
   emission, frame pacing, or codec choice on it.

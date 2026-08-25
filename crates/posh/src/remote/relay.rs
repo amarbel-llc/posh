@@ -74,6 +74,7 @@ use crate::remote::agent::AgentEndpoint;
 use crate::remote::caps::{self, Cap};
 use crate::remote::channel;
 use crate::remote::datagram::{Connection, SEND_INTERVAL_MIN};
+use crate::remote::introspect;
 use crate::remote::server::{send_on_channel, send_payload, server_loop};
 use crate::remote::sync::{
     self, AgentStream, ClientMessage, FragmentAssembly, Fragmenter, FrameBody, InputInbox,
@@ -103,6 +104,23 @@ pub(crate) struct DaemonLink {
 /// / BASE_SUM (RFC 0008 §4). The agent caps (6/7/8) are relay-TERMINATED (Task
 /// 3.2) and MUST NOT reach the daemon; CAP_DIAG/CAP_METRICS are answered by the
 /// relay from its own transport state — so neither category is forwarded here.
+/// The RFC 0014 client-introspection entries in a client message, to be
+/// forwarded to the daemon verbatim (§3): identity, state, upstream. Nothing
+/// else is forwarded here — every other client cap is relay-terminated or
+/// negotiated on Init (`content_caps`).
+pub(crate) fn forwarded_client_caps(client_caps: &[Cap]) -> Vec<Cap> {
+    client_caps
+        .iter()
+        .filter(|c| {
+            matches!(
+                c.id,
+                caps::CAP_CLIENT_IDENT | caps::CAP_CLIENT_STATE | caps::CAP_CLIENT_UPSTREAM
+            )
+        })
+        .cloned()
+        .collect()
+}
+
 pub(crate) fn content_caps(client_caps: &[Cap]) -> Vec<Cap> {
     [caps::CAP_MORPH, caps::CAP_SCROLLBACK, caps::CAP_BASE_SUM]
         .iter()
@@ -304,7 +322,19 @@ pub(crate) fn run(
         write: Vec::new(),
         frame_offset: 0,
     };
-    let content = content_caps(&client_caps);
+    let mut content = content_caps(&client_caps);
+    // RFC 0014 §3: the relay is itself a daemon client, so its Init carries
+    // its OWN identity; the roaming client's entries follow as
+    // `Tag::ClientCaps` and the daemon presents this pid as `via=relay`.
+    content.push(introspect::encode_client_ident(&introspect::Ident {
+        version: env!("POSH_VERSION").into(),
+        git_sha: env!("POSH_GIT_SHA").into(),
+        pid: std::process::id(),
+        start_unix_ms: std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map(|d| d.as_millis() as u64)
+            .unwrap_or(0),
+    }));
     ipc::append_frame(
         &mut link.write,
         Tag::Init,
@@ -808,6 +838,19 @@ fn relay_loop(
                         peer_wants_diag = caps::find(&msg.caps, caps::CAP_DIAG).is_some();
                         peer_wants_state =
                             caps::find(&msg.caps, caps::CAP_SERVER_STATE).is_some();
+                        // RFC 0014 §3: forward the roaming client's unsolicited
+                        // introspection entries to the daemon UNCHANGED, as a
+                        // `Tag::ClientCaps` table, exactly when they ride a
+                        // message — the client's own cadence bounds the cost and
+                        // the daemon retains the ORIGINATING client's record.
+                        let forwarded = forwarded_client_caps(&msg.caps);
+                        if !forwarded.is_empty() {
+                            ipc::append_frame(
+                                &mut link.write,
+                                Tag::ClientCaps,
+                                &caps::encode_table(&forwarded),
+                            );
+                        }
                         // Agent forwarding (FDR 0004, Task 3.2): consume the peer's
                         // relay-TERMINATED agent caps into the stream + endpoint,
                         // lifted verbatim from `server.rs`. AGENT_FORWARD latches

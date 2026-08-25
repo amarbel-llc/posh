@@ -37,6 +37,13 @@ pub enum Tag {
     /// next frame is a `Full`. A reliable local client never sends this — the
     /// daemon self-acks it — so this verb exists only on the relay path.
     FrameAck = 14,
+    /// Client -> daemon: an RFC 0001 capability table carrying the RFC 0014
+    /// unsolicited client-introspection entries (`CAP_CLIENT_IDENT`,
+    /// `CAP_CLIENT_STATE`, `CAP_CLIENT_UPSTREAM`) AFTER `Tag::Init` — the relay
+    /// forwards the roaming client's entries as they arrive (RFC 0014 §3) so
+    /// the daemon retains the ORIGINATING client's record. Payload is
+    /// `caps::encode_table`; entries the daemon does not recognize are skipped.
+    ClientCaps = 15,
 }
 
 impl Tag {
@@ -57,6 +64,7 @@ impl Tag {
             12 => Tag::Frame,
             13 => Tag::Shell,
             14 => Tag::FrameAck,
+            15 => Tag::ClientCaps,
             _ => return None,
         })
     }

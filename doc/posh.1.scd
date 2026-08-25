@@ -197,6 +197,21 @@ Local persistence over Unix sockets.
 *detach-all* (alias: *da*)
 	Detach all clients from all sessions in the group.
 
+*status* [_name_] (alias: *st*)
+	Print the session's status response (RFC 0014 §4.2): a session
+	line — daemon build, pid, frames gate, the PTY's ECHO flag, alt-screen,
+	client count, activity label — then one line per attached client with
+	its build, echo model in effect, control (_auto_, _auto-escalated_,
+	_pinned-env_, _pinned-palette_, _gate-off_), rtt, codec, gates,
+	escalation thresholds, and prediction outcome counters. A client
+	attached through a relay shows the roaming client as the origin and
+	the relay as _via=relay_. With no _name_ the enclosing session
+	(_$POSH_SESSION_) is read — from inside a session this answers "which
+	echo mode is the terminal I am viewed through actually in". A daemon
+	that predates RFC 0014 has no status socket and reports _stale_; a
+	client that reported nothing renders _echo=unknown_, distinct from
+	_echo=none_ (a client that reported it has no predictor).
+
 *kill* _name_ (alias: *k*)
 	Kill a session, its shell, and all attached clients.
 

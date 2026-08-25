@@ -12,6 +12,7 @@ use crate::pty::{self, PtyChild};
 use crate::remote::caps;
 use crate::remote::display::Snapshot;
 use crate::remote::framesync::FrameProducer;
+use crate::remote::introspect;
 use crate::remote::sync::{base_checksum, FrameBody, ServerFrame};
 use crate::session::ipc::{self, FrameBuffer, SessionInfo, Tag};
 use crate::session::{self, Config};
@@ -176,9 +177,48 @@ struct ClientConn {
     /// the top of each daemon iteration; 0 until the first refresh, so a
     /// brand-new conn's replay frame errs toward echo-suppressed.
     echo_flag: u8,
+    /// RFC 0014 §3: the ORIGINATING client's introspection record — identity
+    /// and latest state from the Init table or a later `Tag::ClientCaps`.
+    /// `record_at` is when the state was decoded (`util::now_ms`), for the
+    /// §4.2 `age=`; `attach_pid` is the pid this connection's own Init
+    /// identified as, so a `ClientCaps` identity with a DIFFERENT pid marks
+    /// this attachment as a relay and that pid as the origin (`via=relay`).
+    record: introspect::ClientRecord,
+    record_at: u64,
+    attach_pid: Option<u32>,
 }
 
 impl ClientConn {
+    /// Retain the RFC 0014 entries in a cap table (§3): identity and state,
+    /// keyed to this connection. `from_init` marks the table as this
+    /// attachment's own (its pid becomes `attach_pid`); a later `ClientCaps`
+    /// identity with another pid is the origin behind a relay.
+    fn absorb_client_caps(&mut self, table: &[caps::Cap], now: u64, from_init: bool) {
+        if let Some(cap) = caps::find(table, caps::CAP_CLIENT_IDENT) {
+            if let Ok(ident) = introspect::decode_client_ident(&cap.payload) {
+                if from_init {
+                    self.attach_pid = Some(ident.pid);
+                } else if let Some(attach) = self.attach_pid.filter(|p| *p != ident.pid) {
+                    self.record.via_relay_pid = Some(attach);
+                }
+                self.record.ident = Some(ident);
+            }
+        }
+        if let Some(cap) = caps::find(table, caps::CAP_CLIENT_STATE) {
+            if let Ok(state) = introspect::decode_client_state(&cap.payload) {
+                self.record.state = Some(state);
+                self.record_at = now;
+            }
+        }
+    }
+
+    /// This client's §4.2 record with `age=` filled in from `now`.
+    fn record_now(&self, now: u64) -> introspect::ClientRecord {
+        let mut r = self.record.clone();
+        r.age_ms = r.state.map(|_| now.saturating_sub(self.record_at));
+        r
+    }
+
     fn queue(&mut self, tag: Tag, payload: &[u8]) {
         // Any append other than the coalescable visible frame `queue_frame` is
         // about to (re)establish breaks the "pending frame is a clean tail"
@@ -229,6 +269,10 @@ impl ClientConn {
                     // semantics (DumpDiff, no base_sum). Independent of `lossy` — a
                     // client is one or the other. Preserved across a bare re-Init.
                     self.coalesce = caps::find(&advertised, caps::CAP_COALESCE).is_some();
+                    // RFC 0014: a client's Init table may carry its identity
+                    // and state (the local client always does; a relay carries
+                    // its own identity here and the origin's via ClientCaps).
+                    self.absorb_client_caps(&advertised, util::now_ms(), true);
                     self.caps = advertised;
                 }
                 Err(e) => util::log_write(
@@ -874,9 +918,41 @@ fn daemon_main(
     // to open never blocks the session.
     let recorder = open_recorder(rows, cols);
 
+    // RFC 0014 §4.1: the session status socket (connect → response → EOF)
+    // beside the session socket, its `.status.pid` liveness record written
+    // before the bind. Best-effort: a failure degrades `posh status` only.
+    let status_sock = cfg.status_socket_path(name);
+    let status_pidfile = status_sock.with_extension("pid");
+    let _ = std::fs::remove_file(&status_sock);
+    let status_listener = std::fs::write(&status_pidfile, std::process::id().to_string())
+        .and_then(|()| UnixListener::bind(&status_sock))
+        .map_err(|e| {
+            util::log_write(
+                "warn",
+                &format!("status socket unavailable {}: {e}", status_sock.display()),
+            )
+        })
+        .ok();
+    if let Some(l) = &status_listener {
+        let _ = l.set_nonblocking(true);
+    }
+
     daemon_loop(
-        &listener, &child, &mut term, &mut clients, &info_cmd, &cwd, recorder,
+        &listener,
+        status_listener.as_ref(),
+        name,
+        &cfg.group,
+        &child,
+        &mut term,
+        &mut clients,
+        &info_cmd,
+        &cwd,
+        recorder,
     );
+    // The status socket is introspection, not a rendezvous: always removed.
+    drop(status_listener);
+    let _ = std::fs::remove_file(&status_sock);
+    let _ = std::fs::remove_file(&status_pidfile);
 
     // Teardown. Reap the shell first: when it already exited (the pty-EIO
     // path) WNOHANG captures its real status before the group kills below.
@@ -903,9 +979,56 @@ fn daemon_main(
     std::process::exit(code);
 }
 
+/// The session-line fields of the RFC 0014 §4.2 status response.
+struct SessionStatus<'a> {
+    name: &'a str,
+    group: &'a str,
+    daemon_pid: u32,
+    frames: bool,
+    echo_flag: bool,
+    alt_screen: bool,
+    activity: &'a str,
+}
+
+/// The RFC 0014 §4.2 status response: the session line, then one client line
+/// per attached client (`records` carry their `age=` already).
+fn status_response(s: &SessionStatus<'_>, records: &[introspect::ClientRecord]) -> String {
+    let mut out = format!(
+        "session={} group={} daemon={}({}) pid={} frames={} echo_flag={} \
+         alt_screen={} clients={} activity={:?}\n",
+        s.name,
+        s.group,
+        env!("POSH_VERSION"),
+        env!("POSH_GIT_SHA"),
+        s.daemon_pid,
+        if s.frames { "on" } else { "off" },
+        s.echo_flag as u8,
+        s.alt_screen as u8,
+        records.len(),
+        s.activity,
+    );
+    for r in records {
+        out.push_str(&introspect::render_client_line(r));
+        out.push('\n');
+    }
+    out
+}
+
+/// Answer every pending connection on the status socket (RFC 0014 §4.1):
+/// write the response, close. Never reads; a slow reader cannot stall the
+/// daemon (the write is bounded by `write_all_retry`'s budget).
+fn serve_status(listener: &UnixListener, response: &str) {
+    while let Ok((stream, _)) = listener.accept() {
+        let _ = util::write_all_retry(stream.as_raw_fd(), response.as_bytes(), 100);
+    }
+}
+
 #[allow(clippy::too_many_arguments)]
 fn daemon_loop(
     listener: &UnixListener,
+    status: Option<&UnixListener>,
+    name: &str,
+    group: &str,
     child: &PtyChild,
     term: &mut Terminal,
     clients: &mut Vec<ClientConn>,
@@ -1012,6 +1135,14 @@ fn daemon_loop(
             }
             None => usize::MAX,
         };
+        // The RFC 0014 status socket, appended last for the same reason.
+        let status_idx = match status {
+            Some(l) => {
+                fds.push(util::pollfd(l.as_raw_fd(), libc::POLLIN));
+                fds.len() - 1
+            }
+            None => usize::MAX,
+        };
 
         match util::poll(&mut fds, -1) {
             Ok(_) => {}
@@ -1046,6 +1177,30 @@ fn daemon_loop(
             util::log_write("error", "server socket error");
             break;
         }
+        // RFC 0014 §4.1: answer status readers — connect → response → close.
+        if let Some(l) = status.filter(|_| fds[status_idx].revents & libc::POLLIN != 0) {
+            let now = util::now_ms();
+            let records: Vec<introspect::ClientRecord> =
+                clients.iter().map(|c| c.record_now(now)).collect();
+            let activity = super::activity::compose(
+                crate::pty::foreground_command(pty_fd).as_deref(),
+                term.title(),
+            );
+            let response = status_response(
+                &SessionStatus {
+                    name,
+                    group,
+                    daemon_pid: std::process::id(),
+                    frames: frames_gate,
+                    echo_flag: clients.iter().any(|c| c.echo_flag != 0),
+                    alt_screen: term.is_alt_screen(),
+                    activity: &activity,
+                },
+                &records,
+            );
+            serve_status(l, &response);
+        }
+
         if fds[0].revents & libc::POLLIN != 0 {
             if let Ok((stream, _)) = listener.accept() {
                 let _ = stream.set_nonblocking(true);
@@ -1071,6 +1226,9 @@ fn daemon_loop(
                     last_drain_ms: util::now_ms(),
                     hiwater_mb: 0,
                     echo_flag: 0,
+                    record: introspect::ClientRecord::default(),
+                    record_at: 0,
+                    attach_pid: None,
                 });
             }
         }
@@ -1260,6 +1418,15 @@ fn daemon_loop(
                                         c.rows = r;
                                         c.cols = w;
                                         resized = true;
+                                    }
+                                }
+                                Tag::ClientCaps => {
+                                    // RFC 0014 §3: the relay forwarding its
+                                    // roaming client's identity/state as they
+                                    // arrive. A malformed table is dropped, the
+                                    // held record kept.
+                                    if let Ok((table, _)) = caps::decode_table(&frame.payload) {
+                                        c.absorb_client_caps(&table, util::now_ms(), false);
                                     }
                                 }
                                 Tag::Detach => {
@@ -1485,6 +1652,120 @@ fn daemon_loop(
 mod tests {
     use super::*;
 
+    /// RFC 0014 §3: an Init table's identity is the ATTACHMENT's own; a later
+    /// `ClientCaps` identity with another pid is the origin behind a relay
+    /// (`via=relay`), and its state lands with an `age=` from `record_at`.
+    #[test]
+    fn absorb_client_caps_keeps_the_originating_record_behind_a_relay() {
+        let (c, _peer) = frame_capable_conn(24, 80);
+        let mut c = c;
+        let relay = introspect::Ident {
+            version: "1".into(),
+            git_sha: "a".into(),
+            pid: 100,
+            start_unix_ms: 1,
+        };
+        c.absorb_client_caps(&[introspect::encode_client_ident(&relay)], 5, true);
+        assert_eq!(c.attach_pid, Some(100));
+        assert_eq!(c.record.via_relay_pid, None);
+        let origin = introspect::Ident {
+            pid: 200,
+            ..relay.clone()
+        };
+        let state = introspect::coverage_fixture();
+        c.absorb_client_caps(
+            &[
+                introspect::encode_client_ident(&origin),
+                introspect::encode_client_state(&state),
+            ],
+            1_000,
+            false,
+        );
+        assert_eq!(c.record.via_relay_pid, Some(100));
+        assert_eq!(c.record.ident.as_ref().map(|i| i.pid), Some(200));
+        assert_eq!(c.record.state, Some(state));
+        let line = introspect::render_client_line(&c.record_now(1_250));
+        assert!(line.contains("client pid=200 build=1(a) via=relay pid=100 echo=optimistic"), "{line}");
+        assert!(line.ends_with(" age=250"), "{line}");
+        // A malformed state entry keeps the held record.
+        c.absorb_client_caps(
+            &[caps::Cap {
+                id: caps::CAP_CLIENT_STATE,
+                payload: vec![9, 9],
+            }],
+            2_000,
+            false,
+        );
+        assert_eq!(c.record.state, Some(state));
+    }
+
+    /// RFC 0014 §4.1: the socket contract end to end — `serve_status` answers
+    /// connect → response → EOF, `read_status_socket` reads exactly that, and
+    /// a bound-then-dropped socket reads as `stale`.
+    #[test]
+    fn status_socket_serves_and_reads_the_response() {
+        // Short /tmp path so the unix socket stays within SUN_LEN (the scratch
+        // $TMPDIR is too deep) — the agent.rs/mux.rs `temp_base` convention.
+        let dir = std::path::PathBuf::from(format!("/tmp/posh-status-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let sock = dir.join("w1.status.sock");
+        let listener = UnixListener::bind(&sock).unwrap();
+        listener.set_nonblocking(true).unwrap();
+        let reader = {
+            let sock = sock.clone();
+            std::thread::spawn(move || session::read_status_socket(&sock))
+        };
+        // Poll-serve until the reader has connected and been answered.
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
+        let mut answered = false;
+        while !answered && std::time::Instant::now() < deadline {
+            let mut fds = [util::pollfd(listener.as_raw_fd(), libc::POLLIN)];
+            if util::poll(&mut fds, 100).is_ok() && fds[0].revents & libc::POLLIN != 0 {
+                serve_status(&listener, "session=w1 clients=0\n");
+                answered = true;
+            }
+        }
+        assert_eq!(reader.join().unwrap().unwrap(), "session=w1 clients=0\n");
+        drop(listener);
+        assert!(session::read_status_socket(&sock).unwrap_err().to_string().contains("stale"));
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// RFC 0014 §4.2: the session line then one client line each, the
+    /// registered fields present, an old client rendering `echo=unknown`.
+    #[test]
+    fn status_response_renders_session_and_client_lines() {
+        let reported = introspect::ClientRecord {
+            state: Some(introspect::coverage_fixture()),
+            age_ms: Some(7),
+            ..Default::default()
+        };
+        let old = introspect::ClientRecord::default();
+        let out = status_response(
+            &SessionStatus {
+                name: "w1",
+                group: "default",
+                daemon_pid: 42,
+                frames: true,
+                echo_flag: true,
+                alt_screen: false,
+                activity: "fish · ~/x",
+            },
+            &[reported, old],
+        );
+        let mut lines = out.lines();
+        let session = lines.next().unwrap();
+        assert!(session.starts_with("session=w1 group=default daemon="), "{session}");
+        assert!(session.contains(" pid=42 frames=on echo_flag=1 alt_screen=0 clients=2 activity=\"fish · ~/x\""), "{session}");
+        let first = lines.next().unwrap();
+        for key in introspect::CLIENT_FIELDS {
+            assert!(first.contains(&format!(" {key}=")), "missing {key}= in {first}");
+        }
+        assert_eq!(lines.next().unwrap(), "client build=unknown echo=unknown");
+        assert!(lines.next().is_none());
+    }
+
     fn new_term() -> Terminal {
         Terminal::with_scrollback(5, 20, 100)
     }
@@ -1630,6 +1911,9 @@ mod tests {
             last_drain_ms: 0,
             hiwater_mb: 0,
             echo_flag: 0,
+            record: introspect::ClientRecord::default(),
+            record_at: 0,
+            attach_pid: None,
         }
     }
 
@@ -1737,6 +2021,9 @@ mod tests {
             last_drain_ms: 0,
             hiwater_mb: 0,
             echo_flag: 0,
+            record: introspect::ClientRecord::default(),
+            record_at: 0,
+            attach_pid: None,
         };
         let mut init = ipc::encode_resize(rows, cols).to_vec();
         init.extend_from_slice(&caps::encode_table(&caps::own_table(&[])));
@@ -1766,6 +2053,9 @@ mod tests {
             last_drain_ms: 0,
             hiwater_mb: 0,
             echo_flag: 0,
+            record: introspect::ClientRecord::default(),
+            record_at: 0,
+            attach_pid: None,
         };
         let mut init = ipc::encode_resize(rows, cols).to_vec();
         init.extend_from_slice(&caps::encode_table(&caps::own_table(&[caps::Cap {
@@ -1962,6 +2252,9 @@ mod tests {
             last_drain_ms: 0,
             hiwater_mb: 0,
             echo_flag: 0,
+            record: introspect::ClientRecord::default(),
+            record_at: 0,
+            attach_pid: None,
         };
         let mut init = ipc::encode_resize(24, 80).to_vec();
         init.extend_from_slice(&caps::encode_table(&caps::own_table(&[])));
@@ -2167,6 +2460,9 @@ mod tests {
             last_drain_ms: 0,
             hiwater_mb: 0,
             echo_flag: 0,
+            record: introspect::ClientRecord::default(),
+            record_at: 0,
+            attach_pid: None,
         };
         let mut init = ipc::encode_resize(rows, cols).to_vec();
         init.extend_from_slice(&caps::encode_table(&caps::own_table(&[])));
@@ -2381,6 +2677,9 @@ mod tests {
             last_drain_ms: 0,
             hiwater_mb: 0,
             echo_flag: 0,
+            record: introspect::ClientRecord::default(),
+            record_at: 0,
+            attach_pid: None,
         };
         let mut init = ipc::encode_resize(rows, cols).to_vec();
         init.extend_from_slice(&caps::encode_table(&caps::own_table(&[caps::Cap {
@@ -2679,6 +2978,9 @@ mod tests {
             last_drain_ms: 0,
             hiwater_mb: 0,
             echo_flag: 0,
+            record: introspect::ClientRecord::default(),
+            record_at: 0,
+            attach_pid: None,
         };
         let mut table = vec![caps::Cap {
             id: caps::CAP_LOSSY,
@@ -3045,6 +3347,9 @@ mod tests {
             last_drain_ms: 0,
             hiwater_mb: 0,
             echo_flag: 0,
+            record: introspect::ClientRecord::default(),
+            record_at: 0,
+            attach_pid: None,
         };
         let mut init = ipc::encode_resize(rows, cols).to_vec();
         init.extend_from_slice(&caps::encode_table(&caps::own_table(&[caps::Cap {
@@ -3240,6 +3545,9 @@ mod tests {
             last_drain_ms: 0,
             hiwater_mb: 0,
             echo_flag: 0,
+            record: introspect::ClientRecord::default(),
+            record_at: 0,
+            attach_pid: None,
         };
         let mut init = ipc::encode_resize(rows, cols).to_vec();
         init.extend_from_slice(&caps::encode_table(&caps::own_table(&[
