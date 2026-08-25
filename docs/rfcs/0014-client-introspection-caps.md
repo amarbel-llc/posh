@@ -207,8 +207,12 @@ response per accepted connection then close, never read, non-fatal bind
 failure. Readers treat connect-timeout or empty output as `stale`.
 
 A roaming `posh-server` that owns its PTY directly (Architecture A) has no
-session dir; it MUST answer the same response on `SIGUSR2` (its diag dump,
-FDR 0007) and MAY bind the socket under `<base>/remote/<pid>.status.sock`.
+session dir; it MUST bind the same socket under
+`<base>/remote/<pid>.status.sock` with the same liveness record, response, and
+GC rules, and MUST additionally emit the response in its `SIGUSR2` diag dump
+(FDR 0007). `posh status` and `posh ls` MUST read the `remote/` sockets
+alongside the session dirs. The two roles differ only in the path; a reader
+MUST NOT be able to tell from the response which role answered.
 
 #### 4.2 Response format
 
@@ -319,6 +323,23 @@ observable behavior — MUST surface as a field before the change lands (the
 §2.3 `gate_off`/`pinned_*` bits are the pattern). An FDR introducing such an
 axis SHOULD state, in its Interface section, which field carries it.
 
+### Appendix A (informative): the local/remote introspection divergences this document consolidates
+
+The 2026-08-25 sweep of local (session daemon + local-attach client) versus
+remote (roaming server/client, relay, mux) behavior found these introspection
+gaps; §4 and §6 are their consolidation. Feature-parity gaps outside
+introspection (echo prediction, resync, scrollback v2, agent forwarding on
+local-origin sessions, sizing arbitration — the #87/#53/#137 class) are tracked
+separately and are out of this document's scope; the remaining untracked
+local/remote divergences the same sweep found are posh#171.
+
+| Axis | Local today | Remote today | Consolidated by |
+|---|---|---|---|
+| `SIGUSR2` transport dump | none under `session/` | `remote/diag.rs` client, server, mux daemon (FDR 0007) | §4.1 (daemon answers on the socket), §6 (all dumps render one struct) |
+| Status socket | daemon answers only the `posh list` IPC reply | mux `agent/mux-<id>.status.sock` (RFC 0013 §4); Arch-A server none | §4.1 (`<session>.status.sock` and `remote/<pid>.status.sock`, one response) |
+| Client-state visibility | client has no predictor, sends nothing | client holds everything, sends nothing | §1–§3 (`echo_model` = 0 for a predictor-less client is still a report) |
+| Periodic `[stats]` log records | local client honors `POSH_DEBUG_LOG` but emits no transport records | full periodic records + `#wedge` breadcrumbs | not consolidated here — posh#171 |
+
 ## Security Considerations
 
 `CLIENT_IDENT` and `CLIENT_STATE` reveal the client's build, pid, start time,
@@ -343,8 +364,13 @@ its content, and only to a peer that already sees the session frames.
 
 ## Conformance Testing
 
-Conformance tests live in `crates/posh/zz-tests_bats/` alongside the existing
-suite, using binary injection via `bats-emo`:
+Per the repo's convention (RFC 0001, RFC 0002), the cargo suite under
+`crates/posh/src/**/tests` and `crates/posh-proto` is the normative home for
+conformance until a `zz-tests_bats/` lane exists — no bats lane exists in the
+repo today. The bats files named below are the implementation plan's targets
+for that lane and land with the sections they cover; until then the cargo
+tests for the same rows are normative. The bats lane uses binary injection via
+`bats-emo`:
 
     require_bin POSH posh
 

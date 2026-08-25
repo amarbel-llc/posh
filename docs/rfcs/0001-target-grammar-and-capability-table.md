@@ -202,6 +202,18 @@ entries: count × ( id: u8, len: u8, payload: len bytes )
   payloads it could misparse. (Capability *entries* themselves are
   always safe to send once the peer has sent any table, and are safe in
   the sender's own table regardless, since unknown ids are skipped.)
+- **Amendment (RFC 0014): unsolicited state-bearing entries.** The
+  request/answer discipline above (an entry is attached while the peer's
+  most recent message asked for it, so steady-state cost is zero once
+  held) presumes the *consumer* can ask. Where the consumer is the
+  serving side — which cannot request from a client that has not offered
+  — a registry entry MAY be declared **unsolicited**: the sender attaches
+  it without a request. An unsolicited entry MUST be display/diagnostic
+  data that never gates behavior, MUST be sent on the first message of a
+  connection and after any resync, MUST be re-sent on change, and MUST
+  bound its steady-state cost by a stated heartbeat cadence and a stated
+  per-second cap in its defining RFC. Its registry row MUST say
+  "unsolicited". Ids 16–18 are the first such entries.
 
 #### Capability registry
 
@@ -223,9 +235,9 @@ entries: count × ( id: u8, len: u8, payload: len bytes )
 | 13 | `SERVER_IDENT` | both | client: empty; server: 15–175 bytes | Server identity (RFC 0013 §1): fmt byte, pid `u32` LE, start-time `u64` LE, then length-prefixed version and git-sha strings. Client entry requests it (re-sent until held, and after a resync); the server attaches its identity while requested — the always-available half of server introspection. |
 | 14 | `SERVER_STATE` | both | client: empty; server: `ServerDiag` | On-demand server state (RFC 0013 §2): the RELEASED request id for the `ServerDiag` payload experimental `DIAG` (224) carries in a debug posture. Answered under the id the client requested with; new consumers MUST use this id (posh#150). |
 | 15 | `SESSION_ACTIVITY` | both | client: empty; server: 3–259 bytes | Session activity label (RFC 0013 §5): fmt byte, then length-prefixed foreground-process command and terminal title. Client entry requests it (bounded window, as for id 14); the daemon attaches it while requested and refreshes on change. Also carried in enumeration (`posh list`, the mux status line) so a session is selectable without attaching. |
-| 16 | `CLIENT_IDENT` | client | 15–175 bytes | Client identity (RFC 0014 §1): same layout as id 13's server payload. Sent unconditionally on the first message of a connection, after any resync/reconnect, and at a slow cadence; forwarded unchanged by a relay/bridge so the daemon holds the ORIGINATING client's identity. A server MUST NOT send it. |
-| 17 | `CLIENT_STATE` | client | ≥ 37 bytes | Client echo/transport state (RFC 0014 §2): fmt byte, echo model in effect, escalation-control and gate bit sets, codec, SRTT/RTO, the sender's escalation thresholds, and prediction outcome counters. Sent UNCONDITIONALLY (no request) on connect, on any non-counter change, and at a heartbeat; grows by appending (a reader keeps the `0x01` prefix). Display/diagnostic only — never gates behavior. |
-| 18 | `CLIENT_UPSTREAM` | client | 4–4100 bytes | Enclosing-session client lines (RFC 0014 §5): a local attach made inside a session forwards the outer session's status-socket client lines as opaque text so the inner daemon can show what the outer session is viewed through. Expected to be subsumed by FDR 0012's collapse path; retained for intentional nesting. |
+| 16 | `CLIENT_IDENT` | client | 15–175 bytes | Client identity (RFC 0014 §1): same layout as id 13's server payload. **Unsolicited**: sent on the first message of a connection, after any resync/reconnect, and at a slow cadence; forwarded unchanged by a relay/bridge so the daemon holds the ORIGINATING client's identity. A server MUST NOT send it. |
+| 17 | `CLIENT_STATE` | client | ≥ 37 bytes | Client echo/transport state (RFC 0014 §2): fmt byte, echo model in effect, escalation-control and gate bit sets, codec, SRTT/RTO, the sender's escalation thresholds, and prediction outcome counters. **Unsolicited** (the amendment above): sent on connect, on any non-counter change, and at a 5 s heartbeat, ≤ 1/s; grows by appending (a reader keeps the `0x01` prefix). Display/diagnostic only — never gates behavior. |
+| 18 | `CLIENT_UPSTREAM` | client | 4–4100 bytes | Enclosing-session client lines (RFC 0014 §5). **Unsolicited**, sent once on `Tag::Init`: a local attach made inside a session forwards the outer session's status-socket client lines as opaque text so the inner daemon can show what the outer session is viewed through. Expected to be subsumed by FDR 0012's collapse path; retained for intentional nesting. |
 | 19–223 | — | — | — | Unassigned; allocate sequentially via this registry. |
 | 224–255 | — | — | — | Reserved for experiments; MUST NOT appear in released builds. |
 
