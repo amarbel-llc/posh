@@ -75,6 +75,10 @@ impl MoshPredictor {
         }
     }
 
+    /// The model's SHOW ADVICE (mosh's display preference): `adaptive`
+    /// recommends painting only once the srtt/glitch trigger is up. Since the
+    /// predictor/renderer split this is a recommendation the renderer may
+    /// disregard (`ShowPolicy::Always` does; `Advised` honors it).
     fn shown(&self) -> bool {
         match self.display_preference {
             PredictionModel::Never => false,
@@ -298,11 +302,15 @@ impl Predictor for MoshPredictor {
     }
 
     fn render(&self, fb: &mut Snapshot, renderer: &dyn PredictionRenderer) {
-        if !self.shown() {
-            return;
-        }
-        self.buf
-            .render(fb, renderer, self.buf.confirmed_epoch, self.flagging);
+        // The model's recommendation, not its decision: the adaptive/always
+        // preference (`shown`), the slow-link flag, and the tentative-epoch
+        // hold all ride the advice; the renderer's policy decides.
+        let advice = super::RenderAdvice {
+            show: self.shown(),
+            flag: self.flagging,
+            confirmed_epoch: self.buf.confirmed_epoch,
+        };
+        self.buf.render(fb, renderer, &advice);
     }
 
     fn reset(&mut self) {
@@ -697,19 +705,22 @@ mod tests {
     }
 
     #[test]
-    fn adaptive_hides_predictions_on_fast_link() {
+    fn adaptive_advises_against_showing_on_a_fast_link() {
+        use super::super::{Policed, ShowPolicy};
         let (mut eng, fb) = confirmed_engine(PredictionModel::Adaptive, b"$ ");
         eng.set_send_interval(10);
         eng.cull(&fb, 50);
         eng.new_user_byte(b'x', &fb, 100);
+        assert!(eng.active(), "the prediction exists either way");
+        assert!(!eng.shown(), "the MODEL advises not to show on a fast link");
+        // A renderer honoring the advice hides it (mosh's original behavior)…
+        let mut overlaid = fb.clone();
+        eng.render(&mut overlaid, &Policed::new(ReplaceRenderer, ShowPolicy::Advised));
+        assert_eq!(shown_char(&overlaid, 0, fb.cursor_col), ' ', "advised: hidden");
+        // …the default renderer disregards it and paints.
         let mut overlaid = fb.clone();
         eng.render(&mut overlaid, &ReplaceRenderer);
-        assert_eq!(
-            shown_char(&overlaid, 0, fb.cursor_col),
-            ' ',
-            "fast link: predictions exist but are not displayed"
-        );
-        assert!(eng.active());
+        assert_eq!(shown_char(&overlaid, 0, fb.cursor_col), 'x', "always: painted");
     }
 
     #[test]

@@ -189,15 +189,20 @@ Observed on a pinned `always`: no underline, and a visible hold on the first
 keystroke after Enter. Both were mosh policy living in the render path — the
 slow-link `flagging` (send interval >80 ms) chose the underline, and the
 tentative-epoch gate hid a new epoch's first cell for a round trip. These are
-render-UX choices, orthogonal to what a model predicts, so they moved onto the
-`PredictionRenderer` as policy hooks: `shows_tentative()` (paint a held
-prediction the moment the model produced it) and `always_flags()` (mark every
-predicted cell). Both are `true` for every renderer today — so `adaptive`,
-`always`, and `optimistic` all paint immediately and marked, and the "dim
-optimistic echo: off" lever below is superseded (every renderer marks; `dim`
-vs `replace` picks faint vs underline). The model keeps WHAT and WHETHER:
-adaptive's triggers, `never`, and the ECHO-off/alt-screen safety gate are
-unchanged. The flag/hold remain as advisory model state in the stats.
+render-UX choices, orthogonal to what a model predicts. Adaptive's srtt/glitch
+"show" trigger turned out to be the same kind of thing (the model records
+predictions regardless; the trigger only gated painting), so all three moved:
+the model now hands the renderer a `RenderAdvice { show, flag,
+confirmed_epoch }` — a recommendation — and the renderer's `ShowPolicy`
+(`POSH_PREDICTION_SHOW`) decides. `always` (default) paints every held
+prediction immediately and marks every cell, so `adaptive` and `always` look
+identical and the "dim optimistic echo: off" lever below is superseded (`dim`
+vs `replace` picks faint vs underline). `advised` honors the advice — mosh's
+original behavior as a render choice. The model keeps WHAT: the machinery,
+`never` (records nothing), and the safety gate — which is now applied
+universally by the client (RFC 0007 §5.1: no model renders while the remote
+PTY has ECHO off or the alt-screen is up), since the mosh hold no longer
+masks a password prompt's first keystroke.
 
 ## Tuning Levers
 

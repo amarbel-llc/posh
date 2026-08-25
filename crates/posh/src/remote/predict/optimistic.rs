@@ -156,11 +156,14 @@ impl Predictor for OptimisticPredictor {
     }
 
     fn render(&self, fb: &mut Snapshot, renderer: &dyn PredictionRenderer) {
-        // Optimistic's MODEL verdict: every active prediction is showable now
-        // (no tentative gate) and it raises no slow-link flag (FDR 0006). The
-        // renderer's own policy (`shows_tentative`/`always_flags`) decides the
-        // final look — today that marks these cells too.
-        self.buf.render(fb, renderer, u64::MAX, false);
+        // Optimistic's ADVICE: show now, hold nothing, no slow-link flag
+        // (FDR 0006). The renderer's policy decides the final look.
+        let advice = super::RenderAdvice {
+            show: true,
+            flag: false,
+            confirmed_epoch: u64::MAX,
+        };
+        self.buf.render(fb, renderer, &advice);
     }
 
     fn reset(&mut self) {

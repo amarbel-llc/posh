@@ -228,15 +228,20 @@ the `eng-*(7)` manpages — read them with `man eng-versioning`,
   in-band stays escalated by design; `POSH_ECHO_ESCALATE=0` opts out); any
   explicit model pins — env `adaptive` included — and the palette's
   `Echo: adaptive` re-arms. **Predictor vs renderer are orthogonal axes
-  (2026-08-25 split):** the model decides WHAT is predicted and WHETHER
-  (adaptive's srtt/glitch triggers, `never`, the ECHO-off/alt-screen safety
-  gate); the `PredictionRenderer` decides WHEN a held prediction appears and
-  HOW it looks — `shows_tentative()` and `always_flags()`, both `true` today,
-  so every model paints the first post-Enter keystroke immediately and every
-  predicted cell is marked (underline for `replace`, faint for `dim`). mosh's
-  tentative-epoch hold and its slow-link flag survive only as advisory model
-  state (`flagging`, `srtt_trigger` in the stats); `always` ≈ `adaptive` on a
-  slow link still holds for the model's decisions.
+  (2026-08-25 split):** the model decides WHAT is predicted and hands the
+  renderer a `RenderAdvice` — its recommendation on showing (adaptive's
+  srtt/glitch trigger), holding (the tentative epoch), and marking (the
+  slow-link flag) — which the renderer honors or disregards.
+  `POSH_PREDICTION_SHOW=always` (default) disregards it: every model paints
+  immediately and every cell is marked, so `adaptive` and `always` LOOK
+  identical (they record the same predictions; only their advice differs).
+  `=advised` honors it — mosh's original behavior as a render choice.
+  `POSH_PREDICTION_RENDER=replace|dim` is the look. Above both axes sits the
+  RFC 0007 §5.1 safety gate: the client skips rendering for EVERY model while
+  the remote PTY has ECHO off or the alt-screen is up (`optimistic_echo_on`
+  at the render call) — before the split the mosh models' hold happened to
+  mask most password-prompt leaks; now the gate is explicit. `never` is the
+  one model that records nothing.
 
 ## Debugging a live / wedged roaming session
 

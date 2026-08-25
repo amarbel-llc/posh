@@ -108,13 +108,22 @@ _POSH_ECHO_ESCALATE_
 _POSH_PREDICTION_RENDER_
 	How predicted cells are painted, independent of the model: _replace_
 	(default; replace the glyph and underline it) or _dim_ (replace the
-	glyph and mark it faint). Every renderer paints a prediction the moment
-	the model produces it (no round-trip hold on the first keystroke after
-	Enter) and marks every predicted cell; the model's slow-link flag and
-	tentative-epoch state are advisory. The render style and the model are
-	separate experimentation axes: the model decides what is predicted and
-	whether (_adaptive_'s triggers, _never_, the ECHO-off/alt-screen gate),
-	the renderer decides when it appears and how it looks.
+	glyph and mark it faint). The render style, the show policy, and the
+	model are separate experimentation axes: the model decides what is
+	predicted and hands the renderer its advice; the renderer decides when
+	a prediction appears and how it looks. Above both sits the safety gate:
+	nothing is painted while the remote PTY has ECHO off or the alternate
+	screen is active.
+
+_POSH_PREDICTION_SHOW_
+	When the renderer paints what the model holds: _always_ (default) paints
+	every prediction the moment the model produces it and marks every
+	predicted cell — no round-trip hold on the first keystroke after Enter,
+	and under this policy _adaptive_ and _always_ look identical; _advised_
+	honors the model's advice — _adaptive_ paints only once its slow-link /
+	glitch trigger is up, tentative cells are held until their epoch
+	confirms, and cells are marked only when the model flags a slow link
+	(mosh's original behavior, now a render choice).
 
 _POSH_PREDICTION_OVERWRITE_
 	When set, predictions overwrite the character under the cursor

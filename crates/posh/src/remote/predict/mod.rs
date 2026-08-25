@@ -2,14 +2,22 @@
 //! terminaloverlay.cc), split along two independent seams:
 //!
 //! - a [`Predictor`] *model* — keystrokes→overlay machinery + validation
-//!   lifecycle (epochs, credit, cull) and the visibility gate; it knows WHAT
-//!   is predicted and WHETHER it is currently showable;
-//! - a [`PredictionRenderer`] *render style* — how one already-decided-visible
-//!   prediction is painted (glyph replace + underline, dim, …).
+//!   lifecycle (epochs, credit, cull); it knows WHAT is predicted, and hands
+//!   the renderer a [`RenderAdvice`] — its RECOMMENDATION on showing (the
+//!   adaptive srtt/glitch triggers, the tentative-epoch hold, the slow-link
+//!   flag) — which the renderer may honor or disregard;
+//! - a [`PredictionRenderer`] *render policy + style* — WHEN a held prediction
+//!   appears ([`ShowPolicy`]: always, or as the model advises) and HOW it is
+//!   painted (glyph replace + underline, dim, …).
 //!
-//! Models and render styles are selected independently from the environment
-//! (`POSH_PREDICTION_MODEL` + `POSH_PREDICTION_RENDER`) and combined by
-//! [`build`]. Frame numbers from mosh map onto the reliable input stream's byte
+//! The one thing neither axis may override is the safety gate: the client
+//! skips rendering entirely while the remote PTY has `ECHO` off or the
+//! alternate screen is active (RFC 0007 §5.1), for every model.
+//!
+//! Models, show policies, and render styles are selected independently from
+//! the environment (`POSH_PREDICTION_MODEL`, `POSH_PREDICTION_SHOW`,
+//! `POSH_PREDICTION_RENDER`) and combined by [`build`]. Frame numbers from
+//! mosh map onto the reliable input stream's byte
 //! offsets: a prediction made for the byte at offset B expires at B+1 (the
 //! server's ack of B+1 means it consumed that byte), the "acked" counter is the
 //! frame's `input_ack`, and the "late acked" counter is the frame's `echo_ack`
@@ -124,24 +132,120 @@ pub trait PredictionRenderer: Send {
     fn paint_cell(&self, fb: &mut Snapshot, row: u16, col: u16, replacement: &Cell, hint: CellHint);
     fn paint_cursor(&self, fb: &mut Snapshot, row: u16, col: u16);
 
-    /// Render-axis policy (2026-08-25 split): does this renderer paint a
-    /// prediction the moment the model produced it, ignoring the model's
-    /// tentative-epoch hold? The hold is mosh's "hide the first keystroke of
-    /// a new epoch until the previous one confirms" — a `when to show` choice
-    /// that belongs to the render UX, not to what is predicted. `true` (the
-    /// default, for every renderer today) draws everything the model holds;
-    /// the model's own `whether` decisions (adaptive's srtt/glitch triggers,
-    /// the ECHO-off/alt-screen safety gate) still apply upstream of this.
-    fn shows_tentative(&self) -> bool {
+    /// Render-axis policy: paint this render step at all? The model's
+    /// [`RenderAdvice::show`] is its recommendation (adaptive's srtt/glitch
+    /// triggers say "the link is fast, nothing to hide"); the default
+    /// disregards it and always paints. [`Policed`] with
+    /// [`ShowPolicy::Advised`] honors it.
+    fn shows(&self, _advice: &RenderAdvice) -> bool {
         true
     }
 
-    /// Render-axis policy: mark every predicted cell (underline/dim), not only
-    /// when the model's slow-link/glitch flag is up. `true` (the default) so a
-    /// prediction is always visibly a prediction; the model's `flagged` hint
-    /// is then advisory. Future renderers may experiment with `false`.
-    fn always_flags(&self) -> bool {
+    /// Render-axis policy: paint a prediction the model still holds as
+    /// TENTATIVE (mosh's "hide a new epoch's first keystroke until the
+    /// previous epoch confirms")? The default ignores the hold and paints
+    /// immediately; a renderer honoring it uses [`RenderAdvice::confirmed_epoch`].
+    fn shows_tentative(&self, _advice: &RenderAdvice) -> bool {
         true
+    }
+
+    /// Render-axis policy: mark this step's cells (underline/dim)? The model's
+    /// [`RenderAdvice::flag`] is its slow-link/glitch recommendation; the
+    /// default marks every predicted cell so a prediction is always visibly
+    /// one.
+    fn flags(&self, _advice: &RenderAdvice) -> bool {
+        true
+    }
+}
+
+/// What a model tells the renderer about the render step it is offering —
+/// recommendations, not decisions. Every field is advisory: the renderer's
+/// [`ShowPolicy`] and style decide what actually happens to the screen.
+#[derive(Clone, Copy, Debug)]
+pub struct RenderAdvice {
+    /// The model recommends painting this step at all. `false` from the
+    /// adaptive model on a fast link (nothing worth hiding a round trip for);
+    /// always `true` from `always`/`experimental`/optimistic.
+    pub show: bool,
+    /// The model recommends marking the cells (its slow-link / glitch flag).
+    pub flag: bool,
+    /// The model's confirmed epoch; cells whose `tentative_until_epoch`
+    /// exceeds it are the ones mosh would hold. `u64::MAX` = "hold nothing".
+    pub confirmed_epoch: u64,
+}
+
+/// When the renderer paints what the model holds (`$POSH_PREDICTION_SHOW`).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ShowPolicy {
+    /// Paint every step the model holds, immediately (default). Under this
+    /// policy `adaptive` and `always` look identical: both models record the
+    /// same predictions; only their advice differs, and it is disregarded.
+    Always,
+    /// Honor the model's advice: paint a step only when `RenderAdvice::show`,
+    /// hold tentative cells until `confirmed_epoch`, and mark cells only when
+    /// the model flags them — mosh's original behavior, now a render choice.
+    Advised,
+}
+
+impl ShowPolicy {
+    /// Parses `$POSH_PREDICTION_SHOW` (default `always`).
+    pub fn parse(value: Option<&str>) -> Result<ShowPolicy, String> {
+        match value {
+            None | Some("") | Some("always") => Ok(ShowPolicy::Always),
+            Some("advised") => Ok(ShowPolicy::Advised),
+            Some(other) => Err(format!("unknown prediction show policy ({other})")),
+        }
+    }
+
+    /// The env selection, falling back to the default on a bad value (the
+    /// client validates and errors at startup; this is the in-loop read).
+    pub fn from_env() -> ShowPolicy {
+        ShowPolicy::parse(std::env::var("POSH_PREDICTION_SHOW").ok().as_deref())
+            .unwrap_or(ShowPolicy::Always)
+    }
+
+    pub fn name(self) -> &'static str {
+        match self {
+            ShowPolicy::Always => "always",
+            ShowPolicy::Advised => "advised",
+        }
+    }
+}
+
+/// A look renderer wrapped in a [`ShowPolicy`]: delegates painting, decides
+/// the show/hold/flag questions from the policy and the model's advice.
+pub struct Policed<R: PredictionRenderer> {
+    inner: R,
+    show: ShowPolicy,
+}
+
+impl<R: PredictionRenderer> Policed<R> {
+    pub fn new(inner: R, show: ShowPolicy) -> Policed<R> {
+        Policed { inner, show }
+    }
+}
+
+impl<R: PredictionRenderer> PredictionRenderer for Policed<R> {
+    fn paint_cell(&self, fb: &mut Snapshot, row: u16, col: u16, replacement: &Cell, hint: CellHint) {
+        self.inner.paint_cell(fb, row, col, replacement, hint);
+    }
+    fn paint_cursor(&self, fb: &mut Snapshot, row: u16, col: u16) {
+        self.inner.paint_cursor(fb, row, col);
+    }
+    fn shows(&self, advice: &RenderAdvice) -> bool {
+        match self.show {
+            ShowPolicy::Always => true,
+            ShowPolicy::Advised => advice.show,
+        }
+    }
+    fn shows_tentative(&self, _advice: &RenderAdvice) -> bool {
+        self.show == ShowPolicy::Always
+    }
+    fn flags(&self, advice: &RenderAdvice) -> bool {
+        match self.show {
+            ShowPolicy::Always => true,
+            ShowPolicy::Advised => advice.flag,
+        }
     }
 }
 
@@ -232,6 +336,13 @@ pub enum RenderStyle {
 }
 
 impl RenderStyle {
+    pub fn name(self) -> &'static str {
+        match self {
+            RenderStyle::Replace => "replace",
+            RenderStyle::Dim => "dim",
+        }
+    }
+
     /// Parses `$POSH_PREDICTION_RENDER` (default `replace`).
     pub fn parse(value: Option<&str>) -> Result<RenderStyle, String> {
         match value {
@@ -373,9 +484,10 @@ pub fn build(
         PredictionModel::FromScratch => Box::new(FromScratchPredictor::new(predict_overwrite)),
         other => Box::new(MoshPredictor::new(other, predict_overwrite)),
     };
+    let show = ShowPolicy::from_env();
     let renderer: Box<dyn PredictionRenderer> = match render {
-        RenderStyle::Replace => Box::new(ReplaceRenderer),
-        RenderStyle::Dim => Box::new(DimRenderer),
+        RenderStyle::Replace => Box::new(Policed::new(ReplaceRenderer, show)),
+        RenderStyle::Dim => Box::new(Policed::new(DimRenderer, show)),
     };
     (predictor, renderer)
 }
@@ -475,5 +587,14 @@ mod tests {
         assert_eq!(RenderStyle::parse(Some("replace")), Ok(RenderStyle::Replace));
         assert_eq!(RenderStyle::parse(Some("dim")), Ok(RenderStyle::Dim));
         assert!(RenderStyle::parse(Some("sparkly")).is_err());
+    }
+
+    #[test]
+    fn show_policy_parsing_defaults_to_always() {
+        assert_eq!(ShowPolicy::parse(None), Ok(ShowPolicy::Always));
+        assert_eq!(ShowPolicy::parse(Some("")), Ok(ShowPolicy::Always));
+        assert_eq!(ShowPolicy::parse(Some("always")), Ok(ShowPolicy::Always));
+        assert_eq!(ShowPolicy::parse(Some("advised")), Ok(ShowPolicy::Advised));
+        assert!(ShowPolicy::parse(Some("sometimes")).is_err());
     }
 }

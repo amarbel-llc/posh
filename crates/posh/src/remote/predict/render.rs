@@ -120,11 +120,50 @@ mod tests {
         );
     }
 
+    /// The advice channel end to end: a `Policed` renderer under `Advised`
+    /// honors the mosh model's recommendations (fast link ⇒ don't show; flag
+    /// off ⇒ no underline; tentative ⇒ held), while `Always` disregards them.
+    #[test]
+    fn policed_renderer_honors_or_disregards_the_models_advice() {
+        use crate::remote::predict::{MoshPredictor, Policed, PredictionModel, ShowPolicy};
+        let fb = snapshot(5, 20, b"$ ");
+        let col = fb.cursor_col;
+        let mut eng = MoshPredictor::new(PredictionModel::Always, false);
+        eng.set_send_interval(10); // fast: flag off; first keystroke tentative
+        eng.set_frame_sent(0);
+        eng.on_user_byte(b'z', &fb, 100);
+
+        let advised = Policed::new(ReplaceRenderer, ShowPolicy::Advised);
+        let mut out = fb.clone();
+        eng.render(&mut out, &advised);
+        assert_eq!(out.cell(0, col).unwrap().ch, ' ', "advised: tentative cell held");
+
+        let always = Policed::new(ReplaceRenderer, ShowPolicy::Always);
+        let mut out = fb.clone();
+        eng.render(&mut out, &always);
+        let cell = out.cell(0, col).unwrap();
+        assert_eq!(cell.ch, 'z', "always: painted despite the hold");
+        assert_eq!(cell.style.underline, UnderlineStyle::Single, "always: marked despite flag off");
+
+        // Once the model confirms the epoch, an advised renderer paints the
+        // next keystroke but, with the flag still off, leaves it unmarked.
+        let confirmed = snapshot(5, 20, b"$ z");
+        eng.set_local_frame_late_acked(1);
+        eng.cull(&confirmed, 150);
+        eng.set_frame_sent(1);
+        eng.on_user_byte(b'y', &confirmed, 200);
+        let mut out = confirmed.clone();
+        eng.render(&mut out, &advised);
+        let cell = out.cell(0, col + 1).unwrap();
+        assert_eq!(cell.ch, 'y', "advised: confirmed epoch, painted");
+        assert_eq!(cell.style.underline, UnderlineStyle::None, "advised: flag off, unmarked");
+    }
+
     /// The predictor/renderer split (2026-08-25): a prediction the mosh model
     /// still holds as TENTATIVE (first keystroke of a new epoch on a fast
     /// link, flag off) is painted immediately and marked — the renderer, not
-    /// the model, decides when and how. The model's own `whether` gate stays:
-    /// `never` paints nothing.
+    /// the model, decides when and how. The model's own `never` stays: it
+    /// records nothing, so there is nothing to paint.
     #[test]
     fn renderer_paints_tentative_predictions_immediately_and_marked() {
         use crate::remote::predict::{MoshPredictor, PredictionModel};

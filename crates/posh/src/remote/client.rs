@@ -578,12 +578,15 @@ fn predict_debug_summary(st: &ClientState) -> String {
     // lines below read from the same struct, so the two cannot disagree.
     let ci = client_introspection(st);
     let mut out = format!(
-        "{}\necho model: {}{}\nslow-link escalation: {} (srtt {:.0}ms; escalate >{}ms held {}s, recover <{}ms held {}s)\n\
+        "{}\necho model: {}{}\nrender: show={} style={} (the model advises; the renderer decides)\n\
+         slow-link escalation: {} (srtt {:.0}ms; escalate >{}ms held {}s, recover <{}ms held {}s)\n\
          outcomes: correct={} nocredit={} incorrect={} \
          resets={} epoch_lag={} shown_cells={} srtt_trigger={}",
         introspect::render_client_line(&client_record(st)),
         ci.echo_model.name(),
         if ci.control.escalated { " (auto: slow link)" } else { "" },
+        predict::ShowPolicy::from_env().name(),
+        st.predict_render.name(),
         match (ci.control.governing, ci.control.escalated) {
             (false, _) => "off (model pinned, or POSH_ECHO_ESCALATE=0)",
             (true, false) => "armed (adaptive)",
@@ -943,6 +946,10 @@ fn client_env_config() -> Result<(PredictionModel, RenderStyle, bool, GrabMouse,
     let echo_escalate = echo_escalation_governs(model_env.as_deref(), predict::escalation_selected());
     let render_env = std::env::var("POSH_PREDICTION_RENDER").ok();
     let render = RenderStyle::parse(render_env.as_deref()).map_err(Error::Msg)?;
+    // The show policy is read again inside `predict::build` (it rides the
+    // renderer); validate it here so a typo errors at startup like the others.
+    predict::ShowPolicy::parse(std::env::var("POSH_PREDICTION_SHOW").ok().as_deref())
+        .map_err(Error::Msg)?;
     let predict_overwrite = std::env::var("POSH_PREDICTION_OVERWRITE")
         .map(|v| !v.is_empty())
         .unwrap_or(false);
@@ -2752,7 +2759,16 @@ fn compose_frame(st: &mut ClientState, now: u64) -> Vec<u8> {
         st.predict.set_metrics(&st.last_metrics);
     }
     let mut next = base;
-    st.predict.render(&mut next, &*st.renderer);
+    // The safety gate is universal and above both axes (RFC 0007 §5.1): while
+    // the remote PTY has ECHO off (a password prompt) or the alternate screen
+    // is up, NO model's predictions reach the screen — not just optimistic's
+    // (which also drops its overlay via set_echo_safe). Before the
+    // predictor/renderer split the mosh models' tentative hold and adaptive
+    // trigger happened to mask most of this; now the renderer paints
+    // immediately, so the gate must be explicit.
+    if optimistic_echo_on(st) {
+        st.predict.render(&mut next, &*st.renderer);
+    }
     // The palette overlay sits above the session (greyed) but below the banner.
     if palette_open {
         if let Some(rterm) = st.palette.as_ref().and_then(Palette::screen) {
