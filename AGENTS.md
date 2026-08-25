@@ -309,6 +309,23 @@ read-only, `debug` group):
   status line read from `agent/mux-<id>.status.sock` (connect → one line →
   EOF). All additive caps (ids 13/14) — an old peer on either side just
   reads `unknown`.
+- **Client introspection (RFC 0014)** — the reverse direction: every client
+  sends `CAP_CLIENT_IDENT`/`CAP_CLIENT_STATE` (ids 16/17, unsolicited) — its
+  build and its FDR 0006 echo model / control (auto, auto-escalated,
+  pinned-env, pinned-palette, gate-off) / gates / SRTT / outcome counters —
+  and the session daemon retains one record per attached client (a relay
+  forwards its roaming client's entries as `Tag::ClientCaps`, shown as
+  `via=relay`). `posh status [session]` reads the daemon's
+  `<session>.status.sock` (no arg = the enclosing `$POSH_SESSION`), so
+  "which echo mode is the terminal I am viewed through in?" is answerable
+  from INSIDE a session. One struct (`posh_proto::introspect`) drives the
+  wire entry, the client SIGUSR2 dump, the palette's echo stats, and the
+  status line — `client_line_covers_every_field` fails if an axis is added
+  without every renderer. `echo=unknown` = the client reported nothing (old
+  build); `echo=none` = it reported having no predictor (a local attach).
+  NOT yet covered: the Architecture-A roaming `posh-server` (owns its PTY,
+  no daemon) neither retains nor serves it, and `posh ls` has no columns
+  for it.
 - `just debug-posh-mux-silence-repro <host>` — drive the posh#161 sequence
   deterministically: SIGSTOP the local mux daemon past the remote's 15 s
   agent fast-fail and 60 s exit timeout, SIGCONT, then print both sides'
