@@ -165,8 +165,8 @@ List, with and without workers:
   ergonomic moves to `ph` (FDR 0015) while `posh attach` becomes strict attach
   and `posh start` is the create verb. The strict split has **landed** (FDR 0015
   Phase B): bare `posh attach` now errors on an absent session. RFC 0001 §1's
-  `LocalSession` note is updated to strict here; RFC 0008's fuller grammar
-  amendment remains a follow-up. There is no flag day for the *wire*
+  `LocalSession` note and RFC 0008 §5's grammar / create-semantics amendments are
+  both updated to strict. There is no flag day for the *wire*
   (negotiated); the CLI meaning changed. The explicit non-interactive attach is
   `posh attach box:name`, the explicit create is `posh start box:name`.
 - **`--ephemeral` may ship later.** The durable default is the feature; the

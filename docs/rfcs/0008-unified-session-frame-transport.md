@@ -219,9 +219,15 @@ its transport) is reachable only via an explicit `--ephemeral` modifier on
 `attach` applied to a host target. All other sessions are durable.
 
 `RemoteSession`, `Local` (`:session`, `:group/session`), and bare
-`LocalSession` (a non-`:` word, e.g. `dev`) resolutions are UNCHANGED. The
-explicit `posh attach host:name` path remains the non-interactive way to
-attach-or-create a named session without a picker.
+`LocalSession` (a non-`:` word, e.g. `dev`) resolutions are UNCHANGED. Their
+CREATE semantics, however, changed under **FDR 0015 Phase B**: `attach` (and
+bare `posh <target>`) now attaches an EXISTING session and errors if it is
+absent — it no longer creates. `posh start <target>` is the create verb (strict;
+auto-id when unnamed), and `posh attach --create <target>` is the explicit
+create-or-attach. The `ph` front-door (FDR 0015) resolves a target against the
+listing and routes to `start` (absent) or `attach` (present). So
+`posh attach host:name` attaches an existing named session non-interactively,
+while `posh start host:name` (or `posh attach --create host:name`) creates it.
 
 #### 5.2 Remote command contract (§2)
 
@@ -230,7 +236,9 @@ A conforming client reaching a `RemoteSession` MAY use either:
 1. the **frame-relay bootstrap** (this RFC): `posh-server` connects to the
    session socket and relays frames per §3; or
 2. the **legacy composition** (RFC 0001 §2): `posh-server new -- posh attach
-   SESSION`, which models the terminal twice.
+   --create SESSION` (the `--create` added under FDR 0015 Phase B so a
+   strict-attach remote still creates the session), which models the terminal
+   twice.
 
 The two MUST interoperate via §1.1 capability negotiation, and an
 implementation MUST be able to select (2) as the rollback path (§6). The `POSH
