@@ -118,12 +118,17 @@ pub struct ClientState {
     /// otherwise un-SIGUSR2-able on a remote server. `None` until the server
     /// reports (only in a debug posture, when the client advertised CAP_DIAG).
     pub server_diag: Option<crate::remote::caps::ServerDiag>,
+    /// RFC 0014 §6: this client's own introspection record — the echo model
+    /// in effect, who governs it, the gates, thresholds, and outcome counters
+    /// — rendered as the same §4.2 line a serving side prints, so the dump and
+    /// `posh status` can never disagree about a field.
+    pub client: crate::remote::introspect::ClientRecord,
 }
 
 impl ClientState {
     pub fn format(&self) -> String {
         format!(
-            "role=client pid={} remote={} last_send_age_ms={} last_heard_age_ms={} applied_num={} \
+            "role=client pid={} {} remote={} last_send_age_ms={} last_heard_age_ms={} applied_num={} \
              outbox_base={} outbox_pending={} scrollback_len={} srtt={:.0}ms rto={}ms \
              send_interval={}ms bytes_rx={} bytes_tx={} predict(active={} shown={} epoch_lag={}) \
              term_gen={} rows={} cols={} echo_on={} codec={} title={:?} \
@@ -131,6 +136,7 @@ impl ClientState {
              last_rx(num={} base={} body={}) srv={} \
              link(late={} gap_max={}ms late_gaps={} rx_total={} heartbeats={} retransmits={})",
             std::process::id(),
+            crate::remote::introspect::render_client_line(&self.client),
             fmt_addr(self.remote),
             fmt_age(self.last_send_age_ms),
             self.last_heard_age_ms,
@@ -496,8 +502,18 @@ mod tests {
                 ..Default::default()
             },
             server_late: true,
+            client: crate::remote::introspect::ClientRecord {
+                state: Some(crate::remote::introspect::coverage_fixture()),
+                ..Default::default()
+            },
         }
         .format();
+        // RFC 0014 §6 coverage: the dump renders every registered client
+        // field (it was exactly these — model, control, thresholds — the
+        // pre-RFC dump omitted).
+        for key in crate::remote::introspect::CLIENT_FIELDS {
+            assert!(line.contains(&format!(" {key}=")), "missing {key}= in:\n{line}");
+        }
         for key in [
             "role=client",
             "remote=100.85.205.39:60006",
@@ -558,6 +574,7 @@ mod tests {
             link: crate::remote::stats::LinkSnapshot::default(),
             server_late: false,
             server_diag: None,
+            client: Default::default(),
         };
         st.server_diag = Some(crate::remote::caps::ServerDiag {
             current_num: 43,
@@ -609,6 +626,7 @@ mod tests {
             link: crate::remote::stats::LinkSnapshot::default(),
             server_late: false,
             server_diag: None,
+            client: Default::default(),
         }
         .format();
         assert!(line.contains("srv=none"), "{line}");

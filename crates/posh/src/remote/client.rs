@@ -18,6 +18,7 @@ use crate::remote::datagram::{Connection, Family};
 use crate::remote::diag;
 use crate::remote::display::{self, NotificationEngine, Snapshot};
 use crate::remote::framesync::{self, ApplyOutcome, FrameApplier};
+use crate::remote::introspect::{self, ClientIntrospection, EchoModel};
 use crate::remote::kittykeys::{PaletteKeyNormalizer, ESCAPE_KEY};
 use crate::remote::palette::{composite_palette, Palette, PaletteEvent};
 use crate::remote::predict::{
@@ -199,6 +200,132 @@ fn open_palette(st: &mut ClientState) -> bool {
     }
 }
 
+/// Wall-clock milliseconds since the epoch (the `CLIENT_IDENT` start anchor;
+/// `now_ms` is monotonic and unsuitable for a cross-host identity).
+fn unix_now_ms() -> u64 {
+    std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_millis() as u64)
+        .unwrap_or(0)
+}
+
+/// The §2.2 wire ordinal of a prediction model.
+fn echo_model_wire(model: PredictionModel) -> EchoModel {
+    match model {
+        PredictionModel::Adaptive => EchoModel::Adaptive,
+        PredictionModel::Always => EchoModel::Always,
+        PredictionModel::Never => EchoModel::Never,
+        PredictionModel::Experimental => EchoModel::Experimental,
+        PredictionModel::Optimistic => EchoModel::Optimistic,
+        PredictionModel::Controller => EchoModel::Controller,
+        PredictionModel::FromScratch => EchoModel::Scratch,
+    }
+}
+
+/// This client's identity (RFC 0014 §1): the same shape the server reports.
+fn client_ident(st: &ClientState) -> introspect::Ident {
+    introspect::Ident {
+        version: env!("POSH_VERSION").into(),
+        git_sha: env!("POSH_GIT_SHA").into(),
+        pid: std::process::id(),
+        start_unix_ms: st.start_unix_ms,
+    }
+}
+
+/// THE client introspection value (RFC 0014 §2/§6), built from live state.
+/// Every reporting surface — the wire entry, the SIGUSR2 dump, the palette's
+/// echo stats — renders from this, never from the fields directly.
+fn client_introspection(st: &ClientState) -> ClientIntrospection {
+    let ps = st.predict.stats();
+    let (correct, nocredit, incorrect) = ps.outcomes;
+    let gate_on = predict::escalation_selected();
+    let governing = st.echo_escalation.governing();
+    let srtt = st.wire.srtt();
+    let clamp32 = |v: u64| v.min(u32::MAX as u64) as u32;
+    ClientIntrospection {
+        echo_model: echo_model_wire(st.predict_model),
+        control: introspect::EchoControl {
+            governing,
+            escalated: governing && st.echo_escalation.escalated(),
+            gate_off: !gate_on,
+            // With the gate on, "not governing and not the palette" is the
+            // env pin (`client_env_config`); with it off the machine never
+            // governs, so an env pin is unknowable and reads as gate-off.
+            pinned_env: gate_on && !governing && !st.echo_pinned_palette,
+            pinned_palette: !governing && st.echo_pinned_palette,
+        },
+        gates: introspect::Gates {
+            echo_on: st.echo_on,
+            alt_screen: st.server_term.is_alt_screen(),
+            predict_active: ps.active,
+        },
+        codec: introspect::Codec::from_label(st.framesync.label()),
+        // The estimator's pre-sample placeholder is not a measurement
+        // (FDR 0006: the escalation machine ignores it for the same reason).
+        srtt_ms: st.wire.srtt_measured().then(|| srtt.round() as u32),
+        rto_ms: clamp32(st.wire.rto()),
+        thresholds: introspect::Thresholds {
+            escalate_srtt_ms: predict::ESCALATE_SRTT_MS as u16,
+            escalate_hold_ms: predict::ESCALATE_HOLD_MS as u16,
+            deescalate_srtt_ms: predict::DEESCALATE_SRTT_MS as u16,
+            deescalate_hold_ms: predict::DEESCALATE_HOLD_MS as u16,
+        },
+        outcomes: introspect::Outcomes {
+            correct: clamp32(correct),
+            nocredit: clamp32(nocredit),
+            incorrect: clamp32(incorrect),
+            mispredict_resets: clamp32(ps.mispredict_resets),
+        },
+    }
+}
+
+/// This client's own §4.2 record, as the dump and palette print it.
+fn client_record(st: &ClientState) -> introspect::ClientRecord {
+    introspect::ClientRecord {
+        ident: Some(client_ident(st)),
+        state: Some(client_introspection(st)),
+        age_ms: Some(0),
+        via_relay_pid: None,
+    }
+}
+
+/// RFC 0014 §1.2: re-attach `CLIENT_IDENT` at this cadence after the first
+/// message, so a lossy first message still converges.
+const IDENT_RESEND_MS: u64 = 30_000;
+/// RFC 0014 §2.5: the `CLIENT_STATE` heartbeat, and the floor between sends.
+const STATE_HEARTBEAT_MS: u64 = 5_000;
+const STATE_MIN_INTERVAL_MS: u64 = 1_000;
+
+/// The RFC 0014 unsolicited entries for this message: identity on the first
+/// message, after a resync, and every [`IDENT_RESEND_MS`]; state on the first
+/// message, after a resync, on any non-counter change (rate-floored), and at
+/// the heartbeat. Counters alone never trigger a send (§2.5).
+fn client_introspection_caps(st: &mut ClientState, now: u64, resync: bool) -> Vec<caps::Cap> {
+    let mut out = Vec::with_capacity(2);
+    if resync || st.ident_sent_at == 0 || now.saturating_sub(st.ident_sent_at) >= IDENT_RESEND_MS {
+        out.push(introspect::encode_client_ident(&client_ident(st)));
+        st.ident_sent_at = now.max(1);
+    }
+    let cur = client_introspection(st);
+    let send = match st.state_sent {
+        None => true,
+        Some(_) if resync => true,
+        Some((prev, at)) => {
+            let since = now.saturating_sub(at);
+            let changed = ClientIntrospection {
+                outcomes: prev.outcomes,
+                ..cur
+            } != prev;
+            since >= STATE_HEARTBEAT_MS || (changed && since >= STATE_MIN_INTERVAL_MS)
+        }
+    };
+    if send {
+        out.push(introspect::encode_client_state(&cur));
+        st.state_sent = Some((cur, now));
+    }
+    out
+}
+
 /// Write the full client transport snapshot — and a byte-level forensic bundle
 /// if an apply-stall is pending — to the diagnostic sink. Shared by the SIGUSR2
 /// handler and the "Show wedge debug info" palette command (#3), so both record
@@ -206,6 +333,7 @@ fn open_palette(st: &mut ClientState) -> bool {
 fn dump_client_state(st: &ClientState, now: u64) {
     let ps = predict_sample(&st.predict.stats());
     diag::ClientState {
+        client: client_record(st),
         remote: st.wire.remote(),
         last_send_age_ms: (st.last_send != 0).then(|| now.saturating_sub(st.last_send)),
         last_heard_age_ms: now.saturating_sub(st.last_heard),
@@ -449,24 +577,31 @@ fn agent_debug_summary(st: &ClientState) -> String {
 /// `$XDG_DATA_HOME` (§8).
 fn predict_debug_summary(st: &ClientState) -> String {
     let ps = st.predict.stats();
-    let (correct, nocredit, incorrect) = ps.outcomes;
+    // RFC 0014 §6: the first line IS the §4.2 client line — what a serving
+    // side's `posh status` prints for this client — and the human-readable
+    // lines below read from the same struct, so the two cannot disagree.
+    let ci = client_introspection(st);
     let mut out = format!(
-        "echo model: {:?}{}\nslow-link escalation: {} (srtt {:.0}ms; escalate >{:.0}ms held {}s, recover <{:.0}ms held {}s)\n\
-         outcomes: correct={correct} nocredit={nocredit} incorrect={incorrect} \
+        "{}\necho model: {}{}\nslow-link escalation: {} (srtt {:.0}ms; escalate >{}ms held {}s, recover <{}ms held {}s)\n\
+         outcomes: correct={} nocredit={} incorrect={} \
          resets={} epoch_lag={} shown_cells={} srtt_trigger={}",
-        st.predict_model,
-        if st.echo_escalation.escalated() { " (auto: slow link)" } else { "" },
-        match (st.echo_escalation.governing(), st.echo_escalation.escalated()) {
+        introspect::render_client_line(&client_record(st)),
+        ci.echo_model.name(),
+        if ci.control.escalated { " (auto: slow link)" } else { "" },
+        match (ci.control.governing, ci.control.escalated) {
             (false, _) => "off (model pinned, or POSH_ECHO_ESCALATE=0)",
             (true, false) => "armed (adaptive)",
             (true, true) => "escalated (optimistic)",
         },
         st.wire.srtt(),
-        predict::ESCALATE_SRTT_MS,
-        predict::ESCALATE_HOLD_MS / 1000,
-        predict::DEESCALATE_SRTT_MS,
-        predict::DEESCALATE_HOLD_MS / 1000,
-        ps.mispredict_resets,
+        ci.thresholds.escalate_srtt_ms,
+        ci.thresholds.escalate_hold_ms / 1000,
+        ci.thresholds.deescalate_srtt_ms,
+        ci.thresholds.deescalate_hold_ms / 1000,
+        ci.outcomes.correct,
+        ci.outcomes.nocredit,
+        ci.outcomes.incorrect,
+        ci.outcomes.mispredict_resets,
         ps.epoch_lag,
         ps.shown_cells,
         if ps.srtt_trigger { "on" } else { "off" },
@@ -532,6 +667,9 @@ fn dispatch_palette_action(
                 // so it re-evaluates from the live SRTT).
                 st.echo_escalation
                     .on_explicit(model, predict::escalation_selected());
+                // RFC 0014 §2.3: `adaptive` re-arms governance (not a pin);
+                // anything else is a palette pin, reported as such.
+                st.echo_pinned_palette = model != PredictionModel::Adaptive;
                 apply_echo_model(st, model, now);
             }
             false
@@ -1116,6 +1254,17 @@ struct ClientState {
     /// sticky stall banner has been raised for the current capture episode, reset
     /// when the flag clears so a later episode re-raises it.
     wedge_seen: bool,
+    /// RFC 0014 §2.3: the model was pinned by a palette `Echo:` command (an
+    /// env pin is derived: gate on, not governing, not this).
+    echo_pinned_palette: bool,
+    /// RFC 0014 §1.2: when `CLIENT_IDENT` last rode a message (`now_ms`);
+    /// 0 = never, so the first message carries it.
+    ident_sent_at: u64,
+    /// RFC 0014 §2.5: the `CLIENT_STATE` last sent and when, for the
+    /// change-driven + heartbeat cadence. `None` = never sent.
+    state_sent: Option<(ClientIntrospection, u64)>,
+    /// Wall-clock start of this client process, the `CLIENT_IDENT` anchor.
+    start_unix_ms: u64,
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -1220,6 +1369,10 @@ fn client_loop(
         agent_stream: sync::AgentStream::new(),
         agent_seen: false,
         wedge_seen: false,
+        echo_pinned_palette: false,
+        ident_sent_at: 0,
+        state_sent: None,
+        start_unix_ms: unix_now_ms(),
     };
     // RFC 0007: collect the compute-timing terminals when a GP species is the
     // startup model, independent of POSH_DEBUG_LOG.
@@ -2752,9 +2905,12 @@ fn outgoing_caps(st: &mut ClientState) -> Vec<caps::Cap> {
     // message until an identity is held — reliable delivery, zero cost at
     // steady state. The on-demand state request rides only while the
     // palette-armed window is open.
-    if st.flags & sync::CLIENT_FLAG_RESYNC != 0 {
+    let resync = st.flags & sync::CLIENT_FLAG_RESYNC != 0;
+    if resync {
         st.server_ident = None;
     }
+    // RFC 0014: our own identity + echo/transport state, unsolicited.
+    extra.extend(client_introspection_caps(st, now_ms(), resync));
     if st.server_ident.is_none() {
         extra.push(caps::Cap {
             id: caps::CAP_SERVER_IDENT,
@@ -3411,7 +3567,10 @@ mod tests {
         let mut st = test_state(24, 80);
         apply_echo_model(&mut st, PredictionModel::Controller, 0);
         let summary = predict_debug_summary(&st);
-        assert!(summary.contains("echo model: Controller"), "{summary}");
+        // Spelled the user-facing way (`controller`, the Echo: label), the
+        // same word the RFC 0014 client line's `echo=` carries.
+        assert!(summary.contains("echo model: controller"), "{summary}");
+        assert!(summary.contains(" echo=controller "), "{summary}");
         assert!(summary.contains("evolution: gen=0"), "{summary}");
         assert!(summary.contains("shadow (adaptive floor)"), "{summary}");
         assert!(
@@ -3780,6 +3939,82 @@ mod tests {
         std::fs::remove_file(&sock).ok();
     }
 
+    /// RFC 0014 §6 coverage on the palette surface: "Show echo prediction
+    /// stats" renders every registered client field, from the same struct
+    /// the wire entry encodes.
+    #[test]
+    fn predict_debug_summary_covers_every_introspection_field() {
+        let st = test_state(24, 80);
+        let s = predict_debug_summary(&st);
+        for key in introspect::CLIENT_FIELDS {
+            assert!(s.contains(&format!(" {key}=")), "missing {key}= in:\n{s}");
+        }
+        // test_state pins `never` with the gate untouched: not governing,
+        // not the palette ⇒ an env pin (RFC 0014 §2.3 derivation).
+        let ci = client_introspection(&st);
+        assert_eq!(ci.echo_model, EchoModel::Never);
+        assert!(!ci.control.governing);
+        assert!(!ci.control.pinned_palette);
+        assert_eq!(ci.srtt_ms, None, "no sample yet must not read as a measurement");
+        // The wire entry and the palette line agree byte-for-byte on the model.
+        let cap = introspect::encode_client_state(&ci);
+        assert_eq!(introspect::decode_client_state(&cap.payload).unwrap(), ci);
+    }
+
+    /// RFC 0014 §1.2/§2.5 cadence: both entries on the first message; neither
+    /// on an immediate repeat; state again at the heartbeat; state again on a
+    /// non-counter change (rate-floored); both again on a resync; identity
+    /// again at its slow cadence.
+    #[test]
+    fn client_introspection_caps_follow_the_unsolicited_cadence() {
+        let mut st = test_state(24, 80);
+        let ids = |caps: &[caps::Cap]| caps.iter().map(|c| c.id).collect::<Vec<_>>();
+        assert_eq!(
+            ids(&client_introspection_caps(&mut st, 1_000, false)),
+            vec![caps::CAP_CLIENT_IDENT, caps::CAP_CLIENT_STATE]
+        );
+        assert!(client_introspection_caps(&mut st, 1_500, false).is_empty());
+        // A change inside the 1 s floor waits; past it, it sends.
+        st.echo_on = true;
+        assert!(client_introspection_caps(&mut st, 1_900, false).is_empty());
+        assert_eq!(
+            ids(&client_introspection_caps(&mut st, 2_100, false)),
+            vec![caps::CAP_CLIENT_STATE]
+        );
+        // Heartbeat with nothing changed.
+        assert!(client_introspection_caps(&mut st, 6_000, false).is_empty());
+        assert_eq!(
+            ids(&client_introspection_caps(&mut st, 7_200, false)),
+            vec![caps::CAP_CLIENT_STATE]
+        );
+        // Resync re-sends both regardless of cadence.
+        assert_eq!(
+            ids(&client_introspection_caps(&mut st, 7_300, true)),
+            vec![caps::CAP_CLIENT_IDENT, caps::CAP_CLIENT_STATE]
+        );
+        // Identity rides again at its own slow cadence.
+        assert_eq!(
+            ids(&client_introspection_caps(&mut st, 7_300 + IDENT_RESEND_MS, false)),
+            vec![caps::CAP_CLIENT_IDENT, caps::CAP_CLIENT_STATE]
+        );
+    }
+
+    /// A palette `Echo:` choice is reported as a palette pin; `adaptive`
+    /// re-arms governance and clears it (RFC 0014 §2.3).
+    #[test]
+    fn palette_echo_choice_is_reported_as_a_palette_pin() {
+        let raw = pty_raw_mode();
+        let mut st = test_state(3, 30);
+        dispatch_palette_action(&mut st, &raw, "echo.set", &json!({ "model": "optimistic" }), 0);
+        let ci = client_introspection(&st);
+        assert_eq!(ci.echo_model, EchoModel::Optimistic);
+        assert_eq!(ci.control.name(), if predict::escalation_selected() { "pinned-palette" } else { "gate-off" });
+        dispatch_palette_action(&mut st, &raw, "echo.set", &json!({ "model": "adaptive" }), 0);
+        let ci = client_introspection(&st);
+        assert_eq!(ci.echo_model, EchoModel::Adaptive);
+        assert!(!ci.control.pinned_palette);
+    }
+
     /// ClientState over a throwaway loopback connection, for unit tests
     /// of frame application and composition.
     fn test_state(rows: u16, cols: u16) -> ClientState {
@@ -3849,6 +4084,10 @@ mod tests {
             agent_mux: None,
             agent_notice: None,
             wedge_seen: false,
+            echo_pinned_palette: false,
+            ident_sent_at: 0,
+            state_sent: None,
+            start_unix_ms: 0,
         }
     }
 

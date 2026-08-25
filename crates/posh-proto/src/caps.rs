@@ -125,6 +125,23 @@ pub const CAP_SERVER_IDENT: u8 = 13;
 /// entry: the [`ServerDiag`] payload, byte-identical to CAP_DIAG's, attached
 /// under whichever id the client requested with.
 pub const CAP_SERVER_STATE: u8 = 14;
+/// Client identity (RFC 0014 §1): the `SERVER_IDENT` layout under the client
+/// id. UNSOLICITED (RFC 0001 amendment): sent on the first message, after any
+/// resync, and at a slow cadence; a relay forwards it unchanged so the daemon
+/// holds the ORIGINATING client's identity. A server never sends it.
+pub const CAP_CLIENT_IDENT: u8 = 16;
+/// Client echo/transport state (RFC 0014 §2): the model in effect, the
+/// escalation-control and gate bit sets, codec, SRTT/RTO, thresholds, and
+/// outcome counters. UNSOLICITED: on connect, on any non-counter change, and
+/// at a 5 s heartbeat (≤ 1/s). Grows by appending — a reader keeps the known
+/// prefix. Display/diagnostic only; never gates behavior. Codec:
+/// [`crate::introspect`].
+pub const CAP_CLIENT_STATE: u8 = 17;
+/// Enclosing-session client lines (RFC 0014 §5): a local attach made inside a
+/// session forwards the outer session's status-socket client lines as opaque
+/// text, once on `Tag::Init`, so the inner daemon can show what the outer
+/// session is viewed through. Expected to be subsumed by FDR 0012.
+pub const CAP_CLIENT_UPSTREAM: u8 = 18;
 
 /// The static identity a server reports under [`CAP_SERVER_IDENT`]: what the
 /// operator's `posh version` would print on the far host, plus the process

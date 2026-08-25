@@ -11,6 +11,8 @@
 //!   * [`framesync`] — the swappable encode/apply codecs (`DumpDiff`,
 //!     `MorphDelta`) behind the `FrameEncoder`/`FrameApplier` traits;
 //!   * [`caps`] — the RFC 0001 capability table;
+//!   * [`introspect`] — the RFC 0014 client-introspection struct, its
+//!     `CLIENT_IDENT`/`CLIENT_STATE` codecs, and the status-line renderer;
 //!   * [`channel`] — the [`FrameChannel`] seam a harness binds a server-side
 //!     encoder to a client-side applier through.
 //!
@@ -25,6 +27,7 @@ pub mod display;
 pub mod error;
 pub mod frame;
 pub mod framesync;
+pub mod introspect;
 
 pub use channel::{ClientAck, FrameChannel};
 pub use error::{Error, Result};
