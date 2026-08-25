@@ -323,9 +323,14 @@ read-only, `debug` group):
   status line — `client_line_covers_every_field` fails if an axis is added
   without every renderer. `echo=unknown` = the client reported nothing (old
   build); `echo=none` = it reported having no predictor (a local attach).
-  NOT yet covered: the Architecture-A roaming `posh-server` (owns its PTY,
-  no daemon) neither retains nor serves it, and `posh ls` has no columns
-  for it.
+  An Architecture-A roaming `posh-server` (owns its PTY, no daemon) serves
+  the same response on `<base>/remote/<pid>.status.sock` and in its SIGUSR2
+  dump; the M2 bridge forwards like the relay; `posh ls` condenses each
+  session's first client line into an ECHO column (`optimistic
+  auto-escalated 412ms`, `unknown`, `-`; `echo_summary`). NOT covered: §5
+  UPSTREAM (dead until FDR 0012 or a nesting-guard change), and `posh ls`
+  does not list the `remote/` sockets (`posh status` needs the session
+  name, so an Arch-A server is reachable only via its dump today).
 - `just debug-posh-mux-silence-repro <host>` — drive the posh#161 sequence
   deterministically: SIGSTOP the local mux daemon past the remote's 15 s
   agent fast-fail and 60 s exit timeout, SIGCONT, then print both sides'

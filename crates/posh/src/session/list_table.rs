@@ -159,6 +159,9 @@ struct Row {
     /// is known (a pre-activity daemon or an unreachable session).
     activity: String,
     dim_activity: bool,
+    /// The RFC 0014 §4.3 echo summary (`session::echo_summary`), empty for a
+    /// pre-RFC-0014 daemon or a stale session.
+    echo: String,
 }
 
 fn row(s: &SessionEntry, current: Option<&str>, home: Option<&str>) -> Row {
@@ -172,6 +175,7 @@ fn row(s: &SessionEntry, current: Option<&str>, home: Option<&str>) -> Row {
             dir: String::new(),
             activity: format!("{err} (cleaning up)"),
             dim_activity: true,
+            echo: String::new(),
         };
     }
     Row {
@@ -182,20 +186,22 @@ fn row(s: &SessionEntry, current: Option<&str>, home: Option<&str>) -> Row {
         dir: abbrev_home(s.cwd.as_deref().unwrap_or(""), home),
         activity: s.activity.clone().or_else(|| s.cmd.clone()).unwrap_or_default(),
         dim_activity: false,
+        echo: s.echo.clone().unwrap_or_default(),
     }
 }
 
-const HEADERS: [&str; 6] = ["NAME", "STATUS", "PID", "CLIENTS", "STARTED IN", "ACTIVITY"];
+const HEADERS: [&str; 7] = ["NAME", "STATUS", "PID", "CLIENTS", "STARTED IN", "ACTIVITY", "ECHO"];
 /// 0-based indexes of the flexible columns, shrunk (ACTIVITY first) when the
 /// table overflows the terminal; every other column is content-sized.
 const ACTIVITY_COL: usize = 5;
+const ECHO_COL: usize = 6;
 const DIR_COL: usize = 4;
 /// Narrowest a flexible column shrinks to before we give up and overflow.
 const MIN_FLEX: usize = 8;
 
 /// Content widths per column: the widest cell, seeded with the header
 /// widths (computed once by the caller, reused for the header line).
-fn column_widths(rows: &[Row], mut w: [usize; 6]) -> [usize; 6] {
+fn column_widths(rows: &[Row], mut w: [usize; 7]) -> [usize; 7] {
     for r in rows {
         w[0] = w[0].max(width(&r.name));
         w[1] = w[1].max(r.status.width);
@@ -203,34 +209,38 @@ fn column_widths(rows: &[Row], mut w: [usize; 6]) -> [usize; 6] {
         w[3] = w[3].max(width(&r.clients));
         w[4] = w[4].max(width(&r.dir));
         w[5] = w[5].max(width(&r.activity));
+        w[6] = w[6].max(width(&r.echo));
     }
     w
 }
 
 /// Total rendered width for the given column widths: one leading border
 /// plus `content + 2 padding + 1 border` per column.
-fn table_width(cols: &[usize; 6]) -> usize {
+fn table_width(cols: &[usize; 7]) -> usize {
     1 + cols.iter().map(|w| w + 3).sum::<usize>()
 }
 
-/// Shrinks the flexible columns (CMD, then STARTED IN) until the table
-/// fits `term_cols`. 0 means unknown width: keep the content-sized layout.
-fn fit(mut cols: [usize; 6], term_cols: usize) -> [usize; 6] {
+/// Shrinks the flexible columns (ACTIVITY, then ECHO, then STARTED IN) until
+/// the table fits `term_cols`. 0 means unknown width: keep the content-sized
+/// layout. A column never shrinks below its header's width (the header cell
+/// is not truncated, so a narrower column would misalign the header row).
+fn fit(mut cols: [usize; 7], term_cols: usize) -> [usize; 7] {
     if term_cols == 0 {
         return cols;
     }
-    for col in [ACTIVITY_COL, DIR_COL] {
+    for col in [ACTIVITY_COL, ECHO_COL, DIR_COL] {
         let over = table_width(&cols).saturating_sub(term_cols);
         if over == 0 {
             return cols;
         }
-        cols[col] = cols[col].saturating_sub(over).max(MIN_FLEX.min(cols[col]));
+        let floor = MIN_FLEX.max(width(HEADERS[col])).min(cols[col]);
+        cols[col] = cols[col].saturating_sub(over).max(floor);
     }
     cols
 }
 
 /// A horizontal border line, e.g. `rule('╭','┬','╮', ..)` for the top.
-fn rule(left: char, mid: char, right: char, cols: &[usize; 6]) -> String {
+fn rule(left: char, mid: char, right: char, cols: &[usize; 7]) -> String {
     let mut s = String::new();
     s.push(left);
     for (i, w) in cols.iter().enumerate() {
@@ -248,9 +258,9 @@ fn rule(left: char, mid: char, right: char, cols: &[usize; 6]) -> String {
 /// One body/header line: prestyled cell texts framed by dim `│` borders.
 /// `widths` are the (possibly shrunk) column widths; `cell_widths` the
 /// actual display widths of the passed texts.
-fn line(cells: &[String; 6], cell_widths: &[usize; 6], cols: &[usize; 6]) -> String {
+fn line(cells: &[String; 7], cell_widths: &[usize; 7], cols: &[usize; 7]) -> String {
     let mut s = String::new();
-    for i in 0..6 {
+    for i in 0..7 {
         s.push_str(DIM_BAR);
         s.push(' ');
         s.push_str(&cells[i]);
@@ -288,6 +298,7 @@ pub(super) fn render(
     for r in &rows {
         let (dir, dir_width) = truncate(&r.dir, cols[DIR_COL]);
         let (activity, activity_width) = truncate(&r.activity, cols[ACTIVITY_COL]);
+        let (echo, echo_width) = truncate(&r.echo, cols[ECHO_COL]);
         let widths = [
             width(&r.name),
             r.status.width,
@@ -295,6 +306,7 @@ pub(super) fn render(
             width(&r.clients),
             dir_width,
             activity_width,
+            echo_width,
         ];
         let activity = if r.dim_activity { paint(DIM, &activity) } else { activity };
         let cells = [
@@ -304,6 +316,7 @@ pub(super) fn render(
             r.clients.clone(),
             dir,
             activity,
+            echo,
         ];
         out.push_str(&line(&cells, &widths, &cols));
         out.push('\n');
@@ -384,6 +397,7 @@ mod tests {
             cmd: Some("fish".to_string()),
             cwd: Some("/home/u/eng".to_string()),
             activity: Some("nvim".to_string()),
+            echo: Some("optimistic auto-escalated 412ms".to_string()),
         }
     }
 
@@ -396,6 +410,7 @@ mod tests {
             cmd: None,
             cwd: None,
             activity: None,
+            echo: None,
         }
     }
 

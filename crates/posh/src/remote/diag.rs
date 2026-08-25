@@ -37,16 +37,21 @@ pub struct ServerState {
     pub bytes_tx: u64,
     pub term_gen: u64,
     pub pty_open: bool,
+    /// RFC 0014 §3: the peer client's retained introspection record, rendered
+    /// as the same §4.2 line the status socket serves (§6: one struct, every
+    /// surface). `echo=unknown` until the peer reports.
+    pub client: crate::remote::introspect::ClientRecord,
 }
 
 impl ServerState {
     pub fn format(&self) -> String {
         format!(
-            "role=server pid={} peer_active={} has_remote={} remote={} \
+            "role=server pid={} {} peer_active={} has_remote={} remote={} \
              last_heard_age_ms={} last_send_age_ms={} current_num={} acked_num={} \
              unacked={} outstanding={} srtt={:.0}ms rto={}ms send_interval={}ms \
              bytes_rx={} bytes_tx={} term_gen={} pty_open={}",
             std::process::id(),
+            crate::remote::introspect::render_client_line(&self.client),
             self.peer_active as u8,
             self.has_remote as u8,
             fmt_addr(self.remote),
@@ -413,12 +418,20 @@ mod tests {
             bytes_tx: 4096,
             term_gen: 99,
             pty_open: true,
+            client: crate::remote::introspect::ClientRecord {
+                state: Some(crate::remote::introspect::coverage_fixture()),
+                ..Default::default()
+            },
         }
     }
 
     #[test]
     fn server_format_carries_wedge_fields() {
         let line = server_state().format();
+        // RFC 0014 §6 coverage on the server dump: the peer client's line.
+        for key in crate::remote::introspect::CLIENT_FIELDS {
+            assert!(line.contains(&format!(" {key}=")), "missing {key}= in:\n{line}");
+        }
         for key in [
             "role=server",
             "peer_active=1",

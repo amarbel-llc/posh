@@ -1,7 +1,7 @@
 //! Local session persistence (zmx port): daemon-per-session over Unix
 //! sockets, organized into groups under a socket directory.
 
-mod activity;
+pub(crate) mod activity;
 pub mod client;
 pub mod daemon;
 pub mod ipc;
@@ -342,6 +342,52 @@ struct SessionEntry {
     /// RFC 0013 §5 activity label (`title · process`); `None` from a
     /// pre-activity daemon or an unreachable session.
     activity: Option<String>,
+    /// RFC 0014 §4.3: the attached clients' echo summary read from the
+    /// session's status socket (`echo_summary`); `None` from a pre-RFC-0014
+    /// daemon (no socket) or an unreachable session.
+    echo: Option<String>,
+}
+
+/// Summarize a §4.2 status response for the `posh ls` ECHO column: the first
+/// client line's model, control, and rtt (`optimistic auto-escalated 412ms`),
+/// `unknown` for a client that reported nothing, `-` when no client is
+/// attached. Multiple clients are counted (`+2`) rather than listed.
+pub(crate) fn echo_summary(response: &str) -> String {
+    let clients: Vec<&str> = response
+        .lines()
+        .filter(|l| l.starts_with("client "))
+        .collect();
+    let Some(first) = clients.first() else {
+        return "-".to_string();
+    };
+    let field = |key: &str| -> Option<&str> {
+        first
+            .split(' ')
+            .find_map(|kv| kv.strip_prefix(key).and_then(|v| v.strip_prefix('=')))
+    };
+    let mut out = match field("echo") {
+        Some("unknown") | None => "unknown".to_string(),
+        Some(model) => {
+            let mut s = model.to_string();
+            if let Some(control) = field("control") {
+                s.push(' ');
+                s.push_str(control);
+            }
+            match field("srtt") {
+                Some("none") | None => {}
+                Some(ms) => {
+                    s.push(' ');
+                    s.push_str(ms);
+                    s.push_str("ms");
+                }
+            }
+            s
+        }
+    };
+    if clients.len() > 1 {
+        out.push_str(&format!(" +{}", clients.len() - 1));
+    }
+    out
 }
 
 pub fn cmd_list(cfg: &Config, format: ListFormat) -> Result<()> {
@@ -366,6 +412,11 @@ pub fn cmd_list(cfg: &Config, format: ListFormat) -> Result<()> {
         match probe_session(&path) {
             Ok(probe) => {
                 let cmd = probe.info.cmd_display();
+                // RFC 0014 §4.3: one status-socket read per live session;
+                // a pre-RFC-0014 daemon has no socket and reads `None`.
+                let echo = read_status_socket(&cfg.status_socket_path(&name))
+                    .ok()
+                    .map(|r| echo_summary(&r));
                 sessions.push(SessionEntry {
                     name,
                     pid: Some(probe.info.pid),
@@ -374,6 +425,7 @@ pub fn cmd_list(cfg: &Config, format: ListFormat) -> Result<()> {
                     cmd: (!cmd.is_empty()).then_some(cmd),
                     cwd: (!probe.info.cwd.is_empty()).then_some(probe.info.cwd),
                     activity: (!probe.info.activity.is_empty()).then_some(probe.info.activity),
+                    echo,
                 })
             }
             Err(e) => {
@@ -385,6 +437,7 @@ pub fn cmd_list(cfg: &Config, format: ListFormat) -> Result<()> {
                     cmd: None,
                     cwd: None,
                     activity: None,
+                    echo: None,
                 });
                 cleanup_stale_socket(&path);
             }
@@ -461,6 +514,10 @@ fn json_list(sessions: &[SessionEntry], current: Option<&str>) -> String {
                 out.push_str(",\"activity\":");
                 out.push_str(&json_string(activity));
             }
+            if let Some(echo) = &s.echo {
+                out.push_str(",\"echo\":");
+                out.push_str(&json_string(echo));
+            }
             out.push_str(&format!(",\"current\":{is_current}"));
         }
         out.push('}');
@@ -521,6 +578,9 @@ fn print_session_line(s: &SessionEntry, format: ListFormat, current: Option<&str
     }
     if let Some(cmd) = &s.cmd {
         line.push_str(&format!("\tcmd={cmd}"));
+    }
+    if let Some(echo) = &s.echo {
+        line.push_str(&format!("\techo={echo}"));
     }
     println!("{line}");
 }
@@ -794,6 +854,7 @@ mod tests {
                 cmd: Some("htop -d 10".to_string()),
                 cwd: Some("/home/user".to_string()),
                 activity: Some("vim ~/notes".to_string()),
+                echo: Some("optimistic auto-escalated 412ms".to_string()),
             },
             SessionEntry {
                 name: "broken".to_string(),
@@ -803,6 +864,7 @@ mod tests {
                 cmd: None,
                 cwd: None,
                 activity: None,
+                echo: None,
             },
             SessionEntry {
                 name: "minimal".to_string(),
@@ -812,6 +874,7 @@ mod tests {
                 cmd: None,
                 cwd: None,
                 activity: None,
+                echo: None,
             },
         ];
         let json = json_list(&sessions, Some("minimal"));
@@ -820,7 +883,8 @@ mod tests {
             concat!(
                 "[",
                 "{\"name\":\"alpha\",\"pid\":1234,\"clients\":2,",
-                "\"cwd\":\"/home/user\",\"cmd\":\"htop -d 10\",\"activity\":\"vim ~/notes\",\"current\":false},",
+                "\"cwd\":\"/home/user\",\"cmd\":\"htop -d 10\",\"activity\":\"vim ~/notes\",",
+                "\"echo\":\"optimistic auto-escalated 412ms\",\"current\":false},",
                 "{\"name\":\"broken\",\"error\":true,\"status\":\"ConnectionRefused\"},",
                 "{\"name\":\"minimal\",\"pid\":9,\"clients\":0,\"current\":true}",
                 "]"
@@ -849,9 +913,25 @@ mod tests {
             cmd: None,
             cwd: None,
             activity: None,
+            echo: None,
         }];
         let json = json_list(&sessions, None);
         assert!(json.contains("\"current\":false"));
+    }
+
+    /// RFC 0014 §4.3: the `posh ls` ECHO column condenses the status
+    /// response's first client line; the two absence verdicts survive.
+    #[test]
+    fn echo_summary_condenses_the_first_client_line() {
+        let two = "session=w1 group=default clients=2\n\
+                   client pid=7 build=1(a) echo=optimistic control=auto-escalated srtt=412 rto=900 codec=morph\n\
+                   client pid=8 build=1(a) echo=adaptive control=auto srtt=none rto=1000 codec=dumpdiff\n";
+        assert_eq!(echo_summary(two), "optimistic auto-escalated 412ms +1");
+        let unmeasured = "session=w1\nclient pid=8 build=1(a) echo=adaptive control=auto srtt=none\n";
+        assert_eq!(echo_summary(unmeasured), "adaptive auto");
+        assert_eq!(echo_summary("session=w1\nclient build=unknown echo=unknown\n"), "unknown");
+        assert_eq!(echo_summary("session=w1\nclient pid=1 build=1(a) echo=none control=auto srtt=none\n"), "none auto");
+        assert_eq!(echo_summary("session=w1 clients=0\n"), "-");
     }
 
     #[test]

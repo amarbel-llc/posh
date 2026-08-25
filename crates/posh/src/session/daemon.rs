@@ -979,20 +979,21 @@ fn daemon_main(
     std::process::exit(code);
 }
 
-/// The session-line fields of the RFC 0014 §4.2 status response.
-struct SessionStatus<'a> {
-    name: &'a str,
-    group: &'a str,
-    daemon_pid: u32,
-    frames: bool,
-    echo_flag: bool,
-    alt_screen: bool,
-    activity: &'a str,
+/// The session-line fields of the RFC 0014 §4.2 status response. `pub(crate)`
+/// so the Architecture-A roaming server answers with the identical shape.
+pub(crate) struct SessionStatus<'a> {
+    pub(crate) name: &'a str,
+    pub(crate) group: &'a str,
+    pub(crate) daemon_pid: u32,
+    pub(crate) frames: bool,
+    pub(crate) echo_flag: bool,
+    pub(crate) alt_screen: bool,
+    pub(crate) activity: &'a str,
 }
 
 /// The RFC 0014 §4.2 status response: the session line, then one client line
 /// per attached client (`records` carry their `age=` already).
-fn status_response(s: &SessionStatus<'_>, records: &[introspect::ClientRecord]) -> String {
+pub(crate) fn status_response(s: &SessionStatus<'_>, records: &[introspect::ClientRecord]) -> String {
     let mut out = format!(
         "session={} group={} daemon={}({}) pid={} frames={} echo_flag={} \
          alt_screen={} clients={} activity={:?}\n",
@@ -1017,7 +1018,7 @@ fn status_response(s: &SessionStatus<'_>, records: &[introspect::ClientRecord]) 
 /// Answer every pending connection on the status socket (RFC 0014 §4.1):
 /// write the response, close. Never reads; a slow reader cannot stall the
 /// daemon (the write is bounded by `write_all_retry`'s budget).
-fn serve_status(listener: &UnixListener, response: &str) {
+pub(crate) fn serve_status(listener: &UnixListener, response: &str) {
     while let Ok((stream, _)) = listener.accept() {
         let _ = util::write_all_retry(stream.as_raw_fd(), response.as_bytes(), 100);
     }

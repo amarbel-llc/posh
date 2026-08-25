@@ -14,6 +14,7 @@ use crate::remote::crypto::Key;
 use crate::remote::diag;
 use crate::remote::display::Snapshot;
 use crate::remote::framesync::FrameProducer;
+use crate::remote::introspect;
 use crate::remote::datagram::{Connection, Family, DEFAULT_PORT_RANGE, SEND_INTERVAL_MIN};
 use crate::remote::stats::Stats;
 use crate::remote::sync::{
@@ -845,7 +846,15 @@ fn handle_session_instruction(
                             write: Vec::new(),
                             frame_offset: 0,
                         };
-                        let content = crate::remote::relay::content_caps(&msg.caps);
+                        let mut content = crate::remote::relay::content_caps(&msg.caps);
+                        // RFC 0014 §3: the bridge's own identity on Init; the
+                        // riding client's entries follow as Tag::ClientCaps.
+                        content.push(introspect::encode_client_ident(&introspect::Ident {
+                            version: env!("POSH_VERSION").into(),
+                            git_sha: env!("POSH_GIT_SHA").into(),
+                            pid: std::process::id(),
+                            start_unix_ms: unix_now_ms(),
+                        }));
                         ipc::append_frame(
                             &mut link.write,
                             Tag::Init,
@@ -940,6 +949,16 @@ fn bridge_client_message(b: &mut SessionBridge, msg: &crate::remote::sync::Clien
         b.ack_due = true;
         b.echo.record(b.inbox.next_offset(), now_ms());
     }
+    // RFC 0014 §3: the riding client's unsolicited introspection entries go
+    // to the daemon verbatim (the M2 hop of the relay rule).
+    let forwarded = crate::remote::relay::forwarded_client_caps(&msg.caps);
+    if !forwarded.is_empty() {
+        ipc::append_frame(
+            &mut b.link.write,
+            Tag::ClientCaps,
+            &caps::encode_table(&forwarded),
+        );
+    }
     b.held.drop_if_acked(msg.acked_frame);
     let resync = msg.flags & crate::remote::sync::CLIENT_FLAG_RESYNC != 0;
     if msg.acked_frame > b.acked_forwarded || resync {
@@ -1025,6 +1044,13 @@ pub(crate) fn server_loop(
     let mut peer_wants_state = false;
     let mut peer_wants_ident = false;
     let ident_cap = server_ident_cap();
+    // RFC 0014 §3/§4.1: the peer client's retained introspection record and
+    // this process's status socket under `<base>/remote/<pid>.status.sock`
+    // (an Architecture-A server has no session dir; the daemon's contract
+    // otherwise verbatim: `.status.pid` written first, best-effort).
+    let mut client_record = ClientRecordSlot::default();
+    let status_name = format!("remote-{}", std::process::id());
+    let (status_listener, status_paths) = bind_remote_status_socket();
     // Evolved-predictor metric forwarding (RFC 0007 §3): when the peer advertises
     // CAP_METRICS we attach the remote-host terminals, sampled at most every
     // METRICS_SAMPLE_INTERVAL ms (the /proc reads are not free).
@@ -1179,6 +1205,7 @@ pub(crate) fn server_loop(
                 bytes_tx: conn.bytes_tx(),
                 term_gen: term.generation(),
                 pty_open,
+                client: client_record.record_now(now),
             }
             .dump();
         }
@@ -1242,6 +1269,14 @@ pub(crate) fn server_loop(
             }
             None => (usize::MAX, 0),
         };
+        // RFC 0014 §4.1: the status socket, appended last (fixed indices above).
+        let status_idx = match &status_listener {
+            Some(l) => {
+                fds.push(util::pollfd(std::os::fd::AsRawFd::as_raw_fd(l), libc::POLLIN));
+                fds.len() - 1
+            }
+            None => usize::MAX,
+        };
         let poll_start = stats.enabled().then(Instant::now);
         match util::poll(&mut fds, timeout) {
             Ok(_) => {}
@@ -1249,6 +1284,31 @@ pub(crate) fn server_loop(
             Err(_) => break,
         }
         let idle_us = poll_start.map_or(0, |t| t.elapsed().as_micros() as u64);
+        if let Some(l) = status_listener
+            .as_ref()
+            .filter(|_| fds[status_idx].revents & libc::POLLIN != 0)
+        {
+            // Same response shape as a session daemon's (§4.1: a reader must
+            // not be able to tell which role answered); this server has no
+            // session name, so the pid stands in.
+            let activity = crate::session::activity::compose(
+                pty::foreground_command(child.master).as_deref(),
+                term.title(),
+            );
+            let response = crate::session::daemon::status_response(
+                &crate::session::daemon::SessionStatus {
+                    name: &status_name,
+                    group: "remote",
+                    daemon_pid: std::process::id(),
+                    frames: true,
+                    echo_flag: pty_open && pty::echo_on(child.master),
+                    alt_screen: term.is_alt_screen(),
+                    activity: &activity,
+                },
+                &[client_record.record_now(now_ms())],
+            );
+            crate::session::daemon::serve_status(l, &response);
+        }
 
         // #wedge poll aggregate (#83 Case B): count this wake and whether the PTY
         // signalled readable, before the read branch consumes it.
@@ -1627,6 +1687,9 @@ pub(crate) fn server_loop(
                             caps::find(&msg.caps, caps::CAP_SERVER_STATE).is_some();
                         peer_wants_ident =
                             caps::find(&msg.caps, caps::CAP_SERVER_IDENT).is_some();
+                        // RFC 0014 §3: retain the peer's unsolicited identity /
+                        // state (single-peer: this connection IS the client).
+                        client_record.absorb(&msg.caps, now_ms());
                         // CAP_METRICS (RFC 0007 §3): per-message, like the others.
                         peer_wants_metrics = caps::find(&msg.caps, caps::CAP_METRICS).is_some();
                         // A GP client wants the server-cost terminals (#11): turn
@@ -2258,6 +2321,12 @@ pub(crate) fn server_loop(
     let _ = util::try_reap(child.pid);
     util::close_fd(child.master);
     close_overlay(&mut overlay);
+    // The status socket is introspection, not a rendezvous: always removed.
+    drop(status_listener);
+    if let Some((sock, pidfile)) = status_paths {
+        let _ = std::fs::remove_file(sock);
+        let _ = std::fs::remove_file(pidfile);
+    }
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -2339,6 +2408,83 @@ pub(crate) fn send_payload(
 /// loop: the compile-time version + git sha, the pid, and the wall clock at
 /// call time (callers invoke it at loop entry, so it is the process start
 /// for introspection purposes).
+/// Wall-clock ms since the epoch (identity anchors; `now_ms` is monotonic).
+fn unix_now_ms() -> u64 {
+    std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_millis() as u64)
+        .unwrap_or(0)
+}
+
+/// The single peer's retained RFC 0014 record on an Architecture-A server:
+/// the daemon's per-client `ClientConn` fields, for a loop that has exactly
+/// one client and no attachment/origin distinction (the peer IS the client).
+#[derive(Default)]
+struct ClientRecordSlot {
+    record: introspect::ClientRecord,
+    record_at: u64,
+}
+
+impl ClientRecordSlot {
+    /// Retain the identity / state entries of one client message (§3).
+    fn absorb(&mut self, table: &[caps::Cap], now: u64) {
+        if let Some(cap) = caps::find(table, caps::CAP_CLIENT_IDENT) {
+            if let Ok(ident) = introspect::decode_client_ident(&cap.payload) {
+                self.record.ident = Some(ident);
+            }
+        }
+        if let Some(cap) = caps::find(table, caps::CAP_CLIENT_STATE) {
+            if let Ok(state) = introspect::decode_client_state(&cap.payload) {
+                self.record.state = Some(state);
+                self.record_at = now;
+            }
+        }
+    }
+
+    fn record_now(&self, now: u64) -> introspect::ClientRecord {
+        let mut r = self.record.clone();
+        r.age_ms = r.state.map(|_| now.saturating_sub(self.record_at));
+        r
+    }
+}
+
+/// RFC 0014 §4.1 for a server with no session dir: bind
+/// `<base>/remote/<pid>.status.sock` (+ `.status.pid` first) under a 0700
+/// dir. Best-effort — a failure degrades `posh status`/`posh ls` only.
+/// Returns the listener and the two paths to remove at teardown.
+fn bind_remote_status_socket() -> (
+    Option<std::os::unix::net::UnixListener>,
+    Option<(std::path::PathBuf, std::path::PathBuf)>,
+) {
+    use std::os::unix::fs::DirBuilderExt;
+    let dir = crate::session::socket_base_from_env().join("remote");
+    let mut b = std::fs::DirBuilder::new();
+    b.recursive(true).mode(0o700);
+    let pid = std::process::id();
+    let sock = dir.join(format!("{pid}.status.sock"));
+    let pidfile = dir.join(format!("{pid}.status.pid"));
+    let bound = b
+        .create(&dir)
+        .and_then(|()| std::fs::write(&pidfile, pid.to_string()))
+        .and_then(|()| {
+            let _ = std::fs::remove_file(&sock);
+            std::os::unix::net::UnixListener::bind(&sock)
+        });
+    match bound {
+        Ok(l) => {
+            let _ = l.set_nonblocking(true);
+            (Some(l), Some((sock, pidfile)))
+        }
+        Err(e) => {
+            util::log_write(
+                "warn",
+                &format!("status socket unavailable {}: {e}", sock.display()),
+            );
+            (None, None)
+        }
+    }
+}
+
 pub(crate) fn server_ident_cap() -> caps::Cap {
     let start_unix_ms = std::time::SystemTime::now()
         .duration_since(std::time::UNIX_EPOCH)

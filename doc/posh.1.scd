@@ -159,8 +159,11 @@ Local persistence over Unix sockets.
 *list* [*--short*] [*-j*|*--json*] [*-w*|*--watch* [*--interval* _N_]] (aliases: *ls*, *l*)
 	List sessions in the group: name, pid, attached client count.
 	When stdout is a terminal the default output is a styled table
-	with a state-colored status dot (attached, detached, or stale)
-	and the working directory and command of each session, followed
+	with a state-colored status dot (attached, detached, or stale),
+	the working directory and command of each session, and an ECHO
+	column condensing the first attached client's echo model, control,
+	and rtt from the session's status socket (see *status*; empty for a
+	daemon that predates RFC 0014), followed
 	by any live per-destination mux endpoints (the *mux ls* lines)
 	and, on a host that SERVES other machines' forwarded agents, one
 	status line per mux-peer status socket (build, peer, heard age,
