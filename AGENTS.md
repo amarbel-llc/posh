@@ -227,9 +227,16 @@ the `eng-*(7)` manpages — read them with `man eng-versioning`,
   >150 ms for 3 s and back <80 ms for 15 s (`predict::EchoEscalation`;
   in-band stays escalated by design; `POSH_ECHO_ESCALATE=0` opts out); any
   explicit model pins — env `adaptive` included — and the palette's
-  `Echo: adaptive` re-arms. Note `always` ≈ `adaptive` on a slow link — both keep the
-  tentative-epoch gate; only `optimistic`/`experimental` show post-Enter
-  keystrokes before the round trip.
+  `Echo: adaptive` re-arms. **Predictor vs renderer are orthogonal axes
+  (2026-08-25 split):** the model decides WHAT is predicted and WHETHER
+  (adaptive's srtt/glitch triggers, `never`, the ECHO-off/alt-screen safety
+  gate); the `PredictionRenderer` decides WHEN a held prediction appears and
+  HOW it looks — `shows_tentative()` and `always_flags()`, both `true` today,
+  so every model paints the first post-Enter keystroke immediately and every
+  predicted cell is marked (underline for `replace`, faint for `dim`). mosh's
+  tentative-epoch hold and its slow-link flag survive only as advisory model
+  state (`flagging`, `srtt_trigger` in the stats); `always` ≈ `adaptive` on a
+  slow link still holds for the model's decisions.
 
 ## Debugging a live / wedged roaming session
 

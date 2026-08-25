@@ -340,7 +340,8 @@ _POSH_ECHO_ESCALATE_
 
 _POSH_PREDICTION_RENDER_
 	How predicted cells are painted, independent of the model: _replace_
-	(default) or _dim_. See *posh-client*(1).
+	(default, underlined) or _dim_ (faint). Predictions are painted
+	immediately and always marked. See *posh-client*(1).
 
 _POSH_PREDICTION_OVERWRITE_
 	When set, predictions overwrite instead of inserting.

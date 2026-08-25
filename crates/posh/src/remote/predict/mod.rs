@@ -123,6 +123,26 @@ pub struct EvolutionStats {
 pub trait PredictionRenderer: Send {
     fn paint_cell(&self, fb: &mut Snapshot, row: u16, col: u16, replacement: &Cell, hint: CellHint);
     fn paint_cursor(&self, fb: &mut Snapshot, row: u16, col: u16);
+
+    /// Render-axis policy (2026-08-25 split): does this renderer paint a
+    /// prediction the moment the model produced it, ignoring the model's
+    /// tentative-epoch hold? The hold is mosh's "hide the first keystroke of
+    /// a new epoch until the previous one confirms" — a `when to show` choice
+    /// that belongs to the render UX, not to what is predicted. `true` (the
+    /// default, for every renderer today) draws everything the model holds;
+    /// the model's own `whether` decisions (adaptive's srtt/glitch triggers,
+    /// the ECHO-off/alt-screen safety gate) still apply upstream of this.
+    fn shows_tentative(&self) -> bool {
+        true
+    }
+
+    /// Render-axis policy: mark every predicted cell (underline/dim), not only
+    /// when the model's slow-link/glitch flag is up. `true` (the default) so a
+    /// prediction is always visibly a prediction; the model's `flagged` hint
+    /// is then advisory. Future renderers may experiment with `false`.
+    fn always_flags(&self) -> bool {
+        true
+    }
 }
 
 /// Model state a renderer MAY use when painting a cell: `flagged` =

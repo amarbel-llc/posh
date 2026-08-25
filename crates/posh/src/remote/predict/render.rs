@@ -106,16 +106,48 @@ mod tests {
         assert_eq!(replaced.cell(0, col).unwrap().ch, 'z');
         assert_eq!(dimmed.cell(0, col).unwrap().ch, 'z');
 
-        // But the render styles differ: dim marks the cell faint; replace does
-        // not (and optimistic never underlines).
+        // But the render styles differ: dim marks the cell faint; replace
+        // underlines. Both mark the cell — `always_flags` — even though the
+        // optimistic MODEL raises no slow-link flag (the render-axis split).
         let replaced_style = replaced.cell(0, col).unwrap().style;
         let dimmed_style = dimmed.cell(0, col).unwrap().style;
         assert!(!replaced_style.dim, "replace renderer leaves dim off");
-        assert_eq!(replaced_style.underline, UnderlineStyle::None);
+        assert_eq!(replaced_style.underline, UnderlineStyle::Single);
         assert!(dimmed_style.dim, "dim renderer marks the predicted cell dim");
         assert_ne!(
             replaced_style, dimmed_style,
             "the two render styles must produce distinct cell styles"
         );
+    }
+
+    /// The predictor/renderer split (2026-08-25): a prediction the mosh model
+    /// still holds as TENTATIVE (first keystroke of a new epoch on a fast
+    /// link, flag off) is painted immediately and marked — the renderer, not
+    /// the model, decides when and how. The model's own `whether` gate stays:
+    /// `never` paints nothing.
+    #[test]
+    fn renderer_paints_tentative_predictions_immediately_and_marked() {
+        use crate::remote::predict::{MoshPredictor, PredictionModel};
+        let fb = snapshot(5, 20, b"$ ");
+        let mut eng = MoshPredictor::new(PredictionModel::Always, false);
+        eng.set_send_interval(10); // fast link: no srtt trigger, no flagging
+        eng.set_frame_sent(0);
+        // A fresh predictor's first keystroke is tentative until an epoch
+        // confirms — mosh would hide it for a round trip.
+        eng.on_user_byte(b'z', &fb, 100);
+        assert!(!eng.flagging(), "the MODEL raises no flag on a fast link");
+        let col = fb.cursor_col;
+        let mut out = fb.clone();
+        eng.render(&mut out, &ReplaceRenderer);
+        let cell = out.cell(0, col).unwrap();
+        assert_eq!(cell.ch, 'z', "painted despite being tentative");
+        assert_eq!(cell.style.underline, UnderlineStyle::Single, "always marked");
+
+        let mut never = MoshPredictor::new(PredictionModel::Never, false);
+        never.set_frame_sent(0);
+        never.on_user_byte(b'z', &fb, 100);
+        let mut out = fb.clone();
+        never.render(&mut out, &ReplaceRenderer);
+        assert_eq!(out.cell(0, col).unwrap().ch, ' ', "`never` is the model's call");
     }
 }

@@ -156,10 +156,10 @@ impl Predictor for OptimisticPredictor {
     }
 
     fn render(&self, fb: &mut Snapshot, renderer: &dyn PredictionRenderer) {
-        // Optimistic draws every active prediction immediately, with no
-        // tentative/confirmed-epoch gate and no slow-link underline: force the
-        // confirmed epoch to u64::MAX (so `tentative()` is always false) and
-        // suppress flagging (FDR 0006).
+        // Optimistic's MODEL verdict: every active prediction is showable now
+        // (no tentative gate) and it raises no slow-link flag (FDR 0006). The
+        // renderer's own policy (`shows_tentative`/`always_flags`) decides the
+        // final look — today that marks these cells too.
         self.buf.render(fb, renderer, u64::MAX, false);
     }
 

@@ -89,19 +89,19 @@ impl MoshPredictor {
         }
     }
 
-    /// Cells `render()` would actually paint right now: shown by the adaptive
-    /// trigger AND past the tentative-epoch gate. The honest "is local echo
-    /// visible" gauge, vs `active()` which also counts hidden predictions.
+    /// Cells the model offers `render()` right now: shown by the adaptive
+    /// trigger. The tentative-epoch hold is no longer a hide (the renderer
+    /// decides when a held prediction appears — `shows_tentative`), so every
+    /// active cell counts; `active()` is the same set as a bool.
     fn shown_cells(&self) -> u64 {
         if !self.shown() {
             return 0;
         }
-        let confirmed = self.buf.confirmed_epoch;
         self.buf
             .overlays
             .iter()
             .flat_map(|row| row.cells.iter())
-            .filter(|c| c.active && !c.tentative(confirmed))
+            .filter(|c| c.active)
             .count() as u64
     }
 
@@ -443,16 +443,22 @@ mod tests {
     #[test]
     fn prediction_is_tentative_until_epoch_confirmed() {
         // mosh starts in prediction epoch 1 with confirmed epoch 0: brand-new
-        // predictions stay hidden until the server confirms one.
+        // predictions are TENTATIVE (model state) until the server confirms
+        // one. Since the predictor/renderer split the hold is the renderer's
+        // call, and today's renderers paint tentative cells immediately.
         let mut eng = engine(PredictionModel::Always);
         let fb = snapshot(5, 20, b"$ ");
         eng.set_local_frame_sent(0);
         eng.new_user_byte(b'x', &fb, 100);
         assert!(eng.active());
+        assert!(
+            eng.confirmed_epoch() < eng.prediction_epoch(),
+            "the model holds the prediction as tentative"
+        );
 
         let mut overlaid = fb.clone();
         eng.render(&mut overlaid, &ReplaceRenderer);
-        assert_eq!(shown_char(&overlaid, 0, 2), ' ', "tentative: not drawn");
+        assert_eq!(shown_char(&overlaid, 0, 2), 'x', "tentative, but the renderer paints it");
 
         // Server confirms: echo ack covers the byte and the cell matches.
         let confirmed = snapshot(5, 20, b"$ x");
@@ -520,17 +526,19 @@ mod tests {
         eng.render(&mut overlaid, &ReplaceRenderer);
         assert_eq!(shown_char(&overlaid, 0, 3), 'a', "epoch-1 prediction shown");
 
-        // Ctrl-T (random control byte) bumps the tentative epoch.
+        // Ctrl-T (random control byte) bumps the tentative epoch: the model
+        // holds the next prediction as tentative (a new, unconfirmed epoch)…
+        let before = eng.prediction_epoch();
         eng.new_user_byte(0x14, &fb, 110);
         eng.new_user_byte(b'b', &fb, 120);
+        assert!(eng.prediction_epoch() > before, "control byte opened a new epoch");
+        assert!(eng.confirmed_epoch() < eng.prediction_epoch(), "…which is unconfirmed");
+        // …but the renderer paints it anyway (the predictor/renderer split:
+        // the hold is a render-UX choice, and today's renderers show it).
         let mut overlaid = fb.clone();
         eng.render(&mut overlaid, &ReplaceRenderer);
         assert_eq!(shown_char(&overlaid, 0, 3), 'a', "old epoch still shown");
-        assert_eq!(
-            shown_char(&overlaid, 0, 4),
-            ' ',
-            "post-control prediction is tentative and hidden"
-        );
+        assert_eq!(shown_char(&overlaid, 0, 4), 'b', "post-control prediction painted");
     }
 
     #[test]

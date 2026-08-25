@@ -461,9 +461,11 @@ impl OverlayBuffer {
     }
 
     /// Walks the surviving predictions and paints each shown cell + the
-    /// cursor through `renderer`. `confirmed_epoch` gates the tentative cells
-    /// (the model passes `u64::MAX` to draw everything); `flag` is the
-    /// slow-link underline policy.
+    /// cursor through `renderer`. `confirmed_epoch` is the MODEL's tentative
+    /// gate and `flag` its slow-link/glitch verdict; both are advisory to the
+    /// renderer's own policy (the predictor/renderer split): a renderer that
+    /// `shows_tentative` draws every held prediction (the gate is bypassed
+    /// with `u64::MAX`), and one that `always_flags` marks every cell.
     pub fn render(
         &self,
         fb: &mut Snapshot,
@@ -471,6 +473,12 @@ impl OverlayBuffer {
         confirmed_epoch: u64,
         flag: bool,
     ) {
+        let confirmed_epoch = if renderer.shows_tentative() {
+            u64::MAX
+        } else {
+            confirmed_epoch
+        };
+        let flag = flag || renderer.always_flags();
         for cursor in &self.cursors {
             cursor.render(fb, renderer, confirmed_epoch);
         }

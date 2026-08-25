@@ -183,6 +183,22 @@ against a screen that contains the echo it claims.
 - **Opt-in, not a replacement.** `adaptive` remains the default; `optimistic` is
   selected explicitly until the A/B and promotion criteria settle.
 
+## Predictor / renderer split (2026-08-25)
+
+Observed on a pinned `always`: no underline, and a visible hold on the first
+keystroke after Enter. Both were mosh policy living in the render path — the
+slow-link `flagging` (send interval >80 ms) chose the underline, and the
+tentative-epoch gate hid a new epoch's first cell for a round trip. These are
+render-UX choices, orthogonal to what a model predicts, so they moved onto the
+`PredictionRenderer` as policy hooks: `shows_tentative()` (paint a held
+prediction the moment the model produced it) and `always_flags()` (mark every
+predicted cell). Both are `true` for every renderer today — so `adaptive`,
+`always`, and `optimistic` all paint immediately and marked, and the "dim
+optimistic echo: off" lever below is superseded (every renderer marks; `dim`
+vs `replace` picks faint vs underline). The model keeps WHAT and WHETHER:
+adaptive's triggers, `never`, and the ECHO-off/alt-screen safety gate are
+unchanged. The flag/hold remain as advisory model state in the stats.
+
 ## Tuning Levers
 
 | Lever | Current | Rationale | Change signal |
