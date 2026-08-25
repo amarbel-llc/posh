@@ -181,3 +181,9 @@ RFC 0001's capability table gains ids 13 (`SERVER_IDENT`), 14 (`SERVER_STATE`),
 and 15 (`SESSION_ACTIVITY`), maintained in place per its rules. Id 224's row is
 unchanged; posh#150 tracks the experimental band's shipping contradiction,
 which id 14 resolves for the state path.
+
+This document is one-directional by design: every entry flows server → client.
+The reverse half — the client reporting its own identity and echo/transport
+state, the per-session status socket, and the rule that every introspectable
+axis renders from one shared struct on both ends — is RFC 0014, which reuses
+§1.1's payload layout and §4's socket contract verbatim.
