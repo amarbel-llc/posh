@@ -513,7 +513,8 @@ complete -c posh -n "__fish_seen_subcommand_from ssh" -a '(posh tailnet 2>/dev/n
 pub fn ph_script(shell: Shell) -> Option<&'static str> {
     match shell {
         Shell::Fish => Some(PH_FISH_COMPLETIONS),
-        Shell::Bash | Shell::Zsh => None,
+        Shell::Bash => Some(PH_BASH_COMPLETIONS),
+        Shell::Zsh => None,
     }
 }
 
@@ -593,6 +594,83 @@ complete -c ph -a '(posh list --short 2>/dev/null)' -d 'Local session'
 complete -c ph -a '(__ph_hosts)' -d 'Host'
 complete -c ph -a '(__ph_complete_remote_target)' -d 'Remote session'
 complete -c ph -a ':+' -d 'New local auto-id session'
+"#;
+
+const PH_BASH_COMPLETIONS: &str = r#"_ph_cmdline_group() {
+  local i=1
+  while [[ $i -lt ${#COMP_WORDS[@]} ]]; do
+    if [[ "${COMP_WORDS[$i]}" == "-g" || "${COMP_WORDS[$i]}" == "--group" ]]; then
+      echo "${COMP_WORDS[$((i+1))]}"
+      return
+    fi
+    ((i++))
+  done
+  echo "${POSH_GROUP:-default}"
+}
+
+_ph_remote_sessions() {
+  local host=$1 group=$2
+  local cache_dir=${XDG_CACHE_HOME:-$HOME/.cache}/posh
+  local cache=$cache_dir/sessions-$host
+  local gflag=""
+  if [[ -n "$group" && "$group" != "default" ]]; then
+    gflag="-g $group"
+    cache=$cache-$group
+  fi
+  if [ -z "$(find "$cache" -newermt '-30 seconds' 2>/dev/null)" ]; then
+    mkdir -p "$cache_dir"
+    ssh -o BatchMode=yes -o ConnectTimeout=2 "$host" posh $gflag list --short \
+      >"$cache.new" 2>/dev/null && mv "$cache.new" "$cache"
+  fi
+  cat "$cache" 2>/dev/null
+}
+
+_ph_ssh_hosts() {
+  command sed -n 's/^[[:space:]]*[Hh]ost[[:space:]]\{1,\}//p' \
+    ~/.ssh/config ~/.ssh/config.d/* ~/.ssh/conf.d/* 2>/dev/null \
+    | tr ' \t' '\n\n' | command grep -v '[*?!]' | sort -u
+}
+
+_ph_completions() {
+  # ph takes a single target token (no subcommands): local session names, ssh
+  # and tailnet hosts (offered as `host:`), the remote sessions after a `host:`,
+  # and the `:+` new-local-session sigil.
+  local cur prev
+  COMPREPLY=()
+  cur="${COMP_WORDS[COMP_CWORD]}"
+  prev="${COMP_WORDS[COMP_CWORD-1]}"
+
+  if [[ "$prev" == "-g" || "$prev" == "--group" ]]; then
+    COMPREPLY=($(compgen -W "$(posh groups 2>/dev/null | tr '\n' ' ')" -- "$cur"))
+    return 0
+  fi
+  if [[ "$cur" == -* ]]; then
+    COMPREPLY=($(compgen -W "-g --group" -- "$cur"))
+    return 0
+  fi
+  if [[ "$cur" == ?*:* && "$cur" != \[* ]]; then
+    local rhost="${cur%%:*}"
+    local rrest="${cur#*:}"
+    local rgroup rprefix
+    if [[ "$rrest" == */* ]]; then
+      rgroup="${rrest%%/*}"
+      rprefix="$rhost:$rgroup/"
+    else
+      rgroup="$(_ph_cmdline_group)"
+      rprefix="$rhost:"
+    fi
+    local rsessions=$(_ph_remote_sessions "$rhost" "$rgroup" | sed "s|^|$rprefix|" | tr '\n' ' ')
+    COMPREPLY=($(compgen -W "$rsessions $rhost:+" -- "$cur"))
+    return 0
+  fi
+  local sessions=$(posh list --short 2>/dev/null | tr '\n' ' ')
+  local hosts=$(_ph_ssh_hosts | sed 's/$/:/' | tr '\n' ' ')
+  local tailnet=$(posh tailnet 2>/dev/null | sed 's/$/:/' | tr '\n' ' ')
+  COMPREPLY=($(compgen -W "$sessions $hosts $tailnet :+" -- "$cur"))
+  return 0
+}
+
+complete -o bashdefault -o default -F _ph_completions ph
 "#;
 
 #[cfg(test)]
@@ -796,8 +874,8 @@ mod tests {
         ] {
             assert!(s.contains(needle), "ph fish script missing {needle}");
         }
-        // bash/zsh ph completions are a follow-up (fish is prioritized).
-        assert!(ph_script(Shell::Bash).is_none());
+        // bash also ships; zsh is a follow-up.
+        assert!(ph_script(Shell::Bash).is_some());
         assert!(ph_script(Shell::Zsh).is_none());
     }
 
@@ -817,6 +895,41 @@ mod tests {
         assert!(
             out.status.success(),
             "fish --no-execute rejected the ph script: {}",
+            String::from_utf8_lossy(&out.stderr)
+        );
+    }
+
+    #[test]
+    fn ph_bash_script_covers_targets() {
+        let s = ph_script(Shell::Bash).expect("bash ph script");
+        for needle in [
+            "complete -o bashdefault -o default -F _ph_completions ph",
+            "posh list --short",
+            "_ph_ssh_hosts",
+            "posh tailnet",
+            "BatchMode=yes",
+            ":+",
+        ] {
+            assert!(s.contains(needle), "ph bash script missing {needle}");
+        }
+    }
+
+    #[test]
+    fn ph_bash_script_parses() {
+        use std::process::Command;
+        let s = ph_script(Shell::Bash).unwrap();
+        let path = std::env::temp_dir().join("posh-ph-completions-parse-check.bash");
+        if std::fs::write(&path, s).is_err() {
+            return;
+        }
+        let Ok(out) = Command::new("bash").arg("-n").arg(&path).output() else {
+            let _ = std::fs::remove_file(&path);
+            return;
+        };
+        let _ = std::fs::remove_file(&path);
+        assert!(
+            out.status.success(),
+            "bash -n rejected the ph script: {}",
             String::from_utf8_lossy(&out.stderr)
         );
     }

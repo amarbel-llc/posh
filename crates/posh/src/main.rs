@@ -203,7 +203,7 @@ fn run() -> Result<()> {
             // (FDR 0015); without the `ph` arg it emits posh's own.
             if args.get(1).map(String::as_str) == Some("ph") {
                 let script = completions::ph_script(shell).ok_or_else(|| {
-                    Error::from("ph completions are available for fish (bash is a follow-up)")
+                    Error::from("ph completions are available for fish and bash (zsh is a follow-up)")
                 })?;
                 println!("{script}");
             } else {
