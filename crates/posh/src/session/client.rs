@@ -285,10 +285,10 @@ impl EscapeKeyMatcher {
 /// roaming client. No resync/base-sum, prediction, or palette: those remain
 /// later unification tasks.
 ///
-/// This path runs only when the daemon sends `Tag::Frame` (the default; the
-/// frame gate negotiated by Task 1.4). A gate-off session (`POSH_SESSION_FRAMES=0`)
-/// serves raw `Tag::Output` and never constructs a `FrameRenderer`, so its byte
-/// stream is the legacy one, unchanged.
+/// This path runs only when the daemon sends `Tag::Frame` (a current daemon
+/// always does for a frame-capable client). A session served by a pre-frames
+/// daemon gets raw `Tag::Output` and never constructs a `FrameRenderer`, so
+/// its byte stream is the legacy one, unchanged.
 struct FrameRenderer {
     /// The client's mirror of the daemon terminal. DumpDiff rebuilds it from a
     /// fresh model on every apply, so it is effectively write-then-read here;
@@ -964,9 +964,9 @@ fn local_client_ident() -> introspect::Ident {
 /// (opt-IN) — the kill-switch after coalescing was found to wedge live sessions
 /// (base desync -> `ReackAndWait`). Enable with `POSH_COALESCE=1`/`on`/`true`
 /// (case-insensitive, trimmed); anything else, including unset, leaves it off so
-/// the client runs today's self-ack+append path. Distinct from
-/// `POSH_SESSION_FRAMES` (which gates frames at all) — this gates only the
-/// write-buffer coalescing on top of frames. Kept an opt-in until the desync is
+/// the client runs today's self-ack+append path. This gates only the
+/// write-buffer coalescing on top of frames (frames themselves are no longer
+/// gated — posh#171). Kept an opt-in until the desync is
 /// root-caused; flip the default back to on only once it is trusted.
 fn coalesce_enabled() -> bool {
     parse_coalesce_gate(std::env::var("POSH_COALESCE").ok().as_deref())
@@ -1289,7 +1289,7 @@ fn client_loop(stream: UnixStream, enter: &[u8], raw: &RawMode) -> Result<i32> {
                                 stdout_buf.extend_from_slice(&frame.payload);
                             }
                             // Frame transport (RFC 0008), only when the daemon
-                            // negotiated it (`POSH_SESSION_FRAMES=on`): apply the
+                            // emits it (a pre-frames daemon never does): apply the
                             // ServerFrame into the client model and append the
                             // rendered delta. Build the consumer lazily on the
                             // first frame so the gate-off path stays inert. The
@@ -1715,9 +1715,10 @@ mod tests {
 
     #[test]
     fn gate_off_leaves_raw_ctrl_caret_in_the_stream() {
-        // POSH_SESSION_FRAMES off (no FrameRenderer): the palette is disabled, so
-        // the raw 0x1e is ordinary input forwarded to the shell — the legacy
-        // path. (Detach is still intercepted; only the palette is gated.)
+        // Not framed (a pre-frames daemon ⇒ no FrameRenderer): the palette is
+        // disabled, so the raw 0x1e is ordinary input forwarded to the shell —
+        // the legacy path. (Detach is still intercepted; only the palette is
+        // gated.)
         let mut m = EscapeKeyMatcher::default();
         assert_eq!(m.feed(b"\x1e", false), fwd(b"\x1e"));
     }
@@ -2315,8 +2316,8 @@ mod tests {
         assert_eq!(renderer.scroll_offset, 0, "the wheel did not scroll the local view");
     }
 
-    /// Gate-off invariant: with `POSH_SESSION_FRAMES=0` (frames now default ON,
-    /// so off is explicit) there is no FrameRenderer, so the client_loop stdin
+    /// Not-framed invariant: against a pre-frames daemon (the daemon-side gate
+    /// is retired, posh#171) there is no FrameRenderer, so the client_loop stdin
     /// path forwards `forward` verbatim. The only stage between raw stdin and
     /// `Tag::Input` is the escape-key matcher, which passes wheel SGR bytes
     /// through untouched — the daemon receives the raw wheel exactly as on the

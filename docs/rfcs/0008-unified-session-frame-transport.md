@@ -258,15 +258,20 @@ The socket negotiation MUST handle all four cases without a flag day:
 Because durable daemons may predate an upgrade, the "old daemon / new client"
 case is normal, not exceptional, and MUST be supported indefinitely until the
 promotion criterion (FDR 0011) retires the fallback. An implementation MUST
-provide a single switch that forces the daemon to emit `Tag::Output` only and
-the bootstrap to use §5.2(2) — restoring Architecture A in one step. The
-reference implementation's daemon-side half of this switch is the
-`POSH_SESSION_FRAMES` environment gate, an **opt-out**: default **on**, and
-`0`/`false`/`off`/`no` disables it. With it off the daemon never constructs a
-per-client frame producer and every client receives raw `Tag::Output` (the
-legacy path, byte-for-byte). It is deliberately distinct from `POSH_FRAMESYNC`
-(the *remote* MorphDelta codec opt-in), which selects a codec rather than
-gating frame emission.
+provide a switch that makes the bootstrap use §5.2(2) — restoring the
+Architecture A inner-attach path. The reference implementation's switch is
+`POSH_RELAY=0`.
+
+**Amendment (2026-08-25, posh#171).** This section originally also required a
+daemon-side half — the `POSH_SESSION_FRAMES` opt-out gate that forced a
+daemon to emit `Tag::Output` only. It is RETIRED and the variable is ignored:
+the roaming server never had an equivalent (frames there are unconditional),
+frames had been default-on fleet-wide, and the version-skew protection the
+gate duplicated is already the client's capability advertisement — a client
+whose Init carries no table is never given a frame producer. The "old daemon"
+row above therefore describes a genuinely older binary, not a mode a current
+daemon can be put into. `POSH_FRAMESYNC` (the *remote* MorphDelta codec opt-in)
+is unaffected; it selects a codec, it never gated frame emission.
 
 ## Security Considerations
 

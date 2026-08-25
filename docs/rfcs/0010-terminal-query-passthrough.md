@@ -306,9 +306,11 @@ This specification is additive and degrades cleanly:
   capability in the Init table (RFC 0001 §3 requires unknown caps to be ignored)
   and continues to drop query replies under frame transport. A client MUST NOT
   assume the capability took effect.
-- `POSH_SESSION_FRAMES=0` (RFC 0008 §6) remains a full escape hatch: under raw
-  `Tag::Output` the query reaches the real terminal directly and this
-  specification's daemon-answer path is not exercised.
+- ~~`POSH_SESSION_FRAMES=0` (RFC 0008 §6) remains a full escape hatch~~ —
+  retired 2026-08-25 (RFC 0008 §6 amendment, posh#171): a current daemon
+  always frames a frame-capable client, so the daemon-answer path is the only
+  path; the raw-`Tag::Output` behavior survives only with a baseline (no cap
+  table) client or a pre-frames daemon.
 - The nested case (a roaming client attached to a session that is itself a
   posh session on the remote host) requires the capability to propagate across
   both frame layers; the effective-set rule composes (each layer intersects),

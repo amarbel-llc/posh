@@ -6,8 +6,9 @@ promotion-criteria: >
   behind capability negotiation, a single unified client consumes frames over
   both the Unix and UDP transports, and the RFC 0008 conformance tests (socket
   skew matrix, reliable-as-degenerate property test) are green. The double-model
-  inner-attach path still exists behind the POSH_SESSION_FRAMES rollback switch
-  (RFC 0008 §6; the remote-bootstrap half is POSH_RELAY).
+  inner-attach path still exists behind the POSH_RELAY rollback switch (RFC
+  0008 §6; its daemon-side half, POSH_SESSION_FRAMES, was retired 2026-08-25 —
+  posh#171).
   experimental -> testing: `posh start`/`posh attach` (strict primitives), `ph`
   (the create-or-attach front-door + picker; FDR 0015), `posh list` (unified,
   worker-filtered, spinclass-styled), and the command palette on a local session

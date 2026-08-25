@@ -1548,12 +1548,6 @@ ENVIRONMENT
                     inner-`posh attach` bootstrap. A relay bootstrap also falls
                     back automatically when the remote daemon does not emit
                     frames, so both interoperate by negotiation.
-    POSH_SESSION_FRAMES
-                    Session frame transport (RFC 0008, default on): a local
-                    posh attach renders via posh's own frame path (Ctrl-^
-                    palette, mouse-wheel scroll-view). POSH_SESSION_FRAMES=0
-                    (or false/off/no) restores the legacy raw-output path
-                    (the wheel then passes through to the terminal's arrows).
     POSH_MUX        Per-destination mux endpoint (FDR 0014, default on): one
                     daemon per destination owns agent forwarding; sessions
                     bootstrap with forwarding off. POSH_MUX=0 (or false/off/

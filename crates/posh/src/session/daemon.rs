@@ -117,12 +117,11 @@ struct ClientConn {
     // frame-emission gate is on.
     caps: Vec<caps::Cap>,
     // Per-client visible-frame producer (RFC 0008), `Some` exactly when this
-    // client advertised frame support AND the frame-emission gate is on (the
-    // default; `$POSH_SESSION_FRAMES` not set to an off value). While `Some`, the
-    // daemon emits posh-proto `ServerFrame`s (`Tag::Frame`) to this client instead
-    // of raw `Tag::Output`; each client diffs against its OWN acked base, so a
+    // client advertised frame support on its Init. While `Some`, the daemon
+    // emits posh-proto `ServerFrame`s (`Tag::Frame`) to this client instead of
+    // raw `Tag::Output`; each client diffs against its OWN acked base, so a
     // freshly attached client's first frame is a `Full` while an established one
-    // gets a `Diff`. `None` (gate off / non-frame client) ⇒ legacy `Tag::Output`.
+    // gets a `Diff`. `None` (a baseline, non-frame client) ⇒ legacy `Tag::Output`.
     producer: Option<FrameProducer>,
     // Whether this client relays its frames onto a LOSSY link (it advertised
     // `CAP_LOSSY` on Init — the Phase 3 frame relay, RFC 0008 §3). A lossy client
@@ -292,13 +291,13 @@ impl ClientConn {
         caps::find(&self.caps, caps::CAP_PROTOCOL_VERSION).is_some()
     }
 
-    /// Construct this client's `FrameProducer` when the session frame-emission
-    /// gate is on AND the client is frame-capable. Idempotent: a bare re-`Init`
-    /// (SIGCONT resume) keeps the existing producer (and its acked base) rather
-    /// than resetting it. With `gate` off, NEVER constructs a producer, so the
-    /// client stays on `Tag::Output` — the Phase 1 safety invariant.
-    fn maybe_enable_frames(&mut self, gate: bool) {
-        if gate && self.producer.is_none() && self.is_frame_capable() {
+    /// Construct this client's `FrameProducer` when the client is frame-capable.
+    /// Idempotent: a bare re-`Init` (SIGCONT resume) keeps the existing producer
+    /// (and its acked base) rather than resetting it. A baseline client (no cap
+    /// table) never gets one and stays on `Tag::Output` — the only remaining
+    /// version-skew axis now that the daemon-side gate is retired.
+    fn maybe_enable_frames(&mut self) {
+        if self.producer.is_none() && self.is_frame_capable() {
             self.producer = Some(FrameProducer::new(self.rows.max(1), self.cols.max(1)));
         }
     }
@@ -554,29 +553,13 @@ impl ClientConn {
     }
 }
 
-/// Parses the `$POSH_SESSION_FRAMES` daemon frame-emission gate (RFC 0008 §6):
-/// an **opt-out**. `0`/`false`/`off`/`no` (case-insensitive, trimmed) turn it
-/// OFF; anything else — including unset/empty and any unrecognized value — leaves
-/// it ON (the default since the fleet gate-flip). Kept distinct from
-/// `$POSH_FRAMESYNC` (the *remote* MorphDelta codec opt-in) so the two are never
-/// conflated: this gate decides whether the session daemon emits frames at all,
-/// not which codec. `POSH_SESSION_FRAMES=0` restores today's raw-`Tag::Output`
-/// path byte-for-byte.
-fn parse_frames_gate(value: Option<&str>) -> bool {
-    util::parse_default_on_gate(value)
-}
-
-/// Whether this daemon emits posh-proto `ServerFrame`s (`Tag::Frame`) to
-/// frame-capable clients. DEFAULT ON (opt-out): frames flow to every frame-capable
-/// client unless `POSH_SESSION_FRAMES` is explicitly set off (`0`/`false`/`off`/
-/// `no`), in which case no producer is ever constructed and every client receives
-/// raw `Tag::Output`, byte-for-byte the legacy behavior. The local client has
-/// consumed frames since Phase 2 (RFC 0008 / FDR 0011), so on-by-default is safe.
-/// pub(crate): the palette About table reports the gate through this same
-/// selector so the table can never drift from the behavior.
-pub(crate) fn session_frames_enabled() -> bool {
-    parse_frames_gate(std::env::var("POSH_SESSION_FRAMES").ok().as_deref())
-}
+// The `$POSH_SESSION_FRAMES` daemon-side frame-emission gate (RFC 0008 §6's
+// rollback switch) was RETIRED on 2026-08-25 (posh#171 item 2, local/remote
+// parity): the roaming server never had one, frames had been default-on
+// fleet-wide, and the version-skew protection it duplicated is the client's
+// own capability advertisement — a client without `CAP_PROTOCOL_VERSION` on
+// its Init still gets raw `Tag::Output` (`is_frame_capable`). The env var is
+// now ignored; rollback to Architecture A is the bootstrap-side `POSH_RELAY=0`.
 
 /// Broadcasts a PTY-output chunk to every attached client: a posh-proto
 /// `ServerFrame` (`Tag::Frame`) for each frame-capable client, the raw `bcast`
@@ -1040,11 +1023,6 @@ fn daemon_loop(
     let listener_fd = listener.as_raw_fd();
     let pty_fd = child.master;
     let mut has_pty_output = false;
-    // Frame-emission gate (RFC 0008 §6), read once at startup: when off, no
-    // client ever gets a `FrameProducer`, so every client stays on `Tag::Output`
-    // (legacy behavior, byte-for-byte). Default ON (opt-out); off only when
-    // `POSH_SESSION_FRAMES` is `0`/`false`/`off`/`no`.
-    let frames_gate = session_frames_enabled();
     let mut filter = ScreenSwitchFilter::default();
     let err_events = libc::POLLHUP | libc::POLLERR | libc::POLLNVAL;
     // t=0 for recording timestamps (only used when recorder.is_some()).
@@ -1192,7 +1170,7 @@ fn daemon_loop(
                     name,
                     group,
                     daemon_pid: std::process::id(),
-                    frames: frames_gate,
+                    frames: true,
                     echo_flag: clients.iter().any(|c| c.echo_flag != 0),
                     alt_screen: term.is_alt_screen(),
                     activity: &activity,
@@ -1394,11 +1372,11 @@ fn daemon_loop(
                                         resized = true;
                                     }
                                     // Enable per-client frame production for a
-                                    // frame-capable client when the gate is on;
-                                    // a no-op otherwise (the replay/broadcast
+                                    // frame-capable client; a no-op for a
+                                    // baseline client (the replay/broadcast
                                     // then stay on Tag::Output). RFC 0008.
                                     let framed_before = c.producer.is_some();
-                                    c.maybe_enable_frames(frames_gate);
+                                    c.maybe_enable_frames();
                                     // Forward-only scrollback (RFC 0002 §3): a
                                     // freshly framed client starts with an empty
                                     // ring, so anchor its floor at the current
@@ -2029,7 +2007,7 @@ mod tests {
         let mut init = ipc::encode_resize(rows, cols).to_vec();
         init.extend_from_slice(&caps::encode_table(&caps::own_table(&[])));
         c.apply_init(&init);
-        c.maybe_enable_frames(true);
+        c.maybe_enable_frames();
         (c, peer)
     }
 
@@ -2064,7 +2042,7 @@ mod tests {
             payload: vec![flags],
         }])));
         c.apply_init(&init);
-        c.maybe_enable_frames(true);
+        c.maybe_enable_frames();
         (c, peer)
     }
 
@@ -2208,65 +2186,16 @@ mod tests {
     }
 
     #[test]
-    fn frames_gate_defaults_on_and_parses_falsey() {
-        // Default ON (opt-out): unset/empty and any unrecognized value leave it on.
-        assert!(parse_frames_gate(None));
-        assert!(parse_frames_gate(Some("")));
-        assert!(parse_frames_gate(Some("1")));
-        assert!(parse_frames_gate(Some("on")));
-        assert!(parse_frames_gate(Some("true")));
-        // `morph` is the POSH_FRAMESYNC value, NOT this gate — it is not an off
-        // spelling, so it leaves the frame gate on (unrecognized ⇒ default).
-        assert!(parse_frames_gate(Some("morph")));
-        // Falsey spellings (case-insensitive, trimmed) turn it OFF.
-        for off in ["0", "false", "off", "no", "  FALSE  ", "Off"] {
-            assert!(
-                !parse_frames_gate(Some(off)),
-                "{off:?} should disable the gate"
-            );
-        }
-    }
-
-    #[test]
-    fn producer_constructed_only_when_gated_and_capable() {
-        // Gate on + capable => producer.
+    fn producer_constructed_only_when_capable() {
+        // Capable (cap table on Init) => producer.
         let (capable, _p) = frame_capable_conn(24, 80);
-        assert!(capable.producer.is_some(), "gate on + cap table => producer");
+        assert!(capable.producer.is_some(), "cap table => producer");
 
-        // Gate off + capable => none (the Phase 1 safety invariant).
-        let (stream, _peer) = UnixStream::pair().unwrap();
-        let mut gate_off = ClientConn {
-            stream,
-            read_buf: FrameBuffer::new(),
-            write_buf: Vec::new(),
-            rows: 0,
-            cols: 0,
-            caps: Vec::new(),
-            producer: None,
-            lossy: false,
-            coalesce: false,
-            coalesce_off: false,
-            pending_frame_start: None,
-            sb_floor: 0,
-            acked_sb_total: 0,
-            bytes_drained: 0,
-            last_drain_ms: 0,
-            hiwater_mb: 0,
-            echo_flag: 0,
-            record: introspect::ClientRecord::default(),
-            record_at: 0,
-            attach_pid: None,
-        };
-        let mut init = ipc::encode_resize(24, 80).to_vec();
-        init.extend_from_slice(&caps::encode_table(&caps::own_table(&[])));
-        gate_off.apply_init(&init);
-        gate_off.maybe_enable_frames(false);
-        assert!(gate_off.producer.is_none(), "gate off must not construct a producer");
-
-        // Gate on + NOT capable (bare Init) => none.
+        // NOT capable (bare Init) => none — the one remaining skew axis now
+        // that the daemon-side gate is retired (posh#171).
         let mut baseline = test_client_conn();
         baseline.apply_init(&ipc::encode_resize(24, 80));
-        baseline.maybe_enable_frames(true);
+        baseline.maybe_enable_frames();
         assert!(baseline.producer.is_none(), "a non-capable client never gets a producer");
     }
 
@@ -2332,7 +2261,7 @@ mod tests {
         let num_before = c.producer.as_ref().unwrap().current_num();
         assert_eq!(num_before, 1, "producing one frame must advance current_num to 1");
 
-        c.maybe_enable_frames(true);
+        c.maybe_enable_frames();
 
         assert!(c.producer.is_some(), "the producer survives a re-Init");
         assert_eq!(
@@ -2436,53 +2365,6 @@ mod tests {
     }
 
     #[test]
-    fn gate_off_emits_output_for_every_client() {
-        let (rows, cols) = (24u16, 80u16);
-        let mut term = Terminal::with_scrollback(rows, cols, 100);
-        term.process(b"content");
-
-        // A cap-advertising client, but the gate is OFF => no producer.
-        let (stream, _peer) = UnixStream::pair().unwrap();
-        let mut c = ClientConn {
-            stream,
-            read_buf: FrameBuffer::new(),
-            write_buf: Vec::new(),
-            rows: 0,
-            cols: 0,
-            caps: Vec::new(),
-            producer: None,
-            lossy: false,
-            coalesce: false,
-            coalesce_off: false,
-            pending_frame_start: None,
-            sb_floor: 0,
-            acked_sb_total: 0,
-            bytes_drained: 0,
-            last_drain_ms: 0,
-            hiwater_mb: 0,
-            echo_flag: 0,
-            record: introspect::ClientRecord::default(),
-            record_at: 0,
-            attach_pid: None,
-        };
-        let mut init = ipc::encode_resize(rows, cols).to_vec();
-        init.extend_from_slice(&caps::encode_table(&caps::own_table(&[])));
-        c.apply_init(&init);
-        c.maybe_enable_frames(false);
-        assert!(c.producer.is_none());
-
-        let raw = b"raw broadcast bytes";
-        broadcast_output(std::slice::from_mut(&mut c), &term, raw);
-
-        let mut fb = FrameBuffer::new();
-        fb.feed(&c.write_buf);
-        let frame = fb.next().unwrap().expect("one queued record");
-        assert_eq!(frame.tag, Tag::Output, "gate off => Tag::Output");
-        assert_eq!(frame.payload, raw, "gate off => the raw broadcast bytes, unchanged");
-        assert!(fb.next().unwrap().is_none(), "exactly one Output record");
-    }
-
-    #[test]
     fn non_capable_client_gets_output_even_with_gate_on() {
         let (rows, cols) = (24u16, 80u16);
         let mut term = Terminal::with_scrollback(rows, cols, 100);
@@ -2491,7 +2373,7 @@ mod tests {
         // No cap table in the Init => baseline peer; gate ON.
         let mut c = test_client_conn();
         c.apply_init(&ipc::encode_resize(rows, cols));
-        c.maybe_enable_frames(true);
+        c.maybe_enable_frames();
         assert!(c.producer.is_none(), "a non-capable client never gets a producer");
 
         let raw = b"raw broadcast bytes";
@@ -2516,7 +2398,7 @@ mod tests {
         let (capable, _pc) = frame_capable_conn(rows, cols);
         let mut baseline = test_client_conn();
         baseline.apply_init(&ipc::encode_resize(rows, cols));
-        baseline.maybe_enable_frames(true);
+        baseline.maybe_enable_frames();
         assert!(baseline.producer.is_none());
 
         let mut clients = vec![capable, baseline];
@@ -2550,19 +2432,20 @@ mod tests {
         assert!(fb.next().unwrap().is_none(), "exactly one queued record");
     }
 
-    /// The four-way socket version-skew matrix of RFC 0008 §6: the daemon's
-    /// negotiation degrades cleanly across daemon/client versions without a flag
-    /// day. "old daemon" is modelled by the `$POSH_SESSION_FRAMES` gate being
-    /// OFF (the daemon's newness — gate off ⇒ it never constructs a producer, so
-    /// every client gets raw `Tag::Output`); "old client" by a bare 4-byte Init
-    /// with no capability table.
+    /// The socket version-skew matrix of RFC 0008 §6, as a CURRENT daemon can
+    /// exercise it: "old client" is a bare 4-byte Init with no capability table.
+    /// The "old daemon" rows are a genuinely older binary — the daemon-side
+    /// `POSH_SESSION_FRAMES` gate that used to model them is retired (posh#171),
+    /// so cell 3 here pins only the client-side property that makes that row
+    /// work: the size a cap-extended Init carries is recoverable by an old
+    /// daemon through the Tag::Resize re-assertion.
     ///
-    /// | daemon (gate) | client (Init)        | screen output |
-    /// |---------------|----------------------|---------------|
-    /// | new (on)      | new (caps)           | `Tag::Frame`  |
-    /// | new (on)      | old (bare)           | `Tag::Output` |
-    /// | old (off)     | new (caps + Resize)  | `Tag::Output` |
-    /// | old (off)     | old (bare)           | `Tag::Output` |
+    /// | daemon | client (Init)        | screen output |
+    /// |--------|----------------------|---------------|
+    /// | new    | new (caps)           | `Tag::Frame`  |
+    /// | new    | old (bare)           | `Tag::Output` |
+    /// | old    | new (caps + Resize)  | `Tag::Output` (size via Resize) |
+    /// | old    | old (bare)           | unchanged baseline (not modelled) |
     #[test]
     fn four_way_socket_version_skew_matrix() {
         let (rows, cols) = (24u16, 80u16);
@@ -2592,28 +2475,22 @@ mod tests {
         {
             let mut c = test_client_conn();
             c.apply_init(&ipc::encode_resize(rows, cols));
-            c.maybe_enable_frames(true);
+            c.maybe_enable_frames();
             assert!(c.producer.is_none(), "cell 2: no cap table ⇒ no producer even with gate on");
             broadcast_output(std::slice::from_mut(&mut c), &term, raw);
             assert_single_output(&c.write_buf, raw);
         }
 
-        // Cell 3 (the critical cross-version cell) — old daemon (gate OFF) × new
-        // client (cap-extended Init + the Tag::Resize re-assertion) ⇒ Tag::Output,
-        // AND the size the new client conveys is recoverable on an old daemon.
+        // Cell 3 (the critical cross-version cell) — old daemon × new client
+        // (cap-extended Init + the Tag::Resize re-assertion). An old daemon is a
+        // real older binary (not a mode of this one), so what is pinned here is
+        // the size property that makes the row work.
         {
-            let mut c = test_client_conn();
             let cap_extended_init = {
                 let mut init = ipc::encode_resize(rows, cols).to_vec();
                 init.extend_from_slice(&caps::encode_table(&caps::own_table(&[])));
                 init
             };
-            c.apply_init(&cap_extended_init);
-            c.maybe_enable_frames(false); // gate OFF ⇒ "old daemon" ⇒ no frames
-            assert!(c.producer.is_none(), "cell 3: gate off ⇒ no producer regardless of caps");
-
-            broadcast_output(std::slice::from_mut(&mut c), &term, raw);
-            assert_single_output(&c.write_buf, raw);
 
             // The cross-version size property, pinned on the REAL decoder applied
             // to the GENUINE payloads (not a field write-then-read tautology):
@@ -2637,28 +2514,15 @@ mod tests {
             );
         }
 
-        // Cell 4 — old daemon (gate OFF) × old client (bare Init) ⇒ Tag::Output.
-        // The unchanged baseline: neither side negotiates anything new.
-        {
-            let mut c = test_client_conn();
-            c.apply_init(&ipc::encode_resize(rows, cols));
-            c.maybe_enable_frames(false);
-            assert!(c.producer.is_none(), "cell 4: gate off + no caps ⇒ no producer");
-            broadcast_output(std::slice::from_mut(&mut c), &term, raw);
-            assert_single_output(&c.write_buf, raw);
-        }
+        // Cell 4 — old daemon × old client: the unchanged baseline, exercised by
+        // an older binary, not modelled here.
     }
 
     // ---- Task 2.5a: daemon produces scrollback frames (RFC 0002) ----
 
     /// A frame-capable client that ALSO advertises `CAP_SCROLLBACK` (RFC 0002
-    /// §1), so with the gate on it both frames the screen AND wants scrolled-off
-    /// rows synced. `gate` off models an "old daemon" (no producer at all).
-    fn scrollback_capable_conn(
-        rows: u16,
-        cols: u16,
-        gate: bool,
-    ) -> (ClientConn, UnixStream) {
+    /// §1), so it both frames the screen AND wants scrolled-off rows synced.
+    fn scrollback_capable_conn(rows: u16, cols: u16) -> (ClientConn, UnixStream) {
         let (stream, peer) = UnixStream::pair().unwrap();
         let mut c = ClientConn {
             stream,
@@ -2688,7 +2552,7 @@ mod tests {
             payload: vec![0],
         }])));
         c.apply_init(&init);
-        c.maybe_enable_frames(gate);
+        c.maybe_enable_frames();
         (c, peer)
     }
 
@@ -2711,8 +2575,8 @@ mod tests {
         let (rows, cols) = (5u16, 24u16);
         let mut term = Terminal::with_scrollback(rows, cols, 1000);
 
-        let (mut c, _peer) = scrollback_capable_conn(rows, cols, true);
-        assert!(c.producer.is_some(), "gate on + caps ⇒ producer");
+        let (mut c, _peer) = scrollback_capable_conn(rows, cols);
+        assert!(c.producer.is_some(), "caps ⇒ producer");
         assert!(c.wants_scrollback(), "the client advertised CAP_SCROLLBACK");
 
         // Attach replay: the Full keyframe establishes the acked visible base
@@ -2758,33 +2622,6 @@ mod tests {
                 "ring row {i} must equal the daemon's dump_scrollback_row(i)"
             );
         }
-    }
-
-    /// Gate OFF ⇒ no producer ⇒ the client stays on `Tag::Output`, so no
-    /// scrollback frame is ever emitted even for a scrollback-capable client that
-    /// scrolls heavily. The gate-off invariant extends to scrollback unchanged.
-    #[test]
-    fn gate_off_emits_no_scrollback_frames() {
-        let (rows, cols) = (5u16, 24u16);
-        let mut term = Terminal::with_scrollback(rows, cols, 1000);
-
-        let (mut c, _peer) = scrollback_capable_conn(rows, cols, false);
-        assert!(c.producer.is_none(), "gate off ⇒ no producer regardless of caps");
-
-        scroll_off(&mut term, 12);
-        let raw = b"raw broadcast bytes";
-        broadcast_output(std::slice::from_mut(&mut c), &term, raw);
-
-        // Every queued record is a raw Tag::Output — never a Tag::Frame.
-        let mut fb = FrameBuffer::new();
-        fb.feed(&c.write_buf);
-        let mut records = 0;
-        while let Some(frame) = fb.next().unwrap() {
-            assert_eq!(frame.tag, Tag::Output, "gate off must never emit Tag::Frame");
-            assert_eq!(frame.payload, raw, "the raw broadcast bytes, unchanged");
-            records += 1;
-        }
-        assert_eq!(records, 1, "exactly one Tag::Output record");
     }
 
     /// A frame-capable client that did NOT advertise `CAP_SCROLLBACK` gets its
@@ -2991,7 +2828,7 @@ mod tests {
         let mut init = ipc::encode_resize(rows, cols).to_vec();
         init.extend_from_slice(&caps::encode_table(&caps::own_table(&table)));
         c.apply_init(&init);
-        c.maybe_enable_frames(true);
+        c.maybe_enable_frames();
         (c, peer)
     }
 
@@ -3358,7 +3195,7 @@ mod tests {
             payload: vec![],
         }])));
         c.apply_init(&init);
-        c.maybe_enable_frames(true);
+        c.maybe_enable_frames();
         (c, peer)
     }
 
@@ -3556,7 +3393,7 @@ mod tests {
             caps::Cap { id: caps::CAP_SCROLLBACK, payload: vec![0] },
         ])));
         c.apply_init(&init);
-        c.maybe_enable_frames(true);
+        c.maybe_enable_frames();
         (c, peer)
     }
 

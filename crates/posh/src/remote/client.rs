@@ -467,17 +467,13 @@ fn about_summary(st: &ClientState) -> String {
         None => "remote state: (requested; reopen About to refresh)".to_string(),
     };
     format!(
-        "posh {} ({})\n{remote}\n{remote_state}\nmode: {mode}\n{}\n{}\n{}\n{}\n{}\n{}",
+        "posh {} ({})\n{remote}\n{remote_state}\nmode: {mode}\n{}\n{}\n{}\n{}\n{}",
         env!("POSH_VERSION"),
         env!("POSH_GIT_SHA"),
         gate("POSH_MUX", crate::remote::mux::mux_selected()),
         gate("POSH_MUX_SESSIONS", crate::remote::mux::mux_sessions_selected()),
         gate("POSH_CHANNELS", crate::remote::sshwrap::channels_selected()),
         gate("POSH_CONGESTION", crate::remote::agent::congestion_selected()),
-        gate(
-            "POSH_SESSION_FRAMES",
-            crate::session::daemon::session_frames_enabled()
-        ),
         gate("POSH_RELAY", relay_on),
     )
 }
@@ -3590,14 +3586,13 @@ mod tests {
             "POSH_MUX_SESSIONS=",
             "POSH_CHANNELS=",
             "POSH_CONGESTION=",
-            "POSH_SESSION_FRAMES=",
             "POSH_RELAY=",
         ] {
             assert!(s.contains(gate), "{gate} missing from {s}");
         }
         // Every row names its source so "is my env var live?" is readable.
         assert!(
-            s.matches("(env=").count() + s.matches("(default)").count() >= 6,
+            s.matches("(env=").count() + s.matches("(default)").count() >= 5,
             "{s}"
         );
         // The remote section is present even before any ident arrives.

@@ -558,13 +558,13 @@ debug-verify-grab grab="on" *ARGS:
     echo ">> connecting client (POSH_GRAB_MOUSE={{ grab }}) to 127.0.0.1:$port" >&2
     POSH_KEY="$key" POSH_GRAB_MOUSE='{{ grab }}' exec "$posh" client -4 127.0.0.1 "$port"
 
-# Verify legacy (pre-frame) vs frame posh for a LOCAL `posh attach` session,
-# using freshly-built worktree binaries. FRAMES is on|0: `0` sets
-# POSH_SESSION_FRAMES=0 on the daemon (raw Tag::Output, stdin forwarded
-# verbatim — the pre-frame-work path), `on` leaves it default (the frame path
-# with FrameRenderer/MouseFilter/mode-sync). Run both and diff the printed
-# rawkeys receipts to isolate whether the frame path alters key bytes (the
-# Shift+Enter question, posh#126). ARGS go to posht (default: --only rawkeys).
+# Run the posht rawkeys probe inside a LOCAL `posh attach` session, using
+# freshly-built worktree binaries, to see whether the frame path
+# (FrameRenderer/MouseFilter/mode-sync) alters key bytes (the Shift+Enter
+# question, posh#126). ARGS go to posht (default: --only rawkeys). The former
+# `frames=0` legacy arm is gone: the daemon-side POSH_SESSION_FRAMES gate was
+# retired (posh#171), so the raw-Tag::Output comparison now needs a pre-frames
+# posh binary on the daemon side (`debug-posh-mux-repro-*`'s posh_bin pattern).
 # The receipt is written to a stable path and `cat` to your OUTER terminal AFTER
 # the session exits — the in-session summary is wiped when posht's alt-screen
 # tears down, so the file is the durable record. Runs in an isolated POSH_DIR,
@@ -573,9 +573,9 @@ debug-verify-grab grab="on" *ARGS:
 # Ctrl-\ (the local session detach key). Debug-only; the hermetic gate is
 # build-rust.
 #
-# compare the legacy and frame paths for a local posh attach session
+# run the posht rawkeys probe inside a local posh attach session (frame path)
 [group("debug")]
-debug-verify-session-frames frames="on" *ARGS:
+debug-verify-session-frames *ARGS:
     #!/usr/bin/env bash
     set -euo pipefail
     cd '{{ justfile_directory() }}'
@@ -584,26 +584,19 @@ debug-verify-session-frames frames="on" *ARGS:
     nix shell nixpkgs#go --command bash -c 'cd posht && go build -o posht .'
     posh="$PWD/target/debug/posh"
     dir=$(mktemp -d); export POSH_DIR="$dir"
-    name='rawkeys-{{ frames }}'
+    name='rawkeys-frames'
     # Receipt path OUTSIDE POSH_DIR so the trap's rm -rf doesn't take it; posht
     # writes it to the real filesystem (not through posh's tty), so it survives
     # the alt-screen teardown that wipes the on-screen summary.
-    receipt="$PWD/.tmp/rawkeys-{{ frames }}.json"; mkdir -p "$PWD/.tmp"
+    receipt="$PWD/.tmp/rawkeys-frames.json"; mkdir -p "$PWD/.tmp"
     trap '"$posh" kill "$name" 2>/dev/null || true; rm -rf "$dir"' EXIT
-    # POSH_SESSION_FRAMES is read by the double-forked daemon, which inherits
-    # this process's env. `0` = legacy raw-output path; unset = frame path.
-    case '{{ frames }}' in
-      0|off|false|no) export POSH_SESSION_FRAMES=0
-        echo ">> LEGACY path: POSH_SESSION_FRAMES=0 (raw Tag::Output)" >&2 ;;
-      *) unset POSH_SESSION_FRAMES || true
-        echo ">> FRAME path: POSH_SESSION_FRAMES unset (default on)" >&2 ;;
-    esac
+    echo ">> FRAME path (a current daemon always frames a frame-capable client)" >&2
     echo ">> attaching local session '$name' running posht $args" >&2
     echo ">> receipt -> $receipt (printed below after you exit)" >&2
     # NOT exec: control returns here after the client exits, so we can print the
     # receipt to the OUTER terminal where it persists in scrollback.
     "$posh" attach "$name" -- "$PWD/posht/posht" $args --json "$receipt" || true
-    echo >&2; echo ">> ===== rawkeys receipt ({{ frames }}) =====" >&2
+    echo >&2; echo ">> ===== rawkeys receipt (frames) =====" >&2
     if [ -s "$receipt" ]; then cat "$receipt"; else echo "(no receipt written)" >&2; fi
 
 # The REMOTE analog of debug-verify-session-frames: run posht --only rawkeys as
@@ -1633,20 +1626,18 @@ debug-posh-server-smoke secs="600":
 # spawn an ISOLATED local session (own POSH_DIR) whose command floods stdout,
 # connect a STALLED reader (a raw unix-socket client that never drains — see
 # below), and watch the daemon's per-client write_buf grow until it drops the
-# "slow client". Answers whether output can reach ~17 MB (the field symptom):
-# run with FRAMES=on (default, coalescing diffs) vs FRAMES=0 (raw Tag::Output,
-# every byte queued) to see which path overflows. FLOOD picks the content:
-# distinct = each line unique (large diffs / raw bytes, overflows either path);
-# static = a repeated line (tiny diffs — should NOT overflow frames-on, the
-# diagnostic contrast). Cleanup on exit. Read-only wrt your real sessions
-# (isolated POSH_DIR). Debug-only; hermetic gate is build-rust.
-# NOTE: via a real shell only — `just debug-posh-backlog-repro on static`. (Some
-# MCP recipe-runners pass the whole arg string as one param, collapsing the two.)
-# Usage: just debug-posh-backlog-repro [on|0] [distinct|static]
+# "slow client". Answers whether output can reach ~17 MB (the field symptom).
+# The stalled reader is a BASELINE client (bare Init, no cap table), so the
+# daemon queues raw Tag::Output for it — every byte, no diff coalescing (the
+# former FRAMES=on|0 switch is gone with the daemon gate, posh#171). FLOOD
+# picks the content: distinct = each line unique; static = a repeated line.
+# Cleanup on exit. Read-only wrt your real sessions (isolated POSH_DIR).
+# Debug-only; hermetic gate is build-rust.
+# Usage: just debug-posh-backlog-repro [distinct|static]
 #
 # reproduce the daemon's MAX_CLIENT_BACKLOG slow-client drop
 [group("debug")]
-debug-posh-backlog-repro frames="0" flood="distinct":
+debug-posh-backlog-repro flood="distinct":
     #!/usr/bin/env bash
     set -euo pipefail
     cd '{{ justfile_directory() }}'
@@ -1673,14 +1664,11 @@ debug-posh-backlog-repro frames="0" flood="distinct":
       static) flood_cmd='pad=$(printf "%080d" 0); yes "$pad"' ;;
       *)      flood_cmd='pad=$(printf "%080d" 0); i=0; while :; do printf "%d %s\n" "$i" "$pad"; i=$((i+1)); done' ;;
     esac
-    # POSH_SESSION_FRAMES is read by the daemon (inherited by the double-forked
-    # daemon from THIS shell's env); 0 = raw Tag::Output path, unset = frames.
-    frames='{{ frames }}'
-    case "$frames" in
-      0|off|false|no) export POSH_SESSION_FRAMES=0; fmode="raw Tag::Output" ;;
-      *) unset POSH_SESSION_FRAMES 2>/dev/null || true; fmode="frames (coalescing diffs)" ;;
-    esac
-    echo ">> POSH_DIR=$dir  frames=$frames ($fmode)  flood={{ flood }}" >&2
+    # The stalled reader below sends a BARE 4-byte Init (no cap table), so the
+    # daemon treats it as a baseline client and queues raw Tag::Output — the
+    # un-coalesced path — regardless of any env (the POSH_SESSION_FRAMES gate
+    # is retired, posh#171).
+    echo ">> POSH_DIR=$dir  (baseline client: raw Tag::Output)  flood={{ flood }}" >&2
     # Detached daemon running the flood (no client yet). Inherits the env above.
     "$posh" attach --detach "$name" -- bash -c "$flood_cmd" >/dev/null
     sock="$dir/default/$name"

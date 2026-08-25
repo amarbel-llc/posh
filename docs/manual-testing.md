@@ -162,8 +162,9 @@ The remote `host:session` bootstrap is the frame RELAY by default: `posh-server`
 connects to the session daemon's socket and forwards its `ServerFrame` stream over
 UDP, instead of running an inner `posh attach` in a second PTY. One terminal
 model, server-side. `POSH_RELAY=0` forces the legacy inner-attach bootstrap; a
-daemon that does not emit frames (a `POSH_SESSION_FRAMES=0` / older / pre-frames
-daemon — frames are now default-ON) makes the relay auto-fall-back to the legacy
+daemon that does not emit frames (an older / pre-frames daemon — a current
+daemon always frames; the `POSH_SESSION_FRAMES=0` opt-out is retired, posh#171)
+makes the relay auto-fall-back to the legacy
 inner-attach path at runtime, so both a frames-on and a frames-off remote daemon
 work with no flag day.
 

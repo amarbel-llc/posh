@@ -147,13 +147,14 @@ the `eng-*(7)` manpages — read them with `man eng-versioning`,
   targets a REAL tty that may carry mode leftovers, so it emits
   `DRAWABLE_STATE_RESET` first. Swapping one for the other at a call site is a
   bug, not a refactor.
-- **Frames are default-on but NOT universal:** frames require BOTH the daemon
-  gate (`POSH_SESSION_FRAMES`, default on; `=0` disables them outright) AND the
-  client advertising `CAP_PROTOCOL_VERSION` in its `Tag::Init` capability table
-  — `is_frame_capable` tests for that specific id, not merely for a table being
-  present. A client without it stays on raw `Tag::Output` even with the gate on
-  (the old-client skew case). `daemon.rs`'s four-way matrix pins all four
-  combinations of daemon-gate × client-caps.
+- **Frames are unconditional daemon-side but NOT universal:** a client gets
+  frames iff it advertises `CAP_PROTOCOL_VERSION` in its `Tag::Init` capability
+  table — `is_frame_capable` tests for that specific id, not merely for a table
+  being present. A client without it stays on raw `Tag::Output` (the old-client
+  skew case). The daemon-side `POSH_SESSION_FRAMES` opt-out was RETIRED
+  2026-08-25 (posh#171; the roaming server never had one) — the env var is
+  ignored, and the only rollback to Architecture A is `POSH_RELAY=0`. `daemon.rs`'s
+  version-skew tests pin the client-caps axis.
 - **The RFC 0011 channel envelope is opt-in and default-off:** setting
   `POSH_CHANNELS=1` client-side makes the ssh bootstrap append `--channels`,
   and only then does the datagram connection speak the 9-byte envelope — the
@@ -376,21 +377,19 @@ read-only, `debug` group):
 
 ## Debugging a local session (wheel scrolls vs arrow keys)
 
-- **The wheel scrolls posh's scroll-view by default; if it emits arrow keys,
-  frames are OFF.** Since the fleet gate-flip the `POSH_SESSION_FRAMES` daemon gate
-  is **default-ON** (an opt-out), so the local wheel-intercept/scroll-view
-  (`remote/scrollview.rs`, FDR 0005) is live and the wheel scrolls posh's
-  scrollback (tmux-like). With frames OFF (`POSH_SESSION_FRAMES=0`, or an old
-  daemon) ⇒ no `FrameProducer`/`FrameRenderer` ⇒ stdin forwards verbatim, so the
-  wheel reaches the shell and the *outer terminal's* alternate-scroll mode
-  (`DECSET ?1007`) turns it into `↑`/`↓`. posh never translates the wheel to
-  arrows itself (the `POSH_GRAB_MOUSE` wheel→arrow grab is a remote-client-only
-  path, ADR-0002, default-off). clown launches posh as a local `posh attach`
-  session and sets no `POSH_*` gates, so it runs on the default (frames on).
-  Diagnose an unexpected-arrows case with `cat -v` at a bare prompt: `^[[A`/`^[[B`
-  = frames off, the terminal translated it; `^[[<64;…M` = a different culprit.
-  Full write-up incl. the `POSH_SESSION_FRAMES=0` opt-out in
-  `docs/wheel-scroll-behavior.md`.
+- **The wheel scrolls posh's scroll-view; if it emits arrow keys, the session
+  is not framed.** A current daemon always frames a frame-capable client, so the
+  local wheel-intercept/scroll-view (`remote/scrollview.rs`, FDR 0005) is live
+  and the wheel scrolls posh's scrollback (tmux-like). Not framed (a pre-frames
+  daemon, or a baseline client) ⇒ no `FrameProducer`/`FrameRenderer` ⇒ stdin
+  forwards verbatim, so the wheel reaches the shell and the *outer terminal's*
+  alternate-scroll mode (`DECSET ?1007`) turns it into `↑`/`↓`. posh never
+  translates the wheel to arrows itself (the `POSH_GRAB_MOUSE` wheel→arrow grab
+  is a remote-client-only path, ADR-0002, default-off). The old
+  `POSH_SESSION_FRAMES=0` opt-out is retired and ignored (posh#171). Diagnose an
+  unexpected-arrows case with `cat -v` at a bare prompt: `^[[A`/`^[[B` = not
+  framed, the terminal translated it; `^[[<64;…M` = a different culprit. Full
+  write-up in `docs/wheel-scroll-behavior.md`.
 
 ## When working here
 
