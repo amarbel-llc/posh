@@ -44,6 +44,7 @@ pub use metric::{
 pub use evolved::ControllerPredictor;
 pub use mosh::MoshPredictor;
 pub use optimistic::OptimisticPredictor;
+pub use overlay::OverlayBuffer;
 pub use render::{DimRenderer, ReplaceRenderer};
 #[allow(unused_imports)] // PolicyKnobs referenced by the controller Domain (RFC 0007)
 pub use species::{FromScratchPredictor, PolicyKnobs};
@@ -75,14 +76,28 @@ pub trait Predictor: Send {
     /// Folds one server frame's acks + send-interval into the model
     /// (mosh's local_frame_acked / local_frame_late_acked / send_interval).
     fn on_server_frame(&mut self, input_ack: u64, echo_ack: u64, send_interval: u64);
-    /// Generalizes the optimistic alt-screen/ECHO gate: when `safe` is false
-    /// the optimistic model drops its overlay; other models ignore it.
-    fn set_echo_safe(&mut self, safe: bool);
+    /// The alt-screen/ECHO safety gate, as a hint to models that want to act
+    /// on it EAGERLY (optimistic drops its overlay so the next paint stands;
+    /// the evolved species record it for fitness). The authoritative gate is
+    /// the client's: it skips rendering for every model while echo is unsafe
+    /// (RFC 0007 §5.1), so a model may ignore this — the default does.
+    fn set_echo_safe(&mut self, _safe: bool) {}
     /// Validates predictions against the latest server framebuffer.
     fn cull(&mut self, fb: &Snapshot, now: u64);
-    /// Overlays the surviving, currently-shown predictions onto `fb`,
-    /// painting each through `renderer`.
-    fn render(&self, fb: &mut Snapshot, renderer: &dyn PredictionRenderer);
+    /// The model's OFFER for this paint: its held predictions plus its
+    /// [`RenderAdvice`]. `None` = nothing to offer (the model is idle, or an
+    /// evolved champion chose not to). The renderer walks it — the model never
+    /// touches the screen.
+    fn offer(&self) -> Option<RenderStep<'_>>;
+    /// Convenience over [`offer`](Self::offer) + [`PredictionRenderer::render_step`]:
+    /// paint this model's offer through `renderer`, reporting what the
+    /// renderer actually did.
+    fn render(&self, fb: &mut Snapshot, renderer: &dyn PredictionRenderer) -> RenderOutcome {
+        match self.offer() {
+            Some(step) => renderer.render_step(fb, &step),
+            None => RenderOutcome::default(),
+        }
+    }
     fn reset(&mut self);
     /// Any prediction outstanding at all?
     fn active(&self) -> bool;
@@ -156,6 +171,41 @@ pub trait PredictionRenderer: Send {
     fn flags(&self, _advice: &RenderAdvice) -> bool {
         true
     }
+
+    /// The walk: paint one model offer onto `fb`. The default walks the
+    /// offered [`OverlayBuffer`] under the per-step policies above
+    /// ([`OverlayBuffer::render`]); a renderer wanting per-CELL policy (hold
+    /// only the first cell of a new epoch, mark only tentative cells, …)
+    /// overrides this and walks the buffer itself. Returns the screen-side
+    /// truth for the gauges.
+    fn render_step(&self, fb: &mut Snapshot, step: &RenderStep<'_>) -> RenderOutcome {
+        step.buf.render(fb, self, &step.advice)
+    }
+}
+
+/// A model's offer for one paint: the predictions it holds and its advice.
+pub struct RenderStep<'a> {
+    pub buf: &'a OverlayBuffer,
+    pub advice: RenderAdvice,
+}
+
+/// What the renderer actually did with an offer — the screen-side gauge the
+/// model-side `PredictorStats` cannot give (those describe the advice).
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct RenderOutcome {
+    /// The renderer declined the whole step (`shows` said no).
+    pub step_skipped: bool,
+    /// Overlay cells handed to `paint_cell` — including the blank-over-blank
+    /// cells an insert shifts along the row, which a look renderer paints as
+    /// no-ops; `marked_cells` is the user-visible count.
+    pub painted_cells: u64,
+    /// Of those, painted with the flag hint (underline/dim): the glyphs the
+    /// user sees as predictions.
+    pub marked_cells: u64,
+    /// Overlay cells withheld by the tentative-epoch hold.
+    pub held_cells: u64,
+    /// The predicted cursor was painted.
+    pub cursor_painted: bool,
 }
 
 /// What a model tells the renderer about the render step it is offering —

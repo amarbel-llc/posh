@@ -241,7 +241,14 @@ the `eng-*(7)` manpages — read them with `man eng-versioning`,
   the remote PTY has ECHO off or the alt-screen is up (`optimistic_echo_on`
   at the render call) — before the split the mosh models' hold happened to
   mask most password-prompt leaks; now the gate is explicit. `never` is the
-  one model that records nothing.
+  one model that records nothing. Mechanically the model never touches the
+  screen: `Predictor::offer()` returns a `RenderStep { buf, advice }` and the
+  renderer walks it (`PredictionRenderer::render_step`, default =
+  `OverlayBuffer::render` under the per-step policies; override for per-cell
+  policy), returning a `RenderOutcome` (painted/marked/held/cursor) — the
+  screen-side gauge shown as `last paint:` in the echo stats, distinct from
+  the model's advice-side `PredictorStats`. `set_echo_safe` is a default
+  no-op hint (optimistic drops its overlay eagerly). Further seams: posh#174.
 
 ## Debugging a live / wedged roaming session
 

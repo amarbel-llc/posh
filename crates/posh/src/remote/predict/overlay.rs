@@ -134,21 +134,22 @@ impl OverlayCell {
     }
 
     /// Paints this cell through `renderer` if it is shown: active, in bounds,
-    /// and past the tentative-epoch gate. `flag` is the slow-link underline
-    /// policy; the blank-over-blank case clears it (matching mosh).
+    /// and past the tentative-epoch gate. `flag` is the resolved marking
+    /// policy; the blank-over-blank case clears it (matching mosh). Returns
+    /// what happened for the [`super::RenderOutcome`] gauges.
     fn render(
         &self,
         fb: &mut Snapshot,
-        renderer: &dyn PredictionRenderer,
+        renderer: &(impl PredictionRenderer + ?Sized),
         confirmed_epoch: u64,
         row: u16,
         mut flag: bool,
-    ) {
+    ) -> CellRendered {
         if !self.active || row >= fb.rows || self.col >= fb.cols {
-            return;
+            return CellRendered::Skipped;
         }
         if self.tentative(confirmed_epoch) {
-            return;
+            return CellRendered::Held;
         }
         let current_blank = fb.cell(row, self.col).map(|c| c.is_blank()).unwrap_or(true);
         if self.replacement.is_blank() && current_blank {
@@ -168,8 +169,9 @@ impl OverlayCell {
                         unknown: true,
                     },
                 );
+                return CellRendered::Painted { marked: true };
             }
-            return;
+            return CellRendered::Skipped;
         }
         renderer.paint_cell(
             fb,
@@ -181,7 +183,19 @@ impl OverlayCell {
                 unknown: false,
             },
         );
+        CellRendered::Painted { marked: flag }
     }
+}
+
+/// What the render walk did with one overlay cell.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(super) enum CellRendered {
+    /// Inactive or out of bounds: nothing to do.
+    Skipped,
+    /// Held back by the tentative-epoch gate (the renderer chose to honor it).
+    Held,
+    /// Handed to the renderer; `marked` = with the flag hint set.
+    Painted { marked: bool },
 }
 
 #[derive(Debug, Clone)]
@@ -220,13 +234,20 @@ impl CursorPrediction {
         Validity::Pending
     }
 
-    fn render(&self, fb: &mut Snapshot, renderer: &dyn PredictionRenderer, confirmed_epoch: u64) {
+    fn render(
+        &self,
+        fb: &mut Snapshot,
+        renderer: &(impl PredictionRenderer + ?Sized),
+        confirmed_epoch: u64,
+    ) -> bool {
         if !self.active || self.tentative(confirmed_epoch) {
-            return;
+            return false;
         }
         if self.row < fb.rows && self.col < fb.cols {
             renderer.paint_cursor(fb, self.row, self.col);
+            return true;
         }
+        false
     }
 }
 
@@ -348,10 +369,10 @@ impl InputParser {
 // handlers + render walk. Holds the model-independent epoch/frame counters
 // the handlers and cull pass need.
 
-pub(super) struct OverlayBuffer {
+pub struct OverlayBuffer {
     parser: InputParser,
-    pub overlays: Vec<OverlayRow>,
-    pub cursors: Vec<CursorPrediction>,
+    pub(super) overlays: Vec<OverlayRow>,
+    pub(super) cursors: Vec<CursorPrediction>,
 
     pub local_frame_sent: u64,
 
@@ -460,19 +481,22 @@ impl OverlayBuffer {
         self.become_tentative();
     }
 
-    /// Walks the surviving predictions and paints each shown cell + the
-    /// cursor through `renderer`, under the renderer's policy applied to the
-    /// model's `advice` (the predictor/renderer split): whether to paint this
-    /// step at all, whether to hold tentative cells (the gate is bypassed with
-    /// `u64::MAX` when not), and whether to mark the cells.
+    /// The default render walk (`PredictionRenderer::render_step` delegates
+    /// here): paints each shown cell + the cursor through `renderer`, under the
+    /// renderer's per-step policy applied to the model's `advice` — whether to
+    /// paint this step at all, whether to hold tentative cells (the gate is
+    /// bypassed with `u64::MAX` when not), and whether to mark the cells.
+    /// Returns the screen-side truth for the gauges.
     pub fn render(
         &self,
         fb: &mut Snapshot,
-        renderer: &dyn PredictionRenderer,
+        renderer: &(impl PredictionRenderer + ?Sized),
         advice: &super::RenderAdvice,
-    ) {
+    ) -> super::RenderOutcome {
+        let mut out = super::RenderOutcome::default();
         if !renderer.shows(advice) {
-            return;
+            out.step_skipped = true;
+            return out;
         }
         let confirmed_epoch = if renderer.shows_tentative(advice) {
             u64::MAX
@@ -481,13 +505,25 @@ impl OverlayBuffer {
         };
         let flag = renderer.flags(advice);
         for cursor in &self.cursors {
-            cursor.render(fb, renderer, confirmed_epoch);
+            if cursor.render(fb, renderer, confirmed_epoch) {
+                out.cursor_painted = true;
+            }
         }
         for row in &self.overlays {
             for cell in &row.cells {
-                cell.render(fb, renderer, confirmed_epoch, row.row_num, flag);
+                match cell.render(fb, renderer, confirmed_epoch, row.row_num, flag) {
+                    CellRendered::Painted { marked } => {
+                        out.painted_cells += 1;
+                        if marked {
+                            out.marked_cells += 1;
+                        }
+                    }
+                    CellRendered::Held => out.held_cells += 1,
+                    CellRendered::Skipped => {}
+                }
             }
         }
+        out
     }
 
     /// Parses one keystroke byte and applies it to the overlay. Returns true

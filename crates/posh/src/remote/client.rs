@@ -578,15 +578,21 @@ fn predict_debug_summary(st: &ClientState) -> String {
     // lines below read from the same struct, so the two cannot disagree.
     let ci = client_introspection(st);
     let mut out = format!(
-        "{}\necho model: {}{}\nrender: show={} style={} (the model advises; the renderer decides)\n\
+        "{}\necho model: {}{}\nrender: show={} style={} (the model advises; the renderer decides) \
+         last paint: painted={} marked={} held={} cursor={} step_skipped={}\n\
          slow-link escalation: {} (srtt {:.0}ms; escalate >{}ms held {}s, recover <{}ms held {}s)\n\
          outcomes: correct={} nocredit={} incorrect={} \
-         resets={} epoch_lag={} shown_cells={} srtt_trigger={}",
+         resets={} epoch_lag={} advised_cells={} srtt_trigger={}",
         introspect::render_client_line(&client_record(st)),
         ci.echo_model.name(),
         if ci.control.escalated { " (auto: slow link)" } else { "" },
         predict::ShowPolicy::from_env().name(),
         st.predict_render.name(),
+        st.last_render.painted_cells,
+        st.last_render.marked_cells,
+        st.last_render.held_cells,
+        st.last_render.cursor_painted as u8,
+        st.last_render.step_skipped as u8,
         match (ci.control.governing, ci.control.escalated) {
             (false, _) => "off (model pinned, or POSH_ECHO_ESCALATE=0)",
             (true, false) => "armed (adaptive)",
@@ -1135,6 +1141,9 @@ struct ClientState {
     /// default and `POSH_ECHO_ESCALATE` is on; ticked per server frame on
     /// the wire's SRTT.
     echo_escalation: predict::EchoEscalation,
+    /// What the renderer actually did on the last compose (the screen-side
+    /// gauge; `predict.stats()` describes the model's advice, not the screen).
+    last_render: predict::RenderOutcome,
     /// Latest metric vector (RFC 0007), reassembled each compose while a GP
     /// species is active; the seam the evolved program reads once wired.
     #[allow(dead_code)] // consumed once the GP program is wired (RFC 0007 §7)
@@ -1325,6 +1334,7 @@ fn client_loop(
         predict_render: render,
         predict_overwrite,
         echo_escalation: predict::EchoEscalation::new(echo_escalate),
+        last_render: predict::RenderOutcome::default(),
         last_metrics: predict::MetricVector::unavailable(),
         remote_metrics: [f64::NAN; caps::METRICS_FIELDS],
         notify: NotificationEngine::new(now),
@@ -2766,9 +2776,11 @@ fn compose_frame(st: &mut ClientState, now: u64) -> Vec<u8> {
     // predictor/renderer split the mosh models' tentative hold and adaptive
     // trigger happened to mask most of this; now the renderer paints
     // immediately, so the gate must be explicit.
-    if optimistic_echo_on(st) {
-        st.predict.render(&mut next, &*st.renderer);
-    }
+    st.last_render = if optimistic_echo_on(st) {
+        st.predict.render(&mut next, &*st.renderer)
+    } else {
+        predict::RenderOutcome::default()
+    };
     // The palette overlay sits above the session (greyed) but below the banner.
     if palette_open {
         if let Some(rterm) = st.palette.as_ref().and_then(Palette::screen) {
@@ -4056,6 +4068,7 @@ mod tests {
             predict_model: PredictionModel::Never,
             predict_render: RenderStyle::Replace,
             echo_escalation: predict::EchoEscalation::new(false),
+            last_render: predict::RenderOutcome::default(),
             last_metrics: predict::MetricVector::unavailable(),
             remote_metrics: [f64::NAN; caps::METRICS_FIELDS],
             predict_overwrite: false,

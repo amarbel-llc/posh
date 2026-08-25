@@ -34,8 +34,8 @@ use crate::remote::display::Snapshot;
 use super::metric::{MetricVector, TERMINAL_COUNT};
 use super::species::PolicyKnobs;
 use super::{
-    EvolutionStats, MoshPredictor, OptimisticPredictor, PredictionModel, PredictionRenderer,
-    Predictor, PredictorStats,
+    EvolutionStats, MoshPredictor, OptimisticPredictor, PredictionModel, Predictor,
+    PredictorStats,
 };
 
 /// The schema tag for persisted controller populations (RFC 0007 §8); the
@@ -625,16 +625,19 @@ impl Predictor for ControllerPredictor {
         self.shadow.cull(fb, now);
     }
 
-    fn render(&self, fb: &mut Snapshot, renderer: &dyn PredictionRenderer) {
-        // §7.1 best-of: display the GP champion (gated by its `show` knob, §4.1)
+    fn offer(&self) -> Option<super::RenderStep<'_>> {
+        // §7.1 best-of: offer the GP champion (gated by its `show` knob, §4.1)
         // when it has earned it, else the adaptive shadow floor. The runtime leak
-        // gate holds for both (set_echo_safe drops their overlays under ECHO-off).
+        // gate holds for both (the client skips every model's render under
+        // ECHO-off; set_echo_safe additionally drops the overlays eagerly).
         if self.display_champion {
             if self.show {
-                self.base.render(fb, renderer);
+                self.base.offer()
+            } else {
+                None
             }
         } else {
-            self.shadow.render(fb, renderer);
+            self.shadow.offer()
         }
     }
 

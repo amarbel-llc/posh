@@ -8,7 +8,7 @@ use crate::remote::display::Snapshot;
 
 use super::overlay::{NoCreditReason, OverlayBuffer, Validity};
 use super::{
-    PredictionModel, PredictionRenderer, Predictor, PredictorStats, FLAG_TRIGGER_HIGH,
+    PredictionModel, Predictor, PredictorStats, FLAG_TRIGGER_HIGH,
     FLAG_TRIGGER_LOW, GLITCH_FLAG_THRESHOLD, GLITCH_REPAIR_COUNT, GLITCH_REPAIR_MININTERVAL,
     GLITCH_THRESHOLD, SRTT_TRIGGER_HIGH, SRTT_TRIGGER_LOW,
 };
@@ -293,24 +293,22 @@ impl Predictor for MoshPredictor {
         self.send_interval = send_interval;
     }
 
-    fn set_echo_safe(&mut self, _safe: bool) {
-        // The mosh model has no optimistic echo gate.
-    }
-
     fn cull(&mut self, fb: &Snapshot, now: u64) {
         self.cull_mosh(fb, now);
     }
 
-    fn render(&self, fb: &mut Snapshot, renderer: &dyn PredictionRenderer) {
+    fn offer(&self) -> Option<super::RenderStep<'_>> {
         // The model's recommendation, not its decision: the adaptive/always
         // preference (`shown`), the slow-link flag, and the tentative-epoch
-        // hold all ride the advice; the renderer's policy decides.
-        let advice = super::RenderAdvice {
-            show: self.shown(),
-            flag: self.flagging,
-            confirmed_epoch: self.buf.confirmed_epoch,
-        };
-        self.buf.render(fb, renderer, &advice);
+        // hold all ride the advice; the renderer walks and decides.
+        Some(super::RenderStep {
+            buf: &self.buf,
+            advice: super::RenderAdvice {
+                show: self.shown(),
+                flag: self.flagging,
+                confirmed_epoch: self.buf.confirmed_epoch,
+            },
+        })
     }
 
     fn reset(&mut self) {

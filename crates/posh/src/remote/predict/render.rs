@@ -159,6 +159,44 @@ mod tests {
         assert_eq!(cell.style.underline, UnderlineStyle::None, "advised: flag off, unmarked");
     }
 
+    /// The renderer walks the model's offer and reports the screen-side truth:
+    /// under `always` the tentative cell is painted+marked; under `advised` it
+    /// is held (counted, not painted); a `never` model offers nothing.
+    #[test]
+    fn render_outcome_reports_what_the_renderer_did() {
+        use crate::remote::predict::{
+            MoshPredictor, Policed, PredictionModel, Predictor as _, RenderOutcome, ShowPolicy,
+        };
+        let fb = snapshot(5, 20, b"$ ");
+        let mut eng = MoshPredictor::new(PredictionModel::Always, false);
+        eng.set_send_interval(10);
+        eng.set_frame_sent(0);
+        eng.on_user_byte(b'z', &fb, 100);
+        let step = eng.offer().expect("the mosh model always offers");
+        assert!(step.advice.show && !step.advice.flag);
+
+        let mut out = fb.clone();
+        let always = Policed::new(ReplaceRenderer, ShowPolicy::Always).render_step(&mut out, &step);
+        // An insert shifts the rest of the row, so the overlay holds one cell
+        // per column to the right of the cursor (blank over blank, unmarked):
+        // `painted_cells` counts everything handed to `paint_cell`, and
+        // `marked_cells` is the one glyph the user sees as a prediction.
+        assert!(always.painted_cells >= 1, "{always:?}");
+        assert_eq!(always.marked_cells, 1, "{always:?}");
+        assert_eq!(always.held_cells, 0);
+        assert!(always.cursor_painted && !always.step_skipped);
+        let mut out = fb.clone();
+        let advised = Policed::new(ReplaceRenderer, ShowPolicy::Advised).render_step(&mut out, &step);
+        assert_eq!(advised.painted_cells, 0, "advised: nothing painted while tentative");
+        assert!(advised.held_cells >= 1, "advised: the tentative cells are held");
+        assert!(!advised.cursor_painted);
+
+        let never = MoshPredictor::new(PredictionModel::Never, false);
+        assert!(never.offer().is_some(), "mosh offers even when empty");
+        let mut out = fb.clone();
+        assert_eq!(never.render(&mut out, &ReplaceRenderer), RenderOutcome::default());
+    }
+
     /// The predictor/renderer split (2026-08-25): a prediction the mosh model
     /// still holds as TENTATIVE (first keystroke of a new epoch on a fast
     /// link, flag off) is painted immediately and marked — the renderer, not

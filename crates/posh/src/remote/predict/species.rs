@@ -25,7 +25,7 @@
 use crate::remote::display::Snapshot;
 
 use super::metric::MetricVector;
-use super::{MoshPredictor, PredictionModel, PredictionRenderer, Predictor, PredictorStats};
+use super::{MoshPredictor, PredictionModel, Predictor, PredictorStats};
 
 /// RFC 0007 §4.1 controller output: bounded policy knobs the existing
 /// overlay/cull/render pipeline consumes. The controller MUST NOT emit cells
@@ -143,14 +143,11 @@ macro_rules! delegate_to_shadow {
             fn on_server_frame(&mut self, input_ack: u64, echo_ack: u64, send_interval: u64) {
                 self.shadow.on_server_frame(input_ack, echo_ack, send_interval);
             }
-            fn set_echo_safe(&mut self, safe: bool) {
-                self.shadow.set_echo_safe(safe);
-            }
             fn cull(&mut self, fb: &Snapshot, now: u64) {
                 self.shadow.cull(fb, now);
             }
-            fn render(&self, fb: &mut Snapshot, renderer: &dyn PredictionRenderer) {
-                self.shadow.render(fb, renderer);
+            fn offer(&self) -> Option<super::RenderStep<'_>> {
+                self.shadow.offer()
             }
             fn reset(&mut self) {
                 self.shadow.reset();

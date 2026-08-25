@@ -9,7 +9,7 @@
 use crate::remote::display::Snapshot;
 
 use super::overlay::{OverlayBuffer, Validity};
-use super::{PredictionRenderer, Predictor, PredictorStats};
+use super::{Predictor, PredictorStats};
 
 pub struct OptimisticPredictor {
     buf: OverlayBuffer,
@@ -155,15 +155,17 @@ impl Predictor for OptimisticPredictor {
         self.cull_optimistic(fb);
     }
 
-    fn render(&self, fb: &mut Snapshot, renderer: &dyn PredictionRenderer) {
+    fn offer(&self) -> Option<super::RenderStep<'_>> {
         // Optimistic's ADVICE: show now, hold nothing, no slow-link flag
-        // (FDR 0006). The renderer's policy decides the final look.
-        let advice = super::RenderAdvice {
-            show: true,
-            flag: false,
-            confirmed_epoch: u64::MAX,
-        };
-        self.buf.render(fb, renderer, &advice);
+        // (FDR 0006). The renderer walks and decides the final look.
+        Some(super::RenderStep {
+            buf: &self.buf,
+            advice: super::RenderAdvice {
+                show: true,
+                flag: false,
+                confirmed_epoch: u64::MAX,
+            },
+        })
     }
 
     fn reset(&mut self) {
