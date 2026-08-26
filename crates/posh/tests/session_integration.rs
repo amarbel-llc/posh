@@ -62,14 +62,27 @@ fn daemon_lifecycle_create_list_kill() {
         },
         "session to appear in list",
     );
+    // The default `posh list` output now pipes RFC 0003 NDJSON to the
+    // `mesa` renderer, which on a non-tty pipe (as here, via
+    // `Command::output()`) prints a plain header line plus one
+    // TAB-separated line per row (purse-first#185).
     let out = posh(&dir, &["list"]);
-    let stdout = String::from_utf8_lossy(&out.stdout);
     assert!(
-        stdout.contains("session_name=itest"),
-        "list output: {stdout}"
+        out.status.success(),
+        "list failed: stderr={}",
+        String::from_utf8_lossy(&out.stderr)
     );
-    assert!(stdout.contains("clients=0"), "list output: {stdout}");
-    assert!(stdout.contains("cmd=sleep 300"), "list output: {stdout}");
+    let stdout = String::from_utf8_lossy(&out.stdout);
+    let lines: Vec<&str> = stdout.lines().collect();
+    assert_eq!(lines.len(), 2, "expected header + 1 row: {stdout}");
+    let fields: Vec<&str> = lines[1].split('\t').collect();
+    assert_eq!(fields.len(), 7, "row: {fields:?}");
+    assert_eq!(fields[0], "itest", "row: {fields:?}"); // NAME
+    assert_eq!(fields[3], "0", "row: {fields:?}"); // CLIENTS
+    // ACTIVITY prefers the RFC 0013 activity label over the launch cmd once
+    // the daemon has one (here, the foreground process name); either way it
+    // names the `sleep` process.
+    assert!(fields[5].contains("sleep"), "row: {fields:?}"); // ACTIVITY
 
     // Creating it again is a no-op.
     let out = posh(&dir, &["attach", "--detach", "itest"]);

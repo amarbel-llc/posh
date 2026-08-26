@@ -78,6 +78,29 @@
         "type": "github"
       }
     },
+    "gomod2nix": {
+      "inputs": {
+        "flake-utils": [
+          "purse-first",
+          "utils"
+        ],
+        "nixpkgs-master": [
+          "purse-first",
+          "nixpkgs-master"
+        ]
+      },
+      "locked": {
+        "lastModified": 1785249242,
+        "narHash": "sha256-PYnzeRibCvHs1TLPPZxEds1KW0qYUZ4ycfeCc6bCwrk=",
+        "rev": "38d90d9cdcaca83282c78f8ce1f89414b3e0d854",
+        "type": "tarball",
+        "url": "https://code.linenisgreat.com/gomod2nix/archive/38d90d9cdcaca83282c78f8ce1f89414b3e0d854.tar.gz"
+      },
+      "original": {
+        "type": "tarball",
+        "url": "https://code.linenisgreat.com/gomod2nix/archive/master.tar.gz"
+      }
+    },
     "igloo": {
       "inputs": {
         "bun2nix": "bun2nix",
@@ -134,12 +157,41 @@
         "type": "github"
       }
     },
+    "purse-first": {
+      "inputs": {
+        "conformist": [
+          "conformist"
+        ],
+        "gomod2nix": "gomod2nix",
+        "igloo": [
+          "igloo"
+        ],
+        "nixpkgs-master": [
+          "nixpkgs-master"
+        ],
+        "utils": [
+          "utils"
+        ]
+      },
+      "locked": {
+        "lastModified": 1787703581,
+        "narHash": "sha256-ILTZNiwbZ2KvI1ZA2jV6s+I4J0A/og8OfcvQmwY9rXg=",
+        "rev": "7bda0d88bc7f231efd49967cf4ac7a33014fea5b",
+        "type": "tarball",
+        "url": "https://code.linenisgreat.com/purse-first/archive/7bda0d88bc7f231efd49967cf4ac7a33014fea5b.tar.gz"
+      },
+      "original": {
+        "type": "tarball",
+        "url": "https://code.linenisgreat.com/purse-first/archive/master.tar.gz"
+      }
+    },
     "root": {
       "inputs": {
         "conformist": "conformist",
         "igloo": "igloo",
         "mephisto": "mephisto",
         "nixpkgs-master": "nixpkgs-master",
+        "purse-first": "purse-first",
         "utils": "utils"
       }
     },

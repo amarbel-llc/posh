@@ -5,7 +5,7 @@ pub(crate) mod activity;
 pub mod client;
 pub mod daemon;
 pub mod ipc;
-mod list_table;
+mod mesa;
 
 use std::io::Read;
 use std::os::unix::fs::{DirBuilderExt, FileTypeExt, MetadataExt};
@@ -532,43 +532,32 @@ pub fn cmd_list(cfg: &Config, format: ListFormat) -> Result<()> {
         }
     }
 
-    // The interactive default is the styled table (the `sc list` look);
-    // a piped default stays the legacy tab-separated lines, and --short/
-    // --json are untouched — scripts and the completion probe parse those.
-    let pretty = format == ListFormat::Default && util::is_tty(libc::STDOUT_FILENO);
-
-    if sessions.is_empty() {
-        match format {
-            ListFormat::Default if pretty => print!("{}", list_table::render_empty(&cfg.socket_dir)),
-            ListFormat::Default => println!("{}", list_table::empty_message(&cfg.socket_dir)),
-            ListFormat::Json => println!("[]"),
-            ListFormat::Short => {}
-        }
-        return Ok(());
-    }
-
     sessions.sort_by(|a, b| a.name.cmp(&b.name));
-    if format == ListFormat::Json {
-        println!("{}", json_list(&sessions, current.as_deref()));
-        return Ok(());
+    match format {
+        ListFormat::Json => {
+            // json_list already renders "[]" for an empty slice, so no
+            // separate empty-case branch is needed here.
+            println!("{}", json_list(&sessions, current.as_deref()));
+            Ok(())
+        }
+        ListFormat::Short => {
+            for s in &sessions {
+                print_session_line(s, format, current.as_deref());
+            }
+            Ok(())
+        }
+        // The `mesa` renderer (purse-first, RFC 0003) auto-detects whether
+        // ITS (inherited) stdout is a terminal, so posh needs no tty branch
+        // of its own here — styled table or plain TAB-separated lines, both
+        // driven by the same NDJSON stream. --short/--json stay untouched
+        // (scripts and the completion probe parse those).
+        ListFormat::Default => mesa::render(
+            &sessions,
+            current.as_deref(),
+            std::env::var("HOME").ok().as_deref(),
+            &cfg.socket_dir,
+        ),
     }
-    if pretty {
-        let (_, cols) = crate::pty::term_size(libc::STDOUT_FILENO);
-        print!(
-            "{}",
-            list_table::render(
-                &sessions,
-                current.as_deref(),
-                cols as usize,
-                std::env::var("HOME").ok().as_deref(),
-            )
-        );
-        return Ok(());
-    }
-    for s in &sessions {
-        print_session_line(s, format, current.as_deref());
-    }
-    Ok(())
 }
 
 /// JSON list output, field-for-field compatible with zmx's `list --json`.

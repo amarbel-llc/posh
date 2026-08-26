@@ -37,6 +37,20 @@
       url = "git+ssh://git@github.com/amarbel-llc/mephisto?ref=refs/heads/claude/mephisto-evolution-algorithm-update-80fyge&rev=ea6dc8b072a74454b85fa9b51acb800ce3b1bae0";
       flake = false;
     };
+
+    # purse-first: source of the mesa List-Table NDJSON renderer
+    # (packages.mesa, RFC 0003 there). posh is Rust, so unlike the Go
+    # consumers (clown, spinclass) that import mesa in-process, it consumes
+    # the compiled `mesa` BINARY: `posh list` shells out to it, piping the
+    # NDJSON stream (see crates/posh/src/session/mesa.rs). Direct input,
+    # pinned to master, mirroring clown's flake.nix / spinclass's flake.nix.
+    purse-first = {
+      url = "https://code.linenisgreat.com/purse-first/archive/master.tar.gz";
+      inputs.igloo.follows = "igloo";
+      inputs.nixpkgs-master.follows = "nixpkgs-master";
+      inputs.utils.follows = "utils";
+      inputs.conformist.follows = "conformist";
+    };
   };
 
   # The `...` ellipsis is load-bearing: nix calls `outputs` with `self`
@@ -50,6 +64,7 @@
       utils,
       conformist,
       mephisto,
+      purse-first,
       ...
     }:
     utils.lib.eachDefaultSystem (
@@ -60,6 +75,10 @@
           overlays = [ igloo.overlays.default ];
         };
         inherit (pkgs) lib;
+
+        # purse-first#185: the `mesa` List-Table NDJSON renderer binary that
+        # `posh list` shells out to (crates/posh/src/session/mesa.rs).
+        mesaBin = purse-first.packages.${system}.mesa;
 
         # RFC 0007: both rust derivations (.#posh and the mosh-ffi check) build
         # with src = ./. and load the whole workspace manifest — which includes
@@ -244,10 +263,17 @@
 
           # scdoc compiles the hand-written man pages in doc/*.scd during
           # postInstall; installShellFiles provides installShellCompletion.
-          # See eng-manpages(7) and doc/.
+          # makeWrapper wraps the runtime `mesa` dep onto PATH (postInstall,
+          # below). mesaBin is ALSO on nativeBuildInputs (not just wrapped in)
+          # so it's on PATH for the sandboxed checkPhase too: `cargo test
+          # --workspace` runs the session_integration.rs test that spawns
+          # `posh list`, which shells out to `mesa` (purse-first#185). See
+          # eng-manpages(7) and doc/.
           nativeBuildInputs = [
             pkgs.scdoc
             pkgs.installShellFiles
+            pkgs.makeWrapper
+            mesaBin
           ];
 
           doCheck = true;
@@ -286,6 +312,16 @@
               mkdir -p "$out/share/man/man''${section}"
               scdoc < "$f" > "$out/share/man/man''${section}/''${name}.''${section}"
             done
+
+            # purse-first#185: `posh list` shells out to `mesa` to render its
+            # default table (crates/posh/src/session/mesa.rs). Wrap the real
+            # binary so mesa is always reachable regardless of the ambient
+            # PATH, the way dagnabit wraps ast-grep onto its PATH. --suffix
+            # (not --prefix): a user-provided `mesa` on PATH wins over this
+            # pinned store path. posh-server/ph are symlinks to this same
+            # file, so they inherit the wrapped PATH too.
+            wrapProgram $out/bin/posh \
+              --suffix PATH : ${lib.makeBinPath [ mesaBin ]}
           '';
 
           meta = with lib; {
@@ -539,6 +575,8 @@
               pkgs.gum # terminal UI for the maintenance recipes (eng-versioning(7))
               pkgs.gh # `just release` -> gh release create
               pkgs.tcpdump # live-session transport triage (debug-posh-* recipes)
+              mesaBin # `posh list`'s renderer (purse-first#185); dev-loop parity
+              # with the wrapped nix package for `just debug-cargo`/`debug-posh-*`.
               conformistPkg # the raw conformist runner: `nix fmt`, lint-worktree
               # The config-specific, toolchain-hermetic git hooks on PATH under
               # the names the sweatfile references (conformist#47/#51/#54).
