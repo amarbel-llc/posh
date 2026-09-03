@@ -176,7 +176,7 @@ fn run() -> Result<()> {
             };
             session::cmd_status(&Config::new(&group)?, name)
         }
-        "attach" | "a" => cmd_attach(&group, args),
+        "attach" | "a" => cmd_attach(&group, args, &forward_flag),
         "start" | "s" => cmd_start(&group, args, &forward_flag),
         "kill" | "k" => {
             let name = args
@@ -245,12 +245,12 @@ fn run() -> Result<()> {
         name if !name.starts_with('-') => match target::Target::parse(name) {
             // Bare `posh <name>` attaches an existing local session (strict,
             // FDR 0015 Phase B); `posh start` / `ph` create.
-            target::Target::LocalSession { .. } => cmd_attach(&group, rest),
+            target::Target::LocalSession { .. } => cmd_attach(&group, rest, &forward_flag),
             // `posh :grp/dev` — explicit local, with optional group.
             target::Target::Local { group: g, session } => {
                 let mut args = vec![session];
                 args.extend_from_slice(&rest[1..]);
-                cmd_attach(&g.unwrap_or(group), &args)
+                cmd_attach(&g.unwrap_or(group), &args, &forward_flag)
             }
             // FDR 0011: a bare host no longer spawns an ephemeral roaming
             // shell — durable sessions are the default. Until the FDR 0016
@@ -272,10 +272,67 @@ fn run() -> Result<()> {
     }
 }
 
-fn cmd_attach(group: &str, args: &[String]) -> Result<()> {
+fn cmd_attach(
+    group: &str,
+    args: &[String],
+    forward_flag: &remote::agent::ForwardFlag,
+) -> Result<()> {
     let (detach_flag, create_flag, name, command) = parse_attach_args(args)?;
     let command = (!command.is_empty()).then(|| command.to_vec());
+    // Remote strict attach (posh#176): a `host:session`-shaped target rides
+    // the roaming path, with the strict contract enforced by a probe. ONLY
+    // the full RemoteSession form classifies — a bare word that merely
+    // parses as a host (`my.project`) stays a literal local name, preserving
+    // (most of) RFC 0001's explicit-attach escape hatch; see
+    // `attach_remote_target`.
+    if let Some((user, host, g, session)) = attach_remote_target(name) {
+        // `--create` is the explicit create-or-attach; `--detach` is the
+        // create-or-ensure spawn. Both skip the strictness probe and use the
+        // native create-or-attach path directly. A plain attach probes first
+        // and errors if the session is absent (the FDR 0011 strict contract;
+        // same non-atomicity caveat as `posh start` — a session killed
+        // between probe and attach surfaces as the create path recreating
+        // it, never a hard error).
+        if !create_flag && !detach_flag {
+            let probe_group = g.as_deref().unwrap_or(group);
+            let names = remote_session_names(user.as_deref(), &host, probe_group)?;
+            if !names.iter().any(|n| n == &session) {
+                let dest = ph_dest(user.as_deref(), &host);
+                return Err(Error::Msg(format!(
+                    "posh attach: no session {session} on {dest} \
+                     (use `posh start {dest}:{session}` to create, or `ph`)"
+                )));
+            }
+        }
+        let command_slice = command.unwrap_or_default();
+        return cmd_ssh_session(
+            user,
+            host,
+            g,
+            group,
+            session,
+            &start_remote_extra(detach_flag, &command_slice),
+            forward_flag,
+        );
+    }
     session::client::cmd_attach(&Config::new(group)?, name, command, detach_flag, create_flag)
+}
+
+/// Classify a `posh attach` target as remote: ONLY the full
+/// `[user@]host:[group/]session` form. Everything else — including tokens
+/// that parse as a bare Host (`my.project`, `user@box`) or an explicit local
+/// (`:dev`) — is returned as `None` and treated as a LITERAL local session
+/// name, exactly as before. This keeps RFC 0001's explicit-attach escape
+/// hatch for `/`- and `.`-containing names; the one narrowing (amended in
+/// RFC 0001 §1, 2026-09-03) is that a local name containing a `:` that
+/// completes the host:session shape is no longer addressable here.
+fn attach_remote_target(name: &str) -> Option<(Option<String>, String, Option<String>, String)> {
+    match target::Target::parse(name) {
+        target::Target::RemoteSession { user, host, group, session } => {
+            Some((user, host, group, session))
+        }
+        _ => None,
+    }
 }
 
 /// Parse `attach` args as `[--detach|--create]... <name> [--detach|--create]...
@@ -483,9 +540,9 @@ fn cmd_start_ephemeral(rest: &[String], forward_flag: &remote::agent::ForwardFla
     }
 }
 
-/// Rebuild `cmd_ssh_session`'s extra tail from `posh start`'s parsed args:
-/// `[--detach] [-- command...]`, the exact shape `parse_remote_session_extra`
-/// reads back on the other side.
+/// Rebuild `cmd_ssh_session`'s extra tail from `posh start`/`posh attach`'s
+/// parsed args: `[--detach] [-- command...]`, the exact shape
+/// `parse_remote_session_extra` reads back on the other side.
 fn start_remote_extra(detach: bool, command: &[String]) -> Vec<String> {
     let mut extra: Vec<String> = Vec::new();
     if detach {
@@ -656,7 +713,11 @@ fn cmd_ph(argv: &[String]) -> Result<()> {
             // is the load-bearing routing: ph calls attach ONLY on a live session,
             // so it stays correct with the strict-attach default (Phase B).
             if session::session_socket_exists(&path) && !session::socket_is_dead(&path) {
-                cmd_attach(grp, std::slice::from_ref(&session))
+                cmd_attach(
+                    grp,
+                    std::slice::from_ref(&session),
+                    &remote::agent::ForwardFlag::Unset,
+                )
             } else {
                 cmd_start(
                     grp,
@@ -1566,6 +1627,10 @@ SESSION COMMANDS (local persistence)
         default $SHELL, when created). With --detach, ensure the session
         exists, print status, and exit without attaching. A `--` ends option
         parsing so the command is taken literally. Detach key: Ctrl-\\.
+        A host:session-shaped name attaches the REMOTE session, with the
+        same strict contract (the host's session list is probed first);
+        --create/--detach skip the probe. Any other name — dotted words
+        included — is a literal local session name.
 
     start [--detach] [target] [--] [command...]  (alias: s)
         Create a durable session and attach. Errors if a named session
@@ -2046,6 +2111,30 @@ mod tests {
             classify_start_target(Some("user@box.com")),
             RemoteAuto { user: Some("user".into()), host: "box.com".into(), group: None }
         );
+    }
+
+    #[test]
+    fn attach_remote_target_classifies_only_the_full_form() {
+        // The full [user@]host:[group/]session form classifies remote…
+        assert_eq!(
+            attach_remote_target("box:dev"),
+            Some((None, "box".into(), None, "dev".into()))
+        );
+        assert_eq!(
+            attach_remote_target("user@box:work/dev"),
+            Some((
+                Some("user".into()),
+                "box".into(),
+                Some("work".into()),
+                "dev".into()
+            ))
+        );
+        // …and NOTHING else does: bare host-looking tokens, `/`-names, the
+        // explicit local form, and a session-less `host:` all stay literal
+        // local names — the RFC 0001 explicit-attach escape hatch.
+        for literal in ["my.project", "user@box", "a/b", ":dev", "box:", "+"] {
+            assert_eq!(attach_remote_target(literal), None, "{literal}");
+        }
     }
 
     #[test]

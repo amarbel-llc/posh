@@ -150,6 +150,12 @@ Local persistence over Unix sockets.
 	default _$SHELL_, when created). With *--detach*, ensure the session
 	exists, print status, and exit without attaching. A *--* ends option
 	parsing so _command_ is taken literally. Detach key: *Ctrl-\\*.
+	A _host_*:*_session_-shaped _name_ attaches the *remote* session
+	over the roaming transport with the same strict contract (the
+	host's session list is probed first; *--create*/*--detach* skip
+	the probe and create-or-attach/ensure). Any other _name_ — dotted
+	words included — is a *literal local* session name (the RFC 0001
+	escape hatch for names the namespace grammar shadows).
 
 *start* [*--detach*] [_target_] [*--*] [_command_...] (alias: *s*)
 	Create a durable session (running _command_, default _$SHELL_) and

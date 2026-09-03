@@ -124,6 +124,13 @@ Examples (normative):
 A session name containing a literal `/` is not addressable through a
 group-qualified namespace form (rule 5 takes precedence); implementations
 MUST leave such names reachable via the explicit `attach` subcommand.
+*Amended 2026-09-03 (FDR 0011 remote strict attach):* the explicit
+`attach` subcommand now classifies a token matching the FULL
+`[user@]host:[group/]session` form as a remote target; every other
+token — including bare host-shaped words (`my.project`, `user@box`) and
+`/`-containing names — remains a literal local name. The escape hatch
+thus narrows by exactly the host:session shape: a local name containing
+a `:` that completes that form is no longer addressable via `attach`.
 
 `list` position: an implementation supporting remote listing MUST accept
 a `Host`-resolving argument with a trailing `:` (e.g. `posh list box:`)

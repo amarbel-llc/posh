@@ -242,6 +242,39 @@ fn start_remote_attempts_the_host() {
 }
 
 #[test]
+fn attach_remote_is_strict_and_literal_names_survive() {
+    let dir = test_dir("posh-itest-attach-remote");
+    std::fs::create_dir_all(&dir).unwrap();
+
+    // posh#176: a host:session-shaped attach target rides the remote path —
+    // against an unreachable host the strictness probe fails fast (BatchMode
+    // resolution), instead of being read as a weird local name.
+    let out = posh(&dir, &["attach", "nohost.invalid:dev"]);
+    assert!(!out.status.success(), "remote attach should fail: {out:?}");
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    assert!(
+        !stderr.contains("attach requires a session name"),
+        "remote attach misparsed: {stderr}"
+    );
+
+    // The RFC 0001 escape hatch survives: a dotted token that PARSES as a
+    // host is still a literal local session name under explicit attach.
+    let out = posh(&dir, &["attach", "--detach", "my.project", "sleep", "300"]);
+    assert!(
+        out.status.success(),
+        "dotted literal name should create locally: {out:?}"
+    );
+    let stdout = String::from_utf8_lossy(&out.stdout);
+    assert!(
+        stdout.contains("session \"my.project\" created"),
+        "literal-name output: {stdout}"
+    );
+
+    let _ = posh(&dir, &["kill", "my.project"]);
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+#[test]
 fn bare_host_and_posh_ssh_are_retired() {
     let dir = test_dir("posh-itest-durable-default");
     std::fs::create_dir_all(&dir).unwrap();
