@@ -145,7 +145,11 @@ Sessions export `POSH_SESSION`/`POSH_GROUP`.
 **Remote roaming (mosh port) and the unified namespace:**
 
 ```
-posh [user@]host [-- command]      # like mosh(1): plain roaming shell
+posh [user@]host                   # errors with the host's session list
+                                   # (durable-by-default, FDR 0011)
+posh start --ephemeral [user@]host [-- command]
+                                   # like mosh(1): explicit throwaway
+                                   # roaming shell (no daemon)
 posh [user@]host:[group/]session   # persistent session on the host over
                                    # the roaming transport — attach-or-
                                    # create, detach here, reattach from
@@ -155,13 +159,14 @@ posh host:[group/]session --detach # create a detached session on the host
 posh :[group/]session              # explicit local attach
 posh -g GROUP list host:           # remote listing (host-prefixed names);
                                    # -g scopes it to GROUP on the host
-posh ssh [-4|-6] [-p RANGE] [user@]host [-- command]
 posh server [new] [-p PORT[:PORT2]] [-4|-6] [-- command...]
 posh client [-4|-6] <host> <port>  # key via POSH_KEY, never on argv
 ```
 
-The grammar is scp-style and total (RFC 0001: `docs/rfcs/`); every
-pre-namespace form keeps its meaning. The remote session's exit status
+The grammar is scp-style and total (RFC 0001: `docs/rfcs/`); parsing
+never errors, though the bare-host form's *action* changed with
+durable-by-default (it guides instead of spawning). The remote
+session's exit status
 propagates: `posh box:dev; echo $?` reports the session shell's code.
 
 Tailscale peers are first-class hosts: shell completion offers tailnet

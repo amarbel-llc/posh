@@ -170,8 +170,12 @@ List, with and without workers:
   both updated to strict. There is no flag day for the *wire*
   (negotiated); the CLI meaning changed. The explicit non-interactive attach is
   `posh attach box:name`, the explicit create is `posh start box:name`.
-- **`--ephemeral` may ship later.** The durable default is the feature; the
-  explicit throwaway opt-out is small but deferrable if it slips the first cut.
+- **`--ephemeral` has shipped (2026-09-03), as `posh start --ephemeral`.**
+  It landed together with the bare-host retirement: `posh box` and the
+  `posh ssh` subcommand now error with the host's candidate sessions and the
+  new forms (the non-TTY discipline; the host-scoped *picker* remains FDR
+  0016 work), and the ephemeral flag carries the old form's full grammar
+  (`-4`/`-6`/`-p`, `-- command`) so nothing was lost in the retirement.
 - **No multi-host aggregated list in v1.** `posh list box:` queries one host;
   a `posh list --all` that fans out across a configured host set is future UX.
 - **No auto-reaping.** Durable shells linger until their shell exits, as local

@@ -58,7 +58,11 @@ enum Target {
     LocalSession { name: String },
     /// `:session` / `:group/session`: explicit local.
     Local { group: Option<String>, session: String },
-    /// An ssh destination: plain roaming shell (mosh form).
+    /// An ssh destination with no session. Formerly the plain roaming shell
+    /// (mosh form); since the FDR 0011 durable-by-default amendment
+    /// (2026-09-03) the bare form errors with the host's session list, and
+    /// the throwaway shell is the explicit `posh start --ephemeral`.
+    /// `posh start` reads a Host target as a remote auto-id create.
     Host { user: Option<String>, host: String },
     /// `[user@]host:[group/]session`: a session on a remote host.
     RemoteSession {

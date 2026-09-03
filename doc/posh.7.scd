@@ -27,7 +27,9 @@ keeps its meaning:
 
 - _name_ — a local session (attach-or-create).
 - *:*[_group_/]_session_ — an explicit local session.
-- [_user_@]_host_ — a plain roaming shell.
+- [_user_@]_host_ — a host with no session: errors with the host's
+  session list (durable sessions are the default, FDR 0011; the
+  throwaway roaming shell is *posh start --ephemeral* _host_).
 - [_user_@]_host_*:*[_group_/]_session_ — a persistent session on a
   remote host, over the roaming transport.
 

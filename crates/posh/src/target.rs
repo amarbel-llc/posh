@@ -12,7 +12,11 @@ pub enum Target {
         group: Option<String>,
         session: String,
     },
-    /// An ssh destination: plain roaming shell (mosh form).
+    /// An ssh destination with no session. Formerly the plain roaming shell
+    /// (mosh form); since FDR 0011 (durable-by-default) the bare form errors
+    /// with the host's session list, and the throwaway shell lives behind
+    /// `posh start --ephemeral`. `posh start host` / `host:` read it as a
+    /// remote auto-id create.
     Host { user: Option<String>, host: String },
     /// `[user@]host:[group/]session`: a session on a remote host.
     RemoteSession {

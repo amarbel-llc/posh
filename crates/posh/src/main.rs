@@ -177,7 +177,7 @@ fn run() -> Result<()> {
             session::cmd_status(&Config::new(&group)?, name)
         }
         "attach" | "a" => cmd_attach(&group, args),
-        "start" | "s" => cmd_start(&group, args),
+        "start" | "s" => cmd_start(&group, args, &forward_flag),
         "kill" | "k" => {
             let name = args
                 .first()
@@ -230,7 +230,15 @@ fn run() -> Result<()> {
         "server" => cmd_server(args),
         "client" => cmd_client(args),
         "mux" => cmd_mux(args),
-        "ssh" => cmd_ssh(args, None),
+        // FDR 0011/0015: the explicit ephemeral-shell wrapper is retired with
+        // the bare-host form; cmd_ssh survives internally behind the explicit
+        // `start --ephemeral` opt-out.
+        "ssh" => Err(Error::from(
+            "posh ssh is retired (FDR 0011): durable sessions are the default.\n  \
+             attach or create: posh <host>:<session>  (or `ph <host>:<session>`)\n  \
+             throwaway roaming shell (old behavior, same flags): \
+             posh start --ephemeral [user@]host [-4|-6] [-p PORT[:PORT2]] [-- command...]",
+        )),
         // `posh rec ...` == the standalone `poshterity` binary: deterministic
         // recording replay (poshterity owns the logic; this is just an alias).
         "rec" => poshterity::cli::run(args).map_err(Error::from),
@@ -244,10 +252,13 @@ fn run() -> Result<()> {
                 args.extend_from_slice(&rest[1..]);
                 cmd_attach(&g.unwrap_or(group), &args)
             }
-            // mosh parity: `posh [user@]host [-- command...]` connects
-            // remotely over ssh + encrypted UDP. This roaming path honors
-            // agent forwarding (FDR 0004), like `host:session`.
-            target::Target::Host { .. } => cmd_ssh(rest, Some(&forward_flag)),
+            // FDR 0011: a bare host no longer spawns an ephemeral roaming
+            // shell — durable sessions are the default. Until the FDR 0016
+            // host-scoped picker lands this errors with the candidate list
+            // (the non-TTY discipline); `start --ephemeral` is the opt-out.
+            target::Target::Host { user, host } => {
+                Err(bare_host_guidance(user, host, &group))
+            }
             // `posh host:grp/dev` — persistent remote session over the
             // roaming transport (RFC 0001 §2).
             target::Target::RemoteSession {
@@ -388,7 +399,20 @@ fn classify_start_target(target: Option<&str>) -> StartClass {
 /// is not atomic: a session created between the two degrades to an attach
 /// (the daemon's `connect_or_create` is idempotent), never an error or a
 /// clobber — the strictness is a UX guard, same as `ph`'s resolve.
-fn cmd_start(group: &str, args: &[String]) -> Result<()> {
+///
+/// `--ephemeral` (FDR 0011's explicit non-durable opt-out, leading position
+/// only) short-circuits all of that: the rest of the argv is the retired
+/// bare-host roaming grammar, handed verbatim to the `posh ssh` parser —
+/// so `-4`/`-6`/`-p` and a `-- command` keep working — and spawns the
+/// mosh-style throwaway shell (no daemon, dies with the transport).
+fn cmd_start(
+    group: &str,
+    args: &[String],
+    forward_flag: &remote::agent::ForwardFlag,
+) -> Result<()> {
+    if args.first().map(String::as_str) == Some("--ephemeral") {
+        return cmd_start_ephemeral(&args[1..], forward_flag);
+    }
     let (detach, target, command_slice) = parse_start_args(args);
     let command = (!command_slice.is_empty()).then(|| command_slice.to_vec());
     match classify_start_target(target) {
@@ -407,7 +431,7 @@ fn cmd_start(group: &str, args: &[String]) -> Result<()> {
             g,
             group,
             &start_remote_extra(detach, command_slice),
-            &remote::agent::ForwardFlag::Unset,
+            forward_flag,
         ),
         StartClass::RemoteNamed { user, host, group: g, session } => {
             let probe_group = g.as_deref().unwrap_or(group);
@@ -429,9 +453,33 @@ fn cmd_start(group: &str, args: &[String]) -> Result<()> {
                 group,
                 session,
                 &start_remote_extra(detach, command_slice),
-                &remote::agent::ForwardFlag::Unset,
+                forward_flag,
             )
         }
+    }
+}
+
+/// `posh start --ephemeral`: the explicit throwaway roaming shell (FDR 0011's
+/// non-durable opt-out, and the rollback anchor for retiring bare `posh
+/// host`). The argv after the flag is exactly the old `posh ssh` grammar; the
+/// target must be host-shaped (an ephemeral shell has no session name, and a
+/// local shell without a daemon is just your shell).
+fn cmd_start_ephemeral(rest: &[String], forward_flag: &remote::agent::ForwardFlag) -> Result<()> {
+    let parsed = parse_ssh_args(rest)?;
+    match target::Target::parse(parsed.target) {
+        target::Target::Host { .. } => cmd_ssh(rest, forward_flag),
+        target::Target::RemoteSession { .. } => Err(Error::Msg(format!(
+            "posh start --ephemeral: {} names a session — an ephemeral shell has \
+             none (drop the :session, or use `posh start {}` for a durable one)",
+            parsed.target, parsed.target
+        ))),
+        target::Target::LocalSession { .. } | target::Target::Local { .. } => Err(Error::Msg(
+            format!(
+                "posh start --ephemeral: {} is not a host — an ephemeral roaming \
+                 shell is remote-only (a local shell without a daemon is just your shell)",
+                parsed.target
+            ),
+        )),
     }
 }
 
@@ -448,6 +496,27 @@ fn start_remote_extra(detach: bool, command: &[String]) -> Vec<String> {
         extra.extend_from_slice(command);
     }
     extra
+}
+
+/// The FDR 0011 bare-host refusal: a bare `posh <host>` errors with the
+/// host's candidate sessions and the new forms, instead of spawning an
+/// ephemeral roaming shell. The candidate probe is best-effort — an
+/// unreachable host still gets the guidance, just without the list. The
+/// host-scoped picker (FDR 0016) will replace this error on a TTY.
+fn bare_host_guidance(user: Option<String>, host: String, group: &str) -> Error {
+    let dest = ph_dest(user.as_deref(), &host);
+    let candidates = match remote_session_names(user.as_deref(), &host, group) {
+        Ok(names) if !names.is_empty() => {
+            format!("\n  sessions on {dest}: {}", names.join(", "))
+        }
+        Ok(_) => format!("\n  no sessions on {dest} yet"),
+        Err(_) => String::new(),
+    };
+    Error::Msg(format!(
+        "posh: {dest} is a host — durable sessions are the default (FDR 0011){candidates}\n  \
+         attach: posh {dest}:<session>   create: posh start {dest}: (auto-id) or ph {dest}:<name>\n  \
+         throwaway roaming shell (old behavior): posh start --ephemeral {dest}"
+    ))
 }
 
 /// Remote auto-id create (`posh start host:` / `host:+`, and `ph host:+`):
@@ -576,7 +645,9 @@ fn cmd_ph(argv: &[String]) -> Result<()> {
                  (a durable session on that host)"
             )))
         }
-        PhRoute::LocalNew { group: g } => cmd_start(g.as_deref().unwrap_or(&group), &[]),
+        PhRoute::LocalNew { group: g } => {
+            cmd_start(g.as_deref().unwrap_or(&group), &[], &remote::agent::ForwardFlag::Unset)
+        }
         PhRoute::LocalResolve { group: g, session } => {
             let grp = g.as_deref().unwrap_or(&group);
             let cfg = Config::new(grp)?;
@@ -587,7 +658,11 @@ fn cmd_ph(argv: &[String]) -> Result<()> {
             if session::session_socket_exists(&path) && !session::socket_is_dead(&path) {
                 cmd_attach(grp, std::slice::from_ref(&session))
             } else {
-                cmd_start(grp, std::slice::from_ref(&session))
+                cmd_start(
+                    grp,
+                    std::slice::from_ref(&session),
+                    &remote::agent::ForwardFlag::Unset,
+                )
             }
         }
         PhRoute::RemoteNew { user, host, group: g } => {
@@ -1138,7 +1213,7 @@ fn cmd_list_remote(user: Option<String>, host: String, group: &str) -> Result<()
 }
 
 const SSH_USAGE: &str =
-    "usage: posh ssh [-4|-6] [-a|-A] [-p PORT[:PORT2]] [user@]host [-- command...]";
+    "usage: posh start --ephemeral [-4|-6] [-a|-A] [-p PORT[:PORT2]] [user@]host [-- command...]";
 
 /// Parsed `posh ssh` argv. Pure and side-effect-free so the grammar is
 /// unit-tested without spawning ssh — mirrors `parse_attach_args`.
@@ -1220,14 +1295,12 @@ fn resolve_real_ssh_agent_forward(flag: Option<bool>, mux_owned: bool) -> Option
     flag.or_else(|| (!mux_owned).then_some(true))
 }
 
-// `forward` is Some for the mosh-parity bare `posh host` roaming path (which
-// honors agent forwarding like `host:session`), and None for the explicit
-// `posh ssh` subcommand, which stays a thin ssh wrapper — a `-A`/`-a` there
-// is the real ssh flag, not posh forwarding (FDR 0004 §Limitations). For the
-// bare-host path, `-a`/`-A` are already consumed by the global argv loop in
-// `run()` before dispatch (into `forward_flag`), so they never reach this
-// function's own `-a`/`-A` arm in that case.
-fn cmd_ssh(args: &[String], forward: Option<&remote::agent::ForwardFlag>) -> Result<()> {
+// The ephemeral roaming shell (mosh form), reachable only through
+// `posh start --ephemeral` since FDR 0011 retired the bare-host and `posh
+// ssh` spellings. It honors posh agent forwarding like `host:session`
+// (`forward` is the global loop's `-a`/`-A` resolution); an in-args
+// `-a`/`-A` is the REAL ssh flag on the bootstrap (FDR 0004 §Limitations).
+fn cmd_ssh(args: &[String], forward: &remote::agent::ForwardFlag) -> Result<()> {
     let SshArgs {
         family,
         port_range,
@@ -1235,9 +1308,7 @@ fn cmd_ssh(args: &[String], forward: Option<&remote::agent::ForwardFlag>) -> Res
         target,
         remote_cmd,
     } = parse_ssh_args(args)?;
-    // Resolve agent forwarding for the roaming bare-host path; the explicit
-    // `posh ssh` subcommand passes None and stays a thin wrapper (its None
-    // source also means the mux gate below never spawns anything for it).
+    // Resolve agent forwarding for the roaming shell.
     // POSH_MUX (default ON since the FDR 0014 promotion; `=0` opts out):
     // with forwarding resolved on, the
     // per-destination mux endpoint owns forwarding for this invocation — the
@@ -1246,7 +1317,7 @@ fn cmd_ssh(args: &[String], forward: Option<&remote::agent::ForwardFlag>) -> Res
     // falls back to per-connection forwarding exactly as before.
     let (agent_source, mux_ref) = remote::mux::apply_mux_gate(
         remote::mux::mux_selected(),
-        forward.and_then(resolve_agent_source),
+        resolve_agent_source(forward),
         |source| remote::mux::ensure_mux(target, family, port_range.as_deref(), source),
     );
     // posh#161: the endpoint owning forwarding ⇒ the session still gets
@@ -1458,7 +1529,10 @@ SYNOPSIS
     posh [-g GROUP] <command> [args]
     posh <name>                       (shorthand for: posh attach <name>)
     posh :[group/]session             (explicit local attach)
-    posh [user@]host [-- command...]  (shorthand for: posh ssh ...)
+    posh [user@]host                  (errors with the host's session list;
+                                       durable sessions are the default —
+                                       FDR 0011. `start --ephemeral` is the
+                                       throwaway-shell opt-out.)
     posh [user@]host:[group/]session [--detach] [command...]
                                       (persistent session on the host over
                                        the roaming transport; scp-style —
@@ -1500,7 +1574,9 @@ SESSION COMMANDS (local persistence)
         label. Remote targets work the same way: `host:name` creates a
         named session on the host (strict — errors if it exists there),
         `host:` or `host:+` a remote auto-id. With --detach,
-        ensure-and-return (idempotent, like `attach --detach`).
+        ensure-and-return (idempotent, like `attach --detach`). With
+        --ephemeral (first arg), a non-durable throwaway roaming shell
+        instead — see REMOTE COMMANDS below.
 
     list [--short] [-j|--json] [-w|--watch [--interval N]]  (aliases: ls, l)
         List sessions in the group: name, pid, attached client count.
@@ -1574,19 +1650,19 @@ REMOTE COMMANDS (roaming over encrypted UDP)
         the screen is updated with minimal diffs.
         Quit sequence: Ctrl-^ then \".\" (Ctrl-^ twice for a literal one).
 
-    ssh [-4|-6] [-a|-A] [-p PORT[:PORT2]] [user@]host [-- command...]
-        Convenience wrapper (mosh-style; also reachable as a bare
-        `posh [user@]host` when the host contains @ . or :): start
-        `posh-server new` on the host via ssh (forwarding LANG/LC_* and
-        the -p/-4/-6 flags), then connect to the address the server
-        reports. The remote host needs `posh-server` on its
-        non-interactive PATH (the nix package installs it next to posh).
-        Survives IP changes and sleep/resume.
-        -a/-A here are real ssh agent-forwarding flags, passed through
-        verbatim to the bootstrap ssh connection (not posh's own
-        transport-level forwarding, which only applies to the
-        `[user@]host:session` roaming path). Defaults to -A (forwarding
-        on); pass -a to opt out for this connection.
+    start --ephemeral [-4|-6] [-a|-A] [-p PORT[:PORT2]] [user@]host [-- command...]
+        The explicit throwaway roaming shell (mosh-style; no session
+        daemon, dies with the transport). This replaces the retired bare
+        `posh [user@]host` and `posh ssh` forms (FDR 0011: durable
+        sessions are the default; a bare host now errors with the
+        host's session list). Starts `posh-server new` on the host via
+        ssh (forwarding LANG/LC_* and the -p/-4/-6 flags), then
+        connects to the address the server reports. The remote host
+        needs `posh-server` on its non-interactive PATH. Survives IP
+        changes and sleep/resume.
+        -a/-A after --ephemeral are real ssh agent-forwarding flags on
+        the bootstrap connection; posh's own transport-level forwarding
+        resolves from the global -a/-A before the subcommand.
 
 TOOLS
     rec replay <file> [--to-marker NAME] [--dump text|vt|flat]
@@ -2187,7 +2263,7 @@ mod tests {
             "completions",
             "server",
             "client",
-            "ssh",
+            "--ephemeral",
             "mux ls",
         ] {
             assert!(HELP.contains(needle), "help missing {needle}");

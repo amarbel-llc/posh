@@ -242,6 +242,50 @@ fn start_remote_attempts_the_host() {
 }
 
 #[test]
+fn bare_host_and_posh_ssh_are_retired() {
+    let dir = test_dir("posh-itest-durable-default");
+    std::fs::create_dir_all(&dir).unwrap();
+
+    // FDR 0011: a bare host errors with guidance instead of spawning an
+    // ephemeral roaming shell. Against an unreachable host the candidate
+    // probe fails fast (BatchMode resolution) and the guidance still prints.
+    let out = posh(&dir, &["nohost.invalid"]);
+    assert!(!out.status.success(), "bare host should error: {out:?}");
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    assert!(
+        stderr.contains("durable sessions are the default"),
+        "bare-host stderr: {stderr}"
+    );
+    assert!(
+        stderr.contains("--ephemeral"),
+        "bare-host stderr must hint the opt-out: {stderr}"
+    );
+
+    // `posh ssh` is retired with the bare form.
+    let out = posh(&dir, &["ssh", "nohost.invalid"]);
+    assert!(!out.status.success(), "posh ssh should be retired: {out:?}");
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    assert!(stderr.contains("retired"), "ssh stderr: {stderr}");
+
+    // `start --ephemeral` validates its target shape before any network
+    // attempt: a session-shaped target and a local name are both rejected.
+    let out = posh(&dir, &["start", "--ephemeral", "nohost.invalid:dev"]);
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    assert!(
+        !out.status.success() && stderr.contains("names a session"),
+        "ephemeral with a session: {stderr}"
+    );
+    let out = posh(&dir, &["start", "--ephemeral", "scratch"]);
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    assert!(
+        !out.status.success() && stderr.contains("remote-only"),
+        "ephemeral with a local name: {stderr}"
+    );
+
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+#[test]
 fn ph_argv0_routes_and_defers_picker() {
     let dir = test_dir("posh-itest-ph");
     std::fs::create_dir_all(&dir).unwrap();

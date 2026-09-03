@@ -77,7 +77,7 @@ _posh_completions() {
   cur="${COMP_WORDS[COMP_CWORD]}"
   prev="${COMP_WORDS[COMP_CWORD-1]}"
 
-  local commands="attach run detach detach-all fork groups tailnet list completions kill history server client ssh mux version help"
+  local commands="attach run detach detach-all fork groups tailnet list completions kill history server client mux version help"
 
   # Handle -g/--group flag
   if [[ "$prev" == "-g" || "$prev" == "--group" ]]; then
@@ -110,7 +110,6 @@ _posh_completions() {
       history|hi) flags="--vt" ;;
       server) flags="-p -4 -6" ;;
       client) flags="-4 -6" ;;
-      ssh) flags="-p -4 -6 -a -A" ;;
       # host:[group/]session namespace form (#67): detached remote spawn.
       *:*) flags="$flags --detach" ;;
     esac
@@ -165,9 +164,6 @@ _posh_completions() {
     mux)
       COMPREPLY=($(compgen -W "ls" -- "$cur"))
       ;;
-    ssh)
-      COMPREPLY=($(compgen -W "$(_posh_ssh_hosts | tr '\n' ' ') $(posh tailnet 2>/dev/null | tr '\n' ' ')" -- "$cur"))
-      ;;
     *)
       ;;
   esac
@@ -217,7 +213,6 @@ const ZSH_COMPLETIONS: &str = r#"_posh() {
         'mux:Per-destination mux endpoint status'
         'server:Start a roaming remote server'
         'client:Connect to a posh server over UDP'
-        'ssh:Start and connect to a remote server over ssh'
         'version:Show version'
         'help:Show help message'
       )
@@ -248,10 +243,6 @@ const ZSH_COMPLETIONS: &str = r#"_posh() {
           ;;
         mux)
           _values 'mux verb' 'ls'
-          ;;
-        ssh)
-          _posh_ssh_hosts
-          _posh_tailnet_hosts
           ;;
       esac
       ;;
@@ -453,7 +444,7 @@ end
 
 complete -c posh -f
 
-set -l subcommands attach run detach detach-all fork groups tailnet list completions kill history server client ssh mux version help
+set -l subcommands attach run detach detach-all fork groups tailnet list completions kill history server client mux version help
 set -l no_subcmd "not __fish_seen_subcommand_from $subcommands"
 
 complete -c posh -n $no_subcmd -s g -l group -d 'Session group' -r -a '(posh groups 2>/dev/null)'
@@ -472,7 +463,6 @@ complete -c posh -n $no_subcmd -a history -d 'Output session scrollback'
 complete -c posh -n $no_subcmd -a mux -d 'Per-destination mux endpoint status'
 complete -c posh -n $no_subcmd -a server -d 'Start a roaming remote server'
 complete -c posh -n $no_subcmd -a client -d 'Connect to a posh server over UDP'
-complete -c posh -n $no_subcmd -a ssh -d 'Start and connect to a remote server over ssh'
 complete -c posh -n $no_subcmd -a version -d 'Show version'
 complete -c posh -n $no_subcmd -a help -d 'Show help message'
 
@@ -504,8 +494,6 @@ complete -c posh -n "__fish_seen_subcommand_from list" -l json -s j -d 'JSON out
 complete -c posh -n "__fish_seen_subcommand_from list" -l watch -s w -d 'Live-refresh the unified view'
 complete -c posh -n "__fish_seen_subcommand_from list" -l interval -d 'Watch refresh seconds' -r
 complete -c posh -n "__fish_seen_subcommand_from history" -l vt -d 'VT escape stream output'
-complete -c posh -n "__fish_seen_subcommand_from ssh" -a '(__posh_ssh_config_hosts)' -d 'Host'
-complete -c posh -n "__fish_seen_subcommand_from ssh" -a '(posh tailnet 2>/dev/null)' -d 'Tailnet peer'
 "#;
 
 /// The `ph` front-door completion (FDR 0015). fish only for now (the prioritized
@@ -692,7 +680,6 @@ mod tests {
         "mux",
         "server",
         "client",
-        "ssh",
         "version",
         "help",
     ];

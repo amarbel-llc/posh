@@ -48,8 +48,12 @@ _name_
 
 \[_user_@]_host_
 	An ssh destination (contains _@_ or _._, or is a bracketed IPv6
-	literal, or has a trailing colon) is a *plain roaming shell* over
-	the encrypted UDP transport. Shorthand for *posh ssh* _host_.
+	literal, or has a trailing colon). Durable sessions are the
+	default (FDR 0011), so the bare form *errors* with the host's
+	session list and the new forms — it no longer spawns an ephemeral
+	roaming shell. The throwaway shell survives behind the explicit
+	*start --ephemeral* opt-out; a host-scoped interactive picker is
+	planned (FDR 0016).
 
 \[_user_@]_host_*:*[_group_/]_session_ [*--detach*] [_command_...]
 	A *persistent session on a remote host*, transported over the
@@ -133,8 +137,8 @@ _$SSH_AUTH_SOCK_=_<session-dir>/agent/sock_, valid across
 detach/reattach. This diverges from OpenSSH's opt-in default — posh
 targets are overwhelmingly your own hosts; the trust model is otherwise
 identical to *ssh -A*, so prefer confirm-constrained keys (*ssh-add -c*)
-for hosts you do not fully trust. *posh ssh* stays a thin *ssh* wrapper:
-a *-A* there is the real *ssh* flag, not posh forwarding.
+for hosts you do not fully trust. A *-a*/*-A* after *start --ephemeral*
+is the real *ssh* flag on the bootstrap, not posh forwarding.
 
 # SESSION COMMANDS
 
@@ -157,7 +161,9 @@ Local persistence over Unix sockets.
 	is probed first, and an existing name errors), while _host_*:* or
 	_host_*:+* creates a remote auto-id session (first free _s-N_).
 	With *--detach*, ensure-and-return, idempotent like
-	*attach --detach*.
+	*attach --detach*. With *--ephemeral* (first argument), a
+	non-durable throwaway roaming shell instead — see REMOTE
+	COMMANDS below.
 
 *list* [*--short*] [*-j*|*--json*] [*-w*|*--watch* [*--interval* _N_]] (aliases: *ls*, *l*)
 	List sessions in the group: name, pid, attached client count.
@@ -287,24 +293,24 @@ Local persistence over Unix sockets.
 # REMOTE COMMANDS
 
 Roaming over encrypted UDP. See *posh-server*(1) and *posh-client*(1)
-for the two endpoints; most users never invoke these directly — bare
-*posh* _host_ and *posh* _host_*:*_session_ drive them.
+for the two endpoints; most users never invoke these directly —
+*posh* _host_*:*_session_ drives them.
 
-*ssh* [*-4*|*-6*] [*-a*|*-A*] [*-p* _PORT_[*:*_PORT2_]] [_user_@]_host_ [*--* _command_...]
-	Convenience wrapper (mosh-style; also reached as a bare
-	*posh* [_user_@]_host_ when the host contains _@_, _._, or _:_):
-	start *posh-server new* on the host via ssh (forwarding the
-	locale environment — LANG and the LC_ variables — and the
-	*-p*/*-4*/*-6* flags), then connect to the address the
-	server reports. The remote host needs *posh-server*(1) on its
-	non-interactive PATH. Survives IP changes and sleep/resume.
-	*-a*/*-A* here are the real *ssh*(1) agent-forwarding flags,
-	passed through verbatim to the bootstrap *ssh* connection —
-	not posh's own transport-level forwarding (see GLOBAL
-	OPTIONS above), which only applies to the
-	\[_user_@]_host_*:*_session_ roaming path. Defaults to *-A*
-	(forwarding on), matching the roaming paths' best-effort
-	default; pass *-a* to opt out for this connection.
+*start --ephemeral* [*-4*|*-6*] [*-a*|*-A*] [*-p* _PORT_[*:*_PORT2_]] [_user_@]_host_ [*--* _command_...]
+	The explicit *throwaway roaming shell* (mosh-style: no session
+	daemon, dies with the transport) — FDR 0011's non-durable
+	opt-out, replacing the retired bare *posh* _host_ and
+	*posh ssh* forms with the same flags: start *posh-server new*
+	on the host via ssh (forwarding the locale environment — LANG
+	and the LC_ variables — and the *-p*/*-4*/*-6* flags), then
+	connect to the address the server reports. The remote host
+	needs *posh-server*(1) on its non-interactive PATH. Survives
+	IP changes and sleep/resume.
+	*-a*/*-A* after *--ephemeral* are the real *ssh*(1)
+	agent-forwarding flags, passed through verbatim to the
+	bootstrap *ssh* connection — not posh's own transport-level
+	forwarding (see GLOBAL OPTIONS above), which resolves from the
+	global *-a*/*-A* before the subcommand.
 
 *server* [*new*] [*-p* _PORT_[*:*_PORT2_]] [*-4*|*-6*] [*--* _command_...]
 	Start a remote server; see *posh-server*(1).
@@ -421,8 +427,8 @@ _POSH_MUX_
 	bootstrap *ssh* itself runs with *-a*: an OpenSSH-forwarded agent
 	socket in the session's environment would be a connection-bound
 	competitor that dies with the bootstrap's TCP connection, the very
-	dependency posh removes. An explicit *posh ssh -A* still forwards
-	the real agent on the bootstrap. A remote *posh-server* that has the
+	dependency posh removes. An explicit *-A* after *start --ephemeral*
+	still forwards the real agent on that bootstrap. A remote *posh-server* that has the
 	*agent* verb but predates the export acknowledges nothing, and the
 	client then warns once that the session has no forwarded agent until
 	the remote is upgraded (_POSH_MUX=0_ restores per-connection
@@ -444,8 +450,8 @@ _POSH_MUX_SESSIONS_
 	the daemon retains the channel and reattaches it to the surviving
 	remote session — the screen stalls with the *Last contact N ago*
 	banner and resumes when the wire returns, the same roaming
-	behaviour as a per-invocation connection. Bare-host roaming shells
-	(*posh user@host*) are unaffected.
+	behaviour as a per-invocation connection. Ephemeral shells
+	(*start --ephemeral*) never ride the mux.
 
 _POSH_CONGESTION_
 	The RFC 0011 sender-side congestion response for agent channels,
@@ -536,11 +542,12 @@ laptop$ <Ctrl-\>            # detach
 desktop$ posh box:dev      # same session, full replay
 ```
 
-A plain roaming shell on a host (no persistence):
+An explicit throwaway roaming shell on a host (no persistence; the bare
+*posh box* form errors with the host's session list instead):
 
 ```
-posh box
-posh user@box -- htop
+posh start --ephemeral box
+posh start --ephemeral user@box -- htop
 ```
 
 List local and remote sessions:

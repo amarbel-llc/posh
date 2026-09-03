@@ -17,9 +17,10 @@ keystrokes speculatively (local prediction), and reconnects
 automatically across IP changes and sleep/resume.
 
 It is reached as the *client* subcommand of *posh*(1). Users rarely
-invoke it directly: bare *posh* _host_ and *posh* _host_*:*_session_
-run the ssh bootstrap (*posh ssh*), which starts a *posh-server*(1) on
-the host and then launches this client against the reported address.
+invoke it directly: *posh* _host_*:*_session_ and
+*posh start --ephemeral* _host_ run the ssh bootstrap, which starts a
+*posh-server*(1) on the host and then launches this client against the
+reported address.
 
 When the remote *posh-server*(1)'s organic wedge watchdog detects a session
 stall — its terminal advanced but no frame was produced for longer than the
