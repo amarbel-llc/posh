@@ -333,20 +333,25 @@ fn parse_start_args(args: &[String]) -> (bool, Option<&str>, &[String]) {
     (detach, target, &args[i..])
 }
 
-/// How a `posh start` target resolves. Remote targets are deferred in Phase A
-/// (create a remote session via `posh host:session`); the strict local create is
-/// the slice-A deliverable.
+/// How a `posh start` target resolves. Local targets create through the strict
+/// `cmd_start_local`; remote targets probe the host's session list first (the
+/// strictness check) and then ride the existing roaming create path.
 #[derive(Debug, PartialEq, Eq)]
 enum StartClass {
     LocalAuto { group: Option<String> },
     LocalNamed { group: Option<String>, session: String },
-    Remote,
+    RemoteAuto { user: Option<String>, host: String, group: Option<String> },
+    RemoteNamed { user: Option<String>, host: String, group: Option<String>, session: String },
 }
 
-/// Classify a `posh start` target. `None` and `:+` (and `:g/+`) mean auto-id; a
-/// bare word or `:name` is a named local session; anything that parses to a host
-/// is `Remote`. Bare `+` (no colon) is a literal local name, consistent with the
-/// colon-is-the-new-session-sigil rule (canonical new is `:+`).
+/// Classify a `posh start` target. `None` and `:+` (and `:g/+`) mean local
+/// auto-id; a bare word or `:name` is a named local session; `host:name` is a
+/// named remote session, and `host:+` / `host:g/+` a remote auto-id. A
+/// session-less host form (`host:`, or a bare token posh's grammar reads as a
+/// host, like `box.com` / `user@box`) is also remote auto-id — no session named
+/// means auto-id, exactly as the target-less local form. Bare `+` (no colon) is
+/// a literal local name, consistent with the colon-is-the-new-session-sigil
+/// rule (canonical new is `:+`).
 fn classify_start_target(target: Option<&str>) -> StartClass {
     match target {
         None => StartClass::LocalAuto { group: None },
@@ -360,15 +365,29 @@ fn classify_start_target(target: Option<&str>) -> StartClass {
             target::Target::Local { group, session } => {
                 StartClass::LocalNamed { group, session }
             }
-            _ => StartClass::Remote,
+            target::Target::Host { user, host } => {
+                StartClass::RemoteAuto { user, host, group: None }
+            }
+            target::Target::RemoteSession { user, host, group, session } if session == "+" => {
+                StartClass::RemoteAuto { user, host, group }
+            }
+            target::Target::RemoteSession { user, host, group, session } => {
+                StartClass::RemoteNamed { user, host, group, session }
+            }
         },
     }
 }
 
 /// `posh start`: create a durable session and attach (FDR 0015). Local targets
 /// use the strict create (`cmd_start_local`); an auto-id target picks the next
-/// free `s-N`. Remote start is deferred to a later slice — a remote target routes
-/// the user to the existing create-or-attach `posh host:session` form.
+/// free `s-N`. Remote targets probe the host's session list over ssh first —
+/// a named target that already exists errors (the strict-create contract), an
+/// auto-id target picks the first free remote `s-N` — then create through the
+/// existing roaming path (`cmd_ssh_session`, whose create-or-attach is safe
+/// because the probe just showed the name absent). The probe-then-create pair
+/// is not atomic: a session created between the two degrades to an attach
+/// (the daemon's `connect_or_create` is idempotent), never an error or a
+/// clobber — the strictness is a UX guard, same as `ph`'s resolve.
 fn cmd_start(group: &str, args: &[String]) -> Result<()> {
     let (detach, target, command_slice) = parse_start_args(args);
     let command = (!command_slice.is_empty()).then(|| command_slice.to_vec());
@@ -382,10 +401,71 @@ fn cmd_start(group: &str, args: &[String]) -> Result<()> {
             let cfg = Config::new(g.as_deref().unwrap_or(group))?;
             session::client::cmd_start_local(&cfg, &session, command, detach)
         }
-        StartClass::Remote => Err(Error::from(
-            "posh start: remote targets are not yet supported; use `posh host:session`",
-        )),
+        StartClass::RemoteAuto { user, host, group: g } => start_remote_auto(
+            user,
+            host,
+            g,
+            group,
+            &start_remote_extra(detach, command_slice),
+            &remote::agent::ForwardFlag::Unset,
+        ),
+        StartClass::RemoteNamed { user, host, group: g, session } => {
+            let probe_group = g.as_deref().unwrap_or(group);
+            let names = remote_session_names(user.as_deref(), &host, probe_group)?;
+            // NOTE: the attach hint is the bare create-or-attach form —
+            // `posh attach` is still local-only (remote strict attach is a
+            // later FDR 0011 slice), so it must not be recommended here.
+            if names.iter().any(|n| n == &session) {
+                let dest = ph_dest(user.as_deref(), &host);
+                return Err(Error::Msg(format!(
+                    "posh start: session {session} already exists on {dest} \
+                     (attach with `posh {dest}:{session}`, or `ph`)"
+                )));
+            }
+            cmd_ssh_session(
+                user,
+                host,
+                g,
+                group,
+                session,
+                &start_remote_extra(detach, command_slice),
+                &remote::agent::ForwardFlag::Unset,
+            )
+        }
     }
+}
+
+/// Rebuild `cmd_ssh_session`'s extra tail from `posh start`'s parsed args:
+/// `[--detach] [-- command...]`, the exact shape `parse_remote_session_extra`
+/// reads back on the other side.
+fn start_remote_extra(detach: bool, command: &[String]) -> Vec<String> {
+    let mut extra: Vec<String> = Vec::new();
+    if detach {
+        extra.push("--detach".into());
+    }
+    if !command.is_empty() {
+        extra.push("--".into());
+        extra.extend_from_slice(command);
+    }
+    extra
+}
+
+/// Remote auto-id create (`posh start host:` / `host:+`, and `ph host:+`):
+/// query the host's sessions, pick the first free `s-N`, and create it
+/// (`cmd_ssh_session` create-or-attaches; the id is free, so it creates).
+fn start_remote_auto(
+    user: Option<String>,
+    host: String,
+    target_group: Option<String>,
+    global_group: &str,
+    extra: &[String],
+    forward_flag: &remote::agent::ForwardFlag,
+) -> Result<()> {
+    let grp = target_group.clone().unwrap_or_else(|| global_group.to_string());
+    let names = remote_session_names(user.as_deref(), &host, &grp)?;
+    let id = first_free_autoid(&names)
+        .ok_or_else(|| Error::from("posh start: too many remote sessions"))?;
+    cmd_ssh_session(user, host, target_group, global_group, id, extra, forward_flag)
 }
 
 /// How a `ph` target token resolves (FDR 0015). The colon is the sole
@@ -474,8 +554,7 @@ fn parse_ph_args(argv: &[String]) -> Result<(String, Option<&str>)> {
 
 /// `ph`: the FDR 0015 front-door. Resolves a target and routes to `posh start`
 /// (absent) or `posh attach` (present); the picker forms are deferred to FDR
-/// 0016 and error with guidance (the non-TTY discipline). Remote auto-id
-/// (`host:+`) is a later slice.
+/// 0016 and error with guidance (the non-TTY discipline).
 fn cmd_ph(argv: &[String]) -> Result<()> {
     let (group, token) = parse_ph_args(argv)?;
     match ph_parse(token) {
@@ -512,13 +591,7 @@ fn cmd_ph(argv: &[String]) -> Result<()> {
             }
         }
         PhRoute::RemoteNew { user, host, group: g } => {
-            // Query the host's sessions, pick the first free s-N, and create it
-            // (cmd_ssh_session create-or-attaches; the id is free, so it creates).
-            let grp = g.clone().unwrap_or_else(|| group.clone());
-            let names = remote_session_names(user.as_deref(), &host, &grp)?;
-            let id = first_free_autoid(&names)
-                .ok_or_else(|| Error::from("ph: too many remote sessions"))?;
-            cmd_ssh_session(user, host, g, &group, id, &[], &remote::agent::ForwardFlag::Unset)
+            start_remote_auto(user, host, g, &group, &[], &remote::agent::ForwardFlag::Unset)
         }
         PhRoute::RemoteResolve { user, host, group: g, session } => cmd_ssh_session(
             user,
@@ -1423,9 +1496,10 @@ SESSION COMMANDS (local persistence)
         Create a durable session and attach. Errors if a named session
         already exists (use `attach`). With no target (or `:+`), create a
         new auto-id session (s-1, s-2, ...), picked later by its activity
-        label. With --detach, ensure-and-return (idempotent, like
-        `attach --detach`). Remote targets are not yet supported here — use
-        `posh host:session`.
+        label. Remote targets work the same way: `host:name` creates a
+        named session on the host (strict — errors if it exists there),
+        `host:` or `host:+` a remote auto-id. With --detach,
+        ensure-and-return (idempotent, like `attach --detach`).
 
     list [--short] [-j|--json] [-w|--watch [--interval N]]  (aliases: ls, l)
         List sessions in the group: name, pid, attached client count.
@@ -1862,8 +1936,59 @@ mod tests {
             classify_start_target(Some(":work/dev")),
             LocalNamed { group: Some("work".into()), session: "dev".into() }
         );
-        assert_eq!(classify_start_target(Some("box:dev")), Remote);
-        assert_eq!(classify_start_target(Some("user@box:dev")), Remote);
+        // Remote forms: `host:name` is a named remote create; `host:+` (and
+        // `host:g/+`) a remote auto-id; a session-less host (`host:`, or a
+        // bare token the grammar reads as a host) is auto-id too — no session
+        // named means auto-id, like the target-less local form.
+        assert_eq!(
+            classify_start_target(Some("box:dev")),
+            RemoteNamed { user: None, host: "box".into(), group: None, session: "dev".into() }
+        );
+        assert_eq!(
+            classify_start_target(Some("user@box:work/dev")),
+            RemoteNamed {
+                user: Some("user".into()),
+                host: "box".into(),
+                group: Some("work".into()),
+                session: "dev".into(),
+            }
+        );
+        assert_eq!(
+            classify_start_target(Some("box:+")),
+            RemoteAuto { user: None, host: "box".into(), group: None }
+        );
+        assert_eq!(
+            classify_start_target(Some("box:work/+")),
+            RemoteAuto { user: None, host: "box".into(), group: Some("work".into()) }
+        );
+        assert_eq!(
+            classify_start_target(Some("box:")),
+            RemoteAuto { user: None, host: "box".into(), group: None }
+        );
+        assert_eq!(
+            classify_start_target(Some("user@box.com")),
+            RemoteAuto { user: Some("user".into()), host: "box.com".into(), group: None }
+        );
+    }
+
+    #[test]
+    fn start_remote_extra_roundtrips_through_parse_remote_session_extra() {
+        // The rebuilt tail must read back to exactly the (detach, command)
+        // `posh start` parsed — the two functions are a serializer/parser pair.
+        let v = |xs: &[&str]| -> Vec<String> { xs.iter().map(|s| s.to_string()).collect() };
+        for (detach, command) in [
+            (false, v(&[])),
+            (true, v(&[])),
+            (false, v(&["htop"])),
+            (true, v(&["worker", "--serve"])),
+        ] {
+            let extra = start_remote_extra(detach, &command);
+            assert_eq!(
+                parse_remote_session_extra(&extra),
+                (detach, &command[..]),
+                "roundtrip for detach={detach} command={command:?}"
+            );
+        }
     }
 
     #[test]

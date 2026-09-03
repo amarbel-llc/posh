@@ -152,9 +152,12 @@ Local persistence over Unix sockets.
 	attach. Unlike *attach* this is strict: it errors if a named session
 	already exists (use *attach*). With no _target_ (or *:+*), create a
 	new auto-id session (_s-1_, _s-2_, ...), selected later by its
-	activity label. With *--detach*, ensure-and-return, idempotent like
-	*attach --detach*. Remote targets are not yet supported here; use
-	*posh* _host_*:*_session_.
+	activity label. Remote targets work the same way: _host_*:*_name_
+	creates a named session on _host_ (strict — the host's session list
+	is probed first, and an existing name errors), while _host_*:* or
+	_host_*:+* creates a remote auto-id session (first free _s-N_).
+	With *--detach*, ensure-and-return, idempotent like
+	*attach --detach*.
 
 *list* [*--short*] [*-j*|*--json*] [*-w*|*--watch* [*--interval* _N_]] (aliases: *ls*, *l*)
 	List sessions in the group: name, pid, attached client count.

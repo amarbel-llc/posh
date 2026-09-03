@@ -217,6 +217,31 @@ fn start_detach_autoid_creates_session() {
 }
 
 #[test]
+fn start_remote_attempts_the_host() {
+    let dir = test_dir("posh-itest-start-remote");
+    std::fs::create_dir_all(&dir).unwrap();
+
+    // Remote `posh start` is implemented (the FDR 0015 deferred slice): a
+    // remote target now probes the host rather than erroring "not yet
+    // supported". An unreachable host fails fast at the ssh probe (name
+    // resolution), for the named, auto-id, and session-less host forms alike.
+    for target in ["me@nohost.invalid:dev", "nohost.invalid:+", "nohost.invalid:"] {
+        let out = posh(&dir, &["start", target]);
+        assert!(
+            !out.status.success(),
+            "start {target} on an unreachable host should fail: {out:?}"
+        );
+        let stderr = String::from_utf8_lossy(&out.stderr);
+        assert!(
+            !stderr.contains("not yet supported"),
+            "start {target} should be implemented now: {stderr}"
+        );
+    }
+
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+#[test]
 fn ph_argv0_routes_and_defers_picker() {
     let dir = test_dir("posh-itest-ph");
     std::fs::create_dir_all(&dir).unwrap();
