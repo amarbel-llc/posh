@@ -629,7 +629,10 @@ mechanism is best designed against whatever handshake replaces it.
   §3.3 open-carries-binding rule made positional-safe against datagram
   reordering), ordinal 1 remains the bare single-session/heartbeat stream,
   and single-session receivers MUST ignore higher ordinals rather than feed
-  them to their frame paths.
+  them to their frame paths. The gate was promoted to DEFAULT ON
+  2026-09-03 (`POSH_MUX_SESSIONS=0` is the opt-out, the same off-switch
+  shape as `POSH_MUX`); the wire contract is unchanged — the per-invocation
+  fallback remains the behaviour on any establishment failure.
 - Future channel kinds MUST use a RESERVED kind value; future envelope fields
   MUST use a `ver` bump. Neither may be added ad hoc.
 

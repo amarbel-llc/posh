@@ -97,15 +97,19 @@ pub fn mux_selected() -> bool {
     parse_mux_gate(std::env::var("POSH_MUX").ok().as_deref())
 }
 
-/// The M2 session-sharing gate: OPT-IN (`POSH_MUX_SESSIONS`, the
-/// `POSH_CHANNELS` truthy shape — NOT the default-on off-switch), per the
-/// 2026-08-05 design revision's rollout arc. Off (the default) keeps the
-/// per-invocation relay attach byte-identical; on, a `host:session` attach
-/// rides the mux daemon's connection as a session channel, falling back
-/// per-invocation on any failure. Promotion to default-on is a later dated
-/// decision.
+/// The M2 session-sharing gate: DEFAULT ON since 2026-09-03 — the "later
+/// dated decision" of the 2026-08-05 rollout arc, promoted after the opt-in
+/// soak (the #156 fallback-warning instrumentation and the posh#162
+/// reconnect were its watchdogs). `POSH_MUX_SESSIONS=0` (or `false`/`off`/
+/// `no`) is the rollback switch — the shared [`util::parse_default_on_gate`]
+/// off-switch shape, same contract as `POSH_MUX`. On, a `host:session`
+/// attach rides the mux daemon's connection as a session channel; any
+/// failure (endpoint unreachable, channel refused, an older remote) falls
+/// back to a per-invocation connection with a one-line warning, so
+/// default-on never strands an attach. Off keeps the per-invocation relay
+/// attach byte-identical.
 pub fn mux_sessions_selected() -> bool {
-    crate::remote::sshwrap::env_selected("POSH_MUX_SESSIONS")
+    util::parse_default_on_gate(std::env::var("POSH_MUX_SESSIONS").ok().as_deref())
 }
 
 /// Maps every byte outside `[A-Za-z0-9._-]` to `-`. The one sanitizer behind
@@ -3922,16 +3926,23 @@ mod tests {
     }
 
     #[test]
-    fn mux_sessions_gate_is_opt_in() {
-        use crate::remote::sshwrap::env_value_on;
-        // The M2 rollout gate deliberately takes the POSH_CHANNELS opt-IN
-        // truthy shape, NOT the promoted default-on off-switch (no env
-        // mutation: the predicate is pinned directly).
-        for v in ["1", "true", "on", "yes"] {
-            assert!(env_value_on(v), "{v:?} must select mux sessions");
+    fn mux_sessions_gate_is_default_on_with_off_switch() {
+        // Promoted 2026-09-03: the M2 gate takes the shared default-on
+        // off-switch shape (`POSH_MUX`'s contract), no longer the opt-IN
+        // truthy shape (no env mutation: the predicate is pinned directly).
+        // Unset, empty, an explicit truthy, and unrecognized values are ON;
+        // only the off spellings disable.
+        for v in [None, Some(""), Some("1"), Some("true"), Some("on"), Some("yes"), Some("2")] {
+            assert!(
+                util::parse_default_on_gate(v),
+                "{v:?} must keep mux sessions on"
+            );
         }
-        for v in ["", "0", "false", "off", "no", "2"] {
-            assert!(!env_value_on(v), "{v:?} must leave the opt-in gate off");
+        for v in ["0", "false", "off", "no", " OFF "] {
+            assert!(
+                !util::parse_default_on_gate(Some(v)),
+                "{v:?} must switch mux sessions off"
+            );
         }
     }
 

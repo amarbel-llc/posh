@@ -890,9 +890,10 @@ fn cmd_ssh_session(
         };
         return remote::sshwrap::run_detached(&dest, &inner, &opts);
     }
-    // M2 session sharing (POSH_MUX_SESSIONS, opt-in): the attach rides the
-    // mux daemon's one connection as a session channel — no ssh bootstrap,
-    // no per-invocation transport; agent forwarding stays the endpoint's.
+    // M2 session sharing (POSH_MUX_SESSIONS, default ON since 2026-09-03;
+    // `=0` opts out): the attach rides the mux daemon's one connection as a
+    // session channel — no ssh bootstrap, no per-invocation transport; agent
+    // forwarding stays the endpoint's.
     // Any failure (endpoint unreachable, open refused, transport error)
     // falls THROUGH to the unchanged per-invocation path below, which
     // re-ensures the endpoint for M1 agent ownership on its own — so a

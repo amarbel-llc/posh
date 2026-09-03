@@ -253,12 +253,13 @@ Local persistence over Unix sockets.
 	identity exchange — _unknown_ against a pre-RFC-0013 remote,
 	and again during a reconnect, when the held identity is
 	discarded until the new wire answers), last-heard age, agent
-	channel count, the count of _$POSH_MUX_SESSIONS_ session
+	channel count, the count of M2 session
 	channels riding the wire (_session_channels=_ — zero here while
-	sessions were requested means every one fell back to its own
-	per-connection transport), session refs, linger state, and the
+	named-session attaches ran means every one fell back to its own
+	per-connection transport, or was a bare-host shell, which never
+	rides the mux), session refs, linger state, and the
 	congestion summary (cwnd, cuts, deepest backoff streak). The daily health check
-	for a _$POSH_MUX_SESSIONS_ soak. Probing rides the observer path — no
+	for the _$POSH_MUX_SESSIONS_ default-on rollout. Probing rides the observer path — no
 	session ref is taken and the endpoint's linger clock is
 	untouched. A socket whose daemon died without unlinking is
 	flagged _stale_; a pre-upgrade daemon still serving its old
@@ -429,12 +430,13 @@ _POSH_MUX_
 	worse than before, surfaced rather than silent.
 
 _POSH_MUX_SESSIONS_
-	Opt in to M2 session sharing (*1*, *true*, *on*, or *yes*): a
-	named-session attach (_host:session_) then rides the mux endpoint's
+	M2 session sharing, default ON (promoted 2026-09-03): a
+	named-session attach (_host:session_) rides the mux endpoint's
 	one connection as a session channel — no per-invocation ssh
 	bootstrap, attach latency drops to a unix-socket hop, and the
-	palette's *About / transport info* shows the mode. Default off
-	until promotion; requires _POSH_MUX_ on and agent forwarding
+	palette's *About / transport info* shows the mode. Set to *0*
+	(or *false*, *off*, *no*) to opt out and restore the
+	per-invocation attach; requires _POSH_MUX_ on and agent forwarding
 	resolved on. Any failure (endpoint unreachable, channel refused,
 	an older remote) falls back to a per-invocation connection with a
 	one-line warning. Once riding the mux, a session SURVIVES a wire

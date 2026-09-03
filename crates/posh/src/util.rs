@@ -90,7 +90,7 @@ pub fn now_ms() -> u64 {
 }
 
 /// The default-on env-gate parser shared by the promoted opt-out gates
-/// (`POSH_MUX`, `POSH_CONGESTION`, `POSH_ECHO_ESCALATE`): ON unless the value, trimmed and
+/// (`POSH_MUX`, `POSH_MUX_SESSIONS`, `POSH_CONGESTION`, `POSH_ECHO_ESCALATE`): ON unless the value, trimmed and
 /// ASCII-lowercased, is one of the explicit off spellings. Unset, empty,
 /// and unrecognized values are all ON — an off-SWITCH, not a truthy set
 /// (contrast `sshwrap::env_value_on`, the opt-IN predicate). Pure so each

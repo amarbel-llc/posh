@@ -182,8 +182,9 @@ the `eng-*(7)` manpages — read them with `man eng-versioning`,
   two-client-host election (RFC 0011 §7 conditional rule — direct
   `agent/sock` bind stays a future decision; design:
   `docs/plans/2026-07-28-connection-mux-endpoint-design.md`). M2 session
-  sharing exists behind the OPT-IN `POSH_MUX_SESSIONS`: a `host:session`
-  attach then rides the mux connection as a session channel (`mux_loop`
+  sharing is DEFAULT ON (`POSH_MUX_SESSIONS=0` opts out; promoted from
+  opt-in 2026-09-03): a `host:session`
+  attach rides the mux connection as a session channel (`mux_loop`
   routes whole messages; the remote `posh-server mux` channel table applies
   the §3 relay contract per channel; `remote/client.rs`'s `Wire` seam keeps
   prediction/rendering in the foreground process), falling back
