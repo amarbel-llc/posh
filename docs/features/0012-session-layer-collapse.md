@@ -10,7 +10,10 @@ promotion-criteria: >
   issuing viewport in place — a LOCAL client re-dials, and a viewport attached
   through the M2 mux channel (or the per-invocation relay) is retargeted on
   the session host — with a `Full` keyframe reset, the previous session left
-  running detached, and other attached viewports untouched.
+  running detached, and other attached viewports untouched. STATUS: local
+  re-dial and the M2 mux-channel re-home have landed (2026-09-04); the
+  per-invocation relay path (`POSH_MUX_SESSIONS=0`) re-home is the remaining
+  slice before this criterion is met.
   experimental -> testing: in daily use on the fleet worker flow (jump from
   `clown list` to any worker's session) with no fallback to nested
   double-attach and no force-synced sibling viewports.

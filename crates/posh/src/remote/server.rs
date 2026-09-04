@@ -310,6 +310,12 @@ struct SessionBridge {
     /// re-stamped onto this channel's Empties so a heartbeat never flips
     /// either off client-side between visible frames.
     frame_flags: u8,
+    /// The daemon Init caps this channel negotiated (client content caps +
+    /// the bridge's own RFC 0014 ident), retained so an FDR 0012 §3.1
+    /// retarget can re-`Init` the NEW session daemon with the same
+    /// negotiation. The client's consumable caps do not change across a
+    /// switch (same client), so re-homing must not silently downgrade them.
+    content: Vec<caps::Cap>,
 }
 
 /// A channel the wire opened whose first `ClientMessage` (caps + geometry)
@@ -645,6 +651,9 @@ pub(crate) fn mux_peer_loop(
                 }
             }
             let mut exit_payload: Option<Vec<u8>> = None;
+            // FDR 0012 §3.1: a daemon Tag::Switch captured here, re-homed
+            // AFTER the read loop (so we do not replace b.link mid-iteration).
+            let mut switch_to: Option<Vec<u8>> = None;
             while let Ok(Some(rec)) = b.link.read.next() {
                 match rec.tag {
                     ipc::Tag::Frame => {
@@ -691,10 +700,41 @@ pub(crate) fn mux_peer_loop(
                         exit_payload = Some(rec.payload.clone());
                         eof = true;
                     }
+                    ipc::Tag::Switch => {
+                        // FDR 0012 §3.1: the session daemon routed a switch to
+                        // this viewport. Capture and re-home after the loop; a
+                        // malformed payload is ignored (nothing to switch to).
+                        if switch_wire_target(&rec.payload).is_some() {
+                            switch_to = Some(rec.payload.clone());
+                        }
+                        break; // stop reading the OLD link; it is about to be replaced
+                    }
                     _ => {}
                 }
                 if eof {
                     break;
+                }
+            }
+            // FDR 0012 §3.1 re-home: swap this channel's DaemonLink to the new
+            // session (carrying frame continuity), then tell the client so a
+            // later reconnect re-drives the OPEN with the switched target. A
+            // failed connect closes the channel (the client falls back).
+            if let Some(payload) = switch_to {
+                let target = switch_wire_target(&payload).expect("validated above");
+                match rehome_bridge(b, &target, connect_daemon) {
+                    Ok(()) => {
+                        crate::remote::mux::send_session_wire(
+                            &mut conn,
+                            &mut fragmenter,
+                            b.chan,
+                            crate::remote::mux::SESSION_WIRE_SWITCH,
+                            target.as_bytes(),
+                        );
+                    }
+                    Err(e) => {
+                        exit_payload = Some(format!("switch target unreachable: {e}").into_bytes());
+                        eof = true;
+                    }
                 }
             }
             if !b.link.write.is_empty() {
@@ -893,6 +933,7 @@ fn handle_session_instruction(
                         channels[i] = PeerChannel::Linked(Box::new(SessionBridge {
                             chan,
                             link,
+                            content,
                             inbox: crate::remote::sync::InputInbox::new(),
                             held: crate::remote::relay::HeldFrame::default(),
                             client_size: (rows, cols),
@@ -962,6 +1003,55 @@ fn handle_session_instruction(
 /// cumulative retransmit stream), cumulative frame ack / RESYNC →
 /// `Tag::FrameAck` (dropping/clearing the held frame). Returns `false` on
 /// `CLIENT_FLAG_SHUTDOWN` (the caller detaches and closes the channel).
+/// The `Tag::Switch` payload from the daemon is `group\0session`; the wire
+/// target `connect_named_daemon` parses is `session` (default group) or
+/// `group/session` — the inverse of `switch_in_place`'s encoding.
+fn switch_wire_target(payload: &[u8]) -> Option<String> {
+    let (group, session) = crate::session::ipc::decode_switch_target(payload)?;
+    Some(if group == "default" {
+        session
+    } else {
+        format!("{group}/{session}")
+    })
+}
+
+/// FDR 0012 §3.1 remote retarget: re-home a linked channel's `DaemonLink` to
+/// a new session in place. Reuses the reconnect fix's frame continuity —
+/// `frame_offset` seeded from the client's frame ceiling (`last_frame_num`)
+/// so the new daemon's low numbers rewrap above the client's `applied_num`
+/// and its `Full` is not dropped as stale — and re-`Init`s with the SAME
+/// negotiated caps (`b.content`) so the client's consumable caps are not
+/// silently downgraded. Per-channel fresh-attach state (held, inbox,
+/// acked_forwarded, ack_due) resets; `last_frame_num`/`frame_flags` persist.
+/// `Err` (the target is gone) is the caller's cue to close the channel.
+fn rehome_bridge(
+    b: &mut SessionBridge,
+    target: &str,
+    connect_daemon: &mut dyn FnMut(&str) -> Result<std::os::unix::net::UnixStream>,
+) -> Result<()> {
+    use crate::session::ipc::{self, Tag};
+    let stream = connect_daemon(target)?;
+    let mut link = crate::remote::relay::DaemonLink {
+        stream,
+        read: crate::session::ipc::FrameBuffer::new(),
+        write: Vec::new(),
+        frame_offset: b.last_frame_num,
+    };
+    let (rows, cols) = b.client_size;
+    ipc::append_frame(
+        &mut link.write,
+        Tag::Init,
+        &crate::remote::relay::init_payload(rows, cols, &b.content),
+    );
+    ipc::append_frame(&mut link.write, Tag::Resize, &ipc::encode_resize(rows, cols));
+    b.link = link;
+    b.held = crate::remote::relay::HeldFrame::default();
+    b.inbox = crate::remote::sync::InputInbox::new();
+    b.acked_forwarded = 0;
+    b.ack_due = false;
+    Ok(())
+}
+
 fn bridge_client_message(b: &mut SessionBridge, msg: &crate::remote::sync::ClientMessage) -> bool {
     use crate::session::ipc::{self, Tag};
 
@@ -2601,8 +2691,57 @@ mod tests {
             ack_due: false,
             echo: crate::remote::sync::EchoAck::new(),
             frame_flags: 0,
+            content: Vec::new(),
         };
         (b, peer)
+    }
+
+    #[test]
+    fn switch_wire_target_maps_group_and_default() {
+        // FDR 0012 §3.1: the daemon's group\0session switch payload maps to
+        // the wire target connect_named_daemon parses — bare session for the
+        // default group, group/session otherwise.
+        let dflt = crate::session::ipc::encode_switch_target("default", "dev");
+        assert_eq!(switch_wire_target(&dflt).as_deref(), Some("dev"));
+        let grouped = crate::session::ipc::encode_switch_target("work", "s-1");
+        assert_eq!(switch_wire_target(&grouped).as_deref(), Some("work/s-1"));
+        // A malformed payload (no NUL) yields None — nothing to switch to.
+        assert_eq!(switch_wire_target(b"garbage"), None);
+    }
+
+    #[test]
+    fn rehome_bridge_seeds_frame_offset_and_reinits() {
+        // FDR 0012 §3.1: re-home carries frame continuity (frame_offset =
+        // the client's ceiling) and re-Inits the new daemon with the retained
+        // caps, so the reattach Full continues above applied_num and the
+        // client's negotiated caps are not downgraded.
+        let (mut b, _peer) = test_bridge();
+        b.last_frame_num = 512; // the client's frame ceiling
+        b.content = crate::remote::relay::content_caps(&[]);
+        // A connector handing back a fresh socketpair, recording the target.
+        let seen = std::cell::RefCell::new(None);
+        let mut connect = |t: &str| {
+            *seen.borrow_mut() = Some(t.to_string());
+            let (a, _b) = std::os::unix::net::UnixStream::pair().unwrap();
+            // Leak the daemon side so the peer socket stays open for the test.
+            std::mem::forget(_b);
+            Ok(a)
+        };
+        rehome_bridge(&mut b, "work/s-1", &mut connect).unwrap();
+        assert_eq!(seen.into_inner().as_deref(), Some("work/s-1"));
+        assert_eq!(
+            b.link.frame_offset, 512,
+            "the new link continues numbering above the client's ceiling"
+        );
+        // The re-Init (lossy Init + Resize) is queued to the new daemon.
+        let mut fb = crate::session::ipc::FrameBuffer::new();
+        fb.feed(&b.link.write);
+        let first = fb.next().unwrap().unwrap();
+        assert_eq!(first.tag, crate::session::ipc::Tag::Init);
+        // Fresh-attach state reset; continuity fields kept.
+        assert_eq!(b.acked_forwarded, 0);
+        assert!(!b.ack_due);
+        assert_eq!(b.last_frame_num, 512, "the ceiling persists across re-home");
     }
 
     /// posh#178: a mux-channel client's CLIENT_FLAG_ESCAPE must be bridged to

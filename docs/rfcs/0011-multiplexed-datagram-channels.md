@@ -625,9 +625,14 @@ mechanism is best designed against whatever handshake replaces it.
   a sender-side congestion response — implemented the same day (posh#155),
   after which additional `session` channels SHIPPED behind the opt-in
   `POSH_MUX_SESSIONS` (the M2 revision of the #54 design doc): client-space
-  session ordinals >= 2 carry a 1-byte micro-envelope (data/open/close; the
-  §3.3 open-carries-binding rule made positional-safe against datagram
-  reordering), ordinal 1 remains the bare single-session/heartbeat stream,
+  session ordinals >= 2 carry a 1-byte micro-envelope (data/open/close, plus
+  `switch` — the FDR 0012 §3.1 bridge→client retarget notice carrying the new
+  `[group/]session` target, so the client updates its stored target and a
+  later reconnect re-drives the OPEN with the switched session; an old peer
+  skips the unknown micro-kind, so the switch still repaints and only
+  reconnect-after-switch survival is lost; the §3.3 open-carries-binding rule
+  made positional-safe against datagram reordering), ordinal 1 remains the
+  bare single-session/heartbeat stream,
   and single-session receivers MUST ignore higher ordinals rather than feed
   them to their frame paths. The `open` micro-envelope body is the RFC 0001
   target, optionally followed by a `NUL` and a `u64 LE` **resume base**

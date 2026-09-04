@@ -620,6 +620,16 @@ impl MuxSessionClose {
 pub(crate) const SESSION_WIRE_DATA: u8 = 0;
 pub(crate) const SESSION_WIRE_OPEN: u8 = 1;
 pub(crate) const SESSION_WIRE_CLOSE: u8 = 2;
+/// Bridge → client (FDR 0012 §3.1 remote retarget): the channel's viewport
+/// was switched to a new session (the daemon routed a `Tag::Switch` to the
+/// bridge, which re-homed its `DaemonLink` in place). The body is the new
+/// wire target (`[group/]session`). The client updates its stored
+/// `IpcSession.target` so a LATER wire reconnect re-drives the OPEN with the
+/// switched session, not the original — the client does NOT re-OPEN (the
+/// bridge already re-homed). An old client skips the unknown micro-kind (the
+/// `_ =>` forward-compat arm), so the switch still repaints; only
+/// reconnect-after-switch survival is lost against an old peer.
+pub(crate) const SESSION_WIRE_SWITCH: u8 = 3;
 
 /// The `SESSION_WIRE_OPEN` body: the RFC 0001 target, optionally followed by
 /// a NUL and a `u64 LE` resume base (posh#162 reconnect frame continuity).
@@ -1576,6 +1586,25 @@ fn mux_loop(
                                             ci,
                                             MuxTag::SessionFrame,
                                             &framed,
+                                        );
+                                    }
+                                    Some(&SESSION_WIRE_SWITCH) => {
+                                        // FDR 0012 §3.1: the remote bridge
+                                        // re-homed this channel to a new
+                                        // session. Update the stored target so
+                                        // a later reconnect re-drives the OPEN
+                                        // with the switched session, not the
+                                        // original (the client does not
+                                        // re-OPEN — the bridge already
+                                        // re-homed and its frames are flowing).
+                                        sess.target = message[1..].to_vec();
+                                        util::log_write(
+                                            "info",
+                                            &format!(
+                                                "session channel {} retargeted to {}",
+                                                chan.ordinal(),
+                                                String::from_utf8_lossy(&message[1..])
+                                            ),
                                         );
                                     }
                                     Some(&SESSION_WIRE_CLOSE) => {
