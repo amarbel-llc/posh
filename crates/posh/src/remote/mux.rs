@@ -621,6 +621,38 @@ pub(crate) const SESSION_WIRE_DATA: u8 = 0;
 pub(crate) const SESSION_WIRE_OPEN: u8 = 1;
 pub(crate) const SESSION_WIRE_CLOSE: u8 = 2;
 
+/// The `SESSION_WIRE_OPEN` body: the RFC 0001 target, optionally followed by
+/// a NUL and a `u64 LE` resume base (posh#162 reconnect frame continuity).
+/// A base of 0 encodes as the BARE target — byte-identical to the original
+/// format, so an initial open and an old peer are unaffected; a nonzero base
+/// (only ever on a reconnect re-drive) appends `\0<base>`. Session targets are
+/// `[user@]host:[group/]session` and never contain NUL, so the split is
+/// unambiguous.
+pub(crate) fn encode_session_open(target: &[u8], resume_base: u64) -> Vec<u8> {
+    if resume_base == 0 {
+        return target.to_vec();
+    }
+    let mut out = Vec::with_capacity(target.len() + 1 + 8);
+    out.extend_from_slice(target);
+    out.push(0);
+    out.extend_from_slice(&resume_base.to_le_bytes());
+    out
+}
+
+/// Decode a [`encode_session_open`] body into `(target_bytes, resume_base)`.
+/// No NUL ⇒ the bare-target original format (`base` 0). A NUL with a
+/// malformed 8-byte tail falls back to `base` 0 and the whole payload as the
+/// target (forward/defensive tolerance — the target still resolves).
+pub(crate) fn decode_session_open(payload: &[u8]) -> (&[u8], u64) {
+    match payload.iter().position(|b| *b == 0) {
+        Some(nul) if payload.len() == nul + 1 + 8 => {
+            let base = u64::from_le_bytes(payload[nul + 1..].try_into().unwrap());
+            (&payload[..nul], base)
+        }
+        _ => (payload, 0),
+    }
+}
+
 /// How long an unconfirmed session OPEN retransmits (one send per RTO)
 /// before the endpoint gives up and surfaces a remote close to the client
 /// (which then falls back per-invocation). Generous: a cold remote daemon
@@ -649,6 +681,15 @@ struct IpcSession {
     queued: Vec<Vec<u8>>,
     open_sends: u32,
     last_open_send: Option<u64>,
+    /// The highest `frame_num` relayed to the foreground client on this
+    /// channel — the client's applied ceiling. On a wire reconnect (posh#162)
+    /// the re-driven OPEN carries this as the RESUME BASE so the fresh remote
+    /// endpoint seeds its `frame_offset` to it: without that, the new endpoint
+    /// reattaches to the surviving session daemon whose fresh producer
+    /// restarts `frame_num` low, and the client drops the reattach `Full` as
+    /// stale (`frame_num < applied_num`) and wedges. The reconnect analog of
+    /// the FDR 0012 retarget's `frame_offset` bump; see RFC 0008 §3.1.
+    last_frame_num: u64,
 }
 
 /// A close owed to the wire after its IPC conn is gone (or detached):
@@ -1516,6 +1557,19 @@ fn mux_loop(
                                 }
                                 match message.first() {
                                     Some(&SESSION_WIRE_DATA) => {
+                                        // Track the client's applied ceiling for
+                                        // a later reconnect's resume base
+                                        // (posh#162 frame continuity): peek the
+                                        // relayed frame's number. A decode
+                                        // failure or a non-advancing frame (an
+                                        // Empty ack/heartbeat carries the last
+                                        // number) just leaves the ceiling put.
+                                        if let Ok(f) =
+                                            sync::ServerFrame::decode(&message[1..])
+                                        {
+                                            sess.last_frame_num =
+                                                sess.last_frame_num.max(f.frame_num);
+                                        }
                                         let framed =
                                             encode_session_frame(srtt, &message[1..]);
                                         let _ = send_mux_frame(
@@ -1695,6 +1749,7 @@ fn mux_loop(
                             queued: Vec::new(),
                             open_sends: 0,
                             last_open_send: None,
+                            last_frame_num: 0,
                         });
                         let ack = MuxSessionOpenAck::Granted { ordinal: chan.ordinal() };
                         let _ = send_mux_frame(
@@ -1860,13 +1915,18 @@ fn mux_loop(
                     {
                         s.open_sends += 1;
                         s.last_open_send = Some(now);
-                        let (chan, target) = (s.chan, s.target.clone());
+                        // The OPEN carries the resume base (posh#162): 0 on the
+                        // initial open (bare target, byte-identical), the
+                        // client's frame ceiling on a reconnect re-drive so the
+                        // fresh remote endpoint continues numbering above it.
+                        let (chan, body) =
+                            (s.chan, encode_session_open(&s.target, s.last_frame_num));
                         send_session_wire(
                             &mut conn,
                             &mut fragmenter,
                             chan,
                             SESSION_WIRE_OPEN,
-                            &target,
+                            &body,
                         );
                     }
                 }
@@ -2750,6 +2810,29 @@ mod tests {
         .encode();
         wire[0] = 9;
         assert_eq!(MuxHelloAck::decode(&wire), None);
+    }
+
+    #[test]
+    fn session_open_resume_base_roundtrips_and_stays_compatible() {
+        // posh#162: base 0 encodes as the BARE target (byte-identical to the
+        // original format, so an initial open and an old peer are
+        // unaffected), and a nonzero base appends \0<u64 LE>.
+        assert_eq!(encode_session_open(b"box:dev", 0), b"box:dev".to_vec());
+        assert_eq!(decode_session_open(b"box:dev"), (&b"box:dev"[..], 0));
+
+        let framed = encode_session_open(b"user@box:work/s-1", 4242);
+        assert_eq!(decode_session_open(&framed), (&b"user@box:work/s-1"[..], 4242));
+
+        // Round-trip a spread of bases, including the u64 ceiling.
+        for base in [1u64, 255, 65_536, u64::MAX] {
+            let enc = encode_session_open(b"h:s", base);
+            assert_eq!(decode_session_open(&enc), (&b"h:s"[..], base));
+        }
+
+        // Defensive: a NUL with a malformed (non-8-byte) tail falls back to
+        // the whole payload as the target and base 0 — the target still
+        // resolves rather than erroring.
+        assert_eq!(decode_session_open(b"h:s\0short"), (&b"h:s\0short"[..], 0));
     }
 
     #[test]

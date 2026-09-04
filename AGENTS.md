@@ -193,7 +193,15 @@ the `eng-*(7)` manpages — read them with `man eng-versioning`,
   RETAINS each session channel (does not tear it down, sends the client no
   close) with its ref held, and the open-until-confirmed pass re-drives the
   OPEN with the stored target on the fresh wire — reattaching to the surviving
-  remote session daemon (`connect_or_create` is idempotent). The client is
+  remote session daemon (`connect_or_create` is idempotent). **The re-driven
+  OPEN carries a RESUME BASE** (the client's `last_frame_num` ceiling, tracked
+  by the mux daemon as it relays frames; `encode_session_open`): the fresh
+  remote endpoint seeds its `SessionBridge.frame_offset` to it so the surviving
+  daemon's fresh producer — which restarts `frame_num` low for the new lossy
+  client — is rewrapped ABOVE the client's `applied_num`. Without it the
+  reattach `Full` lands `frame_num < applied_num` and the client drops it as
+  stale and wedges (posh#162 frame-continuity fix; the reconnect analog of the
+  FDR 0012 retarget's `frame_offset` bump, RFC 0008 §3.1). The client is
   sent nothing: frames stall, the transport-agnostic "Last contact N ago"
   banner counts up, and the reattach repaint clears it — mosh-parity, a wire
   blip is invisible exactly as on the baseline per-invocation UDP path

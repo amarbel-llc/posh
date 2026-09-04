@@ -316,7 +316,17 @@ struct SessionBridge {
 /// has not arrived yet — the DaemonLink waits for it, because the daemon
 /// `Tag::Init` needs the client's content caps and size.
 enum PeerChannel {
-    Awaiting { chan: channel::ChannelId, target: String },
+    Awaiting {
+        chan: channel::ChannelId,
+        target: String,
+        /// The client's frame ceiling to resume above (posh#162): 0 on an
+        /// initial open, the retained channel's `last_frame_num` on a
+        /// reconnect re-drive. Seeds the DaemonLink's `frame_offset` when the
+        /// channel links, so the fresh session daemon's low frame numbers are
+        /// rewrapped above the client's `applied_num` and its reattach `Full`
+        /// is not dropped as stale. RFC 0008 §3.1.
+        resume_base: u64,
+    },
     Linked(Box<SessionBridge>),
 }
 
@@ -808,9 +818,14 @@ fn handle_session_instruction(
                     );
                     return;
                 }
+                // The OPEN body is the target, optionally followed by a
+                // resume base (posh#162 reconnect frame continuity).
+                let (target_bytes, resume_base) =
+                    crate::remote::mux::decode_session_open(&message[1..]);
                 channels.push(PeerChannel::Awaiting {
                     chan,
-                    target: String::from_utf8_lossy(&message[1..]).into_owned(),
+                    target: String::from_utf8_lossy(target_bytes).into_owned(),
+                    resume_base,
                 });
             }
             // Confirm the open — for a fresh admit AND for §3.3 duplicate
@@ -839,8 +854,9 @@ fn handle_session_instruction(
             let Ok(msg) = crate::remote::sync::ClientMessage::decode(&message[1..]) else {
                 return;
             };
-            if let PeerChannel::Awaiting { target, .. } = &channels[i] {
+            if let PeerChannel::Awaiting { target, resume_base, .. } = &channels[i] {
                 let target = target.clone();
+                let resume_base = *resume_base;
                 let (rows, cols) = (msg.rows.max(1), msg.cols.max(1));
                 match connect_daemon(&target) {
                     Ok(stream) => {
@@ -848,7 +864,12 @@ fn handle_session_instruction(
                             stream,
                             read: crate::session::ipc::FrameBuffer::new(),
                             write: Vec::new(),
-                            frame_offset: 0,
+                            // posh#162: on a reconnect re-drive the base is the
+                            // client's frame ceiling, so this fresh endpoint's
+                            // rewrap continues numbering above it (rather than
+                            // restarting low and being dropped as stale). 0 on
+                            // an initial open (unchanged).
+                            frame_offset: resume_base,
                         };
                         let mut content = crate::remote::relay::content_caps(&msg.caps);
                         // RFC 0014 §3: the bridge's own identity on Init; the
@@ -876,7 +897,11 @@ fn handle_session_instruction(
                             held: crate::remote::relay::HeldFrame::default(),
                             client_size: (rows, cols),
                             acked_forwarded: 0,
-                            last_frame_num: 0,
+                            // Seed from the resume base (posh#162) so a
+                            // heartbeat Empty sent before the first real frame
+                            // carries a number at/above the client's ceiling,
+                            // not 0 (which the client would drop as stale).
+                            last_frame_num: resume_base,
                             last_retx: 0,
                             // 0 = "never sent": the first heartbeat goes out
                             // on the next iteration, so the client learns the

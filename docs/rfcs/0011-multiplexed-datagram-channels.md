@@ -629,7 +629,15 @@ mechanism is best designed against whatever handshake replaces it.
   §3.3 open-carries-binding rule made positional-safe against datagram
   reordering), ordinal 1 remains the bare single-session/heartbeat stream,
   and single-session receivers MUST ignore higher ordinals rather than feed
-  them to their frame paths. The gate was promoted to DEFAULT ON
+  them to their frame paths. The `open` micro-envelope body is the RFC 0001
+  target, optionally followed by a `NUL` and a `u64 LE` **resume base**
+  (posh#162): a base of 0 encodes as the bare target (byte-identical to the
+  original format), and a nonzero base — carried only on a reconnect re-drive
+  — tells the fresh remote endpoint to seed its frame-offset so the reattached
+  session daemon's restarted frame numbering continues above the client's
+  applied ceiling (else the reattach `Full` is dropped as stale and the client
+  wedges). Targets never contain `NUL`, so the split is unambiguous; a
+  malformed tail falls back to the bare-target reading. The gate was promoted to DEFAULT ON
   2026-09-03 (`POSH_MUX_SESSIONS=0` is the opt-out, the same off-switch
   shape as `POSH_MUX`); the wire contract is unchanged — the per-invocation
   fallback remains the behaviour on any establishment failure.
