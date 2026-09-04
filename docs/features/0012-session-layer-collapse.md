@@ -1,18 +1,19 @@
 ---
-status: exploring
+status: proposed
 date: 2026-07-01
 promotion-criteria: >
-  exploring -> proposed: the collapse trigger (server-side detection vs.
-  client-initiated), the detach semantics (replace vs. stack), and the "offer
-  vs. automatic" UX are decided and drafted as an RFC 0008 amendment. Blocked on
-  the relay existing: this feature is unimplementable under Architecture A (the
-  double model has no relay to retarget) and MUST NOT promote past `proposed`
-  until FDR 0011's relay (RFC 0008 §3) is at least `experimental`.
-  proposed -> experimental: a remote client attached through the relay can
-  collapse into an inner local session started on the far host (the clown/
-  spinclass case), with a `Full` keyframe reset, and detach behaves per the
-  chosen semantics. experimental -> testing: in daily use on the dev-host
-  worker flow with no fallback to nested double-attach.
+  exploring -> proposed (MET 2026-09-04): the trigger, detach semantics, and
+  offer-vs-automatic UX are decided (automatic on a typed in-session attach;
+  replace; per-viewport targeting via the most-recent-input connection) and
+  drafted as an RFC 0008 amendment; FDR 0011's relay is experimental.
+  proposed -> experimental: an in-session `posh attach <sibling>` switches the
+  issuing viewport in place — a LOCAL client re-dials, and a viewport attached
+  through the M2 mux channel (or the per-invocation relay) is retargeted on
+  the session host — with a `Full` keyframe reset, the previous session left
+  running detached, and other attached viewports untouched.
+  experimental -> testing: in daily use on the fleet worker flow (jump from
+  `clown list` to any worker's session) with no fallback to nested
+  double-attach and no force-synced sibling viewports.
 ---
 
 # Session layer collapse (attach through a tunnel, don't nest)
@@ -41,44 +42,52 @@ via `$POSH_SESSION`, the signal the current nesting guard already reads), posh
 collapses the two layers: the outer transport re-homes onto the inner session's
 daemon, and the outer session's shell is left running underneath.
 
-This is a UX feature whose shape drives the implementation; three interface
-decisions are open and are the substance of this record.
+This record's three interface decisions were RESOLVED 2026-09-04 (the
+in-place-switch design review; the diagrams live in the review's `.tmp/`
+sketches and the mechanism below). The switch generalizes the original
+collapse: it covers the tunneled case (the clown self-wrap) AND the plain
+local case (a viewport on the session host jumping between siblings), through
+one mechanism.
 
-### Decision 1 — offer vs. automatic
+### The mechanism (decided): daemon-routed, per-viewport retarget
 
-Today the nesting guard hard-errors: *"cannot attach to a session from within a
-session"* (bypassed by `--detach`, which clown's *spawn* template uses; the
-*start*/*resume* templates do not). Options, in order of least to most magic:
+An in-session `posh attach <sibling>` (detected via `$POSH_SESSION`, the
+signal the nesting guard reads today) becomes a **switch request**: the inner
+command validates the target exists (strict-attach semantics kept), sends the
+request over the current session daemon's own IPC socket, and exits. The
+daemon routes a `Switch` to exactly ONE attached connection — **the one whose
+input arrived most recently** (tmux's current-client heuristic; the daemon
+already sees which connection each input frame came from). That connection
+re-homes:
 
-- **Offer (recommended).** On detecting an in-session `posh attach`, prompt:
-  *"You're already in a posh session tunneled to <host>. Attach <session>
-  directly through this tunnel instead of nesting? [Y/n]"* — a TTY-gated prompt
-  matching the FDR 0011 picker's non-TTY discipline (never prompt on a
-  non-TTY; error with the candidate action instead). Preserves the current
-  safety (no silent surprise) while making the good path one keystroke.
-- **Automatic.** Collapse without asking whenever the inner target resolves to a
-  session reachable through the current tunnel. Cleanest when it is right;
-  surprising when the user genuinely wanted a nested session (rare, but real —
-  e.g. debugging posh-in-posh itself).
-- **Keep erroring, add a flag.** `posh attach --collapse <session>` opts in
-  explicitly. Safest, least discoverable; effectively documentation, not a UX
-  improvement.
+- a **local client** re-dials the target daemon's Unix socket;
+- an **M2 mux session channel** (the post-mux-promotion common case) or a
+  per-invocation **relay** re-homes its daemon-side connection on the session
+  host — the FDR 0012 retarget proper. The AEAD-UDP wire to the viewport's
+  host is untouched: no reconnect, no key change, no new process, no new hop.
 
-### Decision 2 — replace vs. stack detach semantics
+Because every relay/channel serves exactly one viewport, per-connection
+targeting IS per-viewport targeting: sibling viewports on the same session
+are never force-synced. The target daemon's attach handshake sends the
+`Full` keyframe (Decision 3 below) — the repaint is the ordinary attach path.
 
-After collapsing into the inner session, what does `Ctrl-\` (detach) do?
+### Decision 1 — offer vs. automatic: AUTOMATIC (decided 2026-09-04)
 
-- **Replace.** Detaching from the inner session tears down the transport; the
-  outer session's shell (still running `sc start` underneath) is left detached
-  and reattachable separately. Simpler: the relay tracks one daemon target at a
-  time. The outer shell is not lost — it is a durable session — but you return
-  to your *local* prompt, not to the outer session.
-- **Stack (dive/pop, recommended for the mental model).** The relay holds a
-  *stack* of daemon targets; collapsing pushes the inner session, detaching pops
-  back to the outer session (its shell reappears where you left it). Matches the
-  intuition "I dove into clown; detaching brings me back to where I was." Costs
-  the relay real state (a target stack) and raises a roaming question (what
-  happens to the stack across a network roam — see Limitations).
+For a typed in-session `posh attach`, switching without a prompt is what the
+user meant — the command is the consent. The offer prompt (drafted below for
+history) is demoted to a tuning lever, aimed at the *programmatic* surprise
+case (clown's self-wrap) if it proves jarring in practice; the non-TTY
+discipline stands regardless (a non-TTY invocation errors with the action
+rather than switching silently under a script).
+
+### Decision 2 — replace vs. stack: REPLACE (decided 2026-09-04)
+
+Detaching after a switch tears down the viewport's attachment; you return to
+your local prompt, and BOTH sessions remain durable and reattachable. The
+switch workflow is sibling navigation, not diving — and replace keeps the
+relay/channel single-target (no stack to carry across roams, the risk the
+stack option's roaming question exposed). Stack (dive/pop) is demoted to a
+tuning lever with the roaming-survival question as its admission price.
 
 ### Decision 3 — the state reset is a `Full` keyframe (settled)
 
@@ -90,42 +99,50 @@ that already happens on every first attach and every roam reconnect.
 
 ## Examples
 
-The motivating flow, with the recommended offer + stack semantics:
+The fleet-navigation flow (the 2026-09-04 motivating case), with the decided
+automatic + replace semantics — the viewport is on `laptop`, the sessions on
+`box`, attached through the M2 mux wire:
 
-    laptop$ posh user@dev-host          # remote roaming session (the tunnel)
-    dev-host$ sc start                 # clown self-wraps in `posh attach w1`
-    ┌ posh ────────────────────────────────────────────────┐
-    │ You're already in a posh session tunneled to          │
-    │ dev-host. Attach `w1` directly through this tunnel    │
-    │ instead of nesting? [Y/n]                              │
-    └────────────────────────────────────────────────────────┘
-    # Y: the transport re-homes onto w1's daemon; a Full keyframe
-    #    repaints; you are now driving clown in w1 over the SAME
-    #    roaming transport — one client, one model on the far side.
-    dev-host$ ... work in clown ...
-    <Ctrl-\>                            # stack: pop back to the outer
-    dev-host$                          # outer session's shell, where sc start ran
+    laptop$ posh box:dev                # viewport rides a mux session channel
+    box:dev$ clown list                # ...spot a worker you want to visit
+    box:dev$ posh attach s-1           # in-session attach = SWITCH
+    switching to s-1
+    # the channel re-homes onto s-1's daemon on box; a Full keyframe
+    # repaints; dev keeps running, detached; the UDP wire never blinks.
+    # Any OTHER viewport watching dev stays exactly where it was.
+    box:s-1$ ... work ...
+    <Ctrl-\>                            # replace: detach to the LOCAL prompt
+    laptop$ posh box:dev               # both sessions still there, reattach at will
 
-Non-TTY (a script or command substitution) never prompts — it errors with the
-action it would have taken, mirroring the FDR 0011 picker discipline:
+The original tunneled collapse (clown's self-wrap) is the same mechanism —
+`sc start` execs clown, clown runs `posh attach w1`, the viewport switches to
+`w1` instead of nesting a second posh layer.
+
+Non-TTY (a script or command substitution) never switches implicitly — it
+errors with the action it would have taken, mirroring the FDR 0011 picker
+discipline:
 
     $ some-script-that-runs-posh-attach-inside-a-session
-    posh: refusing to nest a session on a non-TTY; run `posh attach --collapse w1`
-          to attach through the current tunnel, or `--detach` to spawn detached
+    posh: refusing to switch on a non-TTY; run `posh attach --detach w1` to
+          ensure the session detached, or attach from an interactive terminal
 
 ## Limitations
 
-- **Requires the relay (Architecture B).** Unimplementable under today's double
-  model (FDR 0001 Architecture A): there is no relay to retarget — the outer
-  `posh-server` owns a full PTY + terminal model the inner client genuinely
-  types into. This feature is a natural addition to the RFC 0008 §3 relay and
-  should be designed into that contract while it is still `proposed`, but it
-  cannot ship before the relay does.
-- **Stack semantics interact with roaming.** If the transport holds a target
-  stack and the network roams (mosh-style reconnect), the stack must survive the
-  roam — the client reconnects to the relay, which must still hold (or
-  reconstruct) the stack. Replace semantics sidestep this entirely. This is the
-  main cost of the stack option and a key input to Decision 2.
+- **Requires the relay (Architecture B) — now met.** Under Architecture A
+  there is no relay to retarget; FDR 0011's relay is `experimental` and the
+  M2 mux channel table (the post-promotion common case) applies the same §3
+  contract per channel, so the retarget lives in both. The `--ephemeral`
+  Arch-A residual keeps the old hard error.
+- **The most-recent-input heuristic can misfire.** Two people typing into the
+  same session within the routing window could switch the other's viewport.
+  Accepted for v1 (the shared-session case is rare and the misfire is
+  recoverable — reattach); per-viewport identity (RFC 0014 idents on the
+  attach) is the precise fix if it bites.
+- **Retarget during a wire reconnect must be defined.** A Switch arriving
+  while the mux wire is in the posh#162 reconnecting state interacts with the
+  retained-channel re-OPEN logic; the implementation must pin an order
+  (simplest: the retarget updates the channel's stored target, so the re-OPEN
+  drives the NEW target).
 - **Widens the agent-forwarding gap (#103).** RFC 0008 §3 binds the forwarded
   agent (`agent/sock`) at the relay, and FDR 0011 already notes a session whose
   shell was spawned without a forwarding connection does not pick up a later
@@ -144,9 +161,10 @@ action it would have taken, mirroring the FDR 0011 picker discipline:
 
 | Lever | Current | Rationale | Change signal |
 |---|---|---|---|
-| collapse trigger UX | offer (prompt) | preserves the current no-surprise safety while making the good path one keystroke | users routinely answer Y and want it automatic, or the prompt interrupts a known-good flow (clown could pre-answer) |
-| detach semantics | stack (dive/pop) | matches the "dove in, come back" mental model | the roaming-survival cost of a per-transport target stack proves too high; replace is the fallback |
-| non-TTY behavior | error with the action | deterministic scripts, mirrors FDR 0011 picker | a scripted flow needs collapse-by-default without a TTY |
+| switch trigger UX | automatic (a typed in-session attach is the consent) | the command IS the intent; a prompt would tax the fleet-navigation flow | the programmatic self-wrap case (clown) proves jarring — reintroduce the offer prompt there, or clown pre-answers |
+| detach semantics | replace (detach to the local prompt) | sibling navigation, single-target relay state, no stack-across-roam question | "dove in, pop back" is missed often enough to pay for a roam-surviving target stack |
+| viewport targeting | most-recent-input attached connection | per-connection = per-viewport (one relay/channel per viewport); no identity machinery needed | shared-session misfires (see Limitations) — key the switch on RFC 0014 client idents instead |
+| non-TTY behavior | error with the action | deterministic scripts, mirrors FDR 0011 picker | a scripted flow needs switch-by-default without a TTY |
 
 ## More Information
 
@@ -154,9 +172,10 @@ action it would have taken, mirroring the FDR 0011 picker discipline:
   feature attaches to the tail of; its relay (Architecture B) is the enabling
   step, and this record is the layer-collapse UX that the relay makes
   expressible.
-- **RFC 0008** (`docs/rfcs/0008-unified-session-frame-transport.md`) — §3 (the
-  relay contract) is where a retarget trigger and the replace/stack target
-  model would be specified; §2 (`Full` keyframe on attach) is the state-reset
+- **RFC 0008** (`docs/rfcs/0008-unified-session-frame-transport.md`) — §3.1
+  (amended 2026-09-04) specifies the retarget: the daemon-routed trigger, the
+  per-viewport most-recent-input routing rule, and the single-target
+  (replace) model; §2 (`Full` keyframe on attach) is the state-reset
   mechanism this feature reuses.
 - **FDR 0001** (`0001-unified-host-session-namespace.md`) — the A→B→C transport
   progression; this feature is a B-and-beyond capability.

@@ -138,11 +138,38 @@ Because the relay holds no terminal model and its only per-session state is
 which Unix socket it is connected to, *retargeting* the relay at a different
 daemon socket mid-transport is a natural extension: the relay drops its current
 connection, opens a new one, and the new daemon's `Full` keyframe (§2)
-re-establishes the base — the same reset as any fresh attach. This RFC does not
-yet specify the retarget trigger or whether the relay tracks a single target or
-a target stack; that is the subject of **FDR 0012** (session layer collapse),
-which hangs off this contract. Nothing in this section presumes a single fixed
-target for the transport's lifetime.
+re-establishes the base — the same reset as any fresh attach. §3.1 (amended
+2026-09-04, FDR 0012) specifies the trigger and the single-target model.
+
+#### 3.1 Retarget (the FDR 0012 in-place switch)
+
+The retarget trigger is **daemon-routed**: a process inside the session (the
+in-session `posh attach <target>`) sends a *switch request* naming a sibling
+session over the current daemon's own Unix socket, after validating the
+target exists (strict-attach semantics). On receiving one, the daemon:
+
+- MUST route a single *switch* record, carrying the target, to exactly ONE
+  attached frame-consuming connection: the connection whose input was
+  received most recently (the per-viewport rule — each relay, M2 channel, or
+  local client connection serves one viewport). Other attached connections
+  MUST NOT be disturbed.
+- MUST NOT tear down the session, its PTY, or any other client on delivery;
+  the switched connection simply detaches.
+
+A connection receiving the switch record:
+
+- MUST re-home to the target daemon's socket — a relay or M2 channel
+  re-dials daemon-side while leaving its datagram transport untouched (no
+  reconnect, no key change); a local client re-dials directly. The fresh
+  attach handshake (§1.1) and the new daemon's `Full` keyframe (§2) carry
+  the entire state reset.
+- holds a SINGLE target (replace semantics, FDR 0012 Decision 2): no target
+  stack, so nothing new must survive a roam. A retarget racing a wire
+  reconnect resolves by updating the channel's stored target BEFORE the
+  re-drive, so a reconnect re-opens the NEW target.
+- that does not understand the switch record MUST ignore it (the §1.1
+  unknown-tag rule) — an old relay leaves its viewport on the original
+  session, a visible no-op rather than an error.
 
 ### 4. Capability re-homing
 
