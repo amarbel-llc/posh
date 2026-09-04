@@ -2435,6 +2435,30 @@ fn apply_frame(st: &mut ClientState, frame: &ServerFrame) -> bool {
     }
     if frame.frame_num < st.applied_num {
         st.stats.record_apply_stale();
+        // #wedge / mux-reattach diagnosis: a stale DIFF/EMPTY is a benign
+        // retransmission, but a stale FULL is pathological — a healthy server
+        // sends a Full only to (re)establish the base, so dropping it wedges
+        // the client permanently. This is the signature of the mux-reconnect
+        // frame-discontinuity: a fresh remote endpoint reattaches and its
+        // session daemon's Full restarts at a low frame_num the client has
+        // already passed (frame_offset not carried across the reconnect).
+        // Loud because it names the exact numbers a real disconnect needs.
+        if matches!(frame.body, FrameBody::Full(_)) && util::log_active() {
+            util::log_write(
+                "wedge",
+                &format!(
+                    "STALE FULL dropped: frame_num={} < applied_num={} \
+                     (mux-reattach frame discontinuity? the reattach base restarted \
+                     below our applied state) body_len={}",
+                    frame.frame_num,
+                    st.applied_num,
+                    match &frame.body {
+                        FrameBody::Full(b) => b.len(),
+                        _ => 0,
+                    },
+                ),
+            );
+        }
         return true; // stale retransmission: re-ack our newer state
     }
     // Scrollback growth (RFC 0002 §3): append rows to the local ring without
