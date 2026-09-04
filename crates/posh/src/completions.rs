@@ -77,7 +77,7 @@ _posh_completions() {
   cur="${COMP_WORDS[COMP_CWORD]}"
   prev="${COMP_WORDS[COMP_CWORD-1]}"
 
-  local commands="attach run detach detach-all fork groups tailnet list completions kill history server client mux version help"
+  local commands="attach start run detach detach-all fork groups tailnet list completions kill history server client mux version help"
 
   # Handle -g/--group flag
   if [[ "$prev" == "-g" || "$prev" == "--group" ]]; then
@@ -106,6 +106,7 @@ _posh_completions() {
     local flags="-g --group"
     case "$subcmd" in
       attach|a) flags="$flags --detach" ;;
+      start|s) flags="$flags --detach --ephemeral" ;;
       list|ls|l) flags="--short --json -j" ;;
       history|hi) flags="--vt" ;;
       server) flags="-p -4 -6" ;;
@@ -149,6 +150,14 @@ _posh_completions() {
     attach|a|run|r|detach|d|kill|k|history|hi)
       local sessions=$(posh list --short 2>/dev/null | tr '\n' ' ')
       COMPREPLY=($(compgen -W "$sessions" -- "$cur"))
+      ;;
+    start|s)
+      # Strict create (FDR 0015): the session NAME is usually new, so
+      # existing local names are deliberately not offered — hosts (as
+      # `host:` targets) and the `:+` auto-id sigil are.
+      local hosts=$(_posh_ssh_hosts | sed 's/$/:/' | tr '\n' ' ')
+      local tailnet=$(posh tailnet 2>/dev/null | sed 's/$/:/' | tr '\n' ' ')
+      COMPREPLY=($(compgen -W "$hosts $tailnet :+" -- "$cur"))
       ;;
     completions|c)
       COMPREPLY=($(compgen -W "bash zsh fish" -- "$cur"))
@@ -200,6 +209,7 @@ const ZSH_COMPLETIONS: &str = r#"_posh() {
       local -a commands
       commands=(
         'attach:Attach to session, creating if needed'
+        'start:Create a durable session and attach'
         'run:Send command without attaching'
         'detach:Detach all clients from current or named session'
         'detach-all:Detach all clients from all sessions in the group'
@@ -243,6 +253,13 @@ const ZSH_COMPLETIONS: &str = r#"_posh() {
           ;;
         mux)
           _values 'mux verb' 'ls'
+          ;;
+        start|s)
+          # Strict create: hosts (typed on toward `host:session`) and the
+          # `:+` auto-id sigil; existing local names deliberately omitted.
+          _posh_ssh_hosts
+          _posh_tailnet_hosts
+          compadd -- ':+'
           ;;
       esac
       ;;
@@ -442,14 +459,24 @@ function __posh_complete_remote_target
     end
 end
 
+function __posh_start_hosts
+    # Hosts for `posh start`, suffixed `:` so a completed host is typed on
+    # toward `host:session` / `host:+` (mirrors the ph completion).
+    begin
+        __posh_ssh_config_hosts
+        posh tailnet 2>/dev/null
+    end | sort -u | string replace -r '$' ':'
+end
+
 complete -c posh -f
 
-set -l subcommands attach run detach detach-all fork groups tailnet list completions kill history server client mux version help
+set -l subcommands attach start run detach detach-all fork groups tailnet list completions kill history server client mux version help
 set -l no_subcmd "not __fish_seen_subcommand_from $subcommands"
 
 complete -c posh -n $no_subcmd -s g -l group -d 'Session group' -r -a '(posh groups 2>/dev/null)'
 
 complete -c posh -n $no_subcmd -a attach -d 'Attach to session, creating if needed'
+complete -c posh -n $no_subcmd -a start -d 'Create a durable session and attach'
 complete -c posh -n $no_subcmd -a run -d 'Send command without attaching'
 complete -c posh -n $no_subcmd -a detach -d 'Detach all clients from current or named session'
 complete -c posh -n $no_subcmd -a detach-all -d 'Detach all clients from all sessions in the group'
@@ -477,6 +504,13 @@ complete -c posh -n $no_subcmd -a '(__posh_complete_remote_target)' -d 'Remote s
 complete -c posh -n "__fish_seen_subcommand_from attach run detach kill history" -a '(posh list --short 2>/dev/null)' -d 'Session name'
 
 complete -c posh -n "__posh_subcommand_is attach a" -l detach -d 'Create session without attaching'
+
+# Strict create (FDR 0015): flags, hosts (as `host:` targets), and the `:+`
+# auto-id sigil; existing local names deliberately omitted — the name is new.
+complete -c posh -n "__posh_subcommand_is start s" -l detach -d 'Create without attaching'
+complete -c posh -n "__posh_subcommand_is start s" -l ephemeral -d 'Throwaway roaming shell (no daemon)'
+complete -c posh -n "__posh_subcommand_is start s" -a '(__posh_start_hosts)' -d 'Host'
+complete -c posh -n "__posh_subcommand_is start s" -a ':+' -d 'New auto-id session'
 
 # host:[group/]session namespace form (#67): --detach requests a detached
 # remote spawn after the target.
@@ -674,6 +708,7 @@ mod tests {
         "groups",
         "tailnet",
         "list",
+        "start",
         "completions",
         "kill",
         "history",
@@ -918,6 +953,30 @@ mod tests {
             out.status.success(),
             "bash -n rejected the ph script: {}",
             String::from_utf8_lossy(&out.stderr)
+        );
+    }
+
+    #[test]
+    fn start_completion_offers_sigil_flags_and_hosts() {
+        // posh#177: `posh start` completes in every shell — the `:+` auto-id
+        // sigil everywhere, and the --ephemeral flag where per-subcommand
+        // flag completion exists (bash and fish; zsh completes no flags
+        // per-subcommand today).
+        for shell in [Shell::Bash, Shell::Zsh, Shell::Fish] {
+            let script = shell.script();
+            assert!(
+                script.contains(":+"),
+                "{shell:?} start completion missing the :+ sigil"
+            );
+        }
+        // bash lists the long flag literally; fish declares it as `-l ephemeral`.
+        assert!(
+            Shell::Bash.script().contains("--ephemeral"),
+            "bash start completion missing --ephemeral"
+        );
+        assert!(
+            Shell::Fish.script().contains("-l ephemeral"),
+            "fish start completion missing -l ephemeral"
         );
     }
 
