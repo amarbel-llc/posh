@@ -2085,3 +2085,31 @@ debug-posh-bleed-render size="80x24":
     echo "cat it into a PURE kitty (NO posh):  cat $out ; sleep 20 ; reset"
     echo "row 9 (E1): steel-blue = the #100 bleed (pre-fix); CLEAN = fixed (ADR 0005)."
     echo "row 8 stays steel-blue either way — the fill text that scrolled up (legit)."
+
+# Render PlantUML doc(s) to PNG and display them inline via the kitty
+# graphics protocol (icat). Serves the architecture-diagram review dev-loop
+# (e.g. the FDR 0012 topology sketches under .tmp/). A multi-diagram .puml
+# yields several PNGs (name, name_001, ...); all are shown in order.
+# NOTE: run in a bare kitty tab — the graphics escapes do not survive a posh
+# session's frame path (posh-term does not model the kitty image protocol).
+#
+# render .puml file(s) to PNG and show them inline via kitty icat
+[group("debug")]
+debug-render-puml +files:
+    #!/usr/bin/env bash
+    set -euo pipefail
+    cd '{{ justfile_directory() }}'
+    icat() {
+      if command -v kitten >/dev/null 2>&1; then kitten icat "$@"
+      elif command -v kitty >/dev/null 2>&1; then kitty +kitten icat "$@"
+      else nix run nixpkgs#kitty -- +kitten icat "$@"
+      fi
+    }
+    for f in {{ files }}; do
+      [ -f "$f" ] || { echo "missing $f" >&2; exit 1; }
+      nix run nixpkgs#plantuml -- -tpng "$f"
+      for png in "${f%.puml}"*.png; do
+        echo "── $png"
+        icat "$png"
+      done
+    done
