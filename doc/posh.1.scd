@@ -194,11 +194,15 @@ Local persistence over Unix sockets.
 	default 2) in the alternate screen: *q* (or Ctrl-C) quits, *r*
 	refreshes immediately; a resize is picked up on the next
 	render. *posh list* _host_*:* lists sessions on a remote host
-	(over a *BatchMode* ssh), printing each name host-prefixed so it
-	pastes back as a target. *posh -g* _group_ *list* _host_*:*
-	scopes the remote listing to _group_ (the probe runs *posh -g*
-	_group_ *list --short* on the host), and each name pastes back as
-	_host_*:*_group_*/*_name_; the default group is unprefixed.
+	(over a *BatchMode* ssh) through the *same styled table* as the
+	local listing — the remote's *--json* is fetched and re-rendered
+	locally, each NAME the full host-prefixed target so a row pastes
+	back in. With *--short* it stays one pasteable name per line
+	(what completion parses); with *--json* the remote's own JSON
+	passes through verbatim (names unprefixed). *posh -g* _group_
+	*list* _host_*:* scopes the remote listing to _group_, and each
+	name pastes back as _host_*:*_group_*/*_name_; the default group
+	is unprefixed. *--watch* is local-only.
 
 *run* _name_ [*--*] _command_... (alias: *r*)
 	Send a command to a session (created if needed) without

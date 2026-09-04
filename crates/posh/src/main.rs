@@ -129,19 +129,26 @@ fn run() -> Result<()> {
             Ok(())
         }
         "list" | "ls" | "l" => {
+            let (format, watch, interval) = parse_list_args(args)?;
             // `posh list box:` — remote listing through the namespace
-            // (RFC 0001 §1): a trailing-colon host runs the same query
-            // completion uses, output prefixed so names paste back in. The
-            // local `-g`/$POSH_GROUP scopes the remote probe (#66), so a
-            // session in a non-default group on the remote is visible.
+            // (RFC 0001 §1): a trailing-colon host queries the host over
+            // ssh and renders through the SAME mesa table as the local
+            // listing (names prefixed so rows paste back in); --short and
+            // --json keep their machine shapes. The local `-g`/$POSH_GROUP
+            // scopes the remote probe (#66), so a session in a non-default
+            // group on the remote is visible.
             if let Some(arg) = args.iter().find(|a| !a.starts_with('-')) {
                 if arg.ends_with(':') {
                     if let target::Target::Host { user, host } = target::Target::parse(arg) {
-                        return cmd_list_remote(user, host, &group);
+                        if watch {
+                            return Err(Error::from(
+                                "--watch is local-only (drop the host: target)",
+                            ));
+                        }
+                        return cmd_list_remote(user, host, &group, format);
                     }
                 }
             }
-            let (format, watch, interval) = parse_list_args(args)?;
             if watch {
                 return cmd_list_watch(&group, interval);
             }
@@ -1198,10 +1205,15 @@ fn effective_remote_group<'a>(
 }
 
 /// The ssh argv behind `posh list host:` (separated for testability). A
-/// non-default `group` is threaded as `posh -g GROUP list --short` so the
-/// remote probe is scoped to that group (#66); the default group injects no
-/// `-g`, leaving the pre-#66 wire shape unchanged.
-fn remote_list_argv(user: Option<&str>, host: &str, group: &str) -> Vec<String> {
+/// non-default `group` is threaded as `posh -g GROUP list <format_flag>` so
+/// the remote probe is scoped to that group (#66); the default group injects
+/// no `-g`, leaving the pre-#66 wire shape unchanged.
+fn remote_list_argv(
+    user: Option<&str>,
+    host: &str,
+    group: &str,
+    format_flag: &str,
+) -> Vec<String> {
     let dest = match user {
         Some(u) => format!("{u}@{host}"),
         None => host.to_string(),
@@ -1215,8 +1227,30 @@ fn remote_list_argv(user: Option<&str>, host: &str, group: &str) -> Vec<String> 
         argv.push(group.into());
     }
     argv.push("list".into());
-    argv.push("--short".into());
+    argv.push(format_flag.into());
     argv
+}
+
+/// Run a remote `posh list` over ssh and return its stdout, forwarding the
+/// remote's stderr on failure — the shared fetch behind the name probe
+/// (`--short`) and the rich table listing (`--json`).
+fn remote_list_output(
+    user: Option<&str>,
+    host: &str,
+    group: &str,
+    format_flag: &str,
+) -> Result<String> {
+    let argv = remote_list_argv(user, host, group, format_flag);
+    let out = std::process::Command::new(&argv[0])
+        .args(&argv[1..])
+        .output()
+        .map_err(|e| Error::Msg(format!("ssh: {e}")))?;
+    if !out.status.success() {
+        use std::io::Write;
+        let _ = std::io::stderr().write_all(&out.stderr);
+        return Err(Error::Msg(format!("remote list failed on {host}")));
+    }
+    Ok(String::from_utf8_lossy(&out.stdout).into_owned())
 }
 
 /// The pasteable RemoteSession target for one remote-listed name. A
@@ -1231,21 +1265,12 @@ fn remote_list_line(prefix: &str, group: &str, name: &str) -> String {
     }
 }
 
-/// Fetch a remote host's session names via `posh list host: --short` over ssh
+/// Fetch a remote host's session names via `posh list --short` over ssh
 /// (group-scoped like the list path). Forwards the remote's stderr on failure.
-/// Shared by `cmd_list_remote` and `ph host:+` auto-id slot selection.
+/// Shared by `cmd_list_remote`, `ph host:+` auto-id slot selection, and the
+/// start/attach strictness probes.
 fn remote_session_names(user: Option<&str>, host: &str, group: &str) -> Result<Vec<String>> {
-    let argv = remote_list_argv(user, host, group);
-    let out = std::process::Command::new(&argv[0])
-        .args(&argv[1..])
-        .output()
-        .map_err(|e| Error::Msg(format!("ssh: {e}")))?;
-    if !out.status.success() {
-        use std::io::Write;
-        let _ = std::io::stderr().write_all(&out.stderr);
-        return Err(Error::Msg(format!("remote list failed on {host}")));
-    }
-    Ok(String::from_utf8_lossy(&out.stdout)
+    Ok(remote_list_output(user, host, group, "--short")?
         .lines()
         .filter(|l| !l.is_empty())
         .map(str::to_string)
@@ -1260,17 +1285,40 @@ fn first_free_autoid(used: &[String]) -> Option<String> {
         .find(|c| !used.iter().any(|u| u == c))
 }
 
-fn cmd_list_remote(user: Option<String>, host: String, group: &str) -> Result<()> {
-    let names = remote_session_names(user.as_deref(), &host, group)?;
-    // Every printed name is itself a valid RemoteSession target.
-    let prefix = match &user {
-        Some(u) => format!("{u}@{host}"),
-        None => host.clone(),
-    };
-    for name in names {
-        println!("{}", remote_list_line(&prefix, group, &name));
+/// `posh list host:` — the remote listing. `--short` keeps the pasteable
+/// name-per-line shape (what the completion and auto-id probes parse);
+/// `--json` passes the remote's own JSON through verbatim (the host's
+/// listing, names unprefixed — a script wanting targets uses --short); the
+/// default renders the SAME mesa table as the local listing, each NAME the
+/// full pasteable target.
+fn cmd_list_remote(
+    user: Option<String>,
+    host: String,
+    group: &str,
+    format: ListFormat,
+) -> Result<()> {
+    let prefix = ph_dest(user.as_deref(), &host);
+    match format {
+        ListFormat::Short => {
+            for name in remote_session_names(user.as_deref(), &host, group)? {
+                println!("{}", remote_list_line(&prefix, group, &name));
+            }
+            Ok(())
+        }
+        ListFormat::Json => {
+            print!(
+                "{}",
+                remote_list_output(user.as_deref(), &host, group, "--json")?
+            );
+            Ok(())
+        }
+        ListFormat::Default => {
+            let json = remote_list_output(user.as_deref(), &host, group, "--json")?;
+            session::render_remote_list(&format!("{prefix}:"), &json, |name| {
+                remote_list_line(&prefix, group, name)
+            })
+        }
     }
-    Ok(())
 }
 
 const SSH_USAGE: &str =
@@ -1652,6 +1700,9 @@ SESSION COMMANDS (local persistence)
         machine-readable array (both stay session-only for scripts).
         --watch re-renders the unified view every N seconds (default 2)
         in the alternate screen: q quits, r refreshes immediately.
+        `list host:` renders a remote host's sessions through the same
+        table (names host-prefixed so rows paste back as targets);
+        --short/--json keep their machine shapes there too.
 
     run <name> [--] <command...>               (alias: r)
         Send a command to a session (created if needed) without attaching.
@@ -1818,11 +1869,17 @@ mod tests {
         // script callers can never hang on an auth prompt. The default group
         // injects no `-g`, so the wire shape is unchanged from pre-#66.
         assert_eq!(
-            remote_list_argv(Some("user"), "box", "default"),
+            remote_list_argv(Some("user"), "box", "default", "--short"),
             ["ssh", "-o", "BatchMode=yes", "user@box", "posh", "list", "--short"]
                 .map(String::from)
         );
-        assert_eq!(remote_list_argv(None, "box", "default")[3], "box");
+        assert_eq!(remote_list_argv(None, "box", "default", "--short")[3], "box");
+        // The table listing fetches the remote's rich shape with the same
+        // wire, only the format flag differing.
+        assert_eq!(
+            remote_list_argv(None, "box", "default", "--json").last().unwrap(),
+            "--json"
+        );
     }
 
     #[test]
@@ -1831,7 +1888,7 @@ mod tests {
         // GROUP via `posh -g GROUP list --short`, or a session created in a
         // non-default group on the remote is invisible to the probe.
         assert_eq!(
-            remote_list_argv(Some("user"), "box", "spinclass"),
+            remote_list_argv(Some("user"), "box", "spinclass", "--short"),
             [
                 "ssh",
                 "-o",

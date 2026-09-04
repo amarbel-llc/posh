@@ -560,6 +560,49 @@ pub fn cmd_list(cfg: &Config, format: ListFormat) -> Result<()> {
     }
 }
 
+/// Render a REMOTE host's sessions through the same mesa table as the local
+/// listing: `json` is the remote's `posh list --json` output, `prefix` maps
+/// each remote name to the full pasteable target for the NAME column, and
+/// `dest` labels the empty-table message. The remote's cwd renders verbatim
+/// (no local-$HOME abbreviation — the remote home is a different path) and
+/// no row is "(current)": the viewer's $POSH_SESSION names a local session,
+/// never one of these.
+pub fn render_remote_list(
+    dest: &str,
+    json: &str,
+    prefix: impl Fn(&str) -> String,
+) -> Result<()> {
+    let sessions = remote_entries(json, prefix)?;
+    mesa::render(&sessions, None, None, Path::new(dest))
+}
+
+/// Parse a remote `posh list --json` array into table entries — the pure,
+/// testable half of [`render_remote_list`]. Field-tolerant on purpose:
+/// unknown fields are ignored and missing ones go blank, so a mixed-version
+/// remote degrades to empty cells rather than an error. An error row
+/// (`{"error":true,"status":…}`) carries its status into the ACTIVITY cell
+/// exactly like a local stale socket.
+fn remote_entries(json: &str, prefix: impl Fn(&str) -> String) -> Result<Vec<SessionEntry>> {
+    let values: Vec<serde_json::Value> = serde_json::from_str(json)
+        .map_err(|e| Error::Msg(format!("remote list --json unparsable: {e}")))?;
+    Ok(values
+        .iter()
+        .map(|v| SessionEntry {
+            name: prefix(v["name"].as_str().unwrap_or_default()),
+            pid: v["pid"].as_i64().map(|p| p as i32),
+            clients: v["clients"].as_u64(),
+            error: v["error"]
+                .as_bool()
+                .unwrap_or(false)
+                .then(|| v["status"].as_str().unwrap_or("unreachable").to_string()),
+            cmd: v["cmd"].as_str().map(str::to_string),
+            cwd: v["cwd"].as_str().map(str::to_string),
+            activity: v["activity"].as_str().map(str::to_string),
+            echo: v["echo"].as_str().map(str::to_string),
+        })
+        .collect())
+}
+
 /// JSON list output, field-for-field compatible with zmx's `list --json`.
 fn json_list(sessions: &[SessionEntry], current: Option<&str>) -> String {
     let mut out = String::from("[");
@@ -967,6 +1010,33 @@ mod tests {
                 "]"
             )
         );
+    }
+
+    #[test]
+    fn remote_entries_maps_json_rows_with_prefix_and_errors() {
+        // The roundtrip source is json_list's own shape (pinned above), so
+        // this exercises exactly what a same-build remote emits — plus the
+        // tolerance properties: a minimal row goes blank, garbage errors.
+        let json = concat!(
+            "[",
+            "{\"name\":\"dev\",\"pid\":42,\"clients\":1,",
+            "\"cwd\":\"/home/u/w\",\"cmd\":\"htop\",\"activity\":\"vim x\",",
+            "\"echo\":\"optimistic 12ms\",\"current\":false},",
+            "{\"name\":\"broken\",\"error\":true,\"status\":\"ConnectionRefused\"},",
+            "{\"name\":\"min\",\"pid\":9,\"clients\":0,\"current\":true}",
+            "]"
+        );
+        let entries = remote_entries(json, |n| format!("box:{n}")).unwrap();
+        assert_eq!(entries.len(), 3);
+        assert_eq!(entries[0].name, "box:dev");
+        assert_eq!(entries[0].pid, Some(42));
+        assert_eq!(entries[0].cwd.as_deref(), Some("/home/u/w"));
+        assert_eq!(entries[0].echo.as_deref(), Some("optimistic 12ms"));
+        assert_eq!(entries[1].name, "box:broken");
+        assert_eq!(entries[1].error.as_deref(), Some("ConnectionRefused"));
+        assert!(entries[2].error.is_none());
+        assert!(entries[2].cmd.is_none() && entries[2].activity.is_none());
+        assert!(remote_entries("nonsense", |n| n.to_string()).is_err());
     }
 
     #[test]
