@@ -99,7 +99,28 @@ fn run_interactive(stream: UnixStream) -> Result<()> {
     let bracket = crate::terminfo::ca_mode_bracket();
     let enter = enter_seq(&bracket);
     let _ = util::write_fd(STDOUT, &enter);
-    let result = client_loop(stream, &enter, &raw);
+    let mut stream = stream;
+    let result = loop {
+        let mut switch_to: Option<(String, String)> = None;
+        let result = client_loop(stream, &enter, &raw, &mut switch_to);
+        // FDR 0012 (RFC 0008 §3.1): the daemon routed a switch to this
+        // viewport. Re-dial the target in place — raw mode and the alternate
+        // screen stay up, and the new daemon's Init replay repaints over the
+        // old session. A failed re-dial (the target died since validation)
+        // falls out through the normal restore path as an error.
+        if let Some((group, name)) = switch_to {
+            match Config::new(&group)
+                .and_then(|cfg| crate::session::attach_existing(&cfg, &name))
+            {
+                Ok(s) => {
+                    stream = s;
+                    continue;
+                }
+                Err(e) => break Err(e),
+            }
+        }
+        break result;
+    };
     let _ = util::write_fd(STDOUT, &restore_seq(&bracket));
     drop(raw);
     // When the session ended (rather than detached), carry the shell's
@@ -118,10 +139,14 @@ pub fn cmd_attach(
     detach_flag: bool,
     create_flag: bool,
 ) -> Result<()> {
-    if !detach_flag && std::env::var_os("POSH_SESSION").is_some() {
-        return Err(Error::from(
-            "cannot attach to a session from within a session",
-        ));
+    // FDR 0012 (RFC 0008 §3.1): an in-session attach is the in-place SWITCH
+    // — the issuing viewport re-homes onto the sibling instead of nesting a
+    // second posh layer. `--detach` keeps its create-or-ensure meaning (the
+    // clown spawn path) and never switches.
+    if !detach_flag {
+        if let Ok(current) = std::env::var("POSH_SESSION") {
+            return switch_in_place(cfg, &current, name);
+        }
     }
 
     if detach_flag {
@@ -139,6 +164,46 @@ pub fn cmd_attach(
         crate::session::attach_existing(cfg, name)?
     };
     run_interactive(stream)
+}
+
+/// FDR 0012 (RFC 0008 §3.1): the in-session switch sender. Validates the
+/// target strictly (it must exist and be live — a switch never creates),
+/// then sends a `SwitchRequest` over the CURRENT session's socket and
+/// exits; the daemon routes a `Switch` to the most-recent-input viewport,
+/// which re-homes in place. Non-TTY invocations error with the action (the
+/// FDR 0011 picker discipline). An OLD daemon skips the unknown tag — the
+/// specified visible no-op — so this prints what it asked for, not a
+/// success claim.
+fn switch_in_place(target_cfg: &Config, current: &str, target: &str) -> Result<()> {
+    if !util::is_tty(STDIN) {
+        return Err(Error::Msg(format!(
+            "refusing to switch on a non-TTY; run `posh attach --detach {target}` to \
+             ensure the session detached, or attach from an interactive terminal"
+        )));
+    }
+    let current_group = std::env::var("POSH_GROUP").unwrap_or_else(|_| "default".to_string());
+    if target == current && target_cfg.group == current_group {
+        return Err(Error::Msg(format!("already attached to {target}")));
+    }
+    let target_path = target_cfg.socket_path(target)?;
+    if !crate::session::session_socket_exists(&target_path)
+        || crate::session::socket_is_dead(&target_path)
+    {
+        return Err(Error::Msg(format!(
+            "no session {target} to switch to (use `posh start {target}` to create it)"
+        )));
+    }
+    let current_cfg = Config::new(&current_group)?;
+    let path = current_cfg.socket_path(current)?;
+    let stream = UnixStream::connect(&path)
+        .map_err(|e| Error::Msg(format!("connect {}: {e}", path.display())))?;
+    ipc::send(
+        stream.as_raw_fd(),
+        Tag::SwitchRequest,
+        &ipc::encode_switch_target(&target_cfg.group, target),
+    )?;
+    println!("switching to {target}");
+    Ok(())
 }
 
 /// `posh start`: create a durable session (strict — errors if a named session is
@@ -984,7 +1049,12 @@ fn parse_coalesce_gate(value: Option<&str>) -> bool {
     )
 }
 
-fn client_loop(stream: UnixStream, enter: &[u8], raw: &RawMode) -> Result<i32> {
+fn client_loop(
+    stream: UnixStream,
+    enter: &[u8],
+    raw: &RawMode,
+    switch_to: &mut Option<(String, String)>,
+) -> Result<i32> {
     stream.set_nonblocking(true)?;
     let sock_fd = stream.as_raw_fd();
     util::set_nonblocking(STDIN)?;
@@ -1340,6 +1410,23 @@ fn client_loop(stream: UnixStream, enter: &[u8], raw: &RawMode) -> Result<i32> {
                                     let _ = util::write_all_retry(STDOUT, &stdout_buf, 1000);
                                 }
                                 break 'client Ok(ipc::decode_exit(&frame.payload).unwrap_or(0));
+                            }
+                            Tag::Switch => {
+                                // FDR 0012 (RFC 0008 §3.1): the daemon picked
+                                // THIS viewport to re-home. Flush pending
+                                // output and hand the target up —
+                                // run_interactive re-dials without leaving the
+                                // alternate screen (the new daemon's replay
+                                // repaints over the old one). A malformed
+                                // payload is ignored, per the old-peer rule.
+                                if let Some(t) = ipc::decode_switch_target(&frame.payload) {
+                                    if !stdout_buf.is_empty() {
+                                        let _ =
+                                            util::write_all_retry(STDOUT, &stdout_buf, 1000);
+                                    }
+                                    *switch_to = Some(t);
+                                    break 'client Ok(0);
+                                }
                             }
                             _ => {}
                         },

@@ -185,6 +185,12 @@ struct ClientConn {
     record: introspect::ClientRecord,
     record_at: u64,
     attach_pid: Option<u32>,
+    /// When this connection last delivered `Tag::Input` (util::now_ms; 0 =
+    /// never). The FDR 0012 switch router picks the most-recent-input
+    /// attached connection — tmux's current-client heuristic, and
+    /// per-viewport by construction (every relay/M2 channel serves one
+    /// viewport). RFC 0008 §3.1.
+    last_input_ms: u64,
 }
 
 impl ClientConn {
@@ -820,6 +826,30 @@ impl ScreenSwitchFilter {
     }
 }
 
+/// FDR 0012 (RFC 0008 §3.1): pick the ONE attached connection a switch
+/// routes to — the most-recent-input client, tmux's current-client
+/// heuristic (per-viewport by construction: every relay/M2 channel serves
+/// exactly one viewport). The requester's own connection is excluded; ties
+/// and the never-typed case fall to the LATEST-attached candidate (highest
+/// index — accept order). `None` when no other connection is attached.
+/// Deliberately unfiltered by frame capability: the most-recent-input
+/// connection IS the issuing viewport, and re-routing to a "more capable"
+/// other viewport would switch the wrong screen — an old client that skips
+/// the unknown tag is the specified visible no-op instead.
+fn switch_route_target(clients: &[ClientConn], requester: usize) -> Option<usize> {
+    let mut best: Option<(u64, usize)> = None;
+    for (j, c) in clients.iter().enumerate() {
+        if j == requester {
+            continue;
+        }
+        let key = (c.last_input_ms, j);
+        if best.is_none_or(|b| key >= b) {
+            best = Some(key);
+        }
+    }
+    best.map(|(_, j)| j)
+}
+
 /// Elementwise minimum size across all clients that have reported one
 /// (tmux `window-size smallest`).
 fn min_client_size(clients: &[ClientConn]) -> Option<(u16, u16)> {
@@ -1208,6 +1238,7 @@ fn daemon_loop(
                     record: introspect::ClientRecord::default(),
                     record_at: 0,
                     attach_pid: None,
+                    last_input_ms: 0,
                 });
             }
         }
@@ -1336,6 +1367,7 @@ fn daemon_loop(
             let mut needs_replay = false;
             let mut detach_all = false;
             let mut open_shell = false;
+            let mut switch_req: Option<Vec<u8>> = None;
             let total_clients = clients.len();
             {
                 let c = &mut clients[i];
@@ -1366,6 +1398,9 @@ fn daemon_loop(
                                         .map(|o| o.child.master)
                                         .unwrap_or(pty_fd);
                                     let _ = util::write_all_retry(target, &frame.payload, 100);
+                                    // FDR 0012: the switch router's
+                                    // current-viewport signal.
+                                    c.last_input_ms = util::now_ms();
                                 }
                                 Tag::Init => {
                                     if c.apply_init(&frame.payload) {
@@ -1454,6 +1489,18 @@ fn daemon_loop(
                                     // a retransmitted request idempotent.
                                     open_shell = true;
                                 }
+                                Tag::SwitchRequest => {
+                                    // FDR 0012 in-place switch (RFC 0008 §3.1):
+                                    // sent by the in-session `posh attach
+                                    // <sibling>` over a fresh connection. Defer
+                                    // routing out of this per-client borrow —
+                                    // the target is ANOTHER attached client. A
+                                    // malformed payload is dropped (the sender
+                                    // validated; nothing to answer).
+                                    if ipc::decode_switch_target(&frame.payload).is_some() {
+                                        switch_req = Some(frame.payload.clone());
+                                    }
+                                }
                                 // A lossy relay client (RFC 0008 §3) OR a
                                 // coalescing local client (CAP_COALESCE, posh#137)
                                 // acking one of its `Tag::Frame`s — the base-advance
@@ -1466,10 +1513,10 @@ fn daemon_loop(
                                     &frame.payload,
                                     active_source(overlay.as_ref().map(|o| &o.term), term),
                                 ),
-                                // Output, Ack, Exit, and Frame are all
+                                // Output, Ack, Exit, Frame, and Switch are all
                                 // daemon->client only; ignore if received from
                                 // a client.
-                                Tag::Output | Tag::Ack | Tag::Exit | Tag::Frame => {}
+                                Tag::Output | Tag::Ack | Tag::Exit | Tag::Frame | Tag::Switch => {}
                             }
                         }
                     }
@@ -1506,6 +1553,26 @@ fn daemon_loop(
                 }
                 if revents & err_events != 0 {
                     remove = true;
+                }
+            }
+            // FDR 0012 (RFC 0008 §3.1): route a validated switch request to
+            // the most-recent-input attached connection — the issuing
+            // viewport — BEFORE any removal shifts indices (the requester
+            // usually EOFs in the same batch it sends in). The requester's
+            // own connection (index i) is excluded; with no other connection
+            // attached the switch is a visible no-op, as specified.
+            if let Some(payload) = switch_req.take() {
+                if let Some(j) = switch_route_target(clients, i) {
+                    util::log_write(
+                        "info",
+                        &format!(
+                            "switch: routing to client fd={}",
+                            clients[j].stream.as_raw_fd()
+                        ),
+                    );
+                    clients[j].queue(Tag::Switch, &payload);
+                } else {
+                    util::log_write("info", "switch: no attached viewport to route to");
                 }
             }
             if detach_all {
@@ -1893,6 +1960,7 @@ mod tests {
             record: introspect::ClientRecord::default(),
             record_at: 0,
             attach_pid: None,
+            last_input_ms: 0,
         }
     }
 
@@ -2003,6 +2071,7 @@ mod tests {
             record: introspect::ClientRecord::default(),
             record_at: 0,
             attach_pid: None,
+            last_input_ms: 0,
         };
         let mut init = ipc::encode_resize(rows, cols).to_vec();
         init.extend_from_slice(&caps::encode_table(&caps::own_table(&[])));
@@ -2035,6 +2104,7 @@ mod tests {
             record: introspect::ClientRecord::default(),
             record_at: 0,
             attach_pid: None,
+            last_input_ms: 0,
         };
         let mut init = ipc::encode_resize(rows, cols).to_vec();
         init.extend_from_slice(&caps::encode_table(&caps::own_table(&[caps::Cap {
@@ -2044,6 +2114,34 @@ mod tests {
         c.apply_init(&init);
         c.maybe_enable_frames();
         (c, peer)
+    }
+
+    // ---- FDR 0012 (RFC 0008 §3.1): the switch router ----
+
+    #[test]
+    fn switch_routes_to_most_recent_input_excluding_requester() {
+        let mut a = test_client_conn();
+        a.last_input_ms = 100;
+        let mut b = test_client_conn();
+        b.last_input_ms = 200;
+        let requester = test_client_conn(); // never typed (it only requested)
+        let clients = vec![a, b, requester];
+        // b typed most recently; the requester (index 2) is excluded.
+        assert_eq!(switch_route_target(&clients, 2), Some(1));
+        // Were the recent typist itself the requester, the other viewer wins.
+        assert_eq!(switch_route_target(&clients, 1), Some(0));
+    }
+
+    #[test]
+    fn switch_falls_back_to_latest_attached_and_none_when_alone() {
+        // Nobody has typed: the latest-attached candidate (highest index)
+        // wins — accept order, the freshest viewport.
+        let clients = vec![test_client_conn(), test_client_conn(), test_client_conn()];
+        assert_eq!(switch_route_target(&clients, 0), Some(2));
+        assert_eq!(switch_route_target(&clients, 2), Some(1));
+        // Only the requester is connected: nothing to route to.
+        let lone = vec![test_client_conn()];
+        assert_eq!(switch_route_target(&lone, 0), None);
     }
 
     // ---- RFC 0010: terminal query passthrough / kitty keyboard negotiation ----
@@ -2545,6 +2643,7 @@ mod tests {
             record: introspect::ClientRecord::default(),
             record_at: 0,
             attach_pid: None,
+            last_input_ms: 0,
         };
         let mut init = ipc::encode_resize(rows, cols).to_vec();
         init.extend_from_slice(&caps::encode_table(&caps::own_table(&[caps::Cap {
@@ -2819,6 +2918,7 @@ mod tests {
             record: introspect::ClientRecord::default(),
             record_at: 0,
             attach_pid: None,
+            last_input_ms: 0,
         };
         let mut table = vec![caps::Cap {
             id: caps::CAP_LOSSY,
@@ -3188,6 +3288,7 @@ mod tests {
             record: introspect::ClientRecord::default(),
             record_at: 0,
             attach_pid: None,
+            last_input_ms: 0,
         };
         let mut init = ipc::encode_resize(rows, cols).to_vec();
         init.extend_from_slice(&caps::encode_table(&caps::own_table(&[caps::Cap {
@@ -3386,6 +3487,7 @@ mod tests {
             record: introspect::ClientRecord::default(),
             record_at: 0,
             attach_pid: None,
+            last_input_ms: 0,
         };
         let mut init = ipc::encode_resize(rows, cols).to_vec();
         init.extend_from_slice(&caps::encode_table(&caps::own_table(&[

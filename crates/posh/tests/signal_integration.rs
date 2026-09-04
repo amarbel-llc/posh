@@ -287,6 +287,95 @@ fn attach_client_exits_with_session_exit_status() {
 }
 
 #[test]
+fn in_session_attach_switches_the_viewport_in_place() {
+    // FDR 0012 (RFC 0008 §3.1): two sessions; a PTY viewport attached to A;
+    // `posh attach B` typed INSIDE A (via `posh run`, so it executes with
+    // A's $POSH_SESSION/$POSH_GROUP and the session PTY as its tty). The
+    // viewport must re-home to B — B's replay renders its marker — WITHOUT
+    // the client process exiting, and A must survive detached.
+    let dir = test_posh_dir("posh-switch");
+    let mk = |name: &str, argv: &[&str]| {
+        let out = posh_cmd()
+            .arg("attach")
+            .arg("--detach")
+            .arg(name)
+            .args(argv)
+            .env("POSH_DIR", &dir)
+            .env_remove("POSH_SESSION")
+            .env_remove("POSH_GROUP")
+            .output()
+            .unwrap();
+        assert!(out.status.success(), "create {name}: {out:?}");
+    };
+    // A: a plain interactive shell we can type into. B: paints a marker.
+    mk("swa", &["sh"]);
+    mk("swb", &["sh", "-c", "printf SWITCHMARKER; read x"]);
+
+    let (master, slave) = open_pty_pair();
+    let mut cmd = posh_cmd();
+    cmd.args(["attach", "swa"])
+        .env("POSH_DIR", &dir)
+        .env_remove("POSH_SESSION")
+        .env_remove("POSH_GROUP");
+    let mut child = spawn_on_pty(&mut cmd, slave);
+    wait_for_pty_output(master, "viewport's first output");
+
+    // Type the switch INSIDE session A. The inner posh must be THIS build
+    // (not whatever `posh` is on PATH), so the absolute binary path rides
+    // the command line.
+    let out = posh_cmd()
+        .args(["run", "swa", "--", env!("CARGO_BIN_EXE_posh"), "attach", "swb"])
+        .env("POSH_DIR", &dir)
+        .env_remove("POSH_SESSION")
+        .env_remove("POSH_GROUP")
+        .output()
+        .unwrap();
+    assert!(out.status.success(), "run into swa failed: {out:?}");
+
+    // The viewport re-homes and B's replay paints the marker.
+    let mut bytes = Vec::new();
+    let deadline = Instant::now() + Duration::from_secs(10);
+    loop {
+        drain_into(master, &mut bytes);
+        if String::from_utf8_lossy(&bytes).contains("SWITCHMARKER") {
+            break;
+        }
+        assert!(
+            Instant::now() < deadline,
+            "viewport never rendered the target session after the switch; got: {:?}",
+            String::from_utf8_lossy(&bytes)
+        );
+        std::thread::sleep(Duration::from_millis(25));
+    }
+    assert!(
+        child.try_wait().expect("try_wait").is_none(),
+        "the viewport process must survive the switch (re-dial, not exit)"
+    );
+
+    // A survived the switch, detached.
+    let out = posh_cmd()
+        .args(["list", "--short"])
+        .env("POSH_DIR", &dir)
+        .env_remove("POSH_SESSION")
+        .env_remove("POSH_GROUP")
+        .output()
+        .unwrap();
+    let names = String::from_utf8_lossy(&out.stdout);
+    assert!(names.lines().any(|l| l == "swa"), "swa gone: {names}");
+
+    let _ = child.kill();
+    for s in ["swa", "swb"] {
+        let _ = posh_cmd()
+            .args(["kill", s])
+            .env("POSH_DIR", &dir)
+            .env_remove("POSH_SESSION")
+            .env_remove("POSH_GROUP")
+            .output();
+    }
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+#[test]
 fn attach_takes_over_and_restores_the_alt_screen() {
     // FDR 0002: the attach byte stream begins by entering the outer
     // terminal's alternate screen (the user's shell screen waits
@@ -562,10 +651,11 @@ fn start_server(port_range: &str, command: &[&str], envs: &[(&str, &str)]) -> (S
         .env("POSH_SERVER_NETWORK_TMOUT", "30")
         // Hermeticity: a fresh test server (and any inner `posh attach` it wraps)
         // must NOT inherit the developer's own session context. If the test runs
-        // inside a posh session, an inherited POSH_SESSION trips the "cannot attach
-        // to a session from within a session" guard (session/client.rs) and the
-        // inner attach exits nonzero — the composition then reports 1, not the
-        // shell's real code (posh#111). Mirrors the `attach --detach` daemon spawn.
+        // inside a posh session, an inherited POSH_SESSION now makes the inner
+        // attach take the FDR 0012 in-place-switch path (session/client.rs)
+        // instead of a normal attach — it would try to switch the developer's
+        // viewport and exit without running the intended command (posh#111 in
+        // its post-FDR-0012 form). Mirrors the `attach --detach` daemon spawn.
         .env_remove("POSH_SESSION")
         .env_remove("POSH_GROUP");
     for (k, v) in envs {

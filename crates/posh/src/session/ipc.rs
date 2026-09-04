@@ -44,6 +44,19 @@ pub enum Tag {
     /// the daemon retains the ORIGINATING client's record. Payload is
     /// `caps::encode_table`; entries the daemon does not recognize are skipped.
     ClientCaps = 15,
+    /// Session-internal process -> daemon: the FDR 0012 in-place switch
+    /// request (RFC 0008 §3.1). Payload is [`encode_switch_target`] (group +
+    /// NUL + session). The sender is the in-session `posh attach <sibling>`,
+    /// which validated the target exists before asking; the daemon routes a
+    /// [`Tag::Switch`] to its most-recent-input attached client and keeps
+    /// serving everything else untouched.
+    SwitchRequest = 16,
+    /// Daemon -> ONE attached client: re-home to the named sibling session
+    /// (same [`encode_switch_target`] payload). A local client re-dials the
+    /// target's socket; a relay / M2 channel re-homes its daemon-side
+    /// connection (RFC 0008 §3.1). A client that predates this tag ignores
+    /// it — a visible no-op, never an error.
+    Switch = 17,
 }
 
 impl Tag {
@@ -65,9 +78,36 @@ impl Tag {
             13 => Tag::Shell,
             14 => Tag::FrameAck,
             15 => Tag::ClientCaps,
+            16 => Tag::SwitchRequest,
+            17 => Tag::Switch,
             _ => return None,
         })
     }
+}
+
+/// The `SwitchRequest`/`Switch` payload: `group` + NUL + `session` (FDR 0012;
+/// session names cannot contain NUL). The group travels explicitly so a
+/// cross-group switch (`posh attach :work/dev`) re-homes into the right
+/// socket directory.
+pub fn encode_switch_target(group: &str, session: &str) -> Vec<u8> {
+    let mut out = Vec::with_capacity(group.len() + 1 + session.len());
+    out.extend_from_slice(group.as_bytes());
+    out.push(0);
+    out.extend_from_slice(session.as_bytes());
+    out
+}
+
+/// Decode [`encode_switch_target`]; `None` on a malformed payload (no NUL, or
+/// non-UTF-8 halves) — the receiver treats that as an ignorable record, per
+/// the RFC 0008 §3.1 old-peer tolerance.
+pub fn decode_switch_target(payload: &[u8]) -> Option<(String, String)> {
+    let nul = payload.iter().position(|b| *b == 0)?;
+    let group = std::str::from_utf8(&payload[..nul]).ok()?;
+    let session = std::str::from_utf8(&payload[nul + 1..]).ok()?;
+    if group.is_empty() || session.is_empty() {
+        return None;
+    }
+    Some((group.to_string(), session.to_string()))
 }
 
 pub const HEADER_LEN: usize = 5;
@@ -465,6 +505,36 @@ mod tests {
         let mut buf = FrameBuffer::new();
         buf.feed(&wire);
         assert!(buf.next().is_err());
+    }
+
+    #[test]
+    fn switch_target_roundtrips_and_rejects_malformed() {
+        // FDR 0012 / RFC 0008 §3.1: group + NUL + session, both halves
+        // required. Malformed payloads decode to None (ignorable record).
+        assert_eq!(
+            decode_switch_target(&encode_switch_target("default", "dev")),
+            Some(("default".into(), "dev".into()))
+        );
+        assert_eq!(
+            decode_switch_target(&encode_switch_target("work", "s-1")),
+            Some(("work".into(), "s-1".into()))
+        );
+        assert_eq!(decode_switch_target(b"no-nul"), None);
+        assert_eq!(decode_switch_target(b"\0name"), None); // empty group
+        assert_eq!(decode_switch_target(b"grp\0"), None); // empty session
+        assert_eq!(decode_switch_target(b""), None);
+        // And through the frame layer.
+        let mut buf = FrameBuffer::new();
+        buf.feed(&encode_frame(
+            Tag::Switch,
+            &encode_switch_target("default", "s-2"),
+        ));
+        let frame = buf.next().unwrap().unwrap();
+        assert_eq!(frame.tag, Tag::Switch);
+        assert_eq!(
+            decode_switch_target(&frame.payload),
+            Some(("default".into(), "s-2".into()))
+        );
     }
 
     #[test]
