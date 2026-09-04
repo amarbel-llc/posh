@@ -2086,30 +2086,38 @@ debug-posh-bleed-render size="80x24":
     echo "row 9 (E1): steel-blue = the #100 bleed (pre-fix); CLEAN = fixed (ADR 0005)."
     echo "row 8 stays steel-blue either way — the fill text that scrolled up (legit)."
 
-# Render PlantUML doc(s) to PNG and display them inline via the kitty
-# graphics protocol (icat). Serves the architecture-diagram review dev-loop
-# (e.g. the FDR 0012 topology sketches under .tmp/). A multi-diagram .puml
-# yields several PNGs (name, name_001, ...); all are shown in order.
-# NOTE: run in a bare kitty tab — the graphics escapes do not survive a posh
-# session's frame path (posh-term does not model the kitty image protocol).
+# Render PlantUML doc(s) to PNG and display them inline. Serves the
+# architecture-diagram review dev-loop (e.g. the FDR 0012 topology sketches
+# under .tmp/). A multi-diagram .puml yields several PNGs (name, name_001,
+# ...); all are shown in order. Display prefers the kitty graphics protocol
+# (icat) and DEGRADES to a chafa unicode preview when that fails — icat
+# needs a kitty-family terminal reached directly (the graphics escapes and
+# the pixel-size query do not survive a posh session or tmux; posh-term
+# does not model the kitty image protocol). plantuml gets an explicit
+# nixpkgs fonts.conf: a bare `nix run` java app has no FONTCONFIG_FILE on
+# NixOS and warns "Cannot load default config file".
 #
-# render .puml file(s) to PNG and show them inline via kitty icat
+# render .puml file(s) to PNG and show them inline (kitty icat, chafa fallback)
 [group("debug")]
 debug-render-puml +files:
     #!/usr/bin/env bash
     set -euo pipefail
     cd '{{ justfile_directory() }}'
-    icat() {
-      if command -v kitten >/dev/null 2>&1; then kitten icat "$@"
-      elif command -v kitty >/dev/null 2>&1; then kitty +kitten icat "$@"
-      else nix run nixpkgs#kitty -- +kitten icat "$@"
-      fi
+    FONTCONFIG_FILE="$(nix build --no-link --print-out-paths 'nixpkgs#fontconfig.out')/etc/fonts/fonts.conf"
+    export FONTCONFIG_FILE
+    show() {
+      if command -v kitten >/dev/null 2>&1 && kitten icat "$1" 2>/dev/null; then return; fi
+      if command -v kitty >/dev/null 2>&1 && kitty +kitten icat "$1" 2>/dev/null; then return; fi
+      echo "(kitty graphics unavailable in this terminal path — chafa preview; open $1 for full quality)"
+      # -f symbols: chafa auto-detects kitty from $TERM and would emit the
+      # SAME swallowed graphics escapes; character art survives everywhere.
+      nix run nixpkgs#chafa -- -f symbols "$1"
     }
     for f in {{ files }}; do
       [ -f "$f" ] || { echo "missing $f" >&2; exit 1; }
       nix run nixpkgs#plantuml -- -tpng "$f"
       for png in "${f%.puml}"*.png; do
         echo "── $png"
-        icat "$png"
+        show "$png"
       done
     done
