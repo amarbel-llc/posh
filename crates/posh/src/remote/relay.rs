@@ -606,12 +606,12 @@ fn relay_loop(
     // grace period, so the client validates/retires predictions against a
     // frame that actually carries the echo. See `forward_daemon_frame`.
     let mut echo = sync::EchoAck::new();
-    // The last daemon frame's FLAG_ECHO (FDR 0006), re-stamped onto the
-    // relay's own Empties so they never flip the client's optimistic-echo
-    // gate off between visible frames.
-    let mut echo_flag: u8 = first_frame
-        .as_ref()
-        .map_or(0, |f| f.flags & sync::FLAG_ECHO);
+    // The last daemon frame's sticky client-side flags — FLAG_ECHO (FDR 0006,
+    // the optimistic-echo gate) and FLAG_OVERLAY (FDR 0008 / posh#178, the
+    // shell-overlay indicator) — re-stamped onto the relay's own Empties so a
+    // heartbeat between visible frames never flips either off client-side.
+    const CARRIED_FLAGS: u8 = sync::FLAG_ECHO | sync::FLAG_OVERLAY;
+    let mut frame_flags: u8 = first_frame.as_ref().map_or(0, |f| f.flags & CARRIED_FLAGS);
     // Agent forwarding (FDR 0004, Task 3.2): the bidirectional agent byte stream
     // the relay TERMINATES, and the peer's per-message AGENT_FORWARD latch.
     // `agent_seen` gates our own AGENT_DATA/ACK emission (RFC 0001: never before
@@ -932,6 +932,14 @@ fn relay_loop(
                                 held.clear();
                             }
                         }
+                        // FDR 0008 escape-to-shell (posh#178): bridge the
+                        // client's CLIENT_FLAG_ESCAPE to the daemon's Tag::Shell
+                        // — the daemon (not the relay) owns the overlay in the
+                        // single-model architecture. The daemon's overlay.is_none()
+                        // guard makes a repeat idempotent.
+                        if msg.flags & sync::CLIENT_FLAG_ESCAPE != 0 {
+                            ipc::append_frame(&mut link.write, Tag::Shell, b"");
+                        }
                         // Client quit (mosh Ctrl-^ .): FDR 0011 durable sessions
                         // -> Tag::Detach (leave the session running); explicit
                         // kill stays a palette-only action. Then wind the relay
@@ -1013,7 +1021,7 @@ fn relay_loop(
                         Ok(Some(frame)) => match frame.tag {
                             Tag::Frame => {
                                 let daemon_frame = ServerFrame::decode(&frame.payload)?;
-                                echo_flag = daemon_frame.flags & sync::FLAG_ECHO;
+                                frame_flags = daemon_frame.flags & CARRIED_FLAGS;
                                 echo_advanced = false; // this frame carries the ack
                                 forward_daemon_frame(
                                     daemon_frame,
@@ -1153,7 +1161,7 @@ fn relay_loop(
                     &mut fragmenter,
                     &inbox,
                     echo.ack(),
-                    echo_flag,
+                    frame_flags,
                     last_frame_num,
                     &out_agent_caps,
                     enveloped,
@@ -1183,7 +1191,7 @@ fn relay_loop(
                     &mut fragmenter,
                     &inbox,
                     echo.ack(),
-                    echo_flag,
+                    frame_flags,
                     last_frame_num,
                     &out_agent_caps,
                     enveloped,

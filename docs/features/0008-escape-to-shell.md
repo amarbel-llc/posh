@@ -77,15 +77,26 @@ Remap the trigger to the vi/less convention:
   again is ignored (the server's already-in-overlay guard).
 - **Request loss.** `CLIENT_FLAG_ESCAPE` is one-shot (cleared after one send), so
   a dropped request datagram just means the user presses `Ctrl-^ s` again.
-- ~~**Roaming only (for now).**~~ Resolved (FDR 0011 Phase 2.4b, posh#85):
-  the session daemon carries the same overlay (`session/daemon.rs`, the
-  `Overlay` struct + source/sink swap generalized from the roaming server),
-  summoned by the local client's palette *Shell out* over the `Tag::Shell`
-  IPC verb (`session/client.rs`), with `FLAG_OVERLAY` on its frames. The
-  overlay is daemon-side, not client-local, so a relayed roaming client and a
-  local attach share one mechanism and one cwd rule. Both paths read
-  `$POSH_ESCAPE_CMD` from the process owning the PTY (the daemon inherits it
-  from `posh start`/the first attach's environment).
+- **Request loss (relay/M2-channel path).** A roaming client through the
+  relay or an M2 mux session channel likewise sends the one-shot
+  `CLIENT_FLAG_ESCAPE`; the bridge translates it to the daemon's `Tag::Shell`
+  and a lost datagram just means the user retries. The daemon's overlay guard
+  (`overlay.is_none()`) makes any retransmit idempotent.
+- ~~**Roaming only (for now).**~~ Resolved (FDR 0011 Phase 2.4b, posh#85;
+  the relay/M2-channel path completed in posh#178): the session daemon
+  carries the same overlay (`session/daemon.rs`, the `Overlay` struct +
+  source/sink swap generalized from the roaming server), summoned by the
+  local client's palette *Shell out* over the `Tag::Shell` IPC verb
+  (`session/client.rs`), with `FLAG_OVERLAY` on its frames. A viewport that
+  reaches the daemon THROUGH a relay or mux channel (rather than the Arch-A
+  server) had a gap until posh#178: those bridges translate client flags to
+  daemon IPC and did not convert `CLIENT_FLAG_ESCAPE` → `Tag::Shell`, and the
+  daemon did not stamp `FLAG_OVERLAY` on its own frames — so shell-out over a
+  channel did nothing and the "opening shell…" notice never cleared. With
+  both fixed, a relayed roaming client and a local attach share one mechanism
+  and one cwd rule. Both paths read `$POSH_ESCAPE_CMD` from the process owning
+  the PTY (the daemon inherits it from `posh start`/the first attach's
+  environment).
 
 ## More Information
 

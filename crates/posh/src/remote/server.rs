@@ -304,10 +304,12 @@ struct SessionBridge {
     /// to the daemon counts as echoed only after the grace period, so the
     /// client validates/retires predictions against a frame that carries it.
     echo: crate::remote::sync::EchoAck,
-    /// The last daemon frame's FLAG_ECHO (FDR 0006; relay.rs parity):
-    /// re-stamped onto this channel's Empties so they never flip the
-    /// client's optimistic-echo gate off between visible frames.
-    echo_flag: u8,
+    /// The last daemon frame's sticky client-side flags — FLAG_ECHO (FDR
+    /// 0006, the optimistic-echo gate) and FLAG_OVERLAY (FDR 0008 / posh#178,
+    /// the shell-overlay indicator); relay.rs `frame_flags` parity —
+    /// re-stamped onto this channel's Empties so a heartbeat never flips
+    /// either off client-side between visible frames.
+    frame_flags: u8,
 }
 
 /// A channel the wire opened whose first `ClientMessage` (caps + geometry)
@@ -640,7 +642,9 @@ pub(crate) fn mux_peer_loop(
                         else {
                             continue;
                         };
-                        b.echo_flag = frame.flags & crate::remote::sync::FLAG_ECHO;
+                        b.frame_flags = frame.flags
+                            & (crate::remote::sync::FLAG_ECHO
+                                | crate::remote::sync::FLAG_OVERLAY);
                         let out = crate::remote::relay::rewrap(
                             frame,
                             b.link.frame_offset,
@@ -728,7 +732,7 @@ pub(crate) fn mux_peer_loop(
             {
                 let mut empty =
                     empty_ack_frame(b.last_frame_num, b.inbox.next_offset(), b.echo.ack());
-                empty.flags |= b.echo_flag;
+                empty.flags |= b.frame_flags;
                 crate::remote::mux::send_session_wire(
                     &mut conn,
                     &mut fragmenter,
@@ -824,7 +828,7 @@ fn handle_session_instruction(
             if let Some(PeerChannel::Linked(b)) =
                 idx.map(|i| &channels[i])
             {
-                confirm.flags |= b.echo_flag;
+                confirm.flags |= b.frame_flags;
             }
             send_session_wire(conn, fragmenter, chan, SESSION_WIRE_DATA, &confirm.encode());
         }
@@ -880,7 +884,7 @@ fn handle_session_instruction(
                             last_send: 0,
                             ack_due: false,
                             echo: crate::remote::sync::EchoAck::new(),
-                            echo_flag: 0,
+                            frame_flags: 0,
                         }));
                     }
                     Err(e) => {
@@ -972,6 +976,15 @@ fn bridge_client_message(b: &mut SessionBridge, msg: &crate::remote::sync::Clien
         if resync {
             b.held.clear();
         }
+    }
+    // FDR 0008 escape-to-shell (posh#178): the roaming client requests the
+    // overlay with CLIENT_FLAG_ESCAPE, which the Arch-A server reads directly
+    // — but on the M2 channel path the frame producer is the session daemon,
+    // so the request must be bridged to its Tag::Shell IPC. The daemon's
+    // overlay.is_none() guard makes a repeat idempotent (the flag is one-shot
+    // client-side, but a retransmit is harmless).
+    if msg.flags & crate::remote::sync::CLIENT_FLAG_ESCAPE != 0 {
+        ipc::append_frame(&mut b.link.write, Tag::Shell, b"");
     }
     if msg.flags & crate::remote::sync::CLIENT_FLAG_SHUTDOWN != 0 {
         ipc::append_frame(&mut b.link.write, Tag::Detach, b"");
@@ -2539,6 +2552,83 @@ mod tests {
     use super::*;
     use crate::remote::sync::InputOutbox;
     use crate::util;
+
+    /// A minimal linked `SessionBridge` over a UnixStream pair — enough to
+    /// drive `bridge_client_message` and inspect what it queued to the daemon
+    /// (`link.write`) without a live daemon.
+    fn test_bridge() -> (SessionBridge, std::os::unix::net::UnixStream) {
+        let (stream, peer) = std::os::unix::net::UnixStream::pair().unwrap();
+        let b = SessionBridge {
+            chan: channel::ChannelId::new(false, channel::KIND_SESSION, 2),
+            link: crate::remote::relay::DaemonLink {
+                stream,
+                read: crate::session::ipc::FrameBuffer::new(),
+                write: Vec::new(),
+                frame_offset: 0,
+            },
+            inbox: crate::remote::sync::InputInbox::new(),
+            held: crate::remote::relay::HeldFrame::default(),
+            client_size: (24, 80),
+            acked_forwarded: 0,
+            last_frame_num: 0,
+            last_retx: 0,
+            last_send: 0,
+            ack_due: false,
+            echo: crate::remote::sync::EchoAck::new(),
+            frame_flags: 0,
+        };
+        (b, peer)
+    }
+
+    /// posh#178: a mux-channel client's CLIENT_FLAG_ESCAPE must be bridged to
+    /// the daemon as Tag::Shell (the daemon owns the overlay in the
+    /// single-model architecture). Pre-fix `bridge_client_message` handled
+    /// only RESYNC/SHUTDOWN, so shell-out over a channel silently did nothing.
+    #[test]
+    fn escape_flag_bridges_to_a_daemon_shell_tag() {
+        let (mut b, _peer) = test_bridge();
+        let msg = crate::remote::sync::ClientMessage {
+            flags: crate::remote::sync::CLIENT_FLAG_ESCAPE,
+            caps: Vec::new(),
+            acked_frame: 0,
+            rows: 24,
+            cols: 80,
+            input_base: 0,
+            input: Vec::new(),
+        };
+        assert!(bridge_client_message(&mut b, &msg), "escape alone does not detach");
+        let mut fb = crate::session::ipc::FrameBuffer::new();
+        fb.feed(&b.link.write);
+        let mut saw_shell = false;
+        while let Ok(Some(frame)) = fb.next() {
+            if frame.tag == crate::session::ipc::Tag::Shell {
+                saw_shell = true;
+            }
+        }
+        assert!(saw_shell, "CLIENT_FLAG_ESCAPE must queue a Tag::Shell to the daemon");
+
+        // No escape flag ⇒ no Shell tag (the pre-fix baseline stays clean).
+        let (mut b2, _peer2) = test_bridge();
+        let quiet = crate::remote::sync::ClientMessage {
+            flags: 0,
+            caps: Vec::new(),
+            acked_frame: 0,
+            rows: 24,
+            cols: 80,
+            input_base: 0,
+            input: Vec::new(),
+        };
+        bridge_client_message(&mut b2, &quiet);
+        let mut fb2 = crate::session::ipc::FrameBuffer::new();
+        fb2.feed(&b2.link.write);
+        while let Ok(Some(frame)) = fb2.next() {
+            assert_ne!(
+                frame.tag,
+                crate::session::ipc::Tag::Shell,
+                "no shell tag without the escape flag"
+            );
+        }
+    }
 
     #[test]
     fn introspection_extras_follow_the_requested_ids() {

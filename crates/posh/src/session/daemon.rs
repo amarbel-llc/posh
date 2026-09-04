@@ -176,6 +176,12 @@ struct ClientConn {
     /// the top of each daemon iteration; 0 until the first refresh, so a
     /// brand-new conn's replay frame errs toward echo-suppressed.
     echo_flag: u8,
+    /// FLAG_OVERLAY while the escape-to-shell overlay (FDR 0008) is up, OR'd
+    /// into every frame's flags beside `echo_flag`. A roaming client reads it
+    /// to clear the "opening shell…" notice (posh#178) — the daemon's own
+    /// counterpart to the Arch-A server's FLAG_OVERLAY, which the relay
+    /// forwards verbatim (`relay::rewrap`). Refreshed per loop iteration.
+    overlay_flag: u8,
     /// RFC 0014 §3: the ORIGINATING client's introspection record — identity
     /// and latest state from the Init table or a later `Tag::ClientCaps`.
     /// `record_at` is when the state was decoded (`util::now_ms`), for the
@@ -371,7 +377,9 @@ impl ClientConn {
                 let bytes = ServerFrame {
                     // FDR 0006: the active pty's ECHO state rides every
                     // frame (RFC 0008 §2 keeps acks 0 here; flags are real).
-                    flags: self.echo_flag,
+                    // FDR 0008: FLAG_OVERLAY rides too while the shell overlay
+                    // is up (posh#178).
+                    flags: self.echo_flag | self.overlay_flag,
                     caps: caps::own_table(&[]),
                     frame_num,
                     input_ack: 0,
@@ -535,7 +543,7 @@ impl ClientConn {
             rows,
         };
         let bytes = ServerFrame {
-            flags: self.echo_flag,
+            flags: self.echo_flag | self.overlay_flag,
             caps: caps::own_table(&[]),
             frame_num,
             input_ack: 0,
@@ -1177,8 +1185,18 @@ fn daemon_loop(
                 0
             }
         };
+        // FDR 0008 (posh#178): while the escape-to-shell overlay is up, stamp
+        // FLAG_OVERLAY on every frame so a roaming client clears its "opening
+        // shell…" notice — the daemon's counterpart to the Arch-A server's
+        // overlay signal, forwarded verbatim by the relay.
+        let overlay_flag = if overlay.is_some() {
+            crate::remote::sync::FLAG_OVERLAY
+        } else {
+            0
+        };
         for c in clients.iter_mut() {
             c.echo_flag = echo_flag;
+            c.overlay_flag = overlay_flag;
         }
 
         // New client connections.
@@ -1235,6 +1253,7 @@ fn daemon_loop(
                     last_drain_ms: util::now_ms(),
                     hiwater_mb: 0,
                     echo_flag: 0,
+                    overlay_flag: 0,
                     record: introspect::ClientRecord::default(),
                     record_at: 0,
                     attach_pid: None,
@@ -1957,6 +1976,7 @@ mod tests {
             last_drain_ms: 0,
             hiwater_mb: 0,
             echo_flag: 0,
+            overlay_flag: 0,
             record: introspect::ClientRecord::default(),
             record_at: 0,
             attach_pid: None,
@@ -2068,6 +2088,7 @@ mod tests {
             last_drain_ms: 0,
             hiwater_mb: 0,
             echo_flag: 0,
+            overlay_flag: 0,
             record: introspect::ClientRecord::default(),
             record_at: 0,
             attach_pid: None,
@@ -2101,6 +2122,7 @@ mod tests {
             last_drain_ms: 0,
             hiwater_mb: 0,
             echo_flag: 0,
+            overlay_flag: 0,
             record: introspect::ClientRecord::default(),
             record_at: 0,
             attach_pid: None,
@@ -2337,7 +2359,7 @@ mod tests {
         assert!(c.queue_frame(
             term.dump_vt(),
             Snapshot::from_term(&term),
-            term.is_alt_screen(),
+            false,
             (rows, cols),
         ));
         let mut fb = FrameBuffer::new();
@@ -2345,6 +2367,56 @@ mod tests {
         while let Some(frame) = fb.next().unwrap() {
             let decoded = ServerFrame::decode(&frame.payload).unwrap();
             assert_eq!(decoded.flags & crate::remote::sync::FLAG_ECHO, 0);
+        }
+    }
+
+    #[test]
+    fn frames_carry_the_overlay_flag_while_the_shell_overlay_is_up() {
+        // FDR 0008 / posh#178: while the escape-to-shell overlay is up the
+        // daemon stamps FLAG_OVERLAY on every frame, so a roaming client
+        // (through the relay/mux, which forwards flags verbatim) clears its
+        // "opening shell…" notice. Pre-fix the daemon never set it, so a
+        // channel-attached client's notice lingered forever.
+        let (rows, cols) = (24u16, 80u16);
+        let mut term = Terminal::with_scrollback(rows, cols, 1000);
+        fill_screen(&mut term);
+        let (mut c, _peer) = frame_capable_conn(rows, cols);
+        c.overlay_flag = crate::remote::sync::FLAG_OVERLAY;
+        assert!(c.queue_frame(
+            term.dump_vt(),
+            Snapshot::from_term(&term),
+            false,
+            (rows, cols),
+        ));
+        let mut fb = FrameBuffer::new();
+        fb.feed(&c.write_buf);
+        let mut saw = 0;
+        while let Some(frame) = fb.next().unwrap() {
+            let decoded = ServerFrame::decode(&frame.payload).unwrap();
+            assert_ne!(
+                decoded.flags & crate::remote::sync::FLAG_OVERLAY,
+                0,
+                "every frame carries FLAG_OVERLAY while the overlay is up"
+            );
+            saw += 1;
+        }
+        assert!(saw > 0);
+
+        // Overlay closed ⇒ the flag clears.
+        c.write_buf.clear();
+        c.overlay_flag = 0;
+        term.process(b"y");
+        assert!(c.queue_frame(
+            term.dump_vt(),
+            Snapshot::from_term(&term),
+            term.is_alt_screen(),
+            (rows, cols),
+        ));
+        let mut fb = FrameBuffer::new();
+        fb.feed(&c.write_buf);
+        while let Some(frame) = fb.next().unwrap() {
+            let decoded = ServerFrame::decode(&frame.payload).unwrap();
+            assert_eq!(decoded.flags & crate::remote::sync::FLAG_OVERLAY, 0);
         }
     }
 
@@ -2640,6 +2712,7 @@ mod tests {
             last_drain_ms: 0,
             hiwater_mb: 0,
             echo_flag: 0,
+            overlay_flag: 0,
             record: introspect::ClientRecord::default(),
             record_at: 0,
             attach_pid: None,
@@ -2915,6 +2988,7 @@ mod tests {
             last_drain_ms: 0,
             hiwater_mb: 0,
             echo_flag: 0,
+            overlay_flag: 0,
             record: introspect::ClientRecord::default(),
             record_at: 0,
             attach_pid: None,
@@ -3285,6 +3359,7 @@ mod tests {
             last_drain_ms: 0,
             hiwater_mb: 0,
             echo_flag: 0,
+            overlay_flag: 0,
             record: introspect::ClientRecord::default(),
             record_at: 0,
             attach_pid: None,
@@ -3484,6 +3559,7 @@ mod tests {
             last_drain_ms: 0,
             hiwater_mb: 0,
             echo_flag: 0,
+            overlay_flag: 0,
             record: introspect::ClientRecord::default(),
             record_at: 0,
             attach_pid: None,
