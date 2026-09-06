@@ -171,9 +171,13 @@ propagates: `posh box:dev; echo $?` reports the session shell's code.
 
 Tailscale peers are first-class hosts: shell completion offers tailnet
 peer names (MagicDNS) alongside `~/.ssh/config` aliases and session names
-(`posh tailnet` lists them), and the roaming transport falls back to a
-peer's tailnet IP when the system resolver can't reach its MagicDNS name.
-Both degrade silently without `tailscale`.
+(`posh tailnet` lists them), and every ssh posh runs — the session
+bootstrap, the detached spawn, the remote listing probe — dials a peer's
+tailnet FQDN or IP when the system resolver can't reach the name you typed
+(a `~/.ssh/config` alias or proxy always wins; an IP is dialed under a
+`HostKeyAlias` of the typed name, so the key is trusted once per peer, not
+per address). The roaming transport applies the same fallback to the
+server's address. Both degrade silently without `tailscale`.
 
 The ssh bootstrap runs `posh-server new` on the remote host (mosh-server
 parity); the package installs `posh-server` as an alias of `posh`, so the

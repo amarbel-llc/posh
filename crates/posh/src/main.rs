@@ -499,9 +499,7 @@ fn cmd_start(
         ),
         StartClass::RemoteNamed { user, host, group: g, session } => {
             let probe_group = g.as_deref().unwrap_or(group);
-            // Resolve the host (tailnet fallback, posh#179) during the
-            // strictness probe; thread the resolved host into the bootstrap.
-            let (host, names) = probe_sessions_resolving(user.as_deref(), &host, probe_group)?;
+            let names = remote_session_names(user.as_deref(), &host, probe_group)?;
             // NOTE: the attach hint is the bare create-or-attach form —
             // `posh attach` is still local-only (remote strict attach is a
             // later FDR 0011 slice), so it must not be recommended here.
@@ -597,10 +595,7 @@ fn start_remote_auto(
     forward_flag: &remote::agent::ForwardFlag,
 ) -> Result<()> {
     let grp = target_group.clone().unwrap_or_else(|| global_group.to_string());
-    // Resolve the host (tailnet fallback on a resolution failure, posh#179)
-    // during the auto-id probe, then thread the resolved host into the
-    // bootstrap so the attach reuses what the probe proved reachable.
-    let (host, names) = probe_sessions_resolving(user.as_deref(), &host, &grp)?;
+    let names = remote_session_names(user.as_deref(), &host, &grp)?;
     let id = first_free_autoid(&names)
         .ok_or_else(|| Error::from("posh start: too many remote sessions"))?;
     cmd_ssh_session(user, host, target_group, global_group, id, extra, forward_flag)
@@ -742,12 +737,8 @@ fn cmd_ph(argv: &[String]) -> Result<()> {
             start_remote_auto(user, host, g, &group, &[], &remote::agent::ForwardFlag::Unset)
         }
         PhRoute::RemoteResolve { user, host, group: g, session } => {
-            // Resolve the host (tailnet fallback, posh#179) so `ph host:name`
-            // is consistent with `ph host:+` — the probe both verifies
-            // reachability and yields the routable host for the attach. `ph`
-            // is interactive, so the extra probe round-trip is acceptable.
-            let probe_group = g.as_deref().unwrap_or(&group);
-            let (host, _names) = probe_sessions_resolving(user.as_deref(), &host, probe_group)?;
+            // Create-or-attach on the host: the bootstrap resolves the host
+            // itself (posh#182), so no probe round-trip is needed.
             cmd_ssh_session(user, host, g, &group, session, &[], &remote::agent::ForwardFlag::Unset)
         }
     }
@@ -1212,21 +1203,25 @@ fn effective_remote_group<'a>(
 /// The ssh argv behind `posh list host:` (separated for testability). A
 /// non-default `group` is threaded as `posh -g GROUP list <format_flag>` so
 /// the remote probe is scoped to that group (#66); the default group injects
-/// no `-g`, leaving the pre-#66 wire shape unchanged.
+/// no `-g`, leaving the pre-#66 wire shape unchanged. `batch` adds
+/// `BatchMode=yes` — for a non-TTY caller (a script, a completion) that
+/// must never hang on a prompt; an interactive caller runs without it so a
+/// first contact can accept the host key (posh#182: the tailnet-IP fallback
+/// dials an address ssh has never seen, and batch mode could only fail it).
 fn remote_list_argv(
-    user: Option<&str>,
-    host: &str,
+    dest: &remote::sshwrap::SshDest,
     group: &str,
     format_flag: &str,
+    batch: bool,
 ) -> Vec<String> {
-    let dest = match user {
-        Some(u) => format!("{u}@{host}"),
-        None => host.to_string(),
-    };
-    let mut argv: Vec<String> = ["ssh", "-o", "BatchMode=yes", &dest, "posh"]
-        .iter()
-        .map(|s| s.to_string())
-        .collect();
+    let mut argv: Vec<String> = vec!["ssh".to_string()];
+    if batch {
+        argv.push("-o".into());
+        argv.push("BatchMode=yes".into());
+    }
+    argv.extend(dest.ssh_args());
+    argv.push(dest.target());
+    argv.push("posh".into());
     if group != "default" {
         argv.push("-g".into());
         argv.push(group.into());
@@ -1245,101 +1240,28 @@ fn remote_list_output(
     group: &str,
     format_flag: &str,
 ) -> Result<String> {
-    let out = run_remote_list(user, host, group, format_flag)?;
-    match out {
-        Ok(stdout) => Ok(stdout),
-        Err(stderr) => {
-            use std::io::Write;
-            let _ = std::io::stderr().write_all(stderr.as_bytes());
-            Err(Error::Msg(format!("remote list failed on {host}")))
-        }
+    // posh#182: the same dial decision every other ssh spawn makes (ssh
+    // config, then the resolver, then the tailnet), so a probe reaches
+    // exactly the host the subsequent bootstrap will.
+    let dest = remote::sshwrap::SshDest::resolve(&ph_dest(user, host));
+    if dest.substituted() {
+        util::log_write("info", &dest.describe());
     }
-}
-
-/// Run one remote `posh list` over ssh, returning `Ok(stdout)` on success and
-/// `Ok(Err(stderr))` on a non-zero exit (the inner `Result` separates the
-/// remote's own failure — which the caller may inspect, e.g. for a
-/// resolution error — from a local exec failure, the outer `Err`).
-#[allow(clippy::type_complexity)]
-fn run_remote_list(
-    user: Option<&str>,
-    host: &str,
-    group: &str,
-    format_flag: &str,
-) -> Result<std::result::Result<String, String>> {
-    let argv = remote_list_argv(user, host, group, format_flag);
+    let batch = !util::is_tty(0);
+    let argv = remote_list_argv(&dest, group, format_flag, batch);
     let out = std::process::Command::new(&argv[0])
         .args(&argv[1..])
         .output()
         .map_err(|e| Error::Msg(format!("ssh: {e}")))?;
     if out.status.success() {
-        Ok(Ok(String::from_utf8_lossy(&out.stdout).into_owned()))
+        Ok(String::from_utf8_lossy(&out.stdout).into_owned())
     } else {
-        Ok(Err(String::from_utf8_lossy(&out.stderr).into_owned()))
-    }
-}
-
-/// Whether an ssh stderr indicates the HOST could not be resolved (posh#179):
-/// the trigger for the tailnet-FQDN fallback. Covers the common resolver
-/// messages across libc/getaddrinfo variants.
-fn is_ssh_resolution_error(stderr: &str) -> bool {
-    let s = stderr.to_ascii_lowercase();
-    s.contains("could not resolve hostname")
-        || s.contains("name or service not known")
-        || s.contains("temporary failure in name resolution")
-        || s.contains("nodename nor servname provided")
-        || s.contains("no address associated with hostname")
-}
-
-/// Probe a remote host's sessions, resolving the host through tailscale when
-/// the system resolver cannot reach its short MagicDNS name (posh#179,
-/// approach A — surprise-free: the name as typed always wins when it
-/// resolves; the tailnet FQDN/IP is tried ONLY after ssh actually fails to
-/// resolve it, so a working `~/.ssh/config` Host alias is never bypassed).
-/// Returns `(host_that_worked, session_names)` so the caller threads the
-/// resolved host into the subsequent bootstrap. The username is preserved by
-/// the caller (tailnet resolution is host-only).
-fn probe_sessions_resolving(
-    user: Option<&str>,
-    host: &str,
-    group: &str,
-) -> Result<(String, Vec<String>)> {
-    let parse = |stdout: String| -> Vec<String> {
-        stdout.lines().filter(|l| !l.is_empty()).map(str::to_string).collect()
-    };
-    match run_remote_list(user, host, group, "--short")? {
-        Ok(stdout) => Ok((host.to_string(), parse(stdout))),
-        Err(stderr) if is_ssh_resolution_error(&stderr) => {
-            // The name as typed does not resolve; try the tailnet FQDN/IP.
-            if let Some(fallback) = crate::tailnet::ssh_fallback(host) {
-                match run_remote_list(user, &fallback, group, "--short")? {
-                    Ok(stdout) => {
-                        util::log_write(
-                            "info",
-                            &format!("resolved {host} via tailscale to {fallback}"),
-                        );
-                        Ok((fallback, parse(stdout)))
-                    }
-                    Err(e2) => {
-                        use std::io::Write;
-                        let _ = std::io::stderr().write_all(e2.as_bytes());
-                        Err(Error::Msg(format!("remote list failed on {fallback}")))
-                    }
-                }
-            } else {
-                use std::io::Write;
-                let _ = std::io::stderr().write_all(stderr.as_bytes());
-                Err(Error::Msg(format!(
-                    "cannot resolve {host} (not in ssh config or the tailnet); \
-                     use its full name"
-                )))
-            }
-        }
-        Err(stderr) => {
-            use std::io::Write;
-            let _ = std::io::stderr().write_all(stderr.as_bytes());
-            Err(Error::Msg(format!("remote list failed on {host}")))
-        }
+        use std::io::Write;
+        let _ = std::io::stderr().write_all(&out.stderr);
+        Err(Error::Msg(format!(
+            "remote list failed on {}",
+            dest.describe()
+        )))
     }
 }
 
@@ -1975,44 +1897,40 @@ mod tests {
     }
 
     #[test]
-    fn ssh_resolution_error_is_detected_across_resolver_variants() {
-        // posh#179: the triggers for the tailnet-FQDN fallback — the messages
-        // ssh/getaddrinfo emit when a host name cannot be resolved.
-        for stderr in [
-            "ssh: Could not resolve hostname flac: Temporary failure in name resolution",
-            "ssh: Could not resolve hostname flac: Name or service not known",
-            "ssh: Could not resolve hostname flac: nodename nor servname provided, or not known",
-            "ssh: Could not resolve hostname flac: No address associated with hostname",
-        ] {
-            assert!(is_ssh_resolution_error(stderr), "should trigger: {stderr}");
-        }
-        // A NON-resolution failure (auth, connection refused) must NOT trigger
-        // the fallback — the host resolved, something else failed.
-        for stderr in [
-            "Permission denied (publickey).",
-            "ssh: connect to host flac port 22: Connection refused",
-            "kex_exchange_identification: read: Connection reset by peer",
-        ] {
-            assert!(!is_ssh_resolution_error(stderr), "should NOT trigger: {stderr}");
-        }
-    }
-
-    #[test]
     fn remote_list_command_shape() {
-        // `posh list box:` runs a BatchMode ssh so completion-time and
-        // script callers can never hang on an auth prompt. The default group
-        // injects no `-g`, so the wire shape is unchanged from pre-#66.
+        // `posh list box:` from a script runs a BatchMode ssh so a
+        // completion-time or script caller can never hang on an auth prompt.
+        // The default group injects no `-g`, so the wire shape is unchanged
+        // from pre-#66.
+        let dest = remote::sshwrap::SshDest::verbatim("user@box");
         assert_eq!(
-            remote_list_argv(Some("user"), "box", "default", "--short"),
+            remote_list_argv(&dest, "default", "--short", true),
             ["ssh", "-o", "BatchMode=yes", "user@box", "posh", "list", "--short"]
                 .map(String::from)
         );
-        assert_eq!(remote_list_argv(None, "box", "default", "--short")[3], "box");
+        assert_eq!(
+            remote_list_argv(&remote::sshwrap::SshDest::verbatim("box"), "default", "--short", true)[3],
+            "box"
+        );
         // The table listing fetches the remote's rich shape with the same
         // wire, only the format flag differing.
         assert_eq!(
-            remote_list_argv(None, "box", "default", "--json").last().unwrap(),
+            remote_list_argv(&dest, "default", "--json", true).last().unwrap(),
             "--json"
+        );
+        // Interactive (posh#182): no BatchMode, so a first contact can
+        // accept the host key; a tailnet-IP substitution rides with its
+        // HostKeyAlias exactly as on the bootstrap.
+        let aliased = remote::sshwrap::SshDest {
+            user: None,
+            typed_host: "flac".into(),
+            dial_host: "100.96.0.8".into(),
+            host_key_alias: Some("flac".into()),
+        };
+        assert_eq!(
+            remote_list_argv(&aliased, "default", "--short", false),
+            ["ssh", "-o", "HostKeyAlias=flac", "100.96.0.8", "posh", "list", "--short"]
+                .map(String::from)
         );
     }
 
@@ -2022,7 +1940,12 @@ mod tests {
         // GROUP via `posh -g GROUP list --short`, or a session created in a
         // non-default group on the remote is invisible to the probe.
         assert_eq!(
-            remote_list_argv(Some("user"), "box", "spinclass", "--short"),
+            remote_list_argv(
+                &remote::sshwrap::SshDest::verbatim("user@box"),
+                "spinclass",
+                "--short",
+                true
+            ),
             [
                 "ssh",
                 "-o",

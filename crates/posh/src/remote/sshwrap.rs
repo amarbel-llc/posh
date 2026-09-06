@@ -3,6 +3,7 @@
 //! then run the UDP client locally with the key in the environment.
 
 use std::io::{BufRead, BufReader};
+use std::net::{IpAddr, ToSocketAddrs};
 use std::process::{Command, Stdio};
 
 use crate::remote::datagram::Family;
@@ -275,6 +276,209 @@ fn forwarded_env_vars() -> Vec<(String, String)> {
         .collect()
 }
 
+/// Where an ssh spawn for a typed `[user@]host` actually dials, and under
+/// which known_hosts name (posh#179/#182). The ONE resolver behind every ssh
+/// posh runs — the session bootstrap, the detached spawn, and the remote
+/// `posh list` probe — so a tailnet peer the system resolver cannot reach
+/// works on every path, and the typed name stays the identity everywhere
+/// else (the mux daemon's key, messages, the completion sources).
+///
+/// The decision is surprise-free: `ssh -G` applies the user's ssh config
+/// (a `Host` alias with a `HostName`, a proxy jump) exactly as ssh itself
+/// would, and the name is dialed AS TYPED whenever that effective hostname
+/// resolves or the connection is proxied. Only an unresolvable, unproxied
+/// name is substituted with the peer's tailnet FQDN, or — on a tailnet whose
+/// MagicDNS names carry no domain (headscale without a base domain) — its
+/// tailnet IP. An IP substitution dials with `HostKeyAlias=<typed>`, so ssh
+/// trusts the peer under the name you typed: one known_hosts entry that
+/// survives a tailnet address change and never asks you to re-accept a key
+/// per IP. A FQDN substitution keeps ssh's own naming (the FQDN is stable
+/// and may already be trusted under itself).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct SshDest {
+    pub user: Option<String>,
+    pub typed_host: String,
+    pub dial_host: String,
+    pub host_key_alias: Option<String>,
+}
+
+impl SshDest {
+    /// Resolve a typed `[user@]host`: ssh config first, then the system
+    /// resolver, then the tailnet fallback. Never fails — an unknown name is
+    /// dialed as typed and ssh reports its own resolution error.
+    pub fn resolve(dest: &str) -> SshDest {
+        let (user, host) = split_user(dest);
+        let view = ssh_config_view(host);
+        let (dial_host, host_key_alias) = decide_dial(
+            host,
+            &view,
+            system_resolves,
+            crate::tailnet::ssh_fallback,
+        );
+        SshDest {
+            user: user.map(str::to_string),
+            typed_host: host.to_string(),
+            dial_host,
+            host_key_alias,
+        }
+    }
+
+    /// The typed destination, dialed as typed (no config or resolver
+    /// consulted) — the argv-shape tests' fixture.
+    #[cfg(test)]
+    pub fn verbatim(dest: &str) -> SshDest {
+        let (user, host) = split_user(dest);
+        SshDest {
+            user: user.map(str::to_string),
+            typed_host: host.to_string(),
+            dial_host: host.to_string(),
+            host_key_alias: None,
+        }
+    }
+
+    /// The `[user@]host` argument for ssh.
+    pub fn target(&self) -> String {
+        match &self.user {
+            Some(u) => format!("{u}@{}", self.dial_host),
+            None => self.dial_host.clone(),
+        }
+    }
+
+    /// The ssh options the dial decision needs: the host-key alias for a
+    /// substituted IP, nothing otherwise (argv byte-identical to before).
+    pub fn ssh_args(&self) -> Vec<String> {
+        match &self.host_key_alias {
+            Some(alias) => vec!["-o".to_string(), format!("HostKeyAlias={alias}")],
+            None => Vec::new(),
+        }
+    }
+
+    pub fn substituted(&self) -> bool {
+        self.dial_host != self.typed_host
+    }
+
+    /// The typed destination for a message, with the substitution shown so a
+    /// failure names both what was typed and what was dialed.
+    pub fn describe(&self) -> String {
+        let typed = match &self.user {
+            Some(u) => format!("{u}@{}", self.typed_host),
+            None => self.typed_host.clone(),
+        };
+        if self.substituted() {
+            format!("{typed} (dialed {} via the tailnet)", self.dial_host)
+        } else {
+            typed
+        }
+    }
+
+    /// The one-line stderr notice for a foreground substitution, so the
+    /// dialed address is never a surprise.
+    pub fn notice(&self) -> Option<String> {
+        self.substituted().then(|| {
+            format!(
+                "posh: {} did not resolve; dialing {} (tailnet)",
+                self.typed_host, self.dial_host
+            )
+        })
+    }
+}
+
+/// `[user@]host` split at the LAST `@` (ssh's rule). An empty user counts as
+/// absent.
+fn split_user(dest: &str) -> (Option<&str>, &str) {
+    match dest.rsplit_once('@') {
+        Some(("", host)) => (None, host),
+        Some((user, host)) => (Some(user), host),
+        None => (None, dest),
+    }
+}
+
+/// What ssh would do with a host name, per the user's config: the effective
+/// `HostName` (an alias's target, else the name itself) and whether the
+/// connection is proxied (`ProxyJump`/`ProxyCommand`), in which case local
+/// resolution is irrelevant and ssh must be trusted as-is.
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct SshConfigView {
+    hostname: String,
+    proxied: bool,
+}
+
+/// `ssh -G <host>`: the effective configuration, no connection made. Any
+/// failure (no ssh on PATH, an unparseable dump) degrades to "the name is its
+/// own hostname, unproxied" — the decision then rests on the resolver alone.
+fn ssh_config_view(host: &str) -> SshConfigView {
+    let dump = Command::new("ssh")
+        .arg("-G")
+        .arg("--")
+        .arg(host)
+        .stdin(Stdio::null())
+        .stderr(Stdio::null())
+        .output()
+        .ok()
+        .filter(|out| out.status.success())
+        .and_then(|out| String::from_utf8(out.stdout).ok());
+    match dump {
+        Some(text) => parse_ssh_config_dump(host, &text),
+        None => SshConfigView {
+            hostname: host.to_string(),
+            proxied: false,
+        },
+    }
+}
+
+/// Parse the `key value` lines of an `ssh -G` dump. A `none` proxy value is
+/// ssh's spelling for unset.
+fn parse_ssh_config_dump(host: &str, dump: &str) -> SshConfigView {
+    let mut view = SshConfigView {
+        hostname: host.to_string(),
+        proxied: false,
+    };
+    for line in dump.lines() {
+        let Some((key, value)) = line.split_once(' ') else {
+            continue;
+        };
+        let value = value.trim();
+        match key.to_ascii_lowercase().as_str() {
+            "hostname" if !value.is_empty() => view.hostname = value.to_string(),
+            "proxyjump" | "proxycommand" if !value.is_empty() && value != "none" => {
+                view.proxied = true;
+            }
+            _ => {}
+        }
+    }
+    view
+}
+
+/// Whether the system resolver (getaddrinfo, which honors a working MagicDNS
+/// or search domain) has an address for `host`.
+fn system_resolves(host: &str) -> bool {
+    (host, 22u16)
+        .to_socket_addrs()
+        .map(|mut addrs| addrs.next().is_some())
+        .unwrap_or(false)
+}
+
+/// The pure dial decision behind [`SshDest::resolve`]: `(dial_host,
+/// host_key_alias)`. Injected resolver and tailnet lookups keep it testable
+/// without a network or a `tailscale` binary.
+fn decide_dial(
+    typed: &str,
+    view: &SshConfigView,
+    resolves: impl Fn(&str) -> bool,
+    tailnet_fallback: impl Fn(&str) -> Option<String>,
+) -> (String, Option<String>) {
+    if view.proxied || resolves(&view.hostname) {
+        return (typed.to_string(), None);
+    }
+    match tailnet_fallback(typed) {
+        Some(sub) => {
+            let alias = sub.parse::<IpAddr>().is_ok().then(|| typed.to_string());
+            (sub, alias)
+        }
+        None => (typed.to_string(), None),
+    }
+}
+
 /// Drives the ssh bootstrap for a `posh-server` invocation and parses its
 /// `POSH IP`/`POSH CONNECT` report: returns `(host, port, key)` for the
 /// caller to stand up its own UDP connection. Factored from [`run`] so the
@@ -319,10 +523,17 @@ pub fn bootstrap(
 ) -> Result<(String, u16, String)> {
     let server_cmd = remote_command(opts, remote_cmd, &forwarded_env_vars());
 
+    // posh#182: resolved per attempt (the mux daemon re-runs this on every
+    // reconnect, so a tailnet address change is picked up, not cached).
+    let dest = SshDest::resolve(target);
+    if let Some(notice) = dest.notice() {
+        eprintln!("{notice}");
+    }
     let mut ssh = Command::new("ssh");
     ssh.args(ssh_args(opts));
+    ssh.args(dest.ssh_args());
     let mut child = ssh
-        .arg(target)
+        .arg(dest.target())
         .arg("--")
         .arg(&server_cmd)
         .stdin(Stdio::inherit()) // keep the tty for auth prompts
@@ -358,8 +569,7 @@ pub fn bootstrap(
     // Prefer the address the server reported (third field of its
     // $SSH_CONNECTION: the IP we actually reached it on); fall back to
     // resolving the hostname we dialed, as mosh.pl does.
-    let fallback = target.rsplit('@').next().unwrap_or(target).to_string();
-    let host = report.ip.unwrap_or(fallback);
+    let host = report.ip.unwrap_or(dest.dial_host);
     Ok((host, port, key))
 }
 
@@ -380,6 +590,10 @@ pub fn run(target: &str, remote_cmd: &[String], opts: &SshOptions) -> Result<()>
 pub fn run_detached(target: &str, inner: &[String], opts: &SshOptions) -> Result<()> {
     let remote_cmd = detached_command(inner, &forwarded_env_vars());
 
+    let dest = SshDest::resolve(target);
+    if let Some(notice) = dest.notice() {
+        eprintln!("{notice}");
+    }
     let mut ssh = Command::new("ssh");
     match opts.family {
         Family::Inet => {
@@ -390,8 +604,9 @@ pub fn run_detached(target: &str, inner: &[String], opts: &SshOptions) -> Result
         }
         Family::Auto => {}
     }
+    ssh.args(dest.ssh_args());
     let status = ssh
-        .arg(target)
+        .arg(dest.target())
         .arg("--")
         .arg(&remote_cmd)
         .stdin(Stdio::inherit()) // keep the tty for auth prompts
@@ -400,7 +615,10 @@ pub fn run_detached(target: &str, inner: &[String], opts: &SshOptions) -> Result
         .status()
         .map_err(|e| Error::Msg(format!("cannot exec ssh: {e}")))?;
     if !status.success() {
-        return Err(Error::Msg(format!("remote detached spawn failed on {target}")));
+        return Err(Error::Msg(format!(
+            "remote detached spawn failed on {}",
+            dest.describe()
+        )));
     }
     Ok(())
 }
@@ -443,6 +661,113 @@ fn shell_quote(s: &str) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn unproxied(hostname: &str) -> SshConfigView {
+        SshConfigView {
+            hostname: hostname.to_string(),
+            proxied: false,
+        }
+    }
+
+    #[test]
+    fn ssh_config_dump_yields_effective_hostname_and_proxy_state() {
+        // posh#182: `ssh -G` is how the user's config (aliases, proxies) is
+        // honored before any tailnet substitution is considered.
+        let dump = "user me\nhostname box.example.net\nproxycommand none\nport 22\n";
+        assert_eq!(
+            parse_ssh_config_dump("box", dump),
+            unproxied("box.example.net")
+        );
+        let jumped = "hostname 10.0.0.5\nproxyjump bastion\n";
+        assert!(parse_ssh_config_dump("inner", jumped).proxied);
+        let via_cmd = "hostname inner\nproxycommand ssh -W %h:%p bastion\n";
+        assert!(parse_ssh_config_dump("inner", via_cmd).proxied);
+        // No hostname line (or garbage): the name is its own hostname.
+        assert_eq!(parse_ssh_config_dump("box", "nonsense"), unproxied("box"));
+    }
+
+    #[test]
+    fn dial_decision_is_as_typed_whenever_ssh_would_succeed() {
+        // A resolvable effective hostname (a working MagicDNS name, or an
+        // alias whose HostName resolves) dials as typed — an ssh-config alias
+        // is never bypassed even when the tailnet knows the name too.
+        let never = |_: &str| -> Option<String> { panic!("tailnet must not be consulted") };
+        assert_eq!(
+            decide_dial("flac", &unproxied("flac.example.net"), |_| true, never),
+            ("flac".to_string(), None)
+        );
+        // A proxied connection is ssh's business regardless of local resolution.
+        let proxied = SshConfigView {
+            hostname: "inner".into(),
+            proxied: true,
+        };
+        assert_eq!(
+            decide_dial("inner", &proxied, |_| false, never),
+            ("inner".to_string(), None)
+        );
+    }
+
+    #[test]
+    fn dial_decision_substitutes_the_tailnet_route_only_when_unresolvable() {
+        // The headscale shape (posh#182 report): MagicDNS names carry no
+        // domain, so the peer's only route is its tailnet IP — dialed under
+        // a HostKeyAlias of the TYPED name, so the key is trusted once as
+        // `flac`, not per address.
+        assert_eq!(
+            decide_dial(
+                "flac",
+                &unproxied("flac"),
+                |_| false,
+                |_| Some("100.96.0.8".to_string())
+            ),
+            ("100.96.0.8".to_string(), Some("flac".to_string()))
+        );
+        // A FQDN substitution keeps ssh's own naming (no alias).
+        assert_eq!(
+            decide_dial(
+                "flac",
+                &unproxied("flac"),
+                |_| false,
+                |_| Some("flac.tail1234.ts.net".to_string())
+            ),
+            ("flac.tail1234.ts.net".to_string(), None)
+        );
+        // Unknown to the tailnet too: dial as typed and let ssh say why.
+        assert_eq!(
+            decide_dial("ghost", &unproxied("ghost"), |_| false, |_| None),
+            ("ghost".to_string(), None)
+        );
+    }
+
+    #[test]
+    fn ssh_dest_carries_the_user_and_renders_alias_target_and_describe() {
+        let dest = SshDest {
+            user: Some("me".into()),
+            typed_host: "flac".into(),
+            dial_host: "100.96.0.8".into(),
+            host_key_alias: Some("flac".into()),
+        };
+        assert_eq!(dest.target(), "me@100.96.0.8");
+        assert_eq!(dest.ssh_args(), ["-o", "HostKeyAlias=flac"].map(String::from));
+        assert!(dest.substituted());
+        assert_eq!(
+            dest.describe(),
+            "me@flac (dialed 100.96.0.8 via the tailnet)"
+        );
+        assert_eq!(
+            dest.notice().as_deref(),
+            Some("posh: flac did not resolve; dialing 100.96.0.8 (tailnet)")
+        );
+        // Verbatim: as typed, argv byte-identical to before the resolver.
+        let plain = SshDest::verbatim("user@box");
+        assert_eq!(plain.target(), "user@box");
+        assert!(plain.ssh_args().is_empty());
+        assert!(!plain.substituted());
+        assert_eq!(plain.describe(), "user@box");
+        assert_eq!(plain.notice(), None);
+        assert_eq!(SshDest::verbatim("@box").user, None);
+        assert_eq!(SshDest::verbatim("u@v@box").user.as_deref(), Some("u@v"));
+    }
 
     #[test]
     fn parses_connect_line() {
