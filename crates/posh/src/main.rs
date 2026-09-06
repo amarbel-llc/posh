@@ -1777,6 +1777,10 @@ SESSION COMMANDS (local persistence)
         default $SHELL, when created). With --detach, ensure the session
         exists, print status, and exit without attaching. A `--` ends option
         parsing so the command is taken literally. Detach key: Ctrl-\\.
+        Inside a session (POSH_SESSION set) this is the in-place SWITCH
+        (FDR 0012): the viewport you typed it in re-homes onto <name>
+        instead of nesting a second posh; the same strict/--create
+        contract applies (--create creates <name> first, then switches).
         A host:session-shaped name attaches the REMOTE session, with the
         same strict contract (the host's session list is probed first);
         --create/--detach skip the probe. Any other name — dotted words
@@ -1789,7 +1793,9 @@ SESSION COMMANDS (local persistence)
         label. Remote targets work the same way: `host:name` creates a
         named session on the host (strict — errors if it exists there),
         `host:` or `host:+` a remote auto-id. With --detach,
-        ensure-and-return (idempotent, like `attach --detach`). With
+        ensure-and-return (idempotent, like `attach --detach`). Inside a
+        session, a local start creates the session and then SWITCHES the
+        viewport you typed it in onto it (FDR 0012; no nesting). With
         --ephemeral (first arg), a non-durable throwaway roaming shell
         instead — see REMOTE COMMANDS below.
 

@@ -150,6 +150,11 @@ Local persistence over Unix sockets.
 	default _$SHELL_, when created). With *--detach*, ensure the session
 	exists, print status, and exit without attaching. A *--* ends option
 	parsing so _command_ is taken literally. Detach key: *Ctrl-\\*.
+	Inside a session (_$POSH_SESSION_ set) this is the in-place
+	*switch* (FDR 0012): the viewport you typed it in re-homes onto
+	_name_ instead of nesting a second posh layer, under the same
+	strict/*--create* contract (*--create* creates _name_ first, then
+	switches; the previous session keeps running, detached).
 	A _host_*:*_session_-shaped _name_ attaches the *remote* session
 	over the roaming transport with the same strict contract (the
 	host's session list is probed first; *--create*/*--detach* skip
@@ -167,7 +172,9 @@ Local persistence over Unix sockets.
 	is probed first, and an existing name errors), while _host_*:* or
 	_host_*:+* creates a remote auto-id session (first free _s-N_).
 	With *--detach*, ensure-and-return, idempotent like
-	*attach --detach*. With *--ephemeral* (first argument), a
+	*attach --detach*. Inside a session, a local *start* creates the
+	session and then *switches* the issuing viewport onto it (FDR
+	0012; no nesting). With *--ephemeral* (first argument), a
 	non-durable throwaway roaming shell instead — see REMOTE
 	COMMANDS below.
 

@@ -141,11 +141,18 @@ pub fn cmd_attach(
 ) -> Result<()> {
     // FDR 0012 (RFC 0008 §3.1): an in-session attach is the in-place SWITCH
     // — the issuing viewport re-homes onto the sibling instead of nesting a
-    // second posh layer. `--detach` keeps its create-or-ensure meaning (the
-    // clown spawn path) and never switches.
+    // second posh layer. `--create` keeps its create-or-attach meaning here
+    // too (create-then-switch — clown's self-wrap `attach --create {id}` for
+    // a not-yet-existing instance, posh#183). `--detach` keeps its
+    // create-or-ensure meaning (the clown spawn path) and never switches.
     if !detach_flag {
         if let Ok(current) = std::env::var("POSH_SESSION") {
-            return switch_in_place(cfg, &current, name);
+            let create = if create_flag {
+                SwitchCreate::Ensure(command)
+            } else {
+                SwitchCreate::Never
+            };
+            return switch_in_place(cfg, &current, name, create);
         }
     }
 
@@ -166,15 +173,36 @@ pub fn cmd_attach(
     run_interactive(stream)
 }
 
-/// FDR 0012 (RFC 0008 §3.1): the in-session switch sender. Validates the
-/// target strictly (it must exist and be live — a switch never creates),
-/// then sends a `SwitchRequest` over the CURRENT session's socket and
-/// exits; the daemon routes a `Switch` to the most-recent-input viewport,
-/// which re-homes in place. Non-TTY invocations error with the action (the
-/// FDR 0011 picker discipline). An OLD daemon skips the unknown tag — the
-/// specified visible no-op — so this prints what it asked for, not a
-/// success claim.
-fn switch_in_place(target_cfg: &Config, current: &str, target: &str) -> Result<()> {
+/// How an in-session switch treats its target's existence — the FDR 0015
+/// create contract of the command that triggered it, carried into the FDR
+/// 0012 switch (posh#183).
+enum SwitchCreate {
+    /// Bare `posh attach`: strict — the target must already be live.
+    Never,
+    /// `posh attach --create`: create-or-switch (an idempotent ensure; a
+    /// live target ignores the command, as the non-switch path does).
+    Ensure(Option<Vec<String>>),
+    /// `posh start`: strict create-then-switch — a live target errors.
+    Strict(Option<Vec<String>>),
+}
+
+/// FDR 0012 (RFC 0008 §3.1): the in-session switch sender. Resolves the
+/// target per `create` (a bare attach must find it live; `--create` /
+/// `start` create it first, running their command — the created daemon's
+/// socket is bound before `ensure_session` returns, so the switch's
+/// re-home connects to it), then sends a `SwitchRequest` over the CURRENT
+/// session's socket and exits; the daemon routes a `Switch` to the
+/// most-recent-input viewport, which re-homes in place. Non-TTY invocations
+/// error with the action BEFORE any creation (the FDR 0011 picker
+/// discipline — a script never creates a session it cannot switch into).
+/// An OLD daemon skips the unknown tag — the specified visible no-op — so
+/// this prints what it asked for, not a success claim.
+fn switch_in_place(
+    target_cfg: &Config,
+    current: &str,
+    target: &str,
+    create: SwitchCreate,
+) -> Result<()> {
     if !util::is_tty(STDIN) {
         return Err(Error::Msg(format!(
             "refusing to switch on a non-TTY; run `posh attach --detach {target}` to \
@@ -185,13 +213,27 @@ fn switch_in_place(target_cfg: &Config, current: &str, target: &str) -> Result<(
     if target == current && target_cfg.group == current_group {
         return Err(Error::Msg(format!("already attached to {target}")));
     }
-    let target_path = target_cfg.socket_path(target)?;
-    if !crate::session::session_socket_exists(&target_path)
-        || crate::session::socket_is_dead(&target_path)
-    {
-        return Err(Error::Msg(format!(
-            "no session {target} to switch to (use `posh start {target}` to create it)"
-        )));
+    match create {
+        SwitchCreate::Never => {
+            let target_path = target_cfg.socket_path(target)?;
+            if !crate::session::session_socket_exists(&target_path)
+                || crate::session::socket_is_dead(&target_path)
+            {
+                return Err(Error::Msg(format!(
+                    "no session {target} to switch to (use `posh start {target}` to create it)"
+                )));
+            }
+        }
+        SwitchCreate::Ensure(command) => {
+            daemon::ensure_session(target_cfg, target, command)?;
+        }
+        SwitchCreate::Strict(command) => {
+            if !daemon::ensure_session(target_cfg, target, command)? {
+                return Err(Error::Msg(format!(
+                    "session \"{target}\" already exists (use `posh attach {target}`)"
+                )));
+            }
+        }
     }
     let current_cfg = Config::new(&current_group)?;
     let path = current_cfg.socket_path(current)?;
@@ -208,21 +250,20 @@ fn switch_in_place(target_cfg: &Config, current: &str, target: &str) -> Result<(
 
 /// `posh start`: create a durable session (strict — errors if a named session is
 /// already live), then attach. `--detach` is the idempotent ensure shared with
-/// attach (FDR 0010), so a re-spawn is a no-op. FDR 0015.
+/// attach (FDR 0010), so a re-spawn is a no-op. FDR 0015. Inside a session the
+/// attach half is the FDR 0012 in-place switch: create, then re-home the
+/// issuing viewport onto the new session (posh#183).
 pub fn cmd_start_local(
     cfg: &Config,
     name: &str,
     command: Option<Vec<String>>,
     detach_flag: bool,
 ) -> Result<()> {
-    if !detach_flag && std::env::var_os("POSH_SESSION").is_some() {
-        return Err(Error::from(
-            "cannot start a session from within a session",
-        ));
-    }
-
     if detach_flag {
         return ensure_detached(cfg, name, command);
+    }
+    if let Ok(current) = std::env::var("POSH_SESSION") {
+        return switch_in_place(cfg, &current, name, SwitchCreate::Strict(command));
     }
 
     // Strict create: `ensure_session` returns false when the session is already

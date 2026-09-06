@@ -119,8 +119,13 @@ automatic + replace semantics — the viewport is on `laptop`, the sessions on
     laptop$ posh box:dev               # both sessions still there, reattach at will
 
 The original tunneled collapse (clown's self-wrap) is the same mechanism —
-`sc start` execs clown, clown runs `posh attach w1`, the viewport switches to
-`w1` instead of nesting a second posh layer.
+`sc start` execs clown, clown runs `posh attach --create w1 …`, the viewport
+switches to `w1` instead of nesting a second posh layer. The triggering
+command's FDR 0015 create contract carries into the switch (posh#183): a bare
+in-session `attach` is strict (the target must be live), `attach --create`
+creates-then-switches (idempotent — the self-wrap's fresh-instance case), and
+a local in-session `start` strict-creates-then-switches. The non-TTY refusal
+precedes any creation.
 
 Non-TTY (a script or command substitution) never switches implicitly — it
 errors with the action it would have taken, mirroring the FDR 0011 picker
