@@ -1312,6 +1312,16 @@ fn cmd_list_remote(
             );
             Ok(())
         }
+        ListFormat::Complete => {
+            // `name<TAB>summary` from the remote; prefix only the NAME (before
+            // the tab) so each line pastes back as `host:name` with its
+            // summary intact for the completion description column.
+            for line in remote_list_output(user.as_deref(), &host, group, "--complete")?.lines() {
+                let (name, summary) = line.split_once('\t').unwrap_or((line, ""));
+                println!("{}\t{summary}", remote_list_line(&prefix, group, name));
+            }
+            Ok(())
+        }
         ListFormat::Default => {
             let json = remote_list_output(user.as_deref(), &host, group, "--json")?;
             session::render_remote_list(&format!("{prefix}:"), &json, |name| {
@@ -1461,13 +1471,15 @@ fn parse_list_args(args: &[String]) -> Result<(ListFormat, bool, u64)> {
         ListFormat::Json
     } else if args.iter().any(|a| a == "--short") {
         ListFormat::Short
+    } else if args.iter().any(|a| a == "--complete") {
+        ListFormat::Complete
     } else {
         ListFormat::Default
     };
     let watch = args.iter().any(|a| a == "--watch" || a == "-w");
     if watch && format != ListFormat::Default {
         return Err(Error::from(
-            "--watch renders the interactive table (drop --json/--short)",
+            "--watch renders the interactive table (drop --json/--short/--complete)",
         ));
     }
     let mut interval: u64 = 2;
@@ -1697,12 +1709,15 @@ SESSION COMMANDS (local persistence)
         when piped. On a terminal, live mux endpoints (see: mux ls)
         render beneath the table — the unified \"what is posh doing\"
         view. --short prints names only; --json prints a
-        machine-readable array (both stay session-only for scripts).
-        --watch re-renders the unified view every N seconds (default 2)
-        in the alternate screen: q quits, r refreshes immediately.
-        `list host:` renders a remote host's sessions through the same
-        table (names host-prefixed so rows paste back as targets);
-        --short/--json keep their machine shapes there too.
+        machine-readable array; --complete prints `name<TAB>summary`
+        lines (the RFC 0013 activity label, else the launch command) for
+        shell completion — the `ph` fish completion renders the summary
+        as each candidate's description. All three stay session-only for
+        scripts. --watch re-renders the unified view every N seconds
+        (default 2) in the alternate screen: q quits, r refreshes
+        immediately. `list host:` renders a remote host's sessions
+        through the same table (names host-prefixed so rows paste back as
+        targets); --short/--json/--complete keep their machine shapes there too.
 
     run <name> [--] <command...>               (alias: r)
         Send a command to a session (created if needed) without attaching.

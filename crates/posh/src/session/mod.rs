@@ -418,6 +418,13 @@ pub enum ListFormat {
     Default,
     Short,
     Json,
+    /// One `name<TAB>summary` line per live session, for shell completion
+    /// (fish/zsh render the tab-separated summary as the candidate's
+    /// description). The summary is the RFC 0013 §5 activity label, else the
+    /// launch command, else empty. Errored/stale sessions are skipped, like
+    /// `Short`. A superset of `Short` (the name is the first tab field), so a
+    /// consumer that wants only names can cut at the tab.
+    Complete,
 }
 
 struct SessionEntry {
@@ -546,6 +553,15 @@ pub fn cmd_list(cfg: &Config, format: ListFormat) -> Result<()> {
             }
             Ok(())
         }
+        ListFormat::Complete => {
+            for s in &sessions {
+                if s.error.is_some() {
+                    continue; // skip stale/unreachable, like Short
+                }
+                println!("{}\t{}", s.name, completion_summary(s));
+            }
+            Ok(())
+        }
         // The `mesa` renderer (purse-first, RFC 0003) auto-detects whether
         // ITS (inherited) stdout is a terminal, so posh needs no tty branch
         // of its own here — styled table or plain TAB-separated lines, both
@@ -666,6 +682,18 @@ fn json_string(s: &str) -> String {
     }
     out.push('"');
     out
+}
+
+/// The `ListFormat::Complete` summary for one session: the RFC 0013 §5
+/// activity label, else the launch command, else empty — flattened to a
+/// single line (any tab becomes a space) so it cannot break the
+/// `name<TAB>summary` completion split.
+fn completion_summary(s: &SessionEntry) -> String {
+    s.activity
+        .as_deref()
+        .or(s.cmd.as_deref())
+        .unwrap_or("")
+        .replace(['\t', '\n', '\r'], " ")
 }
 
 fn print_session_line(s: &SessionEntry, format: ListFormat, current: Option<&str>) {
@@ -1037,6 +1065,34 @@ mod tests {
         assert!(entries[2].error.is_none());
         assert!(entries[2].cmd.is_none() && entries[2].activity.is_none());
         assert!(remote_entries("nonsense", |n| n.to_string()).is_err());
+    }
+
+    #[test]
+    fn completion_summary_prefers_activity_then_cmd_and_flattens() {
+        let entry = |activity: Option<&str>, cmd: Option<&str>| SessionEntry {
+            name: "s".into(),
+            pid: Some(1),
+            clients: Some(0),
+            error: None,
+            cmd: cmd.map(str::to_string),
+            cwd: None,
+            activity: activity.map(str::to_string),
+            echo: None,
+        };
+        // Activity wins over cmd.
+        assert_eq!(
+            completion_summary(&entry(Some("~/x · nvim"), Some("bash"))),
+            "~/x · nvim"
+        );
+        // Falls back to cmd, then to empty.
+        assert_eq!(completion_summary(&entry(None, Some("htop -d 5"))), "htop -d 5");
+        assert_eq!(completion_summary(&entry(None, None)), "");
+        // A tab/newline in the label is flattened so it cannot break the
+        // `name<TAB>summary` completion split.
+        assert_eq!(
+            completion_summary(&entry(Some("a\tb\nc"), None)),
+            "a b c"
+        );
     }
 
     #[test]

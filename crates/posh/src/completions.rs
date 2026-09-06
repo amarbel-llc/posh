@@ -587,7 +587,10 @@ function __ph_remote_sessions
     end
     if test -z "$(find $cache -newermt '-30 seconds' 2>/dev/null)"
         mkdir -p $cache_dir
-        ssh -o BatchMode=yes -o ConnectTimeout=2 $host posh $gflag list --short >$cache.new 2>/dev/null
+        # --complete: `name<TAB>summary` so the remote candidates carry their
+        # activity as the description; the host: prefix (below) prepends to
+        # the whole line, leaving the tab-summary intact.
+        ssh -o BatchMode=yes -o ConnectTimeout=2 $host posh $gflag list --complete >$cache.new 2>/dev/null
         and mv $cache.new $cache
     end
     cat $cache 2>/dev/null
@@ -610,9 +613,13 @@ end
 # ph takes a single target token (no subcommands). Complete local session
 # names, ssh/tailnet hosts (as `host:`), the remote session names after a
 # `host:`, and the `:+` new-local-session sigil.
+# `posh list --complete` emits `name<TAB>summary` (the RFC 0013 §5 activity
+# label, else the launch command); fish renders the tab-separated summary as
+# the candidate's description column. `-d` is a fallback for entries whose
+# summary is empty (a live session running nothing notable).
 complete -c ph -f
 complete -c ph -s g -l group -d 'Session group' -r -a '(posh groups 2>/dev/null)'
-complete -c ph -a '(posh list --short 2>/dev/null)' -d 'Local session'
+complete -c ph -a '(posh list --complete 2>/dev/null)' -d 'Local session'
 complete -c ph -a '(__ph_hosts)' -d 'Host'
 complete -c ph -a '(__ph_complete_remote_target)' -d 'Remote session'
 complete -c ph -a ':+' -d 'New local auto-id session'
@@ -888,7 +895,9 @@ mod tests {
         let s = ph_script(Shell::Fish).expect("fish ph script");
         for needle in [
             "complete -c ph",
-            "posh list --short",
+            // fish renders the `name<TAB>summary` from --complete as the
+            // candidate description (posh#... session-summary completion).
+            "posh list --complete",
             "__ph_ssh_config_hosts",
             "posh tailnet",
             "BatchMode=yes",
@@ -896,6 +905,10 @@ mod tests {
         ] {
             assert!(s.contains(needle), "ph fish script missing {needle}");
         }
+        // The fish path no longer uses --short (it uses --complete for the
+        // summary description); bash stays on --short (no per-candidate
+        // descriptions).
+        assert!(!s.contains("list --short"), "fish ph should use --complete");
         // bash also ships; zsh is a follow-up.
         assert!(ph_script(Shell::Bash).is_some());
         assert!(ph_script(Shell::Zsh).is_none());

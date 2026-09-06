@@ -171,7 +171,7 @@ Local persistence over Unix sockets.
 	non-durable throwaway roaming shell instead — see REMOTE
 	COMMANDS below.
 
-*list* [*--short*] [*-j*|*--json*] [*-w*|*--watch* [*--interval* _N_]] (aliases: *ls*, *l*)
+*list* [*--short*] [*-j*|*--json*] [*--complete*] [*-w*|*--watch* [*--interval* _N_]] (aliases: *ls*, *l*)
 	List sessions in the group: name, pid, attached client count.
 	When stdout is a terminal the default output is a styled table
 	with a state-colored status dot (attached, detached, or stale),
@@ -188,8 +188,12 @@ Local persistence over Unix sockets.
 	the unified "what is posh doing on this machine" view; when
 	piped it is plain tab-separated lines, unchanged for scripts,
 	with no mux section. *--short* prints names only; *--json*
-	prints a machine-readable array (both stay session-only —
-	scripts and the completion probe parse them). *--watch*
+	prints a machine-readable array; *--complete* prints
+	_name_<TAB>_summary_ lines (the RFC 0013 §5 activity label,
+	else the launch command) for shell completion — the *ph* fish
+	completion renders the summary as each candidate's description.
+	All three stay session-only (scripts and the completion probe
+	parse them). *--watch*
 	re-renders the unified view every _N_ seconds (*--interval*,
 	default 2) in the alternate screen: *q* (or Ctrl-C) quits, *r*
 	refreshes immediately; a resize is picked up on the next
