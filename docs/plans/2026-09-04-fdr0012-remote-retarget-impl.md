@@ -50,12 +50,33 @@ NOT re-OPEN (the bridge already re-homed).
   `Config::new(group)` + `connect_or_create` + a fresh `DaemonLink` with
   `frame_offset = last_frame_num`, resetting held/inbox.
 
-## Remaining coverage gap
+## Coverage (closed 2026-09-06, #185)
 
-The re-home helpers and the target conversion are unit-tested; a full
-in-process end-to-end switch drive (mux_peer_loop and relay_loop: OPEN to A,
-deliver a daemon Tag::Switch, assert the client sees B's frames numbered
-above A's ceiling) is not yet written. Tracked in #180.
+The first deploy of the switch surfaced two bugs the helper-only tests could
+not see, both in the SWEEP around the re-home rather than the re-home itself:
+the endpoint drained the new link's Init through the OLD link's captured fd
+and closed the channel (#184), and both bridges reset the input inbox, which
+the viewport's outbox keeps counting past, so every post-switch keystroke was
+dropped as a gap (#186).
+
+Two structural changes followed. `SessionBridge` and `relay_loop` now hold a
+shared `DaemonLeg` (`relay.rs`: link + held frame + forwarded ack + owed ack)
+whose ONE constructor seeds both offset translations from the client's
+ceiling; a resume-base Link and a re-home each replace the leg wholesale, so
+there is no per-field reset list to get wrong, and the viewport-side state
+(inbox, echo maturity, size, ceiling, flags, caps) persists by construction.
+`DaemonLeg::forward_ack` owns the `acked_forwarded - frame_offset`
+translation with a checked subtraction (loud in debug builds).
+
+And the drives now exist: `mux_peer_switch_rehomes_channel_with_frame_and_
+input_continuity` (server.rs, on the `start_peer` harness) and
+`relay_switch_rehomes_with_frame_and_input_continuity` (relay.rs, on the
+`Harness` rig via a new switch-connector seam on `relay_loop`). Each OPENs to
+A, delivers a daemon `Tag::Switch` to B, and asserts the channel survives the
+sweep, B is Init'd lossy, B's frames land above A's ceiling carrying the
+persisted input ack, post-switch input at the continuing offset reaches B,
+and an A-numbered ack is not forwarded while a B-numbered one is translated.
+Either drive fails on #184 or #186 by construction.
 
 ## Key facts (verified)
 

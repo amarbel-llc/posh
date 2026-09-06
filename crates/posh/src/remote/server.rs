@@ -275,15 +275,21 @@ fn empty_ack_frame(
 }
 
 /// One session channel's bridge in the M2 channel table: the §3 relay
-/// contract's per-session state (DaemonLink + one held frame + the reliable
-/// input inbox), instantiated per channel instead of per process.
+/// contract's per-session state, instantiated per channel instead of per
+/// process. Split by LIFETIME (posh#184/#186): `daemon` is the per-daemon-
+/// connection leg a resume-base Link or an FDR 0012 re-home replaces
+/// wholesale; every other field is viewport-side state that persists for
+/// the channel's life (see [`crate::remote::relay::DaemonLeg`]).
 struct SessionBridge {
     chan: channel::ChannelId,
-    link: crate::remote::relay::DaemonLink,
+    /// The daemon leg: link, held frame, forwarded ack, owed ack.
+    daemon: crate::remote::relay::DaemonLeg,
+    /// The viewport's reliable input stream — its offsets continue across a
+    /// re-home (the viewport's outbox never learns a switch happened).
     inbox: crate::remote::sync::InputInbox,
-    held: crate::remote::relay::HeldFrame,
     client_size: (u16, u16),
-    acked_forwarded: u64,
+    /// The client's frame ceiling: the last frame number forwarded on this
+    /// channel, and the base a re-homed leg resumes above.
     last_frame_num: u64,
     /// Last (re)send of the held frame, for the RTO retransmit cadence. Kept
     /// SEPARATE from `last_send` (the heartbeat clock): input-ack Empties
@@ -296,10 +302,6 @@ struct SessionBridge {
     /// `HEARTBEAT_INTERVAL` so the client's "Last contact" liveness stays
     /// fresh; without it a quiet mux session reads as dead.
     last_send: u64,
-    /// An input/resync ack is owed and no visible frame has carried it yet:
-    /// emit an Empty ack frame so the client's input outbox drains without
-    /// waiting for the next daemon frame.
-    ack_due: bool,
     /// Echo-ack maturity (mosh ECHO_TIMEOUT; relay.rs parity): input handed
     /// to the daemon counts as echoed only after the grace period, so the
     /// client validates/retires predictions against a frame that carries it.
@@ -449,7 +451,7 @@ pub(crate) fn mux_peer_loop(
         }
         for ch in &channels {
             if let PeerChannel::Linked(b) = ch {
-                if b.held.is_held() {
+                if b.daemon.held.is_held() {
                     deadline = deadline.min((b.last_retx + conn.rto()).max(now));
                 }
                 deadline = deadline.min((b.last_send + HEARTBEAT_INTERVAL).max(now));
@@ -471,10 +473,10 @@ pub(crate) fn mux_peer_loop(
             match ch {
                 PeerChannel::Linked(b) => {
                     let mut ev = libc::POLLIN;
-                    if !b.link.write.is_empty() {
+                    if !b.daemon.link.write.is_empty() {
                         ev |= libc::POLLOUT;
                     }
-                    fds.push(util::pollfd(b.link.stream.as_raw_fd(), ev));
+                    fds.push(util::pollfd(b.daemon.link.stream.as_raw_fd(), ev));
                 }
                 // A placeholder keeps fd indices aligned with channel
                 // indices; poll ignores fd -1.
@@ -630,20 +632,22 @@ pub(crate) fn mux_peer_loop(
         let mut closed: Vec<(usize, Vec<u8>)> = Vec::new();
         for (i, chp) in channels.iter_mut().enumerate() {
             let PeerChannel::Linked(b) = chp else { continue };
-            let fd = b.link.stream.as_raw_fd();
+            // Valid for the read below ONLY: a re-home in this sweep replaces
+            // the leg, so later uses read the fd live (`b.daemon.fd()`).
+            let fd = b.daemon.fd();
             // Mature the echo ack FIRST (relay.rs ordering), so a frame
             // forwarded below carries it instead of being chased by a
             // redundant Empty — and, like the relay/server_loop, never while
             // this channel's frame is outstanding: a matured ack racing a
             // held echo-bearing frame would make the client cull correct
             // predictions against a pre-echo screen.
-            if !b.held.is_held() && b.echo.update(now) {
-                b.ack_due = true;
+            if !b.daemon.held.is_held() && b.echo.update(now) {
+                b.daemon.ack_due = true;
             }
             let signalled = signalled_bridges.contains(&fd);
             let mut eof = false;
             if signalled {
-                match b.link.read.read_from(fd) {
+                match b.daemon.link.read.read_from(fd) {
                     Ok(0) => eof = true,
                     Ok(_) => {}
                     Err(e) if e.kind() == std::io::ErrorKind::WouldBlock => {}
@@ -654,7 +658,7 @@ pub(crate) fn mux_peer_loop(
             // FDR 0012 §3.1: a daemon Tag::Switch captured here, re-homed
             // AFTER the read loop (so we do not replace b.link mid-iteration).
             let mut switch_to: Option<Vec<u8>> = None;
-            while let Ok(Some(rec)) = b.link.read.next() {
+            while let Ok(Some(rec)) = b.daemon.link.read.next() {
                 match rec.tag {
                     ipc::Tag::Frame => {
                         let Ok(frame) = crate::remote::sync::ServerFrame::decode(&rec.payload)
@@ -666,15 +670,15 @@ pub(crate) fn mux_peer_loop(
                                 | crate::remote::sync::FLAG_OVERLAY);
                         let out = crate::remote::relay::rewrap(
                             frame,
-                            b.link.frame_offset,
+                            b.daemon.link.frame_offset,
                             b.inbox.next_offset(),
                             b.echo.ack(),
                         );
                         b.last_frame_num = out.frame_num;
-                        b.held.hold(out.frame_num, out.encode());
-                        b.ack_due = false;
+                        b.daemon.held.hold(out.frame_num, out.encode());
+                        b.daemon.ack_due = false;
                         if conn.has_remote() {
-                            if let Some(bytes) = b.held.bytes() {
+                            if let Some(bytes) = b.daemon.held.bytes() {
                                 crate::remote::mux::send_session_wire(
                                     &mut conn,
                                     &mut fragmenter,
@@ -737,32 +741,32 @@ pub(crate) fn mux_peer_loop(
                     }
                 }
             }
-            if !b.link.write.is_empty() {
+            if !b.daemon.link.write.is_empty() {
                 // Non-blocking drain: a wedged daemon socket must not stall
                 // the whole sweep (head-of-line across every channel + agent
                 // service). Partial writes stay buffered; POLLOUT re-wakes
-                // the loop to finish. The fd is re-read from the link HERE,
-                // not the `fd` captured above: a re-home in this same sweep
-                // replaced `b.link` (closing the captured fd), and writing
-                // the new link's Init through the stale descriptor failed
-                // and closed the freshly switched channel (posh#184).
-                match util::write_all_retry(b.link.stream.as_raw_fd(), &b.link.write, 0) {
+                // the loop to finish. The fd is read LIVE here, not the
+                // `fd` captured above: a re-home in this same sweep replaced
+                // the leg (closing the captured fd), and writing the new
+                // link's Init through the stale descriptor failed and closed
+                // the freshly switched channel (posh#184).
+                match util::write_all_retry(b.daemon.fd(), &b.daemon.link.write, 0) {
                     Ok(n) => {
-                        b.link.write.drain(..n);
+                        b.daemon.link.write.drain(..n);
                     }
                     Err(_) => eof = true,
                 }
             }
             // Daemon backpressure (relay.rs parity): queued input has not
             // reached the shell, so its echo grace period restarts.
-            if !b.link.write.is_empty() {
+            if !b.daemon.link.write.is_empty() {
                 b.echo.restamp_pending(now);
             }
-            if b.held.is_held()
+            if b.daemon.held.is_held()
                 && conn.has_remote()
                 && now.saturating_sub(b.last_retx) >= conn.rto()
             {
-                if let Some(bytes) = b.held.bytes() {
+                if let Some(bytes) = b.daemon.held.bytes() {
                     crate::remote::mux::send_session_wire(
                         &mut conn,
                         &mut fragmenter,
@@ -782,7 +786,7 @@ pub(crate) fn mux_peer_loop(
             // down). Both send the same frame: the last forwarded frame
             // number plus the current input ack.
             if conn.has_remote()
-                && (b.ack_due || now.saturating_sub(b.last_send) >= HEARTBEAT_INTERVAL)
+                && (b.daemon.ack_due || now.saturating_sub(b.last_send) >= HEARTBEAT_INTERVAL)
             {
                 let mut empty =
                     empty_ack_frame(b.last_frame_num, b.inbox.next_offset(), b.echo.ack());
@@ -794,7 +798,7 @@ pub(crate) fn mux_peer_loop(
                     crate::remote::mux::SESSION_WIRE_DATA,
                     &empty.encode(),
                 );
-                b.ack_due = false;
+                b.daemon.ack_due = false;
                 b.last_send = now;
             }
             if eof {
@@ -902,51 +906,34 @@ fn handle_session_instruction(
                 let target = target.clone();
                 let resume_base = *resume_base;
                 let (rows, cols) = (msg.rows.max(1), msg.cols.max(1));
-                match connect_daemon(&target) {
-                    Ok(stream) => {
-                        let mut link = crate::remote::relay::DaemonLink {
-                            stream,
-                            read: crate::session::ipc::FrameBuffer::new(),
-                            write: Vec::new(),
-                            // posh#162: on a reconnect re-drive the base is the
-                            // client's frame ceiling, so this fresh endpoint's
-                            // rewrap continues numbering above it (rather than
-                            // restarting low and being dropped as stale). 0 on
-                            // an initial open (unchanged).
-                            frame_offset: resume_base,
-                        };
-                        let mut content = crate::remote::relay::content_caps(&msg.caps);
-                        // RFC 0014 §3: the bridge's own identity on Init; the
-                        // riding client's entries follow as Tag::ClientCaps.
-                        content.push(introspect::encode_client_ident(&introspect::Ident {
-                            version: env!("POSH_VERSION").into(),
-                            git_sha: env!("POSH_GIT_SHA").into(),
-                            pid: std::process::id(),
-                            start_unix_ms: unix_now_ms(),
-                        }));
-                        ipc::append_frame(
-                            &mut link.write,
-                            Tag::Init,
-                            &crate::remote::relay::init_payload(rows, cols, &content),
-                        );
-                        ipc::append_frame(
-                            &mut link.write,
-                            Tag::Resize,
-                            &ipc::encode_resize(rows, cols),
-                        );
+                let mut content = crate::remote::relay::content_caps(&msg.caps);
+                // RFC 0014 §3: the bridge's own identity on Init; the
+                // riding client's entries follow as Tag::ClientCaps.
+                content.push(introspect::encode_client_ident(&introspect::Ident {
+                    version: env!("POSH_VERSION").into(),
+                    git_sha: env!("POSH_GIT_SHA").into(),
+                    pid: std::process::id(),
+                    start_unix_ms: unix_now_ms(),
+                }));
+                // posh#162: on a reconnect re-drive the ceiling is the
+                // client's resume base, so this fresh endpoint's leg
+                // continues numbering above it (rather than restarting
+                // low and being dropped as stale). 0 on an initial open.
+                match connect_daemon(&target).and_then(|stream| {
+                    crate::remote::relay::DaemonLeg::link(
+                        stream,
+                        resume_base,
+                        (rows, cols),
+                        &content,
+                    )
+                }) {
+                    Ok(daemon) => {
                         channels[i] = PeerChannel::Linked(Box::new(SessionBridge {
                             chan,
-                            link,
+                            daemon,
                             content,
                             inbox: crate::remote::sync::InputInbox::new(),
-                            held: crate::remote::relay::HeldFrame::default(),
                             client_size: (rows, cols),
-                            // Seeded to the resume base like last_frame_num:
-                            // a client ack at/below the ceiling is for frames
-                            // the surviving daemon's OLD producer numbered,
-                            // and forwarding it would underflow the
-                            // `acked_forwarded - frame_offset` translation.
-                            acked_forwarded: resume_base,
                             // Seed from the resume base (posh#162) so a
                             // heartbeat Empty sent before the first real frame
                             // carries a number at/above the client's ceiling,
@@ -957,7 +944,6 @@ fn handle_session_instruction(
                             // on the next iteration, so the client learns the
                             // channel is live immediately.
                             last_send: 0,
-                            ack_due: false,
                             echo: crate::remote::sync::EchoAck::new(),
                             frame_flags: 0,
                         }));
@@ -979,8 +965,8 @@ fn handle_session_instruction(
                 if !bridge_client_message(b, &msg) {
                     // CLIENT_FLAG_SHUTDOWN: detach and close the channel.
                     let _ = util::write_all_retry(
-                        b.link.stream.as_raw_fd(),
-                        &b.link.write,
+                        b.daemon.link.stream.as_raw_fd(),
+                        &b.daemon.link.write,
                         100,
                     );
                     channels.remove(i);
@@ -991,10 +977,10 @@ fn handle_session_instruction(
         Some(&SESSION_WIRE_CLOSE) => {
             if let Some(i) = idx {
                 if let PeerChannel::Linked(b) = &mut channels[i] {
-                    ipc::append_frame(&mut b.link.write, Tag::Detach, b"");
+                    ipc::append_frame(&mut b.daemon.link.write, Tag::Detach, b"");
                     let _ = util::write_all_retry(
-                        b.link.stream.as_raw_fd(),
-                        &b.link.write,
+                        b.daemon.link.stream.as_raw_fd(),
+                        &b.daemon.link.write,
                         100,
                     );
                 }
@@ -1024,45 +1010,27 @@ fn switch_wire_target(payload: &[u8]) -> Option<String> {
     })
 }
 
-/// FDR 0012 §3.1 remote retarget: re-home a linked channel's `DaemonLink` to
-/// a new session in place. Reuses the reconnect fix's frame continuity —
-/// `frame_offset` seeded from the client's frame ceiling (`last_frame_num`)
-/// so the new daemon's low numbers rewrap above the client's `applied_num`
-/// and its `Full` is not dropped as stale — and re-`Init`s with the SAME
-/// negotiated caps (`b.content`) so the client's consumable caps are not
-/// silently downgraded. Per-channel fresh-attach state (held, ack_due)
-/// resets; `last_frame_num`/`frame_flags` persist — and so does the INPUT
-/// INBOX (posh#186): its offsets are bridge↔viewport stream state, not
-/// daemon state, and the viewport's outbox keeps counting across the
-/// switch, so a reset inbox rejects every post-switch keystroke as a gap
-/// while its Empties advertise ack 0, and input deadlocks. `acked_forwarded`
-/// is seeded to the ceiling: an ack at/below it belongs to the OLD session
-/// (and `acked_forwarded - frame_offset` must not underflow). `Err` (the
-/// target is gone) is the caller's cue to close the channel.
+/// FDR 0012 §3.1 remote retarget: re-home a linked channel to a new session
+/// in place by replacing its daemon leg — a fresh link ABOVE the client's
+/// frame ceiling (`last_frame_num`, the reconnect fix's continuity: the new
+/// daemon's low numbers rewrap above `applied_num`, so its `Full` is not
+/// dropped as stale), re-`Init`'d with the SAME negotiated caps
+/// (`b.content`, no silent downgrade). Everything viewport-side — the input
+/// inbox (posh#186), echo maturity, size, ceiling, flags — is untouched by
+/// construction. `Err` (the target is gone) is the caller's cue to close
+/// the channel.
 fn rehome_bridge(
     b: &mut SessionBridge,
     target: &str,
     connect_daemon: &mut dyn FnMut(&str) -> Result<std::os::unix::net::UnixStream>,
 ) -> Result<()> {
-    use crate::session::ipc::{self, Tag};
     let stream = connect_daemon(target)?;
-    let mut link = crate::remote::relay::DaemonLink {
+    b.daemon = crate::remote::relay::DaemonLeg::link(
         stream,
-        read: crate::session::ipc::FrameBuffer::new(),
-        write: Vec::new(),
-        frame_offset: b.last_frame_num,
-    };
-    let (rows, cols) = b.client_size;
-    ipc::append_frame(
-        &mut link.write,
-        Tag::Init,
-        &crate::remote::relay::init_payload(rows, cols, &b.content),
-    );
-    ipc::append_frame(&mut link.write, Tag::Resize, &ipc::encode_resize(rows, cols));
-    b.link = link;
-    b.held = crate::remote::relay::HeldFrame::default();
-    b.acked_forwarded = b.last_frame_num;
-    b.ack_due = false;
+        b.last_frame_num,
+        b.client_size,
+        &b.content,
+    )?;
     Ok(())
 }
 
@@ -1072,14 +1040,14 @@ fn bridge_client_message(b: &mut SessionBridge, msg: &crate::remote::sync::Clien
     if msg.rows > 0 && msg.cols > 0 && (msg.rows, msg.cols) != b.client_size {
         b.client_size = (msg.rows, msg.cols);
         ipc::append_frame(
-            &mut b.link.write,
+            &mut b.daemon.link.write,
             Tag::Resize,
             &ipc::encode_resize(msg.rows, msg.cols),
         );
     }
     if let Some(new_input) = b.inbox.accept(msg.input_base, &msg.input) {
-        ipc::append_frame(&mut b.link.write, Tag::Input, new_input);
-        b.ack_due = true;
+        ipc::append_frame(&mut b.daemon.link.write, Tag::Input, new_input);
+        b.daemon.ack_due = true;
         b.echo.record(b.inbox.next_offset(), now_ms());
     }
     // RFC 0014 §3: the riding client's unsolicited introspection entries go
@@ -1087,25 +1055,13 @@ fn bridge_client_message(b: &mut SessionBridge, msg: &crate::remote::sync::Clien
     let forwarded = crate::remote::relay::forwarded_client_caps(&msg.caps);
     if !forwarded.is_empty() {
         ipc::append_frame(
-            &mut b.link.write,
+            &mut b.daemon.link.write,
             Tag::ClientCaps,
             &caps::encode_table(&forwarded),
         );
     }
-    b.held.drop_if_acked(msg.acked_frame);
     let resync = msg.flags & crate::remote::sync::CLIENT_FLAG_RESYNC != 0;
-    if msg.acked_frame > b.acked_forwarded || resync {
-        b.acked_forwarded = b.acked_forwarded.max(msg.acked_frame);
-        let ack_flags = if resync { ipc::FRAME_ACK_RESYNC } else { 0 };
-        ipc::append_frame(
-            &mut b.link.write,
-            Tag::FrameAck,
-            &ipc::encode_frame_ack(b.acked_forwarded - b.link.frame_offset, ack_flags),
-        );
-        if resync {
-            b.held.clear();
-        }
-    }
+    b.daemon.forward_ack(msg.acked_frame, resync);
     // FDR 0008 escape-to-shell (posh#178): the roaming client requests the
     // overlay with CLIENT_FLAG_ESCAPE, which the Arch-A server reads directly
     // — but on the M2 channel path the frame producer is the session daemon,
@@ -1113,10 +1069,10 @@ fn bridge_client_message(b: &mut SessionBridge, msg: &crate::remote::sync::Clien
     // overlay.is_none() guard makes a repeat idempotent (the flag is one-shot
     // client-side, but a retransmit is harmless).
     if msg.flags & crate::remote::sync::CLIENT_FLAG_ESCAPE != 0 {
-        ipc::append_frame(&mut b.link.write, Tag::Shell, b"");
+        ipc::append_frame(&mut b.daemon.link.write, Tag::Shell, b"");
     }
     if msg.flags & crate::remote::sync::CLIENT_FLAG_SHUTDOWN != 0 {
-        ipc::append_frame(&mut b.link.write, Tag::Detach, b"");
+        ipc::append_frame(&mut b.daemon.link.write, Tag::Detach, b"");
         return false;
     }
     true
@@ -2689,20 +2645,17 @@ mod tests {
         let (stream, peer) = std::os::unix::net::UnixStream::pair().unwrap();
         let b = SessionBridge {
             chan: channel::ChannelId::new(false, channel::KIND_SESSION, 2),
-            link: crate::remote::relay::DaemonLink {
+            daemon: crate::remote::relay::DaemonLeg::adopt(crate::remote::relay::DaemonLink {
                 stream,
                 read: crate::session::ipc::FrameBuffer::new(),
                 write: Vec::new(),
                 frame_offset: 0,
-            },
+            }),
             inbox: crate::remote::sync::InputInbox::new(),
-            held: crate::remote::relay::HeldFrame::default(),
             client_size: (24, 80),
-            acked_forwarded: 0,
             last_frame_num: 0,
             last_retx: 0,
             last_send: 0,
-            ack_due: false,
             echo: crate::remote::sync::EchoAck::new(),
             frame_flags: 0,
             content: Vec::new(),
@@ -2747,22 +2700,22 @@ mod tests {
         rehome_bridge(&mut b, "work/s-1", &mut connect).unwrap();
         assert_eq!(seen.into_inner().as_deref(), Some("work/s-1"));
         assert_eq!(
-            b.link.frame_offset, 512,
+            b.daemon.link.frame_offset, 512,
             "the new link continues numbering above the client's ceiling"
         );
         // The re-Init (lossy Init + Resize) is queued to the new daemon.
         let mut fb = crate::session::ipc::FrameBuffer::new();
-        fb.feed(&b.link.write);
+        fb.feed(&b.daemon.link.write);
         let first = fb.next().unwrap().unwrap();
         assert_eq!(first.tag, crate::session::ipc::Tag::Init);
         // Fresh-attach state reset; continuity fields kept.
-        assert!(!b.ack_due);
+        assert!(!b.daemon.ack_due);
         assert_eq!(b.last_frame_num, 512, "the ceiling persists across re-home");
         // posh#186: the input inbox persists — the viewport's next keystroke
         // (input_base 40, the offset its outbox reached before the switch)
         // must reach the NEW daemon as Tag::Input, not be dropped as a gap.
         assert_eq!(b.inbox.next_offset(), 40, "inbox offsets survive the re-home");
-        b.link.write.clear();
+        b.daemon.link.write.clear();
         let msg = crate::remote::sync::ClientMessage {
             flags: 0,
             caps: Vec::new(),
@@ -2777,9 +2730,9 @@ mod tests {
         };
         assert!(bridge_client_message(&mut b, &msg));
         assert_eq!(b.inbox.next_offset(), 43);
-        assert_eq!(b.acked_forwarded, 512, "an old-session ack does not move the seed");
+        assert_eq!(b.daemon.acked_forwarded, 512, "an old-session ack does not move the seed");
         let mut fb = crate::session::ipc::FrameBuffer::new();
-        fb.feed(&b.link.write);
+        fb.feed(&b.daemon.link.write);
         let mut input = None;
         while let Ok(Some(rec)) = fb.next() {
             match rec.tag {
@@ -2809,7 +2762,7 @@ mod tests {
         };
         assert!(bridge_client_message(&mut b, &msg), "escape alone does not detach");
         let mut fb = crate::session::ipc::FrameBuffer::new();
-        fb.feed(&b.link.write);
+        fb.feed(&b.daemon.link.write);
         let mut saw_shell = false;
         while let Ok(Some(frame)) = fb.next() {
             if frame.tag == crate::session::ipc::Tag::Shell {
@@ -2831,7 +2784,7 @@ mod tests {
         };
         bridge_client_message(&mut b2, &quiet);
         let mut fb2 = crate::session::ipc::FrameBuffer::new();
-        fb2.feed(&b2.link.write);
+        fb2.feed(&b2.daemon.link.write);
         while let Ok(Some(frame)) = fb2.next() {
             assert_ne!(
                 frame.tag,
@@ -4492,6 +4445,174 @@ mod tests {
             std::thread::sleep(std::time::Duration::from_millis(5));
         }
         assert_eq!(seen, b"still", "channel B must keep bridging after A's EOF");
+        h.join().unwrap();
+        std::fs::remove_dir_all(&base).ok();
+    }
+
+    /// Write one daemon `Tag::Frame` (an Empty body numbered `frame_num`) onto
+    /// a fake daemon's end of its socketpair.
+    fn write_peer_frame(stream: &std::os::unix::net::UnixStream, frame_num: u64) {
+        use std::io::Write;
+        let frame = sync::ServerFrame {
+            flags: 0,
+            caps: caps::own_table(&[]),
+            frame_num,
+            input_ack: 0,
+            echo_ack: 0,
+            body: sync::FrameBody::Empty,
+        };
+        let mut out = Vec::new();
+        ipc::append_frame(&mut out, ipc::Tag::Frame, &frame.encode());
+        (&*stream).write_all(&out).unwrap();
+    }
+
+    fn wire_frame_num_is(m: &[u8], n: u64) -> bool {
+        m.first() == Some(&crate::remote::mux::SESSION_WIRE_DATA)
+            && sync::ServerFrame::decode(&m[1..]).is_ok_and(|f| f.frame_num == n)
+    }
+
+    /// Poll a fake daemon's end until `done` is satisfied by the tags read so
+    /// far (bounded), returning every `(tag, payload)` seen.
+    fn daemon_tags_until(
+        stream: &std::os::unix::net::UnixStream,
+        buf: &mut ipc::FrameBuffer,
+        mut done: impl FnMut(&[(ipc::Tag, Vec<u8>)]) -> bool,
+    ) -> Vec<(ipc::Tag, Vec<u8>)> {
+        let mut seen = Vec::new();
+        let deadline = now_ms() + 8_000;
+        while now_ms() < deadline && !done(&seen) {
+            seen.extend(daemon_tags(stream, buf));
+            std::thread::sleep(std::time::Duration::from_millis(5));
+        }
+        seen
+    }
+
+    /// FDR 0012 §3.1 end-to-end over a session channel (posh#185): OPEN to
+    /// A, deliver a daemon `Tag::Switch` to B, and assert — through the real
+    /// sweep — that the channel SURVIVES the re-home (posh#184: the stale-fd
+    /// write closed it right here), the client is told (`SESSION_WIRE_SWITCH`),
+    /// B is Init'd lossy, B's frames reach the client numbered ABOVE A's
+    /// ceiling carrying the PERSISTED input ack, post-switch input at the
+    /// viewport's continuing offset reaches B (posh#186: the reset inbox
+    /// dropped it as a gap), an ack for an A-numbered frame is not forwarded
+    /// to B, and an ack for B's frame is translated into B's numbering.
+    #[test]
+    fn mux_peer_switch_rehomes_channel_with_frame_and_input_continuity() {
+        let base = peer_temp_base();
+        let (h, mut wire, daemons) = start_peer((63800, 63809), &base);
+        let mut frag = Fragmenter::new();
+        let mut asm = FragmentAssembly::new();
+        let chan = channel::ChannelId::new(false, channel::KIND_SESSION, 2);
+        peer_send(&mut wire, &mut frag, chan, crate::remote::mux::SESSION_WIRE_OPEN, b"a");
+        peer_send(
+            &mut wire,
+            &mut frag,
+            chan,
+            crate::remote::mux::SESSION_WIRE_DATA,
+            &cm(24, 80, b"hi", 0, 0),
+        );
+        wait_daemon(&daemons, 1);
+        let (target_a, a_stream) = daemons.lock().unwrap().remove(0);
+        assert_eq!(target_a, "a");
+        // A's producer reaches frame 3: the client's ceiling is 3.
+        write_peer_frame(&a_stream, 3);
+        peer_recv_until(&mut wire, &mut asm, |c, m| c == chan && wire_frame_num_is(m, 3));
+
+        // The session daemon routes a switch to this viewport's channel.
+        {
+            use std::io::Write;
+            let mut rec = Vec::new();
+            ipc::append_frame(
+                &mut rec,
+                ipc::Tag::Switch,
+                &ipc::encode_switch_target("default", "b"),
+            );
+            (&a_stream).write_all(&rec).unwrap();
+        }
+        // The endpoint connects B through the connector seam and notifies
+        // the client with the wire target.
+        wait_daemon(&daemons, 1);
+        let (target_b, b_stream) = daemons.lock().unwrap().remove(0);
+        assert_eq!(target_b, "b");
+        let (_, m) = peer_recv_until(&mut wire, &mut asm, |c, m| {
+            c == chan && m.first() == Some(&crate::remote::mux::SESSION_WIRE_SWITCH)
+        });
+        assert_eq!(&m[1..], b"b", "the client learns the switched target");
+
+        // B is Init'd as a lossy frame client — which also proves the channel
+        // survived the re-home sweep (posh#184 closed it before this write).
+        let mut bbuf = ipc::FrameBuffer::new();
+        let seen = daemon_tags_until(&b_stream, &mut bbuf, |seen| {
+            seen.iter().any(|(t, _)| *t == ipc::Tag::Init)
+        });
+        let lossy_init = seen.iter().any(|(t, p)| {
+            *t == ipc::Tag::Init
+                && p
+                    .get(4..)
+                    .and_then(|b| caps::decode_table(b).ok())
+                    .is_some_and(|(t, _)| caps::find(&t, caps::CAP_LOSSY).is_some())
+        });
+        assert!(lossy_init, "B must be Init'd as a lossy frame client (channel alive)");
+
+        // B's first frame (1) reaches the client numbered ABOVE A's ceiling
+        // (3 + 1) and carries the PERSISTED input ack (the 2 bytes of "hi"
+        // accepted before the switch — the inbox is viewport state).
+        write_peer_frame(&b_stream, 1);
+        let (_, m) = peer_recv_until(&mut wire, &mut asm, |c, m| c == chan && wire_frame_num_is(m, 4));
+        let f = sync::ServerFrame::decode(&m[1..]).unwrap();
+        assert_eq!(f.input_ack, 2, "the input inbox persists across the re-home (posh#186)");
+
+        // Post-switch input at the viewport's CONTINUING offset (base 2),
+        // acking an A-numbered frame (3): the input reaches B; the stale ack
+        // is for A's producer and must NOT be forwarded to B.
+        let msg = sync::ClientMessage {
+            flags: 0,
+            caps: caps::own_table(&[]),
+            acked_frame: 3,
+            rows: 24,
+            cols: 80,
+            input_base: 2,
+            input: b"zz".to_vec(),
+        };
+        peer_send(&mut wire, &mut frag, chan, crate::remote::mux::SESSION_WIRE_DATA, &msg.encode());
+        let seen = daemon_tags_until(&b_stream, &mut bbuf, |seen| {
+            seen.iter().any(|(t, _)| *t == ipc::Tag::Input)
+        });
+        let input: Vec<u8> = seen
+            .iter()
+            .filter(|(t, _)| *t == ipc::Tag::Input)
+            .flat_map(|(_, p)| p.iter().copied())
+            .collect();
+        assert_eq!(input, b"zz", "post-switch input must reach the NEW daemon (posh#186)");
+        assert!(
+            !seen.iter().any(|(t, _)| *t == ipc::Tag::FrameAck),
+            "an ack for an A-numbered frame must not be forwarded to B"
+        );
+
+        // An ack for B's frame (client number 4) is translated into B's own
+        // numbering: frame 1.
+        let msg = sync::ClientMessage {
+            flags: 0,
+            caps: caps::own_table(&[]),
+            acked_frame: 4,
+            rows: 24,
+            cols: 80,
+            input_base: 4,
+            input: Vec::new(),
+        };
+        peer_send(&mut wire, &mut frag, chan, crate::remote::mux::SESSION_WIRE_DATA, &msg.encode());
+        let seen = daemon_tags_until(&b_stream, &mut bbuf, |seen| {
+            seen.iter().any(|(t, _)| *t == ipc::Tag::FrameAck)
+        });
+        let ack = seen
+            .iter()
+            .find(|(t, _)| *t == ipc::Tag::FrameAck)
+            .and_then(|(_, p)| ipc::decode_frame_ack(p))
+            .map(|(n, _)| n);
+        assert_eq!(ack, Some(1), "client ack 4 above ceiling 3 is B's frame 1");
+
+        drop(a_stream);
+        drop(b_stream);
         h.join().unwrap();
         std::fs::remove_dir_all(&base).ok();
     }

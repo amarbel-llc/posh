@@ -100,6 +100,107 @@ pub(crate) struct DaemonLink {
     pub(crate) frame_offset: u64,
 }
 
+/// ONE daemon connection's bridge state — everything a bridge rebuilds when
+/// it (re)links to a session daemon, and NOTHING that belongs to the
+/// viewport side. Lifetime is the partition (posh#184/#186 post-mortem):
+///
+/// - **daemon leg** (this struct): the link, the single held unacked frame,
+///   the highest client ack forwarded, the owed-ack flag. A resume-base
+///   Link, and an FDR 0012 §3.1 re-home, each REPLACE the whole leg — there
+///   is no per-field reset list to get wrong.
+/// - **viewport side** (the owner's remaining fields): the reliable input
+///   inbox, echo-ack maturity, geometry, the frame ceiling, the sticky
+///   frame flags, the negotiated caps. The viewport's outbox and applied
+///   frame number keep counting across a switch, so these MUST persist.
+///
+/// The ONE constructor seeds both offset translations from the same
+/// `ceiling`, so an ack for a frame an EARLIER producer numbered can never
+/// reach `acked_forwarded - frame_offset` below zero ([`Self::forward_ack`]).
+/// Held by the per-invocation relay ([`relay_loop`]) and per channel by the
+/// M2 endpoint (`server.rs::SessionBridge`).
+pub(crate) struct DaemonLeg {
+    pub(crate) link: DaemonLink,
+    pub(crate) held: HeldFrame,
+    /// Highest client `acked_frame` (CLIENT numbering) already forwarded to
+    /// the daemon as a `Tag::FrameAck`. Invariant: `>= link.frame_offset`.
+    pub(crate) acked_forwarded: u64,
+    /// An input/resync ack is owed and no visible frame has carried it yet.
+    pub(crate) ack_due: bool,
+}
+
+impl DaemonLeg {
+    /// Link a fresh daemon stream ABOVE `ceiling` — the client's frame
+    /// ceiling: 0 on a first attach, the resume base on a reconnect
+    /// (posh#162), the bridge's `last_frame_num` on a re-home (FDR 0012) —
+    /// queueing the §3 lossy `Init` (`content` + size) and the `Resize`.
+    /// The stream is made non-blocking here (the loops poll it).
+    pub(crate) fn link(
+        stream: UnixStream,
+        ceiling: u64,
+        (rows, cols): (u16, u16),
+        content: &[Cap],
+    ) -> Result<DaemonLeg> {
+        stream.set_nonblocking(true)?;
+        let mut link = DaemonLink {
+            stream,
+            read: FrameBuffer::new(),
+            write: Vec::new(),
+            frame_offset: ceiling,
+        };
+        ipc::append_frame(&mut link.write, Tag::Init, &init_payload(rows, cols, content));
+        ipc::append_frame(&mut link.write, Tag::Resize, &ipc::encode_resize(rows, cols));
+        Ok(DaemonLeg::adopt(link))
+    }
+
+    /// Adopt a link whose `Init` the caller already queued or sent (the
+    /// relay's path-selection read consumes the daemon's first record before
+    /// the loop starts). Seeds from the link's own `frame_offset`.
+    pub(crate) fn adopt(link: DaemonLink) -> DaemonLeg {
+        DaemonLeg {
+            acked_forwarded: link.frame_offset,
+            link,
+            held: HeldFrame::default(),
+            ack_due: false,
+        }
+    }
+
+    /// The daemon socket's fd, read LIVE — never capture it across a sweep
+    /// that may re-home the leg (posh#184: the captured fd of the replaced
+    /// link was closed, and draining through it closed the channel).
+    pub(crate) fn fd(&self) -> std::os::fd::RawFd {
+        self.link.stream.as_raw_fd()
+    }
+
+    /// Apply the client's cumulative `acked_frame`: release the held frame it
+    /// confirms, and forward a `Tag::FrameAck` (in the DAEMON's numbering) so
+    /// the daemon advances its diff base — `resync` additionally sets
+    /// `FRAME_ACK_RESYNC` (the daemon drops its base; the diverged held frame
+    /// is discarded). An ack at/below the seed is for a frame an earlier
+    /// producer numbered and is NOT forwarded. Returns whether an ack was
+    /// queued.
+    pub(crate) fn forward_ack(&mut self, acked_frame: u64, resync: bool) -> bool {
+        self.held.drop_if_acked(acked_frame);
+        if acked_frame <= self.acked_forwarded && !resync {
+            return false;
+        }
+        self.acked_forwarded = self.acked_forwarded.max(acked_frame);
+        let Some(daemon_num) = self.acked_forwarded.checked_sub(self.link.frame_offset) else {
+            debug_assert!(false, "acked_forwarded below frame_offset: leg seeded wrong");
+            return false;
+        };
+        let ack_flags = if resync { ipc::FRAME_ACK_RESYNC } else { 0 };
+        ipc::append_frame(
+            &mut self.link.write,
+            Tag::FrameAck,
+            &ipc::encode_frame_ack(daemon_num, ack_flags),
+        );
+        if resync {
+            self.held.clear();
+        }
+        true
+    }
+}
+
 /// The client's CONTENT caps to forward into the daemon Init: MORPH / SCROLLBACK
 /// / BASE_SUM (RFC 0008 §4). The agent caps (6/7/8) are relay-TERMINATED (Task
 /// 3.2) and MUST NOT reach the daemon; CAP_DIAG/CAP_METRICS are answered by the
@@ -354,9 +455,16 @@ pub(crate) fn run(
     //    server against a FRESH `posh attach` client of the same daemon, reusing
     //    the already-peered `conn`. No flag day — either daemon works.
     match first_daemon_record(&mut link, &mut conn, channels)? {
-        FirstRecord::Frame(frame) => {
-            relay_loop(conn, link, (rows, cols), agent, Some(frame), channels, content)
-        }
+        FirstRecord::Frame(frame) => relay_loop(
+            conn,
+            link,
+            (rows, cols),
+            agent,
+            Some(frame),
+            channels,
+            content,
+            &mut switch_connector,
+        ),
         FirstRecord::Output => {
             drop(link); // shed the dead frame-client before the fresh attach
             fallback_to_server(conn, cfg, name, command, agent, auth_env, rows, cols, channels)
@@ -586,13 +694,22 @@ fn wait_for_handshake(conn: &mut Connection, enveloped: bool) -> Result<(u16, u1
     }
 }
 
+/// The production FDR 0012 §3.1 switch connector for [`relay_loop`]:
+/// connect-or-create the `[group/]session` daemon (creation runs the default
+/// `$SHELL`, as the endpoint's `connect_named_daemon` does).
+fn switch_connector(group: &str, session: &str) -> Result<UnixStream> {
+    let cfg = Config::new(group)?;
+    session::connect_or_create(&cfg, session, None)
+}
+
 /// The relay poll loop (a substituted `server_loop`: the daemon socket fd
 /// replaces the PTY fd, and there is no `Terminal`/`FrameProducer`/`Overlay`).
 /// Forwards the daemon `ServerFrame` stream out to the UDP client and the client's
 /// input/resize/frame-acks back to the daemon.
+#[allow(clippy::too_many_arguments)] // the connector seam tipped it to 8; same precedent as forward_daemon_frame
 fn relay_loop(
     mut conn: Connection,
-    mut link: DaemonLink,
+    link: DaemonLink,
     mut client_size: (u16, u16),
     mut agent: Option<AgentEndpoint>,
     first_frame: Option<ServerFrame>,
@@ -603,10 +720,19 @@ fn relay_loop(
     // re-Inits with these, so the client's caps are not downgraded. Empty
     // when a caller never switches (the tests).
     content: Vec<Cap>,
+    // The FDR 0012 §3.1 switch connector: `(group, session)` → the target
+    // session daemon's stream (production: `connect_or_create`). A seam so
+    // the in-process drive can hand the relay a socketpair for the target.
+    connect_switch: &mut dyn FnMut(&str, &str) -> Result<UnixStream>,
 ) -> Result<()> {
     let mut fragmenter = Fragmenter::new();
     let mut assembly = FragmentAssembly::new();
+    // The viewport-side reliable input stream: persists across a re-home
+    // (posh#186) — it is NOT part of the daemon leg.
     let mut inbox = InputInbox::new();
+    // The daemon leg: link + held frame + forwarded ack + owed ack. A
+    // re-home replaces it wholesale (see `DaemonLeg`).
+    let mut leg = DaemonLeg::adopt(link);
     // Echo-ack maturity (mosh ECHO_TIMEOUT, as `server_loop` keeps it): input
     // forwarded to the daemon counts as echoed into the screen only after the
     // grace period, so the client validates/retires predictions against a
@@ -634,17 +760,13 @@ fn relay_loop(
     // peer-liveness gate (AGENT_PEER_ACTIVE) — a roamed-away peer fast-fails a
     // blocked `git push` rather than hanging it.
     let mut last_heard = util::now_ms();
-    // Highest UDP-client `acked_frame` already forwarded to the daemon as a
-    // `Tag::FrameAck`, so the daemon advances its diff base (RFC 0008 §3).
-    let mut acked_forwarded = 0u64;
     // The last frame number forwarded to the UDP client, reused as the number of
     // the final `FLAG_SHUTDOWN` frame and the heartbeat Empty frame (an Empty body
-    // advances no apply state).
+    // advances no apply state). Viewport-side: the ceiling a re-home resumes above.
     let mut last_frame_num = 0u64;
-    // The single held unacked frame (O(1) retransmit buffer, RFC 0008 §3) and the
-    // ms clock of its last (re)send — also the heartbeat's last-send clock,
-    // exactly as `server.rs` shares one `last_send` for retransmit + heartbeat.
-    let mut held = HeldFrame::default();
+    // The ms clock of the held frame's last (re)send — also the heartbeat's
+    // last-send clock, exactly as `server.rs` shares one `last_send` for
+    // retransmit + heartbeat. (The held frame itself lives on `leg`.)
     let mut last_send = 0u64;
     // RFC 0013 introspection: parsed per-message like the other caps. The
     // relay answers from its OWN transport state — content_caps never
@@ -674,7 +796,7 @@ fn relay_loop(
             frame,
             &mut conn,
             &mut fragmenter,
-            link.frame_offset,
+            leg.link.frame_offset,
             &inbox,
             echo.ack(),
             &mut agent_stream,
@@ -682,7 +804,7 @@ fn relay_loop(
             agent.is_some(),
             // Pre-loop: no client message parsed yet, so no requests.
             &[],
-            &mut held,
+            &mut leg.held,
             &mut last_frame_num,
             &mut last_send,
             &mut last_agent_send,
@@ -726,7 +848,7 @@ fn relay_loop(
 
         let timeout = if conn.has_remote() {
             let mut deadline = last_send + sync::HEARTBEAT_INTERVAL;
-            if held.is_held() {
+            if leg.held.is_held() {
                 deadline = deadline.min(last_send + conn.rto());
             }
             if agent_out_pending {
@@ -757,10 +879,10 @@ fn relay_loop(
 
         let mut fds = vec![util::pollfd(conn.raw_fd(), libc::POLLIN)];
         let mut link_events = libc::POLLIN;
-        if !link.write.is_empty() {
+        if !leg.link.write.is_empty() {
             link_events |= libc::POLLOUT;
         }
-        fds.push(util::pollfd(link.stream.as_raw_fd(), link_events));
+        fds.push(util::pollfd(leg.fd(), link_events));
         // Agent-forwarding fds (FDR 0004): the listener then each open channel, in
         // `AgentEndpoint::pollfds` order. `agent_fd_base` is the index of the
         // first; `usize::MAX` when forwarding is inactive. Lifted from `server.rs`.
@@ -789,7 +911,7 @@ fn relay_loop(
         // lost/held echo-bearing frame would judge correct predictions
         // "contradicted" against a pre-echo screen. Held entries keep aging
         // and mature the iteration after the frame is acked.
-        let mut echo_advanced = if held.is_held() { false } else { echo.update(now) };
+        let mut echo_advanced = if leg.held.is_held() { false } else { echo.update(now) };
 
         // --- UDP client -> daemon ---
         let mut winding_down = false;
@@ -852,7 +974,7 @@ fn relay_loop(
                         let forwarded = forwarded_client_caps(&msg.caps);
                         if !forwarded.is_empty() {
                             ipc::append_frame(
-                                &mut link.write,
+                                &mut leg.link.write,
                                 Tag::ClientCaps,
                                 &caps::encode_table(&forwarded),
                             );
@@ -901,7 +1023,7 @@ fn relay_loop(
                         if msg.rows > 0 && msg.cols > 0 && (msg.rows, msg.cols) != client_size {
                             client_size = (msg.rows, msg.cols);
                             ipc::append_frame(
-                                &mut link.write,
+                                &mut leg.link.write,
                                 Tag::Resize,
                                 &ipc::encode_resize(msg.rows, msg.cols),
                             );
@@ -909,49 +1031,31 @@ fn relay_loop(
                         // New input bytes -> Tag::Input. Idempotent under the
                         // cumulative retransmit stream via InputInbox.
                         if let Some(new_input) = inbox.accept(msg.input_base, &msg.input) {
-                            ipc::append_frame(&mut link.write, Tag::Input, new_input);
+                            ipc::append_frame(&mut leg.link.write, Tag::Input, new_input);
                             // Handed to the daemon now: it matures into an
                             // echo ack ECHO_TIMEOUT from here.
                             echo.record(inbox.next_offset(), now);
                         }
-                        // Drop the held frame once the client confirms it via the
-                        // cumulative ack: it has the frame, nothing to retransmit.
-                        held.drop_if_acked(msg.acked_frame);
-                        // Frame-ack / resync -> Tag::FrameAck so the daemon moves
-                        // its diff base. CLIENT_FLAG_RESYNC (a client base-sum
-                        // divergence) additionally sets FRAME_ACK_RESYNC so the
-                        // daemon drops its base and its next frame is a recovering
-                        // Full; the held frame diverged, so discard it too.
+                        // Cumulative frame ack / resync: release the held frame
+                        // the client confirms and forward a Tag::FrameAck so the
+                        // daemon moves its diff base (RESYNC: drops it, next frame
+                        // is a recovering Full; the diverged held frame goes too).
                         let resync = msg.flags & sync::CLIENT_FLAG_RESYNC != 0;
-                        if msg.acked_frame > acked_forwarded || resync {
-                            acked_forwarded = acked_forwarded.max(msg.acked_frame);
-                            let ack_flags = if resync { ipc::FRAME_ACK_RESYNC } else { 0 };
-                            ipc::append_frame(
-                                &mut link.write,
-                                Tag::FrameAck,
-                                &ipc::encode_frame_ack(
-                                    acked_forwarded - link.frame_offset,
-                                    ack_flags,
-                                ),
-                            );
-                            if resync {
-                                held.clear();
-                            }
-                        }
+                        leg.forward_ack(msg.acked_frame, resync);
                         // FDR 0008 escape-to-shell (posh#178): bridge the
                         // client's CLIENT_FLAG_ESCAPE to the daemon's Tag::Shell
                         // — the daemon (not the relay) owns the overlay in the
                         // single-model architecture. The daemon's overlay.is_none()
                         // guard makes a repeat idempotent.
                         if msg.flags & sync::CLIENT_FLAG_ESCAPE != 0 {
-                            ipc::append_frame(&mut link.write, Tag::Shell, b"");
+                            ipc::append_frame(&mut leg.link.write, Tag::Shell, b"");
                         }
                         // Client quit (mosh Ctrl-^ .): FDR 0011 durable sessions
                         // -> Tag::Detach (leave the session running); explicit
                         // kill stays a palette-only action. Then wind the relay
                         // down.
                         if msg.flags & sync::CLIENT_FLAG_SHUTDOWN != 0 {
-                            ipc::append_frame(&mut link.write, Tag::Detach, b"");
+                            ipc::append_frame(&mut leg.link.write, Tag::Detach, b"");
                             winding_down = true;
                         }
                     }
@@ -1007,9 +1111,9 @@ fn relay_loop(
             peer_wants_state,
             &caps::ServerDiag {
                 current_num: last_frame_num,
-                acked_num: last_frame_num.saturating_sub(held.is_held() as u64),
+                acked_num: last_frame_num.saturating_sub(leg.held.is_held() as u64),
                 term_gen: 0,
-                outstanding: held.is_held() as u32,
+                outstanding: leg.held.is_held() as u32,
                 pty_open: true, // the daemon link is open while this loop runs
                 pid: std::process::id(),
                 agent: agent
@@ -1026,10 +1130,10 @@ fn relay_loop(
         // to survive.
         let mut switch_to: Option<Vec<u8>> = None;
         if fds[1].revents & libc::POLLIN != 0 {
-            match link.read.read_from(link.stream.as_raw_fd()) {
+            match leg.link.read.read_from(leg.fd()) {
                 Ok(0) => return Ok(()), // daemon closed the socket
                 Ok(_) => loop {
-                    match link.read.next() {
+                    match leg.link.read.next() {
                         Ok(Some(frame)) => match frame.tag {
                             Tag::Frame => {
                                 let daemon_frame = ServerFrame::decode(&frame.payload)?;
@@ -1039,14 +1143,14 @@ fn relay_loop(
                                     daemon_frame,
                                     &mut conn,
                                     &mut fragmenter,
-                                    link.frame_offset,
+                                    leg.link.frame_offset,
                                     &inbox,
                                     echo.ack(),
                                     &mut agent_stream,
                                     agent_seen,
                                     agent.is_some(),
                                     &intro_caps,
-                                    &mut held,
+                                    &mut leg.held,
                                     &mut last_frame_num,
                                     &mut last_send,
                                     &mut last_agent_send,
@@ -1105,44 +1209,20 @@ fn relay_loop(
             }
         }
 
-        // FDR 0012 §3.1 re-home: swap the relay's DaemonLink to the switch
-        // target in place, carrying frame continuity (frame_offset =
-        // last_frame_num, so the new session's low numbers rewrap above the
-        // client's applied_num) and re-Initing with the retained caps. A
-        // failed connect ends the relay (the client falls back / exits).
+        // FDR 0012 §3.1 re-home: replace the daemon leg wholesale — a fresh
+        // link to the switch target ABOVE the client's ceiling (so the new
+        // session's low numbers rewrap above applied_num), re-Init'd with
+        // the retained caps. The viewport side (inbox, echo, flags,
+        // last_frame_num) is untouched by construction. A failed connect
+        // ends the relay (the client falls back / exits).
         if let Some(payload) = switch_to {
             let (group, session) =
                 ipc::decode_switch_target(&payload).expect("validated above");
-            let (rows, cols) = client_size;
-            match Config::new(&group)
-                .and_then(|cfg| session::connect_or_create(&cfg, &session, None))
+            match connect_switch(&group, &session)
+                .and_then(|stream| DaemonLeg::link(stream, last_frame_num, client_size, &content))
             {
-                Ok(stream) => {
-                    stream.set_nonblocking(true)?;
-                    let mut new_link = DaemonLink {
-                        stream,
-                        read: FrameBuffer::new(),
-                        write: Vec::new(),
-                        frame_offset: last_frame_num,
-                    };
-                    ipc::append_frame(
-                        &mut new_link.write,
-                        Tag::Init,
-                        &init_payload(rows, cols, &content),
-                    );
-                    ipc::append_frame(
-                        &mut new_link.write,
-                        Tag::Resize,
-                        &ipc::encode_resize(rows, cols),
-                    );
-                    link = new_link;
-                    held = HeldFrame::default();
-                    // The input inbox is NOT reset (posh#186): its offsets
-                    // are relay↔client stream state the client's outbox
-                    // continues across the switch. acked_forwarded moves to
-                    // the ceiling so an ack for an old-session frame is
-                    // ignored rather than underflowing the offset translation.
-                    acked_forwarded = last_frame_num;
+                Ok(new_leg) => {
+                    leg = new_leg;
                     util::log_write(
                         "info",
                         &format!("relay retargeted to {group}/{session}"),
@@ -1164,10 +1244,10 @@ fn relay_loop(
         // retirement it exists to time. The socket is non-blocking;
         // WouldBlock leaves the remainder buffered (that IS backpressure)
         // and POLLOUT wakes the loop to finish.
-        if !link.write.is_empty() {
-            match (&link.stream).write(&link.write) {
+        if !leg.link.write.is_empty() {
+            match (&leg.link.stream).write(&leg.link.write) {
                 Ok(n) => {
-                    link.write.drain(..n);
+                    leg.link.write.drain(..n);
                 }
                 Err(e) if e.kind() == std::io::ErrorKind::WouldBlock => {}
                 Err(e)
@@ -1183,7 +1263,7 @@ fn relay_loop(
         // after the flush attempt has not reached the shell, so its echo
         // grace period cannot have begun — restart the pending entries'
         // clocks (they mature ECHO_TIMEOUT after the buffer last drained).
-        if !link.write.is_empty() {
+        if !leg.link.write.is_empty() {
             echo.restamp_pending(now);
         }
 
@@ -1208,7 +1288,7 @@ fn relay_loop(
             let carrier_pending =
                 agent.is_some() && agent_seen && !agent_stream.pending().is_empty();
             let due = periodic_send(
-                held.is_held(),
+                leg.held.is_held(),
                 carrier_pending,
                 now,
                 last_send,
@@ -1218,7 +1298,7 @@ fn relay_loop(
             // A held visible frame's pre-encoded bytes already carry the agent caps
             // stamped when it was held; fresh agent bytes ride the independent carrier.
             if due.retransmit {
-                if let Some(bytes) = held.bytes() {
+                if let Some(bytes) = leg.held.bytes() {
                     send_payload(&mut conn, &mut fragmenter, bytes, enveloped);
                 }
                 last_send = now;
@@ -1286,7 +1366,7 @@ fn relay_loop(
         if winding_down {
             // Push the queued Tag::Detach to the daemon (best-effort), then tell
             // the UDP client the transport is over.
-            let _ = util::write_all_retry(link.stream.as_raw_fd(), &link.write, 100);
+            let _ = util::write_all_retry(leg.fd(), &leg.link.write, 100);
             send_shutdown(
                 &mut conn,
                 &mut fragmenter,
@@ -1490,6 +1570,11 @@ mod tests {
     use crate::remote::framesync::{ApplyOutcome, FrameApplier, FrameProducer, FrameSync};
     use crate::remote::sync::{AgentRecord, InputOutbox, RecordKind};
     use crate::util::now_ms;
+
+    /// The switch connector for drives that never switch.
+    fn no_switch(_group: &str, _session: &str) -> Result<UnixStream> {
+        Err(util::Error::from("no switch target in this test"))
+    }
 
     // ---- pure re-wrap / cap-handshake helpers ------------------------------
 
@@ -1899,7 +1984,7 @@ mod tests {
         ipc::append_frame(&mut link.write, Tag::Resize, &ipc::encode_resize(rows, cols));
 
         let relay = std::thread::spawn(move || {
-            relay_loop(relay_conn, link, (rows, cols), None, None, false, Vec::new())
+            relay_loop(relay_conn, link, (rows, cols), None, None, false, Vec::new(), &mut no_switch)
         });
 
         // --- synthetic UDP client state ---
@@ -2118,7 +2203,16 @@ mod tests {
         ipc::append_frame(&mut link.write, Tag::Resize, &ipc::encode_resize(rows, cols));
 
         let relay = std::thread::spawn(move || {
-            relay_loop(relay_conn, link, (rows, cols), Some(endpoint), None, true, Vec::new())
+            relay_loop(
+                relay_conn,
+                link,
+                (rows, cols),
+                Some(endpoint),
+                None,
+                true,
+                Vec::new(),
+                &mut no_switch,
+            )
         });
 
         // --- synthetic UDP client state (drive_client's enveloped mirror) ---
@@ -2433,6 +2527,9 @@ mod tests {
         daemon_input: Vec<u8>,
         saw_lossy_init: bool,
         saw_resync_ack: bool,
+        /// Every FDR 0012 switch the relay asked the connector for:
+        /// `(group, session, the daemon end of the socketpair handed back)`.
+        switch_daemons: std::sync::Arc<std::sync::Mutex<Vec<(String, String, UnixStream)>>>,
         // the relay thread
         relay: Option<std::thread::JoinHandle<Result<()>>>,
     }
@@ -2465,8 +2562,29 @@ mod tests {
             );
             ipc::append_frame(&mut link.write, Tag::Resize, &ipc::encode_resize(rows, cols));
 
+            let switch_daemons: std::sync::Arc<
+                std::sync::Mutex<Vec<(String, String, UnixStream)>>,
+            > = Default::default();
+            let recorded = switch_daemons.clone();
             let relay = std::thread::spawn(move || {
-                relay_loop(relay_conn, link, (rows, cols), None, None, false, Vec::new())
+                // The switch connector seam: hand the relay one end of a fresh
+                // socketpair and keep the other as the target "daemon".
+                let mut connect = move |group: &str, session: &str| {
+                    let (relay_side, daemon_side) = UnixStream::pair().unwrap();
+                    daemon_side.set_nonblocking(true).unwrap();
+                    recorded.lock().unwrap().push((group.into(), session.into(), daemon_side));
+                    Ok(relay_side)
+                };
+                relay_loop(
+                    relay_conn,
+                    link,
+                    (rows, cols),
+                    None,
+                    None,
+                    false,
+                    content_caps(&[]),
+                    &mut connect,
+                )
             });
 
             let mut dterm = Terminal::with_scrollback(rows, cols, 1000);
@@ -2498,7 +2616,47 @@ mod tests {
                 daemon_input: Vec::new(),
                 saw_lossy_init: false,
                 saw_resync_ack: false,
+                switch_daemons,
                 relay: Some(relay),
+            }
+        }
+
+        /// Point the harness's daemon model at a NEW daemon end (the target
+        /// of an FDR 0012 switch): a fresh screen, a fresh producer numbering
+        /// from 1, an empty read buffer, and the Init/input observations
+        /// cleared. The CLIENT model is untouched — exactly the viewport's
+        /// situation across a switch.
+        fn retarget_daemon(&mut self, daemon_end: UnixStream) {
+            self.daemon_end = daemon_end;
+            self.dterm = Terminal::with_scrollback(self.rows, self.cols, 1000);
+            self.dterm.process(b"\x1b[2J\x1b[Hswitched-target-screen\r\n");
+            self.dprod = FrameProducer::new(self.rows, self.cols);
+            self.dread = FrameBuffer::new();
+            self.daemon_input.clear();
+            self.saw_lossy_init = false;
+        }
+
+        /// Deliver a daemon-side `Tag::Switch` (the session daemon routing an
+        /// in-session `posh attach <sibling>` to this viewport's relay).
+        fn daemon_switch(&self, group: &str, session: &str) {
+            let mut rec = Vec::new();
+            ipc::append_frame(&mut rec, Tag::Switch, &ipc::encode_switch_target(group, session));
+            util::write_all_retry(self.daemon_end.as_raw_fd(), &rec, 1000).unwrap();
+        }
+
+        /// The daemon end handed out for the `n`th switch, once the relay has
+        /// asked for it (bounded wait).
+        fn take_switch_daemon(&self, n: usize) -> (String, String, UnixStream) {
+            let deadline = now_ms() + 3000;
+            loop {
+                {
+                    let mut g = self.switch_daemons.lock().unwrap();
+                    if g.len() > n {
+                        return g.remove(n);
+                    }
+                }
+                assert!(now_ms() < deadline, "the relay never asked the switch connector");
+                std::thread::sleep(Duration::from_millis(10));
             }
         }
 
@@ -2641,6 +2799,77 @@ mod tests {
             }
             handle.join().unwrap().unwrap();
         }
+    }
+
+    /// FDR 0012 §3.1 end-to-end on the per-invocation relay (posh#185):
+    /// converge on A with input acked, deliver a daemon `Tag::Switch` to B,
+    /// and assert the relay re-homes through the connector seam (B is Init'd
+    /// lossy), B's frames land ABOVE A's ceiling so the client converges on
+    /// B's screen, post-switch input at the client's continuing outbox offset
+    /// reaches B (posh#186), and the relay thread is still running afterward.
+    /// The client's A-numbered acks during the hand-over must not trip the
+    /// leg's offset translation (a debug build panics on underflow).
+    #[test]
+    fn relay_switch_rehomes_with_frame_and_input_continuity() {
+        let mut h = Harness::new();
+        // Converge on A with some input delivered, so the client's outbox
+        // (and the relay's inbox) sit past offset 0 before the switch.
+        h.outbox.push(b"pre");
+        h.daemon_produce();
+        for _ in 0..50 {
+            h.step();
+            if h.converged() && h.input_acked == 3 {
+                break;
+            }
+        }
+        assert!(h.converged(), "converged on A first");
+        assert_eq!(h.input_acked, 3, "pre-switch input acked");
+        assert_eq!(h.daemon_input, b"pre");
+        let ceiling = h.applied_num;
+        assert!(ceiling >= 1);
+
+        // The session daemon routes a switch to this viewport.
+        h.daemon_switch("default", "b");
+        let (group, session, b_end) = h.take_switch_daemon(0);
+        assert_eq!((group.as_str(), session.as_str()), ("default", "b"));
+        h.retarget_daemon(b_end);
+
+        // B sees the lossy Init (the retained caps), then produces frame 1.
+        for _ in 0..50 {
+            h.step();
+            if h.saw_lossy_init {
+                break;
+            }
+        }
+        assert!(h.saw_lossy_init, "B must be Init'd as a lossy frame client");
+        h.daemon_produce();
+        for _ in 0..50 {
+            h.step();
+            if h.converged() {
+                break;
+            }
+        }
+        assert!(h.converged(), "the client converges on B's screen");
+        assert!(
+            h.applied_num > ceiling,
+            "B's frame is numbered above A's ceiling: {} > {ceiling}",
+            h.applied_num
+        );
+
+        // Post-switch input at the CONTINUING outbox offset reaches B.
+        h.outbox.push(b"post");
+        for _ in 0..50 {
+            h.step();
+            if h.daemon_input == b"post" {
+                break;
+            }
+        }
+        assert_eq!(h.daemon_input, b"post", "post-switch input reaches the NEW daemon (posh#186)");
+        assert!(
+            !h.relay.as_ref().unwrap().is_finished(),
+            "the relay must still be running after the switch"
+        );
+        h.join();
     }
 
     /// Drop the daemon's Full off the wire; the relay's held frame is never acked,
@@ -2993,7 +3222,16 @@ mod tests {
         ipc::append_frame(&mut link.write, Tag::Resize, &ipc::encode_resize(rows, cols));
 
         let relay = std::thread::spawn(move || {
-            relay_loop(relay_conn, link, (rows, cols), Some(endpoint), None, false, Vec::new())
+            relay_loop(
+                relay_conn,
+                link,
+                (rows, cols),
+                Some(endpoint),
+                None,
+                false,
+                Vec::new(),
+                &mut no_switch,
+            )
         });
 
         // The agent CONSUMER dials the relay's agent/sock and issues one request.
