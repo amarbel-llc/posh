@@ -741,8 +741,12 @@ pub(crate) fn mux_peer_loop(
                 // Non-blocking drain: a wedged daemon socket must not stall
                 // the whole sweep (head-of-line across every channel + agent
                 // service). Partial writes stay buffered; POLLOUT re-wakes
-                // the loop to finish.
-                match util::write_all_retry(fd, &b.link.write, 0) {
+                // the loop to finish. The fd is re-read from the link HERE,
+                // not the `fd` captured above: a re-home in this same sweep
+                // replaced `b.link` (closing the captured fd), and writing
+                // the new link's Init through the stale descriptor failed
+                // and closed the freshly switched channel (posh#184).
+                match util::write_all_retry(b.link.stream.as_raw_fd(), &b.link.write, 0) {
                     Ok(n) => {
                         b.link.write.drain(..n);
                     }
