@@ -44,8 +44,18 @@ NOT re-OPEN (the bridge already re-homed).
   arm → convert target, re-home, send `SESSION_WIRE_SWITCH`.
 - relay.rs `relay_loop`: the per-invocation (`POSH_MUX_SESSIONS=0`) path —
   same bridge-local re-home on `Tag::Switch`, no client notice (a relay has
-  no mux-daemon reconnect; it dies with its attach). FOLLOW-UP if the mux
-  path is landed first.
+  no mux-daemon reconnect; it dies with its attach). DONE (2026-09-06, #180):
+  relay_loop gained a `content` param (the negotiated caps, threaded from
+  `run`), captures the switch after its daemon-read match, and re-homes via
+  `Config::new(group)` + `connect_or_create` + a fresh `DaemonLink` with
+  `frame_offset = last_frame_num`, resetting held/inbox.
+
+## Remaining coverage gap
+
+The re-home helpers and the target conversion are unit-tested; a full
+in-process end-to-end switch drive (mux_peer_loop and relay_loop: OPEN to A,
+deliver a daemon Tag::Switch, assert the client sees B's frames numbered
+above A's ceiling) is not yet written. Tracked in #180.
 
 ## Key facts (verified)
 

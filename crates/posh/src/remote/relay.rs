@@ -355,7 +355,7 @@ pub(crate) fn run(
     //    the already-peered `conn`. No flag day — either daemon works.
     match first_daemon_record(&mut link, &mut conn, channels)? {
         FirstRecord::Frame(frame) => {
-            relay_loop(conn, link, (rows, cols), agent, Some(frame), channels)
+            relay_loop(conn, link, (rows, cols), agent, Some(frame), channels, content)
         }
         FirstRecord::Output => {
             drop(link); // shed the dead frame-client before the fresh attach
@@ -597,6 +597,12 @@ fn relay_loop(
     mut agent: Option<AgentEndpoint>,
     first_frame: Option<ServerFrame>,
     enveloped: bool,
+    // The negotiated daemon Init caps (client content caps + the relay's own
+    // RFC 0014 ident), retained for the FDR 0012 §3.1 in-session switch: on a
+    // Tag::Switch the relay re-homes its DaemonLink to the new session and
+    // re-Inits with these, so the client's caps are not downgraded. Empty
+    // when a caller never switches (the tests).
+    content: Vec<Cap>,
 ) -> Result<()> {
     let mut fragmenter = Fragmenter::new();
     let mut assembly = FragmentAssembly::new();
@@ -1013,6 +1019,12 @@ fn relay_loop(
         );
 
         // --- daemon -> UDP client ---
+        // FDR 0012 §3.1: a daemon Tag::Switch captured here, re-homed AFTER
+        // the read match so link is not replaced mid-iteration. Unlike the
+        // mux path there is no client target-update notice: a relay is
+        // single-session and dies with its attach, so there is no reconnect
+        // to survive.
+        let mut switch_to: Option<Vec<u8>> = None;
         if fds[1].revents & libc::POLLIN != 0 {
             match link.read.read_from(link.stream.as_raw_fd()) {
                 Ok(0) => return Ok(()), // daemon closed the socket
@@ -1067,6 +1079,15 @@ fn relay_loop(
                                 "relay received an unexpected mid-stream Tag::Output \
                                  (daemon frame production regressed)",
                             ),
+                            Tag::Switch => {
+                                // FDR 0012 §3.1: the daemon routed a switch to
+                                // this viewport. Capture and re-home after the
+                                // read match; a malformed payload is ignored.
+                                if ipc::decode_switch_target(&frame.payload).is_some() {
+                                    switch_to = Some(frame.payload.clone());
+                                }
+                                break; // stop reading the OLD link; it is about to be replaced
+                            }
                             _ => {}
                         },
                         Ok(None) => break,
@@ -1081,6 +1102,51 @@ fn relay_loop(
                     return Ok(());
                 }
                 Err(e) => return Err(e.into()),
+            }
+        }
+
+        // FDR 0012 §3.1 re-home: swap the relay's DaemonLink to the switch
+        // target in place, carrying frame continuity (frame_offset =
+        // last_frame_num, so the new session's low numbers rewrap above the
+        // client's applied_num) and re-Initing with the retained caps. A
+        // failed connect ends the relay (the client falls back / exits).
+        if let Some(payload) = switch_to {
+            let (group, session) =
+                ipc::decode_switch_target(&payload).expect("validated above");
+            let (rows, cols) = client_size;
+            match Config::new(&group)
+                .and_then(|cfg| session::connect_or_create(&cfg, &session, None))
+            {
+                Ok(stream) => {
+                    stream.set_nonblocking(true)?;
+                    let mut new_link = DaemonLink {
+                        stream,
+                        read: FrameBuffer::new(),
+                        write: Vec::new(),
+                        frame_offset: last_frame_num,
+                    };
+                    ipc::append_frame(
+                        &mut new_link.write,
+                        Tag::Init,
+                        &init_payload(rows, cols, &content),
+                    );
+                    ipc::append_frame(
+                        &mut new_link.write,
+                        Tag::Resize,
+                        &ipc::encode_resize(rows, cols),
+                    );
+                    link = new_link;
+                    held = HeldFrame::default();
+                    inbox = InputInbox::new();
+                    util::log_write(
+                        "info",
+                        &format!("relay retargeted to {group}/{session}"),
+                    );
+                }
+                Err(e) => {
+                    util::log_write("warn", &format!("relay switch target unreachable: {e}"));
+                    return Ok(());
+                }
             }
         }
 
@@ -1827,7 +1893,9 @@ mod tests {
         );
         ipc::append_frame(&mut link.write, Tag::Resize, &ipc::encode_resize(rows, cols));
 
-        let relay = std::thread::spawn(move || relay_loop(relay_conn, link, (rows, cols), None, None, false));
+        let relay = std::thread::spawn(move || {
+            relay_loop(relay_conn, link, (rows, cols), None, None, false, Vec::new())
+        });
 
         // --- synthetic UDP client state ---
         let mut client_term = Terminal::with_scrollback(rows, cols, 0);
@@ -2045,7 +2113,7 @@ mod tests {
         ipc::append_frame(&mut link.write, Tag::Resize, &ipc::encode_resize(rows, cols));
 
         let relay = std::thread::spawn(move || {
-            relay_loop(relay_conn, link, (rows, cols), Some(endpoint), None, true)
+            relay_loop(relay_conn, link, (rows, cols), Some(endpoint), None, true, Vec::new())
         });
 
         // --- synthetic UDP client state (drive_client's enveloped mirror) ---
@@ -2392,7 +2460,9 @@ mod tests {
             );
             ipc::append_frame(&mut link.write, Tag::Resize, &ipc::encode_resize(rows, cols));
 
-            let relay = std::thread::spawn(move || relay_loop(relay_conn, link, (rows, cols), None, None, false));
+            let relay = std::thread::spawn(move || {
+                relay_loop(relay_conn, link, (rows, cols), None, None, false, Vec::new())
+            });
 
             let mut dterm = Terminal::with_scrollback(rows, cols, 1000);
             fill_screen(&mut dterm);
@@ -2917,8 +2987,9 @@ mod tests {
         );
         ipc::append_frame(&mut link.write, Tag::Resize, &ipc::encode_resize(rows, cols));
 
-        let relay =
-            std::thread::spawn(move || relay_loop(relay_conn, link, (rows, cols), Some(endpoint), None, false));
+        let relay = std::thread::spawn(move || {
+            relay_loop(relay_conn, link, (rows, cols), Some(endpoint), None, false, Vec::new())
+        });
 
         // The agent CONSUMER dials the relay's agent/sock and issues one request.
         // The listener socket exists (bound in AgentEndpoint::new before the thread
