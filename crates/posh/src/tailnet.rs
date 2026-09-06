@@ -59,6 +59,36 @@ fn resolve_among(peers: &[Peer], host: &str) -> Option<IpAddr> {
         })
 }
 
+/// The best ssh HOST for a tailnet peer when the system resolver cannot reach
+/// its short MagicDNS name (posh#179): the peer's FQDN if it has one (`.`-bearing
+/// name — keeps ssh host-key matching sane), else its preferred tailnet IP as a
+/// string. `None` if `host` matches no peer or Tailscale is unavailable. Matches
+/// `resolve`'s case-insensitive name match; the username (never part of a peer)
+/// is the caller's to preserve.
+pub fn ssh_fallback(host: &str) -> Option<String> {
+    let json = status_json()?;
+    ssh_fallback_among(&parse_status(&json), host)
+}
+
+fn ssh_fallback_among(peers: &[Peer], host: &str) -> Option<String> {
+    let want = host.trim_end_matches('.').to_ascii_lowercase();
+    let peer = peers
+        .iter()
+        .find(|p| p.names.iter().any(|n| n.eq_ignore_ascii_case(&want)))?;
+    // Prefer an FQDN (a name with a dot); else the preferred IP as a string.
+    peer.names
+        .iter()
+        .find(|n| n.contains('.'))
+        .cloned()
+        .or_else(|| {
+            peer.ips
+                .iter()
+                .find(|ip| ip.is_ipv4())
+                .or_else(|| peer.ips.first())
+                .map(|ip| ip.to_string())
+        })
+}
+
 /// Run `tailscale status --json`; `None` on any failure (binary missing,
 /// non-zero exit — e.g. not logged in — or non-UTF-8 output).
 fn status_json() -> Option<String> {
@@ -193,6 +223,34 @@ mod tests {
             Some("100.64.0.3".parse().unwrap())
         );
         assert_eq!(resolve_among(&peers, "ghost"), None);
+    }
+
+    #[test]
+    fn ssh_fallback_prefers_fqdn_then_ip_and_matches_short_or_fqdn() {
+        let peers = parse_status(SAMPLE);
+        // A short label resolves to the peer's FQDN (best ssh host — keeps
+        // host-key matching), case-insensitively.
+        assert_eq!(
+            ssh_fallback_among(&peers, "server").as_deref(),
+            Some("server.tail1234.ts.net")
+        );
+        assert_eq!(
+            ssh_fallback_among(&peers, "SERVER").as_deref(),
+            Some("server.tail1234.ts.net")
+        );
+        // An FQDN input returns the same FQDN.
+        assert_eq!(
+            ssh_fallback_among(&peers, "nas.tail1234.ts.net").as_deref(),
+            Some("nas.tail1234.ts.net")
+        );
+        // Unknown host: no fallback.
+        assert_eq!(ssh_fallback_among(&peers, "nope"), None);
+        // A peer with only a bare label (no FQDN) falls back to its IP.
+        let ip_only = vec![Peer {
+            names: vec!["boxy".into()],
+            ips: vec!["100.64.0.9".parse().unwrap()],
+        }];
+        assert_eq!(ssh_fallback_among(&ip_only, "boxy").as_deref(), Some("100.64.0.9"));
     }
 
     #[test]

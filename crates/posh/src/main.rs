@@ -499,7 +499,9 @@ fn cmd_start(
         ),
         StartClass::RemoteNamed { user, host, group: g, session } => {
             let probe_group = g.as_deref().unwrap_or(group);
-            let names = remote_session_names(user.as_deref(), &host, probe_group)?;
+            // Resolve the host (tailnet fallback, posh#179) during the
+            // strictness probe; thread the resolved host into the bootstrap.
+            let (host, names) = probe_sessions_resolving(user.as_deref(), &host, probe_group)?;
             // NOTE: the attach hint is the bare create-or-attach form —
             // `posh attach` is still local-only (remote strict attach is a
             // later FDR 0011 slice), so it must not be recommended here.
@@ -595,7 +597,10 @@ fn start_remote_auto(
     forward_flag: &remote::agent::ForwardFlag,
 ) -> Result<()> {
     let grp = target_group.clone().unwrap_or_else(|| global_group.to_string());
-    let names = remote_session_names(user.as_deref(), &host, &grp)?;
+    // Resolve the host (tailnet fallback on a resolution failure, posh#179)
+    // during the auto-id probe, then thread the resolved host into the
+    // bootstrap so the attach reuses what the probe proved reachable.
+    let (host, names) = probe_sessions_resolving(user.as_deref(), &host, &grp)?;
     let id = first_free_autoid(&names)
         .ok_or_else(|| Error::from("posh start: too many remote sessions"))?;
     cmd_ssh_session(user, host, target_group, global_group, id, extra, forward_flag)
@@ -736,15 +741,15 @@ fn cmd_ph(argv: &[String]) -> Result<()> {
         PhRoute::RemoteNew { user, host, group: g } => {
             start_remote_auto(user, host, g, &group, &[], &remote::agent::ForwardFlag::Unset)
         }
-        PhRoute::RemoteResolve { user, host, group: g, session } => cmd_ssh_session(
-            user,
-            host,
-            g,
-            &group,
-            session,
-            &[],
-            &remote::agent::ForwardFlag::Unset,
-        ),
+        PhRoute::RemoteResolve { user, host, group: g, session } => {
+            // Resolve the host (tailnet fallback, posh#179) so `ph host:name`
+            // is consistent with `ph host:+` — the probe both verifies
+            // reachability and yields the routable host for the attach. `ph`
+            // is interactive, so the extra probe round-trip is acceptable.
+            let probe_group = g.as_deref().unwrap_or(&group);
+            let (host, _names) = probe_sessions_resolving(user.as_deref(), &host, probe_group)?;
+            cmd_ssh_session(user, host, g, &group, session, &[], &remote::agent::ForwardFlag::Unset)
+        }
     }
 }
 
@@ -1240,17 +1245,102 @@ fn remote_list_output(
     group: &str,
     format_flag: &str,
 ) -> Result<String> {
+    let out = run_remote_list(user, host, group, format_flag)?;
+    match out {
+        Ok(stdout) => Ok(stdout),
+        Err(stderr) => {
+            use std::io::Write;
+            let _ = std::io::stderr().write_all(stderr.as_bytes());
+            Err(Error::Msg(format!("remote list failed on {host}")))
+        }
+    }
+}
+
+/// Run one remote `posh list` over ssh, returning `Ok(stdout)` on success and
+/// `Ok(Err(stderr))` on a non-zero exit (the inner `Result` separates the
+/// remote's own failure — which the caller may inspect, e.g. for a
+/// resolution error — from a local exec failure, the outer `Err`).
+#[allow(clippy::type_complexity)]
+fn run_remote_list(
+    user: Option<&str>,
+    host: &str,
+    group: &str,
+    format_flag: &str,
+) -> Result<std::result::Result<String, String>> {
     let argv = remote_list_argv(user, host, group, format_flag);
     let out = std::process::Command::new(&argv[0])
         .args(&argv[1..])
         .output()
         .map_err(|e| Error::Msg(format!("ssh: {e}")))?;
-    if !out.status.success() {
-        use std::io::Write;
-        let _ = std::io::stderr().write_all(&out.stderr);
-        return Err(Error::Msg(format!("remote list failed on {host}")));
+    if out.status.success() {
+        Ok(Ok(String::from_utf8_lossy(&out.stdout).into_owned()))
+    } else {
+        Ok(Err(String::from_utf8_lossy(&out.stderr).into_owned()))
     }
-    Ok(String::from_utf8_lossy(&out.stdout).into_owned())
+}
+
+/// Whether an ssh stderr indicates the HOST could not be resolved (posh#179):
+/// the trigger for the tailnet-FQDN fallback. Covers the common resolver
+/// messages across libc/getaddrinfo variants.
+fn is_ssh_resolution_error(stderr: &str) -> bool {
+    let s = stderr.to_ascii_lowercase();
+    s.contains("could not resolve hostname")
+        || s.contains("name or service not known")
+        || s.contains("temporary failure in name resolution")
+        || s.contains("nodename nor servname provided")
+        || s.contains("no address associated with hostname")
+}
+
+/// Probe a remote host's sessions, resolving the host through tailscale when
+/// the system resolver cannot reach its short MagicDNS name (posh#179,
+/// approach A — surprise-free: the name as typed always wins when it
+/// resolves; the tailnet FQDN/IP is tried ONLY after ssh actually fails to
+/// resolve it, so a working `~/.ssh/config` Host alias is never bypassed).
+/// Returns `(host_that_worked, session_names)` so the caller threads the
+/// resolved host into the subsequent bootstrap. The username is preserved by
+/// the caller (tailnet resolution is host-only).
+fn probe_sessions_resolving(
+    user: Option<&str>,
+    host: &str,
+    group: &str,
+) -> Result<(String, Vec<String>)> {
+    let parse = |stdout: String| -> Vec<String> {
+        stdout.lines().filter(|l| !l.is_empty()).map(str::to_string).collect()
+    };
+    match run_remote_list(user, host, group, "--short")? {
+        Ok(stdout) => Ok((host.to_string(), parse(stdout))),
+        Err(stderr) if is_ssh_resolution_error(&stderr) => {
+            // The name as typed does not resolve; try the tailnet FQDN/IP.
+            if let Some(fallback) = crate::tailnet::ssh_fallback(host) {
+                match run_remote_list(user, &fallback, group, "--short")? {
+                    Ok(stdout) => {
+                        util::log_write(
+                            "info",
+                            &format!("resolved {host} via tailscale to {fallback}"),
+                        );
+                        Ok((fallback, parse(stdout)))
+                    }
+                    Err(e2) => {
+                        use std::io::Write;
+                        let _ = std::io::stderr().write_all(e2.as_bytes());
+                        Err(Error::Msg(format!("remote list failed on {fallback}")))
+                    }
+                }
+            } else {
+                use std::io::Write;
+                let _ = std::io::stderr().write_all(stderr.as_bytes());
+                Err(Error::Msg(format!(
+                    "cannot resolve {host} (not in ssh config or the tailnet); \
+                     use its full name"
+                )))
+            }
+        }
+        Err(stderr) => {
+            use std::io::Write;
+            let _ = std::io::stderr().write_all(stderr.as_bytes());
+            Err(Error::Msg(format!("remote list failed on {host}")))
+        }
+    }
 }
 
 /// The pasteable RemoteSession target for one remote-listed name. A
@@ -1876,6 +1966,29 @@ mod tests {
         assert!(parse_port_range("70000").is_err());
         assert!(parse_port_range("100:50").is_err());
         assert!(parse_port_range("abc").is_err());
+    }
+
+    #[test]
+    fn ssh_resolution_error_is_detected_across_resolver_variants() {
+        // posh#179: the triggers for the tailnet-FQDN fallback — the messages
+        // ssh/getaddrinfo emit when a host name cannot be resolved.
+        for stderr in [
+            "ssh: Could not resolve hostname flac: Temporary failure in name resolution",
+            "ssh: Could not resolve hostname flac: Name or service not known",
+            "ssh: Could not resolve hostname flac: nodename nor servname provided, or not known",
+            "ssh: Could not resolve hostname flac: No address associated with hostname",
+        ] {
+            assert!(is_ssh_resolution_error(stderr), "should trigger: {stderr}");
+        }
+        // A NON-resolution failure (auth, connection refused) must NOT trigger
+        // the fallback — the host resolved, something else failed.
+        for stderr in [
+            "Permission denied (publickey).",
+            "ssh: connect to host flac port 22: Connection refused",
+            "kex_exchange_identification: read: Connection reset by peer",
+        ] {
+            assert!(!is_ssh_resolution_error(stderr), "should NOT trigger: {stderr}");
+        }
     }
 
     #[test]
