@@ -1,20 +1,22 @@
 ---
-status: proposed
+status: experimental
 date: 2026-07-01
 promotion-criteria: >
   exploring -> proposed (MET 2026-09-04): the trigger, detach semantics, and
   offer-vs-automatic UX are decided (automatic on a typed in-session attach;
   replace; per-viewport targeting via the most-recent-input connection) and
   drafted as an RFC 0008 amendment; FDR 0011's relay is experimental.
-  proposed -> experimental: an in-session `posh attach <sibling>` switches the
-  issuing viewport in place — a LOCAL client re-dials, and a viewport attached
-  through the M2 mux channel (or the per-invocation relay) is retargeted on
-  the session host — with a `Full` keyframe reset, the previous session left
-  running detached, and other attached viewports untouched. STATUS: all three
-  paths implemented — local re-dial (2026-09-04), the M2 mux-channel re-home
-  (2026-09-04), and the per-invocation relay re-home (2026-09-06, #180). The
-  code criterion is met; the status bump to experimental awaits deploy
-  verification (the switch confirmed working on the fleet, not just in tests).
+  proposed -> experimental (MET 2026-09-06): an in-session `posh attach
+  <sibling>` switches the issuing viewport in place — a LOCAL client re-dials,
+  and a viewport attached through the M2 mux channel (or the per-invocation
+  relay) is retargeted on the session host — with a `Full` keyframe reset, the
+  previous session left running detached, and other attached viewports
+  untouched. All three paths implemented — local re-dial (2026-09-04), the M2
+  mux-channel re-home (2026-09-04), and the per-invocation relay re-home
+  (2026-09-06, #180) — and verified on the fleet 2026-09-06: clown's
+  `attach --create` self-wrap inside a mux-channel session (twerk viewport,
+  flac sessions) switched, repainted, and took keyboard input after the
+  #183/#184/#185/#186 fixes were deployed to both hosts.
   experimental -> testing: in daily use on the fleet worker flow (jump from
   `clown list` to any worker's session) with no fallback to nested
   double-attach and no force-synced sibling viewports.
