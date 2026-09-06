@@ -941,7 +941,12 @@ fn handle_session_instruction(
                             inbox: crate::remote::sync::InputInbox::new(),
                             held: crate::remote::relay::HeldFrame::default(),
                             client_size: (rows, cols),
-                            acked_forwarded: 0,
+                            // Seeded to the resume base like last_frame_num:
+                            // a client ack at/below the ceiling is for frames
+                            // the surviving daemon's OLD producer numbered,
+                            // and forwarding it would underflow the
+                            // `acked_forwarded - frame_offset` translation.
+                            acked_forwarded: resume_base,
                             // Seed from the resume base (posh#162) so a
                             // heartbeat Empty sent before the first real frame
                             // carries a number at/above the client's ceiling,
@@ -1025,9 +1030,15 @@ fn switch_wire_target(payload: &[u8]) -> Option<String> {
 /// so the new daemon's low numbers rewrap above the client's `applied_num`
 /// and its `Full` is not dropped as stale — and re-`Init`s with the SAME
 /// negotiated caps (`b.content`) so the client's consumable caps are not
-/// silently downgraded. Per-channel fresh-attach state (held, inbox,
-/// acked_forwarded, ack_due) resets; `last_frame_num`/`frame_flags` persist.
-/// `Err` (the target is gone) is the caller's cue to close the channel.
+/// silently downgraded. Per-channel fresh-attach state (held, ack_due)
+/// resets; `last_frame_num`/`frame_flags` persist — and so does the INPUT
+/// INBOX (posh#186): its offsets are bridge↔viewport stream state, not
+/// daemon state, and the viewport's outbox keeps counting across the
+/// switch, so a reset inbox rejects every post-switch keystroke as a gap
+/// while its Empties advertise ack 0, and input deadlocks. `acked_forwarded`
+/// is seeded to the ceiling: an ack at/below it belongs to the OLD session
+/// (and `acked_forwarded - frame_offset` must not underflow). `Err` (the
+/// target is gone) is the caller's cue to close the channel.
 fn rehome_bridge(
     b: &mut SessionBridge,
     target: &str,
@@ -1050,8 +1061,7 @@ fn rehome_bridge(
     ipc::append_frame(&mut link.write, Tag::Resize, &ipc::encode_resize(rows, cols));
     b.link = link;
     b.held = crate::remote::relay::HeldFrame::default();
-    b.inbox = crate::remote::sync::InputInbox::new();
-    b.acked_forwarded = 0;
+    b.acked_forwarded = b.last_frame_num;
     b.ack_due = false;
     Ok(())
 }
@@ -2722,6 +2732,9 @@ mod tests {
         let (mut b, _peer) = test_bridge();
         b.last_frame_num = 512; // the client's frame ceiling
         b.content = crate::remote::relay::content_caps(&[]);
+        // Pre-switch input: the viewport's outbox has delivered 40 bytes, so
+        // its next message carries input_base 40.
+        assert_eq!(b.inbox.accept(0, &[b'x'; 40]).map(<[u8]>::len), Some(40));
         // A connector handing back a fresh socketpair, recording the target.
         let seen = std::cell::RefCell::new(None);
         let mut connect = |t: &str| {
@@ -2743,9 +2756,39 @@ mod tests {
         let first = fb.next().unwrap().unwrap();
         assert_eq!(first.tag, crate::session::ipc::Tag::Init);
         // Fresh-attach state reset; continuity fields kept.
-        assert_eq!(b.acked_forwarded, 0);
         assert!(!b.ack_due);
         assert_eq!(b.last_frame_num, 512, "the ceiling persists across re-home");
+        // posh#186: the input inbox persists — the viewport's next keystroke
+        // (input_base 40, the offset its outbox reached before the switch)
+        // must reach the NEW daemon as Tag::Input, not be dropped as a gap.
+        assert_eq!(b.inbox.next_offset(), 40, "inbox offsets survive the re-home");
+        b.link.write.clear();
+        let msg = crate::remote::sync::ClientMessage {
+            flags: 0,
+            caps: Vec::new(),
+            // An ack for an OLD-session frame (below the 512 ceiling): must be
+            // ignored, not translated (512 seed; the translation would
+            // otherwise underflow).
+            acked_frame: 500,
+            rows: 24,
+            cols: 80,
+            input_base: 40,
+            input: b"ls\n".to_vec(),
+        };
+        assert!(bridge_client_message(&mut b, &msg));
+        assert_eq!(b.inbox.next_offset(), 43);
+        assert_eq!(b.acked_forwarded, 512, "an old-session ack does not move the seed");
+        let mut fb = crate::session::ipc::FrameBuffer::new();
+        fb.feed(&b.link.write);
+        let mut input = None;
+        while let Ok(Some(rec)) = fb.next() {
+            match rec.tag {
+                crate::session::ipc::Tag::Input => input = Some(rec.payload.clone()),
+                crate::session::ipc::Tag::FrameAck => panic!("old-session ack forwarded"),
+                _ => {}
+            }
+        }
+        assert_eq!(input.as_deref(), Some(&b"ls\n"[..]), "post-switch input reaches the daemon");
     }
 
     /// posh#178: a mux-channel client's CLIENT_FLAG_ESCAPE must be bridged to

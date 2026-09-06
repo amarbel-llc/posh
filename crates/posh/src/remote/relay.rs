@@ -1137,7 +1137,12 @@ fn relay_loop(
                     );
                     link = new_link;
                     held = HeldFrame::default();
-                    inbox = InputInbox::new();
+                    // The input inbox is NOT reset (posh#186): its offsets
+                    // are relay↔client stream state the client's outbox
+                    // continues across the switch. acked_forwarded moves to
+                    // the ceiling so an ack for an old-session frame is
+                    // ignored rather than underflowing the offset translation.
+                    acked_forwarded = last_frame_num;
                     util::log_write(
                         "info",
                         &format!("relay retargeted to {group}/{session}"),
