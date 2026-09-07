@@ -138,6 +138,11 @@ pub struct Stats {
     apply_stale: u64,
     apply_dup: u64,
     apply_basemis: u64,
+    /// posh#189: Diffs whose base was BEHIND applied_num but still held in
+    /// the client's base history, so they applied instead of forcing a
+    /// RESYNC + Full. A climbing count under typing is the ack-lag storm
+    /// being absorbed — the number the fix exists to make nonzero.
+    apply_base_history: u64,
     /// RFC 0006 base-checksum mismatches: the diff base NUMBER matched but its
     /// CONTENT checksum did not, so the client refused the body and resynced.
     /// Distinct from `apply_basemis` (a frame-number mismatch); a nonzero count
@@ -218,6 +223,8 @@ pub struct ApplySnapshot {
     pub stale: u64,
     pub dup: u64,
     pub basemis: u64,
+    /// posh#189: base-behind Diffs applied against a retained dump.
+    pub base_history: u64,
     pub base_sum_mismatch: u64,
     pub reack: u64,
     pub nochange: u64,
@@ -412,6 +419,10 @@ impl Stats {
     pub fn record_apply_basemis(&mut self) {
         self.apply_basemis += 1;
     }
+    /// posh#189: a base-behind Diff applied against a retained dump.
+    pub fn record_apply_base_history(&mut self) {
+        self.apply_base_history += 1;
+    }
     /// RFC 0006: a base-checksum mismatch caught a divergent diff base (the base
     /// number matched but the content did not). Counted separately from basemis.
     pub fn record_apply_base_sum_mismatch(&mut self) {
@@ -433,6 +444,7 @@ impl Stats {
             stale: self.apply_stale,
             dup: self.apply_dup,
             basemis: self.apply_basemis,
+            base_history: self.apply_base_history,
             base_sum_mismatch: self.apply_base_sum_mismatch,
             reack: self.apply_reack,
             nochange: self.apply_nochange,
@@ -474,7 +486,7 @@ impl Stats {
                     "visible model frozen {frozen_ms}ms while {diffs_since} diff frames arrived \
                      (apply-stall) applied_num={applied_num} codec={codec} \
                      last_rx(num={} base={} body={}) \
-                     apply(adv={} stale={} dup={} basemis={} reack={} nochange={})",
+                     apply(adv={} stale={} dup={} basemis={} base_history={} reack={} nochange={})",
                     self.last_rx_num,
                     self.last_rx_base,
                     self.last_rx_body.as_str(),
@@ -482,6 +494,7 @@ impl Stats {
                     self.apply_stale,
                     self.apply_dup,
                     self.apply_basemis,
+                    self.apply_base_history,
                     self.apply_reack,
                     self.apply_nochange,
                 ),
@@ -726,7 +739,7 @@ impl Stats {
                  render writes={} bytes_out={} skipped_idle={} \
                  apply_us={}/{} compose_us={}/{} input_ms={}/{} \
                  loop iters={} busy={}us idle={}us busy_pct={}% max_iter_us={} \
-                 apply(adv={} stale={} dup={} basemis={} reack={} nochange={}) sb_rx={}",
+                 apply(adv={} stale={} dup={} basemis={} base_history={} reack={} nochange={}) sb_rx={}",
                 self.frames_total,
                 self.frames_full,
                 self.frames_diff,
@@ -761,6 +774,7 @@ impl Stats {
                 self.apply_stale,
                 self.apply_dup,
                 self.apply_basemis,
+                self.apply_base_history,
                 self.apply_reack,
                 self.apply_nochange,
                 self.frames_scrollback,
@@ -1086,7 +1100,7 @@ mod tests {
             "compose_us=60/60",
             "input_ms=23/34",
             "loop iters=1 busy=100us idle=900us busy_pct=10% max_iter_us=100",
-            "apply(adv=0 stale=0 dup=0 basemis=0 reack=0 nochange=0) sb_rx=0",
+            "apply(adv=0 stale=0 dup=0 basemis=0 base_history=0 reack=0 nochange=0) sb_rx=0",
         ] {
             assert!(body.contains(key), "missing client key {key:?} in:\n{body}");
         }

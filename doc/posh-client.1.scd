@@ -168,6 +168,19 @@ _POSH_DEBUG_LOG_
 	interval. Rotated at 5 MB. The on-demand *SIGUSR2* state dump
 	(*SIGNALS*) is written to this same sink. Unset disables logging.
 
+_POSH_BASE_HISTORY_
+	Controls retained-base apply (*on by default*). A session daemon
+	serving a roaming client anchors every unacknowledged frame at the
+	last frame it saw acknowledged, so when the application writes faster
+	than one round trip the next frame's diff base is behind the client's
+	applied frame. The client keeps the screens of its last few applied
+	frames and applies such a diff against the matching one — the diff
+	from an older base still yields the server's current screen — instead
+	of rejecting it, requesting a resync, and repainting from a full
+	keyframe on every burst (the sluggish, jagged echo of a busy prompt).
+	Set to _0_, _off_, _false_, or _no_ to restore the strict same-base
+	rule.
+
 _POSH_WEDGE_WATCHDOG_
 	Controls the apply-stall watchdog (*on by default*). If the visible
 	model stays frozen past a threshold while diff frames keep arriving —

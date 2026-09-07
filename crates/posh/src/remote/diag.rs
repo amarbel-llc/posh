@@ -137,7 +137,7 @@ impl ClientState {
              outbox_base={} outbox_pending={} scrollback_len={} srtt={:.0}ms rto={}ms \
              send_interval={}ms bytes_rx={} bytes_tx={} predict(active={} shown={} epoch_lag={}) \
              term_gen={} rows={} cols={} echo_on={} codec={} title={:?} \
-             apply(adv={} stale={} dup={} basemis={} bsum_mis={} reack={} nochange={} sb_rx={}) \
+             apply(adv={} stale={} dup={} basemis={} base_history={} bsum_mis={} reack={} nochange={} sb_rx={}) \
              last_rx(num={} base={} body={}) srv={} \
              link(late={} gap_max={}ms late_gaps={} rx_total={} heartbeats={} retransmits={})",
             std::process::id(),
@@ -167,6 +167,7 @@ impl ClientState {
             self.apply.stale,
             self.apply.dup,
             self.apply.basemis,
+            self.apply.base_history,
             self.apply.base_sum_mismatch,
             self.apply.reack,
             self.apply.nochange,
@@ -542,7 +543,7 @@ mod tests {
             "codec=morph",
             "last_heard_age_ms=1234",
             "title=\"user@host: ~/work\"",
-            "apply(adv=0 stale=0 dup=0 basemis=7 bsum_mis=0 reack=0 nochange=0 sb_rx=0)",
+            "apply(adv=0 stale=0 dup=0 basemis=7 base_history=0 bsum_mis=0 reack=0 nochange=0 sb_rx=0)",
             "last_rx(num=41 base=40 body=diff)",
             // `agent=off` is the forwarding-disabled rendering; see
             // `client_format_renders_the_agent_counters` for the live shape.

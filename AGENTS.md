@@ -274,6 +274,19 @@ the `eng-*(7)` manpages — read them with `man eng-versioning`,
   screen-side gauge shown as `last paint:` in the echo stats, distinct from
   the model's advice-side `PredictorStats`. `set_echo_safe` is a default
   no-op hint (optimistic drops its overlay eagerly). Further seams: posh#174.
+- **A lossy client keeps its recent diff bases (posh#189, `POSH_BASE_HISTORY`,
+  default on):** the session daemon anchors every unacked frame for a lossy
+  (relay / mux-bridge) client at the last frame it saw ACKED and emits one
+  frame per PTY read, so any output faster than a round trip (a fish prompt
+  redraw on every keystroke) makes the next Diff's base fall BEHIND the
+  client's `applied_num`. The roaming client retains the dumps of its last 8
+  applied frames (`ClientState::base_history`) and applies such a Diff against
+  the matching one — the diff from an older base still yields the server's
+  current screen — instead of the old `base < applied_num ⇒ RESYNC ⇒ Full`
+  round trip per burst (the "sluggish, jagged echo" over channels). Morph
+  bodies and a base no longer held keep the strict rule; the history clears on
+  resize. `apply(... base_history=N ...)` in the SIGUSR2 dump / `[stats]` line
+  counts absorbed ack-lag Diffs.
 
 ## Debugging a live / wedged roaming session
 

@@ -1930,6 +1930,12 @@ ENVIRONMENT
                     model frozen while frames keep arriving auto-captures
                     forensics and forces a resync, once per episode. Set to
                     0/off/false/no to disable.
+    POSH_BASE_HISTORY
+                    Client retained-base apply (on by default): a Diff anchored
+                    at a recently applied frame still applies when output
+                    outran the ack round trip, instead of forcing a resync and
+                    a Full keyframe per burst. Set to 0/off/false/no to
+                    restore the strict same-base rule.
     POSH_SERVER_CMD Full path to the remote posh-server binary to exec over ssh
                     (bare host:session form). Overrides the packaged posh-server
                     on the remote PATH, so a debug/instrumented build can be
@@ -2551,6 +2557,7 @@ mod tests {
             "POSH_PREDICTION",
             "POSH_SERVER_NETWORK_TMOUT",
             "POSH_SERVER_SIGNAL_TMOUT",
+            "POSH_BASE_HISTORY",
         ] {
             assert!(HELP.contains(env), "help missing {env}");
         }

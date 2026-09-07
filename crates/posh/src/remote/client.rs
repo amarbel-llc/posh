@@ -993,6 +993,32 @@ fn client_env_config() -> Result<(PredictionModel, RenderStyle, bool, GrabMouse,
     Ok((model, render, predict_overwrite, grab_mouse, echo_escalate))
 }
 
+/// How many recently applied visible dumps the client retains as diff bases
+/// (posh#189). Matches the producer's outstanding window: a server never
+/// anchors a frame further back than that.
+const BASE_HISTORY_DEPTH: usize = 8;
+
+/// `POSH_BASE_HISTORY`: retained-base apply (posh#189) is ON by default;
+/// `0`/`off`/`false`/`no` opts out (the same spelling as the other gates),
+/// restoring the strict `base == applied_num` rule.
+fn base_history_gate() -> bool {
+    !matches!(
+        std::env::var("POSH_BASE_HISTORY").ok().as_deref(),
+        Some("0") | Some("off") | Some("false") | Some("no")
+    )
+}
+
+/// Remember a just-applied visible dump as a future diff base, bounded.
+fn remember_base(st: &mut ClientState, frame_num: u64, dump: &[u8]) {
+    if !st.base_history_on {
+        return;
+    }
+    st.base_history.push((frame_num, dump.to_vec()));
+    if st.base_history.len() > BASE_HISTORY_DEPTH {
+        st.base_history.remove(0);
+    }
+}
+
 /// Whether the slow-link escalation governs at startup: no model named in
 /// the environment (unset or empty) AND the `POSH_ECHO_ESCALATE` gate on.
 /// Pure so the env-pins rule is pinned without touching the process env.
@@ -1255,6 +1281,17 @@ struct ClientState {
     /// One-shot guard so a wedge writes a single forensic bundle, not one per
     /// retransmit (the reack loop fires constantly); reset when apply advances.
     forensic_captured: bool,
+    /// posh#189: the visible dumps of recently applied frames, oldest first,
+    /// bounded to [`BASE_HISTORY_DEPTH`]. A lossy server (the relay / mux
+    /// bridge's session daemon) anchors every unacked frame at the last frame
+    /// it saw ACKED, so under output faster than one round trip the second
+    /// frame's base is behind `applied_num`. Holding the recent bases lets
+    /// such a Diff apply — the server's diff from an older base still yields
+    /// its current screen — instead of forcing a RESYNC and a Full keyframe
+    /// per burst (mosh keeps its recent states for the same reason).
+    base_history: Vec<(u64, Vec<u8>)>,
+    /// `POSH_BASE_HISTORY` gate (default on; 0/off/false/no opts out).
+    base_history_on: bool,
     /// Whether to advertise CAP_DIAG so the server piggybacks its transport
     /// state (#6). True only in a debug posture (POSH_DEBUG_LOG set, or
     /// POSH_WEDGE_WATCHDOG EXPLICITLY on — the watchdog default (#117) does not
@@ -1392,6 +1429,8 @@ fn client_loop(
         palette: None,
         last_reack: None,
         forensic_captured: false,
+        base_history: Vec::new(),
+        base_history_on: base_history_gate(),
         want_server_diag,
         last_server_diag: None,
         last_server_diag_at: 0,
@@ -1546,6 +1585,9 @@ fn drive_client(st: &mut ClientState, raw: &RawMode, port: u16) -> Result<i32> {
                 }
                 st.predict.reset();
                 st.initialized = false; // full repaint at the new size
+                // posh#189: retained bases are dumps at the OLD size; a diff
+                // against one would rebuild a wrong-size screen.
+                st.base_history.clear();
                 // RFC 0002 §4: a width change rewraps the server's ring, so
                 // absolute row continuity ends. Drop the accumulated ring,
                 // discard the (not-yet-built) scroll view by virtue of the
@@ -2534,31 +2576,59 @@ fn apply_frame(st: &mut ClientState, frame: &ServerFrame) -> bool {
     // back to a Full keyframe once it sees the ack. Same base-mismatch rule
     // for both, so a lost frame is handled identically whichever codec is in
     // use (#15).
+    // posh#189: a Diff anchored at a base BEHIND applied_num that we still
+    // hold applies against that retained dump (`Some`); otherwise the body
+    // applies against `applied_data` as before.
+    let mut retained_base: Option<Vec<u8>> = None;
     match &frame.body {
         FrameBody::Empty => return false,
         FrameBody::Diff { base, base_sum, .. } | FrameBody::Morph { base, base_sum, .. } => {
             if *base != st.applied_num {
-                st.stats.record_apply_basemis();
-                // #95 recovery: a base BEHIND our applied_num means a scrollback
-                // frame leapt us past this (unapplied) visible frame — our visible
-                // baseline is stale, and the plain re-ack reports an applied_num we
-                // do not truly hold, so the server never falls back to a Full. That
-                // desync self-heals via neither reack nor base_sum, so actively
-                // request a resync. (base > applied_num is the benign we-are-behind
-                // case a retransmit resolves, so it keeps the passive re-ack.)
-                if *base < st.applied_num {
-                    st.flags |= sync::CLIENT_FLAG_RESYNC;
+                // Retained-base apply (posh#189): a lossy server anchors every
+                // unacked frame at the last ACKED one, so under output faster
+                // than a round trip the next Diff's base is behind us. The
+                // server's diff from that base still yields its current
+                // screen, so applying it against the dump we kept for that
+                // frame is exact — and spares the RESYNC + Full per burst.
+                // Diff only: a Morph base is a rendered snapshot, not bytes.
+                let held = matches!(frame.body, FrameBody::Diff { .. })
+                    && *base < st.applied_num
+                    && st.base_history_on;
+                let dump = held
+                    .then(|| st.base_history.iter().rev().find(|(n, _)| n == base))
+                    .flatten()
+                    .map(|(_, d)| d.clone());
+                match dump {
+                    Some(d) => {
+                        st.stats.record_apply_base_history();
+                        retained_base = Some(d);
+                    }
+                    None => {
+                        st.stats.record_apply_basemis();
+                        // #95 recovery: a base BEHIND our applied_num that we no
+                        // longer hold — our visible baseline is stale, and the
+                        // plain re-ack reports an applied_num we do not truly
+                        // hold, so the server never falls back to a Full. That
+                        // desync self-heals via neither reack nor base_sum, so
+                        // actively request a resync. (base > applied_num is the
+                        // benign we-are-behind case a retransmit resolves, so
+                        // it keeps the passive re-ack.)
+                        if *base < st.applied_num {
+                            st.flags |= sync::CLIENT_FLAG_RESYNC;
+                        }
+                        return true;
+                    }
                 }
-                return true;
             }
-            // RFC 0006: the base NUMBER matches; when the server stamped a base
-            // checksum (CAP_BASE_SUM, Diff only) verify the base CONTENT too. A
-            // mismatch means our applied_data diverged from the server's diff
-            // base -- applying would short-base wedge or silently corrupt (#94) --
-            // so re-ack and request a Full keyframe instead. (Morph base_sum is
-            // always None, so this is inert there.)
+            // RFC 0006: the base NUMBER matches (or is retained); when the
+            // server stamped a base checksum (CAP_BASE_SUM, Diff only) verify
+            // the base CONTENT too. A mismatch means our base diverged from the
+            // server's diff base -- applying would short-base wedge or silently
+            // corrupt (#94) -- so re-ack and request a Full keyframe instead.
+            // (Morph base_sum is always None, so this is inert there.)
             if let Some(sum) = base_sum {
-                if sync::base_checksum(&st.applied_data) != *sum {
+                let base_bytes = retained_base.as_deref().unwrap_or(&st.applied_data);
+                if sync::base_checksum(base_bytes) != *sum {
                     st.stats.record_apply_base_sum_mismatch();
                     st.flags |= sync::CLIENT_FLAG_RESYNC;
                     return true;
@@ -2580,19 +2650,23 @@ fn apply_frame(st: &mut ClientState, frame: &ServerFrame) -> bool {
     // the full-dump reparse (the suspected hot spot); for MorphDelta it is the
     // forward `process(escapes)` on the existing model (the optimization).
     let apply_timer = st.stats.instrument().then(Instant::now);
-    let outcome = st.applier.apply(
-        st.rows,
-        st.cols,
-        &st.applied_data,
-        &mut st.server_term,
-        &frame.body,
-    );
+    let outcome = match retained_base.as_deref() {
+        Some(base) => st.applier.apply(st.rows, st.cols, base, &mut st.server_term, &frame.body),
+        None => st.applier.apply(
+            st.rows,
+            st.cols,
+            &st.applied_data,
+            &mut st.server_term,
+            &frame.body,
+        ),
+    };
     if let Some(t) = apply_timer {
         st.stats.record_apply_us(t.elapsed().as_micros() as u64);
     }
     match outcome {
         ApplyOutcome::Advanced { dump } => {
             st.applied_num = frame.frame_num;
+            remember_base(st, frame.frame_num, &dump);
             st.applied_data = dump;
             st.stats.record_apply_advanced();
             // The manual "Reset & resync" (CLIENT_FLAG_RESYNC) forces a Full
@@ -3449,6 +3523,80 @@ mod tests {
         assert!(!st.forensic_captured, "advance resets the one-shot guard");
     }
 
+    /// posh#189: under ack-lag the server's next Diff is anchored at the
+    /// last frame it saw acked, behind applied_num. With the base still in
+    /// the retained history it applies (the diff from that base yields the
+    /// server's current screen) — no RESYNC, no Full — and the applied dump
+    /// is the diff's target. With the gate off, or a base we no longer hold,
+    /// the strict rule (basemis + RESYNC) stands.
+    #[test]
+    fn retained_base_applies_an_ack_lag_diff() {
+        let screen_a = b"\x1b[2J\x1b[Hprompt$ a".to_vec();
+        let screen_b = b"\x1b[2J\x1b[Hprompt$ ab".to_vec();
+        let screen_c = b"\x1b[2J\x1b[Hprompt$ abc".to_vec();
+        let frame = |num: u64, base: u64, diff: Vec<u8>| ServerFrame {
+            flags: 0,
+            caps: vec![],
+            frame_num: num,
+            input_ack: 0,
+            echo_ack: 0,
+            body: FrameBody::Diff { base, base_sum: None, diff },
+        };
+        let mut st = test_state(24, 80);
+        // Frame 1 (a Full) establishes base 1 and enters the history.
+        assert!(apply_frame(
+            &mut st,
+            &ServerFrame {
+                flags: 0,
+                caps: vec![],
+                frame_num: 1,
+                input_ack: 0,
+                echo_ack: 0,
+                body: FrameBody::Full(screen_a.clone()),
+            }
+        ));
+        assert_eq!(st.applied_num, 1);
+        // Frame 2 diffs 1 → B (applies, applied_num 2), then frame 3 arrives
+        // still anchored at 1 (the ack of 2 has not reached the server):
+        // the ack-lag shape a lossy daemon produces on every burst.
+        assert!(apply_frame(&mut st, &frame(2, 1, sync::make_diff(&screen_a, &screen_b))));
+        assert_eq!(st.applied_num, 2);
+        st.flags = 0;
+        assert!(apply_frame(&mut st, &frame(3, 1, sync::make_diff(&screen_a, &screen_c))));
+        assert_eq!(st.applied_num, 3, "the retained base 1 let frame 3 apply");
+        assert_eq!(st.applied_data, screen_c, "the applied dump is the diff's target");
+        assert_eq!(st.flags & sync::CLIENT_FLAG_RESYNC, 0, "no resync, no Full");
+        assert_eq!(st.stats.apply_snapshot().base_history, 1);
+
+        // A base that fell out of the history (or was never applied) keeps
+        // the #95 rule: basemis + RESYNC.
+        st.flags = 0;
+        assert!(apply_frame(&mut st, &frame(4, 0, sync::make_diff(b"", &screen_c))));
+        assert_eq!(st.applied_num, 3);
+        assert_ne!(st.flags & sync::CLIENT_FLAG_RESYNC, 0);
+
+        // Gate off: the same ack-lag Diff is rejected with a RESYNC.
+        let mut off = test_state(24, 80);
+        off.base_history_on = false;
+        assert!(apply_frame(
+            &mut off,
+            &ServerFrame {
+                flags: 0,
+                caps: vec![],
+                frame_num: 1,
+                input_ack: 0,
+                echo_ack: 0,
+                body: FrameBody::Full(screen_a.clone()),
+            }
+        ));
+        assert!(apply_frame(&mut off, &frame(2, 1, sync::make_diff(&screen_a, &screen_b))));
+        off.flags = 0;
+        assert!(apply_frame(&mut off, &frame(3, 1, sync::make_diff(&screen_a, &screen_c))));
+        assert_eq!(off.applied_num, 2, "gate off: strict base rule");
+        assert_ne!(off.flags & sync::CLIENT_FLAG_RESYNC, 0);
+        assert!(off.base_history.is_empty(), "gate off retains nothing");
+    }
+
     #[test]
     fn apply_frame_base_behind_applied_num_requests_resync() {
         // #95: a scrollback frame can leap applied_num past an unapplied visible
@@ -4188,6 +4336,8 @@ mod tests {
             palette: None,
             last_reack: None,
             forensic_captured: false,
+            base_history: Vec::new(),
+            base_history_on: true,
             want_server_diag: false,
             last_server_diag: None,
             last_server_diag_at: 0,
