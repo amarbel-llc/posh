@@ -8,3 +8,7 @@
 # .gitattributes alone does not activate it. Driver: scripts/version-merge.
 # See eng-versioning(7).
 version.env merge=keep-higher-semver
+# conformist-git(7) MERGE DRIVERS: regenerate-on-conflict merge for
+# generated files. The merge.<name>.driver side is registered per-machine
+# in eng home-manager git config; these lines are the per-repo half.
+flake.lock merge=conformist-flake-lock
