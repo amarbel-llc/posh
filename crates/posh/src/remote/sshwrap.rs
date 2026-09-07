@@ -95,6 +95,28 @@ pub fn export_unacked_warning(requested: bool, acked: bool) -> Option<&'static s
     )
 }
 
+/// The bootstrap's failure when ssh ended without `POSH CONNECT`: the PATH
+/// hint (the one posh-side cause) plus what ssh itself said, when its
+/// stderr was captured — the last few non-empty lines, so an auth,
+/// resolution, or host-key failure names itself in the mux log.
+fn startup_failure(ssh_stderr: &str) -> Error {
+    let mut msg = String::from(
+        "did not find posh server startup message \
+         (is posh-server on the server's non-interactive PATH?)",
+    );
+    let tail: Vec<&str> = ssh_stderr
+        .lines()
+        .map(str::trim)
+        .filter(|l| !l.is_empty())
+        .collect();
+    if !tail.is_empty() {
+        let keep = tail.len().saturating_sub(3);
+        msg.push_str("; ssh: ");
+        msg.push_str(&tail[keep..].join(" | "));
+    }
+    Error::Msg(msg)
+}
+
 /// What the wrapped server reported on stdout.
 #[derive(Debug, Default, PartialEq, Eq)]
 pub struct ServerReport {
@@ -532,15 +554,29 @@ pub fn bootstrap(
     let mut ssh = Command::new("ssh");
     ssh.args(ssh_args(opts));
     ssh.args(dest.ssh_args());
+    // ssh's stderr: on a tty it streams through (auth prompts, warnings);
+    // with no tty (the mux daemon's bootstrap) it is captured so a failed
+    // attempt can SAY why — the generic "no startup message" hid the real
+    // ssh error (resolution, an agent prompt refused without a tty, a host
+    // key) behind a PATH hint. Drained on a thread so a chatty ssh can never
+    // fill the pipe while stdout is being read.
+    let capture_stderr = !crate::util::is_tty(libc::STDERR_FILENO);
     let mut child = ssh
         .arg(dest.target())
         .arg("--")
         .arg(&server_cmd)
         .stdin(Stdio::inherit()) // keep the tty for auth prompts
         .stdout(Stdio::piped())
-        .stderr(Stdio::inherit())
+        .stderr(if capture_stderr { Stdio::piped() } else { Stdio::inherit() })
         .spawn()
         .map_err(|e| Error::Msg(format!("cannot exec ssh: {e}")))?;
+    let stderr_drain = child.stderr.take().map(|mut err| {
+        std::thread::spawn(move || {
+            let mut bytes = Vec::new();
+            let _ = std::io::Read::read_to_end(&mut err, &mut bytes);
+            bytes
+        })
+    });
 
     let stdout = child.stdout.take().expect("piped stdout");
     let mut report = ServerReport::default();
@@ -555,12 +591,13 @@ pub fn bootstrap(
         }
     }
     let _ = child.wait();
+    let ssh_stderr = stderr_drain
+        .and_then(|h| h.join().ok())
+        .map(|bytes| String::from_utf8_lossy(&bytes).into_owned())
+        .unwrap_or_default();
 
     let (Some(port), Some(key)) = (report.port, report.key) else {
-        return Err(Error::from(
-            "did not find posh server startup message \
-             (is posh-server on the server's non-interactive PATH?)",
-        ));
+        return Err(startup_failure(&ssh_stderr));
     };
     if let Some(warning) = export_unacked_warning(opts.agent_export, report.agent_export) {
         eprintln!("{warning}");
@@ -821,6 +858,27 @@ mod tests {
         assert!(!is_shell_safe_name("9LC")); // leading digit
         assert!(!is_shell_safe_name("LC_X;curl evil|sh;")); // metacharacters
         assert!(!is_shell_safe_name("LC X")); // space
+    }
+
+    /// A failed bootstrap names ssh's own complaint (its last non-empty
+    /// stderr lines) after the PATH hint; with nothing captured the hint
+    /// stands alone.
+    #[test]
+    fn startup_failure_carries_the_ssh_stderr_tail() {
+        let bare = startup_failure("").to_string();
+        assert!(bare.starts_with("did not find posh server startup message"));
+        assert!(!bare.contains("ssh:"));
+        let noisy = startup_failure(
+            "Warning: Permanently added 'box' (ED25519) to the list of known hosts.\n\n\
+             sign_and_send_pubkey: signing failed for ED25519 \"cardno:1\" from agent: agent refused operation\n\
+             me@box: Permission denied (publickey).\n",
+        )
+        .to_string();
+        assert!(noisy.contains("ssh: Warning: Permanently added"), "{noisy}");
+        assert!(noisy.contains("agent refused operation | me@box: Permission denied"), "{noisy}");
+        // Only the last three lines ride along.
+        let long = startup_failure("a\nb\nc\nd\ne\n").to_string();
+        assert!(long.ends_with("ssh: c | d | e"), "{long}");
     }
 
     #[test]

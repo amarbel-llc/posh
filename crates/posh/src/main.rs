@@ -1099,11 +1099,12 @@ fn cmd_ssh_session(
                     match remote::client::run_over_mux(transport, &dest) {
                         Ok(0) => return Ok(()),
                         Ok(code) => std::process::exit(code),
-                        // A close BEFORE any frame arrived: the remote
-                        // refused/failed the channel after the local grant
-                        // — fall through to the per-invocation path, like
-                        // every other establishment failure.
-                        Err(e) if e.to_string().contains("before establishing") => {
+                        // A close BEFORE any frame arrived (the remote
+                        // refused/failed the channel after the local grant)
+                        // or no frame within the connect timeout (the daemon
+                        // mid-reconnect) — fall through to the per-invocation
+                        // path, like every other establishment failure.
+                        Err(e) if mux_establish_failed(&e) => {
                             warn_mux_fallback(&e);
                         }
                         Err(e) => return Err(e),
@@ -1671,6 +1672,16 @@ fn cmd_mux(args: &[String]) -> Result<()> {
         }
         _ => Err(Error::from("usage: posh mux ls")),
     }
+}
+
+/// Whether a mux-session attach error means the channel was never
+/// established — closed by the remote before any frame, or timed out waiting
+/// for the first one (the daemon mid-reconnect) — so the per-invocation
+/// bootstrap is the right next move. Any other error (a real close after
+/// frames flowed) is final.
+fn mux_establish_failed(e: &Error) -> bool {
+    let text = e.to_string();
+    text.contains("before establishing") || text.contains("not established")
 }
 
 /// The M2 fallback warning, durable for the soak (#156): greppable in the
@@ -2318,6 +2329,18 @@ mod tests {
                 "roundtrip for detach={detach} command={command:?}"
             );
         }
+    }
+
+    /// The M2 fallback fires on both never-established shapes — the remote's
+    /// early close and the client's first-frame timeout — and on nothing else.
+    #[test]
+    fn mux_establish_failed_covers_close_and_timeout_only() {
+        assert!(mux_establish_failed(&Error::from("mux session closed before establishing: refused")));
+        assert!(mux_establish_failed(&Error::from(
+            "mux session not established within 15s (mux daemon reconnecting?)"
+        )));
+        assert!(!mux_establish_failed(&Error::from("mux session closed: daemon exited")));
+        assert!(!mux_establish_failed(&Error::from("Timed out waiting for server on UDP port 60001.")));
     }
 
     #[test]

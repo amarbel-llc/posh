@@ -1795,16 +1795,27 @@ fn drive_client(st: &mut ClientState, raw: &RawMode, port: u16) -> Result<i32> {
         if !heard {
             let waited = now.saturating_sub(started);
             if connect_timeout > 0 && waited >= connect_timeout {
-                break 'client Err(Error::Msg(format!(
-                    "Timed out waiting for server on UDP port {port}."
-                )));
+                break 'client Err(match &st.wire {
+                    Wire::Udp(_) => Error::Msg(format!(
+                        "Timed out waiting for server on UDP port {port}."
+                    )),
+                    // The mux channel never got its first frame: the daemon's
+                    // wire is most likely mid-reconnect (posh#162). Worded as
+                    // a not-established outcome so the front door's
+                    // per-invocation fallback fires (it can answer an agent
+                    // prompt on the tty, which the daemon's bootstrap cannot).
+                    Wire::Mux(_) => Error::Msg(format!(
+                        "mux session not established within {}s (mux daemon reconnecting?)",
+                        connect_timeout / 1000
+                    )),
+                });
             }
             if waited >= 250 && st.notify.message().is_empty() {
-                st.notify.set_message(
-                    &format!("Nothing received from server on UDP port {port}."),
-                    true,
-                    now,
-                );
+                let waiting_on = match &st.wire {
+                    Wire::Udp(_) => format!("Nothing received from server on UDP port {port}."),
+                    Wire::Mux(_) => "Nothing received over the mux session channel yet.".to_string(),
+                };
+                st.notify.set_message(&waiting_on, true, now);
             }
         }
         render(st, now);
