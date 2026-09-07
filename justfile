@@ -454,6 +454,47 @@ debug-merge-driver-e2e:
 debug-cargo *ARGS:
     nix develop --command cargo {{ ARGS }}
 
+# Drive the `real_binary_*` palette round-trips (RFC 0005 views, FDR 0016
+# picker) against a FRESHLY BUILT posh-palette instead of whatever is on
+# PATH — the profile's renderer may predate the tree's protocol surface, in
+# which case those tests skip. The agent dev-loop for renderer changes.
+#
+# run the palette round-trip tests against a fresh posh-palette build
+[group("debug")]
+debug-palette-e2e: build-palette
+    POSH_PALETTE="{{ justfile_directory() }}/result-posh-palette/bin/posh-palette" \
+      nix develop --command cargo test -p posh -- real_binary
+
+# Smoke the FDR 0016 top-level picker headlessly: run the worktree's `ph`
+# (a symlink to the debug posh, so argv[0] routes the front-door) with the
+# fresh renderer in a detached tmux pane against THIS host's real sessions,
+# print the drawn picker, dismiss it with Esc, and print what it left
+# behind. Reads only (`posh list` probes); nothing is attached.
+#
+# smoke the top-level `ph` picker in a detached tmux pane
+[group("debug")]
+debug-ph-picker-smoke: build-palette
+    #!/usr/bin/env bash
+    set -euo pipefail
+    dir="{{ justfile_directory() }}/.tmp/phpick"
+    mkdir -p "$dir"
+    nix develop --command cargo build -p posh
+    ln -sfn "{{ justfile_directory() }}/target/debug/posh" "$dir/ph"
+    tmux kill-session -t posh-phpick 2>/dev/null || true
+    tmux new-session -d -s posh-phpick -x 100 -y 30 \
+      "env POSH_PALETTE='{{ justfile_directory() }}/result-posh-palette/bin/posh-palette' \
+        '$dir/ph' 2>'$dir/stderr.log'; echo \"ph exited: \$?\"; sleep 30"
+    sleep 4
+    echo "== picker (before Esc) =="
+    tmux capture-pane -p -t posh-phpick
+    tmux send-keys -t posh-phpick Escape
+    sleep 1
+    echo "== after Esc =="
+    tmux capture-pane -p -t posh-phpick
+    echo "== stderr =="
+    cat "$dir/stderr.log" || true
+    tmux kill-session -t posh-phpick 2>/dev/null || true
+
 # (Re)bless the mosh terminal characterization goldens (task #4). The driver is
 # the mosh-ffi C++ FFI shim, so a fixed VT script always renders the same grid
 # (no clock, no network). Assert with the normal loop: `just debug-cargo test

@@ -115,6 +115,13 @@ type command struct {
 	Action *action `json:"action,omitempty"`
 }
 
+// row is one line of the "picker" view (RFC 0005 §3.5): column texts the
+// renderer aligns but does not interpret, plus the action a selection issues.
+type row struct {
+	Cells  []string `json:"cells"`
+	Action *action  `json:"action,omitempty"`
+}
+
 type showParams struct {
 	View     string    `json:"view"`
 	Commands []command `json:"commands,omitempty"`
@@ -122,6 +129,15 @@ type showParams struct {
 	Prompt   string    `json:"prompt,omitempty"`
 	// Body is the text rendered by the "dialog" view (RFC 0005 §3.2).
 	Body string `json:"body,omitempty"`
+	// Rows and Empty belong to the "picker" view (RFC 0005 §3.5): the table
+	// rows, and the text shown when there are none.
+	Rows  []row  `json:"rows,omitempty"`
+	Empty string `json:"empty,omitempty"`
+}
+
+// knownView reports whether a ui.show view name is one this renderer draws.
+func knownView(v string) bool {
+	return v == "palette" || v == "dialog" || v == "picker"
 }
 
 // bubbletea messages produced from control input.
@@ -163,6 +179,7 @@ const (
 	viewNone viewKind = iota
 	viewPalette
 	viewDialog
+	viewPicker
 )
 
 type keymap struct {
@@ -178,6 +195,11 @@ type model struct {
 	commands []command
 	filtered []command
 	selected int
+	// Picker view (RFC 0005 §3.5): the table rows, the filtered subset the
+	// list and `selected` index over, and the no-rows text.
+	rows         []row
+	filteredRows []row
+	empty        string
 	// Dialog view (RFC 0005 ui.show view="dialog"): the body text shown, a
 	// transient "copied" footer flag, and the latest known terminal width.
 	body   string
@@ -232,6 +254,24 @@ func (m model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 			}
 			m.body = msg.Body
 			m.copied = false
+		case "picker":
+			m.view = viewPicker
+			m.rows = msg.Rows
+			m.title = msg.Title
+			if m.title == "" {
+				m.title = "Sessions"
+			}
+			m.empty = msg.Empty
+			if m.empty == "" {
+				m.empty = "(no sessions)"
+			}
+			if msg.Prompt != "" {
+				m.input.Prompt = msg.Prompt
+			}
+			m.input.SetValue("")
+			m.input.Focus()
+			m.selected = 0
+			m.recompute()
 		default:
 			m.view = viewNone
 		}
@@ -254,8 +294,8 @@ func (m model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 				m.view = viewNone
 			}
 			return m, nil
-		case viewPalette:
-			// fall through to the palette key handling below
+		case viewPalette, viewPicker:
+			// fall through to the shared list key handling below
 		default:
 			return m, nil // hidden: the client owns the keyboard
 		}
@@ -274,7 +314,7 @@ func (m model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 			}
 			return m, nil
 		case key.Matches(msg, m.keys.down):
-			if m.selected < len(m.filtered)-1 {
+			if m.selected < m.listLen()-1 {
 				m.selected++
 			}
 			return m, nil
@@ -287,6 +327,17 @@ func (m model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 	return m, nil
 }
 
+// listLen is the length of the list `selected` indexes: the filtered
+// commands (palette) or the filtered rows (picker).
+func (m model) listLen() int {
+	if m.view == viewPicker {
+		return len(m.filteredRows)
+	}
+	return len(m.filtered)
+}
+
+// recompute re-filters the active list by the input query: a command matches
+// on its name, a picker row when ANY cell contains the query (RFC 0005 §3.5).
 func (m *model) recompute() {
 	q := strings.ToLower(strings.TrimSpace(m.input.Value()))
 	m.filtered = nil
@@ -295,24 +346,50 @@ func (m *model) recompute() {
 			m.filtered = append(m.filtered, c)
 		}
 	}
-	if m.selected >= len(m.filtered) {
-		m.selected = len(m.filtered) - 1
+	m.filteredRows = nil
+	for _, r := range m.rows {
+		if q == "" || rowMatches(r, q) {
+			m.filteredRows = append(m.filteredRows, r)
+		}
+	}
+	if m.selected >= m.listLen() {
+		m.selected = m.listLen() - 1
 	}
 	if m.selected < 0 {
 		m.selected = 0
 	}
 }
 
-// choose issues the selected command's action to the client, or reports a
+func rowMatches(r row, q string) bool {
+	for _, cell := range r.Cells {
+		if strings.Contains(strings.ToLower(cell), q) {
+			return true
+		}
+	}
+	return false
+}
+
+// selectedAction is the action of the highlighted entry in the active list,
+// or nil when the list is empty or the entry is a no-op.
+func (m model) selectedAction() *action {
+	if m.view == viewPicker {
+		if m.selected < len(m.filteredRows) {
+			return m.filteredRows[m.selected].Action
+		}
+		return nil
+	}
+	if m.selected < len(m.filtered) {
+		return m.filtered[m.selected].Action
+	}
+	return nil
+}
+
+// choose issues the selected entry's action to the client, or reports a
 // cancel when there is nothing to select (RFC 0005 §4.1/§4.2).
 func (m model) choose() {
-	if len(m.filtered) == 0 {
-		m.conn.notify("ui.cancelled", nil)
-		return
-	}
-	a := m.filtered[m.selected].Action
+	a := m.selectedAction()
 	if a == nil || a.Method == "" {
-		m.conn.notify("ui.cancelled", nil) // no-op entry
+		m.conn.notify("ui.cancelled", nil) // nothing selected, or a no-op entry
 		return
 	}
 	m.conn.request(a.Method, a.Params)
@@ -332,8 +409,95 @@ func (m model) View() tea.View {
 		return tea.NewView(m.paletteView())
 	case viewDialog:
 		return tea.NewView(m.dialogView())
+	case viewPicker:
+		return tea.NewView(m.pickerView())
 	}
 	return tea.NewView("")
+}
+
+// pickerView draws the filterable table (RFC 0005 §3.5): every column padded
+// to the widest cell among the filtered rows, cells truncated (never wrapped)
+// to the panel width, which follows the terminal like the dialog does.
+func (m model) pickerView() string {
+	var b strings.Builder
+	b.WriteString(titleStyle.Render(m.title))
+	b.WriteByte('\n')
+	b.WriteString(m.input.View())
+	b.WriteString("\n\n")
+	// The panel width tracks the terminal (capped); the rows get what is left
+	// after the marker column and the panel's own border + padding.
+	panelWidth := 80
+	if m.width > 0 {
+		panelWidth = m.width - 4
+	}
+	panelWidth = max(min(panelWidth, 120), 30)
+	// dialogStyle's Padding(1, 2) + the double border: 6 columns of chrome;
+	// the "› " marker takes two more.
+	lineWidth := panelWidth - 8
+	if len(m.filteredRows) == 0 {
+		b.WriteString(dimStyle.Render(m.empty))
+		b.WriteByte('\n')
+	}
+	widths := columnWidths(m.filteredRows)
+	for i, r := range m.filteredRows {
+		line := truncate(alignCells(r.Cells, widths), lineWidth)
+		if i == m.selected {
+			b.WriteString(selStyle.Render("› " + line))
+		} else {
+			b.WriteString("  " + line)
+		}
+		b.WriteByte('\n')
+	}
+	b.WriteByte('\n')
+	b.WriteString(helpStyle.Render("↑/↓ choose · enter select · esc cancel"))
+	return dialogStyle.Width(panelWidth).Render(b.String())
+}
+
+// columnWidths is the widest cell per column across rows (rune-counted so a
+// non-ASCII label pads correctly).
+func columnWidths(rows []row) []int {
+	var widths []int
+	for _, r := range rows {
+		for i, cell := range r.Cells {
+			n := len([]rune(cell))
+			if i >= len(widths) {
+				widths = append(widths, n)
+			} else if n > widths[i] {
+				widths[i] = n
+			}
+		}
+	}
+	return widths
+}
+
+// alignCells joins cells with each padded to its column width, two spaces
+// between columns; a row shorter than the widest is padded with blanks.
+func alignCells(cells []string, widths []int) string {
+	var b strings.Builder
+	for i, w := range widths {
+		cell := ""
+		if i < len(cells) {
+			cell = cells[i]
+		}
+		if i > 0 {
+			b.WriteString("  ")
+		}
+		b.WriteString(cell)
+		b.WriteString(strings.Repeat(" ", max(w-len([]rune(cell)), 0)))
+	}
+	return strings.TrimRight(b.String(), " ")
+}
+
+// truncate clips s to n runes, marking the cut with an ellipsis.
+func truncate(s string, n int) string {
+	r := []rune(s)
+	if len(r) <= n || n <= 0 {
+		return s
+	}
+	if n == 1 {
+		return "…"
+	}
+	return string(r[:n-1]) + "…"
 }
 
 func (m model) dialogView() string {
@@ -439,7 +603,7 @@ func readControl(c *conn, r *os.File, p *tea.Program) {
 			c.respond(m.ID, res)
 		case "ui.show":
 			var sp showParams
-			if json.Unmarshal(m.Params, &sp) != nil || (sp.View != "palette" && sp.View != "dialog") {
+			if json.Unmarshal(m.Params, &sp) != nil || !knownView(sp.View) {
 				c.respondError(m.ID, -32602, "invalid params: unknown view")
 				continue
 			}

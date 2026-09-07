@@ -338,18 +338,26 @@ fn ph_argv0_routes_and_defers_picker() {
             .expect("run ph")
     };
 
-    // Bare `ph` -> the picker is deferred (FDR 0016): a non-zero error, no hang.
+    // Bare `ph` off a terminal -> the FDR 0016 picker never launches (the
+    // FDR 0011 non-TTY discipline): a non-zero error naming the candidates,
+    // no hang. The candidates here are the local create row's siblings —
+    // an empty POSH_DIR lists no sessions.
     let out = run(&[]);
-    assert!(!out.status.success(), "bare ph should defer: {out:?}");
+    assert!(!out.status.success(), "bare ph should error off a tty: {out:?}");
     assert!(
-        String::from_utf8_lossy(&out.stderr).contains("picker not yet available"),
+        String::from_utf8_lossy(&out.stderr).contains("needs a terminal"),
         "bare ph stderr: {}",
         String::from_utf8_lossy(&out.stderr)
     );
 
-    // `ph box:` (host picker) -> deferred.
+    // `ph box:` (host picker) off a terminal -> the same discipline.
     let out = run(&["box:"]);
-    assert!(!out.status.success(), "ph host: should defer: {out:?}");
+    assert!(!out.status.success(), "ph host: should error off a tty: {out:?}");
+    assert!(
+        String::from_utf8_lossy(&out.stderr).contains("needs a terminal"),
+        "ph host: stderr: {}",
+        String::from_utf8_lossy(&out.stderr)
+    );
 
     // `ph host:+` (remote auto-id) now ATTEMPTS the remote (it was deferred);
     // an unreachable host fails fast (resolution) rather than hanging.

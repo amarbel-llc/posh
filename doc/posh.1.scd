@@ -52,8 +52,8 @@ _name_
 	default (FDR 0011), so the bare form *errors* with the host's
 	session list and the new forms — it no longer spawns an ephemeral
 	roaming shell. The throwaway shell survives behind the explicit
-	*start --ephemeral* opt-out; a host-scoped interactive picker is
-	planned (FDR 0016).
+	*start --ephemeral* opt-out; the host-scoped interactive picker is
+	*ph* _host_*:* (FDR 0016).
 
 \[_user_@]_host_*:*[_group_/]_session_ [*--detach*] [_command_...]
 	A *persistent session on a remote host*, transported over the
@@ -95,8 +95,14 @@ local session.
 *ph* _host_*:+*
 	Create a new auto-id session on _host_ (first free _s-N_).
 
-The bare *ph* and *ph* _host_*:* pickers (FDR 0016) are not yet available and
-error with guidance.
+*ph*, *ph* _host_*:*
+	Open the session picker (FDR 0016): a filterable table of the
+	reachable sessions — this machine plus every host with a live mux
+	endpoint, or _host_ alone — labelled by activity, host, and status,
+	with a *+ create new session…* row per host. Selecting a row attaches
+	as typing its target would. Drawn by the *posh-palette* renderer
+	(the command palette's, RFC 0005); off a terminal the picker never
+	launches and the command errors with the candidate targets.
 
 # GLOBAL OPTIONS
 

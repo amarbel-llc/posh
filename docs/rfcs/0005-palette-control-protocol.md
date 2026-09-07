@@ -134,11 +134,13 @@ Show a view. `result` is an empty object `{}` acknowledging the view is up
 
 | field      | type      | required | meaning                                  |
 |------------|-----------|----------|------------------------------------------|
-| `view`     | string    | yes      | View to display. Defines `"palette"` and `"dialog"`. |
+| `view`     | string    | yes      | View to display. Defines `"palette"`, `"dialog"`, and `"picker"` (§3.5). |
 | `commands` | command[] | for `palette` | The command list (§5).             |
-| `title`    | string    | no       | Heading; default `"Commands"` (palette) / `"Info"` (dialog). |
-| `prompt`   | string    | no       | Filter-input prompt; default `"/ "` (palette only). |
+| `title`    | string    | no       | Heading; default `"Commands"` (palette) / `"Info"` (dialog) / `"Sessions"` (picker). |
+| `prompt`   | string    | no       | Filter-input prompt; default `"/ "` (palette and picker). |
 | `body`     | string    | for `dialog` | The text the `dialog` view displays.   |
+| `rows`     | row[]     | for `picker` | The table rows (§3.5).                 |
+| `empty`    | string    | no       | Text shown by a `picker` with no rows; default `"(no sessions)"`. |
 
 An unknown `view` MUST yield error `-32602` (invalid params). A second `ui.show`
 while a view is up REPLACES it (re-configures in place).
@@ -161,6 +163,34 @@ Tell the renderer to exit. The renderer MUST stop drawing, restore nothing
 a notification there is no response; the client SHOULD treat control-channel
 EOF or process exit as completion, and SHOULD enforce a timeout-bounded
 `SIGKILL` backstop (the renderer's event loop may be wedged).
+
+#### 3.5 The `picker` view (FDR 0016)
+
+The `"picker"` view is a filterable **table**: the generalization of the
+`palette` list to rows with several columns, so a client can present a
+session listing (or any other tabular choice) without the renderer learning
+what the columns mean. A **row** in `params.rows`:
+
+| field    | type     | required | meaning                                          |
+|----------|----------|----------|--------------------------------------------------|
+| `cells`  | string[] | yes      | The row's column texts, left to right. Rows MAY have different lengths; the renderer aligns column `i` across rows and pads a missing cell as blank. |
+| `action` | action   | no       | What to issue on selection (§4.1, §5); omit for a no-op row. |
+
+The renderer MUST render each row on one line with its cells in the given
+order, padded so that each column is aligned across all rows, and MUST
+truncate cells that do not fit the panel rather than wrapping. The filter
+input matches a row when the query is a case-insensitive substring of ANY
+cell. Navigation, selection, and cancellation behave exactly as for the
+`palette` view: selecting a row issues its `action` as a request (§4.1),
+`Esc` sends `ui.cancelled` (§4.2), and selecting a row with no `action` is a
+cancel. A `picker` carries no `commands`; `commands` present with
+`view="picker"` MUST be ignored.
+
+`empty` is displayed in place of the row list when `rows` is empty (the
+client still learns of a cancel the usual way). The view is additive (§9):
+a version-1 renderer that predates it answers `-32602`, which a client MUST
+treat as "picker unavailable" (fall back to its non-TUI listing), never as a
+protocol failure.
 
 ### 4. Methods the client implements (renderer → client)
 
@@ -243,6 +273,8 @@ methods it does not implement.
 | `shell.open`     | `{}`                                    | Open the server-side escape-to-shell overlay (FDR 0008) in the session cwd. On a client without a server-side overlay, `-32601`. |
 | `client.suspend` | `{}`                                    | Suspend the client process (job-control `SIGSTOP`); the remote session keeps running. |
 | `app.quit`       | `{}`                                    | Quit the client (close the connection / detach per client semantics). |
+| `session.list`   | `{}`                                    | Replace the current view with the reachable-session picker (FDR 0016): the client lists sessions and re-shows the renderer with `view="picker"`. The palette's *Switch session…* command carries this action. |
+| `session.switch` | `{"target": <string>}`                  | Switch the viewport to the named session (an RFC 0001 target: `[user@]host:[group/]session`, `:[group/]session`, or a bare local name) — FDR 0016. The client ends its attach with a switch outcome and its front door re-attaches to `target`. `{"target": "<host>:+"}` (or `":+"`) creates a new auto-id session there first. Invalid target → `-32602`. |
 
 Per posh#87, these methods are the client's shared control surface: a converged
 client core implements them once and the same palette drives every transport.

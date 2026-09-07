@@ -260,9 +260,10 @@ fn run() -> Result<()> {
                 cmd_attach(&g.unwrap_or(group), &args, &forward_flag)
             }
             // FDR 0011: a bare host no longer spawns an ephemeral roaming
-            // shell — durable sessions are the default. Until the FDR 0016
-            // host-scoped picker lands this errors with the candidate list
-            // (the non-TTY discipline); `start --ephemeral` is the opt-out.
+            // shell — durable sessions are the default. `posh` errors with
+            // the candidate list (the non-TTY discipline); the host-scoped
+            // picker is `ph host:` (FDR 0016); `start --ephemeral` is the
+            // opt-out.
             target::Target::Host { user, host } => {
                 Err(bare_host_guidance(user, host, &group))
             }
@@ -566,7 +567,7 @@ fn start_remote_extra(detach: bool, command: &[String]) -> Vec<String> {
 /// host's candidate sessions and the new forms, instead of spawning an
 /// ephemeral roaming shell. The candidate probe is best-effort — an
 /// unreachable host still gets the guidance, just without the list. The
-/// host-scoped picker (FDR 0016) will replace this error on a TTY.
+/// interactive form is `ph host:` (the FDR 0016 picker).
 fn bare_host_guidance(user: Option<String>, host: String, group: &str) -> Error {
     let dest = ph_dest(user.as_deref(), &host);
     let candidates = match remote_session_names(user.as_deref(), &host, group) {
@@ -603,8 +604,8 @@ fn start_remote_auto(
 
 /// How a `ph` target token resolves (FDR 0015). The colon is the sole
 /// local-vs-host discriminator (a no-colon token is always local); `+` after the
-/// colon is the new-session sigil. Picker forms (bare `ph`, `ph host:`) are
-/// deferred to FDR 0016.
+/// colon is the new-session sigil. The picker forms (bare `ph`, `ph host:`)
+/// open the FDR 0016 chooser.
 #[derive(Debug, PartialEq, Eq)]
 enum PhRoute {
     PickerAll,
@@ -632,7 +633,7 @@ fn ph_dest(user: Option<&str>, host: &str) -> String {
 /// Parse a `ph` target token (FDR 0015). The colon is the local-vs-host
 /// discriminator: a plain bare word is a local session, while a token posh reads
 /// as a *host* (`box.com`, `user@host`, IPv6) needs a `:session` — a trailing
-/// `:` (`host:`) is the deferred picker, a bare host-looking token is a
+/// `:` (`host:`) is the host-scoped picker, a bare host-looking token is a
 /// forgotten-session hint (routed cleanly rather than through `posh start`).
 fn ph_parse(token: Option<&str>) -> PhRoute {
     let Some(t) = token else {
@@ -686,22 +687,20 @@ fn parse_ph_args(argv: &[String]) -> Result<(String, Option<&str>)> {
 }
 
 /// `ph`: the FDR 0015 front-door. Resolves a target and routes to `posh start`
-/// (absent) or `posh attach` (present); the picker forms are deferred to FDR
-/// 0016 and error with guidance (the non-TTY discipline).
+/// (absent) or `posh attach` (present); the picker forms open the FDR 0016
+/// chooser on a terminal and error with the candidates off one.
 fn cmd_ph(argv: &[String]) -> Result<()> {
     let (group, token) = parse_ph_args(argv)?;
-    match ph_parse(token) {
-        PhRoute::PickerAll => Err(Error::from(
-            "ph: interactive picker not yet available (FDR 0016); use `ph <name>` \
-             (local), `ph host:session` (remote), or `ph :+` (new)",
-        )),
-        PhRoute::PickerHost { user, host } => {
-            let dest = ph_dest(user.as_deref(), &host);
-            Err(Error::Msg(format!(
-                "ph: interactive picker not yet available (FDR 0016); use `ph {dest}:session` \
-                 or `ph {dest}:+` (new)"
-            )))
-        }
+    dispatch_ph(ph_parse(token), &group)
+}
+
+/// Run one resolved `ph` route. The picker routes (bare `ph`, `ph host:`)
+/// open the FDR 0016 chooser and re-enter here with the chosen target's
+/// route, so a selection attaches exactly as typing it would.
+fn dispatch_ph(route: PhRoute, group: &str) -> Result<()> {
+    match route {
+        PhRoute::PickerAll => cmd_ph_picker(None, group),
+        PhRoute::PickerHost { user, host } => cmd_ph_picker(Some((user, host)), group),
         PhRoute::HostNeedsSession { user, host } => {
             let dest = ph_dest(user.as_deref(), &host);
             Err(Error::Msg(format!(
@@ -710,10 +709,10 @@ fn cmd_ph(argv: &[String]) -> Result<()> {
             )))
         }
         PhRoute::LocalNew { group: g } => {
-            cmd_start(g.as_deref().unwrap_or(&group), &[], &remote::agent::ForwardFlag::Unset)
+            cmd_start(g.as_deref().unwrap_or(group), &[], &remote::agent::ForwardFlag::Unset)
         }
         PhRoute::LocalResolve { group: g, session } => {
-            let grp = g.as_deref().unwrap_or(&group);
+            let grp = g.as_deref().unwrap_or(group);
             let cfg = Config::new(grp)?;
             let path = cfg.socket_path(&session)?;
             // Existing (and live) ⇒ attach; absent or stale ⇒ strict create. This
@@ -734,13 +733,151 @@ fn cmd_ph(argv: &[String]) -> Result<()> {
             }
         }
         PhRoute::RemoteNew { user, host, group: g } => {
-            start_remote_auto(user, host, g, &group, &[], &remote::agent::ForwardFlag::Unset)
+            start_remote_auto(user, host, g, group, &[], &remote::agent::ForwardFlag::Unset)
         }
         PhRoute::RemoteResolve { user, host, group: g, session } => {
             // Create-or-attach on the host: the bootstrap resolves the host
             // itself (posh#182), so no probe round-trip is needed.
-            cmd_ssh_session(user, host, g, &group, session, &[], &remote::agent::ForwardFlag::Unset)
+            cmd_ssh_session(user, host, g, group, session, &[], &remote::agent::ForwardFlag::Unset)
         }
+    }
+}
+
+/// One row of the FDR 0016 session picker: the RFC 0001 target a selection
+/// attaches to (fed back through [`ph_parse`]) and its display cells —
+/// label (activity, else launch command, else blank), session id, host,
+/// status. The id rides beside the label so same-label sessions (a fleet of
+/// detached workers running one command) stay tellable.
+#[derive(Debug, PartialEq, Eq)]
+struct PickerRow {
+    target: String,
+    cells: Vec<String>,
+}
+
+/// The `[user@]host` a picker row's host cell shows and its target carries;
+/// `None` is this machine.
+fn picker_rows_for(
+    dest: Option<&str>,
+    group: &str,
+    entries: &[session::PickerEntry],
+) -> Vec<PickerRow> {
+    let host_cell = dest.unwrap_or("local").to_string();
+    let target = |session: &str| {
+        let scoped = if group == "default" {
+            session.to_string()
+        } else {
+            format!("{group}/{session}")
+        };
+        format!("{}:{scoped}", dest.unwrap_or(""))
+    };
+    let mut rows: Vec<PickerRow> = entries
+        .iter()
+        .map(|e| PickerRow {
+            target: target(&e.name),
+            cells: vec![e.label.clone(), e.name.clone(), host_cell.clone(), e.status.clone()],
+        })
+        .collect();
+    rows.push(PickerRow {
+        target: target("+"),
+        cells: vec![
+            "+ create new session…".to_string(),
+            String::new(),
+            host_cell,
+            String::new(),
+        ],
+    });
+    rows
+}
+
+/// The rows the picker shows: one host (`ph host:`), or this machine plus
+/// every host with a live mux endpoint (bare `ph`) — the connected set. A
+/// host whose listing fails is reported on stderr and skipped, never fatal.
+fn ph_picker_rows(scope: Option<(Option<String>, String)>, group: &str) -> Result<Vec<PickerRow>> {
+    let mut rows = Vec::new();
+    let mut dests: Vec<String> = Vec::new();
+    match scope {
+        Some((user, host)) => dests.push(ph_dest(user.as_deref(), &host)),
+        None => {
+            rows.extend(picker_rows_for(
+                None,
+                group,
+                &session::picker_entries_local(&Config::new(group)?)?,
+            ));
+            match remote::mux::live_endpoint_dests() {
+                Ok(d) => dests = d,
+                Err(e) => eprintln!("ph: mux endpoints unavailable: {e}"),
+            }
+        }
+    }
+    for dest in dests {
+        let (user, host) = match dest.rsplit_once('@') {
+            Some((u, h)) if !u.is_empty() => (Some(u), h),
+            _ => (None, dest.as_str()),
+        };
+        match remote_list_output(user, host, group, "--json")
+            .and_then(|json| session::picker_entries_from_json(&json))
+        {
+            Ok(entries) => rows.extend(picker_rows_for(Some(&dest), group, &entries)),
+            Err(e) => eprintln!("ph: {dest}: {e}"),
+        }
+    }
+    Ok(rows)
+}
+
+/// The RFC 0005 §3.5 `rows` array: each picker row's cells plus a
+/// `session.switch {target}` action (§7).
+fn picker_rows_json(rows: &[PickerRow]) -> serde_json::Value {
+    serde_json::Value::Array(
+        rows.iter()
+            .map(|r| {
+                serde_json::json!({
+                    "cells": r.cells,
+                    "action": { "method": "session.switch", "params": { "target": r.target } },
+                })
+            })
+            .collect(),
+    )
+}
+
+/// The picker forms of `ph` (FDR 0016 top-level chooser): list, choose,
+/// attach. Non-TTY invocations keep FDR 0011's discipline and error with the
+/// candidate targets; so does a renderer too old to draw the picker.
+fn cmd_ph_picker(scope: Option<(Option<String>, String)>, group: &str) -> Result<()> {
+    let title = match &scope {
+        Some((user, host)) => format!("sessions on {}", ph_dest(user.as_deref(), host)),
+        None => "sessions".to_string(),
+    };
+    let rows = ph_picker_rows(scope, group)?;
+    let candidates = || {
+        rows.iter()
+            .filter(|r| !r.target.ends_with(":+"))
+            .map(|r| r.target.as_str())
+            .collect::<Vec<_>>()
+            .join(", ")
+    };
+    if !util::is_tty(libc::STDIN_FILENO) || !util::is_tty(libc::STDOUT_FILENO) {
+        return Err(Error::Msg(format!(
+            "ph: the picker needs a terminal; candidates: {}",
+            candidates()
+        )));
+    }
+    match remote::palette::choose_standalone(&title, picker_rows_json(&rows), "(no sessions)")? {
+        remote::palette::Choice::Action { method, params } if method == "session.switch" => {
+            let target = params
+                .get("target")
+                .and_then(serde_json::Value::as_str)
+                .ok_or_else(|| Error::from("ph: picker selection carried no target"))?;
+            dispatch_ph(ph_parse(Some(target)), group)
+        }
+        remote::palette::Choice::Action { method, .. } => {
+            Err(Error::Msg(format!("ph: unexpected picker action {method}")))
+        }
+        remote::palette::Choice::Cancelled => Ok(()),
+        remote::palette::Choice::Unsupported => Err(Error::Msg(format!(
+            "ph: this posh-palette predates the session picker (rebuild the toolset); \
+             candidates: {}",
+            candidates()
+        ))),
     }
 }
 
@@ -2269,6 +2406,49 @@ mod tests {
                 "roundtrip for detach={detach} command={command:?}"
             );
         }
+    }
+
+    /// FDR 0016: picker rows carry targets that `ph_parse` routes exactly as
+    /// the typed form would — local `:name` / `:group/name`, remote
+    /// `dest:name`, the create row `:+` / `dest:+` — and cells that label
+    /// a session by activity, else by its id.
+    #[test]
+    fn picker_rows_round_trip_through_ph_parse() {
+        use PhRoute::*;
+        let entries = vec![
+            session::PickerEntry { name: "dev".into(), label: "~/x · nvim".into(), status: "detached".into() },
+            session::PickerEntry { name: "s-2".into(), label: String::new(), status: "attached (1)".into() },
+        ];
+        let local = picker_rows_for(None, "default", &entries);
+        assert_eq!(local[0].cells, vec!["~/x · nvim", "dev", "local", "detached"]);
+        assert_eq!(local[1].cells[..2], ["", "s-2"], "no label ⇒ blank, the id still names it");
+        assert_eq!(ph_parse(Some(&local[0].target)), LocalResolve { group: None, session: "dev".into() });
+        assert_eq!(ph_parse(Some(&local[2].target)), LocalNew { group: None });
+        assert_eq!(local[2].cells[0], "+ create new session…");
+
+        let grouped = picker_rows_for(None, "work", &entries[..1]);
+        assert_eq!(
+            ph_parse(Some(&grouped[0].target)),
+            LocalResolve { group: Some("work".into()), session: "dev".into() }
+        );
+
+        let remote = picker_rows_for(Some("me@box"), "default", &entries[..1]);
+        assert_eq!(remote[0].cells[2], "me@box");
+        assert_eq!(
+            ph_parse(Some(&remote[0].target)),
+            RemoteResolve { user: Some("me".into()), host: "box".into(), group: None, session: "dev".into() }
+        );
+        assert_eq!(
+            ph_parse(Some(&remote[1].target)),
+            RemoteNew { user: Some("me".into()), host: "box".into(), group: None }
+        );
+
+        // The RFC 0005 §3.5 rows: cells verbatim, a session.switch action per row.
+        let json = picker_rows_json(&remote);
+        assert_eq!(json[0]["cells"][0], "~/x · nvim");
+        assert_eq!(json[0]["action"]["method"], "session.switch");
+        assert_eq!(json[0]["action"]["params"]["target"], "me@box:dev");
+        assert_eq!(json[1]["action"]["params"]["target"], "me@box:+");
     }
 
     #[test]

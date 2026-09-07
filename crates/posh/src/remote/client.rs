@@ -1737,7 +1737,7 @@ fn drive_client(st: &mut ClientState, raw: &RawMode, port: u16) -> Result<i32> {
                         }
                         st.initialized = false; // palette closed -> repaint session
                     }
-                    Some(PaletteEvent::Cancelled) => {
+                    Some(PaletteEvent::Cancelled) | Some(PaletteEvent::ViewRejected) => {
                         st.initialized = false; // palette closed -> repaint session
                     }
                     Some(PaletteEvent::Copy) => {

@@ -485,8 +485,89 @@ pub(crate) fn echo_summary(response: &str) -> String {
     out
 }
 
+/// One session as the FDR 0016 picker presents it, host-agnostic: the name
+/// (the attach target's session part), the human label (the RFC 0013 §5
+/// activity label, else the launch command, else empty — the same summary
+/// completion shows), and a status word.
+pub struct PickerEntry {
+    pub name: String,
+    pub label: String,
+    pub status: String,
+}
+
+impl PickerEntry {
+    fn from_entry(s: &SessionEntry) -> PickerEntry {
+        let status = match (&s.error, s.clients) {
+            (Some(e), _) => format!("stale ({e})"),
+            (None, Some(n)) if n > 0 => format!("attached ({n})"),
+            (None, _) => "detached".to_string(),
+        };
+        PickerEntry {
+            name: s.name.clone(),
+            label: completion_summary(s),
+            status,
+        }
+    }
+}
+
+/// The local sessions of `cfg`'s group as picker entries (FDR 0016).
+pub fn picker_entries_local(cfg: &Config) -> Result<Vec<PickerEntry>> {
+    Ok(scan_sessions(cfg)?.iter().map(PickerEntry::from_entry).collect())
+}
+
+/// A remote host's `posh list --json` output as picker entries (FDR 0016):
+/// the same field-tolerant parse the remote table uses, names unprefixed
+/// (the caller composes the `host:` target).
+pub fn picker_entries_from_json(json: &str) -> Result<Vec<PickerEntry>> {
+    Ok(remote_entries(json, str::to_string)?
+        .iter()
+        .map(PickerEntry::from_entry)
+        .collect())
+}
+
 pub fn cmd_list(cfg: &Config, format: ListFormat) -> Result<()> {
     let current = std::env::var("POSH_SESSION").ok();
+    let sessions = scan_sessions(cfg)?;
+    match format {
+        ListFormat::Json => {
+            // json_list already renders "[]" for an empty slice, so no
+            // separate empty-case branch is needed here.
+            println!("{}", json_list(&sessions, current.as_deref()));
+            Ok(())
+        }
+        ListFormat::Short => {
+            for s in &sessions {
+                print_session_line(s, format, current.as_deref());
+            }
+            Ok(())
+        }
+        ListFormat::Complete => {
+            for s in &sessions {
+                if s.error.is_some() {
+                    continue; // skip stale/unreachable, like Short
+                }
+                println!("{}\t{}", s.name, completion_summary(s));
+            }
+            Ok(())
+        }
+        // The `mesa` renderer (purse-first, RFC 0003) auto-detects whether
+        // ITS (inherited) stdout is a terminal, so posh needs no tty branch
+        // of its own here — styled table or plain TAB-separated lines, both
+        // driven by the same NDJSON stream. --short/--json stay untouched
+        // (scripts and the completion probe parse those).
+        ListFormat::Default => mesa::render(
+            &sessions,
+            current.as_deref(),
+            std::env::var("HOME").ok().as_deref(),
+            &cfg.socket_dir,
+        ),
+    }
+}
+
+/// Probe every session socket in `cfg`'s group: one entry per socket, sorted
+/// by name, with an unreachable socket recorded as an error row (and cleaned
+/// up when genuinely dead). Shared by `posh list` and the FDR 0016 picker.
+fn scan_sessions(cfg: &Config) -> Result<Vec<SessionEntry>> {
     let mut sessions: Vec<SessionEntry> = Vec::new();
 
     for entry in std::fs::read_dir(&cfg.socket_dir)? {
@@ -540,40 +621,7 @@ pub fn cmd_list(cfg: &Config, format: ListFormat) -> Result<()> {
     }
 
     sessions.sort_by(|a, b| a.name.cmp(&b.name));
-    match format {
-        ListFormat::Json => {
-            // json_list already renders "[]" for an empty slice, so no
-            // separate empty-case branch is needed here.
-            println!("{}", json_list(&sessions, current.as_deref()));
-            Ok(())
-        }
-        ListFormat::Short => {
-            for s in &sessions {
-                print_session_line(s, format, current.as_deref());
-            }
-            Ok(())
-        }
-        ListFormat::Complete => {
-            for s in &sessions {
-                if s.error.is_some() {
-                    continue; // skip stale/unreachable, like Short
-                }
-                println!("{}\t{}", s.name, completion_summary(s));
-            }
-            Ok(())
-        }
-        // The `mesa` renderer (purse-first, RFC 0003) auto-detects whether
-        // ITS (inherited) stdout is a terminal, so posh needs no tty branch
-        // of its own here — styled table or plain TAB-separated lines, both
-        // driven by the same NDJSON stream. --short/--json stay untouched
-        // (scripts and the completion probe parse those).
-        ListFormat::Default => mesa::render(
-            &sessions,
-            current.as_deref(),
-            std::env::var("HOME").ok().as_deref(),
-            &cfg.socket_dir,
-        ),
-    }
+    Ok(sessions)
 }
 
 /// Render a REMOTE host's sessions through the same mesa table as the local
@@ -1065,6 +1113,32 @@ mod tests {
         assert!(entries[2].error.is_none());
         assert!(entries[2].cmd.is_none() && entries[2].activity.is_none());
         assert!(remote_entries("nonsense", |n| n.to_string()).is_err());
+    }
+
+    /// FDR 0016: a picker entry labels a session by its completion summary
+    /// and words its status from the probe (stale / attached / detached).
+    #[test]
+    fn picker_entries_from_json_label_and_status() {
+        let json = concat!(
+            "[",
+            "{\"name\":\"dev\",\"pid\":42,\"clients\":2,\"cmd\":\"bash\",\"activity\":\"~/x · nvim\"},",
+            "{\"name\":\"broken\",\"error\":true,\"status\":\"ConnectionRefused\"},",
+            "{\"name\":\"idle\",\"pid\":9,\"clients\":0,\"cmd\":\"htop\"}",
+            "]"
+        );
+        let entries = picker_entries_from_json(json).unwrap();
+        let shape: Vec<(&str, &str, &str)> = entries
+            .iter()
+            .map(|e| (e.name.as_str(), e.label.as_str(), e.status.as_str()))
+            .collect();
+        assert_eq!(
+            shape,
+            vec![
+                ("dev", "~/x · nvim", "attached (2)"),
+                ("broken", "", "stale (ConnectionRefused)"),
+                ("idle", "htop", "detached"),
+            ]
+        );
     }
 
     #[test]

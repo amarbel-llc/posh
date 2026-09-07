@@ -156,6 +156,76 @@ func TestShowDialogRendersBody(t *testing.T) {
 	}
 }
 
+// The "picker" view (RFC 0005 §3.5): a row matches the filter when ANY of its
+// cells contains the query, and the highlighted row's action is what a
+// selection issues — with its params verbatim.
+func TestPickerFiltersAnyCellAndChoosesRowAction(t *testing.T) {
+	c, collect := captureConn(t)
+	updated, _ := newModel(c).Update(showMsg{View: "picker", Rows: []row{
+		{Cells: []string{"cargo build", "box", "running"}, Action: &action{Method: "session.switch", Params: json.RawMessage(`{"target":"box:s-1"}`)}},
+		{Cells: []string{"vim ~/notes", "dev", "idle"}, Action: &action{Method: "session.switch", Params: json.RawMessage(`{"target":"dev:s-2"}`)}},
+		{Cells: []string{"+ create new session…", "local"}, Action: &action{Method: "session.switch", Params: json.RawMessage(`{"target":":+"}`)}},
+	}})
+	m := updated.(model)
+	if m.view != viewPicker {
+		t.Fatalf("view = %d, want viewPicker", m.view)
+	}
+	if m.title != "Sessions" {
+		t.Errorf("default title = %q, want Sessions", m.title)
+	}
+	// "dev" appears only in the second row's HOST cell, not its label.
+	m.input.SetValue("dev")
+	m.recompute()
+	if len(m.filteredRows) != 1 || m.filteredRows[0].Cells[0] != "vim ~/notes" {
+		t.Fatalf("want the dev row alone, got %+v", m.filteredRows)
+	}
+	m.choose()
+	msgs := collect()
+	if len(msgs) != 1 || msgs[0].Method != "session.switch" {
+		t.Fatalf("want a session.switch request, got %+v", msgs)
+	}
+	if string(msgs[0].Params) != `{"target":"dev:s-2"}` {
+		t.Errorf("params = %s, want the row's params verbatim", msgs[0].Params)
+	}
+}
+
+// Picker rows render as an aligned table: each column padded to its widest
+// cell, a short row padded with blanks, and the empty text when nothing
+// matches.
+func TestPickerViewAlignsColumns(t *testing.T) {
+	updated, _ := newModel(&conn{}).Update(showMsg{View: "picker", Rows: []row{
+		{Cells: []string{"cargo build", "box", "running"}},
+		{Cells: []string{"vi", "dev"}},
+	}})
+	m := updated.(model)
+	out := m.pickerView()
+	for _, want := range []string{"cargo build  box  running", "vi           dev"} {
+		if !strings.Contains(out, want) {
+			t.Errorf("pickerView() missing aligned row %q in:\n%s", want, out)
+		}
+	}
+	m.input.SetValue("zzz")
+	m.recompute()
+	if !strings.Contains(m.pickerView(), "(no sessions)") {
+		t.Errorf("empty picker must show the default empty text:\n%s", m.pickerView())
+	}
+	if got := truncate("abcdef", 4); got != "abc…" {
+		t.Errorf("truncate = %q, want abc…", got)
+	}
+}
+
+// ui.show accepts exactly the three RFC 0005 views.
+func TestKnownViews(t *testing.T) {
+	for _, v := range []string{"palette", "dialog", "picker"} {
+		if !knownView(v) {
+			t.Errorf("%q must be a known view", v)
+		}
+	}
+	if knownView("tabs") {
+		t.Error("an unknown view must be rejected (-32602)")
+	}
+}
+
 // Pressing copy in a dialog notifies the client (which owns the real terminal
 // and emits the OSC 52); the notification carries no id (RFC 0005 §4.3).
 func TestDialogCopyNotifies(t *testing.T) {

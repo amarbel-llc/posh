@@ -1530,8 +1530,9 @@ fn client_loop(
                             stdout_buf.extend_from_slice(&fr.recompose(None));
                         }
                     }
-                    Some(PaletteEvent::Cancelled) => {
-                        // Dismissed without a selection: repaint the plain session.
+                    // Dismissed without a selection — or the renderer refused
+                    // the view (an older binary): repaint the plain session.
+                    Some(PaletteEvent::Cancelled) | Some(PaletteEvent::ViewRejected) => {
                         if let Some(fr) = frame_renderer.as_mut() {
                             fr.invalidate();
                             stdout_buf.extend_from_slice(&fr.recompose(None));

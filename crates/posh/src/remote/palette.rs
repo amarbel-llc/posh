@@ -44,6 +44,10 @@ pub enum PaletteEvent {
     /// The user pressed copy in an info dialog (RFC 0005 §4.3). The client copies
     /// the dialog body to the terminal clipboard (OSC 52); the dialog stays open.
     Copy,
+    /// The renderer answered the latest `ui.show` with an error — a renderer
+    /// that predates the requested view (RFC 0005 §3.5: an old binary answers
+    /// `-32602` to `picker`). Nothing is on screen; the client falls back.
+    ViewRejected,
     /// Nothing actionable yet (a partial line, or only a response/ack arrived).
     None,
 }
@@ -61,6 +65,10 @@ pub struct Palette {
     /// The body of the most recent info dialog (RFC 0005 §3.2), held so a
     /// `ui.copy` can be answered with an OSC 52 to the real terminal.
     dialog_body: String,
+    /// The request id of the latest `ui.show`, so an error response to it
+    /// (an unknown view on an older renderer) surfaces as
+    /// [`PaletteEvent::ViewRejected`] rather than being ignored.
+    pending_show: Option<i64>,
 }
 
 /// Locate the `posh-palette` binary: `$POSH_PALETTE` override, else next to the
@@ -123,6 +131,7 @@ impl Palette {
             ctrl_buf: Vec::new(),
             next_id: 0,
             dialog_body: String::new(),
+            pending_show: None,
         };
         if p.handshake() {
             Some(p)
@@ -152,10 +161,13 @@ impl Palette {
     /// Summon the palette with a command list (RFC 0005 §3.2 `ui.show`). The
     /// `{}` ack is ignored — the client composites from the rendered screen.
     pub fn open(&mut self, title: &str, commands: Value) {
-        self.send_request(
-            "ui.show",
-            json!({ "view": "palette", "title": title, "commands": commands }),
-        );
+        self.show(json!({ "view": "palette", "title": title, "commands": commands }));
+    }
+
+    /// Send a `ui.show` and remember its id (see `pending_show`).
+    fn show(&mut self, params: Value) {
+        let id = self.send_request("ui.show", params);
+        self.pending_show = Some(id);
         self.open = true;
     }
 
@@ -164,16 +176,20 @@ impl Palette {
     /// later `ui.copy` can be answered with an OSC 52 to the real terminal.
     pub fn show_dialog(&mut self, title: &str, body: &str) {
         self.dialog_body = body.to_string();
-        self.send_request(
-            "ui.show",
-            json!({ "view": "dialog", "title": title, "body": body }),
-        );
-        self.open = true;
+        self.show(json!({ "view": "dialog", "title": title, "body": body }));
     }
 
     /// The body of the most recent info dialog, for answering a `ui.copy`.
     pub fn dialog_body(&self) -> &str {
         &self.dialog_body
+    }
+
+    /// Summon the session picker (RFC 0005 §3.5 `ui.show` view="picker",
+    /// FDR 0016): `rows` is the `[{cells, action}]` table — opaque to the
+    /// renderer, which aligns the cells and issues the chosen row's action —
+    /// and `empty` the text shown when there are no rows.
+    pub fn show_picker(&mut self, title: &str, rows: Value, empty: &str) {
+        self.show(json!({ "view": "picker", "title": title, "rows": rows, "empty": empty }));
     }
 
     /// Drain the renderer PTY into the emulated screen. Returns whether the
@@ -226,7 +242,18 @@ impl Palette {
                     self.open = false;
                     return PaletteEvent::Action { method, params };
                 }
-                _ => {} // a response to our own request, or noise: ignore
+                None if self.pending_show.is_some()
+                    && v.get("id").and_then(Value::as_i64) == self.pending_show =>
+                {
+                    // The answer to our latest ui.show: an error means the
+                    // renderer does not draw that view (RFC 0005 §3.5).
+                    self.pending_show = None;
+                    if v.get("error").is_some() {
+                        self.open = false;
+                        return PaletteEvent::ViewRejected;
+                    }
+                }
+                _ => {} // a response to an older request, or noise: ignore
             }
         }
         PaletteEvent::None
@@ -424,6 +451,94 @@ pub(crate) fn composite_palette(next: &mut Snapshot, rterm: &Terminal, rows: u16
     }
 }
 
+/// The outcome of a standalone chooser run ([`choose_standalone`]).
+pub enum Choice {
+    /// The user selected a row: the row's action (RFC 0005 §4.1).
+    Action { method: String, params: Value },
+    /// The user dismissed the picker.
+    Cancelled,
+    /// The renderer does not draw the `picker` view (an older binary).
+    Unsupported,
+}
+
+/// Host the renderer as a TOP-LEVEL chooser (FDR 0016): no session behind
+/// it — the picker is composited onto a blank frame with the same
+/// [`composite_palette`] the in-session palette uses, on the alternate screen
+/// in raw mode, keystrokes forwarded to the renderer, until the user selects
+/// a row or dismisses. The terminal is restored before returning. Errors
+/// only when the renderer cannot be spawned; a renderer that predates the
+/// view reports [`Choice::Unsupported`] so the caller falls back.
+pub fn choose_standalone(title: &str, rows: Value, empty: &str) -> util::Result<Choice> {
+    const STDIN: RawFd = libc::STDIN_FILENO;
+    const STDOUT: RawFd = libc::STDOUT_FILENO;
+    let (rows_n, cols_n) = pty::term_size(STDOUT);
+    let Some(mut palette) = Palette::spawn(rows_n, cols_n) else {
+        return Err(util::Error::from(
+            "posh-palette renderer unavailable (not on PATH / beside posh / $POSH_PALETTE)",
+        ));
+    };
+    let raw = pty::RawMode::enable(STDIN)?;
+    let _ = util::write_all_retry(STDOUT, &crate::remote::display::open(), 1000);
+    let mut last = Snapshot::blank(rows_n, cols_n);
+    let mut initialized = false;
+    let paint = |palette: &Palette, last: &mut Snapshot, initialized: &mut bool| {
+        let mut next = Snapshot::blank(rows_n, cols_n);
+        if let Some(screen) = palette.screen() {
+            composite_palette(&mut next, screen, rows_n, cols_n);
+        }
+        let bytes = crate::remote::display::new_frame_opt(*initialized, last, &next, false, false, true);
+        *initialized = true;
+        *last = next;
+        let _ = util::write_all_retry(STDOUT, &bytes, 1000);
+    };
+    palette.show_picker(title, rows, empty);
+    paint(&palette, &mut last, &mut initialized);
+    let outcome = loop {
+        let mut fds = [
+            util::pollfd(STDIN, libc::POLLIN),
+            util::pollfd(palette.master_fd(), libc::POLLIN),
+            util::pollfd(palette.ctrl_fd(), libc::POLLIN),
+        ];
+        let rc = unsafe { libc::poll(fds.as_mut_ptr(), fds.len() as libc::nfds_t, 1000) };
+        if rc < 0 {
+            let err = std::io::Error::last_os_error();
+            if err.kind() == std::io::ErrorKind::Interrupted {
+                continue;
+            }
+            break Err(err.into());
+        }
+        let hup = libc::POLLHUP | libc::POLLERR | libc::POLLNVAL;
+        if fds[0].revents & libc::POLLIN != 0 {
+            let mut buf = [0u8; 1024];
+            let n = read_fd(STDIN, &mut buf);
+            if n <= 0 {
+                break Ok(Choice::Cancelled); // stdin closed under us
+            }
+            palette.forward_input(&buf[..n as usize]);
+        }
+        if fds[1].revents & (libc::POLLIN | hup) != 0 && palette.pump() {
+            paint(&palette, &mut last, &mut initialized);
+        }
+        if fds[2].revents & (libc::POLLIN | hup) != 0 {
+            match palette.poll_events() {
+                PaletteEvent::Action { method, params } => {
+                    break Ok(Choice::Action { method, params });
+                }
+                PaletteEvent::Cancelled => break Ok(Choice::Cancelled),
+                PaletteEvent::ViewRejected => break Ok(Choice::Unsupported),
+                PaletteEvent::Copy | PaletteEvent::None => {}
+            }
+            if fds[2].revents & hup != 0 {
+                break Ok(Choice::Cancelled); // renderer went away
+            }
+        }
+    };
+    let _ = util::write_all_retry(STDOUT, &crate::remote::display::close(), 1000);
+    drop(raw);
+    palette.shutdown();
+    outcome
+}
+
 /// Non-blank bounding box of a screen: (top, left, bottom, right), or None.
 fn bbox(scr: &Screen) -> Option<(u16, u16, u16, u16)> {
     let mut found: Option<(u16, u16, u16, u16)> = None;
@@ -463,8 +578,32 @@ mod tests {
             ctrl_buf: Vec::new(),
             next_id: 0,
             dialog_body: String::new(),
+            pending_show: None,
         };
         (p, sp[1])
+    }
+
+    // An error response to the latest ui.show (an older renderer that lacks
+    // the view) surfaces as ViewRejected and closes the palette; an error to
+    // some other request, or a plain ack, is not an event (RFC 0005 §3.5).
+    #[test]
+    fn poll_events_surfaces_a_rejected_view() {
+        let (mut p, peer) = palette_with_ctrl();
+        p.show_picker("s", json!([]), "(none)");
+        let id = p.pending_show.expect("show records its request id");
+        write_line(peer, &format!(r#"{{"jsonrpc":"2.0","id":{},"error":{{"code":-32602,"message":"x"}}}}"#, id + 7));
+        assert!(matches!(p.poll_events(), PaletteEvent::None), "a stray error is noise");
+        assert!(p.is_open());
+        write_line(peer, &format!(r#"{{"jsonrpc":"2.0","id":{id},"error":{{"code":-32602,"message":"unknown view"}}}}"#));
+        assert!(matches!(p.poll_events(), PaletteEvent::ViewRejected));
+        assert!(!p.is_open(), "nothing is on screen after a rejected view");
+        // A later ack to a fresh show is not an event.
+        p.show_dialog("t", "b");
+        let id = p.pending_show.unwrap();
+        write_line(peer, &format!(r#"{{"jsonrpc":"2.0","id":{id},"result":{{}}}}"#));
+        assert!(matches!(p.poll_events(), PaletteEvent::None));
+        assert!(p.is_open());
+        unsafe { libc::close(peer) };
     }
 
     fn write_line(fd: RawFd, s: &str) {
@@ -530,6 +669,80 @@ mod tests {
         assert_eq!(v["params"]["view"], "dialog");
         assert_eq!(v["params"]["body"], "agent-fwd: on\nserver: up");
         unsafe { libc::close(peer) };
+    }
+
+    // show_picker summons a `picker` view carrying the rows and the empty text
+    // (RFC 0005 §3.5, FDR 0016).
+    #[test]
+    fn show_picker_sends_picker_view_with_rows() {
+        let (mut p, peer) = palette_with_ctrl();
+        p.show_picker(
+            "switch session",
+            json!([{ "cells": ["vim", "dev"], "action": { "method": "session.switch", "params": { "target": "dev:s-2" } } }]),
+            "(no sessions)",
+        );
+        assert!(p.is_open());
+        let mut buf = [0u8; 512];
+        let n = unsafe { libc::read(peer, buf.as_mut_ptr() as *mut libc::c_void, buf.len()) };
+        let line = std::str::from_utf8(&buf[..n.max(0) as usize]).unwrap();
+        let v: Value = serde_json::from_str(line.trim()).unwrap();
+        assert_eq!(v["method"], "ui.show");
+        assert_eq!(v["params"]["view"], "picker");
+        assert_eq!(v["params"]["rows"][0]["cells"][1], "dev");
+        assert_eq!(v["params"]["rows"][0]["action"]["params"]["target"], "dev:s-2");
+        assert_eq!(v["params"]["empty"], "(no sessions)");
+        unsafe { libc::close(peer) };
+    }
+
+    // The REAL renderer draws a picker as an aligned table and answers a
+    // selection with the row's action (RFC 0005 §3.5). Skipped without the
+    // binary, like the other real_binary tests.
+    #[test]
+    fn real_binary_picker_round_trip() {
+        if palette_binary().is_none() {
+            eprintln!("skip: posh-palette not found (set POSH_PALETTE to run)");
+            return;
+        }
+        let mut p = Palette::spawn(24, 100).expect("spawn + handshake");
+        p.show_picker(
+            "switch session",
+            json!([
+                { "cells": ["cargo build", "box", "running"], "action": { "method": "session.switch", "params": { "target": "box:s-1" } } },
+                { "cells": ["vim ~/notes", "dev", "idle"], "action": { "method": "session.switch", "params": { "target": "dev:s-2" } } },
+            ]),
+            "(no sessions)",
+        );
+        let deadline = Instant::now() + Duration::from_secs(3);
+        while Instant::now() < deadline && !p.rterm.dump_text().contains("vim ~/notes") {
+            poll_readable(p.master, Duration::from_millis(50));
+            p.pump();
+            // A renderer that predates the view answers -32602 (RFC 0005
+            // §3.5): the deployed binary on PATH may be older than this
+            // tree — skip rather than fail on version skew. Run against a
+            // fresh build with `just debug-palette-e2e`.
+            poll_readable(p.ctrl, Duration::from_millis(50));
+            if matches!(p.poll_events(), PaletteEvent::ViewRejected) {
+                eprintln!("skip: this posh-palette predates the picker view");
+                p.shutdown();
+                return;
+            }
+        }
+        let text = p.rterm.dump_text();
+        assert!(text.contains("cargo build  box  running"), "rows not aligned:\n{text}");
+        // Filter on the host cell, then select: the row's action comes back.
+        p.forward_input(b"dev\r");
+        let mut got = None;
+        let deadline = Instant::now() + Duration::from_secs(3);
+        while Instant::now() < deadline && got.is_none() {
+            poll_readable(p.ctrl, Duration::from_millis(100));
+            if let PaletteEvent::Action { method, params } = p.poll_events() {
+                got = Some((method, params));
+            }
+        }
+        let (method, params) = got.expect("an action came back");
+        assert_eq!(method, "session.switch");
+        assert_eq!(params["target"], "dev:s-2");
+        p.shutdown();
     }
 
     // A response to one of our own requests (no method) is not an event.

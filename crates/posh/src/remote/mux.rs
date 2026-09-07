@@ -1229,6 +1229,11 @@ pub fn run_daemon(
         MuxBind::ExistingDaemon => return Ok(MuxSpawn::AlreadyRunning),
         MuxBind::Bound(l) => l,
     };
+    // FDR 0016: record the destination beside the socket so the session
+    // picker can enumerate the connected hosts (`live_endpoint_dests`) — the
+    // slug key is not reversible. Best-effort: a missing file only drops the
+    // host from the all-hosts picker.
+    let _ = std::fs::write(dest_sidecar(&sock), dest);
     if util::double_fork()? {
         drop(listener);
         // Give the grandchild a beat to exist before the spawner connects
@@ -2500,6 +2505,45 @@ fn mux_ls_in(dir: &Path) -> Result<String> {
     Ok(out)
 }
 
+/// `<key>.dest` beside `<key>.sock`: the `[user@]host` the daemon serves.
+fn dest_sidecar(sock: &Path) -> PathBuf {
+    sock.with_extension("dest")
+}
+
+/// FDR 0016: the destinations (`[user@]host`, as typed) of every LIVE mux
+/// endpoint under the mux dir — the hosts the all-hosts session picker
+/// lists. A socket nothing answers on, or one without its `.dest` sidecar
+/// (a pre-FDR-0016 daemon), is skipped: the picker shows the connected set
+/// it can name, never a stale one.
+pub fn live_endpoint_dests() -> Result<Vec<String>> {
+    live_endpoint_dests_in(&mux_dir()?)
+}
+
+fn live_endpoint_dests_in(dir: &Path) -> Result<Vec<String>> {
+    let mut keys: Vec<String> = std::fs::read_dir(dir)
+        .map_err(|e| util::Error::Msg(format!("mux dir {}: {e}", dir.display())))?
+        .filter_map(|ent| {
+            let name = ent.ok()?.file_name().into_string().ok()?;
+            name.strip_suffix(".sock").map(str::to_string)
+        })
+        .collect();
+    keys.sort();
+    let mut dests = Vec::new();
+    for key in keys {
+        let sock = mux_socket_path_in(dir, &key);
+        if probe_endpoint(&sock).is_err() {
+            continue;
+        }
+        if let Ok(dest) = std::fs::read_to_string(dest_sidecar(&sock)) {
+            let dest = dest.trim();
+            if !dest.is_empty() {
+                dests.push(dest.to_string());
+            }
+        }
+    }
+    Ok(dests)
+}
+
 /// RFC 0013 §4 tuning lever: per-endpoint bound on a status-socket read. A
 /// live peer answers over a unix socket in microseconds; 200 ms flags a
 /// wedged one as stale without stalling the listing. Revisit against real
@@ -3503,6 +3547,24 @@ mod tests {
             "the live line is the daemon's own status one-liner: {out}"
         );
         daemon.join().unwrap(); // observer probes never reset the linger
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    /// FDR 0016: the picker's host set is the LIVE endpoints that recorded
+    /// their destination — a dead socket and a live daemon without the
+    /// sidecar (pre-FDR-0016) are both skipped.
+    #[test]
+    fn live_endpoint_dests_names_only_live_daemons_with_a_sidecar() {
+        let dir = temp_base();
+        assert!(live_endpoint_dests_in(&dir).unwrap().is_empty());
+        let (daemon, _server) = start_inprocess_daemon(&dir, "named", 2_500, (63670, 63679));
+        std::fs::write(dest_sidecar(&mux_socket_path_in(&dir, "named")), "me@box.example\n")
+            .unwrap();
+        // Dead socket WITH a sidecar: not live, so not listed.
+        drop(UnixListener::bind(mux_socket_path_in(&dir, "dead")).unwrap());
+        std::fs::write(dest_sidecar(&mux_socket_path_in(&dir, "dead")), "dead.example").unwrap();
+        assert_eq!(live_endpoint_dests_in(&dir).unwrap(), vec!["me@box.example".to_string()]);
+        daemon.join().unwrap();
         std::fs::remove_dir_all(&dir).ok();
     }
 

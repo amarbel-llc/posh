@@ -229,6 +229,17 @@ the `eng-*(7)` manpages — read them with `man eng-versioning`,
   fd 3, composited onto the session `Snapshot`. It is the escape menu (echo,
   logging, shell-out, suspend, quit); `Ctrl-^ .` survives only as the
   renderer-unavailable emergency quit. `remote/client.rs` + `remote/palette.rs`.
+  **The same renderer is the FDR 0016 session picker:** RFC 0005 §3.5 adds a
+  generic `picker` view (aligned rows + a per-row action); `ph` / `ph host:`
+  host it standalone (`palette::choose_standalone`, composited onto a blank
+  frame) and route the chosen `session.switch` target back through
+  `ph_parse`. Rows come from `session::picker_entries_*` (local scan, or a
+  host's `posh list --json`) over this machine plus the live mux endpoints
+  (`mux::live_endpoint_dests`, the `<key>.dest` sidecar). An older renderer
+  answers `-32602` → `PaletteEvent::ViewRejected` → the non-TUI candidate
+  list. Dev-loop: `just debug-palette-e2e` (round-trips against a fresh
+  renderer build), `just debug-ph-picker-smoke` (draws the real picker in a
+  detached tmux pane).
   Its heading carries the live `rtt` and the echo model in effect
   (`palette_title`, kept under the renderer's ~42 content columns).
   **Slow-link echo escalation (FDR 0006 A/B):** the un-pinned default
