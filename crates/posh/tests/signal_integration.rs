@@ -685,7 +685,7 @@ fn drive_client_to_exit(port: &str, key: &str) -> std::process::ExitStatus {
         .env("POSH_KEY", key);
     let mut child = spawn_on_pty(&mut cmd, slave);
     wait_for_pty_output(master, "remote client first paint");
-    let nl = [b'\r'];
+    let nl = *b"\r";
     unsafe { libc::write(master, nl.as_ptr() as *const libc::c_void, 1) };
     wait_for_exit(&mut child, master, 20)
 }

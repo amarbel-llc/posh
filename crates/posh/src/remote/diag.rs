@@ -162,7 +162,7 @@ impl ClientState {
             self.cols,
             self.echo_on as u8,
             self.codec,
-            &self.title,
+            self.title,
             self.apply.advanced,
             self.apply.stale,
             self.apply.dup,
