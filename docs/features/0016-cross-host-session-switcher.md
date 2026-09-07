@@ -101,13 +101,18 @@ re-dial. The UX is identical either way; the user never sees which fired.
 
 ### Staging
 
-1. **Renderer + protocol.** The `picker` view in `posh-palette` and the
-   `Palette::show_picker` host call (RFC 0005 §3.5, §7 `session.switch`).
-2. **Row source + top-level picker.** A `picker_rows` listing (local + mux
-   hosts, or one host) and the standalone chooser behind bare `ph` / `ph host:`.
-3. **In-session switch.** The palette's *Switch session…* command, the client
-   switch outcome, and the front door's re-attach loop, on both the roaming and
-   the local attach client.
+1. **Renderer + protocol** (landed 2026-09-07). The `picker` view in
+   `posh-palette` and the `Palette::show_picker` host call (RFC 0005 §3.5, §7
+   `session.list` / `session.switch`).
+2. **Row source + top-level picker** (landed 2026-09-07). The `picker` module's
+   row listing (local + live mux hosts, or one host) and the standalone chooser
+   behind bare `ph` / `ph host:`.
+3. **In-session switch** (implemented 2026-09-07, awaiting fleet verification
+   for `experimental`). The palette's *Switch session…* command re-shows the
+   renderer as the picker; a selection records the target
+   (`picker::request_switch`) and ends the attach — quit on the roaming client,
+   detach on the local one — and `run()`'s re-attach loop dispatches the target
+   through `ph`'s routing. Both clients.
 4. (Later) **Same-host retarget** behind a viewport switch capability.
 
 ## Examples

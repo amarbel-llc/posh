@@ -903,6 +903,9 @@ fn palette_commands(scroll_opt: bool, coalesce_on: bool, coalesce_available: boo
         ("Enable scroll-region optimization", true)
     };
     let mut commands = vec![
+        // FDR 0016: the palette as picker — list the reachable sessions and
+        // switch this viewport to one (detach, then the front door re-attaches).
+        json!({ "name": "Switch session…", "action": { "method": "session.list" } }),
         json!({ "name": "Suspend client", "action": { "method": "client.suspend" } }),
         json!({ "name": "Shell out", "action": { "method": "shell.open" } }),
         json!({ "name": scroll_opt_name, "action": { "method": "render.scroll_opt", "params": { "enabled": scroll_opt_enabled } } }),
@@ -976,6 +979,9 @@ enum LocalAction {
     /// desired new state, applied to the loop's `coalesce_on` flag at the call
     /// site (dispatch holds no loop state).
     SetCoalesce(bool),
+    /// Re-show the renderer as the FDR 0016 session picker (the call site
+    /// holds the `Palette`; dispatch does not).
+    ShowPicker,
 }
 
 /// Dispatch a palette selection on the local client. Wire-only effects (Detach,
@@ -1000,6 +1006,16 @@ fn dispatch_local_action(method: &str, params: &Value, sock_write_buf: &mut Vec<
             LocalAction::None
         }
         "client.suspend" => LocalAction::Suspend,
+        "session.list" => LocalAction::ShowPicker,
+        "session.switch" => {
+            // FDR 0016 re-dial: record the target for the front door and
+            // detach exactly as `app.detach` does; `run()` re-attaches.
+            if let Some(target) = params.get("target").and_then(Value::as_str) {
+                crate::picker::request_switch(target);
+                ipc::append_frame(sock_write_buf, Tag::Detach, b"");
+            }
+            LocalAction::None
+        }
         "render.scroll_opt" => {
             // posh#100 escape hatch: flip the DECSTBM scroll-region optimization.
             // `enabled` is the desired new state (the command labels itself from
@@ -1520,14 +1536,37 @@ fn client_loop(
                                 // reverted self-ack+append behavior when off.
                                 coalesce_on = on;
                             }
+                            LocalAction::ShowPicker => {
+                                // FDR 0016: re-show the renderer as the picker.
+                                // The listing blocks (one `posh list` per
+                                // connected host); the session keeps running.
+                                match crate::picker::rows(None, &crate::picker::default_group()) {
+                                    Ok(rows) => {
+                                        if let Some(p) = palette.as_mut() {
+                                            p.show_picker(
+                                                crate::picker::TITLE,
+                                                crate::picker::rows_json(&rows),
+                                                crate::picker::EMPTY,
+                                            );
+                                        }
+                                    }
+                                    Err(e) => util::log_write("warn", &format!("session list failed: {e}")),
+                                }
+                            }
                             LocalAction::None => {}
                         }
                         // The palette closed and (for Suspend) the tty was cleared
                         // and restored: force a full repaint of the plain session
-                        // (also applies the new scroll-opt mode immediately).
+                        // (also applies the new scroll-opt mode immediately) —
+                        // or, when the picker re-opened it, of the session with
+                        // the picker composited on top.
                         if let Some(fr) = frame_renderer.as_mut() {
                             fr.invalidate();
-                            stdout_buf.extend_from_slice(&fr.recompose(None));
+                            let screen = palette
+                                .as_ref()
+                                .filter(|p| p.is_open())
+                                .and_then(Palette::screen);
+                            stdout_buf.extend_from_slice(&fr.recompose(screen));
                         }
                     }
                     // Dismissed without a selection — or the renderer refused
@@ -2474,6 +2513,33 @@ mod tests {
             LocalAction::None
         ));
         assert_eq!(buf, ipc::encode_frame(Tag::Detach, b""));
+    }
+
+    /// FDR 0016: `session.switch` records the target for the front door's
+    /// re-attach loop and detaches (the same wire frame as `app.detach`);
+    /// `session.list` is routed to the call site, which holds the renderer.
+    #[test]
+    fn dispatch_session_switch_records_target_and_detaches() {
+        let _g = crate::picker::switch_test_guard();
+        let mut buf = Vec::new();
+        assert!(matches!(
+            dispatch_local_action("session.switch", &json!({ "target": ":dev" }), &mut buf),
+            LocalAction::None
+        ));
+        assert_eq!(buf, ipc::encode_frame(Tag::Detach, b""));
+        assert_eq!(crate::picker::take_switch().as_deref(), Some(":dev"));
+        let mut buf = Vec::new();
+        assert!(matches!(
+            dispatch_local_action("session.list", &json!({}), &mut buf),
+            LocalAction::ShowPicker
+        ));
+        assert!(buf.is_empty(), "listing sends nothing to the daemon");
+        assert!(
+            serde_json::to_string(&palette_commands(true, false, false))
+                .unwrap()
+                .contains("Switch session"),
+            "the local palette offers the switcher"
+        );
     }
 
     /// `shell.open` dispatch queues a `Tag::Shell` wire frame (empty payload) —

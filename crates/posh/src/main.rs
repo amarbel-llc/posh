@@ -5,6 +5,7 @@
 
 mod completions;
 mod overlay;
+mod picker;
 mod pty;
 mod remote;
 mod session;
@@ -30,7 +31,20 @@ fn main() {
     }
 }
 
+/// One invocation, then the FDR 0016 re-attach loop: an attach that ended
+/// with a picker selection (`session.switch`, recorded by the client through
+/// `picker::request_switch`) is followed by an attach to that target — via
+/// the same routing as typing it to `ph` — until an attach ends without one.
+/// The previous session keeps running detached.
 fn run() -> Result<()> {
+    run_once()?;
+    while let Some(target) = picker::take_switch() {
+        dispatch_ph(ph_parse(Some(&target)), &picker::default_group())?;
+    }
+    Ok(())
+}
+
+fn run_once() -> Result<()> {
     let argv: Vec<String> = std::env::args().skip(1).collect();
 
     // mosh-server parity: the package installs `bin/posh-server -> posh`;
@@ -743,125 +757,23 @@ fn dispatch_ph(route: PhRoute, group: &str) -> Result<()> {
     }
 }
 
-/// One row of the FDR 0016 session picker: the RFC 0001 target a selection
-/// attaches to (fed back through [`ph_parse`]) and its display cells —
-/// label (activity, else launch command, else blank), session id, host,
-/// status. The id rides beside the label so same-label sessions (a fleet of
-/// detached workers running one command) stay tellable.
-#[derive(Debug, PartialEq, Eq)]
-struct PickerRow {
-    target: String,
-    cells: Vec<String>,
-}
-
-/// The `[user@]host` a picker row's host cell shows and its target carries;
-/// `None` is this machine.
-fn picker_rows_for(
-    dest: Option<&str>,
-    group: &str,
-    entries: &[session::PickerEntry],
-) -> Vec<PickerRow> {
-    let host_cell = dest.unwrap_or("local").to_string();
-    let target = |session: &str| {
-        let scoped = if group == "default" {
-            session.to_string()
-        } else {
-            format!("{group}/{session}")
-        };
-        format!("{}:{scoped}", dest.unwrap_or(""))
-    };
-    let mut rows: Vec<PickerRow> = entries
-        .iter()
-        .map(|e| PickerRow {
-            target: target(&e.name),
-            cells: vec![e.label.clone(), e.name.clone(), host_cell.clone(), e.status.clone()],
-        })
-        .collect();
-    rows.push(PickerRow {
-        target: target("+"),
-        cells: vec![
-            "+ create new session…".to_string(),
-            String::new(),
-            host_cell,
-            String::new(),
-        ],
-    });
-    rows
-}
-
-/// The rows the picker shows: one host (`ph host:`), or this machine plus
-/// every host with a live mux endpoint (bare `ph`) — the connected set. A
-/// host whose listing fails is reported on stderr and skipped, never fatal.
-fn ph_picker_rows(scope: Option<(Option<String>, String)>, group: &str) -> Result<Vec<PickerRow>> {
-    let mut rows = Vec::new();
-    let mut dests: Vec<String> = Vec::new();
-    match scope {
-        Some((user, host)) => dests.push(ph_dest(user.as_deref(), &host)),
-        None => {
-            rows.extend(picker_rows_for(
-                None,
-                group,
-                &session::picker_entries_local(&Config::new(group)?)?,
-            ));
-            match remote::mux::live_endpoint_dests() {
-                Ok(d) => dests = d,
-                Err(e) => eprintln!("ph: mux endpoints unavailable: {e}"),
-            }
-        }
-    }
-    for dest in dests {
-        let (user, host) = match dest.rsplit_once('@') {
-            Some((u, h)) if !u.is_empty() => (Some(u), h),
-            _ => (None, dest.as_str()),
-        };
-        match remote_list_output(user, host, group, "--json")
-            .and_then(|json| session::picker_entries_from_json(&json))
-        {
-            Ok(entries) => rows.extend(picker_rows_for(Some(&dest), group, &entries)),
-            Err(e) => eprintln!("ph: {dest}: {e}"),
-        }
-    }
-    Ok(rows)
-}
-
-/// The RFC 0005 §3.5 `rows` array: each picker row's cells plus a
-/// `session.switch {target}` action (§7).
-fn picker_rows_json(rows: &[PickerRow]) -> serde_json::Value {
-    serde_json::Value::Array(
-        rows.iter()
-            .map(|r| {
-                serde_json::json!({
-                    "cells": r.cells,
-                    "action": { "method": "session.switch", "params": { "target": r.target } },
-                })
-            })
-            .collect(),
-    )
-}
-
 /// The picker forms of `ph` (FDR 0016 top-level chooser): list, choose,
 /// attach. Non-TTY invocations keep FDR 0011's discipline and error with the
 /// candidate targets; so does a renderer too old to draw the picker.
 fn cmd_ph_picker(scope: Option<(Option<String>, String)>, group: &str) -> Result<()> {
     let title = match &scope {
-        Some((user, host)) => format!("sessions on {}", ph_dest(user.as_deref(), host)),
-        None => "sessions".to_string(),
+        Some((user, host)) => format!("{} on {}", picker::TITLE, ph_dest(user.as_deref(), host)),
+        None => picker::TITLE.to_string(),
     };
-    let rows = ph_picker_rows(scope, group)?;
-    let candidates = || {
-        rows.iter()
-            .filter(|r| !r.target.ends_with(":+"))
-            .map(|r| r.target.as_str())
-            .collect::<Vec<_>>()
-            .join(", ")
-    };
+    let rows = picker::rows(scope, group)?;
+    let candidates = || picker::candidates(&rows);
     if !util::is_tty(libc::STDIN_FILENO) || !util::is_tty(libc::STDOUT_FILENO) {
         return Err(Error::Msg(format!(
             "ph: the picker needs a terminal; candidates: {}",
             candidates()
         )));
     }
-    match remote::palette::choose_standalone(&title, picker_rows_json(&rows), "(no sessions)")? {
+    match remote::palette::choose_standalone(&title, picker::rows_json(&rows), picker::EMPTY)? {
         remote::palette::Choice::Action { method, params } if method == "session.switch" => {
             let target = params
                 .get("target")
@@ -2406,49 +2318,6 @@ mod tests {
                 "roundtrip for detach={detach} command={command:?}"
             );
         }
-    }
-
-    /// FDR 0016: picker rows carry targets that `ph_parse` routes exactly as
-    /// the typed form would — local `:name` / `:group/name`, remote
-    /// `dest:name`, the create row `:+` / `dest:+` — and cells that label
-    /// a session by activity, else by its id.
-    #[test]
-    fn picker_rows_round_trip_through_ph_parse() {
-        use PhRoute::*;
-        let entries = vec![
-            session::PickerEntry { name: "dev".into(), label: "~/x · nvim".into(), status: "detached".into() },
-            session::PickerEntry { name: "s-2".into(), label: String::new(), status: "attached (1)".into() },
-        ];
-        let local = picker_rows_for(None, "default", &entries);
-        assert_eq!(local[0].cells, vec!["~/x · nvim", "dev", "local", "detached"]);
-        assert_eq!(local[1].cells[..2], ["", "s-2"], "no label ⇒ blank, the id still names it");
-        assert_eq!(ph_parse(Some(&local[0].target)), LocalResolve { group: None, session: "dev".into() });
-        assert_eq!(ph_parse(Some(&local[2].target)), LocalNew { group: None });
-        assert_eq!(local[2].cells[0], "+ create new session…");
-
-        let grouped = picker_rows_for(None, "work", &entries[..1]);
-        assert_eq!(
-            ph_parse(Some(&grouped[0].target)),
-            LocalResolve { group: Some("work".into()), session: "dev".into() }
-        );
-
-        let remote = picker_rows_for(Some("me@box"), "default", &entries[..1]);
-        assert_eq!(remote[0].cells[2], "me@box");
-        assert_eq!(
-            ph_parse(Some(&remote[0].target)),
-            RemoteResolve { user: Some("me".into()), host: "box".into(), group: None, session: "dev".into() }
-        );
-        assert_eq!(
-            ph_parse(Some(&remote[1].target)),
-            RemoteNew { user: Some("me".into()), host: "box".into(), group: None }
-        );
-
-        // The RFC 0005 §3.5 rows: cells verbatim, a session.switch action per row.
-        let json = picker_rows_json(&remote);
-        assert_eq!(json[0]["cells"][0], "~/x · nvim");
-        assert_eq!(json[0]["action"]["method"], "session.switch");
-        assert_eq!(json[0]["action"]["params"]["target"], "me@box:dev");
-        assert_eq!(json[1]["action"]["params"]["target"], "me@box:+");
     }
 
     #[test]

@@ -130,6 +130,10 @@ fn palette_commands(server_log_on: bool, scroll_opt: bool) -> Value {
         ("Enable scroll-region optimization", true)
     };
     json!([
+        // FDR 0016: the palette as picker — list the reachable sessions and
+        // switch this viewport to one (the client ends with a switch outcome
+        // and the front door re-attaches).
+        { "name": "Switch session…", "action": { "method": "session.list" } },
         { "name": "Echo: adaptive", "action": { "method": "echo.set", "params": { "model": "adaptive" } } },
         { "name": "Echo: optimistic", "action": { "method": "echo.set", "params": { "model": "optimistic" } } },
         { "name": "Echo: always", "action": { "method": "echo.set", "params": { "model": "always" } } },
@@ -811,6 +815,32 @@ fn dispatch_palette_action(
         }
         "app.quit" => {
             request_shutdown(st);
+            true
+        }
+        "session.list" => {
+            // FDR 0016: re-show the renderer as the session picker. The
+            // listing blocks (one `posh list` per connected host, bounded by
+            // the ssh connect timeout) — the session keeps running underneath.
+            match crate::picker::rows(None, &crate::picker::default_group()) {
+                Ok(rows) => {
+                    if let Some(p) = st.palette.as_mut() {
+                        p.show_picker(crate::picker::TITLE, crate::picker::rows_json(&rows), crate::picker::EMPTY);
+                    }
+                }
+                Err(e) => st.notify.set_message(&format!("session list failed: {e}"), false, now),
+            }
+            false
+        }
+        "session.switch" => {
+            // FDR 0016 re-dial: record the target for the front door and end
+            // this attach exactly as Quit does (the session stays running
+            // detached); `run()` re-attaches to the target.
+            let Some(target) = params.get("target").and_then(Value::as_str) else {
+                return false;
+            };
+            crate::picker::request_switch(target);
+            request_shutdown(st);
+            st.notify.set_message(&format!("switching to {target}\u{2026}"), true, now);
             true
         }
         _ => false, // unknown method: the renderer already closed; ignore
@@ -3180,6 +3210,30 @@ mod tests {
         assert!(st.shutdown_requested, "quit requests shutdown");
     }
 
+    /// FDR 0016: a picker selection records its target for the front door's
+    /// re-attach loop and ends this attach like Quit (a switch is a re-dial).
+    #[test]
+    fn dispatch_session_switch_records_target_and_requests_shutdown() {
+        let _g = crate::picker::switch_test_guard();
+        let raw = pty_raw_mode();
+        let mut st = test_state(24, 80);
+        let send = dispatch_palette_action(
+            &mut st,
+            &raw,
+            "session.switch",
+            &json!({ "target": "box:dev" }),
+            0,
+        );
+        assert!(send, "a switch asks to send the shutdown promptly");
+        assert!(st.shutdown_requested, "a switch ends this attach");
+        assert_eq!(crate::picker::take_switch().as_deref(), Some("box:dev"));
+        // No target: nothing recorded, nothing ended.
+        let mut st = test_state(24, 80);
+        assert!(!dispatch_palette_action(&mut st, &raw, "session.switch", &json!({}), 0));
+        assert!(!st.shutdown_requested);
+        assert_eq!(crate::picker::take_switch(), None);
+    }
+
     #[test]
     fn dispatch_resync_sets_one_shot_resync_flag() {
         // The palette's "Reset & resync" command sets CLIENT_FLAG_RESYNC and asks
@@ -3561,7 +3615,9 @@ mod tests {
             off.iter().any(|n| n == "Enable scroll-region optimization"),
             "scroll-opt enable command missing when off: {off:?}"
         );
-        assert_eq!(arr.len(), 19, "expected 19 commands, got {names:?}");
+        // FDR 0016: the switcher leads the list.
+        assert_eq!(names.first().copied(), Some("Switch session…"), "{names:?}");
+        assert_eq!(arr.len(), 20, "expected 20 commands, got {names:?}");
     }
 
     #[test]

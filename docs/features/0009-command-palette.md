@@ -27,6 +27,9 @@ client's behavior (backend) and reusing mature TUI prior art.
   what to forward, so the inner app's `-isig` is irrelevant (the same
   interception point the old escape menu used).
 - **Commands:** the palette *is* the escape menu. Version 1 lists:
+  - **Switch session…** — re-show the renderer as the FDR 0016 session picker
+    (`session.list`); choosing a row switches this viewport to that session
+    (`session.switch`, a re-dial through the front door). Both clients.
   - **Echo: adaptive / optimistic / always / never** — set the predictive-echo
     model live (`echo.set`), overriding `$POSH_PREDICTION_MODEL` for the session.
   - **Enable / Disable client debug logging** — toggle this client's debug
