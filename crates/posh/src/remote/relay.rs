@@ -16,14 +16,17 @@
 //!
 //! # Scope — through Task 3.1b (loss / roam / resync recovery)
 //!
-//! The relay holds a single-frame O(1) retransmit buffer ([`HeldFrame`]): the
-//! latest re-wrapped unacked frame, and nothing more. Because the daemon runs
-//! this client's `FrameProducer` in lossy, ack-gated mode (`CAP_LOSSY`, Task 3.0),
-//! every unacked frame anchors at the client's last *acked* base, so each new
-//! frame SUPERSEDES the previous one — retransmitting the newest brings the client
-//! fully current. The relay therefore never retains more than ONE frame, even
-//! across a roam (the UDP peer silent while the screen keeps changing — each new
-//! daemon frame just replaces the held one). It:
+//! The relay holds a fixed-size O(1) retransmit buffer ([`HeldFrame`]): the
+//! latest re-wrapped unacked visible frame plus the latest unacked scrollback
+//! frame, and nothing more. Because the daemon runs this client's
+//! `FrameProducer` in lossy, ack-gated mode (`CAP_LOSSY`, Task 3.0), every
+//! unacked visible frame anchors at the client's last *acked* base, so each new
+//! one SUPERSEDES the previous — retransmitting the newest brings the client
+//! fully current; a scrollback frame threads off the visible frame it follows
+//! (posh#181), so the pair is resent together. The relay therefore never
+//! retains more than one of each, even across a roam (the UDP peer silent while
+//! the screen keeps changing — each new daemon frame just replaces the held
+//! one). It:
 //!
 //! - retransmits the held frame on the RTO (`conn.rto()`), gated on a reachable
 //!   peer, and drops it when the client's cumulative `acked_frame` reaches it;
@@ -303,59 +306,88 @@ pub(crate) fn rewrap(
     }
 }
 
-/// The relay's O(1) retransmit buffer (RFC 0008 §3): at most ONE unacked frame,
-/// the latest re-wrapped `ServerFrame`. The daemon anchors every unacked frame at
-/// the client's last *acked* base (lossy mode, Task 3.0), so a new frame
-/// SUPERSEDES the previous one — retransmitting the newest is enough to bring the
-/// client fully current. The relay thus never accumulates a diff chain:
-/// [`hold`](HeldFrame::hold) replaces, [`drop_if_acked`](HeldFrame::drop_if_acked)
-/// releases on the client's cumulative ack, and [`clear`](HeldFrame::clear)
-/// discards a diverged frame on RESYNC. This single-frame bound is the whole point
-/// of Model 2 — the alternative (relay-owned reliability) must buffer and
-/// retransmit the entire unacked chain, which grows unboundedly on roam.
+/// The relay's O(1) retransmit buffer (RFC 0008 §3): at most ONE unacked
+/// visible frame — the latest re-wrapped `ServerFrame` — plus at most one
+/// unacked scrollback frame. The daemon anchors every unacked visible frame
+/// at the client's last *acked* base (lossy mode, Task 3.0), so a new visible
+/// frame SUPERSEDES the previous one — retransmitting the newest is enough to
+/// bring the client fully current. A scrollback frame is the one exception
+/// (posh#181): it threads off the visible frame it follows, so the pair must
+/// be retransmitted together — a lost visible frame with only its scrollback
+/// frame held would leave the client unable to apply either until the next
+/// output. Two slots, never a chain: [`hold`](HeldFrame::hold) replaces
+/// within its slot, [`drop_if_acked`](HeldFrame::drop_if_acked) releases each
+/// on the client's cumulative ack, and [`clear`](HeldFrame::clear) discards
+/// both on RESYNC. This fixed bound is the whole point of Model 2 — the
+/// alternative (relay-owned reliability) must buffer and retransmit the
+/// entire unacked chain, which grows unboundedly on roam.
 #[derive(Default)]
 pub(crate) struct HeldFrame {
-    /// The one unacked frame: (re-wrapped `frame_num`, encoded `ServerFrame` bytes
-    /// ready to (re)send). `None` when nothing is outstanding.
-    frame: Option<(u64, Vec<u8>)>,
+    /// The one unacked visible frame: (re-wrapped `frame_num`, encoded
+    /// `ServerFrame` bytes ready to (re)send). `None` when nothing is outstanding.
+    visible: Option<(u64, Vec<u8>)>,
+    /// The one unacked scrollback frame, same shape. Threads off `visible` (or
+    /// an already-acked visible frame), so it is resent right after it.
+    scrollback: Option<(u64, Vec<u8>)>,
 }
 
 impl HeldFrame {
-    /// Supersede any previously-held frame with the newest one. O(1): this
-    /// replaces, it never appends — the supersession invariant makes one enough.
-    pub(crate) fn hold(&mut self, frame_num: u64, encoded: Vec<u8>) {
-        self.frame = Some((frame_num, encoded));
+    /// Supersede the previously-held frame of the same kind with the newest
+    /// one. O(1): this replaces within its slot, it never appends — the
+    /// supersession invariant makes one of each enough.
+    pub(crate) fn hold(&mut self, frame_num: u64, encoded: Vec<u8>, scrollback: bool) {
+        let slot = if scrollback { &mut self.scrollback } else { &mut self.visible };
+        *slot = Some((frame_num, encoded));
     }
 
-    /// Release the held frame once the client's cumulative `acked_frame` reaches
-    /// it: the client has it, so there is nothing left to retransmit. Idempotent
-    /// (a no-op when nothing is held or the ack is still behind).
+    /// Release each held frame once the client's cumulative `acked_frame`
+    /// reaches it: the client has it, so there is nothing left to retransmit.
+    /// Idempotent (a no-op when nothing is held or the ack is still behind).
     pub(crate) fn drop_if_acked(&mut self, acked_frame: u64) {
-        if self.frame.as_ref().is_some_and(|(num, _)| acked_frame >= *num) {
-            self.frame = None;
+        for slot in [&mut self.visible, &mut self.scrollback] {
+            if slot.as_ref().is_some_and(|(num, _)| acked_frame >= *num) {
+                *slot = None;
+            }
         }
     }
 
-    /// Discard the held frame unconditionally: on a base-sum divergence
-    /// (`CLIENT_FLAG_RESYNC`) it diffs against a base the client rejected, so the
-    /// daemon's forced `Full` — not this frame — re-establishes the client.
+    /// Discard the held frames unconditionally: on a base-sum divergence
+    /// (`CLIENT_FLAG_RESYNC`) they diff against a base the client rejected, so
+    /// the daemon's forced `Full` — not these frames — re-establishes the client.
     pub(crate) fn clear(&mut self) {
-        self.frame = None;
+        self.visible = None;
+        self.scrollback = None;
     }
 
     pub(crate) fn is_held(&self) -> bool {
-        self.frame.is_some()
+        self.visible.is_some() || self.scrollback.is_some()
     }
 
-    /// The encoded bytes of the held frame, for a (re)send.
-    pub(crate) fn bytes(&self) -> Option<&[u8]> {
-        self.frame.as_ref().map(|(_, bytes)| bytes.as_slice())
+    /// The encoded bytes of the held frames for a resend, visible first (the
+    /// scrollback frame threads off it, so the client needs it first).
+    pub(crate) fn frames(&self) -> impl Iterator<Item = &[u8]> {
+        self.visible
+            .iter()
+            .chain(self.scrollback.iter())
+            .map(|(_, bytes)| bytes.as_slice())
     }
 
-    /// The held frame's re-wrapped number (test/observability).
+    /// The newest held frame's re-wrapped number (test/observability).
     fn frame_num(&self) -> Option<u64> {
-        self.frame.as_ref().map(|(num, _)| *num)
+        self.visible
+            .iter()
+            .chain(self.scrollback.iter())
+            .map(|(num, _)| *num)
+            .max()
     }
+}
+
+/// Whether a frame is a scrollback body — the [`HeldFrame`] slot it occupies.
+pub(crate) fn is_scrollback_frame(frame: &ServerFrame) -> bool {
+    matches!(
+        frame.body,
+        FrameBody::Scrollback { .. } | FrameBody::Scrollback2 { .. }
+    )
 }
 
 /// Run the frame relay: handshake with the UDP client, connect to (or create)
@@ -1298,7 +1330,7 @@ fn relay_loop(
             // A held visible frame's pre-encoded bytes already carry the agent caps
             // stamped when it was held; fresh agent bytes ride the independent carrier.
             if due.retransmit {
-                if let Some(bytes) = leg.held.bytes() {
+                for bytes in leg.held.frames() {
                     send_payload(&mut conn, &mut fragmenter, bytes, enveloped);
                 }
                 last_send = now;
@@ -1431,14 +1463,14 @@ fn forward_daemon_frame(
     out.caps.extend(agent_caps(agent_stream, agent_seen, has_agent, enveloped));
     out.caps.extend(intro.iter().cloned());
     *last_frame_num = out.frame_num;
-    held.hold(out.frame_num, out.encode());
+    let scrollback = is_scrollback_frame(&out);
+    let bytes = out.encode();
     if conn.has_remote() {
-        if let Some(bytes) = held.bytes() {
-            send_payload(conn, fragmenter, bytes, enveloped);
-        }
+        send_payload(conn, fragmenter, &bytes, enveloped);
         *last_send = now;
         *last_agent_send = now;
     }
+    held.hold(out.frame_num, bytes, scrollback);
 }
 
 /// Send the UDP client an Empty heartbeat / ack frame carrying the current input
@@ -1813,13 +1845,13 @@ mod tests {
         let mut held = HeldFrame::default();
         assert!(!held.is_held());
 
-        held.hold(1, vec![0xaa]);
+        held.hold(1, vec![0xaa], false);
         assert_eq!(held.frame_num(), Some(1));
 
         // A newer daemon frame SUPERSEDES the older one — still exactly one held.
-        held.hold(2, vec![0xbb]);
+        held.hold(2, vec![0xbb], false);
         assert_eq!(held.frame_num(), Some(2));
-        assert_eq!(held.bytes(), Some(&b"\xbb"[..]));
+        assert_eq!(held.frames().collect::<Vec<_>>(), vec![&b"\xbb"[..]]);
 
         // A cumulative ack BELOW the held number keeps it (not yet confirmed).
         held.drop_if_acked(1);
@@ -1830,9 +1862,45 @@ mod tests {
         assert!(!held.is_held(), "confirmed frame is dropped");
 
         // clear() (the RESYNC path) discards the diverged frame unconditionally.
-        held.hold(9, vec![0xcc]);
+        held.hold(9, vec![0xcc], false);
         held.clear();
         assert!(!held.is_held(), "RESYNC clears the held frame");
+    }
+
+    /// posh#181: a scrollback frame threads off the visible frame it follows,
+    /// so the buffer keeps ONE of each and resends them visible-first — a lost
+    /// visible frame with only its scrollback frame held would leave the
+    /// client unable to apply either. Still a fixed bound: each slot replaces.
+    #[test]
+    fn held_frame_keeps_visible_and_scrollback_pair() {
+        let mut held = HeldFrame::default();
+        held.hold(3, vec![0xaa], false);
+        held.hold(4, vec![0xbb], true);
+        assert_eq!(held.frame_num(), Some(4));
+        assert_eq!(
+            held.frames().collect::<Vec<_>>(),
+            vec![&b"\xaa"[..], &b"\xbb"[..]],
+            "visible first, then the scrollback frame that threads off it"
+        );
+
+        // A newer visible frame supersedes only the visible slot.
+        held.hold(5, vec![0xcc], false);
+        assert_eq!(held.frames().collect::<Vec<_>>(), vec![&b"\xcc"[..], &b"\xbb"[..]]);
+        // A newer scrollback frame supersedes only the scrollback slot.
+        held.hold(6, vec![0xdd], true);
+        assert_eq!(held.frames().collect::<Vec<_>>(), vec![&b"\xcc"[..], &b"\xdd"[..]]);
+
+        // The cumulative ack releases each slot independently.
+        held.drop_if_acked(5);
+        assert_eq!(held.frames().collect::<Vec<_>>(), vec![&b"\xdd"[..]]);
+        held.drop_if_acked(6);
+        assert!(!held.is_held());
+
+        // RESYNC clears both.
+        held.hold(7, vec![0xee], false);
+        held.hold(8, vec![0xff], true);
+        held.clear();
+        assert!(!held.is_held(), "RESYNC clears both slots");
     }
 
     /// The Task 3.2 anti-starvation invariant: a held (lost) visible frame plus a

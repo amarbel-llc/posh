@@ -675,21 +675,21 @@ pub(crate) fn mux_peer_loop(
                             b.echo.ack(),
                         );
                         b.last_frame_num = out.frame_num;
-                        b.daemon.held.hold(out.frame_num, out.encode());
+                        let scrollback = crate::remote::relay::is_scrollback_frame(&out);
+                        let bytes = out.encode();
                         b.daemon.ack_due = false;
                         if conn.has_remote() {
-                            if let Some(bytes) = b.daemon.held.bytes() {
-                                crate::remote::mux::send_session_wire(
-                                    &mut conn,
-                                    &mut fragmenter,
-                                    b.chan,
-                                    crate::remote::mux::SESSION_WIRE_DATA,
-                                    bytes,
-                                );
-                            }
+                            crate::remote::mux::send_session_wire(
+                                &mut conn,
+                                &mut fragmenter,
+                                b.chan,
+                                crate::remote::mux::SESSION_WIRE_DATA,
+                                &bytes,
+                            );
                             b.last_retx = now;
                             b.last_send = now;
                         }
+                        b.daemon.held.hold(out.frame_num, bytes, scrollback);
                     }
                     ipc::Tag::Output => {
                         // A frames-off daemon cannot ride a mux channel
@@ -766,7 +766,7 @@ pub(crate) fn mux_peer_loop(
                 && conn.has_remote()
                 && now.saturating_sub(b.last_retx) >= conn.rto()
             {
-                if let Some(bytes) = b.daemon.held.bytes() {
+                for bytes in b.daemon.held.frames() {
                     crate::remote::mux::send_session_wire(
                         &mut conn,
                         &mut fragmenter,

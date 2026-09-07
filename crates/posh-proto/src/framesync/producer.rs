@@ -218,6 +218,31 @@ impl FrameProducer {
         });
     }
 
+    /// Advance to a scrollback frame slot that threads off the NEWEST visible
+    /// frame (`current`) rather than the acked one — for a producer whose
+    /// caller queues the scrollback frame immediately behind the visible
+    /// frame of the same broadcast on an ordered link (the session daemon,
+    /// posh#181). The client applies the visible frame first and its RFC 0002
+    /// §3 rule accepts only `base == applied_num`, so the scrollback frame's
+    /// base must name that visible frame ([`last_visible_num`]); its data is
+    /// that frame's dump, so an ack landing on the scrollback slot confirms
+    /// exactly the screen the client holds (no #95 leap: the client can only
+    /// apply it after applying the visible frame it names).
+    ///
+    /// [`last_visible_num`]: Self::last_visible_num
+    pub fn advance_scrollback_after_visible(&mut self, sb_total: u64) {
+        let num = self.current.num + 1;
+        let next = ProducedFrame {
+            num,
+            data: self.current.data.clone(),
+            snapshot: self.current.snapshot.clone(),
+            alt_screen: self.current.alt_screen,
+            dims: self.current.dims,
+            sb_total,
+        };
+        self.rotate_current(next);
+    }
+
     /// Retire the current frame into the retransmission window (bounded to the
     /// most recent 8) and install `next` as the new current. Shared by both
     /// advance paths so the slot machinery is identical for visible and

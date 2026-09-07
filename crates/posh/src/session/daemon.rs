@@ -516,7 +516,14 @@ impl ClientConn {
         // `Tag::FrameAck`, mirroring the visible-frame path in `queue_frame`.
         let withhold = self.lossy || self.coalescing();
         let producer = self.producer.as_mut().expect("has_base implies Some");
-        producer.advance_scrollback(cur_sb_total);
+        // posh#181: thread off the visible frame queued just before this one
+        // (`broadcast_output` orders them so), NOT the acked base. A
+        // not-self-acked client (lossy relay/bridge, coalescing) applies that
+        // visible frame first, and its RFC 0002 §3 rule accepts a scrollback
+        // body only at `base == applied_num` — anchored at the older acked
+        // base, every scrollback frame was rejected and the ring never grew.
+        // For the self-acked reliable client the two anchors coincide.
+        producer.advance_scrollback_after_visible(cur_sb_total);
         // The rows that entered scrollback since this client's floor/ack, bounded
         // by what the ring still holds. Work in ring positions (newest-anchored):
         // `grown` rows entered since this frame's coverage and sit at the tail — 0
@@ -536,10 +543,10 @@ impl ClientConn {
             .map(|i| term.dump_scrollback_row(i).unwrap_or_default())
             .collect();
         let frame_num = producer.current_num();
-        // `base` reads the CONFIRMED visible frame (before the self-ack below),
-        // exactly as server.rs builds the body.
+        // `base` names the visible frame this body follows (its dump is what
+        // the slot above inherited), so the client at that frame applies it.
         let body = FrameBody::Scrollback {
-            base: producer.acked_num(),
+            base: producer.last_visible_num(),
             rows,
         };
         let bytes = ServerFrame {
@@ -3123,6 +3130,91 @@ mod tests {
         let frames = decode_server_frames(&c.write_buf);
         assert!(matches!(frames[1].body, FrameBody::Diff { base: 1, .. }), "got {:?}", frames[1].body);
         assert!(matches!(frames[2].body, FrameBody::Diff { base: 2, .. }), "got {:?}", frames[2].body);
+    }
+
+    /// posh#181: a LOSSY client (the relay / M2 bridge) that wants scrollback
+    /// must be able to APPLY the scrollback frames the daemon queues. The
+    /// client's RFC 0002 §3 rule is `body.base == applied_num`; the daemon
+    /// queues the scrollback frame right AFTER the visible frame of the same
+    /// broadcast, so its base must be that visible frame — the one the client
+    /// has just applied — not the older acked base the visible frame diffed
+    /// against. Simulates the client's apply rule over the queued stream.
+    #[test]
+    fn lossy_scrollback_frame_threads_off_the_visible_frame_it_follows() {
+        let (rows, cols) = (5u16, 24u16);
+        let mut term = Terminal::with_scrollback(rows, cols, 1000);
+        let (mut c, _peer) = lossy_conn(
+            rows,
+            cols,
+            &[caps::Cap {
+                id: caps::CAP_SCROLLBACK,
+                payload: vec![0],
+            }],
+        );
+        assert!(c.lossy && c.wants_scrollback());
+
+        // Attach Full (frame 1), acked by the client via the bridge.
+        assert!(c.queue_frame_from(&term));
+        c.apply_frame_ack(&ipc::encode_frame_ack(1, 0));
+        c.write_buf.clear();
+
+        // Output scrolls rows off: one broadcast = visible frame + scrollback frame.
+        scroll_off(&mut term, 12);
+        broadcast_output(std::slice::from_mut(&mut c), &term, b"<raw ignored>");
+
+        // The client's apply rule (remote/client.rs process_frame, v1 bodies).
+        let mut applied_num = 1u64;
+        let mut ring_rows = 0usize;
+        for f in decode_server_frames(&c.write_buf) {
+            match &f.body {
+                FrameBody::Empty => {}
+                FrameBody::Scrollback { base, rows } => {
+                    if *base == applied_num {
+                        ring_rows += rows.len();
+                        applied_num = f.frame_num;
+                    }
+                }
+                FrameBody::Full(_) => applied_num = f.frame_num,
+                FrameBody::Diff { base, .. } | FrameBody::Morph { base, .. } => {
+                    if *base == applied_num {
+                        applied_num = f.frame_num;
+                    }
+                }
+                other => panic!("unexpected body {other:?}"),
+            }
+        }
+        assert!(
+            ring_rows > 0,
+            "the lossy client dropped every scrollback frame: its base never matched \
+             the visible frame the client had just applied (posh#181)"
+        );
+        assert_eq!(
+            ring_rows,
+            term.primary_scrollback_len(),
+            "every scrolled-off row landed in the client ring"
+        );
+
+        // The client's cumulative ack lands on the scrollback frame: the daemon
+        // folds its coverage into acked_sb_total, so the next growth ships ONLY
+        // the new rows (no double-append), threaded off the next visible frame.
+        c.apply_frame_ack(&ipc::encode_frame_ack(applied_num, 0));
+        c.write_buf.clear();
+        scroll_off(&mut term, 3);
+        broadcast_output(std::slice::from_mut(&mut c), &term, b"<raw ignored>");
+        let frames = decode_server_frames(&c.write_buf);
+        let visible_num = frames[0].frame_num;
+        assert!(
+            matches!(frames[0].body, FrameBody::Diff { base, .. } if base == applied_num),
+            "the visible frame diffs against the acked scrollback slot, got {:?}",
+            frames[0].body
+        );
+        match &frames[1].body {
+            FrameBody::Scrollback { base, rows } => {
+                assert_eq!(*base, visible_num, "threads off the visible frame it follows");
+                assert_eq!(rows.len(), 3, "only the rows since the acked coverage");
+            }
+            other => panic!("expected a scrollback frame, got {other:?}"),
+        }
     }
 
     /// (c) A `Tag::FrameAck` with the RESYNC flag drops the acked base, forcing the
