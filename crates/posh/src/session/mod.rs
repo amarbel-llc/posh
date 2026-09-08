@@ -784,7 +784,22 @@ fn print_session_line(s: &SessionEntry, format: ListFormat, current: Option<&str
 // ---------------------------------------------------------------------------
 // kill / detach / run
 
-pub fn cmd_kill(cfg: &Config, name: &str) -> Result<()> {
+/// What [`kill_session`] did.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum KillOutcome {
+    /// The daemon was told to exit (its shell and every attached client go).
+    Killed,
+    /// Nothing answered; the dead socket was removed.
+    CleanedStale,
+    /// `unless_attached` and viewports are attached: left running.
+    Kept { clients: u64 },
+}
+
+/// Kill a session by name. With `unless_attached`, a session that still
+/// has attached clients is KEPT (FDR 0016's switch-time cleanup must not
+/// throw other viewports out unless forced); the probe's own connection is
+/// not counted.
+pub fn kill_session(cfg: &Config, name: &str, unless_attached: bool) -> Result<KillOutcome> {
     let path = cfg.socket_path(name)?;
     if !session_socket_exists(&path) {
         return Err(Error::Msg(format!(
@@ -793,16 +808,31 @@ pub fn cmd_kill(cfg: &Config, name: &str) -> Result<()> {
     }
     match probe_session(&path) {
         Ok(probe) => {
+            if unless_attached && probe.info.clients > 0 {
+                return Ok(KillOutcome::Kept { clients: probe.info.clients });
+            }
             let fd = std::os::fd::AsRawFd::as_raw_fd(&probe.stream);
             let _ = ipc::send(fd, Tag::Kill, b"");
-            println!("killed session {name}");
+            Ok(KillOutcome::Killed)
         }
         Err(e) => {
             if cleanup_stale_socket(&path) {
-                println!("cleaned up stale session {name}");
+                Ok(KillOutcome::CleanedStale)
             } else {
-                return Err(Error::Msg(format!("session {name} is unresponsive: {e}")));
+                Err(Error::Msg(format!("session {name} is unresponsive: {e}")))
             }
+        }
+    }
+}
+
+/// `posh kill [--unless-attached] <name>`. The wording is what the FDR 0016
+/// remote kill parses back over ssh — keep it byte-for-byte.
+pub fn cmd_kill(cfg: &Config, name: &str, unless_attached: bool) -> Result<()> {
+    match kill_session(cfg, name, unless_attached)? {
+        KillOutcome::Killed => println!("killed session {name}"),
+        KillOutcome::CleanedStale => println!("cleaned up stale session {name}"),
+        KillOutcome::Kept { clients } => {
+            println!("kept session {name}: {clients} client(s) attached")
         }
     }
     Ok(())

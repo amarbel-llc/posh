@@ -38,8 +38,23 @@ fn main() {
 /// The previous session keeps running detached.
 fn run() -> Result<()> {
     run_once()?;
-    while let Some(target) = picker::take_switch() {
-        dispatch_ph(ph_parse(Some(&target)), &picker::default_group())?;
+    while let Some(sw) = picker::take_switch() {
+        // Kill-after-attach: arm the kill of the session being LEFT for the
+        // new client to carry out once it is established; a failed attach
+        // disarms it, so the old session survives a switch that went nowhere.
+        let force = match sw.previous {
+            picker::Previous::Keep => None,
+            picker::Previous::Kill => Some(false),
+            picker::Previous::ForceKill => Some(true),
+        };
+        if let (Some(force), Some(leaving)) = (force, picker::current()) {
+            picker::arm_kill(&leaving, force);
+        }
+        let outcome = dispatch_ph(ph_parse(Some(&sw.target)), &picker::default_group());
+        if outcome.is_err() {
+            picker::disarm_kill();
+        }
+        outcome?;
     }
     Ok(())
 }
@@ -200,10 +215,14 @@ fn run_once() -> Result<()> {
         "attach" | "a" => cmd_attach(&group, args, &forward_flag),
         "start" | "s" => cmd_start(&group, args, &forward_flag),
         "kill" | "k" => {
+            // `--unless-attached` (FDR 0016): keep a session other viewports
+            // are attached to — the switcher's non-forced cleanup.
+            let unless_attached = args.iter().any(|a| a == "--unless-attached");
             let name = args
-                .first()
+                .iter()
+                .find(|a| !a.starts_with("--"))
                 .ok_or_else(|| Error::from("kill requires a session name"))?;
-            session::cmd_kill(&Config::new(&group)?, name)
+            session::cmd_kill(&Config::new(&group)?, name, unless_attached)
         }
         "detach" | "d" => {
             session::cmd_detach(&Config::new(&group)?, args.first().map(|s| s.as_str()))
@@ -1061,6 +1080,8 @@ fn cmd_ssh_session(
         Some(u) => format!("{u}@{host}"),
         None => host,
     };
+    // FDR 0016: the session a later switch would be leaving.
+    picker::set_current(&picker::target_for(Some(&dest), group, &session));
     if detached {
         // Detached spawn (#67): no transport, so no agent endpoint — execute
         // the inner `posh attach --detach` directly over ssh and return. This
@@ -1819,8 +1840,11 @@ SESSION COMMANDS (local persistence)
         name, the enclosing session ($POSH_SESSION) — the in-session answer
         to: which echo mode am I being viewed through? (RFC 0014)
 
-    kill <name>                                (alias: k)
-        Kill a session, its shell, and all attached clients.
+    kill [--unless-attached] <name>            (alias: k)
+        Kill a session, its shell, and all attached clients. With
+        --unless-attached a session that still has attached clients is
+        kept (prints `kept session NAME: N client(s) attached`) — the
+        switcher's non-forced cleanup (FDR 0016).
 
     groups                                     (alias: gs)
         List session groups that contain sessions.

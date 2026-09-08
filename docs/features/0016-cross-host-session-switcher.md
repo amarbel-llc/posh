@@ -72,7 +72,25 @@ every host their mux daemons reach.
 switch outcome** instead of an exit status; the front door then attaches to the
 named target exactly as `ph <target>` would — a local socket, a mux session
 channel, or a fresh bootstrap — and loops until an attach ends without a switch.
-The previous session keeps running detached (FDR 0011: nothing is reaped).
+
+**Leaving a session.** FDR 0011 reaps nothing, so a switch is where a session
+would otherwise pile up. Choosing a row from *inside* a session therefore asks
+a second question, in the same renderer as a three-command palette:
+
+- **Switch, keep it running** (the default, and what Enter on the first
+  entry does) — the previous session stays detached.
+- **Switch, kill it** — killed once the new attach is *established*, so a
+  switch that fails to attach never destroys the session it was leaving.
+  If other viewports are still attached to it, it is kept and the new
+  session's banner says so.
+- **Switch, kill it even with other viewports attached** — the forced
+  form; those viewports are thrown out exactly as `posh kill` does.
+
+The kill is the ordinary `posh kill` primitive on the session's host — the
+local daemon socket, or `posh kill --unless-attached` over ssh for a remote
+one (non-interactive; an auth prompt cannot be answered from inside a
+session). The top-level `ph` picker, run from a plain shell, has no session to
+leave and asks nothing.
 
 ### The switch mechanism (decided)
 

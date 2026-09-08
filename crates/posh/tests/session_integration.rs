@@ -92,8 +92,9 @@ fn daemon_lifecycle_create_list_kill() {
         "unexpected output: {stdout}"
     );
 
-    // Kill tears down the daemon and removes the socket.
-    let out = posh(&dir, &["kill", "itest"]);
+    // FDR 0016: `--unless-attached` kills a session nothing is attached to
+    // (the switcher's non-forced cleanup), reporting it the same way.
+    let out = posh(&dir, &["kill", "--unless-attached", "itest"]);
     let stdout = String::from_utf8_lossy(&out.stdout);
     assert!(
         stdout.contains("killed session itest"),

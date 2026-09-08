@@ -99,6 +99,13 @@ fn run_interactive(stream: UnixStream) -> Result<()> {
     let bracket = crate::terminfo::ca_mode_bracket();
     let enter = enter_seq(&bracket);
     let _ = util::write_fd(STDOUT, &enter);
+    // FDR 0016 kill-after-attach: this socket IS the established attach, so
+    // a kill armed by a switch runs now; the local client has no banner, so
+    // the notice is logged and printed once the tty is restored.
+    let kill_notice = crate::picker::run_pending_kill();
+    if let Some(n) = kill_notice.as_deref() {
+        util::log_write("switch", n);
+    }
     let mut stream = stream;
     let result = loop {
         let mut switch_to: Option<(String, String)> = None;
@@ -113,6 +120,8 @@ fn run_interactive(stream: UnixStream) -> Result<()> {
                 .and_then(|cfg| crate::session::attach_existing(&cfg, &name))
             {
                 Ok(s) => {
+                    // FDR 0016: the re-homed viewport now sits in `name`.
+                    crate::picker::set_current(&crate::picker::target_for(None, Some(&group), &name));
                     stream = s;
                     continue;
                 }
@@ -123,6 +132,9 @@ fn run_interactive(stream: UnixStream) -> Result<()> {
     };
     let _ = util::write_fd(STDOUT, &restore_seq(&bracket));
     drop(raw);
+    if let Some(n) = kill_notice {
+        eprintln!("posh: {n}");
+    }
     // When the session ended (rather than detached), carry the shell's
     // exit status out as our own. github #18.
     match result {
@@ -170,6 +182,7 @@ pub fn cmd_attach(
     } else {
         crate::session::attach_existing(cfg, name)?
     };
+    crate::picker::set_current(&crate::picker::target_for(None, Some(&cfg.group), name));
     run_interactive(stream)
 }
 
@@ -277,6 +290,7 @@ pub fn cmd_start_local(
     let path = cfg.socket_path(name)?;
     let stream = UnixStream::connect(&path)
         .map_err(|e| Error::Msg(format!("connect {}: {e}", path.display())))?;
+    crate::picker::set_current(&crate::picker::target_for(None, Some(&cfg.group), name));
     run_interactive(stream)
 }
 
@@ -982,6 +996,9 @@ enum LocalAction {
     /// Re-show the renderer as the FDR 0016 session picker (the call site
     /// holds the `Palette`; dispatch does not).
     ShowPicker,
+    /// A picker row was chosen from inside a session: ask what to do with
+    /// the session being left (`picker::leave_commands` for this target).
+    AskLeave(String),
 }
 
 /// Dispatch a palette selection on the local client. Wire-only effects (Detach,
@@ -1008,12 +1025,22 @@ fn dispatch_local_action(method: &str, params: &Value, sock_write_buf: &mut Vec<
         "client.suspend" => LocalAction::Suspend,
         "session.list" => LocalAction::ShowPicker,
         "session.switch" => {
-            // FDR 0016 re-dial: record the target for the front door and
+            // FDR 0016 re-dial. A first selection (no `previous`) from inside
+            // a session asks the leave question first; with the answer (or no
+            // session to leave), record the switch for the front door and
             // detach exactly as `app.detach` does; `run()` re-attaches.
-            if let Some(target) = params.get("target").and_then(Value::as_str) {
-                crate::picker::request_switch(target);
-                ipc::append_frame(sock_write_buf, Tag::Detach, b"");
+            let Some(target) = params.get("target").and_then(Value::as_str) else {
+                return LocalAction::None;
+            };
+            let previous = params.get("previous").and_then(Value::as_str);
+            if previous.is_none() && crate::picker::current().is_some() {
+                return LocalAction::AskLeave(target.to_string());
             }
+            let Some(previous) = crate::picker::Previous::parse(previous) else {
+                return LocalAction::None; // unknown spelling: the renderer closed; ignore
+            };
+            crate::picker::request_switch(target, previous);
+            ipc::append_frame(sock_write_buf, Tag::Detach, b"");
             LocalAction::None
         }
         "render.scroll_opt" => {
@@ -1551,6 +1578,16 @@ fn client_loop(
                                         }
                                     }
                                     Err(e) => util::log_write("warn", &format!("session list failed: {e}")),
+                                }
+                            }
+                            LocalAction::AskLeave(target) => {
+                                if let (Some(p), Some(leaving)) =
+                                    (palette.as_mut(), crate::picker::current())
+                                {
+                                    p.open(
+                                        &format!("switch to {target}"),
+                                        crate::picker::leave_commands(&target, &leaving),
+                                    );
                                 }
                             }
                             LocalAction::None => {}
@@ -2515,19 +2552,34 @@ mod tests {
         assert_eq!(buf, ipc::encode_frame(Tag::Detach, b""));
     }
 
-    /// FDR 0016: `session.switch` records the target for the front door's
-    /// re-attach loop and detaches (the same wire frame as `app.detach`);
-    /// `session.list` is routed to the call site, which holds the renderer.
+    /// FDR 0016: `session.switch` with a `previous` records the switch for
+    /// the front door's re-attach loop and detaches (the same wire frame as
+    /// `app.detach`); without one, from inside a session, it asks the leave
+    /// question instead. `session.list` is routed to the call site, which
+    /// holds the renderer.
     #[test]
     fn dispatch_session_switch_records_target_and_detaches() {
         let _g = crate::picker::switch_test_guard();
+        crate::picker::set_current(":here");
         let mut buf = Vec::new();
         assert!(matches!(
             dispatch_local_action("session.switch", &json!({ "target": ":dev" }), &mut buf),
+            LocalAction::AskLeave(t) if t == ":dev"
+        ));
+        assert!(buf.is_empty(), "asking sends nothing to the daemon");
+        assert!(matches!(
+            dispatch_local_action(
+                "session.switch",
+                &json!({ "target": ":dev", "previous": "kill" }),
+                &mut buf
+            ),
             LocalAction::None
         ));
         assert_eq!(buf, ipc::encode_frame(Tag::Detach, b""));
-        assert_eq!(crate::picker::take_switch().as_deref(), Some(":dev"));
+        assert_eq!(
+            crate::picker::take_switch(),
+            Some(crate::picker::Switch { target: ":dev".into(), previous: crate::picker::Previous::Kill })
+        );
         let mut buf = Vec::new();
         assert!(matches!(
             dispatch_local_action("session.list", &json!({}), &mut buf),
