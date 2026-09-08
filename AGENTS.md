@@ -383,7 +383,10 @@ read-only, `debug` group):
   stale-daemon verdict), its remote endpoint's build (REMOTE), and its
   agent / M2 session channel counts (CHANNELS); on a host SERVING other
   machines' agents the same table has a `served` row per mux peer, read
-  from `agent/mux-<id>.status.sock` (connect → one line → EOF). `posh mux
+  from `agent/mux-<id>.status.sock` (connect → one line → EOF); the key
+  under the table is an RFC 0003 §6.1 `footer` on the header record (mesa
+  ≥ purse-first 7b0fc8b; an older mesa ignores it, and on a pipe the lines
+  print verbatim after the rows, untabbed). `posh mux
   ls --raw` prints the verbatim one-liners (`self=` / `remote=` /
   `session_channels=` / the congestion summary) — the grep shape the soak
   recipes use. `posh list` is sessions only (the old appended mux / peer /

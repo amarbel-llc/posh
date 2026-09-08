@@ -292,7 +292,9 @@ Local persistence over Unix sockets.
 	channels / M2 session channels riding the wire — a zero session
 	count while named-session attaches ran means every one fell
 	back to its own per-connection transport, or was a bare-host
-	shell, which never rides the mux), REFS, and LINGER.
+	shell, which never rides the mux), REFS, and LINGER. A key
+	under the table (dim on a terminal; plain trailing lines on a
+	pipe) restates what SELF, REMOTE, and CHANNELS mean.
 	*--raw* prints each daemon's verbatim status one-liner instead
 	(every field, including the congestion summary: cwnd, cuts,
 	deepest backoff streak) — the daily health check for the

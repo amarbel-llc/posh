@@ -186,9 +186,19 @@ fn heard_cell(v: &str) -> String {
     }
 }
 
-/// The header record: columns, the STATUS-dot legend, and the empty-table
-/// message. SELF/REMOTE/PEER are `flex` and shrink in that order (lowest
-/// `shrink` first); the counts are `pin`.
+/// The key under the table (RFC 0003 §6.1 `footer`): what the columns a
+/// reader cannot guess mean. Rendered dim on a tty, verbatim on a pipe
+/// (after the rows, untabbed); an older `mesa` ignores it.
+const FOOTER: [&str; 2] = [
+    "SELF: the build the long-lived daemon actually runs (an upgrade on disk does not change it; \
+     blank = a pre-self-ident daemon)",
+    "REMOTE: the endpoint's build (unknown before RFC 0013, or mid-reconnect) \u{b7} \
+     CHANNELS: agent/session \u{b7} --raw: the full status lines",
+];
+
+/// The header record: columns, the STATUS-dot legend, the key, and the
+/// empty-table message. SELF/REMOTE/PEER are `flex` and shrink in that
+/// order (lowest `shrink` first); the counts are `pin`.
 fn header() -> Value {
     json!({
         "columns": [
@@ -209,6 +219,7 @@ fn header() -> Value {
             {"sev": Health::Stale.sev(), "glyph": "\u{25cf}", "label": Health::Stale.label()},
             {"sev": Health::OldGeneration.sev(), "glyph": "\u{25cf}", "label": Health::OldGeneration.label()},
         ],
+        "footer": FOOTER,
         "empty": EMPTY,
     })
 }
@@ -312,6 +323,11 @@ mod tests {
         assert_eq!(records[0]["empty"], EMPTY);
         assert_eq!(records[0]["columns"].as_array().unwrap().len(), 11);
         assert_eq!(records[0]["legend"].as_array().unwrap().len(), 3);
+        // The key rides the header as §6.1 footer lines (bare strings =
+        // muted prose), one per FOOTER entry.
+        let footer = records[0]["footer"].as_array().unwrap();
+        assert_eq!(footer.len(), FOOTER.len());
+        assert!(footer[0].as_str().unwrap().starts_with("SELF:"));
     }
 
     #[test]
