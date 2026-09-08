@@ -25,7 +25,7 @@ use crate::remote::predict::{
     self, PredictionModel, PredictionRenderer, Predictor, RenderStyle,
 };
 use crate::remote::scrollview::{self, MouseFilter};
-use crate::remote::stats::{FrameKind, PredictSample, Stats};
+use crate::remote::stats::{FrameKind, PaintSample, PredictSample, Stats};
 use crate::remote::sync::{
     self, ClientMessage, FragmentAssembly, Fragmenter, FrameBody, InputOutbox, ScrollbackRing,
     ServerFrame, HEARTBEAT_INTERVAL,
@@ -55,6 +55,13 @@ const ESCAPE_PASS_KEY: u8 = b'^';
 /// wedged): the degraded escape prefix, where Ctrl-^ . still quits.
 const PALETTE_FALLBACK_HELP: &str =
     "command palette unavailable — \".\" quits, \"^\" gives literal Ctrl-^";
+
+/// The in-flight half of one time-to-paint sample: when the keystroke's bytes
+/// were read off stdin, and how long the predictor took over them.
+struct PaintPending {
+    key_at: Instant,
+    predict_us: u64,
+}
 
 /// Rebuild the predictor/renderer for `next` in place and force a clean repaint
 /// so stale predicted cells clear; banners the new model. Backs the palette's
@@ -360,6 +367,7 @@ fn dump_client_state(st: &ClientState, now: u64) {
         codec: st.framesync.label(),
         title: st.server_term.title().to_string(),
         apply: st.stats.apply_snapshot(),
+        paint: st.stats.paint_snapshot(),
         link: st.stats.link_snapshot(),
         server_late: st.notify.server_late(now),
         server_diag: st.last_server_diag,
@@ -584,6 +592,7 @@ fn predict_debug_summary(st: &ClientState) -> String {
     let mut out = format!(
         "{}\necho model: {}{}\nrender: show={} style={} (the model advises; the renderer decides) \
          last paint: painted={} marked={} held={} cursor={} step_skipped={}\n\
+         time-to-paint (keystroke read → tty write, this process): {}\n\
          slow-link escalation: {} (srtt {:.0}ms; escalate >{}ms held {}s, recover <{}ms held {}s)\n\
          outcomes: correct={} nocredit={} incorrect={} \
          resets={} epoch_lag={} advised_cells={} srtt_trigger={}",
@@ -597,6 +606,7 @@ fn predict_debug_summary(st: &ClientState) -> String {
         st.last_render.held_cells,
         st.last_render.cursor_painted as u8,
         st.last_render.step_skipped as u8,
+        st.stats.paint_snapshot().format(),
         match (ci.control.governing, ci.control.escalated) {
             (false, _) => "off (model pinned, or POSH_ECHO_ESCALATE=0)",
             (true, false) => "armed (adaptive)",
@@ -1282,6 +1292,10 @@ struct ClientState {
     applier: Box<dyn FrameApplier>,
     /// Optional performance instrumentation (POSH_DEBUG_LOG); inert when unset.
     stats: Stats,
+    /// A keystroke the predictor was fed this iteration, awaiting its paint:
+    /// the local-echo time-to-paint gauge (FDR 0006). Set by
+    /// `process_user_input`, consumed by `render_to` in the same iteration.
+    paint_pending: Option<PaintPending>,
     /// The command-palette overlay renderer (Ctrl-^ p), spawned lazily on first
     /// summon and kept resident; `None` until then or if it can't be launched.
     palette: Option<Palette>,
@@ -1438,6 +1452,7 @@ fn client_loop(
         framesync,
         applier,
         stats,
+        paint_pending: None,
         palette: None,
         last_reack: None,
         forensic_captured: false,
@@ -1640,6 +1655,10 @@ fn drive_client(st: &mut ClientState, raw: &RawMode, port: u16) -> Result<i32> {
         // Keystrokes -> quit sequence / prediction / reliable input stream.
         if fds[0].revents & libc::POLLIN != 0 {
             let mut buf = [0u8; 4096];
+            // The time-to-paint clock starts here: the earliest point after
+            // poll woke for the keystroke (the kernel's queueing delay before
+            // that is invisible from userspace).
+            let key_at = Instant::now();
             match util::read_fd(STDIN, &mut buf) {
                 Ok(0) => {
                     // EOF on the local tty: ask the server to wind down.
@@ -1647,7 +1666,7 @@ fn drive_client(st: &mut ClientState, raw: &RawMode, port: u16) -> Result<i32> {
                     send_now = true;
                 }
                 Ok(n) => {
-                    if process_user_input(st, &buf[..n]) {
+                    if process_user_input(st, &buf[..n], key_at) {
                         send_now = true;
                     }
                 }
@@ -2036,8 +2055,10 @@ fn optimistic_echo_on(st: &ClientState) -> bool {
 
 /// Feeds user bytes through the Ctrl-^ quit-sequence state machine, the
 /// prediction engine, and into the reliable input stream. Returns true when
-/// anything needs sending.
-fn process_user_input(st: &mut ClientState, buf: &[u8]) -> bool {
+/// anything needs sending. `key_at` is when the bytes were read; if any of
+/// them reach the predictor it becomes the start of this iteration's
+/// time-to-paint sample.
+fn process_user_input(st: &mut ClientState, buf: &[u8], key_at: Instant) -> bool {
     let now = now_ms();
     let mut dirty = false;
 
@@ -2132,11 +2153,19 @@ fn process_user_input(st: &mut ClientState, buf: &[u8]) -> bool {
     // ignore this. The compose path re-asserts the same gate before rendering.
     st.predict.set_echo_safe(optimistic_echo_on(st));
 
-    let push = |st: &mut ClientState, byte: u8| {
+    // Time-to-paint (FDR 0006): the predictor's share of this read, summed
+    // over every byte it is fed, and whether it was fed at all — a paste or
+    // a palette-only read arms no sample.
+    let mut predict_us = 0u64;
+    let mut predicted = false;
+    let push = |st: &mut ClientState, predict_us: &mut u64, predicted: &mut bool, byte: u8| {
         if !paste {
+            let t = Instant::now();
             st.predict.set_frame_sent(st.outbox.end_offset());
             let fb = live_fb.as_ref().unwrap_or(&st.last_drawn);
             st.predict.on_user_byte(byte, fb, now);
+            *predict_us += t.elapsed().as_micros() as u64;
+            *predicted = true;
         }
         st.outbox.push(&[byte]);
     };
@@ -2154,12 +2183,12 @@ fn process_user_input(st: &mut ClientState, buf: &[u8]) -> bool {
                 }
                 ESCAPE_KEY | ESCAPE_PASS_KEY => {
                     // Ctrl-^ twice (or Ctrl-^ ^) sends a literal Ctrl-^.
-                    push(st, ESCAPE_KEY);
+                    push(st, &mut predict_us, &mut predicted, ESCAPE_KEY);
                 }
                 other => {
                     // Anything else is sent literally, escape key included.
-                    push(st, ESCAPE_KEY);
-                    push(st, other);
+                    push(st, &mut predict_us, &mut predicted, ESCAPE_KEY);
+                    push(st, &mut predict_us, &mut predicted, other);
                 }
             }
             if st.notify.message() == PALETTE_FALLBACK_HELP {
@@ -2187,8 +2216,11 @@ fn process_user_input(st: &mut ClientState, buf: &[u8]) -> bool {
             st.initialized = false;
         }
 
-        push(st, byte);
+        push(st, &mut predict_us, &mut predicted, byte);
         dirty = true;
+    }
+    if predicted {
+        st.paint_pending = Some(PaintPending { key_at, predict_us });
     }
     // If this read queued input, timestamp the resulting outbox offset for the
     // input-latency gauge (drained in process_frame when input_ack covers it).
@@ -2816,10 +2848,18 @@ fn render_to<S: TtySink>(st: &mut ClientState, now: u64, sink: &mut S) {
     } else {
         compose_frame(st, now)
     };
+    // Time-to-paint (FDR 0006): a keystroke the predictor was fed this
+    // iteration closes its sample here. It counts as a paint only when the
+    // compose that followed it put a predicted cell (or cursor) on the tty;
+    // an empty or prediction-free paint is the `unpainted` complement.
+    let pending = st.paint_pending.take();
+    let predicted_visible = !bytes.is_empty()
+        && (st.last_render.painted_cells > 0 || st.last_render.cursor_painted);
     if bytes.is_empty() {
         st.stats.record_render_skip();
     } else {
         st.stats.record_render(bytes.len());
+        let write_at = Instant::now();
         match sink.write_budget(&bytes) {
             Ok(n) if n == bytes.len() => {
                 // #wedge (#83): the model generation now actually on the tty.
@@ -2829,6 +2869,17 @@ fn render_to<S: TtySink>(st: &mut ClientState, now: u64, sink: &mut S) {
             // mid-paint: either way the tty diverged from last_drawn. Resync.
             _ => st.initialized = false,
         }
+        if let Some(p) = pending.as_ref().filter(|_| predicted_visible) {
+            st.stats.record_paint(PaintSample {
+                total_us: p.key_at.elapsed().as_micros() as u64,
+                predict_us: p.predict_us,
+                compose_us: st.stats.last_compose_us(),
+                write_us: write_at.elapsed().as_micros() as u64,
+            });
+        }
+    }
+    if pending.is_some() && !predicted_visible {
+        st.stats.record_paint_unpainted();
     }
 }
 
@@ -2879,8 +2930,9 @@ fn compose_frame(st: &mut ClientState, now: u64) -> Vec<u8> {
 
     // Time the actual render compute (snapshot + prediction/banner overlay +
     // diff), excluding the idle fast-path above so the average reflects real
-    // work. enabled() is read and dropped before the borrows below.
-    let compose_timer = st.stats.instrument().then(Instant::now);
+    // work. enabled() is read and dropped before the borrows below. A pending
+    // time-to-paint sample needs this compose's cost whatever the log state.
+    let compose_timer = (st.stats.instrument() || st.paint_pending.is_some()).then(Instant::now);
     // Optimistic echo gate (FDR 0006): when echo is unsafe (password prompt /
     // full-screen app) the optimistic model drops its pending overlay so the
     // authoritative paint stands; other models ignore this.
@@ -3463,7 +3515,7 @@ mod tests {
         assert!(st.wedge_seen, "latch set on first FLAG_WEDGE");
         assert_eq!(st.notify.message(), WEDGE_BANNER);
         // A keystroke dismisses the banner; the latch stays (still stalled).
-        let _ = process_user_input(&mut st, b"x");
+        let _ = process_user_input(&mut st, b"x", Instant::now());
         assert_eq!(st.notify.message(), "", "keystroke dismisses the banner");
         assert!(st.wedge_seen, "latch persists across a dismissal mid-episode");
         // Same flag still set on later frames: no re-raise mid-episode.
@@ -4371,6 +4423,7 @@ mod tests {
             framesync: framesync::FrameSync::DumpDiff,
             applier: Box::new(framesync::DumpDiff),
             stats: Stats::new(),
+            paint_pending: None,
             palette: None,
             last_reack: None,
             forensic_captured: false,
@@ -4725,6 +4778,60 @@ mod tests {
             compose_frame(&mut st, 20).is_empty(),
             "and the tick after it is idle again"
         );
+    }
+
+    /// A paint destination that accepts everything, for the gauge tests.
+    struct SwallowSink;
+
+    impl TtySink for SwallowSink {
+        fn write_budget(&mut self, bytes: &[u8]) -> std::io::Result<usize> {
+            Ok(bytes.len())
+        }
+    }
+
+    /// FDR 0006 time-to-paint: a keystroke the predictor paints closes a
+    /// sample (with every phase filled) on the same iteration's render; one
+    /// it does not paint counts as `unpainted`; a paste arms nothing. The
+    /// gauge is on without POSH_DEBUG_LOG (`Stats::new` here is disabled).
+    #[test]
+    fn keystroke_to_paint_is_measured_per_iteration() {
+        let mut st = test_state(6, 40);
+        st.echo_on = true; // the safety gate is open
+        let (p, r) = predict::build(PredictionModel::Always, RenderStyle::Replace, false);
+        st.predict = p;
+        st.renderer = r;
+        st.predict_model = PredictionModel::Always;
+        assert!(!st.stats.enabled(), "the gauge must not depend on the log");
+
+        // A printable key: `always` predicts it, the compose paints it.
+        assert!(process_user_input(&mut st, b"h", Instant::now()));
+        assert!(st.paint_pending.is_some(), "the read armed a sample");
+        render_to(&mut st, 0, &mut SwallowSink);
+        assert!(st.paint_pending.is_none(), "the render consumed it");
+        let paint = st.stats.paint_snapshot();
+        assert_eq!(paint.count, 1, "one painted keystroke: {}", paint.format());
+        assert_eq!(paint.unpainted, 0);
+        assert!(paint.last.total_us >= paint.last.write_us);
+        assert!(paint.last.compose_us > 0, "compose was timed for the sample");
+        assert_eq!(paint.buckets.iter().sum::<u64>(), 1);
+
+        // A paste (>100 bytes) resets the predictor and arms nothing.
+        let paste = vec![b'x'; 101];
+        assert!(process_user_input(&mut st, &paste, Instant::now()));
+        assert!(st.paint_pending.is_none(), "a paste is not a predicted keystroke");
+        render_to(&mut st, 1, &mut SwallowSink);
+        assert_eq!(st.stats.paint_snapshot().count, 1);
+
+        // `never` records nothing, so its keystroke is an unpainted one.
+        let (p, r) = predict::build(PredictionModel::Never, RenderStyle::Replace, false);
+        st.predict = p;
+        st.renderer = r;
+        st.initialized = false; // force a compose so the verdict is fresh
+        assert!(process_user_input(&mut st, b"i", Instant::now()));
+        render_to(&mut st, 2, &mut SwallowSink);
+        let paint = st.stats.paint_snapshot();
+        assert_eq!(paint.count, 1);
+        assert_eq!(paint.unpainted, 1, "{}", paint.format());
     }
 
     /// A lossy in-memory paint destination for driving the real `render_to`.

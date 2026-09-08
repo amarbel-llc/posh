@@ -204,6 +204,50 @@ universally by the client (RFC 0007 §5.1: no model renders while the remote
 PTY has ECHO off or the alt-screen is up), since the mosh hold no longer
 masks a password prompt's first keystroke.
 
+## Measuring the hot path (2026-09-08)
+
+"Echo feels sluggish" has two halves: the round trip (the transport's `srtt`,
+the log's `input_ms`) and the client's own keystroke→paint path, which runs
+entirely inside one event-loop iteration — stdin read, `on_user_byte`,
+compose (`Snapshot::from_term`, `cull`, the overlay render, the `new_frame`
+diff), tty write. Before this the second half was invisible: `compose_us` was
+log-gated and said nothing about which keystroke it belonged to. Two
+instruments now cover it:
+
+- **The live `time-to-paint` gauge**, always on (a few `Instant::now`s per
+  keystroke). A read that feeds the predictor arms a sample; the iteration's
+  render closes it when the compose put a predicted cell (or cursor) on the
+  tty, recording total / predict / compose / write microseconds, or counts
+  it `unpainted` otherwise (`never`, a control key, a tentative hold under
+  `POSH_PREDICTION_SHOW=advised`, the safety gate). Cumulative count / avg /
+  max, the phase averages, the last sample, and a bucketed distribution
+  (<100 µs … ≥20 ms) show in the palette's *Show echo prediction stats*
+  and the SIGUSR2 dump's `paint(...)` group; the `[stats]` line carries a
+  windowed `paint_us=avg/max paints=N unpainted=N`. `total − (predict +
+  compose + write)` is the iteration's other work (frame receive, agent
+  traffic) that sat between the key and its paint.
+- **The offline probe**, `just debug-perf-echo`: the same phases per
+  predictor model at steady-state typing in release, on 24×80 and 50×212.
+  `never` is the floor every model pays (compose + diff); a model's
+  `predict` column is its own cost above it.
+
+The budget the numbers are read against: a local terminal paints a keystroke
+in well under a millisecond, so anything in the ≥1 ms buckets on an idle
+client is the hot path's own problem, not the link's.
+
+First probe run (2026-09-08, release, one dev box; relative figures):
+
+| screen | predict (`always`) | compose | `new_frame` diff | per key |
+|---|---|---|---|---|
+| 24×80 | 2.6 µs | 14 µs | 333 µs | 350 µs |
+| 50×212 | 10 µs | 89 µs | 1 842 µs | 1 941 µs |
+
+The prediction models are not the cost — every model, the GP species
+included, sits within ~20 µs of `never`. The `new_frame` diff is: ~95 % of
+the per-key time, scaling with the whole grid to emit a ~40-byte paint. That
+is the optimization target (tracked as posh#191), and the live gauge's
+`compose` phase (which includes the diff) is where a fix shows up.
+
 ## Tuning Levers
 
 | Lever | Current | Rationale | Change signal |

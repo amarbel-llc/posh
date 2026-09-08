@@ -535,6 +535,18 @@ debug-agent-e2e:
 debug-perf-compose:
     nix develop --command cargo test -p posh --release remote::perf_probe -- --ignored --nocapture
 
+# Local-echo hot path (FDR 0006): per predictor, what one keystroke costs from
+# on_user_byte through the compose to the tty diff, at steady-state typing, in
+# release. The offline half of the client's `time-to-paint` gauge (palette
+# "Show echo prediction stats" / SIGUSR2 `paint(...)` / `[stats] paint_us=`),
+# which adds the tty write and the loop's other work. `never` is the floor
+# every model pays; compare a model's `predict` column against it.
+#
+# time one keystroke's local-echo predict + compose + diff per predictor, in release
+[group("debug")]
+debug-perf-echo:
+    nix develop --command cargo test -p posh --release remote::perf_probe::perf_echo -- --ignored --nocapture
+
 # Loaded-mux measurement (posh#143/#144, RFC 0011 §9.2/§9.3): N synthetic
 # sessions + bulk agent channels over the real transport through an
 # in-process impairment relay (delay/loss/bottleneck-queue), printing the

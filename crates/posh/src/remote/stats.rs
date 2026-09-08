@@ -119,6 +119,16 @@ pub struct Stats {
     input_count: u64,
     input_ms_max: u64,
 
+    // Local-echo time-to-paint (FDR 0006 hot path): keystroke read -> the
+    // predicted cell written to the tty, all inside one event-loop iteration.
+    // Always on (a few `Instant::now`s per keystroke) so the number is there
+    // when echo feels sluggish, without arming the log. Cumulative, with a
+    // per-flush window for the `[stats]` line.
+    paint: PaintLatency,
+    paint_win_us_total: u64,
+    paint_win_count: u64,
+    paint_win_us_max: u64,
+
     // Server framing economics.
     /// Sum of full-dump bytes over frames that had a diff option (whether or
     /// not the diff was chosen) — the denominator for `diff_saved_pct`.
@@ -187,6 +197,103 @@ pub struct PredictSample {
     pub nocredit_unknown: u64,
     pub nocredit_blank: u64,
     pub nocredit_matched: u64,
+}
+
+/// One keystroke's time-to-paint, split by phase (µs): `predict` is the
+/// predictor's `on_user_byte` walk over the read's bytes, `compose` the
+/// snapshot + overlay + diff that produced the escape stream, `write` the tty
+/// write itself, and `total` the whole span from the stdin read to the write's
+/// return — so `total - (predict + compose + write)` is the iteration's other
+/// work (frame receive, agent traffic) that sat between the key and its paint.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub struct PaintSample {
+    pub total_us: u64,
+    pub predict_us: u64,
+    pub compose_us: u64,
+    pub write_us: u64,
+}
+
+/// Upper edges (µs) of the time-to-paint distribution buckets; the last bucket
+/// is open-ended. Sub-millisecond resolution at the low end, where a healthy
+/// hot path lives; the ≥20 ms tail is a frame's worth of lag.
+pub const PAINT_BUCKET_EDGES_US: [u64; 8] = [100, 250, 500, 1_000, 2_000, 5_000, 10_000, 20_000];
+
+/// The cumulative time-to-paint record: count/avg/max, the phase sums, the
+/// last sample, the keystrokes that produced no local paint at all, and the
+/// bucketed distribution. `Copy` so the dump and the palette read a snapshot.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub struct PaintLatency {
+    pub count: u64,
+    pub total_us: u64,
+    pub max_us: u64,
+    pub predict_us: u64,
+    pub compose_us: u64,
+    pub write_us: u64,
+    pub last: PaintSample,
+    /// Keystrokes fed to the predictor whose iteration painted no predicted
+    /// cell: the `never` model, a control key, a tentative hold under
+    /// `POSH_PREDICTION_SHOW=advised`, or the echo-safety gate. Not a latency
+    /// — the complement that says how often the hot path had nothing to show.
+    pub unpainted: u64,
+    pub buckets: [u64; PAINT_BUCKET_EDGES_US.len() + 1],
+}
+
+impl PaintLatency {
+    fn record(&mut self, s: PaintSample) {
+        self.count += 1;
+        self.total_us += s.total_us;
+        self.max_us = self.max_us.max(s.total_us);
+        self.predict_us += s.predict_us;
+        self.compose_us += s.compose_us;
+        self.write_us += s.write_us;
+        self.last = s;
+        let idx = PAINT_BUCKET_EDGES_US
+            .iter()
+            .position(|&edge| s.total_us < edge)
+            .unwrap_or(PAINT_BUCKET_EDGES_US.len());
+        self.buckets[idx] += 1;
+    }
+
+    pub fn avg_us(&self) -> u64 {
+        self.total_us.checked_div(self.count).unwrap_or(0)
+    }
+
+    /// Per-phase cumulative averages (µs): (predict, compose, write).
+    pub fn phase_avg_us(&self) -> (u64, u64, u64) {
+        let n = self.count;
+        (
+            self.predict_us.checked_div(n).unwrap_or(0),
+            self.compose_us.checked_div(n).unwrap_or(0),
+            self.write_us.checked_div(n).unwrap_or(0),
+        )
+    }
+
+    /// The one-line rendering shared by the SIGUSR2 dump and the echo-stats
+    /// dialog: `paint(n=… last=…us avg=…us max=…us predict=…us compose=…us
+    /// write=…us unpainted=… dist=<100:… … ≥20000:…)`. The phase figures are
+    /// averages; the distribution counts every painted keystroke.
+    pub fn format(&self) -> String {
+        let (p, c, w) = self.phase_avg_us();
+        let mut dist = String::new();
+        for (i, n) in self.buckets.iter().enumerate() {
+            if i > 0 {
+                dist.push(' ');
+            }
+            match PAINT_BUCKET_EDGES_US.get(i) {
+                Some(edge) => dist.push_str(&format!("<{edge}:{n}")),
+                None => dist.push_str(&format!("≥{}:{n}", PAINT_BUCKET_EDGES_US[i - 1])),
+            }
+        }
+        format!(
+            "paint(n={} last={}us avg={}us max={}us predict={p}us compose={c}us write={w}us \
+             unpainted={} dist={dist})",
+            self.count,
+            self.last.total_us,
+            self.avg_us(),
+            self.max_us,
+            self.unpainted,
+        )
+    }
 }
 
 /// Wire-body kind of a received frame, recorded at the apply gate so the dump
@@ -554,6 +661,26 @@ impl Stats {
         self.input_ms_max = self.input_ms_max.max(ms);
     }
 
+    /// Client: one keystroke's local-echo time-to-paint (FDR 0006 hot path).
+    /// Unconditional — the gauge is meant to be readable the moment echo
+    /// feels slow, so it never waits for `POSH_DEBUG_LOG`.
+    pub fn record_paint(&mut self, sample: PaintSample) {
+        self.paint.record(sample);
+        self.paint_win_us_total += sample.total_us;
+        self.paint_win_count += 1;
+        self.paint_win_us_max = self.paint_win_us_max.max(sample.total_us);
+        self.dirty = true;
+    }
+    /// Client: a keystroke the predictor saw whose iteration painted no
+    /// predicted cell (see [`PaintLatency::unpainted`]).
+    pub fn record_paint_unpainted(&mut self) {
+        self.paint.unpainted += 1;
+    }
+    /// The cumulative time-to-paint record, for the dump and the palette.
+    pub fn paint_snapshot(&self) -> PaintLatency {
+        self.paint
+    }
+
     /// One event-loop iteration: `idle_us` blocked in poll, `busy_us` doing
     /// work. Cheap accumulation; the caller gates the `Instant`s on `enabled()`.
     /// Does not mark `dirty` — the loop spins constantly, so loop stats ride out
@@ -627,6 +754,10 @@ impl Stats {
         self.compose_us_total.checked_div(self.compose_count).unwrap_or(0)
     }
 
+    fn avg_paint_win_us(&self) -> u64 {
+        self.paint_win_us_total.checked_div(self.paint_win_count).unwrap_or(0)
+    }
+
     // --- flushing ------------------------------------------------------------
 
     /// Whether a periodic flush is due: enabled, something changed, and at
@@ -663,6 +794,9 @@ impl Stats {
         self.input_ms_total = 0;
         self.input_count = 0;
         self.input_ms_max = 0;
+        self.paint_win_us_total = 0;
+        self.paint_win_count = 0;
+        self.paint_win_us_max = 0;
     }
 
     /// Share of the window spent doing work vs blocked in poll, as a whole
@@ -737,7 +871,7 @@ impl Stats {
                  correct={} nocredit={} incorrect={} srtt_trig={} \
                  nocredit_by(unk={} blank={} matched={}) \
                  render writes={} bytes_out={} skipped_idle={} \
-                 apply_us={}/{} compose_us={}/{} input_ms={}/{} \
+                 apply_us={}/{} compose_us={}/{} input_ms={}/{} paint_us={}/{} paints={} unpainted={} \
                  loop iters={} busy={}us idle={}us busy_pct={}% max_iter_us={} \
                  apply(adv={} stale={} dup={} basemis={} base_history={} reack={} nochange={}) sb_rx={}",
                 self.frames_total,
@@ -765,6 +899,10 @@ impl Stats {
                 self.compose_us_max,
                 self.avg_input_ms(),
                 self.input_ms_max,
+                self.avg_paint_win_us(),
+                self.paint_win_us_max,
+                self.paint_win_count,
+                self.paint.unpainted,
                 self.loop_iters,
                 self.loop_busy_us,
                 self.loop_idle_us,
@@ -1039,6 +1177,53 @@ mod tests {
     }
 
     #[test]
+    fn paint_latency_buckets_phases_and_window() {
+        // Always on: a default (disabled) collector still records.
+        let mut s = Stats::default();
+        s.record_paint(PaintSample {
+            total_us: 99,
+            predict_us: 10,
+            compose_us: 60,
+            write_us: 20,
+        });
+        s.record_paint(PaintSample {
+            total_us: 100, // exactly an edge lands in the NEXT bucket
+            predict_us: 30,
+            compose_us: 40,
+            write_us: 20,
+        });
+        s.record_paint(PaintSample {
+            total_us: 25_000, // past the last edge: the open tail
+            ..Default::default()
+        });
+        s.record_paint_unpainted();
+        let p = s.paint_snapshot();
+        assert_eq!(p.count, 3);
+        assert_eq!(p.max_us, 25_000);
+        assert_eq!(p.avg_us(), (99 + 100 + 25_000) / 3);
+        assert_eq!(p.phase_avg_us(), (40 / 3, 100 / 3, 40 / 3));
+        assert_eq!(p.last.total_us, 25_000);
+        assert_eq!(p.unpainted, 1);
+        assert_eq!(p.buckets[0], 1, "<100");
+        assert_eq!(p.buckets[1], 1, "<250");
+        assert_eq!(p.buckets[8], 1, "≥20000");
+        let line = p.format();
+        for key in [
+            "paint(n=3 last=25000us",
+            "max=25000us",
+            "unpainted=1",
+            "dist=<100:1 <250:1 <500:0 <1000:0 <2000:0 <5000:0 <10000:0 <20000:0 ≥20000:1)",
+        ] {
+            assert!(line.contains(key), "missing {key:?} in {line}");
+        }
+        // The window resets on flush; the cumulative record does not.
+        s.mark_flushed(1000, 0, 0);
+        assert_eq!(s.avg_paint_win_us(), 0);
+        assert_eq!(s.paint_win_count, 0);
+        assert_eq!(s.paint_snapshot().count, 3);
+    }
+
+    #[test]
     fn human_rate_units() {
         assert_eq!(human_rate(512.0), "512B/s");
         assert_eq!(human_rate(2048.0), "2.0KB/s");
@@ -1064,6 +1249,17 @@ mod tests {
         c.record_compose_us(60);
         c.record_input_ms(12);
         c.record_input_ms(34); // keystroke latency: avg 23, max 34
+        c.record_paint(PaintSample {
+            total_us: 300,
+            predict_us: 20,
+            compose_us: 200,
+            write_us: 50,
+        });
+        c.record_paint(PaintSample {
+            total_us: 500,
+            ..Default::default()
+        }); // time-to-paint: avg 400, max 500
+        c.record_paint_unpainted();
         c.record_loop_iter(100, 900); // 100us busy, 900us idle => 10% busy
         c.emit_client(
             "client",
@@ -1099,6 +1295,7 @@ mod tests {
             "apply_us=60/80", // windowed avg / max
             "compose_us=60/60",
             "input_ms=23/34",
+            "paint_us=400/500 paints=2 unpainted=1",
             "loop iters=1 busy=100us idle=900us busy_pct=10% max_iter_us=100",
             "apply(adv=0 stale=0 dup=0 basemis=0 base_history=0 reack=0 nochange=0) sb_rx=0",
         ] {

@@ -284,6 +284,14 @@ the `eng-*(7)` manpages — read them with `man eng-versioning`,
   screen-side gauge shown as `last paint:` in the echo stats, distinct from
   the model's advice-side `PredictorStats`. `set_echo_safe` is a default
   no-op hint (optimistic drops its overlay eagerly). Further seams: posh#174.
+  **The hot path is measured, always on:** a stdin read that feeds the
+  predictor arms `ClientState::paint_pending`; the same iteration's
+  `render_to` closes it as a `PaintSample` (total / predict / compose /
+  write µs) when a predicted cell reached the tty, else `unpainted`
+  (`Stats::record_paint*`, `PaintLatency`). Read it as `time-to-paint:` in
+  the echo stats dialog, `paint(...)` in the SIGUSR2 dump, `paint_us=` in
+  the `[stats]` line; `just debug-perf-echo` is the offline per-model probe
+  (`never` = the compose+diff floor every model pays).
 - **A lossy client keeps its recent diff bases (posh#189, `POSH_BASE_HISTORY`,
   default on):** the session daemon anchors every unacked frame for a lossy
   (relay / mux-bridge) client at the last frame it saw ACKED and emits one

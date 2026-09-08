@@ -111,6 +111,10 @@ pub struct ClientState {
     /// Client apply-path histogram + last received frame (#wedge): a climbing
     /// `basemis` with a frozen `term_gen` is the apply-stall fingerprint.
     pub apply: crate::remote::stats::ApplySnapshot,
+    /// Local-echo time-to-paint (FDR 0006): keystroke read → predicted cell on
+    /// the tty, by phase, with its distribution — the in-process half of
+    /// "echo feels sluggish" (the network half is `srtt` / `input_ms`).
+    pub paint: crate::remote::stats::PaintLatency,
     /// Transport-liveness gauges (#false-disconnect): the frame-arrival timing
     /// behind the "Last contact" banner. A nonzero `frame_gaps_late` with a
     /// healthy `retransmits` and steady `heartbeats_rx` means the banner tripped
@@ -138,7 +142,7 @@ impl ClientState {
              send_interval={}ms bytes_rx={} bytes_tx={} predict(active={} shown={} epoch_lag={}) \
              term_gen={} rows={} cols={} echo_on={} codec={} title={:?} \
              apply(adv={} stale={} dup={} basemis={} base_history={} bsum_mis={} reack={} nochange={} sb_rx={}) \
-             last_rx(num={} base={} body={}) srv={} \
+             last_rx(num={} base={} body={}) {} srv={} \
              link(late={} gap_max={}ms late_gaps={} rx_total={} heartbeats={} retransmits={})",
             std::process::id(),
             crate::remote::introspect::render_client_line(&self.client),
@@ -175,6 +179,7 @@ impl ClientState {
             self.apply.last_rx_num,
             self.apply.last_rx_base,
             self.apply.last_rx_body.as_str(),
+            self.paint.format(),
             fmt_server_diag(self.server_diag.as_ref()),
             self.server_late as u8,
             self.link.frame_gap_ms_max,
@@ -498,6 +503,13 @@ mod tests {
                 last_rx_body: crate::remote::stats::FrameKind::Diff,
                 ..Default::default()
             },
+            paint: crate::remote::stats::PaintLatency {
+                count: 2,
+                total_us: 800,
+                max_us: 600,
+                unpainted: 1,
+                ..Default::default()
+            },
             server_diag: Some(crate::remote::caps::ServerDiag {
                 current_num: 43,
                 acked_num: 41,
@@ -545,6 +557,7 @@ mod tests {
             "title=\"user@host: ~/work\"",
             "apply(adv=0 stale=0 dup=0 basemis=7 base_history=0 bsum_mis=0 reack=0 nochange=0 sb_rx=0)",
             "last_rx(num=41 base=40 body=diff)",
+            "paint(n=2 last=0us avg=400us max=600us predict=0us compose=0us write=0us unpainted=1 dist=",
             // `agent=off` is the forwarding-disabled rendering; see
             // `client_format_renders_the_agent_counters` for the live shape.
             "srv=(pid=4242 num=43 acked=41 gen=90 out=2 pty=1 agent=off)",
@@ -585,6 +598,7 @@ mod tests {
             codec: "dumpdiff",
             title: String::new(),
             apply: crate::remote::stats::ApplySnapshot::default(),
+            paint: crate::remote::stats::PaintLatency::default(),
             link: crate::remote::stats::LinkSnapshot::default(),
             server_late: false,
             server_diag: None,
@@ -637,6 +651,7 @@ mod tests {
             codec: "dumpdiff",
             title: String::new(),
             apply: crate::remote::stats::ApplySnapshot::default(),
+            paint: crate::remote::stats::PaintLatency::default(),
             link: crate::remote::stats::LinkSnapshot::default(),
             server_late: false,
             server_diag: None,

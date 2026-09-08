@@ -96,6 +96,87 @@ fn perf_reparse_and_from_term() {
     }
 }
 
+/// The FDR 0006 local-echo hot path, per predictor: what ONE keystroke costs
+/// from `on_user_byte` to the escape stream the tty would get, at steady-state
+/// typing on a fast link (the server echoes and acks each byte before the next
+/// key, a new prompt line every 60 keys). The phases mirror the live
+/// `time-to-paint` gauge's split — `predict` (`on_user_byte`), `compose`
+/// (`Snapshot::from_term` + `cull` + the overlay render), and the `new_frame`
+/// diff — minus the tty write, which only the live gauge can see. `never`
+/// is the floor: the compose + diff every model pays whether or not it
+/// predicts; a model's `predict` figure is its own cost above that.
+#[test]
+#[ignore = "perf probe; run via `just debug-perf-echo` (--ignored --nocapture)"]
+fn perf_echo_time_to_paint() {
+    use crate::remote::predict::{self, PredictionModel, RenderStyle};
+    const MODELS: [PredictionModel; 7] = [
+        PredictionModel::Never,
+        PredictionModel::Always,
+        PredictionModel::Adaptive,
+        PredictionModel::Experimental,
+        PredictionModel::Optimistic,
+        PredictionModel::Controller,
+        PredictionModel::FromScratch,
+    ];
+    const WARMUP: u32 = 50;
+    const ITERS: u32 = 2000;
+    let text = b"echo hello world ";
+    for &(rows, cols) in &[(24u16, 80u16), (50, 212)] {
+        for model in MODELS {
+            let (mut predictor, renderer) = predict::build(model, RenderStyle::Replace, false);
+            let mut term = build_screen(rows, cols);
+            // A prompt on the last row, cursor after it: where typing lands.
+            term.process(format!("\x1b[{rows};1H\x1b[2K$ ").as_bytes());
+            let mut last_drawn = Snapshot::from_term(&term);
+            let (mut predict_ns, mut compose_ns, mut diff_ns) = (0u128, 0u128, 0u128);
+            let mut paint_bytes = 0usize;
+            let mut offset = 0u64;
+            let mut now = 0u64;
+            for i in 0..(WARMUP + ITERS) {
+                let b = text[i as usize % text.len()];
+                now += 30;
+                offset += 1;
+                let t0 = Instant::now();
+                predictor.set_frame_sent(offset);
+                predictor.on_user_byte(b, &last_drawn, now);
+                let t1 = Instant::now();
+                let base = Snapshot::from_term(&term);
+                predictor.cull(&base, now);
+                let mut next = base;
+                black_box(predictor.render(&mut next, &*renderer));
+                let t2 = Instant::now();
+                let bytes = display::new_frame_opt(true, &last_drawn, &next, false, false, true);
+                let t3 = Instant::now();
+                last_drawn = next;
+                if i >= WARMUP {
+                    predict_ns += (t1 - t0).as_nanos();
+                    compose_ns += (t2 - t1).as_nanos();
+                    diff_ns += (t3 - t2).as_nanos();
+                    paint_bytes += bytes.len();
+                }
+                // The server echoes the byte and acks before the next key; a
+                // fresh prompt line keeps the typing on-screen.
+                term.process(&[b]);
+                if i % 60 == 59 {
+                    term.process(b"\r\n$ ");
+                }
+                predictor.on_server_frame(offset, offset, 30);
+            }
+            let per = |ns: u128| ns as f64 / ITERS as f64 / 1000.0;
+            eprintln!(
+                "[perf] {rows}x{cols}  model={:<12} predict={:.1}us  compose={:.1}us  \
+                 diff={:.1}us  per-key≈{:.1}us  paint≈{}B",
+                model.name(),
+                per(predict_ns),
+                per(compose_ns),
+                per(diff_ns),
+                per(predict_ns + compose_ns + diff_ns),
+                paint_bytes / ITERS as usize,
+            );
+        }
+    }
+}
+
 /// The #15 win, measured: MorphDelta's incremental apply (`process(escapes)` on
 /// an existing model that is already at state a) vs DumpDiff's full-dump reparse
 /// of state b, on the same workloads. The morph delta is a realistic per-frame

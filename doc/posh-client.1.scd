@@ -53,7 +53,10 @@ by the next keystroke.
 	heartbeats, the largest inter-arrival gap and how many gaps crossed the
 	banner threshold, and SRTT/RTO/send-interval — for diagnosing a *disconnect*
 	that a healthy link should not have reported), show echo prediction stats (the local-echo outcome
-	gauges plus, for the evolved GP models, the live evolution state — RFC
+	gauges; the keystroke→paint latency of the local-echo hot path — how many
+	keystrokes were painted locally, the last/average/worst microseconds from
+	the stdin read to the tty write, the predict/compose/write split, how many
+	keystrokes painted nothing, and a bucketed distribution — plus, for the evolved GP models, the live evolution state — RFC
 	0007: generations, population and fitness-window sizes, the champion's
 	rank/size and whether it or the adaptive shadow is displayed, and the
 	champion hyphence-doc record under
@@ -162,7 +165,10 @@ _POSH_DEBUG_LOG_
 	compute timing as _avg/max_ microseconds (full-dump re-parse
 	_apply_us_ and render _compose_us_; the max is the worst single frame
 	in the interval), keystroke→consumed input latency (_input_ms_, the
-	lag you feel), and event-loop timing (_loop iters=… busy=…us idle=…us
+	lag you feel), the local-echo time-to-paint (_paint_us_ avg/max
+	microseconds from the stdin read to the predicted cell's tty write,
+	_paints_ in the interval, and the cumulative _unpainted_ keystrokes
+	that produced no local paint), and event-loop timing (_loop iters=… busy=…us idle=…us
 	busy_pct=…% max_iter_us=…_, the stall / busy-CPU view) — plus _#wedge_
 	breadcrumbs and a final line on exit. All timings are windowed per
 	interval. Rotated at 5 MB. The on-demand *SIGUSR2* state dump
@@ -203,7 +209,12 @@ _POSH_WEDGE_WATCHDOG_
 	sink: peer (server) address, last-send age, applied frame number,
 	input-outbox base and pending bytes, accumulated scrollback depth,
 	smoothed RTT/RTO and send interval, byte counters, prediction gauges,
-	terminal size, and the remote echo state. A trailing _link=_ group carries
+	terminal size, and the remote echo state. A _paint=_ group carries the
+	local-echo time-to-paint record — painted keystrokes, the last/average/
+	worst microseconds from the stdin read to the tty write, the
+	predict/compose/write phase averages, the unpainted keystroke count, and
+	a bucketed distribution — the in-process half of a sluggish echo (the
+	network half is _srtt_ and the log's _input_ms_). A trailing _link=_ group carries
 	the transport-liveness view behind the "Last contact" banner — whether the
 	banner is showing (_late_), the largest frame inter-arrival gap
 	(_gap_max_), how many gaps crossed the banner threshold (_late_gaps_), the
