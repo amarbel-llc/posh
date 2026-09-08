@@ -522,10 +522,10 @@ complete -c posh -n "__fish_seen_subcommand_from completions" -a 'bash zsh fish'
 # single-model relay), agent (FDR 0014 agent-only mux remote).
 complete -c posh -n "__fish_seen_subcommand_from server" -a 'new relay agent' -d 'Server verb'
 
-complete -c posh -n "__fish_seen_subcommand_from mux" -a ls -d 'List endpoint status lines'
+complete -c posh -n "__fish_seen_subcommand_from mux" -a ls -d 'Mux endpoint table (--raw: status lines)'
 complete -c posh -n "__fish_seen_subcommand_from list" -l short -d 'Short output'
 complete -c posh -n "__fish_seen_subcommand_from list" -l json -s j -d 'JSON output'
-complete -c posh -n "__fish_seen_subcommand_from list" -l watch -s w -d 'Live-refresh the unified view'
+complete -c posh -n "__fish_seen_subcommand_from list" -l watch -s w -d 'Live-refresh the session table'
 complete -c posh -n "__fish_seen_subcommand_from list" -l interval -d 'Watch refresh seconds' -r
 complete -c posh -n "__fish_seen_subcommand_from history" -l vt -d 'VT escape stream output'
 "#;

@@ -377,14 +377,18 @@ read-only, `debug` group):
   no longer needs `/proc` spelunking: the palette's *About / transport info*
   shows the connected server's build + uptime (always) and its live state
   (fetched on demand while the dialog's 10 s request window is armed);
-  `posh mux ls` shows each daemon's own build (`self=` — a long-lived
-  daemon keeps running pre-upgrade code; a line without `self=` IS the
-  stale-daemon verdict), its remote endpoint's build (`remote=`), and its
-  live M2 session-channel count (`session_channels=`); and on a
-  host SERVING other machines' agents, `posh ls` lists each mux peer's
-  status line read from `agent/mux-<id>.status.sock` (connect → one line →
-  EOF). All additive caps (ids 13/14) — an old peer on either side just
-  reads `unknown`.
+  `posh mux ls` is a mesa table (`remote/mux_ls.rs`, rows parsed from the
+  daemons' status one-liners) showing each daemon's own build (SELF — a
+  long-lived daemon keeps running pre-upgrade code; a blank SELF IS the
+  stale-daemon verdict), its remote endpoint's build (REMOTE), and its
+  agent / M2 session channel counts (CHANNELS); on a host SERVING other
+  machines' agents the same table has a `served` row per mux peer, read
+  from `agent/mux-<id>.status.sock` (connect → one line → EOF). `posh mux
+  ls --raw` prints the verbatim one-liners (`self=` / `remote=` /
+  `session_channels=` / the congestion summary) — the grep shape the soak
+  recipes use. `posh list` is sessions only (the old appended mux / peer /
+  remote sections are gone). All additive caps (ids 13/14) — an old peer on
+  either side just reads `unknown`.
 - **Client introspection (RFC 0014)** — the reverse direction: every client
   sends `CAP_CLIENT_IDENT`/`CAP_CLIENT_STATE` (ids 16/17, unsolicited) — its
   build and its FDR 0006 echo model / control (auto, auto-escalated,
@@ -403,10 +407,10 @@ read-only, `debug` group):
   the same response on `<base>/remote/<pid>.status.sock` and in its SIGUSR2
   dump; the M2 bridge forwards like the relay; `posh ls` condenses each
   session's first client line into an ECHO column (`optimistic
-  auto-escalated 412ms`, `unknown`, `-`; `echo_summary`) and appends a
-  "remote N: activity=… echo=…" section for the `remote/` sockets (dead-pid
-  leftovers reaped); `posh status remote-<pid>` / `posh status <pid>`
-  reads an Arch-A server directly. NOT covered: §5 UPSTREAM (dead until
+  auto-escalated 412ms`, `unknown`, `-`; `echo_summary`);
+  `posh status remote-<pid>` / `posh status <pid>` reads an Arch-A
+  server's `remote/` socket directly (the listing no longer enumerates
+  them). NOT covered: §5 UPSTREAM (dead until
   FDR 0012 or a nesting-guard change).
 - `just debug-posh-mux-silence-repro <host>` — drive the posh#161 sequence
   deterministically: SIGSTOP the local mux daemon past the remote's 15 s

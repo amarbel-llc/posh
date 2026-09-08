@@ -181,23 +181,10 @@ fn run_once() -> Result<()> {
             if watch {
                 return cmd_list_watch(&group, interval);
             }
-            session::cmd_list(&Config::new(&group)?, format)?;
-            // The #158 unified view: mux endpoints under the session table,
-            // interactive default only — the machine formats (--short is
-            // the completion source, --json the stable shape) and piped
-            // default stay session-only for their existing parsers.
-            if format == ListFormat::Default && util::is_tty(libc::STDOUT_FILENO) {
-                if let Some(section) = mux_section() {
-                    print!("{section}");
-                }
-                if let Some(section) = endpoint_section() {
-                    print!("{section}");
-                }
-                if let Some(section) = remote_section() {
-                    print!("{section}");
-                }
-            }
-            Ok(())
+            // Sessions only: the mux endpoints have their own table
+            // (`posh mux ls`), so the listing is the same shape on a
+            // terminal and on a pipe.
+            session::cmd_list(&Config::new(&group)?, format)
         }
         // `posh status [session]` (RFC 0014 §4.3): the session's status
         // socket — daemon build, gates, and every attached client's echo
@@ -1579,44 +1566,8 @@ fn parse_list_args(args: &[String]) -> Result<(ListFormat, bool, u64)> {
     Ok((format, watch, interval))
 }
 
-/// The #158 mux half of the unified listing: the `posh mux ls` lines,
-/// prefixed with a separating blank line — `None` when there is nothing to
-/// show. An unreadable mux dir degrades to a note rather than failing the
-/// session listing.
-fn mux_section() -> Option<String> {
-    match remote::mux::mux_ls() {
-        Ok(s) if s == remote::mux::MUX_LS_EMPTY => None,
-        Ok(s) => Some(format!("\n{s}")),
-        Err(e) => Some(format!("\nmux endpoints unavailable: {e}\n")),
-    }
-}
-
-/// The RFC 0013 §4 half of the unified listing: mux-peer status sockets
-/// under this host's `agent/` dir — the endpoints serving OTHER client
-/// hosts' forwarded agents into this machine. `None` when there are none;
-/// a probe failure degrades to a note like the mux section.
-fn endpoint_section() -> Option<String> {
-    match remote::mux::endpoint_status_ls() {
-        Ok(s) if s == remote::mux::ENDPOINT_LS_EMPTY => None,
-        Ok(s) => Some(format!("\n{s}")),
-        Err(e) => Some(format!("\nremote endpoints unavailable: {e}\n")),
-    }
-}
-
-/// The RFC 0014 §4.3 remote half of the unified listing: Architecture-A
-/// roaming servers' status sockets under `remote/` — sessions this host
-/// serves directly (no daemon), condensed to activity + echo. `None` when
-/// there are none; a probe failure degrades to a note like the others.
-fn remote_section() -> Option<String> {
-    match session::remote_status_ls() {
-        Ok(s) if s == session::REMOTE_LS_EMPTY => None,
-        Ok(s) => Some(format!("\n{s}")),
-        Err(e) => Some(format!("\nremote sessions unavailable: {e}\n")),
-    }
-}
-
-/// `posh list --watch [--interval N]` (#125/#158): the unified listing —
-/// session table + mux endpoints — re-rendered on an interval in the
+/// `posh list --watch [--interval N]` (#125): the session table re-rendered
+/// on an interval in the
 /// alternate screen (the FDR 0002 terminfo-aware smcup/rmcup pair). `q` or
 /// Ctrl-C quits, `r` refreshes immediately; a resize is picked up on the
 /// next render (the table reads the width each pass). Cbreak, not raw:
@@ -1641,15 +1592,6 @@ fn list_watch_loop(cfg: &Config, interval_secs: u64) -> Result<()> {
         // screen exactly as they would to a fresh terminal.
         print!("\x1b[2J\x1b[H");
         session::cmd_list(cfg, ListFormat::Default)?;
-        if let Some(section) = mux_section() {
-            print!("{section}");
-        }
-        if let Some(section) = endpoint_section() {
-            print!("{section}");
-        }
-        if let Some(section) = remote_section() {
-            print!("{section}");
-        }
         print!("\n[watch: q quit, r refresh, every {interval_secs}s]");
         std::io::stdout().flush().ok();
 
@@ -1688,10 +1630,19 @@ fn list_watch_loop(cfg: &Config, interval_secs: u64) -> Result<()> {
 fn cmd_mux(args: &[String]) -> Result<()> {
     match args.first().map(String::as_str) {
         Some("ls" | "list" | "l") => {
-            print!("{}", remote::mux::mux_ls()?);
-            Ok(())
+            // `--raw`: the daemons' verbatim status one-liners (every field,
+            // greppable) — the soak / triage shape. Default: the mesa table
+            // over both the endpoints this host dials and the peers it
+            // serves (RFC 0013 §4).
+            if args.iter().any(|a| a == "--raw") {
+                print!("{}", remote::mux::mux_ls()?);
+                print!("{}", remote::mux::endpoint_status_ls()?);
+                Ok(())
+            } else {
+                remote::mux_ls::render()
+            }
         }
-        _ => Err(Error::from("usage: posh mux ls")),
+        _ => Err(Error::from("usage: posh mux ls [--raw]")),
     }
 }
 
@@ -1805,14 +1756,13 @@ SESSION COMMANDS (local persistence)
     list [--short] [-j|--json] [-w|--watch [--interval N]]  (aliases: ls, l)
         List sessions in the group: name, pid, attached client count.
         A styled status table on a terminal; plain tab-separated lines
-        when piped. On a terminal, live mux endpoints (see: mux ls)
-        render beneath the table — the unified \"what is posh doing\"
-        view. --short prints names only; --json prints a
+        when piped (mux endpoints have their own table: mux ls).
+        --short prints names only; --json prints a
         machine-readable array; --complete prints `name<TAB>summary`
         lines (the RFC 0013 activity label, else the launch command) for
         shell completion — the `ph` fish completion renders the summary
         as each candidate's description. All three stay session-only for
-        scripts. --watch re-renders the unified view every N seconds
+        scripts. --watch re-renders the table every N seconds
         (default 2) in the alternate screen: q quits, r refreshes
         immediately. `list host:` renders a remote host's sessions
         through the same table (names host-prefixed so rows paste back as
@@ -1862,12 +1812,16 @@ SESSION COMMANDS (local persistence)
     completions <shell>                        (alias: c)
         Print the completion script for bash, zsh, or fish.
 
-    mux ls
-        One status line per live per-destination mux endpoint (state, peer,
-        last-heard age, channels, refs, linger, congestion) — the
-        $POSH_MUX_SESSIONS soak health check. Sockets whose daemon died
-        without unlinking are flagged stale; a pre-upgrade daemon still
-        serving is labeled old-generation.
+    mux ls [--raw]
+        The mux endpoints on this host as a table: the per-destination
+        daemons this host dials (role client — their own build, the
+        remote's build, state, peer, last-heard age, agent/session channel
+        counts, refs, linger) and the peers it serves for other machines'
+        agents (role served). A status dot marks live, stale (the daemon
+        died without unlinking), and old-generation (a pre-upgrade daemon
+        still serving). --raw prints each daemon's verbatim status
+        one-liner instead (every field, including congestion) — the
+        $POSH_MUX_SESSIONS soak health check and grep target.
 
 REMOTE COMMANDS (roaming over encrypted UDP)
     server [new] [-p PORT[:PORT2]] [-4|-6] [-- command...]

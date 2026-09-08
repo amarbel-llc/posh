@@ -191,23 +191,16 @@ Local persistence over Unix sockets.
 	the working directory and command of each session, and an ECHO
 	column condensing the first attached client's echo model, control,
 	and rtt from the session's status socket (see *status*; empty for a
-	daemon that predates RFC 0014), followed by a "remote" section listing
-	each roaming server this host serves directly (no daemon) with its
-	activity and echo summary, and
-	by any live per-destination mux endpoints (the *mux ls* lines)
-	and, on a host that SERVES other machines' forwarded agents, one
-	status line per mux-peer status socket (build, peer, heard age,
-	channel counts, _agent/sock_ ownership — RFC 0013 §4) —
-	the unified "what is posh doing on this machine" view; when
-	piped it is plain tab-separated lines, unchanged for scripts,
-	with no mux section. *--short* prints names only; *--json*
+	daemon that predates RFC 0014); when
+	piped it is plain tab-separated lines, unchanged for scripts. The
+	mux endpoints have their own table, *mux ls*. *--short* prints names only; *--json*
 	prints a machine-readable array; *--complete* prints
 	_name_<TAB>_summary_ lines (the RFC 0013 §5 activity label,
 	else the launch command) for shell completion — the *ph* fish
 	completion renders the summary as each candidate's description.
 	All three stay session-only (scripts and the completion probe
 	parse them). *--watch*
-	re-renders the unified view every _N_ seconds (*--interval*,
+	re-renders the table every _N_ seconds (*--interval*,
 	default 2) in the alternate screen: *q* (or Ctrl-C) quits, *r*
 	refreshes immediately; a resize is picked up on the next
 	render. *posh list* _host_*:* lists sessions on a remote host
@@ -278,29 +271,35 @@ Local persistence over Unix sockets.
 	(session names for *attach* and the bare target position,
 	remote _host_*:* sessions, ssh hosts) without manual sourcing.
 
-*mux* *ls*
-	One status line per live per-destination mux endpoint: the
-	daemon's own build (_self=version (sha)_ — the code the
-	long-lived daemon actually runs, which a binary upgrade on disk
-	does not change; absent on a pre-self-ident daemon, which is
-	itself the "stale daemon" verdict), state (_connected_, or
-	_reconnecting_ while the daemon re-establishes a wire it has
-	judged dead), peer address, the remote endpoint's
-	build (_remote=version (sha)_, learned over the heartbeat
-	identity exchange — _unknown_ against a pre-RFC-0013 remote,
-	and again during a reconnect, when the held identity is
-	discarded until the new wire answers), last-heard age, agent
-	channel count, the count of M2 session
-	channels riding the wire (_session_channels=_ — zero here while
-	named-session attaches ran means every one fell back to its own
-	per-connection transport, or was a bare-host shell, which never
-	rides the mux), session refs, linger state, and the
-	congestion summary (cwnd, cuts, deepest backoff streak). The daily health check
-	for the _$POSH_MUX_SESSIONS_ default-on rollout. Probing rides the observer path — no
+*mux* *ls* [*--raw*]
+	The mux endpoints on this host as a table (the same styled
+	*mesa* table as *list*; plain tab-separated lines when piped),
+	one row per per-destination daemon this host dials (ROLE
+	_client_) and one per mux-peer status socket it serves for
+	another machine's forwarded agents (ROLE _served_, RFC 0013 §4).
+	The STATUS dot is the probe verdict — _live_; _stale_, a socket
+	whose daemon died without unlinking; _old-generation_, a
+	pre-upgrade daemon still serving its old protocol generation —
+	and the columns are STATE (_connected_, or _reconnecting_ while
+	the daemon re-establishes a wire it has judged dead; _serving_
+	for a served peer), SELF (the build the long-lived daemon
+	actually runs, which a binary upgrade on disk does not change;
+	blank on a pre-self-ident daemon, which is itself the "stale
+	daemon" verdict), REMOTE (the remote endpoint's build, learned
+	over the heartbeat identity exchange — _unknown_ against a
+	pre-RFC-0013 remote, and again during a reconnect until the new
+	wire answers), PEER, HEARD (last-heard age), CHANNELS (agent
+	channels / M2 session channels riding the wire — a zero session
+	count while named-session attaches ran means every one fell
+	back to its own per-connection transport, or was a bare-host
+	shell, which never rides the mux), REFS, and LINGER.
+	*--raw* prints each daemon's verbatim status one-liner instead
+	(every field, including the congestion summary: cwnd, cuts,
+	deepest backoff streak) — the daily health check for the
+	_$POSH_MUX_SESSIONS_ default-on rollout and the grep target for
+	a soak. Probing rides the observer path — no
 	session ref is taken and the endpoint's linger clock is
-	untouched. A socket whose daemon died without unlinking is
-	flagged _stale_; a pre-upgrade daemon still serving its old
-	protocol generation is labeled _old-generation_. The complement
+	untouched. The complement
 	is the fallback breadcrumb: every "falling back to a
 	per-invocation connection" warning is also written to the debug
 	log (tag _mux-fallback_) when a sink is armed, so a soak's

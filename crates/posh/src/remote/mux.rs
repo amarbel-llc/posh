@@ -2466,8 +2466,8 @@ fn hello_handshake(
 const LS_STATUS_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(2);
 
 /// What [`mux_ls`] returns when no endpoint sockets exist — exported so the
-/// unified `posh list` view (#158) can suppress its mux section without
-/// string-matching a copy of this text.
+/// `mux ls` table (`remote::mux_ls`) can tell "no endpoints" from a
+/// listing without string-matching a copy of this text.
 pub const MUX_LS_EMPTY: &str = "no mux endpoints\n";
 
 /// The #156 soak instrument: one status line per endpoint socket under the
@@ -2551,15 +2551,16 @@ fn live_endpoint_dests_in(dir: &Path) -> Result<Vec<String>> {
 const ENDPOINT_STATUS_TIMEOUT: std::time::Duration = std::time::Duration::from_millis(200);
 
 /// What [`endpoint_status_ls`] returns when no status sockets exist —
-/// exported like [`MUX_LS_EMPTY`] so the unified `posh list` view can
-/// suppress its remote-endpoints section without string-matching a copy.
+/// exported like [`MUX_LS_EMPTY`] so the `mux ls` table can skip it
+/// without string-matching a copy.
 pub const ENDPOINT_LS_EMPTY: &str = "no remote endpoints\n";
 
 /// RFC 0013 §4 — the SERVER-host counterpart of [`mux_ls`]: one line per
 /// mux-peer status socket under this host's `agent/` dir (the endpoints
 /// serving OTHER client hosts' agents into this machine), each read
 /// connect → EOF. Answers "is the endpoint from host X alive, and how
-/// stale" locally, without touching the wire.
+/// stale" locally, without touching the wire. The `served` rows of the
+/// `mux ls` table and the second half of `mux ls --raw`.
 pub fn endpoint_status_ls() -> Result<String> {
     endpoint_status_ls_in(&crate::session::socket_base_from_env().join("agent"))
 }

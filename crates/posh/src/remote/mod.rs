@@ -51,6 +51,9 @@ pub mod kittykeys;
 /// the hardened `<base>/mux/` socket dir, and the client id
 /// (docs/plans/2026-07-28-connection-mux-endpoint-design.md).
 pub mod mux;
+/// `posh mux ls` as a mesa table: the endpoints this host dials and the
+/// peers it serves, parsed from the daemons' status one-liners.
+pub mod mux_ls;
 /// The command-palette overlay renderer subprocess driver (RFC 0005) and the
 /// `composite_palette` compositor. Shared by both this crate's roaming client
 /// (`remote::client`) and the local session frame client (`session::client`) so

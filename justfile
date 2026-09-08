@@ -1491,7 +1491,7 @@ debug-posh-mux-repro-stop host="":
     echo "stopped"
 
 # Read the LOCAL per-destination mux daemons' state (posh#161 triage): the
-# `posh mux ls` status lines, each daemon socket's owning pid, and each
+# `posh mux ls --raw` status lines, each daemon socket's owning pid, and each
 # daemon's always-on log — where the new ref-lifecycle (+ipc-ref/-conn-drop),
 # wire-recv-error, and SIGUSR2 status lines land. Read-only. NOTE: on a
 # healthy IDLE M1 connection the remote sends nothing unprompted, so a large
@@ -1506,8 +1506,8 @@ debug-posh-mux-log lines="40":
     uid="$(id -u)"
     base="${POSH_DIR:-${XDG_RUNTIME_DIR:-/run/user/$uid}/posh}"
     dir="$base/mux"
-    echo "== posh mux ls =="
-    posh mux ls || true
+    echo "== posh mux ls --raw =="
+    posh mux ls --raw || true
     echo
     echo "== daemon sockets -> pids =="
     found=0
@@ -1807,7 +1807,22 @@ debug-posh-list-table:
 # this host serving, on what build" — the isolated-table twin is
 # debug-posh-list-table.
 #
-# print the real host's posh list (mux + remote-endpoints sections) headlessly
+# Render this host's REAL `posh mux ls` table with the locally built binary
+# under a fake tty (so mesa styles it), then the `--raw` lines it was parsed
+# from — the dev-loop for the mux table's columns (remote/mux_ls.rs).
+#
+# render the locally built posh mux ls table (+ --raw) under a fake TTY
+[group("debug")]
+debug-posh-mux-table:
+    #!/usr/bin/env bash
+    set -euo pipefail
+    cd '{{ justfile_directory() }}'
+    nix develop --command cargo build -q -p posh
+    script -qec "$PWD/target/debug/posh mux ls" /dev/null
+    echo "== --raw =="
+    "$PWD/target/debug/posh" mux ls --raw
+
+# print the real host's posh list table headlessly (a fake tty, so it styles)
 [group("debug")]
 debug-posh-ls:
     script -qec "posh list" /dev/null

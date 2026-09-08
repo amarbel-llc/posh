@@ -161,7 +161,12 @@ pub(super) fn render(
     home: Option<&str>,
     socket_dir: &Path,
 ) -> Result<()> {
-    let ndjson = build_ndjson(sessions, current, home, socket_dir);
+    pipe(&build_ndjson(sessions, current, home, socket_dir))
+}
+
+/// Pipes a complete RFC 0003 NDJSON stream to `mesa` — the one child-process
+/// seam every posh table (`list`, `mux ls`) renders through.
+pub(crate) fn pipe(ndjson: &str) -> Result<()> {
     let mut child = Command::new("mesa")
         .stdin(Stdio::piped())
         .stdout(Stdio::inherit())
@@ -170,7 +175,7 @@ pub(super) fn render(
         .map_err(|e| {
             if e.kind() == std::io::ErrorKind::NotFound {
                 Error::Msg(
-                    "mesa binary not found on PATH: posh list renders through mesa \
+                    "mesa binary not found on PATH: posh's tables render through mesa \
                      (purse-first); the nix package wraps it onto PATH, so a manual \
                      build needs it available too"
                         .to_string(),
