@@ -868,7 +868,19 @@ impl NotificationEngine {
 /// ([`NotificationEngine::apply`]) and the scrollback indicator
 /// ([`apply_scroll_indicator`]).
 fn draw_top_bar(fb: &mut Snapshot, text: &str) {
-    if fb.cursor_row == 0 {
+    draw_bar_row(fb, 0, text);
+}
+
+/// Draws `text` as a bold reverse-video bar across row `row` of `fb` (the
+/// top-bar treatment on any row; the client's live debug banner stacks
+/// these under the connection banner), hiding the cursor when it sits on
+/// that row and truncating at the right edge. A row past the screen is a
+/// no-op.
+pub fn draw_bar_row(fb: &mut Snapshot, row: usize, text: &str) {
+    if row >= fb.cells.len() {
+        return;
+    }
+    if usize::from(fb.cursor_row) == row {
         fb.cursor_visible = false;
     }
     let bar_style = Style {
@@ -876,13 +888,13 @@ fn draw_top_bar(fb: &mut Snapshot, text: &str) {
         bold: true,
         ..Style::default()
     };
-    for cell in fb.cells[0].iter_mut() {
+    for cell in fb.cells[row].iter_mut() {
         *cell = Cell {
             style: bar_style,
             ..blank_cell()
         };
     }
-    fb.wrapped[0] = false;
+    fb.wrapped[row] = false;
 
     let mut col: u16 = 0;
     for ch in text.chars() {
@@ -893,14 +905,14 @@ fn draw_top_bar(fb: &mut Snapshot, text: &str) {
         if col + u16::from(w) > fb.cols {
             break;
         }
-        fb.cells[0][col as usize] = Cell {
+        fb.cells[row][col as usize] = Cell {
             ch,
             style: bar_style,
             width: w,
             ..Cell::default()
         };
         if w == 2 {
-            fb.cells[0][col as usize + 1] = Cell {
+            fb.cells[row][col as usize + 1] = Cell {
                 ch: '\0',
                 style: bar_style,
                 width: 0,

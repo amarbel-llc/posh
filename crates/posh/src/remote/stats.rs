@@ -103,6 +103,11 @@ pub struct Stats {
     last_loop_busy_us: u64,
     last_loop_idle_us: u64,
 
+    /// Every event-loop iteration, cumulative and unconditional (one
+    /// increment per turn, whatever the log state) — the live debug banner
+    /// derives its wake-ups-per-second from the delta.
+    loop_iters_total: u64,
+
     // Event-loop timing (windowed): per iteration, time blocked in poll (idle)
     // vs doing work (busy), the longest single busy stretch, and the iteration
     // count. Drives the busy% / stall / jitter view. Reset each flush.
@@ -679,6 +684,15 @@ impl Stats {
     /// The cumulative time-to-paint record, for the dump and the palette.
     pub fn paint_snapshot(&self) -> PaintLatency {
         self.paint
+    }
+
+    /// Client: count one event-loop turn (always on; a bare increment).
+    pub fn note_loop_iter(&mut self) {
+        self.loop_iters_total += 1;
+    }
+    /// Cumulative event-loop turns since start.
+    pub fn loop_iters_total(&self) -> u64 {
+        self.loop_iters_total
     }
 
     /// One event-loop iteration: `idle_us` blocked in poll, `busy_us` doing

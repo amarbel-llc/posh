@@ -81,6 +81,25 @@ A healthy-but-idle server whose client roamed away (peer forgotten after the
 60s timeout): `peer_active=0 remote=none` — the session is fine, waiting for the
 client to reappear from a new address.
 
+## Live debug banner (2026-09-09)
+
+The dump and the log are for after the fact; the palette's dialogs are a
+snapshot per keystroke. For watching a number *move* — the rtt as a link
+degrades, the time-to-paint while typing, the loop wake rate while the
+shimmer runs — the roaming client can keep a **live debug banner** up: one or
+two bold reverse-video rows, drawn under the connection banner (from row 0
+when that is down), rebuilt every 250 ms from the same in-process gauges:
+
+    posh dbg rtt 42ms rto 200ms iv 30ms heard 18ms  echo adaptive/lookalike  pred act=1 shown=1 ok=812 bad=3
+    paint 310us avg 296us max 1420us n=815 unp=12  loop 19/s  rx 1204 applied 1188 bh 3 late 0
+
+Segments pack greedily into rows of the terminal's width (two rows when the
+screen has six or more; a row is truncated at the right edge). Toggled by
+the palette's *Show / Hide live debug banner* (`debug.banner`, RFC 0005 §7,
+client-local) or started up with `POSH_DEBUG_BANNER=1`. While it is up the
+loop wakes at least every 250 ms and every compose composites it — a cost of
+the same order as the prediction timer, and only while enabled.
+
 ## Limitations
 
 - **Point-in-time, not a trail.** The dump is a single snapshot at signal time.

@@ -63,6 +63,122 @@ struct PaintPending {
     predict_us: u64,
 }
 
+/// How often the live debug banner's text is rebuilt (and the loop wakes
+/// for it). Fast enough to read a changing rtt or paint figure as live,
+/// slow enough that the compose it forces is negligible.
+const DEBUG_BANNER_REFRESH_MS: u64 = 250;
+
+/// The live debug banner's cached text and the loop-rate sample behind it.
+#[derive(Default)]
+struct DebugBanner {
+    lines: Vec<String>,
+    /// When `lines` is next rebuilt (ms).
+    next_at: u64,
+    /// (loop turns, ms) at the previous rebuild, for the wake-ups/s figure.
+    loop_mark: Option<(u64, u64)>,
+    loop_hz: u64,
+}
+
+/// `POSH_DEBUG_BANNER=1|on|true|yes` starts the client with the banner up.
+fn debug_banner_env() -> bool {
+    matches!(
+        std::env::var("POSH_DEBUG_BANNER").ok().as_deref(),
+        Some("1") | Some("on") | Some("true") | Some("yes")
+    )
+}
+
+/// The banner's segments, freshest values first: transport (srtt / rto /
+/// send interval, last-heard age), echo model + render style, prediction
+/// gauges, the time-to-paint record, the loop wake rate, and the frame /
+/// apply counters. Each is short enough to pack several per row.
+fn debug_banner_segments(st: &ClientState, now: u64) -> Vec<String> {
+    let ps = st.predict.stats();
+    let (correct, _, incorrect) = ps.outcomes;
+    let paint = st.stats.paint_snapshot();
+    let link = st.stats.link_snapshot();
+    let apply = st.stats.apply_snapshot();
+    vec![
+        format!(
+            "posh dbg rtt {:.0}ms rto {}ms iv {}ms heard {}ms",
+            st.wire.srtt(),
+            st.wire.rto(),
+            st.wire.send_interval(),
+            now.saturating_sub(st.last_heard)
+        ),
+        format!(
+            "echo {}{}/{}",
+            st.predict_model.name(),
+            if st.echo_escalation.escalated() { "(auto)" } else { "" },
+            st.predict_render.name()
+        ),
+        format!(
+            "pred act={} shown={} ok={} bad={}",
+            u8::from(ps.active),
+            ps.shown_cells,
+            correct,
+            incorrect
+        ),
+        format!(
+            "paint {}us avg {}us max {}us n={} unp={}",
+            paint.last.total_us,
+            paint.avg_us(),
+            paint.max_us,
+            paint.count,
+            paint.unpainted
+        ),
+        format!("loop {}/s", st.banner.loop_hz),
+        format!(
+            "rx {} applied {} bh {} late {}",
+            link.frames_total, st.applied_num, apply.base_history, link.frame_gaps_late
+        ),
+    ]
+}
+
+/// Packs the segments into at most `max_rows` rows of `cols` columns
+/// (greedy, two spaces between segments; a segment wider than a row is
+/// truncated by the draw).
+fn pack_banner_rows(segments: &[String], cols: usize, max_rows: usize) -> Vec<String> {
+    let mut rows: Vec<String> = Vec::new();
+    for seg in segments {
+        let fits = rows
+            .last()
+            .is_some_and(|row| row.chars().count() + 2 + seg.chars().count() <= cols);
+        if fits {
+            let row = rows.last_mut().expect("checked above");
+            row.push_str("  ");
+            row.push_str(seg);
+        } else if rows.len() < max_rows {
+            rows.push(seg.clone());
+        } else {
+            break;
+        }
+    }
+    rows
+}
+
+/// Rebuilds the banner text when its refresh is due (the loop-rate figure is
+/// the turn delta over the interval), then draws it as reverse-video rows
+/// under the connection banner — or from row 0 when that banner is down.
+fn apply_debug_banner(st: &mut ClientState, next: &mut Snapshot, now: u64) {
+    if now >= st.banner.next_at {
+        let turns = st.stats.loop_iters_total();
+        if let Some((t0, at)) = st.banner.loop_mark {
+            let dt = now.saturating_sub(at).max(1);
+            st.banner.loop_hz = turns.saturating_sub(t0) * 1000 / dt;
+        }
+        st.banner.loop_mark = Some((turns, now));
+        st.banner.next_at = now + DEBUG_BANNER_REFRESH_MS;
+        let max_rows = if st.rows >= 6 { 2 } else { 1 };
+        st.banner.lines =
+            pack_banner_rows(&debug_banner_segments(st, now), usize::from(st.cols), max_rows);
+    }
+    let top_bar = !st.notify.message().is_empty() || st.notify.server_late(now);
+    let first = usize::from(top_bar);
+    for (i, line) in st.banner.lines.iter().enumerate() {
+        display::draw_bar_row(next, first + i, line);
+    }
+}
+
 /// Rebuild the predictor/renderer for `next` in place and force a clean repaint
 /// so stale predicted cells clear; banners the new model. Backs the palette's
 /// `echo.set` action.
@@ -115,7 +231,15 @@ fn set_logging(st: &mut ClientState, enabled: bool, now: u64) {
 /// escape action lives here. The logging entries reflect the current state —
 /// client logging from this process, server logging from the last frame's
 /// FLAG_SERVER_LOG (`server_log_on`).
-fn palette_commands(server_log_on: bool, scroll_opt: bool) -> Value {
+fn palette_commands(server_log_on: bool, scroll_opt: bool, debug_banner: bool) -> Value {
+    // The live debug banner (FDR 0007): a reverse-video line or two under
+    // the connection banner with the transport / echo / time-to-paint gauges,
+    // refreshed every DEBUG_BANNER_REFRESH_MS while it is up.
+    let (banner_name, banner_enabled): (&str, bool) = if debug_banner {
+        ("Hide live debug banner", false)
+    } else {
+        ("Show live debug banner", true)
+    };
     // Imperative labels (the verb is the action): "on"/"off" read ambiguously as
     // status, so a user who saw "…: on" assumed it was already enabled.
     let (client_log_name, client_log_enabled): (&str, bool) = if util::log_active() {
@@ -153,6 +277,7 @@ fn palette_commands(server_log_on: bool, scroll_opt: bool) -> Value {
         { "name": client_log_name, "action": { "method": "logging.set", "params": { "enabled": client_log_enabled } } },
         { "name": server_log_name, "action": { "method": "logging.set", "params": { "scope": "server", "enabled": server_log_enabled } } },
         { "name": scroll_opt_name, "action": { "method": "render.scroll_opt", "params": { "enabled": scroll_opt_enabled } } },
+        { "name": banner_name, "action": { "method": "debug.banner", "params": { "enabled": banner_enabled } } },
         { "name": "Shell out (server)", "action": { "method": "shell.open" } },
         { "name": "Reset & resync (force redraw)", "action": { "method": "session.resync" } },
         { "name": "Dump wedge forensics", "action": { "method": "session.forensics" } },
@@ -195,7 +320,7 @@ fn open_palette(st: &mut ClientState) -> bool {
     if st.palette.is_none() {
         st.palette = Palette::spawn(st.rows, st.cols);
     }
-    let commands = palette_commands(st.server_log_on, st.scroll_opt);
+    let commands = palette_commands(st.server_log_on, st.scroll_opt, st.debug_banner);
     let title = palette_title(st.wire.srtt(), st.predict_model, st.echo_escalation.escalated());
     if let Some(p) = st.palette.as_mut() {
         // A persisted (spawned-then-closed) palette is not resized while closed,
@@ -715,6 +840,21 @@ fn dispatch_palette_action(
             }
             if let Some(en) = enabled {
                 set_logging(st, en, now); // client-local (default scope)
+            }
+            false
+        }
+        "debug.banner" => {
+            // FDR 0007: the live debug banner. Client-local; a full repaint
+            // so the rows it covered (or uncovers) redraw at once.
+            if let Some(en) = params.get("enabled").and_then(Value::as_bool) {
+                st.debug_banner = en;
+                st.banner = DebugBanner::default();
+                st.initialized = false;
+                st.notify.set_message(
+                    if en { "debug banner: on" } else { "debug banner: off" },
+                    false,
+                    now,
+                );
             }
             false
         }
@@ -1296,6 +1436,11 @@ struct ClientState {
     /// the local-echo time-to-paint gauge (FDR 0006). Set by
     /// `process_user_input`, consumed by `render_to` in the same iteration.
     paint_pending: Option<PaintPending>,
+    /// The live debug banner (FDR 0007): on via the palette or
+    /// `POSH_DEBUG_BANNER=1`; its text is rebuilt every
+    /// [`DEBUG_BANNER_REFRESH_MS`] and composited under the connection banner.
+    debug_banner: bool,
+    banner: DebugBanner,
     /// The command-palette overlay renderer (Ctrl-^ p), spawned lazily on first
     /// summon and kept resident; `None` until then or if it can't be launched.
     palette: Option<Palette>,
@@ -1453,6 +1598,8 @@ fn client_loop(
         applier,
         stats,
         paint_pending: None,
+        debug_banner: debug_banner_env(),
+        banner: DebugBanner::default(),
         palette: None,
         last_reack: None,
         forensic_captured: false,
@@ -1530,6 +1677,7 @@ fn drive_client(st: &mut ClientState, raw: &RawMode, port: u16) -> Result<i32> {
 
     let result: Result<i32> = 'client: loop {
         let iter_start = st.stats.instrument().then(Instant::now);
+        st.stats.note_loop_iter();
         let now = now_ms();
         let mut deadline = st.last_send + HEARTBEAT_INTERVAL;
         if !st.outbox.is_empty() || st.flags != 0 {
@@ -1542,6 +1690,9 @@ fn drive_client(st: &mut ClientState, raw: &RawMode, port: u16) -> Result<i32> {
             // Outstanding predictions need 50ms ticks for glitch detection —
             // and, under the look-alike style, to repaint the shimmer.
             deadline = deadline.min(now + 50);
+        }
+        if st.debug_banner {
+            deadline = deadline.min(st.banner.next_at.max(now));
         }
         if !heard {
             // Pre-contact: tick for the 250ms hint / connect timeout.
@@ -2900,7 +3051,8 @@ fn compose_frame(st: &mut ClientState, now: u64) -> Vec<u8> {
     let overlays_live = st.predict.active()
         || !st.notify.message().is_empty()
         || st.notify.server_late(now)
-        || palette_open;
+        || palette_open
+        || st.debug_banner;
     if st.initialized
         && model_state == st.last_render_state
         && !overlays_live
@@ -3004,6 +3156,9 @@ fn compose_frame(st: &mut ClientState, now: u64) -> Vec<u8> {
     }
     st.notify.adjust(now);
     st.notify.apply(&mut next, now);
+    if st.debug_banner {
+        apply_debug_banner(st, &mut next, now);
+    }
 
     let wheel = wheel_active(st);
     let bytes = display::new_frame_opt(
@@ -3812,7 +3967,7 @@ mod tests {
 
     #[test]
     fn palette_commands_includes_both_logging_scopes() {
-        let cmds = palette_commands(false, true);
+        let cmds = palette_commands(false, true, false);
         let arr = cmds.as_array().expect("commands is an array");
         let names: Vec<&str> = arr.iter().filter_map(|c| c["name"].as_str()).collect();
         assert!(
@@ -3857,7 +4012,7 @@ mod tests {
             names.iter().any(|n| n.contains("Disable scroll-region optimization")),
             "scroll-opt disable command missing: {names:?}"
         );
-        let off: Vec<String> = palette_commands(false, false)
+        let off: Vec<String> = palette_commands(false, false, true)
             .as_array()
             .unwrap()
             .iter()
@@ -3867,9 +4022,12 @@ mod tests {
             off.iter().any(|n| n == "Enable scroll-region optimization"),
             "scroll-opt enable command missing when off: {off:?}"
         );
+        // The live debug banner toggle reads its state too.
+        assert!(names.contains(&"Show live debug banner"), "{names:?}");
+        assert!(off.iter().any(|n| n == "Hide live debug banner"), "{off:?}");
         // FDR 0016: the switcher leads the list.
         assert_eq!(names.first().copied(), Some("Switch session…"), "{names:?}");
-        assert_eq!(arr.len(), 20, "expected 20 commands, got {names:?}");
+        assert_eq!(arr.len(), 21, "expected 21 commands, got {names:?}");
     }
 
     #[test]
@@ -4427,6 +4585,8 @@ mod tests {
             applier: Box::new(framesync::DumpDiff),
             stats: Stats::new(),
             paint_pending: None,
+            debug_banner: false,
+            banner: DebugBanner::default(),
             palette: None,
             last_reack: None,
             forensic_captured: false,
@@ -4781,6 +4941,42 @@ mod tests {
             compose_frame(&mut st, 20).is_empty(),
             "and the tick after it is idle again"
         );
+    }
+
+    /// FDR 0007 live debug banner: packs greedily to the width, draws bold
+    /// reverse-video rows from row 0 (under the connection banner when one is
+    /// up), rebuilds only on its refresh interval, and counts as a live
+    /// overlay so the idle fast path keeps composing it.
+    #[test]
+    fn debug_banner_packs_draws_and_shifts_under_the_notice() {
+        let segs: Vec<String> = ["aaaa", "bbbb", "cccccccc", "dd"].iter().map(|s| s.to_string()).collect();
+        // 10 columns: "aaaa  bbbb" fills row 0, "cccccccc" row 1, "dd" is dropped.
+        assert_eq!(pack_banner_rows(&segs, 10, 2), vec!["aaaa  bbbb", "cccccccc"]);
+        assert_eq!(pack_banner_rows(&segs, 10, 1), vec!["aaaa  bbbb"]);
+
+        let mut st = test_state(8, 60);
+        st.debug_banner = true;
+        st.initialized = true;
+        st.last_render_state = (st.applied_num, st.server_term.generation());
+        let bytes = compose_frame(&mut st, 1000);
+        assert!(!bytes.is_empty(), "the banner is a live overlay, no fast-path skip");
+        let row0: String = row_text(&st.last_drawn, 0);
+        assert!(row0.starts_with("posh dbg rtt"), "{row0:?}");
+        assert!(st.last_drawn.cell(0, 0).unwrap().style.inverse);
+        assert_eq!(st.banner.next_at, 1000 + DEBUG_BANNER_REFRESH_MS);
+
+        // Under a notice the banner starts on row 1.
+        st.notify.set_message("hello", false, 1100);
+        compose_frame(&mut st, 1100);
+        assert!(row_text(&st.last_drawn, 0).starts_with("posh: hello"));
+        assert!(row_text(&st.last_drawn, 1).starts_with("posh dbg"));
+
+        // Turning it off restores the session content on the next compose.
+        st.debug_banner = false;
+        st.notify.set_message("", false, 1200);
+        st.initialized = false;
+        compose_frame(&mut st, 1200);
+        assert!(!row_text(&st.last_drawn, 0).starts_with("posh dbg"));
     }
 
     /// A paint destination that accepts everything, for the gauge tests.

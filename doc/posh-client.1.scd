@@ -60,7 +60,12 @@ by the next keystroke.
 	0007: generations, population and fitness-window sizes, the champion's
 	rank/size and whether it or the adaptive shadow is displayed, and the
 	champion hyphence-doc record under
-	_$XDG_DATA_HOME/posh/predict/champions/_), show agent-forwarding debug info (the
+	_$XDG_DATA_HOME/posh/predict/champions/_), show or hide the live debug
+	banner (a reverse-video line or two under the connection banner with the
+	smoothed RTT / RTO / send interval and last-heard age, the echo model and
+	render style, the prediction gauges, the keystroke→paint record, the
+	event-loop wake rate, and the frame / apply counters, refreshed four times
+	a second; _POSH_DEBUG_BANNER=1_ starts with it up), show agent-forwarding debug info (the
 		SSH agent-forwarding state on both the client and server ends, FDR 0004), suspend the client, and quit. Type to filter, arrows to
 	choose, Enter to run, Esc to
 	dismiss. Rendered by the *posh-palette* helper over a JSON-RPC control
@@ -180,6 +185,10 @@ _POSH_DEBUG_LOG_
 	breadcrumbs and a final line on exit. All timings are windowed per
 	interval. Rotated at 5 MB. The on-demand *SIGUSR2* state dump
 	(*SIGNALS*) is written to this same sink. Unset disables logging.
+
+_POSH_DEBUG_BANNER_
+	_1_ (or *on*, *true*, *yes*): start with the live debug banner up (the
+	palette's *Show live debug banner*; see *Ctrl-^* above). Off by default.
 
 _POSH_BASE_HISTORY_
 	Controls retained-base apply (*on by default*). A session daemon

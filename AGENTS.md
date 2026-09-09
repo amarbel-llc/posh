@@ -349,6 +349,14 @@ read-only, `debug` group):
   breadcrumbs are gated on the sink being open, so they stay dormant until then.
   A connected client's `Ctrl-^` palette / `SIGUSR2` can also open a sink at
   runtime (default per-pid file under `$XDG_RUNTIME_DIR/posh`).
+- **Live debug banner** (FDR 0007, 2026-09-09): the palette's *Show live
+  debug banner* (`debug.banner`; `POSH_DEBUG_BANNER=1` to start with it) keeps
+  one or two reverse-video rows under the connection banner with the live
+  rtt / rto / send interval / heard age, echo model + render style, prediction
+  gauges, the time-to-paint record, the loop wake rate, and rx / applied /
+  base-history / late-gap counters, rebuilt every 250 ms
+  (`client.rs::apply_debug_banner`, `display::draw_bar_row`). The
+  watch-it-move complement to the dump and the dialogs.
 - `just debug-posh-log-gaps <pid|log>` / `debug-posh-log-loss <pid|log>` —
   offline scans of a `[stats]` log: `-gaps` finds event-loop STALLS (timestamp
   jumps between records = a wedge/no-paint freeze); `-loss` finds transport
