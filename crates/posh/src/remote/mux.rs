@@ -2696,8 +2696,9 @@ fn claim_ref(
 }
 
 /// The local hostname via gethostname(2); `"unknown"` when the call fails or
-/// reports an empty name, so [`client_id`] never yields an empty id.
-fn hostname() -> String {
+/// reports an empty name, so [`client_id`] never yields an empty id. Also
+/// the host half of a local attach's default title (`picker::default_title`).
+pub(crate) fn hostname() -> String {
     let mut buf = [0u8; 256];
     // SAFETY: gethostname writes at most buf.len() bytes into a valid,
     // exclusively held buffer; no pointers escape the call.

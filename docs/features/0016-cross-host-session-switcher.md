@@ -86,6 +86,14 @@ a second question, in the same renderer as a three-command palette:
 - **Switch, kill it even with other viewports attached** — the forced
   form; those viewports are thrown out exactly as `posh kill` does.
 
+**The title after a switch.** A viewport titles the outer terminal
+`host:session` for any session that has set no title of its own (both
+clients, on every compose whose model title is empty; a title the session
+sets always wins). The paint rule leaves an *empty* title untouched on the
+first frame by design (posh#108, so an attach does not reset an inherited
+title), which would otherwise leave the previous session's title standing
+after a switch into an untitled one — the default closes that gap.
+
 The kill is the ordinary `posh kill` primitive on the session's host — the
 local daemon socket, or `posh kill --unless-attached` over ssh for a remote
 one (non-interactive; an auth prompt cannot be answered from inside a

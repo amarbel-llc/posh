@@ -775,6 +775,13 @@ impl FrameRenderer {
     /// follows `self.scroll_opt` (the palette toggle; default on).
     fn compose_live(&mut self, palette: Option<&Terminal>) -> Vec<u8> {
         let mut next = Snapshot::from_term(&self.server_term);
+        // Default title (mirrors the remote client): `host:session` until the
+        // session sets one of its own.
+        if next.title.is_empty() {
+            if let Some(t) = crate::picker::default_title() {
+                next.title = t;
+            }
+        }
         if let Some(rterm) = palette {
             composite_palette(&mut next, rterm, self.rows, self.cols);
         }

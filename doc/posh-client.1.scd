@@ -30,6 +30,14 @@ session: _session stall detected - captured to server log_. The banner is
 sticky so a fast self-recovery does not rob you of the notice; it is dismissed
 by the next keystroke.
 
+The outer terminal's title follows the session: a title the session's shell
+or program sets (OSC 0/1/2) is re-asserted on attach and on every full
+repaint, and changes — including a deliberate clear — propagate on the next
+paint. A session that has set no title of its own is shown as
+_host_*:*_session_ (the host as typed, minus any user and domain; this
+machine's hostname for a local attach), so attaching to, or switching into,
+an untitled session never leaves the previous title standing.
+
 # OPTIONS
 
 *-4*, *-6*

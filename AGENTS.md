@@ -250,7 +250,12 @@ the `eng-*(7)` manpages — read them with `man eng-versioning`,
   `posh kill --unless-attached` over ssh, so a failed switch never destroys
   the session it left and other attached viewports are respected unless
   forced. The attach entry points record the session they sit in with
-  `picker::set_current`. An older renderer answers
+  `picker::set_current`, which also feeds `picker::default_title`: a
+  session that set no title of its own is shown as `host:session` on the
+  outer terminal by both clients (compose-time, a set title wins), so a
+  switch into an untitled session never leaves the previous title standing
+  (the posh#108 first-frame rule leaves an EMPTY title alone on purpose).
+  An older renderer answers
   `-32602` → `PaletteEvent::ViewRejected` → the non-TUI candidate list.
   Dev-loop: `just debug-palette-e2e` (round-trips against a fresh renderer
   build), `just debug-ph-picker-smoke` (draws the real picker in a detached

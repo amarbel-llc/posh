@@ -3136,6 +3136,14 @@ fn compose_frame(st: &mut ClientState, now: u64) -> Vec<u8> {
         st.predict.set_metrics(&st.last_metrics);
     }
     let mut next = base;
+    // Default title: a session that has set no title of its own shows
+    // `host:session` on the outer terminal, so an attach — and a switch from
+    // a titled session — never leaves a stale or foreign title in place.
+    if next.title.is_empty() {
+        if let Some(t) = crate::picker::default_title() {
+            next.title = t;
+        }
+    }
     // The safety gate is universal and above both axes (RFC 0007 §5.1): while
     // the remote PTY has ECHO off (a password prompt) or the alternate screen
     // is up, NO model's predictions reach the screen — not just optimistic's
@@ -5009,6 +5017,34 @@ mod tests {
         // A later frame with the same title emits nothing new for it.
         let bytes = compose_frame(&mut st, 50);
         assert!(!String::from_utf8_lossy(&bytes).contains("]0;"));
+    }
+
+    /// The default title: a session with no title of its own paints
+    /// `host:session` on the first compose (so a switch replaces the previous
+    /// session's title), and a title the session sets wins over it.
+    #[test]
+    fn untitled_session_paints_the_default_title_until_the_app_sets_one() {
+        let _g = crate::picker::switch_test_guard();
+        crate::picker::set_current(&crate::picker::target_for(Some("box"), None, "dev"));
+        let mut st = test_state(5, 40);
+        let bytes = compose_frame(&mut st, 0);
+        assert!(
+            String::from_utf8_lossy(&bytes).contains("\x1b]0;box:dev\x07"),
+            "first paint asserts the default"
+        );
+        let mut term = Terminal::with_scrollback(5, 40, 0);
+        term.process(b"\x1b]0;MINE\x07");
+        let frame = ServerFrame {
+            flags: 0,
+            caps: vec![],
+            frame_num: 1,
+            input_ack: 0,
+            echo_ack: 0,
+            body: FrameBody::Full(term.dump_vt()),
+        };
+        assert!(apply_frame(&mut st, &frame));
+        let bytes = compose_frame(&mut st, 10);
+        assert!(String::from_utf8_lossy(&bytes).contains("\x1b]0;MINE\x07"), "the app's title wins");
     }
 
     /// A paint destination that accepts everything, for the gauge tests.

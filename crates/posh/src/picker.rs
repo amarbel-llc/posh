@@ -235,6 +235,37 @@ pub fn current() -> Option<String> {
     CURRENT.lock().unwrap_or_else(|e| e.into_inner()).clone()
 }
 
+/// The title a viewport shows for a session that has set none of its own:
+/// `host:session` for the attach in progress — the host as typed minus any
+/// `user@` and trailing domain labels (`box` for `me@box.example`), this
+/// machine's hostname for a local attach — with the group kept for a
+/// non-default one (`box:grp/dev`). `None` before any attach entry point
+/// recorded a target. Asserted by both clients on every compose whose model
+/// title is empty (a set title always wins), so a switch into a session
+/// that never titled itself replaces the previous session's title instead
+/// of leaving it stale (the posh#108 first-frame rule leaves an EMPTY title
+/// untouched by design).
+pub fn default_title() -> Option<String> {
+    let cur = current()?;
+    let (dest, session) = cur.rsplit_once(':')?;
+    let host = if dest.is_empty() {
+        crate::remote::mux::hostname()
+    } else {
+        short_host(dest.rsplit_once('@').map_or(dest, |(_, h)| h))
+    };
+    Some(format!("{host}:{session}"))
+}
+
+/// `box.example.com` → `box`; a bracketed / numeric address is kept whole.
+fn short_host(host: &str) -> String {
+    let literal = host.starts_with('[') || host.chars().all(|c| c.is_ascii_digit() || c == '.' || c == ':');
+    if literal {
+        host.to_string()
+    } else {
+        host.split('.').next().unwrap_or(host).to_string()
+    }
+}
+
 pub fn arm_kill(target: &str, force: bool) {
     *PENDING_KILL.lock().unwrap_or_else(|e| e.into_inner()) = Some((target.to_string(), force));
 }
@@ -334,6 +365,23 @@ pub(crate) fn switch_test_guard() -> std::sync::MutexGuard<'static, ()> {
 mod tests {
     use super::*;
     use crate::PhRoute::*;
+
+    #[test]
+    fn default_title_is_short_host_colon_session() {
+        let _g = switch_test_guard();
+        set_current(&target_for(Some("me@box.example.com"), None, "dev"));
+        assert_eq!(default_title().as_deref(), Some("box:dev"));
+        set_current(&target_for(Some("box"), Some("grp"), "dev"));
+        assert_eq!(default_title().as_deref(), Some("box:grp/dev"));
+        set_current(&target_for(Some("[fe80::1]"), None, "dev"));
+        assert_eq!(default_title().as_deref(), Some("[fe80::1]:dev"));
+        set_current(&target_for(Some("10.0.0.7"), None, "dev"));
+        assert_eq!(default_title().as_deref(), Some("10.0.0.7:dev"));
+        // A local attach names this machine.
+        set_current(&target_for(None, None, "dev"));
+        let local = default_title().unwrap();
+        assert!(local.ends_with(":dev") && local.len() > 4, "{local}");
+    }
 
     /// Picker rows carry targets that `ph_parse` routes exactly as the typed
     /// form would — local `:name` / `:group/name`, remote `dest:name`, the
