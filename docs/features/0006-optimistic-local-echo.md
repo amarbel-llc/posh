@@ -248,6 +248,23 @@ the per-key time, scaling with the whole grid to emit a ~40-byte paint. That
 is the optimization target (tracked as posh#191), and the live gauge's
 `compose` phase (which includes the diff) is where a fix shows up.
 
+## Look-alike render style (prototype, 2026-09-09)
+
+A third way to mark an unconfirmed prediction, besides the underline and
+the dim rendition: draw the cell with a single-width look-alike of the typed
+glyph (Greek / Cyrillic / Latin-extended homoglyphs, `posh_proto::lookalike`)
+and rotate the choice every ~150 ms, so the text reads correctly at a glance
+but visibly "shimmers" until the server confirms it, at which point it snaps
+to the real glyph. The marking lives in the glyph, not in an attribute a
+terminal theme may drop. Prototyped standalone — `just debug-lookalike-echo
+[rtt_ms] [period_ms]` runs a fake shell line with a simulated round trip in
+the current terminal — before deciding whether it becomes a
+`POSH_PREDICTION_RENDER=lookalike` renderer (a `PredictionRenderer` whose
+`paint_cell` substitutes by the compose tick; the rotation rides the 50 ms
+prediction timer the client already runs while predictions are outstanding).
+Open questions the demo is for: is the shimmer calming or distracting at
+real RTTs; do the homoglyphs survive the user's font; digits.
+
 ## Tuning Levers
 
 | Lever | Current | Rationale | Change signal |

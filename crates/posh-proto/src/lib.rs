@@ -28,6 +28,9 @@ pub mod error;
 pub mod frame;
 pub mod framesync;
 pub mod introspect;
+/// Look-alike glyphs for unconfirmed local echo (FDR 0006 render-style
+/// prototype; demo: `just debug-lookalike-echo`).
+pub mod lookalike;
 
 pub use channel::{ClientAck, FrameChannel};
 pub use error::{Error, Result};

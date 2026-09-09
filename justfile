@@ -535,6 +535,17 @@ debug-agent-e2e:
 debug-perf-compose:
     nix develop --command cargo test -p posh --release remote::perf_probe -- --ignored --nocapture
 
+# Look-alike local echo prototype (FDR 0006 render-style idea): a fake shell
+# line in THIS terminal where each typed character shows at once as a rotating
+# homoglyph (posh_proto::lookalike) and snaps to the real glyph after a
+# simulated round trip. For eyeballing the effect before wiring it in as a
+# POSH_PREDICTION_RENDER style. No posh, no network.
+#
+# run the look-alike echo demo in this terminal (rtt ms, rotation period ms)
+[group("debug")]
+debug-lookalike-echo rtt="800" period="150":
+    nix develop --command cargo run -q -p posh-proto --example lookalike_echo -- {{ rtt }} {{ period }}
+
 # Local-echo hot path (FDR 0006): per predictor, what one keystroke costs from
 # on_user_byte through the compose to the tty diff, at steady-state typing, in
 # release. The offline half of the client's `time-to-paint` gauge (palette
