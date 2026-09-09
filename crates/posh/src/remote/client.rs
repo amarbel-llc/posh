@@ -603,8 +603,15 @@ fn about_summary(st: &ClientState) -> String {
         ),
         None => "remote state: (requested; reopen About to refresh)".to_string(),
     };
+    // RFC 0013 §5.2 (#193): what the session is running, as the daemon
+    // last reported it on a frame — the same label `posh list` shows.
+    let activity = match &st.session_activity {
+        Some(a) if !a.label().is_empty() => format!("activity: {}", a.label()),
+        Some(_) => "activity: unknown".to_string(),
+        None => "activity: (not reported; pre-#193 daemon, or not yet delivered)".to_string(),
+    };
     format!(
-        "posh {} ({})\n{remote}\n{remote_state}\nmode: {mode}\n{}\n{}\n{}\n{}\n{}",
+        "posh {} ({})\n{remote}\n{remote_state}\n{activity}\nmode: {mode}\n{}\n{}\n{}\n{}\n{}",
         env!("POSH_VERSION"),
         env!("POSH_GIT_SHA"),
         gate("POSH_MUX", crate::remote::mux::mux_selected()),
@@ -1436,6 +1443,11 @@ struct ClientState {
     /// the local-echo time-to-paint gauge (FDR 0006). Set by
     /// `process_user_input`, consumed by `render_to` in the same iteration.
     paint_pending: Option<PaintPending>,
+    /// RFC 0013 §5.2: the session's activity label as last reported on a
+    /// frame (`CAP_SESSION_ACTIVITY`, requested on every message; the daemon
+    /// attaches it on the first request and on change). Feeds the default
+    /// title (#193) and the About view. `None` against a pre-#193 daemon.
+    session_activity: Option<caps::SessionActivity>,
     /// The live debug banner (FDR 0007): on via the palette or
     /// `POSH_DEBUG_BANNER=1`; its text is rebuilt every
     /// [`DEBUG_BANNER_REFRESH_MS`] and composited under the connection banner.
@@ -1598,6 +1610,7 @@ fn client_loop(
         applier,
         stats,
         paint_pending: None,
+        session_activity: None,
         debug_banner: debug_banner_env(),
         banner: DebugBanner::default(),
         palette: None,
@@ -2607,6 +2620,13 @@ fn process_frame(st: &mut ClientState, frame: &ServerFrame) -> bool {
             st.server_ident = Some(ident);
         }
     }
+    // RFC 0013 §5.2: the session's activity label, held once delivered
+    // (refreshed only when the far end sees it change).
+    if let Some(cap) = caps::find(&frame.caps, caps::CAP_SESSION_ACTIVITY) {
+        if let Ok(activity) = caps::decode_session_activity(&cap.payload) {
+            st.session_activity = Some(activity);
+        }
+    }
     // Scrollback stream v2 (RFC 0009 §1): adopt the server's epoch from its
     // SCROLLBACK2 ack. A change (or a first ack, or the ack after our local
     // resize cleared `sb2_epoch`) opens a fresh epoch: clear the ring and zero
@@ -3140,7 +3160,8 @@ fn compose_frame(st: &mut ClientState, now: u64) -> Vec<u8> {
     // `host:session` on the outer terminal, so an attach — and a switch from
     // a titled session — never leaves a stale or foreign title in place.
     if next.title.is_empty() {
-        if let Some(t) = crate::picker::default_title() {
+        let process = st.session_activity.as_ref().map(|a| a.process.as_str());
+        if let Some(t) = crate::picker::default_title_with(process) {
             next.title = t;
         }
     }
@@ -3325,6 +3346,13 @@ fn outgoing_caps(st: &mut ClientState) -> Vec<caps::Cap> {
             payload: vec![],
         });
     }
+    // RFC 0013 §5.2: the activity-label request rides every message (two
+    // bytes); the far end answers on the first request and on change only,
+    // so steady state costs nothing beyond the request itself.
+    extra.push(caps::Cap {
+        id: caps::CAP_SESSION_ACTIVITY,
+        payload: vec![],
+    });
     // Evolved predictor (RFC 0007 §3): request the server's remote-host metric
     // terminals only when a GP species is active, so a default session never
     // negotiates CAP_METRICS and pays no per-frame overhead.
@@ -4593,6 +4621,7 @@ mod tests {
             applier: Box::new(framesync::DumpDiff),
             stats: Stats::new(),
             paint_pending: None,
+            session_activity: None,
             debug_banner: false,
             banner: DebugBanner::default(),
             palette: None,
@@ -5045,6 +5074,29 @@ mod tests {
         assert!(apply_frame(&mut st, &frame));
         let bytes = compose_frame(&mut st, 10);
         assert!(String::from_utf8_lossy(&bytes).contains("\x1b]0;MINE\x07"), "the app's title wins");
+
+        // #193: an untitled session whose daemon reported its foreground
+        // process on a frame titles itself `host:session · process`.
+        let mut st = test_state(5, 40);
+        let frame = ServerFrame {
+            flags: 0,
+            caps: vec![caps::encode_session_activity(&caps::SessionActivity {
+                process: "clown".into(),
+                title: String::new(),
+            })],
+            frame_num: 1,
+            input_ack: 0,
+            echo_ack: 0,
+            body: FrameBody::Full(Terminal::with_scrollback(5, 40, 0).dump_vt()),
+        };
+        assert!(process_frame(&mut st, &frame));
+        assert_eq!(st.session_activity.as_ref().map(|a| a.process.as_str()), Some("clown"));
+        let bytes = compose_frame(&mut st, 20);
+        assert!(
+            String::from_utf8_lossy(&bytes).contains("\x1b]0;box:dev \u{b7} clown\x07"),
+            "{:?}",
+            String::from_utf8_lossy(&bytes)
+        );
     }
 
     /// A paint destination that accepts everything, for the gauge tests.

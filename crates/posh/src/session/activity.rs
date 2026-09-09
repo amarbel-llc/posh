@@ -12,6 +12,12 @@
 
 const SEP: &str = " · ";
 
+/// How often a frame producer re-reads the PTY's foreground process for the
+/// RFC 0013 §5.2 on-frame label (`CAP_SESSION_ACTIVITY`): a `tcgetpgrp` plus
+/// a `/proc` read, so not per frame. The title half is free (the terminal
+/// model holds it) and is read fresh every time.
+pub(crate) const PROBE_INTERVAL_MS: u64 = 250;
+
 /// Compose the activity label from the foreground-process command and the
 /// terminal title. See the module docs for the rule.
 pub(crate) fn compose(process: Option<&str>, title: &str) -> String {

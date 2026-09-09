@@ -197,6 +197,14 @@ struct ClientConn {
     /// per-viewport by construction (every relay/M2 channel serves one
     /// viewport). RFC 0008 §3.1.
     last_input_ms: u64,
+    /// RFC 0013 §5.2 on-frame activity label: `wants_activity` latches once
+    /// this client (or the client behind its relay/bridge) requested id 15;
+    /// `activity_now` is the daemon's current label, refreshed per loop
+    /// iteration for requesting clients; `activity_sent` what this client
+    /// last received — the entry rides a visible frame only when they differ.
+    wants_activity: bool,
+    activity_now: Option<caps::SessionActivity>,
+    activity_sent: Option<caps::SessionActivity>,
 }
 
 impl ClientConn {
@@ -205,6 +213,11 @@ impl ClientConn {
     /// attachment's own (its pid becomes `attach_pid`); a later `ClientCaps`
     /// identity with another pid is the origin behind a relay.
     fn absorb_client_caps(&mut self, table: &[caps::Cap], now: u64, from_init: bool) {
+        // RFC 0013 §5.2: an activity-label request latches for the
+        // connection (the client re-sends it on every message anyway).
+        if caps::find(table, caps::CAP_SESSION_ACTIVITY).is_some() {
+            self.wants_activity = true;
+        }
         if let Some(cap) = caps::find(table, caps::CAP_CLIENT_IDENT) {
             if let Ok(ident) = introspect::decode_client_ident(&cap.payload) {
                 if from_init {
@@ -356,6 +369,17 @@ impl ClientConn {
         let withhold = self.lossy || self.coalescing();
         let use_morph = lossy && caps::find(&self.caps, caps::CAP_MORPH).is_some();
         let stamp_base_sum = lossy && caps::find(&self.caps, caps::CAP_BASE_SUM).is_some();
+        // RFC 0013 §5.2: the activity label rides this visible frame only
+        // when it changed since this client last received it (or never did).
+        let activity_cap: Vec<caps::Cap> = if self.wants_activity
+            && self.activity_now.is_some()
+            && self.activity_now != self.activity_sent
+        {
+            self.activity_sent = self.activity_now.clone();
+            self.activity_now.iter().map(caps::encode_session_activity).collect()
+        } else {
+            Vec::new()
+        };
         let encoded = match self.producer.as_mut() {
             None => return false,
             Some(producer) => {
@@ -380,7 +404,7 @@ impl ClientConn {
                     // FDR 0008: FLAG_OVERLAY rides too while the shell overlay
                     // is up (posh#178).
                     flags: self.echo_flag | self.overlay_flag,
-                    caps: caps::own_table(&[]),
+                    caps: caps::own_table(&activity_cap),
                     frame_num,
                     input_ack: 0,
                     echo_ack: 0,
@@ -1078,6 +1102,10 @@ fn daemon_loop(
     // sink, the live session keeps advancing `term` underneath, and the session
     // repaints when the overlay shell exits. `None` ⇒ today's behavior, exactly.
     let mut overlay: Option<Overlay> = None;
+    // RFC 0013 §5.2 (#193): the on-frame activity label's foreground-process
+    // half, probed at most every PROBE_INTERVAL_MS while any client wants it.
+    let mut activity_probe_at: u64 = 0;
+    let mut activity_process = String::new();
 
     'daemon: loop {
         if util::take_flag(&util::SIGTERM_RECEIVED) {
@@ -1201,9 +1229,29 @@ fn daemon_loop(
         } else {
             0
         };
+        // RFC 0013 §5.2: refresh the activity label for requesting clients
+        // (the title from the model each turn, the process on a throttle);
+        // `queue_frame` attaches it to a visible frame only when it changed
+        // for that client.
+        let activity = if clients.iter().any(|c| c.wants_activity) {
+            let t = util::now_ms();
+            if t.saturating_sub(activity_probe_at) >= super::activity::PROBE_INTERVAL_MS {
+                activity_probe_at = t;
+                activity_process = crate::pty::foreground_command(pty_fd).unwrap_or_default();
+            }
+            Some(caps::SessionActivity {
+                process: activity_process.clone(),
+                title: term.title().to_string(),
+            })
+        } else {
+            None
+        };
         for c in clients.iter_mut() {
             c.echo_flag = echo_flag;
             c.overlay_flag = overlay_flag;
+            if c.wants_activity {
+                c.activity_now = activity.clone();
+            }
         }
 
         // New client connections.
@@ -1265,6 +1313,9 @@ fn daemon_loop(
                     record_at: 0,
                     attach_pid: None,
                     last_input_ms: 0,
+                    wants_activity: false,
+                    activity_now: None,
+                    activity_sent: None,
                 });
             }
         }
@@ -1988,6 +2039,9 @@ mod tests {
             record_at: 0,
             attach_pid: None,
             last_input_ms: 0,
+            wants_activity: false,
+            activity_now: None,
+            activity_sent: None,
         }
     }
 
@@ -2100,6 +2154,9 @@ mod tests {
             record_at: 0,
             attach_pid: None,
             last_input_ms: 0,
+            wants_activity: false,
+            activity_now: None,
+            activity_sent: None,
         };
         let mut init = ipc::encode_resize(rows, cols).to_vec();
         init.extend_from_slice(&caps::encode_table(&caps::own_table(&[])));
@@ -2134,6 +2191,9 @@ mod tests {
             record_at: 0,
             attach_pid: None,
             last_input_ms: 0,
+            wants_activity: false,
+            activity_now: None,
+            activity_sent: None,
         };
         let mut init = ipc::encode_resize(rows, cols).to_vec();
         init.extend_from_slice(&caps::encode_table(&caps::own_table(&[caps::Cap {
@@ -2724,6 +2784,9 @@ mod tests {
             record_at: 0,
             attach_pid: None,
             last_input_ms: 0,
+            wants_activity: false,
+            activity_now: None,
+            activity_sent: None,
         };
         let mut init = ipc::encode_resize(rows, cols).to_vec();
         init.extend_from_slice(&caps::encode_table(&caps::own_table(&[caps::Cap {
@@ -3000,6 +3063,9 @@ mod tests {
             record_at: 0,
             attach_pid: None,
             last_input_ms: 0,
+            wants_activity: false,
+            activity_now: None,
+            activity_sent: None,
         };
         let mut table = vec![caps::Cap {
             id: caps::CAP_LOSSY,
@@ -3011,6 +3077,59 @@ mod tests {
         c.apply_init(&init);
         c.maybe_enable_frames();
         (c, peer)
+    }
+
+    /// RFC 0013 §5.2 (#193): the activity label rides a visible frame only for
+    /// a client that requested id 15, only on the first frame after the
+    /// request, and again only when the label changes.
+    #[test]
+    fn activity_label_rides_visible_frames_on_request_and_change_only() {
+        let (mut c, _peer) = frame_capable_conn(24, 80);
+        let mut term = Terminal::with_scrollback(24, 80, 0);
+        term.process(b"hello");
+        let label = |process: &str, title: &str| caps::SessionActivity {
+            process: process.into(),
+            title: title.into(),
+        };
+        // Not requested: the label is known daemon-side but never attached.
+        c.activity_now = Some(label("fish", ""));
+        assert!(c.queue_frame_from(&term));
+        let frames = decode_server_frames(&c.write_buf);
+        assert!(caps::find(&frames[0].caps, caps::CAP_SESSION_ACTIVITY).is_none());
+        c.write_buf.clear();
+
+        // Requested (a forwarded ClientCaps table, as a relay/bridge sends):
+        // the next visible frame carries it, the one after (unchanged) not.
+        c.absorb_client_caps(
+            &[caps::Cap {
+                id: caps::CAP_SESSION_ACTIVITY,
+                payload: vec![],
+            }],
+            0,
+            false,
+        );
+        assert!(c.wants_activity);
+        term.process(b" one");
+        assert!(c.queue_frame_from(&term));
+        term.process(b" two");
+        assert!(c.queue_frame_from(&term));
+        let frames = decode_server_frames(&c.write_buf);
+        assert_eq!(frames.len(), 2);
+        let got = caps::find(&frames[0].caps, caps::CAP_SESSION_ACTIVITY).expect("first frame carries it");
+        assert_eq!(caps::decode_session_activity(&got.payload).unwrap(), label("fish", ""));
+        assert!(caps::find(&frames[1].caps, caps::CAP_SESSION_ACTIVITY).is_none(), "unchanged: not repeated");
+        c.write_buf.clear();
+
+        // The label changes (the app set a title): attached once more.
+        c.activity_now = Some(label("vim", "~/notes"));
+        term.process(b" three");
+        assert!(c.queue_frame_from(&term));
+        let frames = decode_server_frames(&c.write_buf);
+        let got = caps::find(&frames[0].caps, caps::CAP_SESSION_ACTIVITY).expect("changed: attached");
+        assert_eq!(
+            caps::decode_session_activity(&got.payload).unwrap().label(),
+            "~/notes \u{b7} vim"
+        );
     }
 
     /// Decode the queued `Tag::Frame` records into whole `ServerFrame`s (header +
@@ -3456,6 +3575,9 @@ mod tests {
             record_at: 0,
             attach_pid: None,
             last_input_ms: 0,
+            wants_activity: false,
+            activity_now: None,
+            activity_sent: None,
         };
         let mut init = ipc::encode_resize(rows, cols).to_vec();
         init.extend_from_slice(&caps::encode_table(&caps::own_table(&[caps::Cap {
@@ -3656,6 +3778,9 @@ mod tests {
             record_at: 0,
             attach_pid: None,
             last_input_ms: 0,
+            wants_activity: false,
+            activity_now: None,
+            activity_sent: None,
         };
         let mut init = ipc::encode_resize(rows, cols).to_vec();
         init.extend_from_slice(&caps::encode_table(&caps::own_table(&[

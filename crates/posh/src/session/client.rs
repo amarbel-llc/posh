@@ -462,6 +462,9 @@ struct FrameRenderer {
     /// leaves a stuck background on some terminals (posh#100) — the local escape
     /// hatch the roaming client already exposes.
     scroll_opt: bool,
+    /// RFC 0013 §5.2: the daemon's activity label as last carried on a frame
+    /// (requested on Init); the default title's process half (#193).
+    activity: Option<caps::SessionActivity>,
     rows: u16,
     cols: u16,
 }
@@ -510,6 +513,7 @@ impl FrameRenderer {
             initialized: false,
             last_wheel: false,
             scroll_opt: true,
+            activity: None,
             rows,
             cols,
             stats: Stats::new(),
@@ -616,6 +620,12 @@ impl FrameRenderer {
             Ok(f) => f,
             Err(e) => return (Err(e.into()), None),
         };
+        // RFC 0013 §5.2: the activity label rides a frame when it changes.
+        if let Some(cap) = caps::find(&frame.caps, caps::CAP_SESSION_ACTIVITY) {
+            if let Ok(a) = caps::decode_session_activity(&cap.payload) {
+                self.activity = Some(a);
+            }
+        }
         // `[stats]` (posh#171): the frame's kind + arrival, then the apply
         // outcome at each classification below — the roaming client's shape.
         self.stats.record_frame_arrival(util::now_ms());
@@ -778,7 +788,8 @@ impl FrameRenderer {
         // Default title (mirrors the remote client): `host:session` until the
         // session sets one of its own.
         if next.title.is_empty() {
-            if let Some(t) = crate::picker::default_title() {
+            let process = self.activity.as_ref().map(|a| a.process.as_str());
+            if let Some(t) = crate::picker::default_title_with(process) {
                 next.title = t;
             }
         }
@@ -1180,6 +1191,12 @@ fn client_loop(
         id: caps::CAP_SCROLLBACK,
         payload: vec![0],
     }];
+    // RFC 0013 §5.2 (#193): ask for the activity label on frames — the
+    // request latches daemon-side, so Init is the only place it is needed.
+    extra_caps.push(caps::Cap {
+        id: caps::CAP_SESSION_ACTIVITY,
+        payload: vec![],
+    });
     // Advertise CAP_COALESCE only when opted in (posh#137, `POSH_COALESCE=1`):
     // coalescing bounds the daemon's per-client `write_buf` so an output burst
     // can't grow it past MAX_CLIENT_BACKLOG and get us dropped (the

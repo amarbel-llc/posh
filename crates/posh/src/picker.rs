@@ -245,7 +245,11 @@ pub fn current() -> Option<String> {
 /// that never titled itself replaces the previous session's title instead
 /// of leaving it stale (the posh#108 first-frame rule leaves an EMPTY title
 /// untouched by design).
-pub fn default_title() -> Option<String> {
+/// With the session's RFC 0013 §5 foreground process, when the daemon has
+/// reported one on the frame (`CAP_SESSION_ACTIVITY`, #193), the title is
+/// `host:session · process` — so an auto-named session reads as what it is
+/// running, `flac:ff9fe216 · clown`, not just an id.
+pub fn default_title_with(process: Option<&str>) -> Option<String> {
     let cur = current()?;
     let (dest, session) = cur.rsplit_once(':')?;
     let host = if dest.is_empty() {
@@ -253,7 +257,12 @@ pub fn default_title() -> Option<String> {
     } else {
         short_host(dest.rsplit_once('@').map_or(dest, |(_, h)| h))
     };
-    Some(format!("{host}:{}", short_session(session)))
+    let mut title = format!("{host}:{}", short_session(session));
+    if let Some(p) = process.map(str::trim).filter(|p| !p.is_empty()) {
+        title.push_str(" \u{b7} ");
+        title.push_str(p);
+    }
+    Some(title)
 }
 
 /// A `[group/]name` for the title: an auto-generated UUID name (what clown
@@ -392,25 +401,29 @@ mod tests {
     fn default_title_is_short_host_colon_session() {
         let _g = switch_test_guard();
         set_current(&target_for(Some("me@box.example.com"), None, "dev"));
-        assert_eq!(default_title().as_deref(), Some("box:dev"));
+        assert_eq!(default_title_with(None).as_deref(), Some("box:dev"));
         set_current(&target_for(Some("box"), Some("grp"), "dev"));
-        assert_eq!(default_title().as_deref(), Some("box:grp/dev"));
+        assert_eq!(default_title_with(None).as_deref(), Some("box:grp/dev"));
         set_current(&target_for(Some("[fe80::1]"), None, "dev"));
-        assert_eq!(default_title().as_deref(), Some("[fe80::1]:dev"));
+        assert_eq!(default_title_with(None).as_deref(), Some("[fe80::1]:dev"));
         set_current(&target_for(Some("10.0.0.7"), None, "dev"));
-        assert_eq!(default_title().as_deref(), Some("10.0.0.7:dev"));
+        assert_eq!(default_title_with(None).as_deref(), Some("10.0.0.7:dev"));
         // A local attach names this machine.
         set_current(&target_for(None, None, "dev"));
-        let local = default_title().unwrap();
+        let local = default_title_with(None).unwrap();
         assert!(local.ends_with(":dev") && local.len() > 4, "{local}");
         // An auto-generated UUID name is abbreviated, group kept; a look-alike
         // that is not a UUID (wrong length / a non-hex digit) stays whole.
         set_current(&target_for(Some("box"), None, "ff9fe216-9652-4e23-805c-6f4dd5ce7eca"));
-        assert_eq!(default_title().as_deref(), Some("box:ff9fe216"));
+        assert_eq!(default_title_with(None).as_deref(), Some("box:ff9fe216"));
         set_current(&target_for(Some("box"), Some("grp"), "ff9fe216-9652-4e23-805c-6f4dd5ce7eca"));
-        assert_eq!(default_title().as_deref(), Some("box:grp/ff9fe216"));
+        assert_eq!(default_title_with(None).as_deref(), Some("box:grp/ff9fe216"));
         set_current(&target_for(Some("box"), None, "ff9fe216-9652-4e23-805c-6f4dd5ce7ecz"));
-        assert_eq!(default_title().as_deref(), Some("box:ff9fe216-9652-4e23-805c-6f4dd5ce7ecz"));
+        assert_eq!(default_title_with(None).as_deref(), Some("box:ff9fe216-9652-4e23-805c-6f4dd5ce7ecz"));
+        // With the daemon's foreground process known, it is appended (#193).
+        set_current(&target_for(Some("box"), None, "ff9fe216-9652-4e23-805c-6f4dd5ce7eca"));
+        assert_eq!(default_title_with(Some("clown")).as_deref(), Some("box:ff9fe216 \u{b7} clown"));
+        assert_eq!(default_title_with(Some("  ")).as_deref(), Some("box:ff9fe216"));
     }
 
     /// Picker rows carry targets that `ph_parse` routes exactly as the typed

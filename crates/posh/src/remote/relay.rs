@@ -209,16 +209,21 @@ impl DaemonLeg {
 /// 3.2) and MUST NOT reach the daemon; CAP_DIAG/CAP_METRICS are answered by the
 /// relay from its own transport state — so neither category is forwarded here.
 /// The RFC 0014 client-introspection entries in a client message, to be
-/// forwarded to the daemon verbatim (§3): identity, state, upstream. Nothing
-/// else is forwarded here — every other client cap is relay-terminated or
-/// negotiated on Init (`content_caps`).
+/// forwarded to the daemon verbatim (§3): identity, state, upstream — plus
+/// the RFC 0013 §5.2 activity-label request (id 15), which only the daemon
+/// can answer (it owns the PTY and the title). Nothing else is forwarded
+/// here — every other client cap is relay-terminated or negotiated on Init
+/// (`content_caps`).
 pub(crate) fn forwarded_client_caps(client_caps: &[Cap]) -> Vec<Cap> {
     client_caps
         .iter()
         .filter(|c| {
             matches!(
                 c.id,
-                caps::CAP_CLIENT_IDENT | caps::CAP_CLIENT_STATE | caps::CAP_CLIENT_UPSTREAM
+                caps::CAP_CLIENT_IDENT
+                    | caps::CAP_CLIENT_STATE
+                    | caps::CAP_CLIENT_UPSTREAM
+                    | caps::CAP_SESSION_ACTIVITY
             )
         })
         .cloned()

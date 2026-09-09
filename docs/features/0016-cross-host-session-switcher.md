@@ -90,8 +90,10 @@ a second question, in the same renderer as a three-command palette:
 `host:session` for any session that has set no title of its own (both
 clients, on every compose whose model title is empty; a title the session
 sets always wins; an auto-generated UUID name is abbreviated to its first
-eight hex digits, `flac:ff9fe216`, until the RFC 0013 §5 activity label
-rides frames and can stand in for the name). The paint rule leaves an *empty* title untouched on the
+eight hex digits, and the session's foreground process is appended when the
+daemon reports it on the frame — RFC 0013 §5.2's `CAP_SESSION_ACTIVITY`,
+implemented for posh#193 — so a clown-spawned session reads
+`flac:ff9fe216 · clown`). The paint rule leaves an *empty* title untouched on the
 first frame by design (posh#108, so an attach does not reset an inherited
 title), which would otherwise leave the previous session's title standing
 after a switch into an untitled one — the default closes that gap.

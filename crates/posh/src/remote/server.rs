@@ -1142,6 +1142,13 @@ pub(crate) fn server_loop(
     let mut peer_wants_state = false;
     let mut peer_wants_ident = false;
     let ident_cap = server_ident_cap();
+    // RFC 0013 §5.2: the activity label (this server owns the PTY, so it
+    // answers directly) — attached on the first request and on change; the
+    // foreground-process probe is throttled, the title read fresh.
+    let mut peer_wants_activity = false;
+    let mut activity_sent: Option<caps::SessionActivity> = None;
+    let mut activity_probe_at: u64 = 0;
+    let mut activity_process = String::new();
     // RFC 0014 §3/§4.1: the peer client's retained introspection record and
     // this process's status socket under `<base>/remote/<pid>.status.sock`
     // (an Architecture-A server has no session dir; the daemon's contract
@@ -1785,6 +1792,8 @@ pub(crate) fn server_loop(
                             caps::find(&msg.caps, caps::CAP_SERVER_STATE).is_some();
                         peer_wants_ident =
                             caps::find(&msg.caps, caps::CAP_SERVER_IDENT).is_some();
+                        peer_wants_activity =
+                            caps::find(&msg.caps, caps::CAP_SESSION_ACTIVITY).is_some();
                         // RFC 0014 §3: retain the peer's unsolicited identity /
                         // state (single-peer: this connection IS the client).
                         client_record.absorb(&msg.caps, now_ms());
@@ -2221,6 +2230,25 @@ pub(crate) fn server_loop(
                         peer_wants_state,
                         &diag,
                     ));
+                }
+                // RFC 0013 §5.2: the activity label, when requested and changed.
+                if peer_wants_activity {
+                    let t = now_ms();
+                    if t.saturating_sub(activity_probe_at)
+                        >= crate::session::activity::PROBE_INTERVAL_MS
+                    {
+                        activity_probe_at = t;
+                        activity_process =
+                            pty::foreground_command(child.master).unwrap_or_default();
+                    }
+                    let activity = caps::SessionActivity {
+                        process: activity_process.clone(),
+                        title: term.title().to_string(),
+                    };
+                    if activity_sent.as_ref() != Some(&activity) {
+                        extras.push(caps::encode_session_activity(&activity));
+                        activity_sent = Some(activity);
+                    }
                 }
                 // Evolved-predictor remote metrics (RFC 0007 §3): sample the
                 // host/app/proc signals (throttled — the /proc reads are not

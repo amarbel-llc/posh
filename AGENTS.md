@@ -252,9 +252,18 @@ the `eng-*(7)` manpages — read them with `man eng-versioning`,
   forced. The attach entry points record the session they sit in with
   `picker::set_current`, which also feeds `picker::default_title`: a
   session that set no title of its own is shown as `host:session` on the
-  outer terminal by both clients (compose-time, a set title wins), so a
-  switch into an untitled session never leaves the previous title standing
-  (the posh#108 first-frame rule leaves an EMPTY title alone on purpose).
+  outer terminal by both clients (compose-time, a set title wins; a UUID
+  name is abbreviated; the daemon's foreground process is appended when
+  known — `flac:ff9fe216 · clown`), so a switch into an untitled session
+  never leaves the previous title standing (the posh#108 first-frame rule
+  leaves an EMPTY title alone on purpose). The process comes from RFC 0013
+  §5.2's `CAP_SESSION_ACTIVITY` (id 15, posh#193): both clients request it
+  on every message / on Init, a relay or bridge forwards the request as
+  `Tag::ClientCaps`, and the daemon (`ClientConn::wants_activity` /
+  `activity_now` / `activity_sent`, `queue_frame`) or the Arch-A server
+  attaches the label to a visible frame only on first request and on
+  change, with the foreground-process probe throttled to 250 ms
+  (`session::activity::PROBE_INTERVAL_MS`).
   An older renderer answers
   `-32602` → `PaletteEvent::ViewRejected` → the non-TUI candidate list.
   Dev-loop: `just debug-palette-e2e` (round-trips against a fresh renderer

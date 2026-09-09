@@ -152,12 +152,19 @@ client entry is empty (a request).
 The same label reaches a client two ways, depending on whether it is attached to
 the session or choosing among sessions:
 
-- **On frames (attached).** A client requesting id 15 — e.g. for the palette
-  heading or About view — MUST bound its request window as for `CAP_SERVER_STATE`
-  (§2); the daemon attaches the label entry to outgoing frames while the peer's
-  most recent message requested it, and refreshes it when the underlying title or
-  foreground process changes. This is how an attached client shows the current
-  session's label alongside the rtt/echo model already in the palette heading.
+- **On frames (attached).** A client requesting id 15 sends the empty client
+  entry on every message (two bytes; no request window — *amended 2026-09-09,
+  posh#193*, since the label feeds a standing surface, the viewport's default
+  title, not a one-shot dialog). The daemon — or the standalone server that
+  owns its PTY — attaches the label entry to the first visible frame after the
+  request and again only when the title or the foreground process CHANGES,
+  never on every frame; a relay or mux bridge forwards the request to the
+  daemon (`Tag::ClientCaps`, as for the RFC 0014 entries) and the daemon's
+  answer back unchanged. A client keeps the last label delivered. The
+  foreground-process probe SHOULD be throttled (posh: 250 ms); the title is
+  read from the terminal model. This is how an attached client titles an
+  untitled session by what it is running (`host:session · process`) and shows
+  the current session's label in the About view.
 - **In enumeration (unattached).** The activity label is also carried in the
   session daemon's list reply and appended to the mux peer's per-session status
   line (§4), so `posh list`, `posh list box:`, the picker, and `ph` completion

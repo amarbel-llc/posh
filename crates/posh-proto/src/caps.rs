@@ -125,6 +125,15 @@ pub const CAP_SERVER_IDENT: u8 = 13;
 /// entry: the [`ServerDiag`] payload, byte-identical to CAP_DIAG's, attached
 /// under whichever id the client requested with.
 pub const CAP_SERVER_STATE: u8 = 14;
+/// Session activity label (RFC 0013 §5). Client entry (empty payload): "tell
+/// me what this session is running" — rides every message (two bytes), so
+/// a relay/bridge forwards it to the daemon like the RFC 0014 entries.
+/// Server entry: an encoded [`SessionActivity`] — the PTY's foreground
+/// process and the terminal title — attached to the first frame after the
+/// request and again whenever either changes (never every frame). Display
+/// data only: the viewport's fallback title when the session sets none, the
+/// palette's About view.
+pub const CAP_SESSION_ACTIVITY: u8 = 15;
 /// Client identity (RFC 0014 §1): the `SERVER_IDENT` layout under the client
 /// id. UNSOLICITED (RFC 0001 amendment): sent on the first message, after any
 /// resync, and at a slow cadence; a relay forwards it unchanged so the daemon
@@ -212,6 +221,78 @@ pub fn decode_server_ident(payload: &[u8]) -> Result<ServerIdent> {
         pid,
         start_unix_ms,
     })
+}
+
+/// What a session is running, as the daemon observes it (RFC 0013 §5): the
+/// PTY's foreground-process command (empty when unknown) and the terminal
+/// title the shell/app last set (empty when none).
+#[derive(Debug, Clone, PartialEq, Eq, Default)]
+pub struct SessionActivity {
+    pub process: String,
+    pub title: String,
+}
+
+impl SessionActivity {
+    /// The §5 rendered label: `title · process` when a title is set, else
+    /// the process alone; empty when both are.
+    pub fn label(&self) -> String {
+        let (title, process) = (self.title.trim(), self.process.trim());
+        match (title.is_empty(), process.is_empty()) {
+            (false, false) => format!("{title} \u{b7} {process}"),
+            (false, true) => title.to_string(),
+            (true, false) => process.to_string(),
+            (true, true) => String::new(),
+        }
+    }
+}
+
+/// Format version of the [`SessionActivity`] payload (§5.1).
+const SESSION_ACTIVITY_FMT: u8 = 1;
+
+/// Encode a [`SessionActivity`] as its cap entry (§5.1): fmt byte, then the
+/// length-prefixed process command and title, each truncated to 128 bytes
+/// on a char boundary.
+pub fn encode_session_activity(a: &SessionActivity) -> Cap {
+    fn clamp(s: &str) -> &[u8] {
+        let mut end = s.len().min(128);
+        while !s.is_char_boundary(end) {
+            end -= 1;
+        }
+        &s.as_bytes()[..end]
+    }
+    let (process, title) = (clamp(&a.process), clamp(&a.title));
+    let mut payload = Vec::with_capacity(3 + process.len() + title.len());
+    payload.push(SESSION_ACTIVITY_FMT);
+    payload.push(process.len() as u8);
+    payload.extend_from_slice(process);
+    payload.push(title.len() as u8);
+    payload.extend_from_slice(title);
+    Cap {
+        id: CAP_SESSION_ACTIVITY,
+        payload,
+    }
+}
+
+/// Decode a [`CAP_SESSION_ACTIVITY`] payload. Rejects an unknown format
+/// version, a truncated field, or trailing bytes (§5.1); the consumer keeps
+/// its previously held label on rejection.
+pub fn decode_session_activity(payload: &[u8]) -> Result<SessionActivity> {
+    let err = || Error::from("malformed SESSION_ACTIVITY payload");
+    if payload.first() != Some(&SESSION_ACTIVITY_FMT) {
+        return Err(err());
+    }
+    let take_str = |off: usize| -> Result<(String, usize)> {
+        let len = *payload.get(off).ok_or_else(err)? as usize;
+        let end = off + 1 + len;
+        let bytes = payload.get(off + 1..end).ok_or_else(err)?;
+        Ok((String::from_utf8_lossy(bytes).into_owned(), end))
+    };
+    let (process, off) = take_str(1)?;
+    let (title, end) = take_str(off)?;
+    if end != payload.len() {
+        return Err(err());
+    }
+    Ok(SessionActivity { process, title })
 }
 
 /// Mask a received [`CAP_KITTY_KEYBOARD`] payload to the valid low-5-bit flag
@@ -678,6 +759,50 @@ mod tests {
         // registry ids (13/14) pins the released-band placement with them.
         assert_eq!(CAP_SERVER_IDENT, 13);
         assert_eq!(CAP_SERVER_STATE, 14);
+        assert_eq!(CAP_SESSION_ACTIVITY, 15);
+    }
+
+    #[test]
+    fn session_activity_roundtrips_labels_and_rejects_malformed() {
+        let a = SessionActivity {
+            process: "vim".into(),
+            title: "~/notes".into(),
+        };
+        let cap = encode_session_activity(&a);
+        assert_eq!(cap.id, CAP_SESSION_ACTIVITY);
+        assert_eq!(decode_session_activity(&cap.payload).unwrap(), a);
+        assert_eq!(a.label(), "~/notes \u{b7} vim");
+        assert_eq!(
+            SessionActivity {
+                process: "fish".into(),
+                title: String::new()
+            }
+            .label(),
+            "fish"
+        );
+        assert_eq!(SessionActivity::default().label(), "");
+        // Empty fields encode to the 3-byte minimum and decode back.
+        let empty = encode_session_activity(&SessionActivity::default());
+        assert_eq!(empty.payload, vec![1, 0, 0]);
+        assert_eq!(decode_session_activity(&empty.payload).unwrap(), SessionActivity::default());
+        // Truncation at every cut, trailing bytes, and a future fmt are rejected.
+        for cut in 0..cap.payload.len() {
+            assert!(decode_session_activity(&cap.payload[..cut]).is_err(), "cut={cut}");
+        }
+        let mut trailing = cap.payload.clone();
+        trailing.push(0);
+        assert!(decode_session_activity(&trailing).is_err());
+        let mut future = cap.payload.clone();
+        future[0] = 2;
+        assert!(decode_session_activity(&future).is_err());
+        // Over-long fields are clamped on a char boundary, never split.
+        let long = SessionActivity {
+            process: "é".repeat(100),
+            title: String::new(),
+        };
+        let decoded = decode_session_activity(&encode_session_activity(&long).payload).unwrap();
+        assert_eq!(decoded.process.len(), 128);
+        assert_eq!(decoded.process.chars().count(), 64);
     }
 
     #[test]
