@@ -253,7 +253,29 @@ pub fn default_title() -> Option<String> {
     } else {
         short_host(dest.rsplit_once('@').map_or(dest, |(_, h)| h))
     };
-    Some(format!("{host}:{session}"))
+    Some(format!("{host}:{}", short_session(session)))
+}
+
+/// A `[group/]name` for the title: an auto-generated UUID name (what clown
+/// and other spawners hand `posh start`, and the FDR 0011 `:+` form) is cut
+/// to its first 8 hex digits, git-abbreviation style — `flac:ff9fe216`
+/// rather than a 36-character id — while any other name is kept whole.
+/// Until the RFC 0013 §5 activity label rides frames (it reaches only the
+/// unattached listing today), the name is all an attached viewport knows.
+fn short_session(scoped: &str) -> String {
+    let (group, name) = match scoped.rsplit_once('/') {
+        Some((g, n)) => (Some(g), n),
+        None => (None, scoped),
+    };
+    let is_uuid = name.len() == 36
+        && name
+            .char_indices()
+            .all(|(i, c)| if matches!(i, 8 | 13 | 18 | 23) { c == '-' } else { c.is_ascii_hexdigit() });
+    let name = if is_uuid { &name[..8] } else { name };
+    match group {
+        Some(g) => format!("{g}/{name}"),
+        None => name.to_string(),
+    }
 }
 
 /// `box.example.com` → `box`; a bracketed / numeric address is kept whole.
@@ -381,6 +403,14 @@ mod tests {
         set_current(&target_for(None, None, "dev"));
         let local = default_title().unwrap();
         assert!(local.ends_with(":dev") && local.len() > 4, "{local}");
+        // An auto-generated UUID name is abbreviated, group kept; a look-alike
+        // that is not a UUID (wrong length / a non-hex digit) stays whole.
+        set_current(&target_for(Some("box"), None, "ff9fe216-9652-4e23-805c-6f4dd5ce7eca"));
+        assert_eq!(default_title().as_deref(), Some("box:ff9fe216"));
+        set_current(&target_for(Some("box"), Some("grp"), "ff9fe216-9652-4e23-805c-6f4dd5ce7eca"));
+        assert_eq!(default_title().as_deref(), Some("box:grp/ff9fe216"));
+        set_current(&target_for(Some("box"), None, "ff9fe216-9652-4e23-805c-6f4dd5ce7ecz"));
+        assert_eq!(default_title().as_deref(), Some("box:ff9fe216-9652-4e23-805c-6f4dd5ce7ecz"));
     }
 
     /// Picker rows carry targets that `ph_parse` routes exactly as the typed

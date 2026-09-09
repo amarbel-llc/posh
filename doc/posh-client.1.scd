@@ -35,8 +35,9 @@ or program sets (OSC 0/1/2) is re-asserted on attach and on every full
 repaint, and changes — including a deliberate clear — propagate on the next
 paint. A session that has set no title of its own is shown as
 _host_*:*_session_ (the host as typed, minus any user and domain; this
-machine's hostname for a local attach), so attaching to, or switching into,
-an untitled session never leaves the previous title standing.
+machine's hostname for a local attach; an auto-generated UUID session name
+abbreviated to its first eight hex digits), so attaching to, or switching
+into, an untitled session never leaves the previous title standing.
 
 # OPTIONS
 
