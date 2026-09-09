@@ -655,11 +655,16 @@ pub(crate) fn mux_peer_loop(
                 }
             }
             let mut exit_payload: Option<Vec<u8>> = None;
+            // posh#194: the daemon's `Tag::ExitCause` precedes its Exit.
+            let mut exit_cause: Option<caps::SessionEnd> = None;
             // FDR 0012 §3.1: a daemon Tag::Switch captured here, re-homed
             // AFTER the read loop (so we do not replace b.link mid-iteration).
             let mut switch_to: Option<Vec<u8>> = None;
             while let Ok(Some(rec)) = b.daemon.link.read.next() {
                 match rec.tag {
+                    ipc::Tag::ExitCause => {
+                        exit_cause = caps::decode_exit_cause(&rec.payload);
+                    }
                     ipc::Tag::Frame => {
                         let Ok(frame) = crate::remote::sync::ServerFrame::decode(&rec.payload)
                         else {
@@ -701,6 +706,33 @@ pub(crate) fn mux_peer_loop(
                         eof = true;
                     }
                     ipc::Tag::Exit => {
+                        // The session ended: a FLAG_SHUTDOWN frame with the
+                        // exit status (when the client advertised it, RFC
+                        // 0001 §3) and the cause (posh#194) goes out AHEAD of
+                        // the channel close — relay `send_shutdown` parity —
+                        // so the client ends as "session ended", not as a
+                        // channel lost. The close still carries the raw
+                        // status bytes for an older client.
+                        if conn.has_remote() {
+                            let code = caps::find(&b.content, caps::CAP_EXIT_STATUS)
+                                .and_then(|_| ipc::decode_exit(&rec.payload));
+                            let mut frame = empty_ack_frame(
+                                b.last_frame_num,
+                                b.inbox.next_offset(),
+                                b.echo.ack(),
+                            );
+                            frame.flags = crate::remote::sync::FLAG_SHUTDOWN;
+                            frame.caps = caps::own_table(
+                                &crate::remote::relay::shutdown_caps(code, exit_cause),
+                            );
+                            crate::remote::mux::send_session_wire(
+                                &mut conn,
+                                &mut fragmenter,
+                                b.chan,
+                                crate::remote::mux::SESSION_WIRE_DATA,
+                                &frame.encode(),
+                            );
+                        }
                         exit_payload = Some(rec.payload.clone());
                         eof = true;
                     }
@@ -1237,6 +1269,9 @@ pub(crate) fn server_loop(
     // whether the peer ever advertised understanding the capability.
     let mut exit_status: Option<i32> = None;
     let mut peer_wants_exit = false;
+    // posh#194: the shutdown was the shell's own exit (vs the client's quit),
+    // reported as EXIT_CAUSE on the shutdown frame.
+    let mut shell_ended = false;
     let mut force_ack = false;
     // Set when the shell exits: forces one final frame (with FLAG_SHUTDOWN)
     // that the client must ack before we go away.
@@ -1469,6 +1504,7 @@ pub(crate) fn server_loop(
                 shutdown = true;
                 shutdown_at = now_ms();
                 force_frame = true;
+                shell_ended = true;
                 exit_status = util::try_reap(child.pid).map(util::exit_code);
                 // The whole session is ending: tear down any escape overlay.
                 close_overlay(&mut overlay);
@@ -2298,6 +2334,12 @@ pub(crate) fn server_loop(
                             payload: vec![code.clamp(0, 255) as u8],
                         });
                     }
+                }
+                if shutdown && shell_ended {
+                    extras.push(caps::Cap {
+                        id: caps::CAP_EXIT_CAUSE,
+                        payload: caps::encode_exit_cause(caps::SessionEnd::Exited),
+                    });
                 }
                 // Agent forwarding (FDR 0004): advertise AGENT_FORWARD whenever
                 // the endpoint is up so the peer may begin; emit AGENT_DATA

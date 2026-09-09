@@ -1222,6 +1222,8 @@ fn client_loop(
     let mut sock_write_buf: Vec<u8> = Vec::with_capacity(4096);
     let mut stdout_buf: Vec<u8> = Vec::with_capacity(4096);
     let mut read_buf = FrameBuffer::new();
+    // posh#194: the daemon's `Tag::ExitCause`, read just ahead of its Exit.
+    let mut exit_cause: Option<caps::SessionEnd> = None;
     // Socket byte counters for the `[stats]` bandwidth fields (posh#171).
     let (mut bytes_rx, mut bytes_tx) = (0u64, 0u64);
     let mut escape_matcher = EscapeKeyMatcher::default();
@@ -1579,8 +1581,14 @@ fn client_loop(
                                     let _ = util::write_all_retry(STDOUT, &stdout_buf, 1000);
                                 }
                                 let code = ipc::decode_exit(&frame.payload).unwrap_or(0);
-                                crate::picker::note_attach_end(crate::picker::AttachEnd::Ended(code));
+                                crate::picker::note_attach_end(crate::picker::AttachEnd::Ended {
+                                    code,
+                                    cause: exit_cause,
+                                });
                                 break 'client Ok(code);
+                            }
+                            Tag::ExitCause => {
+                                exit_cause = caps::decode_exit_cause(&frame.payload);
                             }
                             Tag::Switch => {
                                 // FDR 0012 (RFC 0008 §3.1): the daemon picked

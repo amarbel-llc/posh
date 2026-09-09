@@ -79,17 +79,28 @@ fn run() -> Result<()> {
 }
 
 /// The front door's last word on an attach nothing followed: a session that
-/// ended hands its shell's exit status out as our own (github #18), a lost
-/// one is named on stderr (nothing else says so once the tty is restored),
-/// and a quit is silent.
+/// ended hands its shell's exit status out as our own (github #18); one the
+/// daemon reported as killed / signaled / failed (posh#194), or one that was
+/// lost, is named on stderr first (nothing else says so once the tty is
+/// restored). A shell's own exit and a quit are silent.
 fn exit_with_attach_end(end: Option<picker::AttachEnd>) -> Result<()> {
-    match end {
-        Some(picker::AttachEnd::Ended(code)) if code != 0 => std::process::exit(code),
-        Some(picker::AttachEnd::Lost(reason)) => {
-            let left = picker::current().unwrap_or_else(|| "session".to_string());
-            eprintln!("posh: session {left} lost ({reason})");
-            Ok(())
+    use posh_proto::caps::SessionEnd;
+    let Some(end) = end else { return Ok(()) };
+    let explained = match &end {
+        picker::AttachEnd::Ended { cause, .. } => {
+            !matches!(cause, None | Some(SessionEnd::Exited))
         }
+        picker::AttachEnd::Lost(_) => true,
+        picker::AttachEnd::Quit => false,
+    };
+    if explained {
+        if let Some(label) = end.label() {
+            let left = picker::current().unwrap_or_else(|| "session".to_string());
+            eprintln!("posh: session {left} {label}");
+        }
+    }
+    match end {
+        picker::AttachEnd::Ended { code, .. } if code != 0 => std::process::exit(code),
         _ => Ok(()),
     }
 }

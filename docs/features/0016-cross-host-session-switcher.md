@@ -111,10 +111,17 @@ quits, and the stack goes with the viewport. A re-dial that fails during an
 automatic pop drops to the shell with both the notice and the failure. With
 no stack to pop, an ended session's exit status is the viewport's own (as
 before) and a lost one is named on one stderr line — no more silent drop to
-the prompt. What the client cannot tell is *why* a session ended beyond its
-exit status (killed by `posh kill` versus a shell `exit`); a daemon-reported
-cause and the picker's handling of a session vanishing while it is open are
-follow-ons.
+the prompt. **The daemon says why** (posh#194): its teardown reports the
+cause — the shell exited, `posh kill`, a signal to the daemon, a daemon
+failure — as an IPC record ahead of the exit status, and the relay / M2
+bridge carry it to the roaming client as `EXIT_CAUSE` (RFC 0001 id 19) on
+the shutdown frame, so the notice reads `session box:dev killed (posh kill)
+— back to flac:s-2` or `… ended (daemon got SIGTERM) …`; a session killed
+from outside with no stack to pop prints that same phrase on stderr. A
+daemon that predates the record leaves the cause unknown and the notice
+falls back to the exit status. Still a follow-on: the picker's handling of a
+session vanishing while it is open, and a next step with an empty stack
+other than exiting.
 
 **The title after a switch.** A viewport titles the outer terminal
 `host:session` for any session that has set no title of its own (both

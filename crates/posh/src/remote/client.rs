@@ -1436,6 +1436,9 @@ struct ClientState {
     /// Remote session exit code from the EXIT_STATUS capability on the
     /// shutdown frame; 0 against baseline servers or on user-quit.
     exit_status: i32,
+    /// Why the session ended (EXIT_CAUSE on the shutdown frame, posh#194);
+    /// `None` when the far end did not say.
+    exit_cause: Option<caps::SessionEnd>,
     /// (applied_num, server_term generation) at the last compose, plus
     /// whether any overlay was live then — the idle fast-path key. github #35.
     last_render_state: (u64, u64),
@@ -1636,6 +1639,7 @@ fn client_loop(
         shutdown_requested_at: 0,
         shutdown_seen: false,
         exit_status: 0,
+        exit_cause: None,
         last_render_state: (u64::MAX, u64::MAX),
         last_render_overlays: false,
         last_painted_gen: 0,
@@ -1942,9 +1946,15 @@ fn drive_client(st: &mut ClientState, raw: &RawMode, port: u16) -> Result<i32> {
                             )));
                         }
                         // FDR 0016 auto-pop: an established channel closing
-                        // under us is a LOST session unless we asked to leave.
-                        crate::picker::note_attach_end(if st.shutdown_requested {
+                        // under us is a LOST session unless we asked to leave
+                        // — or the daemon's exit status rode the close (a
+                        // pre-posh#194 bridge sends the raw `Tag::Exit` bytes
+                        // and no shutdown frame): then the session ENDED.
+                        let end = if st.shutdown_requested || st.shutdown_seen {
                             crate::picker::AttachEnd::Quit
+                        } else if let Some(code) = crate::session::ipc::decode_exit(&payload) {
+                            st.exit_status = code;
+                            crate::picker::AttachEnd::Ended { code, cause: None }
                         } else {
                             let why = String::from_utf8_lossy(&payload);
                             crate::picker::AttachEnd::Lost(if why.trim().is_empty() {
@@ -1952,7 +1962,10 @@ fn drive_client(st: &mut ClientState, raw: &RawMode, port: u16) -> Result<i32> {
                             } else {
                                 format!("mux channel closed: {}", why.trim())
                             })
-                        });
+                        };
+                        if !st.shutdown_seen {
+                            crate::picker::note_attach_end(end);
+                        }
                         break 'client Ok(st.exit_status);
                     }
                     Rx::Frame(bytes) => {
@@ -2179,7 +2192,10 @@ fn drive_client(st: &mut ClientState, raw: &RawMode, port: u16) -> Result<i32> {
             crate::picker::note_attach_end(if st.shutdown_requested {
                 crate::picker::AttachEnd::Quit
             } else {
-                crate::picker::AttachEnd::Ended(st.exit_status)
+                crate::picker::AttachEnd::Ended {
+                    code: st.exit_status,
+                    cause: st.exit_cause,
+                }
             });
             break 'client Ok(st.exit_status);
         }
@@ -2719,6 +2735,10 @@ fn process_frame(st: &mut ClientState, frame: &ServerFrame) -> bool {
             if let Some(&code) = cap.payload.first() {
                 st.exit_status = code as i32;
             }
+        }
+        // EXIT_CAUSE (posh#194): why, when the far end knew.
+        if let Some(cap) = caps::find(&frame.caps, caps::CAP_EXIT_CAUSE) {
+            st.exit_cause = caps::decode_exit_cause(&cap.payload);
         }
     }
     // Evolved-predictor remote metrics (RFC 0007 §3): the server attaches
@@ -4681,6 +4701,7 @@ mod tests {
             shutdown_requested_at: 0,
             shutdown_seen: false,
             exit_status: 0,
+        exit_cause: None,
             last_render_state: (u64::MAX, u64::MAX),
             last_render_overlays: false,
             last_painted_gen: 0,

@@ -57,6 +57,12 @@ pub enum Tag {
     /// connection (RFC 0008 §3.1). A client that predates this tag ignores
     /// it — a visible no-op, never an error.
     Switch = 17,
+    /// Daemon -> client, immediately BEFORE [`Tag::Exit`]: why the session is
+    /// ending (posh#194) — a `posh_proto::caps::encode_exit_cause` payload
+    /// (shell exit, `posh kill`, a signal, a daemon failure). Its own record
+    /// rather than a longer `Exit` payload so a client that predates it keeps
+    /// decoding the 4-byte exit status; such a client skips this tag.
+    ExitCause = 18,
 }
 
 impl Tag {
@@ -80,6 +86,7 @@ impl Tag {
             15 => Tag::ClientCaps,
             16 => Tag::SwitchRequest,
             17 => Tag::Switch,
+            18 => Tag::ExitCause,
             _ => return None,
         })
     }

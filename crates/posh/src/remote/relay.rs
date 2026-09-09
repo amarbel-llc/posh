@@ -801,6 +801,8 @@ fn relay_loop(
     // the final `FLAG_SHUTDOWN` frame and the heartbeat Empty frame (an Empty body
     // advances no apply state). Viewport-side: the ceiling a re-home resumes above.
     let mut last_frame_num = 0u64;
+    // posh#194: the daemon's `Tag::ExitCause`, held for the shutdown frame.
+    let mut exit_cause: Option<caps::SessionEnd> = None;
     // The ms clock of the held frame's last (re)send — also the heartbeat's
     // last-send clock, exactly as `server.rs` shares one `last_send` for
     // retransmit + heartbeat. (The held frame itself lives on `leg`.)
@@ -1195,6 +1197,11 @@ fn relay_loop(
                                     enveloped,
                                 );
                             }
+                            Tag::ExitCause => {
+                                // posh#194: why the session is ending, ahead of
+                                // Exit; forwarded on the shutdown frame.
+                                exit_cause = caps::decode_exit_cause(&frame.payload);
+                            }
                             Tag::Exit => {
                                 // Session over: tell the UDP client and wind down.
                                 let code = ipc::decode_exit(&frame.payload);
@@ -1205,6 +1212,7 @@ fn relay_loop(
                                     echo.ack(),
                                     last_frame_num,
                                     code,
+                                    exit_cause,
                                     enveloped,
                                 );
                                 return Ok(());
@@ -1411,6 +1419,7 @@ fn relay_loop(
                 echo.ack(),
                 last_frame_num,
                 None,
+                None,
                 enveloped,
             );
             return Ok(());
@@ -1512,9 +1521,10 @@ fn send_empty(
 }
 
 /// Send the UDP client a final `FLAG_SHUTDOWN` frame (Empty body), carrying the
-/// exit-status cap when the daemon reported one. Reuses `frame_num` (the last
-/// forwarded number) — an Empty body advances no apply state, so the client
-/// accepts it as the quit signal.
+/// exit-status and exit-cause caps when the daemon reported them. Reuses
+/// `frame_num` (the last forwarded number) — an Empty body advances no apply
+/// state, so the client accepts it as the quit signal.
+#[allow(clippy::too_many_arguments)]
 fn send_shutdown(
     conn: &mut Connection,
     fragmenter: &mut Fragmenter,
@@ -1522,27 +1532,40 @@ fn send_shutdown(
     echo_ack: u64,
     frame_num: u64,
     exit_code: Option<i32>,
+    exit_cause: Option<caps::SessionEnd>,
     enveloped: bool,
 ) {
     if !conn.has_remote() {
         return;
     }
-    let extras: Vec<Cap> = match exit_code {
-        Some(code) => vec![Cap {
-            id: caps::CAP_EXIT_STATUS,
-            payload: vec![code.clamp(0, 255) as u8],
-        }],
-        None => Vec::new(),
-    };
     let frame = ServerFrame {
         flags: FLAG_SHUTDOWN,
-        caps: caps::own_table(&extras),
+        caps: caps::own_table(&shutdown_caps(exit_code, exit_cause)),
         frame_num,
         input_ack: inbox.next_offset(),
         echo_ack,
         body: FrameBody::Empty,
     };
     send_payload(conn, fragmenter, &frame.encode(), enveloped);
+}
+
+/// The shutdown frame's extras: `EXIT_STATUS` (RFC 0001 §3) and, when the
+/// daemon said why, `EXIT_CAUSE` (posh#194). Shared with the M2 bridge.
+pub(crate) fn shutdown_caps(exit_code: Option<i32>, exit_cause: Option<caps::SessionEnd>) -> Vec<Cap> {
+    let mut extras = Vec::new();
+    if let Some(code) = exit_code {
+        extras.push(Cap {
+            id: caps::CAP_EXIT_STATUS,
+            payload: vec![code.clamp(0, 255) as u8],
+        });
+    }
+    if let Some(cause) = exit_cause {
+        extras.push(Cap {
+            id: caps::CAP_EXIT_CAUSE,
+            payload: caps::encode_exit_cause(cause),
+        });
+    }
+    extras
 }
 
 /// Which periodic frames the relay loop should emit this iteration.
@@ -1655,6 +1678,22 @@ mod tests {
         );
         assert!(caps::find(&table, CAP_PROTOCOL_VERSION).is_some());
         assert!(caps::find(&table, CAP_SCROLLBACK).is_some());
+    }
+
+    /// posh#194: the shutdown frame's extras carry the status only when the
+    /// daemon reported one, and the cause only when it said why — each
+    /// absent entry means "unknown" to the client, never a made-up value.
+    #[test]
+    fn shutdown_caps_carry_status_and_cause_only_when_known() {
+        assert!(shutdown_caps(None, None).is_empty());
+        let both = shutdown_caps(Some(300), Some(caps::SessionEnd::Killed));
+        assert_eq!(caps::find(&both, caps::CAP_EXIT_STATUS).unwrap().payload, vec![255], "clamped");
+        assert_eq!(
+            caps::decode_exit_cause(&caps::find(&both, caps::CAP_EXIT_CAUSE).unwrap().payload),
+            Some(caps::SessionEnd::Killed)
+        );
+        let status_only = shutdown_caps(Some(1), None);
+        assert!(caps::find(&status_only, caps::CAP_EXIT_CAUSE).is_none());
     }
 
     #[test]

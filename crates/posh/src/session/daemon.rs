@@ -989,7 +989,7 @@ fn daemon_main(
         let _ = l.set_nonblocking(true);
     }
 
-    daemon_loop(
+    let end = daemon_loop(
         &listener,
         status_listener.as_ref(),
         name,
@@ -1019,10 +1019,13 @@ fn daemon_main(
     let status = reaped.unwrap_or_else(|| util::reap(child.pid));
     util::close_fd(child.master);
     let code = util::exit_code(status);
-    // Tell attached clients the real status before hanging up (their EOF
-    // is the detach notice). Best-effort: a stuck client cannot block
-    // teardown. github #18.
+    // Tell attached clients WHY (posh#194; its own record ahead of Exit, so
+    // an older client just skips it) and the real status before hanging up
+    // (their EOF is the detach notice). Best-effort: a stuck client cannot
+    // block teardown. github #18.
+    let cause = caps::encode_exit_cause(end);
     for c in clients.iter_mut() {
+        ipc::append_frame(&mut c.write_buf, Tag::ExitCause, &cause);
         ipc::append_frame(&mut c.write_buf, Tag::Exit, &ipc::encode_exit(code));
         let _ = util::write_all_retry(c.stream.as_raw_fd(), &c.write_buf, 100);
     }
@@ -1088,7 +1091,7 @@ fn daemon_loop(
     info_cmd: &str,
     cwd: &str,
     mut recorder: Option<SessionRecorder>,
-) {
+) -> caps::SessionEnd {
     let listener_fd = listener.as_raw_fd();
     let pty_fd = child.master;
     let mut has_pty_output = false;
@@ -1107,7 +1110,9 @@ fn daemon_loop(
     let mut activity_probe_at: u64 = 0;
     let mut activity_process = String::new();
 
-    'daemon: loop {
+    // Why the loop ended (posh#194): reported to attached clients as the
+    // `Tag::ExitCause` record ahead of `Tag::Exit`.
+    let end = 'daemon: loop {
         if util::take_flag(&util::SIGTERM_RECEIVED) {
             let signo = util::LAST_SIGNAL.load(std::sync::atomic::Ordering::Acquire);
             util::log_write(
@@ -1117,7 +1122,7 @@ fn daemon_loop(
                     util::signal_name(signo)
                 ),
             );
-            break;
+            break 'daemon caps::SessionEnd::Signaled(signo.clamp(0, 255) as u8);
         }
 
         // Backlog growth breadcrumb (posh#131 sibling diagnosis): one line per
@@ -1201,7 +1206,7 @@ fn daemon_loop(
             Err(e) if e.kind() == std::io::ErrorKind::Interrupted => continue,
             Err(e) => {
                 util::log_write("error", &format!("poll failed: {e}"));
-                break;
+                break 'daemon caps::SessionEnd::Failed;
             }
         }
 
@@ -1257,7 +1262,7 @@ fn daemon_loop(
         // New client connections.
         if fds[0].revents & err_events != 0 {
             util::log_write("error", "server socket error");
-            break;
+            break 'daemon caps::SessionEnd::Failed;
         }
         // RFC 0014 §4.1: answer status readers — connect → response → close.
         if let Some(l) = status.filter(|_| fds[status_idx].revents & libc::POLLIN != 0) {
@@ -1329,7 +1334,7 @@ fn daemon_loop(
             match util::read_fd(pty_fd, &mut buf) {
                 Ok(0) => {
                     util::log_write("info", "shell exited");
-                    break;
+                    break 'daemon caps::SessionEnd::Exited;
                 }
                 Ok(n) => {
                     let mut bcast = Vec::with_capacity(n);
@@ -1384,7 +1389,7 @@ fn daemon_loop(
                 Err(_) => {
                     // EIO on Linux when the slave side is gone.
                     util::log_write("info", "pty closed");
-                    break;
+                    break 'daemon caps::SessionEnd::Exited;
                 }
             }
         }
@@ -1528,7 +1533,7 @@ fn daemon_loop(
                                     detach_all = true;
                                     break;
                                 }
-                                Tag::Kill => break 'daemon,
+                                Tag::Kill => break 'daemon caps::SessionEnd::Killed,
                                 Tag::Info => {
                                     // RFC 0013 §5 activity label: the pty's
                                     // foreground-process command plus the
@@ -1593,7 +1598,12 @@ fn daemon_loop(
                                 // Output, Ack, Exit, Frame, and Switch are all
                                 // daemon->client only; ignore if received from
                                 // a client.
-                                Tag::Output | Tag::Ack | Tag::Exit | Tag::Frame | Tag::Switch => {}
+                                Tag::Output
+                                | Tag::Ack
+                                | Tag::Exit
+                                | Tag::ExitCause
+                                | Tag::Frame
+                                | Tag::Switch => {}
                             }
                         }
                     }
@@ -1759,7 +1769,7 @@ fn daemon_loop(
                 }
             }
         }
-    }
+    };
 
     // Tear down any escape overlay before the shell/session cleanup (FDR 0008).
     close_overlay(&mut overlay);
@@ -1769,6 +1779,7 @@ fn daemon_loop(
     if let Some(mut rec) = recorder {
         let _ = rec.finish();
     }
+    end
 }
 
 #[cfg(test)]

@@ -151,6 +151,75 @@ pub const CAP_CLIENT_STATE: u8 = 17;
 /// text, once on `Tag::Init`, so the inner daemon can show what the outer
 /// session is viewed through. Expected to be subsumed by FDR 0012.
 pub const CAP_CLIENT_UPSTREAM: u8 = 18;
+/// Why the session ended (posh#194): server entry on shutdown-flagged
+/// frames, next to `EXIT_STATUS` — an encoded [`SessionEnd`], so a viewport
+/// can tell a shell `exit` from a `posh kill` or a signaled daemon. Sent
+/// only when the origin knew (a daemon end reaches the roaming client
+/// through the relay / bridge unchanged). Display only.
+pub const CAP_EXIT_CAUSE: u8 = 19;
+
+/// Why a session ended, as its daemon (or a standalone server) knew it.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum SessionEnd {
+    /// The shell (the session's command) exited on its own.
+    Exited,
+    /// `posh kill` (the daemon received a kill request).
+    Killed,
+    /// The daemon was signaled (SIGTERM / SIGINT / SIGHUP …) and shut down.
+    Signaled(u8),
+    /// The daemon failed internally (its poll / listening socket broke).
+    Failed,
+}
+
+impl SessionEnd {
+    /// The short human phrase a notice uses: `killed (posh kill)`,
+    /// `ended (daemon got SIGTERM)`, … — `exit_code` completes the shell
+    /// case (`ended (exit 1)`).
+    pub fn label(self, exit_code: i32) -> String {
+        match self {
+            SessionEnd::Exited => format!("ended (exit {exit_code})"),
+            SessionEnd::Killed => "killed (posh kill)".to_string(),
+            SessionEnd::Signaled(signo) => {
+                format!("ended (daemon got {})", signal_name(signo))
+            }
+            SessionEnd::Failed => "ended (daemon failed)".to_string(),
+        }
+    }
+}
+
+fn signal_name(signo: u8) -> String {
+    match signo {
+        1 => "SIGHUP".to_string(),
+        2 => "SIGINT".to_string(),
+        9 => "SIGKILL".to_string(),
+        15 => "SIGTERM".to_string(),
+        n => format!("signal {n}"),
+    }
+}
+
+/// The `EXIT_CAUSE` payload: a kind byte (1 exited, 2 killed, 3 signaled,
+/// 4 failed), then the signal number for kind 3. The same bytes ride the
+/// session daemon's IPC `ExitCause` record.
+pub fn encode_exit_cause(end: SessionEnd) -> Vec<u8> {
+    match end {
+        SessionEnd::Exited => vec![1],
+        SessionEnd::Killed => vec![2],
+        SessionEnd::Signaled(signo) => vec![3, signo],
+        SessionEnd::Failed => vec![4],
+    }
+}
+
+/// `None` for an unknown kind (a newer origin), so the reader keeps saying
+/// only what it knows.
+pub fn decode_exit_cause(payload: &[u8]) -> Option<SessionEnd> {
+    Some(match payload {
+        [1, ..] => SessionEnd::Exited,
+        [2, ..] => SessionEnd::Killed,
+        [3, signo, ..] => SessionEnd::Signaled(*signo),
+        [4, ..] => SessionEnd::Failed,
+        _ => return None,
+    })
+}
 
 /// The static identity a server reports under [`CAP_SERVER_IDENT`]: what the
 /// operator's `posh version` would print on the far host, plus the process
@@ -891,6 +960,28 @@ mod tests {
         // Absent / malformed (wrong length) ⇒ None (treated as unadvertised).
         assert_eq!(decode_kitty_keyboard(&[]), None);
         assert_eq!(decode_kitty_keyboard(&[1, 2]), None);
+    }
+
+    /// posh#194: the exit cause round-trips, labels itself, and an unknown
+    /// kind (a newer origin) decodes to nothing rather than to a wrong cause.
+    #[test]
+    fn exit_cause_roundtrips_and_labels() {
+        for end in [
+            SessionEnd::Exited,
+            SessionEnd::Killed,
+            SessionEnd::Signaled(15),
+            SessionEnd::Failed,
+        ] {
+            assert_eq!(decode_exit_cause(&encode_exit_cause(end)), Some(end));
+        }
+        assert_eq!(decode_exit_cause(&[]), None);
+        assert_eq!(decode_exit_cause(&[9]), None);
+        assert_eq!(decode_exit_cause(&[3]), None, "a signaled kind needs its number");
+        assert_eq!(SessionEnd::Exited.label(1), "ended (exit 1)");
+        assert_eq!(SessionEnd::Killed.label(129), "killed (posh kill)");
+        assert_eq!(SessionEnd::Signaled(15).label(143), "ended (daemon got SIGTERM)");
+        assert_eq!(SessionEnd::Signaled(31).label(0), "ended (daemon got signal 31)");
+        assert_eq!(SessionEnd::Failed.label(0), "ended (daemon failed)");
     }
 
     #[test]

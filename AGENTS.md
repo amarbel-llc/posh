@@ -264,7 +264,19 @@ the `eng-*(7)` manpages — read them with `man eng-versioning`,
   `session X ended (exit N) — back to Y` notice that `first_frame` /
   `run_interactive` show with the kill notice. `Quit` never pops. With no
   stack, `Ended` becomes the process exit status (the entry points no longer
-  `process::exit` themselves) and `Lost` prints one stderr line.
+  `process::exit` themselves) and `Lost` prints one stderr line. **The
+  cause travels (posh#194):** `daemon_loop` returns a
+  `posh_proto::caps::SessionEnd` (exited / killed / signaled / failed) that
+  teardown sends as `Tag::ExitCause` (ipc 18) ahead of `Tag::Exit`; the
+  relay forwards it as `CAP_EXIT_CAUSE` (id 19, `relay::shutdown_caps`) on
+  its shutdown frame, and the M2 bridge now sends a `FLAG_SHUTDOWN` frame
+  (status + cause) BEFORE the channel close — before this the bridge closed
+  with the raw `Tag::Exit` bytes as the close payload and the roaming
+  client's `exit_status` stayed 0 over mux; the client still decodes such a
+  4-byte close from an older bridge as `Ended`. `AttachEnd::label` /
+  `SessionEnd::label` phrase it (`killed (posh kill)`), and
+  `exit_with_attach_end` prints a killed / signaled / failed / lost end on
+  stderr when nothing pops.
   The attach entry points record the session they sit in with
   `picker::set_current`, which also feeds `picker::default_title`: a
   session that set no title of its own is shown as `host:session` on the

@@ -298,12 +298,30 @@ pub fn take_switch() -> Option<Switch> {
 /// the session under it).
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum AttachEnd {
-    /// The session itself ended: its shell exited with this status.
-    Ended(i32),
+    /// The session itself ended — its shell exited with this status, or its
+    /// daemon was told to go (`cause`, when the daemon said; posh#194).
+    Ended {
+        code: i32,
+        cause: Option<posh_proto::caps::SessionEnd>,
+    },
     /// The attach lost the session without being asked to leave (the reason).
     Lost(String),
     /// The user quit or detached (a signal counts), or a switch ended it.
     Quit,
+}
+
+impl AttachEnd {
+    /// The notice phrase: `ended (exit 1)`, `killed (posh kill)`, `ended
+    /// (daemon got SIGTERM)`, `lost (mux channel closed)`; `None` for a quit.
+    pub fn label(&self) -> Option<String> {
+        Some(match self {
+            AttachEnd::Ended { code, cause } => cause
+                .unwrap_or(posh_proto::caps::SessionEnd::Exited)
+                .label(*code),
+            AttachEnd::Lost(reason) => format!("lost ({reason})"),
+            AttachEnd::Quit => return None,
+        })
+    }
 }
 
 static ATTACH_END: Mutex<Option<AttachEnd>> = Mutex::new(None);
@@ -333,8 +351,7 @@ pub fn take_pending_notice() -> Option<String> {
 /// `None` when nothing is to be popped.
 pub fn auto_pop(end: Option<&AttachEnd>) -> Option<Switch> {
     let why = match end? {
-        AttachEnd::Ended(code) => format!("ended (exit {code})"),
-        AttachEnd::Lost(reason) => format!("lost ({reason})"),
+        AttachEnd::Ended { .. } | AttachEnd::Lost(_) => end?.label()?,
         AttachEnd::Quit => return None,
     };
     let top = stack_top()?;
@@ -668,11 +685,12 @@ mod tests {
         while stack_pop().is_some() {}
         take_pending_notice();
         set_current("box:dev");
-        note_attach_end(AttachEnd::Ended(0));
-        assert_eq!(take_attach_end(), Some(AttachEnd::Ended(0)));
+        let ended = |code: i32| AttachEnd::Ended { code, cause: None };
+        note_attach_end(ended(0));
+        assert_eq!(take_attach_end(), Some(ended(0)));
         assert_eq!(take_attach_end(), None, "one-shot");
         // No stack: nothing to pop, whatever the end.
-        assert_eq!(auto_pop(Some(&AttachEnd::Ended(0))), None);
+        assert_eq!(auto_pop(Some(&ended(0))), None);
         assert_eq!(take_pending_notice(), None);
         stack_push(":s-2");
         // A quit never pops.
@@ -681,13 +699,21 @@ mod tests {
         assert_eq!(take_pending_notice(), None);
         // An ended session pops back (the front door pops the entry on re-dial).
         assert_eq!(
-            auto_pop(Some(&AttachEnd::Ended(1))),
+            auto_pop(Some(&ended(1))),
             Some(Switch { target: ":s-2".into(), previous: Previous::Keep, pop: true })
         );
         let notice = take_pending_notice().unwrap();
         assert!(notice.starts_with("session box:dev ended (exit 1) \u{2014} back to "), "{notice}");
         assert!(notice.ends_with(":s-2"), "a local target names this machine: {notice}");
         assert_eq!(take_pending_notice(), None, "one-shot");
+        // A daemon-reported cause (posh#194) names what happened.
+        use posh_proto::caps::SessionEnd;
+        let killed = AttachEnd::Ended { code: 129, cause: Some(SessionEnd::Killed) };
+        assert!(auto_pop(Some(&killed)).is_some());
+        assert!(take_pending_notice().unwrap().contains("killed (posh kill)"));
+        let signaled = AttachEnd::Ended { code: 143, cause: Some(SessionEnd::Signaled(15)) };
+        assert_eq!(signaled.label().as_deref(), Some("ended (daemon got SIGTERM)"));
+        assert_eq!(AttachEnd::Quit.label(), None);
         assert_eq!(
             auto_pop(Some(&AttachEnd::Lost("mux channel closed".into()))),
             Some(Switch { target: ":s-2".into(), previous: Previous::Keep, pop: true })
