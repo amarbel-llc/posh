@@ -86,6 +86,19 @@ a second question, in the same renderer as a three-command palette:
 - **Switch, kill it even with other viewports attached** — the forced
   form; those viewports are thrown out exactly as `posh kill` does.
 
+**Stacked switching (push / pop).** A switch that *keeps* the session it
+leaves is a **push**: the front door records that session on a stack, and
+the palette gains **Back to `<session>`** (`session.pop`, RFC 0005 §7),
+offered only while the stack has a top, which re-dials the top and pops it.
+So a detour — check on a build, answer a prompt elsewhere — is two palette
+choices: switch (keep), then Back. A switch that kills the session it leaves
+pushes nothing (there is nothing to return to). *Back* asks the same
+keep / kill / force-kill question about the session being left, so a
+one-off session can be discarded on the way back. The stack lives in the
+viewport process — the `run()` re-attach loop — and no longer: quitting posh
+empties it, and each viewport has its own. Depth is unbounded in practice
+(a target string per level).
+
 **The title after a switch.** A viewport titles the outer terminal
 `host:session` for any session that has set no title of its own (both
 clients, on every compose whose model title is empty; a title the session
@@ -191,6 +204,7 @@ re-dial. The UX is identical either way; the user never sees which fired.
 | same-host switch mechanism (follow-on) | FDR 0012 retarget | reuses one transport, no blip, matches the collapse story | the two-path split (retarget + re-dial) costs more than re-dial-everywhere saves |
 | picker host set | local + live mux endpoints (`ph host:` = one host) | the connected set, no per-host ssh fan-out to cold hosts | users routinely want a cold host in the all-hosts picker (add the ssh-config/tailnet union behind a flag) |
 | switch affordance | palette "Switch session…" | one discoverable home, shared with `ph` | a dedicated keybind proves faster than the palette round-trip |
+| session stack scope | per viewport process, in memory | matches the re-attach loop that owns switching; no state to reconcile across viewports | users want `ph -` (back) from a fresh shell, or the stack to survive a viewport exit — persist it under the runtime dir |
 
 ## More Information
 

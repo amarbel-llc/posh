@@ -52,7 +52,11 @@ standing.
 
 *Ctrl-^*
 	Open the command palette — the escape menu. It lists every client-local
-	escape command: the predictive-echo models (_adaptive_, _optimistic_,
+	escape command: switch session (the reachable-session picker, FDR 0016; a
+	switch that keeps the session it leaves pushes it on a per-viewport
+	stack), back to the previous session (offered while that stack has a
+	top; asks the same keep / kill question about the session being left),
+	the predictive-echo models (_adaptive_, _optimistic_,
 	_always_, _never_, plus the evolved-predictor pilot's _controller_ and
 		_from-scratch_, RFC 0007), the client *and* server debug-logging toggles
 	(_POSH_DEBUG_LOG_; the server toggle rides the transport), shell-out on the

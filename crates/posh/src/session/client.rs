@@ -926,7 +926,12 @@ impl FrameRenderer {
 /// label reflecting the current `scroll_opt` state), and Detach (leave the
 /// session running). The remote client's echo/prediction/resync/forensics/agent/
 /// server-log commands are UDP/prediction-only and intentionally omitted.
-fn palette_commands(scroll_opt: bool, coalesce_on: bool, coalesce_available: bool) -> Value {
+fn palette_commands(
+    scroll_opt: bool,
+    coalesce_on: bool,
+    coalesce_available: bool,
+    back_to: Option<&str>,
+) -> Value {
     // Imperative label (the verb is the action), matching the remote palette:
     // enabled now => offer "Disable"; disabled now => offer "Enable".
     let (scroll_opt_name, scroll_opt_enabled) = if scroll_opt {
@@ -938,10 +943,16 @@ fn palette_commands(scroll_opt: bool, coalesce_on: bool, coalesce_available: boo
         // FDR 0016: the palette as picker — list the reachable sessions and
         // switch this viewport to one (detach, then the front door re-attaches).
         json!({ "name": "Switch session…", "action": { "method": "session.list" } }),
+    ];
+    // Stacked switching: *Back* pops the session this viewport left.
+    if let Some(t) = back_to {
+        commands.push(json!({ "name": format!("Back to {t}"), "action": { "method": "session.pop" } }));
+    }
+    commands.extend([
         json!({ "name": "Suspend client", "action": { "method": "client.suspend" } }),
         json!({ "name": "Shell out", "action": { "method": "shell.open" } }),
         json!({ "name": scroll_opt_name, "action": { "method": "render.scroll_opt", "params": { "enabled": scroll_opt_enabled } } }),
-    ];
+    ]);
     // Frame coalescing (posh#137): offer the toggle ONLY when coalescing was
     // negotiated for this connection (`POSH_COALESCE=1`). Under the default-off
     // kill-switch the cap is never advertised and the daemon ignores the toggle,
@@ -987,7 +998,11 @@ fn open_local_palette(
     // current tty size before summoning — else it renders at the size it had
     // when last open, misaligned against a since-resized screen (posh#135).
     p.resize(rows, cols);
-    p.open("Commands", palette_commands(fr.scroll_opt, coalesce_on, coalesce_available));
+    let back_to = crate::picker::stack_top();
+    p.open(
+        "Commands",
+        palette_commands(fr.scroll_opt, coalesce_on, coalesce_available, back_to.as_deref()),
+    );
     fr.set_scroll(0);
     fr.invalidate();
     stdout_buf.extend_from_slice(&fr.recompose(p.screen()));
@@ -1017,6 +1032,9 @@ enum LocalAction {
     /// A picker row was chosen from inside a session: ask what to do with
     /// the session being left (`picker::leave_commands` for this target).
     AskLeave(String),
+    /// *Back* was chosen: ask what to do with the session being left
+    /// (`picker::back_commands`); the target is the stack top named here.
+    AskBack(String),
 }
 
 /// Dispatch a palette selection on the local client. Wire-only effects (Detach,
@@ -1059,6 +1077,25 @@ fn dispatch_local_action(method: &str, params: &Value, sock_write_buf: &mut Vec<
             };
             crate::picker::request_switch(target, previous);
             ipc::append_frame(sock_write_buf, Tag::Detach, b"");
+            LocalAction::None
+        }
+        "session.pop" => {
+            // Stacked switching (FDR 0016): *Back* to the stack's top. The
+            // leave question first when `previous` is absent; then record
+            // the pop and detach like a switch. Nothing to pop: nothing.
+            let previous = params.get("previous").and_then(Value::as_str);
+            let Some(top) = crate::picker::stack_top() else {
+                return LocalAction::None;
+            };
+            if previous.is_none() && crate::picker::current().is_some() {
+                return LocalAction::AskBack(top);
+            }
+            let Some(previous) = crate::picker::Previous::parse(previous) else {
+                return LocalAction::None;
+            };
+            if crate::picker::request_pop(previous).is_some() {
+                ipc::append_frame(sock_write_buf, Tag::Detach, b"");
+            }
             LocalAction::None
         }
         "render.scroll_opt" => {
@@ -1595,7 +1632,7 @@ fn client_loop(
                                     Ok(rows) => {
                                         if let Some(p) = palette.as_mut() {
                                             p.show_picker(
-                                                crate::picker::TITLE,
+                                                &crate::picker::title(),
                                                 crate::picker::rows_json(&rows),
                                                 crate::picker::EMPTY,
                                             );
@@ -1611,6 +1648,16 @@ fn client_loop(
                                     p.open(
                                         &format!("switch to {target}"),
                                         crate::picker::leave_commands(&target, &leaving),
+                                    );
+                                }
+                            }
+                            LocalAction::AskBack(top) => {
+                                if let (Some(p), Some(leaving)) =
+                                    (palette.as_mut(), crate::picker::current())
+                                {
+                                    p.open(
+                                        &format!("back to {top}"),
+                                        crate::picker::back_commands(&leaving),
                                     );
                                 }
                             }
@@ -2581,6 +2628,43 @@ mod tests {
     /// `app.detach`); without one, from inside a session, it asks the leave
     /// question instead. `session.list` is routed to the call site, which
     /// holds the renderer.
+    /// Stacked switching: *Back* with an empty stack does nothing; with a
+    /// top it asks the leave question, and with the answer records a pop and
+    /// detaches. The palette offers *Back to …* only with a top.
+    #[test]
+    fn dispatch_session_pop_asks_then_records_a_pop() {
+        let _g = crate::picker::switch_test_guard();
+        while crate::picker::stack_pop().is_some() {}
+        crate::picker::set_current(":here");
+        let mut buf = Vec::new();
+        assert!(matches!(
+            dispatch_local_action("session.pop", &json!({}), &mut buf),
+            LocalAction::None
+        ));
+        assert!(buf.is_empty(), "nothing to go back to: no detach");
+        crate::picker::stack_push(":prev");
+        assert!(matches!(
+            dispatch_local_action("session.pop", &json!({}), &mut buf),
+            LocalAction::AskBack(t) if t == ":prev"
+        ));
+        assert!(matches!(
+            dispatch_local_action("session.pop", &json!({ "previous": "keep" }), &mut buf),
+            LocalAction::None
+        ));
+        assert_eq!(buf, ipc::encode_frame(Tag::Detach, b""));
+        assert_eq!(
+            crate::picker::take_switch(),
+            Some(crate::picker::Switch {
+                target: ":prev".into(),
+                previous: crate::picker::Previous::Keep,
+                pop: true
+            })
+        );
+        let text = serde_json::to_string(&palette_commands(true, false, false, Some(":prev"))).unwrap();
+        assert!(text.contains("Back to :prev"), "{text}");
+        crate::picker::stack_pop();
+    }
+
     #[test]
     fn dispatch_session_switch_records_target_and_detaches() {
         let _g = crate::picker::switch_test_guard();
@@ -2602,7 +2686,11 @@ mod tests {
         assert_eq!(buf, ipc::encode_frame(Tag::Detach, b""));
         assert_eq!(
             crate::picker::take_switch(),
-            Some(crate::picker::Switch { target: ":dev".into(), previous: crate::picker::Previous::Kill })
+            Some(crate::picker::Switch {
+                target: ":dev".into(),
+                previous: crate::picker::Previous::Kill,
+                pop: false
+            })
         );
         let mut buf = Vec::new();
         assert!(matches!(
@@ -2611,7 +2699,7 @@ mod tests {
         ));
         assert!(buf.is_empty(), "listing sends nothing to the daemon");
         assert!(
-            serde_json::to_string(&palette_commands(true, false, false))
+            serde_json::to_string(&palette_commands(true, false, false, None))
                 .unwrap()
                 .contains("Switch session"),
             "the local palette offers the switcher"
@@ -2678,13 +2766,13 @@ mod tests {
     #[test]
     fn palette_commands_labels_the_scroll_opt_toggle_by_state() {
         let text = |cmds: &Value| serde_json::to_string(cmds).unwrap();
-        let on = palette_commands(true, true, true);
+        let on = palette_commands(true, true, true, None);
         assert!(
             text(&on).contains("Disable scroll-region optimization"),
             "enabled now => offer Disable: {}",
             text(&on)
         );
-        let off = palette_commands(false, true, true);
+        let off = palette_commands(false, true, true, None);
         assert!(
             text(&off).contains("Enable scroll-region optimization"),
             "disabled now => offer Enable: {}",
@@ -2699,20 +2787,20 @@ mod tests {
     #[test]
     fn palette_commands_labels_the_coalesce_toggle_by_state() {
         let text = |cmds: &Value| serde_json::to_string(cmds).unwrap();
-        let on = palette_commands(true, true, true);
+        let on = palette_commands(true, true, true, None);
         assert!(
             text(&on).contains("Frame coalescing: on (disable)"),
             "coalescing on now => offer disable: {}",
             text(&on)
         );
-        let off = palette_commands(true, false, true);
+        let off = palette_commands(true, false, true, None);
         assert!(
             text(&off).contains("Frame coalescing: off (enable)"),
             "coalescing off now => offer enable: {}",
             text(&off)
         );
         // Unavailable (POSH_COALESCE unset ⇒ cap not advertised): no toggle at all.
-        let unavailable = palette_commands(true, false, false);
+        let unavailable = palette_commands(true, false, false, None);
         assert!(
             !text(&unavailable).contains("Frame coalescing"),
             "no coalescing command when unavailable: {}",

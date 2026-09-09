@@ -249,7 +249,12 @@ the `eng-*(7)` manpages — read them with `man eng-versioning`,
   — kill-after-attach, through `session::kill_session` locally or
   `posh kill --unless-attached` over ssh, so a failed switch never destroys
   the session it left and other attached viewports are respected unless
-  forced. The attach entry points record the session they sit in with
+  forced. **Stacked switching:** a keep-switch PUSHES the session it leaves
+  (`picker::stack_push`, done by `run()`), the palettes offer *Back to X*
+  (`session.pop`, `picker::request_pop` / `back_commands`) while
+  `picker::stack_top` is Some, and `run()` pops on a `Switch { pop: true }`;
+  a kill-switch pushes nothing. The stack is process-local to the viewport.
+  The attach entry points record the session they sit in with
   `picker::set_current`, which also feeds `picker::default_title`: a
   session that set no title of its own is shown as `host:session` on the
   outer terminal by both clients (compose-time, a set title wins; a UUID

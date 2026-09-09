@@ -174,30 +174,94 @@ impl Previous {
 /// The second step after a picker row is chosen from INSIDE a session: the
 /// palette asking what to do with the session being left. Each command
 /// re-issues `session.switch` with the same `target` and a `previous`.
+/// Keeping it is a PUSH: the session goes on the stack and *Back* returns
+/// to it (FDR 0016, stacked switching).
 pub fn leave_commands(target: &str, leaving: &str) -> Value {
+    leave_commands_for("session.switch", "Switch", Some(target), leaving)
+}
+
+/// The leave question for *Back* (`session.pop`): the same three fates for
+/// the session being left, re-issued as `session.pop` with a `previous`
+/// (the target is the stack's top, never named by the renderer).
+pub fn back_commands(leaving: &str) -> Value {
+    leave_commands_for("session.pop", "Back", None, leaving)
+}
+
+fn leave_commands_for(method: &str, verb: &str, target: Option<&str>, leaving: &str) -> Value {
     let cmd = |name: String, previous: Previous| {
+        let mut params = json!({ "previous": previous.as_str() });
+        if let Some(t) = target {
+            params["target"] = json!(t);
+        }
         json!({
             "name": name,
-            "action": {
-                "method": "session.switch",
-                "params": { "target": target, "previous": previous.as_str() },
-            },
+            "action": { "method": method, "params": params },
         })
     };
     json!([
-        cmd(format!("Switch, keep {leaving} running"), Previous::Keep),
-        cmd(format!("Switch, kill {leaving} (kept if other viewports are attached)"), Previous::Kill),
-        cmd(format!("Switch, kill {leaving} even with other viewports attached"), Previous::ForceKill),
+        cmd(format!("{verb}, keep {leaving} running"), Previous::Keep),
+        cmd(format!("{verb}, kill {leaving} (kept if other viewports are attached)"), Previous::Kill),
+        cmd(format!("{verb}, kill {leaving} even with other viewports attached"), Previous::ForceKill),
         { "name": "Cancel" },
     ])
 }
 
-/// A recorded switch: the target to re-attach to and what to do with the
-/// session being left.
+/// A recorded switch: the target to re-attach to, what to do with the
+/// session being left, and whether this is a POP (the target came off the
+/// stack; the front door pops it) or a push (the front door pushes the
+/// session being left).
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Switch {
     pub target: String,
     pub previous: Previous,
+    pub pop: bool,
+}
+
+/// The session stack (FDR 0016, stacked switching): the targets a viewport
+/// switched AWAY from in this front-door process, most recent last. A switch
+/// pushes the session it leaves; *Back* pops. Lives as long as the process
+/// — the `run()` re-attach loop — and no longer: leaving posh empties it.
+static STACK: Mutex<Vec<String>> = Mutex::new(Vec::new());
+
+/// The session *Back* would return to, if any.
+pub fn stack_top() -> Option<String> {
+    STACK.lock().unwrap_or_else(|e| e.into_inner()).last().cloned()
+}
+
+pub fn stack_depth() -> usize {
+    STACK.lock().unwrap_or_else(|e| e.into_inner()).len()
+}
+
+/// The picker's heading: [`TITLE`], plus how deep the session stack is when
+/// a *Back* would return somewhere (`sessions · 2 to go back`).
+pub fn title() -> String {
+    match stack_depth() {
+        0 => TITLE.to_string(),
+        1 => format!("{TITLE} \u{b7} 1 to go back"),
+        n => format!("{TITLE} \u{b7} {n} to go back"),
+    }
+}
+
+/// Push the session a switch is leaving (the front door, before the re-dial).
+pub fn stack_push(target: &str) {
+    STACK.lock().unwrap_or_else(|e| e.into_inner()).push(target.to_string());
+}
+
+/// Pop the stack (the front door, when dispatching a *Back*).
+pub fn stack_pop() -> Option<String> {
+    STACK.lock().unwrap_or_else(|e| e.into_inner()).pop()
+}
+
+/// Record a *Back*: the switch target is the stack's top. `None` (nothing
+/// recorded) when the stack is empty.
+pub fn request_pop(previous: Previous) -> Option<String> {
+    let target = stack_top()?;
+    *SWITCH.lock().unwrap_or_else(|e| e.into_inner()) = Some(Switch {
+        target: target.clone(),
+        previous,
+        pop: true,
+    });
+    Some(target)
 }
 
 /// The switch hand-off: a client that dispatched `session.switch` records
@@ -220,6 +284,7 @@ pub fn request_switch(target: &str, previous: Previous) {
     *SWITCH.lock().unwrap_or_else(|e| e.into_inner()) = Some(Switch {
         target: target.to_string(),
         previous,
+        pop: false,
     });
 }
 
@@ -485,9 +550,44 @@ mod tests {
         request_switch("box:dev", Previous::Kill);
         assert_eq!(
             take_switch(),
-            Some(Switch { target: "box:dev".into(), previous: Previous::Kill })
+            Some(Switch { target: "box:dev".into(), previous: Previous::Kill, pop: false })
         );
         assert_eq!(take_switch(), None);
+    }
+
+    /// Stacked switching: a push records the session being left, *Back*
+    /// targets the top (recorded as a pop), and an empty stack records
+    /// nothing. The stack itself is the front door's to push and pop.
+    #[test]
+    fn back_pops_the_stack_and_an_empty_stack_records_nothing() {
+        let _g = switch_test_guard();
+        while stack_pop().is_some() {}
+        assert_eq!(title(), TITLE);
+        assert_eq!(request_pop(Previous::Keep), None, "nothing to go back to");
+        assert_eq!(take_switch(), None);
+        stack_push(":s-1");
+        stack_push("box:dev");
+        assert_eq!(stack_depth(), 2);
+        assert_eq!(title(), "sessions \u{b7} 2 to go back");
+        assert_eq!(stack_top().as_deref(), Some("box:dev"));
+        assert_eq!(request_pop(Previous::Kill).as_deref(), Some("box:dev"));
+        assert_eq!(
+            take_switch(),
+            Some(Switch { target: "box:dev".into(), previous: Previous::Kill, pop: true })
+        );
+        // Recording a pop does not pop: the front door does, when it re-dials.
+        assert_eq!(stack_depth(), 2);
+        assert_eq!(stack_pop().as_deref(), Some("box:dev"));
+        assert_eq!(stack_top().as_deref(), Some(":s-1"));
+        stack_pop();
+        // The back question re-issues session.pop with a previous, no target.
+        let cmds = back_commands(":s-1");
+        let arr = cmds.as_array().unwrap();
+        assert_eq!(arr.len(), 4);
+        assert_eq!(arr[0]["action"]["method"], "session.pop");
+        assert!(arr[0]["action"]["params"].get("target").is_none());
+        assert_eq!(arr[1]["action"]["params"]["previous"], "kill");
+        assert!(arr[0]["name"].as_str().unwrap().starts_with("Back, keep :s-1"));
     }
 
     /// The leave step: three `session.switch` re-issues carrying the chosen

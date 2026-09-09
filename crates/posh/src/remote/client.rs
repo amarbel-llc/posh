@@ -231,7 +231,12 @@ fn set_logging(st: &mut ClientState, enabled: bool, now: u64) {
 /// escape action lives here. The logging entries reflect the current state —
 /// client logging from this process, server logging from the last frame's
 /// FLAG_SERVER_LOG (`server_log_on`).
-fn palette_commands(server_log_on: bool, scroll_opt: bool, debug_banner: bool) -> Value {
+fn palette_commands(
+    server_log_on: bool,
+    scroll_opt: bool,
+    debug_banner: bool,
+    back_to: Option<&str>,
+) -> Value {
     // The live debug banner (FDR 0007): a reverse-video line or two under
     // the connection banner with the transport / echo / time-to-paint gauges,
     // refreshed every DEBUG_BANNER_REFRESH_MS while it is up.
@@ -260,45 +265,53 @@ fn palette_commands(server_log_on: bool, scroll_opt: bool, debug_banner: bool) -
     } else {
         ("Enable scroll-region optimization", true)
     };
-    json!([
+    let mut commands = vec![
         // FDR 0016: the palette as picker — list the reachable sessions and
         // switch this viewport to one (the client ends with a switch outcome
         // and the front door re-attaches).
-        { "name": "Switch session…", "action": { "method": "session.list" } },
-        { "name": "Echo: adaptive", "action": { "method": "echo.set", "params": { "model": "adaptive" } } },
-        { "name": "Echo: optimistic", "action": { "method": "echo.set", "params": { "model": "optimistic" } } },
-        { "name": "Echo: always", "action": { "method": "echo.set", "params": { "model": "always" } } },
-        { "name": "Echo: never", "action": { "method": "echo.set", "params": { "model": "never" } } },
+        json!({ "name": "Switch session…", "action": { "method": "session.list" } }),
+    ];
+    // Stacked switching: *Back* pops the session this viewport switched
+    // away from (kept running), shown only while there is one.
+    if let Some(t) = back_to {
+        commands.push(json!({ "name": format!("Back to {t}"), "action": { "method": "session.pop" } }));
+    }
+    commands.extend([
+        json!({ "name": "Echo: adaptive", "action": { "method": "echo.set", "params": { "model": "adaptive" } } }),
+        json!({ "name": "Echo: optimistic", "action": { "method": "echo.set", "params": { "model": "optimistic" } } }),
+        json!({ "name": "Echo: always", "action": { "method": "echo.set", "params": { "model": "always" } } }),
+        json!({ "name": "Echo: never", "action": { "method": "echo.set", "params": { "model": "never" } } }),
         // RFC 0007 evolved-predictor pilot: select `controller` to turn the GP
         // predictor on (it falls back to the adaptive shadow until it earns the
         // display, §7.1); pick any other Echo entry to turn it back off.
-        { "name": "Echo: controller (evolved GP)", "action": { "method": "echo.set", "params": { "model": "controller" } } },
-        { "name": "Echo: from-scratch (evolved GP)", "action": { "method": "echo.set", "params": { "model": "scratch" } } },
-        { "name": client_log_name, "action": { "method": "logging.set", "params": { "enabled": client_log_enabled } } },
-        { "name": server_log_name, "action": { "method": "logging.set", "params": { "scope": "server", "enabled": server_log_enabled } } },
-        { "name": scroll_opt_name, "action": { "method": "render.scroll_opt", "params": { "enabled": scroll_opt_enabled } } },
-        { "name": banner_name, "action": { "method": "debug.banner", "params": { "enabled": banner_enabled } } },
-        { "name": "Shell out (server)", "action": { "method": "shell.open" } },
-        { "name": "Reset & resync (force redraw)", "action": { "method": "session.resync" } },
-        { "name": "Dump wedge forensics", "action": { "method": "session.forensics" } },
-        { "name": "Show wedge debug info", "action": { "method": "session.debuginfo" } },
+        json!({ "name": "Echo: controller (evolved GP)", "action": { "method": "echo.set", "params": { "model": "controller" } } }),
+        json!({ "name": "Echo: from-scratch (evolved GP)", "action": { "method": "echo.set", "params": { "model": "scratch" } } }),
+        json!({ "name": client_log_name, "action": { "method": "logging.set", "params": { "enabled": client_log_enabled } } }),
+        json!({ "name": server_log_name, "action": { "method": "logging.set", "params": { "scope": "server", "enabled": server_log_enabled } } }),
+        json!({ "name": scroll_opt_name, "action": { "method": "render.scroll_opt", "params": { "enabled": scroll_opt_enabled } } }),
+        json!({ "name": banner_name, "action": { "method": "debug.banner", "params": { "enabled": banner_enabled } } }),
+        json!({ "name": "Shell out (server)", "action": { "method": "shell.open" } }),
+        json!({ "name": "Reset & resync (force redraw)", "action": { "method": "session.resync" } }),
+        json!({ "name": "Dump wedge forensics", "action": { "method": "session.forensics" } }),
+        json!({ "name": "Show wedge debug info", "action": { "method": "session.debuginfo" } }),
         // #false-disconnect: the transport-liveness view — why the "Last contact"
         // banner fired (frame-arrival gaps, heartbeats, retransmits, srtt/rto),
         // distinct from the apply-stall wedge view above.
-        { "name": "Show connection health", "action": { "method": "session.linkinfo" } },
+        json!({ "name": "Show connection health", "action": { "method": "session.linkinfo" } }),
         // RFC 0007: the local-echo prediction state — outcome gauges for every
         // model, plus the live evolution-loop stats (generations, champion,
         // hyphence champion record) when a GP species is selected.
-        { "name": "Show echo prediction stats", "action": { "method": "session.predictinfo" } },
-        { "name": "Show agent-forwarding debug info", "action": { "method": "session.agentinfo" } },
+        json!({ "name": "Show echo prediction stats", "action": { "method": "session.predictinfo" } }),
+        json!({ "name": "Show agent-forwarding debug info", "action": { "method": "session.agentinfo" } }),
         // M2 design revision (2026-08-05): the env-var verification surface —
         // version, connection mode, and every transport gate's RESOLVED value
         // with its source, so "is POSH_X actually affecting this session?"
         // is answerable in-session.
-        { "name": "About / transport info", "action": { "method": "session.aboutinfo" } },
-        { "name": "Suspend client", "action": { "method": "client.suspend" } },
-        { "name": "Quit session", "action": { "method": "app.quit" } },
-    ])
+        json!({ "name": "About / transport info", "action": { "method": "session.aboutinfo" } }),
+        json!({ "name": "Suspend client", "action": { "method": "client.suspend" } }),
+        json!({ "name": "Quit session", "action": { "method": "app.quit" } }),
+    ]);
+    Value::Array(commands)
 }
 
 /// The palette's heading (RFC 0005 `ui.show` `title`): the live link latency
@@ -320,7 +333,9 @@ fn open_palette(st: &mut ClientState) -> bool {
     if st.palette.is_none() {
         st.palette = Palette::spawn(st.rows, st.cols);
     }
-    let commands = palette_commands(st.server_log_on, st.scroll_opt, st.debug_banner);
+    let back_to = crate::picker::stack_top();
+    let commands =
+        palette_commands(st.server_log_on, st.scroll_opt, st.debug_banner, back_to.as_deref());
     let title = palette_title(st.wire.srtt(), st.predict_model, st.echo_escalation.escalated());
     if let Some(p) = st.palette.as_mut() {
         // A persisted (spawned-then-closed) palette is not resized while closed,
@@ -981,7 +996,7 @@ fn dispatch_palette_action(
             match crate::picker::rows(None, &crate::picker::default_group()) {
                 Ok(rows) => {
                     if let Some(p) = st.palette.as_mut() {
-                        p.show_picker(crate::picker::TITLE, crate::picker::rows_json(&rows), crate::picker::EMPTY);
+                        p.show_picker(&crate::picker::title(), crate::picker::rows_json(&rows), crate::picker::EMPTY);
                     }
                 }
                 Err(e) => st.notify.set_message(&format!("session list failed: {e}"), false, now),
@@ -1010,6 +1025,33 @@ fn dispatch_palette_action(
             crate::picker::request_switch(target, previous);
             request_shutdown(st);
             st.notify.set_message(&format!("switching to {target}\u{2026}"), true, now);
+            true
+        }
+        "session.pop" => {
+            // Stacked switching (FDR 0016): *Back* to the session this
+            // viewport switched away from. Without `previous`, ask the leave
+            // question first (the stack top is the target, so the renderer
+            // never names it); with the answer, record the pop and end this
+            // attach like a switch. An empty stack just says so.
+            let previous = params.get("previous").and_then(Value::as_str);
+            let Some(top) = crate::picker::stack_top() else {
+                st.notify.set_message("nothing to go back to", false, now);
+                return false;
+            };
+            if previous.is_none() {
+                if let (Some(p), Some(leaving)) = (st.palette.as_mut(), crate::picker::current()) {
+                    p.open(&format!("back to {top}"), crate::picker::back_commands(&leaving));
+                    return false;
+                }
+            }
+            let Some(previous) = crate::picker::Previous::parse(previous) else {
+                return false;
+            };
+            if crate::picker::request_pop(previous).is_none() {
+                return false;
+            }
+            request_shutdown(st);
+            st.notify.set_message(&format!("back to {top}\u{2026}"), true, now);
             true
         }
         _ => false, // unknown method: the renderer already closed; ignore
@@ -3582,7 +3624,11 @@ mod tests {
         assert!(st.shutdown_requested, "a switch ends this attach");
         assert_eq!(
             crate::picker::take_switch(),
-            Some(crate::picker::Switch { target: "box:dev".into(), previous: crate::picker::Previous::Keep })
+            Some(crate::picker::Switch {
+                target: "box:dev".into(),
+                previous: crate::picker::Previous::Keep,
+                pop: false
+            })
         );
         let mut st = test_state(24, 80);
         assert!(dispatch_palette_action(
@@ -4003,7 +4049,7 @@ mod tests {
 
     #[test]
     fn palette_commands_includes_both_logging_scopes() {
-        let cmds = palette_commands(false, true, false);
+        let cmds = palette_commands(false, true, false, None);
         let arr = cmds.as_array().expect("commands is an array");
         let names: Vec<&str> = arr.iter().filter_map(|c| c["name"].as_str()).collect();
         assert!(
@@ -4048,12 +4094,17 @@ mod tests {
             names.iter().any(|n| n.contains("Disable scroll-region optimization")),
             "scroll-opt disable command missing: {names:?}"
         );
-        let off: Vec<String> = palette_commands(false, false, true)
+        let off: Vec<String> = palette_commands(false, false, true, Some("box:dev"))
             .as_array()
             .unwrap()
             .iter()
             .filter_map(|c| c["name"].as_str().map(String::from))
             .collect();
+        // Stacked switching: *Back* appears right after the switcher, only
+        // while the stack has a top, and names it.
+        assert_eq!(off[1], "Back to box:dev", "{off:?}");
+        assert!(!names.iter().any(|n| n.starts_with("Back to")), "{names:?}");
+        assert_eq!(off.len(), names.len() + 1);
         assert!(
             off.iter().any(|n| n == "Enable scroll-region optimization"),
             "scroll-opt enable command missing when off: {off:?}"

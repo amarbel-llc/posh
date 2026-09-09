@@ -33,9 +33,11 @@ fn main() {
 
 /// One invocation, then the FDR 0016 re-attach loop: an attach that ended
 /// with a picker selection (`session.switch`, recorded by the client through
-/// `picker::request_switch`) is followed by an attach to that target — via
-/// the same routing as typing it to `ph` — until an attach ends without one.
-/// The previous session keeps running detached.
+/// `picker::request_switch`) or a *Back* (`session.pop`) is followed by an
+/// attach to that target — via the same routing as typing it to `ph` — until
+/// an attach ends without one. The session stack (stacked switching): a
+/// switch that KEEPS the session it leaves pushes it; a *Back* pops its
+/// target. A killed session is never pushed (there is nothing to return to).
 fn run() -> Result<()> {
     run_once()?;
     while let Some(sw) = picker::take_switch() {
@@ -49,6 +51,11 @@ fn run() -> Result<()> {
         };
         if let (Some(force), Some(leaving)) = (force, picker::current()) {
             picker::arm_kill(&leaving, force);
+        }
+        if sw.pop {
+            picker::stack_pop();
+        } else if let (None, Some(leaving)) = (force, picker::current()) {
+            picker::stack_push(&leaving);
         }
         let outcome = dispatch_ph(ph_parse(Some(&sw.target)), &picker::default_group());
         if outcome.is_err() {
