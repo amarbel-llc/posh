@@ -4979,6 +4979,38 @@ mod tests {
         assert!(!row_text(&st.last_drawn, 0).starts_with("posh dbg"));
     }
 
+    /// A title set inside the session (OSC 0) rides the daemon's full dump,
+    /// lands in the client model on apply, and is re-emitted to the OUTER
+    /// terminal by the next compose — the whole client half of title
+    /// propagation, on the same frame shape the relay and the mux bridge
+    /// both forward.
+    #[test]
+    fn a_titled_full_frame_repaints_the_outer_title() {
+        let mut st = test_state(5, 40);
+        let mut term = Terminal::with_scrollback(5, 40, 0);
+        term.process(b"\x1b]0;TITLE-TEST\x07hello");
+        let dump = term.dump_vt();
+        assert!(String::from_utf8_lossy(&dump).contains("\x1b]0;TITLE-TEST\x07"), "dump carries OSC 0");
+        let frame = ServerFrame {
+            flags: 0,
+            caps: vec![],
+            frame_num: 1,
+            input_ack: 0,
+            echo_ack: 0,
+            body: FrameBody::Full(dump),
+        };
+        assert!(apply_frame(&mut st, &frame));
+        assert_eq!(st.server_term.title(), "TITLE-TEST", "the client model holds the title");
+        let bytes = compose_frame(&mut st, 0);
+        assert!(
+            String::from_utf8_lossy(&bytes).contains("\x1b]0;TITLE-TEST\x07"),
+            "the paint re-emits the title to the outer terminal"
+        );
+        // A later frame with the same title emits nothing new for it.
+        let bytes = compose_frame(&mut st, 50);
+        assert!(!String::from_utf8_lossy(&bytes).contains("]0;"));
+    }
+
     /// A paint destination that accepts everything, for the gauge tests.
     struct SwallowSink;
 
