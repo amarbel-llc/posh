@@ -99,6 +99,23 @@ viewport process — the `run()` re-attach loop — and no longer: quitting posh
 empties it, and each viewport has its own. Depth is unbounded in practice
 (a target string per level).
 
+**When the top session goes away.** An attach that ends because the session
+*ended* (its shell exited, or it was killed from elsewhere) or was *lost*
+(an established mux channel closed, the local daemon's socket dropped) pops
+on its own: the front door re-dials the stack's top exactly as a *Back,
+keep* would, and the new attach's first frame carries a banner saying why —
+`session box:dev ended (exit 0) — back to flac:s-2`, or `… lost (mux
+channel closed) — back to …`. A quit or detach the user asked for (the
+palette, `Ctrl-^ .`, `Ctrl-\`, a signal) never pops: quitting posh still
+quits, and the stack goes with the viewport. A re-dial that fails during an
+automatic pop drops to the shell with both the notice and the failure. With
+no stack to pop, an ended session's exit status is the viewport's own (as
+before) and a lost one is named on one stderr line — no more silent drop to
+the prompt. What the client cannot tell is *why* a session ended beyond its
+exit status (killed by `posh kill` versus a shell `exit`); a daemon-reported
+cause and the picker's handling of a session vanishing while it is open are
+follow-ons.
+
 **The title after a switch.** A viewport titles the outer terminal
 `host:session` for any session that has set no title of its own (both
 clients, on every compose whose model title is empty; a title the session

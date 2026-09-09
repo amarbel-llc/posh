@@ -1132,12 +1132,10 @@ pub fn run(
     drop(raw);
     eprintln!("\nposh: [client exited]");
     // Carry the remote session's exit status (EXIT_STATUS capability,
-    // RFC 0001 §3) into our own, mirroring the local attach path (#18).
-    match result {
-        Ok(0) => Ok(()),
-        Ok(code) => std::process::exit(code),
-        Err(e) => Err(e),
-    }
+    // RFC 0001 §3) into our own, mirroring the local attach path (#18) — the
+    // front door's `run()` exits with it, after the FDR 0016 stack has had
+    // its say (an ended top session pops back rather than exiting).
+    result.map(|_| ())
 }
 
 /// The M2 (`POSH_MUX_SESSIONS`) entry: the same foreground client —
@@ -1943,6 +1941,18 @@ fn drive_client(st: &mut ClientState, raw: &RawMode, port: u16) -> Result<i32> {
                                 String::from_utf8_lossy(&payload)
                             )));
                         }
+                        // FDR 0016 auto-pop: an established channel closing
+                        // under us is a LOST session unless we asked to leave.
+                        crate::picker::note_attach_end(if st.shutdown_requested {
+                            crate::picker::AttachEnd::Quit
+                        } else {
+                            let why = String::from_utf8_lossy(&payload);
+                            crate::picker::AttachEnd::Lost(if why.trim().is_empty() {
+                                "mux channel closed".to_string()
+                            } else {
+                                format!("mux channel closed: {}", why.trim())
+                            })
+                        });
                         break 'client Ok(st.exit_status);
                     }
                     Rx::Frame(bytes) => {
@@ -2164,10 +2174,17 @@ fn drive_client(st: &mut ClientState, raw: &RawMode, port: u16) -> Result<i32> {
 
         if st.shutdown_seen {
             // Shell exited (or our quit was acknowledged); the final-state
-            // ack went out just above.
+            // ack went out just above. FDR 0016 auto-pop reads WHY: the
+            // session ended on its own, or we asked (quit / switch / signal).
+            crate::picker::note_attach_end(if st.shutdown_requested {
+                crate::picker::AttachEnd::Quit
+            } else {
+                crate::picker::AttachEnd::Ended(st.exit_status)
+            });
             break 'client Ok(st.exit_status);
         }
         if st.shutdown_requested && now.saturating_sub(st.shutdown_requested_at) >= SHUTDOWN_GRACE {
+            crate::picker::note_attach_end(crate::picker::AttachEnd::Quit);
             break 'client Ok(0); // server unreachable; leave anyway
         }
 
@@ -2199,12 +2216,18 @@ fn suspend(st: &mut ClientState, raw: &RawMode) {
 
 /// The first authentic frame: the attach is established. Drop the
 /// pre-connect banner and, when a switch armed a kill of the session this
-/// client left (FDR 0016 kill-after-attach), carry it out now and say so.
+/// client left (FDR 0016 kill-after-attach), carry it out now and say so;
+/// likewise say why an automatic pop brought the viewport here.
 fn first_frame(st: &mut ClientState, now: u64) {
     if st.notify.message().starts_with("Nothing received") {
         st.notify.set_message("", false, now);
     }
-    if let Some(notice) = crate::picker::run_pending_kill() {
+    let notices: Vec<String> = crate::picker::take_pending_notice()
+        .into_iter()
+        .chain(crate::picker::run_pending_kill())
+        .collect();
+    if !notices.is_empty() {
+        let notice = notices.join(" \u{b7} ");
         util::log_write("switch", &notice);
         st.notify.set_message(&notice, false, now);
     }

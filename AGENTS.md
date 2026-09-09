@@ -254,6 +254,17 @@ the `eng-*(7)` manpages — read them with `man eng-versioning`,
   (`session.pop`, `picker::request_pop` / `back_commands`) while
   `picker::stack_top` is Some, and `run()` pops on a `Switch { pop: true }`;
   a kill-switch pushes nothing. The stack is process-local to the viewport.
+  **Auto-pop:** every client loop notes WHY its attach ended
+  (`picker::note_attach_end`: `Ended(status)` on the shutdown / `Tag::Exit`
+  frame, `Lost(reason)` when an established mux channel or the daemon socket
+  closes unasked, `Quit` for a user quit / detach / switch / signal — the
+  local loop's `detaching` flag tells a detach's socket close from a loss);
+  `run()` takes it and, for `Ended` / `Lost` with a stack top,
+  `picker::auto_pop` re-dials the top as a *Back, keep* and leaves a
+  `session X ended (exit N) — back to Y` notice that `first_frame` /
+  `run_interactive` show with the kill notice. `Quit` never pops. With no
+  stack, `Ended` becomes the process exit status (the entry points no longer
+  `process::exit` themselves) and `Lost` prints one stderr line.
   The attach entry points record the session they sit in with
   `picker::set_current`, which also feeds `picker::default_title`: a
   session that set no title of its own is shown as `host:session` on the

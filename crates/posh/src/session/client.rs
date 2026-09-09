@@ -101,8 +101,13 @@ fn run_interactive(stream: UnixStream) -> Result<()> {
     let _ = util::write_fd(STDOUT, &enter);
     // FDR 0016 kill-after-attach: this socket IS the established attach, so
     // a kill armed by a switch runs now; the local client has no banner, so
-    // the notice is logged and printed once the tty is restored.
-    let kill_notice = crate::picker::run_pending_kill();
+    // the notice — and an automatic pop's "session … ended — back to …" —
+    // is logged and printed once the tty is restored.
+    let notices: Vec<String> = crate::picker::take_pending_notice()
+        .into_iter()
+        .chain(crate::picker::run_pending_kill())
+        .collect();
+    let kill_notice = (!notices.is_empty()).then(|| notices.join(" \u{b7} "));
     if let Some(n) = kill_notice.as_deref() {
         util::log_write("switch", n);
     }
@@ -135,13 +140,10 @@ fn run_interactive(stream: UnixStream) -> Result<()> {
     if let Some(n) = kill_notice {
         eprintln!("posh: {n}");
     }
-    // When the session ended (rather than detached), carry the shell's
-    // exit status out as our own. github #18.
-    match result {
-        Ok(code) if code != 0 => std::process::exit(code),
-        Ok(_) => Ok(()),
-        Err(e) => Err(e),
-    }
+    // When the session ended (rather than detached), the shell's exit status
+    // becomes our own (github #18) — `run()` exits with the noted end, after
+    // the FDR 0016 stack has had its say.
+    result.map(|_| ())
 }
 
 pub fn cmd_attach(
@@ -1144,8 +1146,19 @@ fn suspend(raw: &RawMode) {
     let _ = util::write_all_retry(STDOUT, &display::open(), 1000);
 }
 
+/// The daemon socket ended (FDR 0016 auto-pop): a quit when we queued a
+/// detach, else the session is LOST — the daemon died or dropped us.
+fn note_socket_end(detaching: bool, reason: &str) {
+    crate::picker::note_attach_end(if detaching {
+        crate::picker::AttachEnd::Quit
+    } else {
+        crate::picker::AttachEnd::Lost(reason.to_string())
+    });
+}
+
 /// Bridges the tty to the daemon until detach or session end. Returns the
-/// session shell's exit status (0 on detach or connection loss).
+/// session shell's exit status (0 on detach or connection loss), and notes
+/// WHY it ended for the front door (`picker::note_attach_end`).
 /// `enter` is re-written on SIGCONT, when the outer terminal may have
 /// left our alternate screen while we were stopped. `raw` is the tty's raw-mode
 /// guard, borrowed for the palette's Suspend command (temporary restore + re-arm
@@ -1293,6 +1306,12 @@ fn client_loop(
     let mut frame_renderer: Option<FrameRenderer> = None;
     let mut frame_size = (rows, cols);
 
+    // FDR 0016 auto-pop: whether WE asked to leave (a detach was queued —
+    // the key, the palette, a switch, a signal). The daemon answers a detach
+    // by closing the socket, exactly as it does when the session is lost, so
+    // this flag is what tells the two apart when the socket ends.
+    let mut detaching = false;
+
     // The command-palette overlay (FDR 0011 Phase 2.4a): stays None until the
     // user first opens it with Ctrl-^ on a frames-on session, then persists
     // (spawned renderer reused across opens) until loop teardown. A gate-off
@@ -1354,6 +1373,7 @@ fn client_loop(
             // cmd_attach restores the tty on the way out either way.
             ipc::append_frame(&mut sock_write_buf, Tag::Detach, b"");
             let _ = util::write_all_retry(sock_fd, &sock_write_buf, 100);
+            crate::picker::note_attach_end(crate::picker::AttachEnd::Quit);
             break 'client Ok(0);
         }
 
@@ -1484,6 +1504,7 @@ fn client_loop(
                         }
                         if matches!(event, EscapeEvent::Detach { .. }) {
                             ipc::append_frame(&mut sock_write_buf, Tag::Detach, b"");
+                            detaching = true;
                         }
                     }
                 }
@@ -1495,7 +1516,10 @@ fn client_loop(
         // daemon -> stdout
         if fds[1].revents & libc::POLLIN != 0 {
             match read_buf.read_from(sock_fd) {
-                Ok(0) => break 'client Ok(0),
+                Ok(0) => {
+                    note_socket_end(detaching, "daemon closed the connection");
+                    break 'client Ok(0);
+                }
                 Ok(n) => loop {
                     bytes_rx += n as u64;
                     match read_buf.next() {
@@ -1554,7 +1578,9 @@ fn client_loop(
                                 if !stdout_buf.is_empty() {
                                     let _ = util::write_all_retry(STDOUT, &stdout_buf, 1000);
                                 }
-                                break 'client Ok(ipc::decode_exit(&frame.payload).unwrap_or(0));
+                                let code = ipc::decode_exit(&frame.payload).unwrap_or(0);
+                                crate::picker::note_attach_end(crate::picker::AttachEnd::Ended(code));
+                                break 'client Ok(code);
                             }
                             Tag::Switch => {
                                 // FDR 0012 (RFC 0008 §3.1): the daemon picked
@@ -1584,6 +1610,7 @@ fn client_loop(
                     if e.kind() == std::io::ErrorKind::ConnectionReset
                         || e.kind() == std::io::ErrorKind::BrokenPipe =>
                 {
+                    note_socket_end(detaching, "daemon connection reset");
                     break 'client Ok(0);
                 }
                 Err(e) => break 'client Err(e.into()),
@@ -1610,7 +1637,15 @@ fn client_loop(
             if fds[base + 1].revents & libc::POLLIN != 0 {
                 match palette.as_mut().map(Palette::poll_events) {
                     Some(PaletteEvent::Action { method, params }) => {
-                        match dispatch_local_action(&method, &params, &mut sock_write_buf) {
+                        let queued = sock_write_buf.len();
+                        let action = dispatch_local_action(&method, &params, &mut sock_write_buf);
+                        // A detach queued by the palette (Detach, a switch,
+                        // Back) is ours: the socket ending afterwards is a
+                        // quit, not a lost session.
+                        if sock_write_buf[queued..] == ipc::encode_frame(Tag::Detach, b"")[..] {
+                            detaching = true;
+                        }
+                        match action {
                             LocalAction::Suspend => suspend(raw),
                             LocalAction::SetScrollOpt(on) => {
                                 if let Some(fr) = frame_renderer.as_mut() {
@@ -1704,6 +1739,7 @@ fn client_loop(
                     if e.kind() == std::io::ErrorKind::ConnectionReset
                         || e.kind() == std::io::ErrorKind::BrokenPipe =>
                 {
+                    note_socket_end(detaching, "daemon connection reset");
                     break 'client Ok(0);
                 }
                 Err(e) => break 'client Err(e.into()),
@@ -1721,6 +1757,7 @@ fn client_loop(
         }
 
         if fds[1].revents & err_events != 0 {
+            note_socket_end(detaching, "daemon connection closed");
             break 'client Ok(0);
         }
 

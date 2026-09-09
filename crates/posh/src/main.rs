@@ -38,9 +38,18 @@ fn main() {
 /// an attach ends without one. The session stack (stacked switching): a
 /// switch that KEEPS the session it leaves pushes it; a *Back* pops its
 /// target. A killed session is never pushed (there is nothing to return to).
+/// An attach that ends because its session ENDED or was LOST — not a quit or
+/// detach the user asked for — pops on its own (`picker::auto_pop`): the
+/// viewport returns to the session under it, with a banner saying why. With
+/// nothing to pop, the ended session's exit status becomes the process's,
+/// and a lost one is reported on stderr.
 fn run() -> Result<()> {
     run_once()?;
-    while let Some(sw) = picker::take_switch() {
+    loop {
+        let end = picker::take_attach_end();
+        let Some(sw) = picker::take_switch().or_else(|| picker::auto_pop(end.as_ref())) else {
+            return exit_with_attach_end(end);
+        };
         // Kill-after-attach: arm the kill of the session being LEFT for the
         // new client to carry out once it is established; a failed attach
         // disarms it, so the old session survives a switch that went nowhere.
@@ -57,13 +66,32 @@ fn run() -> Result<()> {
         } else if let (None, Some(leaving)) = (force, picker::current()) {
             picker::stack_push(&leaving);
         }
-        let outcome = dispatch_ph(ph_parse(Some(&sw.target)), &picker::default_group());
-        if outcome.is_err() {
+        if let Err(e) = dispatch_ph(ph_parse(Some(&sw.target)), &picker::default_group()) {
             picker::disarm_kill();
+            // An automatic pop whose re-dial failed: say what happened to the
+            // session that ended before saying why the fallback failed.
+            if let Some(n) = picker::take_pending_notice() {
+                eprintln!("posh: {n}");
+            }
+            return Err(e);
         }
-        outcome?;
     }
-    Ok(())
+}
+
+/// The front door's last word on an attach nothing followed: a session that
+/// ended hands its shell's exit status out as our own (github #18), a lost
+/// one is named on stderr (nothing else says so once the tty is restored),
+/// and a quit is silent.
+fn exit_with_attach_end(end: Option<picker::AttachEnd>) -> Result<()> {
+    match end {
+        Some(picker::AttachEnd::Ended(code)) if code != 0 => std::process::exit(code),
+        Some(picker::AttachEnd::Lost(reason)) => {
+            let left = picker::current().unwrap_or_else(|| "session".to_string());
+            eprintln!("posh: session {left} lost ({reason})");
+            Ok(())
+        }
+        _ => Ok(()),
+    }
 }
 
 fn run_once() -> Result<()> {
@@ -1112,8 +1140,8 @@ fn cmd_ssh_session(
             {
                 Ok(transport) => {
                     match remote::client::run_over_mux(transport, &dest) {
-                        Ok(0) => return Ok(()),
-                        Ok(code) => std::process::exit(code),
+                        // The exit status was noted for `run()` to exit with.
+                        Ok(_) => return Ok(()),
                         // A close BEFORE any frame arrived (the remote
                         // refused/failed the channel after the local grant)
                         // or no frame within the connect timeout (the daemon

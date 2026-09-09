@@ -55,7 +55,10 @@ standing.
 	escape command: switch session (the reachable-session picker, FDR 0016; a
 	switch that keeps the session it leaves pushes it on a per-viewport
 	stack), back to the previous session (offered while that stack has a
-	top; asks the same keep / kill question about the session being left),
+	top; asks the same keep / kill question about the session being left;
+	a session that ends or is lost while it is the top pops back on its own,
+	with a first-frame banner such as _session box:dev ended (exit 0) — back
+	to flac:s-2_ — a quit or detach never does),
 	the predictive-echo models (_adaptive_, _optimistic_,
 	_always_, _never_, plus the evolved-predictor pilot's _controller_ and
 		_from-scratch_, RFC 0007), the client *and* server debug-logging toggles

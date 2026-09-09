@@ -292,6 +292,74 @@ pub fn take_switch() -> Option<Switch> {
     SWITCH.lock().unwrap_or_else(|e| e.into_inner()).take()
 }
 
+/// Why an attach ended — noted by the client loop as it returns, read by
+/// the front door to decide whether the stack pops on its own (FDR 0016
+/// stacked switching: a top session that goes away returns the viewport to
+/// the session under it).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum AttachEnd {
+    /// The session itself ended: its shell exited with this status.
+    Ended(i32),
+    /// The attach lost the session without being asked to leave (the reason).
+    Lost(String),
+    /// The user quit or detached (a signal counts), or a switch ended it.
+    Quit,
+}
+
+static ATTACH_END: Mutex<Option<AttachEnd>> = Mutex::new(None);
+
+/// Notice text for the NEXT attach's first frame (the local client prints
+/// it once its tty is restored): what happened to the session that was
+/// left behind by an automatic pop.
+static PENDING_NOTICE: Mutex<Option<String>> = Mutex::new(None);
+
+pub fn note_attach_end(end: AttachEnd) {
+    *ATTACH_END.lock().unwrap_or_else(|e| e.into_inner()) = Some(end);
+}
+
+pub fn take_attach_end() -> Option<AttachEnd> {
+    ATTACH_END.lock().unwrap_or_else(|e| e.into_inner()).take()
+}
+
+pub fn take_pending_notice() -> Option<String> {
+    PENDING_NOTICE.lock().unwrap_or_else(|e| e.into_inner()).take()
+}
+
+/// The automatic pop: an attach that ended WITHOUT a switch, because the
+/// session ended or the connection was lost, returns the viewport to the
+/// stack's top (a *Back, keep* the user did not have to ask for) and leaves a
+/// notice for the new attach's banner. An explicit quit or detach — or no
+/// stack — pops nothing: the viewport exits and the stack goes with it.
+/// `None` when nothing is to be popped.
+pub fn auto_pop(end: Option<&AttachEnd>) -> Option<Switch> {
+    let why = match end? {
+        AttachEnd::Ended(code) => format!("ended (exit {code})"),
+        AttachEnd::Lost(reason) => format!("lost ({reason})"),
+        AttachEnd::Quit => return None,
+    };
+    let top = stack_top()?;
+    let left = current().unwrap_or_else(|| "session".to_string());
+    *PENDING_NOTICE.lock().unwrap_or_else(|e| e.into_inner()) = Some(format!(
+        "session {} {why} \u{2014} back to {}",
+        display_target(&left),
+        display_target(&top)
+    ));
+    Some(Switch {
+        target: top,
+        previous: Previous::Keep,
+        pop: true,
+    })
+}
+
+/// A target for a notice: a local `:session` names this machine, like the
+/// picker's rows and the default title do.
+fn display_target(target: &str) -> String {
+    match target.strip_prefix(':') {
+        Some(rest) => format!("{}:{rest}", crate::remote::mux::hostname()),
+        None => target.to_string(),
+    }
+}
+
 pub fn set_current(target: &str) {
     *CURRENT.lock().unwrap_or_else(|e| e.into_inner()) = Some(target.to_string());
 }
@@ -588,6 +656,44 @@ mod tests {
         assert!(arr[0]["action"]["params"].get("target").is_none());
         assert_eq!(arr[1]["action"]["params"]["previous"], "kill");
         assert!(arr[0]["name"].as_str().unwrap().starts_with("Back, keep :s-1"));
+    }
+
+    /// The automatic pop: a top session that ENDED or was LOST returns the
+    /// viewport to the stack's top as a *Back, keep*, with a notice for the
+    /// new attach's banner; a quit pops nothing, and neither does an empty
+    /// stack. The noted end is one-shot, like the switch.
+    #[test]
+    fn an_ended_or_lost_top_session_pops_back_with_a_notice() {
+        let _g = switch_test_guard();
+        while stack_pop().is_some() {}
+        take_pending_notice();
+        set_current("box:dev");
+        note_attach_end(AttachEnd::Ended(0));
+        assert_eq!(take_attach_end(), Some(AttachEnd::Ended(0)));
+        assert_eq!(take_attach_end(), None, "one-shot");
+        // No stack: nothing to pop, whatever the end.
+        assert_eq!(auto_pop(Some(&AttachEnd::Ended(0))), None);
+        assert_eq!(take_pending_notice(), None);
+        stack_push(":s-2");
+        // A quit never pops.
+        assert_eq!(auto_pop(Some(&AttachEnd::Quit)), None);
+        assert_eq!(auto_pop(None), None);
+        assert_eq!(take_pending_notice(), None);
+        // An ended session pops back (the front door pops the entry on re-dial).
+        assert_eq!(
+            auto_pop(Some(&AttachEnd::Ended(1))),
+            Some(Switch { target: ":s-2".into(), previous: Previous::Keep, pop: true })
+        );
+        let notice = take_pending_notice().unwrap();
+        assert!(notice.starts_with("session box:dev ended (exit 1) \u{2014} back to "), "{notice}");
+        assert!(notice.ends_with(":s-2"), "a local target names this machine: {notice}");
+        assert_eq!(take_pending_notice(), None, "one-shot");
+        assert_eq!(
+            auto_pop(Some(&AttachEnd::Lost("mux channel closed".into()))),
+            Some(Switch { target: ":s-2".into(), previous: Previous::Keep, pop: true })
+        );
+        assert!(take_pending_notice().unwrap().contains("lost (mux channel closed)"));
+        stack_pop();
     }
 
     /// The leave step: three `session.switch` re-issues carrying the chosen
