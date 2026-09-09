@@ -206,7 +206,9 @@ constants, and underlined predictions when the link is slow
 instead echoes keystrokes immediately and lets the next paint correct them, gated
 on the remote PTY's ECHO flag and alt-screen (FDR 0006). The prediction model and
 the render style are independent, swappable axes: `POSH_PREDICTION_RENDER` selects
-how predicted cells are painted (`replace`, the default, or `dim`). `POSH_PREDICTION`
+how predicted cells are painted (`lookalike`, the default — a shimmering look-alike
+glyph until the server confirms the cell — or the original underlined `replace`, or
+`dim`). `POSH_PREDICTION`
 is a deprecated alias for `POSH_PREDICTION_MODEL`. A reverse-video
 "Last contact N seconds ago" banner appears after 6.5s of silence. Ctrl-^ opens
 a command palette — the escape menu — listing the predictive-echo models, the

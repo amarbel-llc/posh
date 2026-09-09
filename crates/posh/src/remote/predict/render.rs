@@ -2,11 +2,120 @@
 //! painted onto the framebuffer. The model walks the visible predictions and
 //! calls these for each shown cell + the cursor.
 
+use std::cell::RefCell;
+use std::collections::HashMap;
+use std::time::{Duration, Instant};
+
+use posh_proto::lookalike::{cell_seed, has_lookalike, next_lookalike};
 use posh_term::{Cell, UnderlineStyle};
 
 use crate::remote::display::Snapshot;
 
 use super::{CellHint, PredictionRenderer};
+
+/// How often a look-alike cell changes glyph (FDR 0006 look-alike style).
+/// Above the client's 50 ms prediction tick so a change is always painted
+/// on a tick boundary; below a typical round trip so a cell shimmers at
+/// least once before it settles.
+pub const LOOKALIKE_PERIOD: Duration = Duration::from_millis(150);
+
+/// The default look (FDR 0006, 2026-09-09): an unconfirmed predicted cell
+/// is drawn as a random single-width LOOK-ALIKE of its glyph — its case
+/// swap, a homoglyph, a symbol of the same silhouette — re-picked (never
+/// the same twice in a row) every [`LOOKALIKE_PERIOD`], so it reads right
+/// at a glance, visibly shimmers until the server confirms it, and snaps to
+/// the real glyph then. A cell without a look-alike (space, non-ASCII) is
+/// painted as [`ReplaceRenderer`] would, underline included, so a predicted
+/// space still shows. The per-cell memory that makes "never the same twice"
+/// possible is interior state: `paint_cell` takes `&self` and the model
+/// walks its overlay with it once per compose.
+pub struct LookalikeRenderer {
+    started: Instant,
+    period: Duration,
+    state: RefCell<LookalikeState>,
+}
+
+#[derive(Default)]
+struct LookalikeState {
+    /// The tick the memory below was last pruned at.
+    tick: u64,
+    /// Per cell: the glyph on screen and the tick it was picked at.
+    shown: HashMap<u32, (char, u64)>,
+}
+
+impl Default for LookalikeRenderer {
+    fn default() -> Self {
+        Self::with_period(LOOKALIKE_PERIOD)
+    }
+}
+
+impl LookalikeRenderer {
+    pub fn new() -> Self {
+        Self::default()
+    }
+
+    /// A renderer changing glyph every `period` (tests use a tiny one).
+    pub fn with_period(period: Duration) -> Self {
+        LookalikeRenderer {
+            started: Instant::now(),
+            period: period.max(Duration::from_nanos(1)),
+            state: RefCell::new(LookalikeState::default()),
+        }
+    }
+
+    fn tick(&self) -> u64 {
+        (self.started.elapsed().as_nanos() / self.period.as_nanos()) as u64
+    }
+
+    /// The glyph for `ch` at (`row`,`col`) this tick: reused within a tick,
+    /// re-picked (never the previous glyph) on a new one. On entering a new
+    /// tick, cells that were not painted in the previous tick are forgotten
+    /// — by "previous render", not tick distance, so a loop that slept
+    /// through several periods still remembers what is on screen — and the
+    /// memory never grows past the overlay's own size.
+    fn glyph(&self, row: u16, col: u16, ch: char) -> char {
+        let tick = self.tick();
+        let key = (u32::from(row) << 16) | u32::from(col);
+        let mut st = self.state.borrow_mut();
+        if st.tick != tick {
+            let last = st.tick;
+            st.tick = tick;
+            st.shown.retain(|_, (_, at)| *at == last);
+        }
+        match st.shown.get(&key) {
+            Some(&(g, at)) if at == tick => g,
+            prev => {
+                let g = next_lookalike(ch, prev.map(|&(g, _)| g), cell_seed(tick, u64::from(key)));
+                st.shown.insert(key, (g, tick));
+                g
+            }
+        }
+    }
+}
+
+impl PredictionRenderer for LookalikeRenderer {
+    fn paint_cell(&self, fb: &mut Snapshot, row: u16, col: u16, replacement: &Cell, hint: CellHint) {
+        if hint.unknown || !has_lookalike(replacement.ch) {
+            return ReplaceRenderer.paint_cell(fb, row, col, replacement, hint);
+        }
+        // Same skip as ReplaceRenderer: a cell already showing the predicted
+        // glyph (blank over blank on an insert shift, or the server's echo
+        // already in place) is left alone — no shimmer over confirmed text.
+        if fb.cell(row, col) == Some(replacement) {
+            return;
+        }
+        let glyph = self.glyph(row, col, replacement.ch);
+        if let Some(cell) = fb.cell_mut(row, col) {
+            *cell = replacement.clone();
+            cell.ch = glyph;
+        }
+    }
+
+    fn paint_cursor(&self, fb: &mut Snapshot, row: u16, col: u16) {
+        fb.cursor_row = row;
+        fb.cursor_col = col;
+    }
+}
 
 /// The default look, byte-for-byte today's `OverlayCell::apply` /
 /// `CursorPrediction::apply`: replace the glyph when it differs from what is
@@ -118,6 +227,64 @@ mod tests {
             replaced_style, dimmed_style,
             "the two render styles must produce distinct cell styles"
         );
+    }
+
+    /// The look-alike style: an unconfirmed predicted cell shows a look-alike
+    /// of its glyph (never the glyph itself), stable within a tick and
+    /// changed — never repeated — across ticks; a cell the screen already
+    /// shows as predicted is untouched; a glyph without look-alikes falls
+    /// back to the replace look.
+    #[test]
+    fn lookalike_renderer_shimmers_unconfirmed_cells_only() {
+        use posh_proto::lookalike::has_lookalike;
+        let fb = snapshot(5, 20, b"$ ");
+        let mut eng = OptimisticPredictor::new(false);
+        eng.set_echo_safe(true);
+        eng.set_frame_sent(0);
+        eng.on_user_byte(b'z', &fb, 100);
+        let col = fb.cursor_col;
+
+        // A long period: two renders land in the same tick.
+        let stable = LookalikeRenderer::with_period(Duration::from_secs(3600));
+        let mut a = fb.clone();
+        eng.render(&mut a, &stable);
+        let first = a.cell(0, col).unwrap().ch;
+        assert_ne!(first, 'z', "an unconfirmed cell never shows the real glyph");
+        assert!(has_lookalike('z'));
+        assert_eq!(a.cell(0, col).unwrap().width, 1);
+        let mut b = fb.clone();
+        eng.render(&mut b, &stable);
+        assert_eq!(b.cell(0, col).unwrap().ch, first, "stable within a tick");
+
+        // A tiny period: every render is a new tick and the glyph changes.
+        let shimmer = LookalikeRenderer::with_period(Duration::from_nanos(1));
+        let mut prev = None;
+        for _ in 0..8 {
+            let mut out = fb.clone();
+            eng.render(&mut out, &shimmer);
+            let g = out.cell(0, col).unwrap().ch;
+            assert_ne!(Some(g), prev, "never the same glyph twice in a row");
+            assert_ne!(g, 'z');
+            prev = Some(g);
+        }
+
+        // The screen already shows the predicted 'z' (server echoed it):
+        // the renderer leaves it alone — no shimmer over confirmed text.
+        let echoed = snapshot(5, 20, b"$ z");
+        let mut out = echoed.clone();
+        eng.render(&mut out, &shimmer);
+        assert_eq!(out.cell(0, col).unwrap().ch, 'z');
+
+        // A predicted SPACE has no look-alike: handed to the `replace` look,
+        // which (as it always has) leaves a blank-over-blank cell untouched —
+        // no shimmer, no stray glyph.
+        let mut eng = OptimisticPredictor::new(false);
+        eng.set_echo_safe(true);
+        eng.set_frame_sent(0);
+        eng.on_user_byte(b' ', &fb, 100);
+        let mut out = fb.clone();
+        eng.render(&mut out, &shimmer);
+        assert_eq!(out.cell(0, col).unwrap().ch, ' ');
     }
 
     /// The advice channel end to end: a `Policed` renderer under `Advised`

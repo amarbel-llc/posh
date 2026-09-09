@@ -271,7 +271,12 @@ the `eng-*(7)` manpages — read them with `man eng-versioning`,
   immediately and every cell is marked, so `adaptive` and `always` LOOK
   identical (they record the same predictions; only their advice differs).
   `=advised` honors it — mosh's original behavior as a render choice.
-  `POSH_PREDICTION_RENDER=replace|dim` is the look. Above both axes sits the
+  `POSH_PREDICTION_RENDER=lookalike|replace|dim` is the look — `lookalike`
+  (default since 2026-09-09, `predict/render.rs::LookalikeRenderer` over
+  `posh_proto::lookalike`) draws an unconfirmed cell as a random look-alike
+  glyph re-picked every 150 ms (per-cell memory so it never repeats; the
+  client's 50 ms prediction tick also runs while it is active so the shimmer
+  repaints), `replace` is the original underline. Above both axes sits the
   RFC 0007 §5.1 safety gate: the client skips rendering for EVERY model while
   the remote PTY has ECHO off or the alt-screen is up (`optimistic_echo_on`
   at the render call) — before the split the mosh models' hold happened to

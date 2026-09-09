@@ -378,7 +378,11 @@ impl PredictionModel {
 /// Prediction render-style selection (`$POSH_PREDICTION_RENDER`).
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum RenderStyle {
-    /// Today's look: replace the glyph, underline when flagged.
+    /// The default (2026-09-09): draw an unconfirmed cell as a random,
+    /// shimmering look-alike of its glyph; snaps to the real glyph on
+    /// confirmation. [`render::LookalikeRenderer`].
+    Lookalike,
+    /// The original look: replace the glyph, underline when flagged.
     Replace,
     /// Replace the glyph but mark predicted cells with a dim/faint rendition
     /// instead of an underline.
@@ -388,15 +392,18 @@ pub enum RenderStyle {
 impl RenderStyle {
     pub fn name(self) -> &'static str {
         match self {
+            RenderStyle::Lookalike => "lookalike",
             RenderStyle::Replace => "replace",
             RenderStyle::Dim => "dim",
         }
     }
 
-    /// Parses `$POSH_PREDICTION_RENDER` (default `replace`).
+    /// Parses `$POSH_PREDICTION_RENDER` (default `lookalike`; `replace` is
+    /// the original underline look, `dim` the faint one).
     pub fn parse(value: Option<&str>) -> Result<RenderStyle, String> {
         match value {
-            None | Some("") | Some("replace") => Ok(RenderStyle::Replace),
+            None | Some("") | Some("lookalike") => Ok(RenderStyle::Lookalike),
+            Some("replace") | Some("underline") => Ok(RenderStyle::Replace),
             Some("dim") => Ok(RenderStyle::Dim),
             Some(other) => Err(format!("unknown prediction render style ({other})")),
         }
@@ -536,6 +543,7 @@ pub fn build(
     };
     let show = ShowPolicy::from_env();
     let renderer: Box<dyn PredictionRenderer> = match render {
+        RenderStyle::Lookalike => Box::new(Policed::new(render::LookalikeRenderer::new(), show)),
         RenderStyle::Replace => Box::new(Policed::new(ReplaceRenderer, show)),
         RenderStyle::Dim => Box::new(Policed::new(DimRenderer, show)),
     };
@@ -633,8 +641,10 @@ mod tests {
 
     #[test]
     fn render_style_parsing() {
-        assert_eq!(RenderStyle::parse(None), Ok(RenderStyle::Replace));
+        assert_eq!(RenderStyle::parse(None), Ok(RenderStyle::Lookalike));
+        assert_eq!(RenderStyle::parse(Some("lookalike")), Ok(RenderStyle::Lookalike));
         assert_eq!(RenderStyle::parse(Some("replace")), Ok(RenderStyle::Replace));
+        assert_eq!(RenderStyle::parse(Some("underline")), Ok(RenderStyle::Replace));
         assert_eq!(RenderStyle::parse(Some("dim")), Ok(RenderStyle::Dim));
         assert!(RenderStyle::parse(Some("sparkly")).is_err());
     }

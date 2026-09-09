@@ -381,8 +381,9 @@ _POSH_ECHO_ESCALATE_
 	(_rtt 412ms · echo: optimistic (auto)_). See *posh-client*(1).
 
 _POSH_PREDICTION_RENDER_
-	How predicted cells are painted, independent of the model: _replace_
-	(default, underlined) or _dim_ (faint). See *posh-client*(1).
+	How predicted cells are painted, independent of the model:
+	_lookalike_ (default; a shimmering look-alike glyph until confirmed),
+	_replace_ (underlined), or _dim_ (faint). See *posh-client*(1).
 
 _POSH_PREDICTION_SHOW_
 	When predictions are painted: _always_ (default; immediately, every

@@ -110,9 +110,16 @@ _POSH_ECHO_ESCALATE_
 	(the FDR 0006 A/B record).
 
 _POSH_PREDICTION_RENDER_
-	How predicted cells are painted, independent of the model: _replace_
-	(default; replace the glyph and underline it) or _dim_ (replace the
-	glyph and mark it faint). The render style, the show policy, and the
+	How predicted cells are painted, independent of the model:
+	_lookalike_ (default; draw an unconfirmed cell as a random
+	single-width look-alike of its glyph — its case swap, a Greek /
+	Cyrillic / Latin-extended homoglyph, or a symbol of the same
+	silhouette — re-picked every 150 ms so the text reads right but
+	visibly shimmers until the server confirms it, then snaps to the
+	real glyph; a cell with no look-alike, such as a space, is
+	underlined as _replace_ would), _replace_ (the original look:
+	replace the glyph and underline it), or _dim_ (replace the glyph
+	and mark it faint). The render style, the show policy, and the
 	model are separate experimentation axes: the model decides what is
 	predicted and hands the renderer its advice; the renderer decides when
 	a prediction appears and how it looks. Above both sits the safety gate:

@@ -248,28 +248,41 @@ the per-key time, scaling with the whole grid to emit a ~40-byte paint. That
 is the optimization target (tracked as posh#191), and the live gauge's
 `compose` phase (which includes the diff) is where a fix shows up.
 
-## Look-alike render style (prototype, 2026-09-09)
+## Look-alike render style (default since 2026-09-09)
 
 A third way to mark an unconfirmed prediction, besides the underline and
 the dim rendition: draw the cell with a single-width look-alike of the typed
-glyph (Greek / Cyrillic / Latin-extended homoglyphs, `posh_proto::lookalike`)
-and rotate the choice every ~150 ms, so the text reads correctly at a glance
-but visibly "shimmers" until the server confirms it, at which point it snaps
-to the real glyph. The marking lives in the glyph, not in an attribute a
-terminal theme may drop. Prototyped standalone — `just debug-lookalike-echo
-[rtt_ms] [period_ms]` runs a fake shell line with a simulated round trip in
-the current terminal — before deciding whether it becomes a
-`POSH_PREDICTION_RENDER=lookalike` renderer (a `PredictionRenderer` whose
-`paint_cell` substitutes by the compose tick; the rotation rides the 50 ms
-prediction timer the client already runs while predictions are outstanding).
-Open questions the demo is for: is the shimmer calming or distracting at
-real RTTs; do the homoglyphs survive the user's font; digits.
+glyph — its case swap, a Greek / Cyrillic / Latin-extended homoglyph, or a
+symbol of the same silhouette (`posh_proto::lookalike`; letters, digits, and
+punctuation) — picked at random and re-picked, never the same twice in a
+row, every 150 ms, so the text reads correctly at a glance but visibly
+"shimmers" until the server confirms it, at which point it snaps to the real
+glyph. The marking lives in the glyph, not in an attribute a terminal theme
+may drop. Prototyped standalone first (`just debug-lookalike-echo [rtt_ms]
+[period_ms]`, a fake shell line with a simulated round trip), judged good,
+and promoted to the default `POSH_PREDICTION_RENDER=lookalike`
+(`LookalikeRenderer`: per-cell memory for the never-repeat rule, pruned to
+live predictions; the client keeps its 50 ms prediction tick while the style
+is active so the shimmer repaints; a cell without a look-alike, such as a
+space, falls back to the underline). `replace` (underline) and `dim` remain
+as the env override. Cost, measured by `just debug-perf-echo`'s
+`perf_echo_render_styles` (release, `always`, steady-state typing, one dev
+box; the `compose` column is where a renderer lands):
+
+| screen | replace | dim | lookalike | per key (any) |
+|---|---|---|---|---|
+| 24×80 | 15.3 µs | 14.8 µs | 18.3 µs | ≈325 µs |
+| 50×212 | 92.5 µs | 89.6 µs | 95.3 µs | ≈1 765 µs |
+
+About 3 µs per keystroke over the underline: a hashed pick plus one small
+hash-map touch per predicted cell, invisible next to the `new_frame` diff
+(posh#191). The live `time-to-paint` gauge shows the same in the field.
 
 ## Tuning Levers
 
 | Lever | Current | Rationale | Change signal |
 |---|---|---|---|
-| dim optimistic echo | off | unconfirmed echo *could* be visually marked, but dimming every keystroke is noisy and unlike a local terminal | users report flicker/uncertainty, or conversely find dimming distracting |
+| unconfirmed-cell marking | look-alike shimmer (`POSH_PREDICTION_RENDER=lookalike`) | the marking is in the glyph, so it survives any theme; the shimmer distinguishes "predicted" from "confirmed" without a round-trip hold | the shimmer distracts at real RTTs, a font lacks the homoglyphs, or the probe shows the style's `compose` cost above the underline's by more than a few µs per key |
 | post-mode-switch guard | 0 ms (none) | rely on the `ECHO` flag alone; any guard adds keystroke latency | an observed password leak in the `ECHO`-flip race |
 | insert vs overwrite | insert | matches typical shell line editing | shells/apps where insert mispaints the line |
 

@@ -991,7 +991,7 @@ pub fn run_over_mux(
 /// (`run` and `run_over_mux`) so a new knob can never drift between them.
 /// Model selection: $POSH_PREDICTION_MODEL, falling back to the deprecated
 /// $POSH_PREDICTION alias. Render style: $POSH_PREDICTION_RENDER (default
-/// replace).
+/// lookalike; `replace` is the original underline look).
 fn client_env_config() -> Result<(PredictionModel, RenderStyle, bool, GrabMouse, bool)> {
     let model_env = std::env::var("POSH_PREDICTION_MODEL")
         .ok()
@@ -1536,8 +1536,11 @@ fn drive_client(st: &mut ClientState, raw: &RawMode, port: u16) -> Result<i32> {
             deadline = deadline.min(st.last_send + st.wire.rto());
         }
         deadline = deadline.min(now + st.notify.wait_time(now));
-        if st.predict.needs_timer() {
-            // Outstanding predictions need 50ms ticks for glitch detection.
+        if st.predict.needs_timer()
+            || (st.predict_render == RenderStyle::Lookalike && st.predict.active())
+        {
+            // Outstanding predictions need 50ms ticks for glitch detection —
+            // and, under the look-alike style, to repaint the shimmer.
             deadline = deadline.min(now + 50);
         }
         if !heard {
