@@ -1,6 +1,7 @@
 //! Visual prototype of look-alike local echo (FDR 0006): a fake shell line
-//! where every character you type is shown IMMEDIATELY as a rotating
-//! look-alike glyph (`posh_proto::lookalike`) and snaps to the real
+//! where every character you type is shown IMMEDIATELY as a look-alike
+//! glyph that changes at random every period (`posh_proto::lookalike`,
+//! case swaps and symbols included) and snaps to the real
 //! character once a simulated server round trip confirms it. No posh, no
 //! network — just the terminal, so the rendering can be judged by eye.
 //!
@@ -15,11 +16,14 @@ use std::process::Command;
 use std::sync::mpsc;
 use std::time::{Duration, Instant};
 
-use posh_proto::lookalike::lookalike;
+use posh_proto::lookalike::{cell_seed, next_lookalike};
 
 struct Pending {
     ch: char,
     confirm_at: Instant,
+    /// The look-alike on screen, and the tick it was picked at — re-picked
+    /// (never the same glyph) on each tick.
+    shown: Option<(char, u64)>,
 }
 
 fn stty(args: &[&str]) -> Option<String> {
@@ -77,14 +81,19 @@ fn main() {
         let now = Instant::now();
         let tick = (now - started).as_millis() as u64 / period.as_millis().max(1) as u64;
         let mut frame = String::from("$ ");
-        for p in &line {
+        for (cell, p) in line.iter_mut().enumerate() {
             if now >= p.confirm_at {
                 frame.push(p.ch);
             } else {
                 if underline {
                     frame.push_str("\x1b[4m");
                 }
-                frame.push(lookalike(p.ch, tick));
+                let glyph = match p.shown {
+                    Some((g, at)) if at == tick => g,
+                    prev => next_lookalike(p.ch, prev.map(|(g, _)| g), cell_seed(tick, cell as u64)),
+                };
+                p.shown = Some((glyph, tick));
+                frame.push(glyph);
                 if underline {
                     frame.push_str("\x1b[24m");
                 }
@@ -114,6 +123,7 @@ fn main() {
                 b if b.is_ascii_graphic() || b == b' ' => line.push(Pending {
                     ch: b as char,
                     confirm_at: Instant::now() + rtt,
+                    shown: None,
                 }),
                 _ => {}
             },
