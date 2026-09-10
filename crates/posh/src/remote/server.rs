@@ -228,7 +228,13 @@ pub(crate) fn agent_only_loop(
     endpoint: crate::remote::agent::AgentEndpoint,
     peer_timeout: u64,
 ) {
-    mux_peer_loop(conn, endpoint, peer_timeout, &mut connect_named_daemon)
+    mux_peer_loop(
+        conn,
+        endpoint,
+        peer_timeout,
+        crate::remote::agent::AGENT_PEER_ACTIVE,
+        &mut connect_named_daemon,
+    )
 }
 
 /// The production daemon connector for [`mux_peer_loop`]: parses the wire
@@ -362,6 +368,10 @@ pub(crate) fn mux_peer_loop(
     mut conn: Connection,
     mut endpoint: crate::remote::agent::AgentEndpoint,
     peer_timeout: u64,
+    // The peer-silence window after which agent service fast-fails
+    // (`AGENT_PEER_ACTIVE` in production; compressed by tests so the
+    // fast-fail → recover cycle runs in milliseconds, not 15 s).
+    agent_active_window: u64,
     connect_daemon: &mut dyn FnMut(&str) -> Result<std::os::unix::net::UnixStream>,
 ) {
     use crate::session::ipc;
@@ -423,8 +433,7 @@ pub(crate) fn mux_peer_loop(
         // server_loop gates them: the stricter AGENT_PEER_ACTIVE window, so
         // a roamed-away peer releases/repoints agent/sock and fast-fails
         // open channels well before the exit timeout above.
-        let agent_peer_active =
-            conn.has_remote() && heard_age < crate::remote::agent::AGENT_PEER_ACTIVE;
+        let agent_peer_active = conn.has_remote() && heard_age < agent_active_window;
         // Edge-log silence episodes (once each way): entering the fast-fail
         // window, and the peer's return. Gated on has_remote so the pre-first-
         // datagram startup window is not reported as an outage.
@@ -4170,6 +4179,204 @@ mod tests {
         got
     }
 
+    /// posh#196 characterization: does the AGENT serving loop recover after its
+    /// peer goes silent past the fast-fail window and then returns — WITHOUT a
+    /// fresh session? Drives a real `mux_peer_loop` with a compressed
+    /// `agent_active_window` (so the fast-fail → recover cycle runs in ms) and a
+    /// large `peer_timeout` (so the loop does NOT exit during the silence).
+    /// Sequence: (1) a consumer request round-trips (baseline); (2) the pump
+    /// stops sending, so the server's peer goes silent past the window and
+    /// fast-fails, releasing `agent/sock`; (3) the pump resumes, refreshing the
+    /// server's `last_heard`; (4) a FRESH consumer request must round-trip
+    /// again. Step 4 is the assertion the bug (if it lives on this loop) fails.
+    #[test]
+    fn agent_serving_loop_recovers_after_peer_silence_without_a_new_session() {
+        use crate::remote::agent::{AgentChannelMux, AgentClient, AgentEndpoint};
+        use crate::remote::channel;
+        use std::io::{Read, Write};
+        use std::os::unix::net::{UnixListener, UnixStream};
+        use std::sync::atomic::{AtomicBool, Ordering};
+        use std::sync::Arc;
+
+        const REQUEST: &[u8] = b"AGENT-REQUEST-PING";
+        const REPLY: &[u8] = b"AGENT-REPLY-PONG";
+        // Compressed fast-fail window: silence past this fast-fails agent
+        // service; well under the loop's peer_timeout so the loop stays up.
+        const WINDOW_MS: u64 = 400;
+
+        let pid = std::process::id();
+        let base = std::path::PathBuf::from(format!("/tmp/posh-ag196-{pid}"));
+        std::fs::remove_dir_all(&base).ok();
+        std::os::unix::fs::DirBuilderExt::mode(std::fs::DirBuilder::new().recursive(true), 0o700)
+            .create(&base)
+            .unwrap();
+        let fake_agent_sock = std::path::PathBuf::from(format!("/tmp/posh-ag196-{pid}.agent"));
+        std::fs::remove_file(&fake_agent_sock).ok();
+
+        // Fake local ssh-agent: answers EVERY connection (two requests here) with
+        // the canned reply, until told to stop.
+        let agent_done = Arc::new(AtomicBool::new(false));
+        let agent_listener = UnixListener::bind(&fake_agent_sock).unwrap();
+        agent_listener.set_nonblocking(true).unwrap();
+        let agent_thread = {
+            let agent_done = agent_done.clone();
+            std::thread::spawn(move || {
+                while !agent_done.load(Ordering::Relaxed) {
+                    match agent_listener.accept() {
+                        Ok((mut s, _)) => {
+                            s.set_read_timeout(Some(std::time::Duration::from_secs(2))).ok();
+                            let mut buf = vec![0u8; REQUEST.len()];
+                            if s.read_exact(&mut buf).is_ok() {
+                                let _ = s.write_all(REPLY);
+                            }
+                        }
+                        Err(ref e) if e.kind() == std::io::ErrorKind::WouldBlock => {
+                            std::thread::sleep(std::time::Duration::from_millis(5));
+                        }
+                        Err(_) => break,
+                    }
+                }
+            })
+        };
+
+        // The serving loop: large peer_timeout (stays up through the silence),
+        // compressed agent window (fast-fails quickly). No sessions here, so the
+        // connector must never be called.
+        let key = Key::random();
+        let (server_conn, port) = Connection::server((62400, 62499), &key, Family::Inet).unwrap();
+        let endpoint = AgentEndpoint::new_mux(&base, "ag196").unwrap();
+        let well_known = endpoint.sock_path().to_path_buf();
+        let server = std::thread::spawn(move || {
+            let mut connector =
+                |_: &str| -> Result<UnixStream> { panic!("no session in the agent-only test") };
+            mux_peer_loop(server_conn, endpoint, 30_000, WINDOW_MS, &mut connector);
+        });
+
+        // Client pump: enveloped session-channel announces keep the peer active;
+        // the agent adopter dials the fake agent. `paused` stops ALL sends so the
+        // server sees peer silence (the network fault).
+        let done = Arc::new(AtomicBool::new(false));
+        let paused = Arc::new(AtomicBool::new(false));
+        let pump = {
+            let done = done.clone();
+            let paused = paused.clone();
+            let source = fake_agent_sock.clone();
+            std::thread::spawn(move || {
+                let addr = format!("127.0.0.1:{port}").parse().unwrap();
+                let mut conn = Connection::client(addr, &key).unwrap();
+                let mut fragmenter = Fragmenter::new();
+                let mut assembly = FragmentAssembly::new();
+                let mut proxy = AgentClient::new(source);
+                let mut mux_c = AgentChannelMux::new_client();
+                while !done.load(Ordering::Relaxed) {
+                    if paused.load(Ordering::Relaxed) {
+                        // The fault: send nothing (peer goes silent) and do not
+                        // service the agent side.
+                        std::thread::sleep(std::time::Duration::from_millis(5));
+                        continue;
+                    }
+                    let msg = ClientMessage {
+                        flags: 0,
+                        caps: vec![],
+                        acked_frame: 0,
+                        rows: 24,
+                        cols: 80,
+                        input_base: 0,
+                        input: Vec::new(),
+                    };
+                    let encoded = msg.encode();
+                    let wire = channel::seal_instruction(true, &encoded);
+                    for frag in fragmenter.make_fragments(&wire, sync::FRAGMENT_CONTENTS_MAX) {
+                        let _ = conn.send(&frag.to_bytes());
+                    }
+                    while let Ok(Some(payload)) = conn.recv() {
+                        let Ok(frag) = sync::Fragment::from_bytes(&payload) else {
+                            continue;
+                        };
+                        let Some(assembled) = assembly.add(frag) else {
+                            continue;
+                        };
+                        let Some((chan, message)) =
+                            channel::open_any_instruction(true, &assembled)
+                        else {
+                            continue;
+                        };
+                        if chan.kind() != channel::KIND_AGENT {
+                            continue;
+                        }
+                        let recs = mux_c.on_instruction(chan, message);
+                        let replies = proxy.apply_records(&recs);
+                        mux_c.queue_records(&replies);
+                    }
+                    mux_c.queue_records(&proxy.read_channels());
+                    for (id, wire) in mux_c.outgoing(now_ms(), 50) {
+                        send_on_channel(&mut conn, &mut fragmenter, id, &wire, true);
+                    }
+                    std::thread::sleep(std::time::Duration::from_millis(5));
+                }
+            })
+        };
+
+        // One request/reply round-trip against agent/sock, retrying the connect
+        // (the symlink may be mid-reclaim). Returns Ok(reply) or the io error.
+        let one_request = |deadline: u64| -> std::io::Result<Vec<u8>> {
+            let mut stream = loop {
+                if let Ok(s) = UnixStream::connect(&well_known) {
+                    break s;
+                }
+                if now_ms() >= deadline {
+                    return Err(std::io::Error::new(
+                        std::io::ErrorKind::TimedOut,
+                        "agent/sock never became connectable",
+                    ));
+                }
+                std::thread::sleep(std::time::Duration::from_millis(20));
+            };
+            stream.set_read_timeout(Some(std::time::Duration::from_secs(3))).ok();
+            stream.write_all(REQUEST)?;
+            let mut got = vec![0u8; REPLY.len()];
+            stream.read_exact(&mut got)?;
+            Ok(got)
+        };
+
+        // (1) Baseline: a request round-trips over the live peer.
+        let baseline = one_request(now_ms() + 5_000);
+        assert_eq!(
+            baseline.as_deref().ok(),
+            Some(REPLY),
+            "baseline agent request must round-trip"
+        );
+
+        // (2) The fault: peer goes silent past the fast-fail window.
+        paused.store(true, Ordering::Relaxed);
+        std::thread::sleep(std::time::Duration::from_millis(WINDOW_MS + 500));
+
+        // (3) The peer returns: announces resume, refreshing the server's
+        // last_heard so agent service should re-arm.
+        paused.store(false, Ordering::Relaxed);
+        std::thread::sleep(std::time::Duration::from_millis(300));
+
+        // (4) THE CHARACTERIZATION: a fresh request must round-trip again,
+        // WITHOUT restarting anything. If the serving loop is the wedge locus,
+        // this fails/times out (the bug); if it self-heals, it succeeds.
+        let after = one_request(now_ms() + 5_000);
+
+        done.store(true, Ordering::Relaxed);
+        agent_done.store(true, Ordering::Relaxed);
+        let _ = pump.join();
+        let _ = agent_thread.join();
+        let _ = server.join();
+        std::fs::remove_dir_all(&base).ok();
+        std::fs::remove_file(&fake_agent_sock).ok();
+
+        assert_eq!(
+            after.as_deref().ok(),
+            Some(REPLY),
+            "posh#196: after the peer returned, a fresh agent request must \
+             round-trip without a new session (serving-loop self-heal)"
+        );
+    }
+
     #[test]
     fn agent_only_server_serves_channels_without_a_session() {
         let got = drive_agent_only_exchange("srvless", 0, (62900, 62949));
@@ -4251,7 +4458,13 @@ mod tests {
                 d2.lock().unwrap().push((target.to_string(), daemon_side));
                 Ok(peer_side)
             };
-            mux_peer_loop(peer_conn, endpoint, 2_500, &mut connector);
+            mux_peer_loop(
+                peer_conn,
+                endpoint,
+                2_500,
+                crate::remote::agent::AGENT_PEER_ACTIVE,
+                &mut connector,
+            );
         });
         (handle, test_conn, daemons)
     }
@@ -4812,7 +5025,13 @@ mod tests {
         let h = std::thread::spawn(move || {
             let mut connector =
                 |_: &str| -> Result<std::os::unix::net::UnixStream> { panic!("no sessions") };
-            mux_peer_loop(peer_conn, endpoint, 2_500, &mut connector);
+            mux_peer_loop(
+                peer_conn,
+                endpoint,
+                2_500,
+                crate::remote::agent::AGENT_PEER_ACTIVE,
+                &mut connector,
+            );
         });
         // A daemon heartbeat: a bare ClientMessage on ordinal 1 whose caps
         // carry the RFC 0013 §3 ident request.
@@ -4882,7 +5101,13 @@ mod tests {
         let h = std::thread::spawn(move || {
             let mut connector =
                 |_: &str| -> Result<std::os::unix::net::UnixStream> { panic!("no sessions here") };
-            mux_peer_loop(peer_conn, endpoint, 2_500, &mut connector);
+            mux_peer_loop(
+                peer_conn,
+                endpoint,
+                2_500,
+                crate::remote::agent::AGENT_PEER_ACTIVE,
+                &mut connector,
+            );
         });
         // Zero sessions: the M1 agent path is untouched — a consumer dialing
         // the endpoint's socket opens a server-initiated agent channel.

@@ -439,6 +439,19 @@ read-only, `debug` group):
   tail rides every message until acked, i.e. what cumulative-only ack actually
   costs (posh#142). Needs client dumps taken while forwarding was active
   (`debug-posh-dump`, or the palette's agent info).
+- **Agent-ownership breadcrumbs (posh#196):** the always-on
+  `agent/mux-<client-id>.log` carries three `pid=`-keyed lines that pin whether a
+  wedged forwarded agent is an orphan-ownership problem or a failed
+  establishment. `agent endpoint up: pid=… sock=…` maps each pid to its bound
+  socket (sibling daemons — respawns, competitors — share one per-client-id log).
+  `agent consumer accepted: pid=… channel=N` prints on every consumer connect: if
+  a `git`/`ssh` request fails yet the LIVE daemon logged no accept, the connect
+  landed on a different daemon holding `agent/sock` (not a fast-fail). The WARN
+  `agent/sock held by a sibling while our peer is live: pid=… points_at=…` is the
+  direct orphan-ownership tell — a peer-active daemon that cannot own `agent/sock`
+  because a sibling's socket is merely *bound* (`symlink_needs_takeover` judges
+  socket-liveness, not agent-peer liveness). Diagnostic only; the self-heal fix
+  is pending live capture.
 - `just debug-posh-mux-log` — the LOCAL mux daemons' state (posh#161 triage):
   `posh mux ls`, each daemon socket's pid, and each always-on `mux/<key>.log`
   tail, where the ref-lifecycle lines (which invocations pin the daemon,

@@ -4258,7 +4258,13 @@ mod tests {
                 });
                 Ok(peer_side)
             };
-            crate::remote::server::mux_peer_loop(server_conn, endpoint, 6_000, &mut connector);
+            crate::remote::server::mux_peer_loop(
+                server_conn,
+                endpoint,
+                6_000,
+                crate::remote::agent::AGENT_PEER_ACTIVE,
+                &mut connector,
+            );
         });
 
         // The local mux daemon: real mux_loop over the loopback connection.
@@ -4440,7 +4446,13 @@ mod tests {
             // Generous peer timeout: the daemon only reaches peer 2 ~2 s after
             // the verdict (immediate attempt 0 fails, backoff(1) = 2 s), so
             // peer 2 must outlive the idle pre-connect window.
-            crate::remote::server::mux_peer_loop(server2, endpoint2, 30_000, &mut connector);
+            crate::remote::server::mux_peer_loop(
+                server2,
+                endpoint2,
+                30_000,
+                crate::remote::agent::AGENT_PEER_ACTIVE,
+                &mut connector,
+            );
         });
 
         // The local mux daemon: compressed liveness so the silent peer 1 is
@@ -4542,6 +4554,227 @@ mod tests {
         peer2.join().unwrap();
         std::fs::remove_dir_all(&local_base).ok();
         std::fs::remove_dir_all(&remote_base).ok();
+    }
+
+    /// posh#196 reconnect path: after a mux wire death + reconnect to a fresh
+    /// remote endpoint, does AGENT forwarding still work? The session channel
+    /// self-heals (posh#162); this asserts the agent channel does too. A session
+    /// open holds the ref and drives the reconnect (peer 1 silent → peer 2);
+    /// once reattached, a consumer dials peer 2's agent/sock and its request must
+    /// round-trip through the mux daemon's proxy to a fake LOCAL agent behind the
+    /// client. If the reconnect's agent-state discard (`proxy.close_all()` +
+    /// `agent_mux = new_client()` with no re-establish) breaks post-reconnect
+    /// agent service, this fails — the wedge.
+    #[test]
+    fn agent_forwarding_recovers_after_a_mux_wire_reconnect() {
+        use std::io::{Read, Write};
+        use std::os::fd::AsRawFd as _;
+        use std::sync::atomic::{AtomicBool, AtomicU32, Ordering};
+        use std::sync::Arc;
+
+        const REQUEST: &[u8] = b"AGENT-REQ-196";
+        const REPLY: &[u8] = b"AGENT-REP-196";
+
+        let local_base = temp_base();
+        let remote_base = temp_base();
+
+        // Fake LOCAL ssh-agent behind the mux daemon's proxy: the daemon dials
+        // this (its `agent_sock` source) to serve inbound agent channels.
+        let agent_sock = local_base.join("fake-agent.sock");
+        let agent_done = Arc::new(AtomicBool::new(false));
+        let agent_listener = UnixListener::bind(&agent_sock).unwrap();
+        agent_listener.set_nonblocking(true).unwrap();
+        let agent_thread = {
+            let agent_done = agent_done.clone();
+            std::thread::spawn(move || {
+                while !agent_done.load(Ordering::Relaxed) {
+                    match agent_listener.accept() {
+                        Ok((mut s, _)) => {
+                            s.set_read_timeout(Some(std::time::Duration::from_secs(2))).ok();
+                            let mut buf = vec![0u8; REQUEST.len()];
+                            if s.read_exact(&mut buf).is_ok() {
+                                let _ = s.write_all(REPLY);
+                            }
+                        }
+                        Err(ref e) if e.kind() == std::io::ErrorKind::WouldBlock => {
+                            std::thread::sleep(std::time::Duration::from_millis(5));
+                        }
+                        Err(_) => break,
+                    }
+                }
+            })
+        };
+
+        // Peer 1: silent — condemned by the compressed liveness probe.
+        let ukey1 = crate::remote::crypto::Key::random();
+        let (_server1, port1) = Connection::server((63790, 63799), &ukey1, Family::Inet).unwrap();
+
+        // Peer 2: a real mux_peer_loop with an AgentEndpoint. Its session
+        // connector is a fake daemon (frames 300+, proving post-reattach); its
+        // endpoint serves the agent channel toward the reconnected client.
+        let ukey2 = crate::remote::crypto::Key::random();
+        let (server2, port2) = Connection::server((63790, 63799), &ukey2, Family::Inet).unwrap();
+        let endpoint2 = crate::remote::agent::AgentEndpoint::new_mux(&remote_base, "ag196").unwrap();
+        let remote_agent_sock = endpoint2.sock_path().to_path_buf();
+        let peer2 = std::thread::spawn(move || {
+            let mut connector = |_target: &str| {
+                let (peer_side, daemon_side) = UnixStream::pair().unwrap();
+                peer_side.set_nonblocking(true).unwrap();
+                std::thread::spawn(move || {
+                    let mut buf = crate::session::ipc::FrameBuffer::new();
+                    let mut inputs = 0u64;
+                    daemon_side
+                        .set_read_timeout(Some(std::time::Duration::from_millis(50)))
+                        .ok();
+                    let deadline = util::now_ms() + 25_000;
+                    while util::now_ms() < deadline {
+                        let _ = buf.read_from(daemon_side.as_raw_fd());
+                        let mut wrote = false;
+                        while let Ok(Some(rec)) = buf.next() {
+                            match rec.tag {
+                                crate::session::ipc::Tag::Input => {
+                                    inputs += 1;
+                                    let frame = sync::ServerFrame {
+                                        flags: 0,
+                                        caps: crate::remote::caps::own_table(&[]),
+                                        frame_num: 300 + inputs,
+                                        input_ack: 0,
+                                        echo_ack: 0,
+                                        body: sync::FrameBody::Empty,
+                                    };
+                                    let mut out = Vec::new();
+                                    crate::session::ipc::append_frame(
+                                        &mut out,
+                                        crate::session::ipc::Tag::Frame,
+                                        &frame.encode(),
+                                    );
+                                    if (&daemon_side).write_all(&out).is_err() {
+                                        return;
+                                    }
+                                    wrote = true;
+                                }
+                                crate::session::ipc::Tag::Detach => return,
+                                _ => {}
+                            }
+                        }
+                        if !wrote {
+                            std::thread::sleep(std::time::Duration::from_millis(5));
+                        }
+                    }
+                });
+                Ok(peer_side)
+            };
+            crate::remote::server::mux_peer_loop(
+                server2,
+                endpoint2,
+                30_000,
+                crate::remote::agent::AGENT_PEER_ACTIVE,
+                &mut connector,
+            );
+        });
+
+        // The local mux daemon: compressed liveness, reconnect fails once then
+        // swaps to peer 2. Its proxy source is the fake local agent.
+        let dir = local_base.clone();
+        let listener = UnixListener::bind(mux_socket_path_in(&dir, "ag196")).unwrap();
+        let addr1 = format!("127.0.0.1:{port1}").parse().unwrap();
+        let daemon_conn = Connection::client(addr1, &ukey1).unwrap();
+        let attempts = Arc::new(AtomicU32::new(0));
+        let daemon = {
+            let attempts = Arc::clone(&attempts);
+            let agent_sock = agent_sock.clone();
+            std::thread::spawn(move || {
+                let addr2 = format!("127.0.0.1:{port2}").parse().unwrap();
+                mux_loop(
+                    listener,
+                    daemon_conn,
+                    &agent_sock,
+                    2_000,
+                    "ag196",
+                    &mut || {
+                        if attempts.fetch_add(1, Ordering::Relaxed) == 0 {
+                            return Err(util::Error::from("first attempt refused"));
+                        }
+                        Connection::client(addr2, &ukey2)
+                    },
+                    WireLiveness::with_thresholds(1_000, 1_000),
+                )
+            })
+        };
+
+        // Open a session (holds the ref, drives the reconnect) + a keystroke.
+        let mut spawn = |_: &str| -> Result<MuxSpawn> { panic!("daemon is live") };
+        let timeout = std::time::Duration::from_secs(8);
+        let h = ensure_mux_conn(&dir, "ag196", &mut spawn, timeout, &agent_sock).unwrap();
+        let mut t = h.open_session("default/x").unwrap();
+        let input = sync::ClientMessage {
+            flags: 0,
+            caps: crate::remote::caps::own_table(&[]),
+            acked_frame: 0,
+            rows: 24,
+            cols: 80,
+            input_base: 0,
+            input: b"x".to_vec(),
+        }
+        .encode();
+        t.send_msg(&input);
+
+        // Wait for the reattach: a frame >= 300 from peer 2.
+        let deadline = util::now_ms() + 15_000;
+        loop {
+            assert!(util::now_ms() < deadline, "session never reattached to peer 2");
+            match t.next_event() {
+                Some(MuxSessionEvent::Frame(b)) => {
+                    if sync::ServerFrame::decode(&b).is_ok_and(|f| f.frame_num >= 300) {
+                        break;
+                    }
+                }
+                Some(MuxSessionEvent::Closed(p)) => panic!("session closed across reconnect: {p:?}"),
+                None => std::thread::sleep(std::time::Duration::from_millis(5)),
+            }
+        }
+        assert_eq!(attempts.load(Ordering::Relaxed), 2, "reconnected to peer 2");
+        assert!(t.established(), "session reattached");
+
+        // THE CHARACTERIZATION: after the reconnect, a consumer on peer 2's
+        // agent/sock must round-trip a request through the daemon's proxy to the
+        // fake local agent. Retry the connect (the channel/serviceability may be
+        // mid-establish on the fresh wire).
+        let deadline = util::now_ms() + 15_000;
+        let mut got: Option<Vec<u8>> = None;
+        while util::now_ms() < deadline {
+            let Ok(mut consumer) = UnixStream::connect(&remote_agent_sock) else {
+                std::thread::sleep(std::time::Duration::from_millis(50));
+                continue;
+            };
+            consumer
+                .set_read_timeout(Some(std::time::Duration::from_millis(1500)))
+                .ok();
+            if consumer.write_all(REQUEST).is_err() {
+                std::thread::sleep(std::time::Duration::from_millis(50));
+                continue;
+            }
+            let mut buf = vec![0u8; REPLY.len()];
+            if consumer.read_exact(&mut buf).is_ok() {
+                got = Some(buf);
+                break;
+            }
+            std::thread::sleep(std::time::Duration::from_millis(50));
+        }
+
+        agent_done.store(true, Ordering::Relaxed);
+        drop(t);
+        daemon.join().unwrap();
+        peer2.join().unwrap();
+        let _ = agent_thread.join();
+        std::fs::remove_dir_all(&local_base).ok();
+        std::fs::remove_dir_all(&remote_base).ok();
+
+        assert_eq!(
+            got.as_deref(),
+            Some(REPLY),
+            "posh#196: agent forwarding must round-trip after a mux wire reconnect"
+        );
     }
 
     #[test]

@@ -133,6 +133,13 @@ pub struct AgentEndpoint {
     /// (posh#152 interim). `None` until the first call, so the first call is
     /// itself an edge and settles the link/marker into the right state.
     last_peer_active: Option<bool>,
+    /// posh#196: whether the "live but cannot own agent/sock" deferral has been
+    /// edge-logged for the current deferral episode. Set when a peer-active
+    /// endpoint finds `agent/sock` held by a sibling it will not take over
+    /// (`symlink_needs_takeover()` is false — the sibling's socket is merely
+    /// bound), cleared once it owns the link again. Suppresses per-tick spam
+    /// while still capturing the orphan-ownership wedge on its edge.
+    deferral_logged: bool,
 }
 
 /// `<base>/agent/sock` — the stable, symlinked `SSH_AUTH_SOCK` path every
@@ -367,7 +374,21 @@ impl AgentEndpoint {
             // could arrive (surfaced by suite-order shift, posh#162 work).
             last_tick: crate::util::now_ms(),
             last_peer_active: None,
+            deferral_logged: false,
         };
+        // posh#196: map this pid to its bound socket in the per-client-id log,
+        // which sibling daemons (respawns, competing endpoints) share — the
+        // anchor for correlating every later `pid=` line to a socket, and for
+        // spotting several daemons alive for one destination.
+        util::log_write(
+            "info",
+            &format!(
+                "agent endpoint up: pid={} stem={} sock={}",
+                std::process::id(),
+                endpoint.stem,
+                endpoint.own_sock.display(),
+            ),
+        );
         endpoint.claim_symlink()?;
         Ok(endpoint)
     }
@@ -636,6 +657,17 @@ impl AgentEndpoint {
             match self.listener.accept() {
                 Ok((stream, _addr)) => {
                     if self.live_channel_count() >= MAX_AGENT_CHANNELS {
+                        // posh#196: capacity refuse. Logged so a live daemon that
+                        // is somehow saturated is distinguishable from one that
+                        // never saw the consumer connect at all.
+                        util::log_write(
+                            "info",
+                            &format!(
+                                "agent consumer refused (at capacity {MAX_AGENT_CHANNELS}): pid={} stem={}",
+                                std::process::id(),
+                                self.stem
+                            ),
+                        );
                         drop(stream); // at capacity: refuse by closing
                         continue;
                     }
@@ -644,6 +676,22 @@ impl AgentEndpoint {
                     }
                     let id = self.next_channel_id;
                     self.next_channel_id += 1;
+                    // posh#196: the decisive ownership breadcrumb. A consumer
+                    // (git/ssh via agent/sock) reached THIS endpoint and a channel
+                    // was opened toward the peer. If the live daemon's log shows
+                    // no such line while a consumer request fails, the connect
+                    // landed on a different (orphaned) endpoint holding agent/sock
+                    // — not a fast-fail. pid + stem disambiguate sibling daemons
+                    // sharing the per-client-id log.
+                    util::log_write(
+                        "info",
+                        &format!(
+                            "agent consumer accepted: pid={} stem={} channel={id} live={}",
+                            std::process::id(),
+                            self.stem,
+                            self.live_channel_count() + 1,
+                        ),
+                    );
                     self.channels.push(Channel {
                         id,
                         stream,
@@ -734,6 +782,30 @@ impl AgentEndpoint {
             if self.symlink_needs_takeover() {
                 let _ = self.claim_symlink();
             }
+            // posh#196: after the takeover attempt, do we actually own
+            // agent/sock? If not, a sibling holds it whose socket is merely
+            // BOUND — `symlink_needs_takeover` judges socket-liveness, not
+            // agent-peer liveness — so consumers (git/ssh) reach that sibling,
+            // not us, even though OUR peer is live. This is the orphan-ownership
+            // wedge: the live endpoint never serves a request because it never
+            // owns the door. Edge-logged (once per deferral episode).
+            if self.symlink_points_to_self() {
+                self.deferral_logged = false;
+            } else if !self.deferral_logged {
+                self.deferral_logged = true;
+                let target = std::fs::read_link(&self.well_known)
+                    .map(|p| p.display().to_string())
+                    .unwrap_or_else(|_| "<unreadable>".to_string());
+                util::log_write(
+                    "warn",
+                    &format!(
+                        "agent/sock held by a sibling while our peer is live: pid={} stem={} points_at={} — consumers reach the sibling, not us (posh#196)",
+                        std::process::id(),
+                        self.stem,
+                        target,
+                    ),
+                );
+            }
         } else {
             // Our peer is gone: relinquish `agent/sock` if we hold it, so a
             // sibling endpoint whose client IS active can take over (repointed
@@ -742,6 +814,9 @@ impl AgentEndpoint {
             // link stays pinned to us — `socket_is_dead` reports our still-bound
             // listener "alive" — and active siblings are starved (posh#136).
             self.release_symlink();
+            // Not deferring while inactive (we release deliberately); reset so a
+            // later active-but-can't-own episode logs afresh.
+            self.deferral_logged = false;
         }
         self.gc_dead_sockets();
 
