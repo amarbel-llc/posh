@@ -1112,9 +1112,10 @@ pub fn run(
     // consumes the flag in drive_client, arms it.
     util::install_sigusr2_handler();
     let raw = RawMode::enable(STDIN)?;
-    // Take over the alternate screen (mosh smcup); close() below restores
-    // the user's pre-connect shell screen on the way out.
-    write_display_control("smcup (connect)", &display::open());
+    // The alt-screen takeover (smcup) is deferred into the client loop (#1): it
+    // waits for the connection to establish, showing a `crap-present` spinner on
+    // the primary screen meanwhile; rmcup on exit is the loop's too, gated on
+    // whether it actually took over.
     let result = client_loop(
         Wire::Udp(Box::new(conn)),
         model,
@@ -1128,7 +1129,6 @@ pub fn run(
         host,
         channels,
     );
-    write_display_control("rmcup (exit)", &display::close());
     drop(raw);
     eprintln!("\nposh: [client exited]");
     // Carry the remote session's exit status (EXIT_STATUS capability,
@@ -1154,7 +1154,7 @@ pub fn run_over_mux(
     util::install_client_signal_handlers();
     util::install_sigusr2_handler();
     let raw = RawMode::enable(STDIN)?;
-    write_display_control("smcup (connect)", &display::open());
+    // smcup/rmcup deferred into the client loop (#1); see `run`.
     let result = client_loop(
         Wire::Mux(transport),
         model,
@@ -1168,7 +1168,6 @@ pub fn run_over_mux(
         host,
         false,
     );
-    write_display_control("rmcup (exit)", &display::close());
     drop(raw);
     eprintln!("\nposh: [client exited]");
     result
@@ -1690,7 +1689,11 @@ fn client_loop(
     // RFC 0007: collect the compute-timing terminals when a GP species is the
     // startup model, independent of POSH_DEBUG_LOG.
     st.stats.set_gp_active(is_gp_species(model));
-    let result = drive_client(&mut st, raw, port);
+    // Spawn the connect-progress indicator (#1): a `crap-present` child drawing
+    // the establishing spinner on the primary screen. None (no tty / not
+    // installed) => the client takes over the terminal immediately, as before.
+    let crap = crate::remote::connect_progress::spawn();
+    let result = drive_client(&mut st, raw, port, crap, host);
     // Tear down the palette renderer (if any) before the final stats flush.
     if let Some(p) = st.palette.take() {
         p.shutdown();
@@ -1712,9 +1715,64 @@ fn client_loop(
     result
 }
 
+/// The connect-progress indicator's success resolution (#1): finish the
+/// ndjson-crap stream (so `crap-present` renders its verdict, clears its status
+/// line, and exits), tear the child down, then take over the alt screen
+/// (deferred smcup) unless we already have. Idempotent via the `Option::take`s
+/// and `alt_active`.
+fn connect_progress_ok(
+    crap: &mut Option<std::process::Child>,
+    crap_stdin: &mut Option<std::process::ChildStdin>,
+    alt_active: &mut bool,
+    source: &str,
+) {
+    if let Some(mut sd) = crap_stdin.take() {
+        let mut w = rust_crap::NdjsonCrapWriter::new(&mut sd);
+        let _ = w.plan_ahead(1);
+        let _ = w.ok(&format!("connected to {source}"));
+        let _ = w.finish();
+    } // sd dropped here -> stdin EOF
+    if let Some(c) = crap.take() {
+        crate::remote::connect_progress::teardown(c);
+    }
+    if !*alt_active {
+        write_display_control("smcup (connect)", &display::open());
+        *alt_active = true;
+    }
+}
+
+/// The connect-progress indicator's failure resolution (#1): the establish never
+/// reached a first frame (timeout / abort / error). Mark the ndjson-crap test
+/// failed so `crap-present` shows the failure verdict and exits, then tear it
+/// down. The alt screen was never taken over, so there is nothing to restore.
+fn connect_progress_failed(
+    crap: &mut Option<std::process::Child>,
+    crap_stdin: &mut Option<std::process::ChildStdin>,
+    reason: &str,
+) {
+    if let Some(mut sd) = crap_stdin.take() {
+        let mut w = rust_crap::NdjsonCrapWriter::new(&mut sd);
+        let _ = w.plan_ahead(1);
+        let _ = w.not_ok_diag("establish connection", &[("message", reason)]);
+        let _ = w.finish();
+    }
+    if let Some(c) = crap.take() {
+        crate::remote::connect_progress::teardown(c);
+    }
+}
+
 /// Drives the client event loop until detach, shell exit, timeout, or error.
 /// Split from `client_loop` so the final stats flush runs on every exit path.
-fn drive_client(st: &mut ClientState, raw: &RawMode, port: u16) -> Result<i32> {
+/// `crap` is the connect-progress `crap-present` child (Some only when stdout is
+/// a tty and the binary was found); this fn owns the deferred smcup/rmcup
+/// lifecycle around it (#1). `source` labels the indicator.
+fn drive_client(
+    st: &mut ClientState,
+    raw: &RawMode,
+    port: u16,
+    mut crap: Option<std::process::Child>,
+    source: &str,
+) -> Result<i32> {
     let mut assembly = FragmentAssembly::new();
 
     // Connect diagnostics (mosh stmclient): before the first authentic
@@ -1728,6 +1786,22 @@ fn drive_client(st: &mut ClientState, raw: &RawMode, port: u16) -> Result<i32> {
         .map(|s| s.saturating_mul(1000))
         .unwrap_or(15_000);
     let mut heard = false;
+
+    // Connect-progress indicator (#1): while establishing — before the terminal
+    // takeover — draw a spinner on the PRIMARY screen via a `crap-present` child
+    // fed ndjson-crap. `crap` is Some only when stdout is a tty and the binary
+    // was found; otherwise take over the alt screen now, exactly as before. The
+    // smcup/rmcup pair lives here (deferred to the first frame), not in
+    // run/run_over_mux, so the takeover waits for a real connection.
+    let mut crap_stdin = crap.as_mut().and_then(|c| c.stdin.take());
+    let mut alt_active = false;
+    if let Some(sd) = crap_stdin.as_mut() {
+        let mut w = rust_crap::NdjsonCrapWriter::new(sd);
+        let _ = w.header(&format!("establishing {source}"), source);
+    } else {
+        write_display_control("smcup (connect)", &display::open());
+        alt_active = true;
+    }
 
     // Hello: teaches the server our address and terminal size.
     send_message(st);
@@ -1975,6 +2049,7 @@ fn drive_client(st: &mut ClientState, raw: &RawMode, port: u16) -> Result<i32> {
                         st.last_heard = now_ms();
                         if !heard {
                             heard = true;
+                            connect_progress_ok(&mut crap, &mut crap_stdin, &mut alt_active, source);
                             first_frame(st, now_ms());
                         }
                         if process_frame(st, &frame) {
@@ -2017,6 +2092,7 @@ fn drive_client(st: &mut ClientState, raw: &RawMode, port: u16) -> Result<i32> {
                         st.last_heard = now_ms();
                         if !heard {
                             heard = true;
+                            connect_progress_ok(&mut crap, &mut crap_stdin, &mut alt_active, source);
                             first_frame(st, now_ms());
                         }
                         if process_frame(st, &frame) {
@@ -2111,7 +2187,10 @@ fn drive_client(st: &mut ClientState, raw: &RawMode, port: u16) -> Result<i32> {
                     )),
                 });
             }
-            if waited >= 250 && st.notify.message().is_empty() {
+            // While the connect indicator owns the primary screen (crap-present
+            // draws the spinner), don't also raise our own "Nothing received"
+            // banner — the indicator is the feedback until the first frame.
+            if crap.is_none() && waited >= 250 && st.notify.message().is_empty() {
                 let waiting_on = match &st.wire {
                     Wire::Udp(_) => format!("Nothing received from server on UDP port {port}."),
                     Wire::Mux(_) => "Nothing received over the mux session channel yet.".to_string(),
@@ -2119,7 +2198,12 @@ fn drive_client(st: &mut ClientState, raw: &RawMode, port: u16) -> Result<i32> {
                 st.notify.set_message(&waiting_on, true, now);
             }
         }
-        render(st, now);
+        // Skip our own drawing while the connect indicator owns the primary
+        // screen (crap-present is drawing the spinner); once the first frame
+        // lands the indicator is torn down (`crap` taken) and we render as usual.
+        if crap.is_none() {
+            render(st, now);
+        }
         // Apply-stall detector (#wedge): a visible model frozen past the
         // threshold while diff frames keep arriving. Detection is unconditional
         // and cheap; the log line inside is POSH_DEBUG_LOG-gated.
@@ -2211,6 +2295,17 @@ fn drive_client(st: &mut ClientState, raw: &RawMode, port: u16) -> Result<i32> {
             st.stats.record_loop_iter(total.saturating_sub(idle_us), idle_us);
         }
     };
+    // The establish never reached a first frame (timeout / abort / error): the
+    // connect indicator never resolved — mark it failed and tear it down.
+    if crap.is_some() {
+        connect_progress_failed(&mut crap, &mut crap_stdin, "connection not established");
+    }
+    // Restore the outer terminal iff we took it over. The smcup is deferred to
+    // the first frame (or written at the top when there was no indicator), and
+    // both live here now instead of in run/run_over_mux (#1).
+    if alt_active {
+        write_display_control("rmcup (exit)", &display::close());
+    }
     result
 }
 

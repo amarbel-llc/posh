@@ -23,3 +23,11 @@ repository = "https://github.com/amarbel-llc/mosh"
 [profile.release]
 lto = "thin"
 strip = true
+
+# rust-crap's canonical home is the eng forge (code.linenisgreat.com), served
+# anonymously over https. mephisto's transitive dep points at the github mirror;
+# redirect that source to the forge so posh's direct rust-crap dep and mephisto's
+# transitive one unify to a single forge-sourced lock entry (no duplicate fetch
+# or compile). Drop this once mephisto itself points at the forge.
+[patch."https://github.com/amarbel-llc/crap.git"]
+rust-crap = { git = "https://code.linenisgreat.com/crap.git", rev = "3d0b855e695b8642804e0795fe9d6333e85ac342" }

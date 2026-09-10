@@ -192,6 +192,17 @@ _POSH_NO_TERM_INIT_
 	Suppress the alternate-screen takeover (set by *posh*(1)'s
 	*--no-init*).
 
+_POSH_CRAP_PRESENT_
+	Path to the *crap-present* viewport binary that draws the "establishing
+	connection" indicator while an attach connects. The client emits
+	ndjson-crap and pipes it to this binary, which spins on the *primary*
+	screen until the first frame arrives; the alternate-screen takeover
+	(smcup) is deferred until then, rather than blanking the screen before
+	the connection is up. Defaults to the *crap-present* found beside the
+	running binary or on _PATH_ (the nix package wraps it in); when it is
+	absent, or when stdout is not a terminal, the indicator is skipped and
+	the client takes over immediately as before.
+
 _POSH_DEBUG_LOG_
 	When set to a writable path, the client appends periodic one-line
 	performance summaries — smoothed RTT, RTO, send interval, received

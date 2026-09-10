@@ -1,5 +1,36 @@
 {
   "nodes": {
+    "bats": {
+      "inputs": {
+        "conformist": [
+          "crap",
+          "conformist"
+        ],
+        "igloo": [
+          "crap",
+          "igloo"
+        ],
+        "nixpkgs-master": [
+          "crap",
+          "nixpkgs-master"
+        ],
+        "utils": [
+          "crap",
+          "utils"
+        ]
+      },
+      "locked": {
+        "lastModified": 1788916149,
+        "narHash": "sha256-eAL/nOm+zlXrNGZncge3ugwWaHTMHVQMNTNtHTXjzqw=",
+        "rev": "d69889488ceb876731a13eea52b161355fd744bf",
+        "type": "tarball",
+        "url": "https://code.linenisgreat.com/bats/archive/d69889488ceb876731a13eea52b161355fd744bf.tar.gz"
+      },
+      "original": {
+        "type": "tarball",
+        "url": "https://code.linenisgreat.com/bats/archive/master.tar.gz"
+      }
+    },
     "bun2nix": {
       "inputs": {
         "flake-parts": [
@@ -55,6 +86,34 @@
       "original": {
         "type": "tarball",
         "url": "https://code.linenisgreat.com/conformist/archive/master.tar.gz"
+      }
+    },
+    "crap": {
+      "inputs": {
+        "bats": "bats",
+        "conformist": [
+          "conformist"
+        ],
+        "igloo": [
+          "igloo"
+        ],
+        "nixpkgs-master": [
+          "nixpkgs-master"
+        ],
+        "utils": [
+          "utils"
+        ]
+      },
+      "locked": {
+        "lastModified": 1788953153,
+        "narHash": "sha256-/0b5i0fj5YeeCbfqwS8hRNSZfVrO89rDYNffL7W6BxU=",
+        "rev": "7f360cf91747b1e8220827e5c3793a3d254d5f15",
+        "type": "tarball",
+        "url": "https://code.linenisgreat.com/crap/archive/7f360cf91747b1e8220827e5c3793a3d254d5f15.tar.gz"
+      },
+      "original": {
+        "type": "tarball",
+        "url": "https://code.linenisgreat.com/crap/archive/master.tar.gz"
       }
     },
     "flake-parts": {
@@ -188,6 +247,7 @@
     "root": {
       "inputs": {
         "conformist": "conformist",
+        "crap": "crap",
         "igloo": "igloo",
         "mephisto": "mephisto",
         "nixpkgs-master": "nixpkgs-master",

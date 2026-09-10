@@ -194,6 +194,7 @@ dependencies = [
  "posh-proto",
  "posh-term",
  "poshterity",
+ "rust-crap",
  "serde_json",
 ]
 
@@ -247,7 +248,7 @@ dependencies = [
 [[package]]
 name = "rust-crap"
 version = "2.2.2"
-source = "git+https://github.com/amarbel-llc/crap.git?rev=3d0b855e695b8642804e0795fe9d6333e85ac342#3d0b855e695b8642804e0795fe9d6333e85ac342"
+source = "git+https://code.linenisgreat.com/crap.git?rev=3d0b855e695b8642804e0795fe9d6333e85ac342#3d0b855e695b8642804e0795fe9d6333e85ac342"
 dependencies = [
  "serde",
  "serde_json",

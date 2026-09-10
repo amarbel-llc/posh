@@ -10,6 +10,10 @@ pub mod caps {
     pub use posh_proto::caps::*;
 }
 pub mod client;
+/// The `crap-present` connect-progress indicator (#1): locate/spawn/teardown of
+/// the CRAP viewport child that draws the "establishing connection" spinner on
+/// the primary screen while an attach establishes, before the terminal takeover.
+pub mod connect_progress;
 pub mod crypto;
 pub mod datagram;
 pub mod diag;

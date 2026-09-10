@@ -25,6 +25,15 @@ aes-gcm = { version = "0.10", default-features = false, features = [
 # The command-palette control channel speaks JSON-RPC 2.0 (RFC 0005); serde_json
 # parses the renderer's selected-command actions (arbitrary params) robustly.
 serde_json = "1"
+# Connect-progress indicator: posh emits ndjson-crap with this writer during the
+# attach establish and pipes it to a `crap-present` child (a runtime binary the
+# flake wraps onto posh's PATH) that draws the spinner on the primary screen,
+# before the terminal takeover. crap's canonical home is the eng forge, which
+# serves it anonymously over https so the hermetic sandbox fetches it via
+# builtins.fetchGit (flake.nix cargoLock.allowBuiltinFetchGit). The rev matches
+# mephisto's transitive rust-crap; the workspace [patch] (root Cargo.toml)
+# redirects that dep's github mirror to the forge so both unify to one entry.
+rust-crap = { git = "https://code.linenisgreat.com/crap.git", rev = "3d0b855e695b8642804e0795fe9d6333e85ac342" }
 # Evolutionary predictive-echo pilot (RFC 0007): the mephisto GP engine drives
 # the controller/from-scratch predictor species. A path dep into vendor/, which
 # the flake populates from the `mephisto` flake input (private repo, ssh-fetched

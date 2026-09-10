@@ -51,6 +51,21 @@
       inputs.utils.follows = "utils";
       inputs.conformist.follows = "conformist";
     };
+
+    # crap: source of the `crap-present` ndjson-crap viewport binary. posh's
+    # connect-progress indicator (#1) emits ndjson-crap (the rust-crap cargo
+    # dep, a public forge git dep) and pipes it to this binary, which draws the
+    # "establishing connection" spinner on the primary screen before the
+    # terminal takeover (crates/posh/src/remote/connect_progress.rs). Consumed as
+    # a BINARY wrapped onto posh's PATH below — the same posture as mesa. Follows
+    # keep the closure shared with the rest of the eng inputs.
+    crap = {
+      url = "https://code.linenisgreat.com/crap/archive/master.tar.gz";
+      inputs.igloo.follows = "igloo";
+      inputs.nixpkgs-master.follows = "nixpkgs-master";
+      inputs.utils.follows = "utils";
+      inputs.conformist.follows = "conformist";
+    };
   };
 
   # The `...` ellipsis is load-bearing: nix calls `outputs` with `self`
@@ -65,6 +80,7 @@
       conformist,
       mephisto,
       purse-first,
+      crap,
       ...
     }:
     utils.lib.eachDefaultSystem (
@@ -79,6 +95,11 @@
         # purse-first#185: the `mesa` List-Table NDJSON renderer binary that
         # `posh list` shells out to (crates/posh/src/session/mesa.rs).
         mesaBin = purse-first.packages.${system}.mesa;
+
+        # crap: the `crap-present` ndjson-crap viewport binary posh's
+        # connect-progress indicator (#1) drives as a subprocess to draw the
+        # establishing spinner (crates/posh/src/remote/connect_progress.rs).
+        crapPresentBin = crap.packages.${system}.crap-present;
 
         # RFC 0007: both rust derivations (.#posh and the mosh-ffi check) build
         # with src = ./. and load the whole workspace manifest — which includes
@@ -319,9 +340,16 @@
             # PATH, the way dagnabit wraps ast-grep onto its PATH. --suffix
             # (not --prefix): a user-provided `mesa` on PATH wins over this
             # pinned store path. posh-server/ph are symlinks to this same
-            # file, so they inherit the wrapped PATH too.
+            # file, so they inherit the wrapped PATH too. crap-present rides the
+            # same wrap: the connect-progress indicator (#1) drives it as a
+            # subprocess (crates/posh/src/remote/connect_progress.rs).
             wrapProgram $out/bin/posh \
-              --suffix PATH : ${lib.makeBinPath [ mesaBin ]}
+              --suffix PATH : ${
+                lib.makeBinPath [
+                  mesaBin
+                  crapPresentBin
+                ]
+              }
           '';
 
           meta = with lib; {
@@ -577,6 +605,8 @@
               pkgs.tcpdump # live-session transport triage (debug-posh-* recipes)
               mesaBin # `posh list`'s renderer (purse-first#185); dev-loop parity
               # with the wrapped nix package for `just debug-cargo`/`debug-posh-*`.
+              crapPresentBin # connect-progress spinner viewport (#1); dev-loop
+              # parity for `just debug-posh-run` and a live attach.
               conformistPkg # the raw conformist runner: `nix fmt`, lint-worktree
               # The config-specific, toolchain-hermetic git hooks on PATH under
               # the names the sweatfile references (conformist#47/#51/#54).

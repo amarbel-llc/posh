@@ -127,6 +127,17 @@ the `eng-*(7)` manpages — read them with `man eng-versioning`,
   any client. Detach/disconnect/roam leave it running; the daemon exits
   (killing its process group, propagating the shell's exit code) only when
   the shell itself exits. `crates/posh/src/session/daemon.rs`.
+- **Connect shows a spinner, then takes over (#1):** an attach does NOT smcup
+  up front. While the connection establishes, the client draws a `crap-present`
+  "establishing connection" spinner on the PRIMARY screen (ndjson-crap over a
+  pipe via the `rust-crap` writer, `remote/connect_progress.rs`), and DEFERS the
+  alt-screen takeover (smcup) — and its paired rmcup — into `drive_client`,
+  firing on the first frame (or a failure verdict + no takeover on
+  timeout/abort). `run`/`run_over_mux` no longer smcup. `crap-present` is wrapped
+  onto posh's PATH by the flake (the mesa pattern); `POSH_CRAP_PRESENT` overrides
+  it, and no-tty / not-found degrades to today's immediate takeover. `rust-crap`
+  is a public-forge git cargo dep unified with mephisto's transitive one via a
+  workspace `[patch]` (drop the patch once mephisto points at the forge).
 - **Multi-client sizing is smallest-wins, and the DAEMON owns it:** the
   session daemon sizes the pty to the elementwise MINIMUM across all attached
   clients (`min_client_size`/`apply_client_size`, `session/daemon.rs`; tmux
