@@ -319,10 +319,14 @@ the `eng-*(7)` manpages — read them with `man eng-versioning`,
   glyph re-picked every 150 ms (per-cell memory so it never repeats; the
   client's 50 ms prediction tick also runs while it is active so the shimmer
   repaints), `replace` is the original underline. Above both axes sits the
-  RFC 0007 §5.1 safety gate: the client skips rendering for EVERY model while
-  the remote PTY has ECHO off or the alt-screen is up (`optimistic_echo_on`
-  at the render call) — before the split the mosh models' hold happened to
-  mask most password-prompt leaks; now the gate is explicit. `never` is the
+  RFC 0007 §5.1 safety gate: the client skips rendering while the remote PTY
+  has ECHO off or the alt-screen is up (`render_gate_open` at the render call)
+  for every model EXCEPT the human-selected `always`, which bypasses the gate
+  entirely — paint every keystroke immediately, correct on the next server
+  frame, incl. a transient password glyph the `always` selection accepts by
+  name (§5.1 opt-out; never available to a GP species) — before the split the
+  mosh models' hold happened to mask most password-prompt leaks; now the gate
+  is explicit. `never` is the
   one model that records nothing. Mechanically the model never touches the
   screen: `Predictor::offer()` returns a `RenderStep { buf, advice }` and the
   renderer walks it (`PredictionRenderer::render_step`, default =

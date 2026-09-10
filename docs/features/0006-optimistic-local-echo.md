@@ -199,10 +199,13 @@ prediction immediately and marks every cell, so `adaptive` and `always` look
 identical and the "dim optimistic echo: off" lever below is superseded (`dim`
 vs `replace` picks faint vs underline). `advised` honors the advice — mosh's
 original behavior as a render choice. The model keeps WHAT: the machinery,
-`never` (records nothing), and the safety gate — which is now applied
-universally by the client (RFC 0007 §5.1: no model renders while the remote
-PTY has ECHO off or the alt-screen is up), since the mosh hold no longer
-masks a password prompt's first keystroke.
+`never` (records nothing), and the safety gate — applied by the client to
+every model except the `always` prediction *model* (not the `always` show
+policy above): RFC 0007 §5.1, no model renders while the remote PTY has ECHO
+off or the alt-screen is up, since the mosh hold no longer masks a password
+prompt's first keystroke; the `always` model is the one opt-out, painting
+immediately everywhere and correcting on the next frame — a transient echo of
+secret input the `always` choice accepts.
 
 ## Measuring the hot path (2026-09-08)
 

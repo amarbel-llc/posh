@@ -2296,6 +2296,19 @@ fn optimistic_echo_on(st: &ClientState) -> bool {
     st.echo_on && !st.server_term.is_alt_screen()
 }
 
+/// Whether the safety gate lets the active model's predictions reach the
+/// screen this compose (RFC 0007 §5.1). Normally that is [`optimistic_echo_on`]:
+/// echo on AND the primary screen, so a password prompt or a full-screen app
+/// suppresses every model. The `always` model is the deliberate exception —
+/// its whole contract is "paint every keystroke immediately, correct on the
+/// next server frame, no delay" — so it bypasses the gate entirely, predicting
+/// in full-screen apps AND at password prompts. The transient password glyph
+/// is a self-inflicted, retroactively-corrected leak the `always` selection
+/// accepts by name; every other model keeps the universal gate.
+fn render_gate_open(st: &ClientState) -> bool {
+    st.predict_model == PredictionModel::Always || optimistic_echo_on(st)
+}
+
 // The wheel-intercept `MouseFilter` (with its `FilterOut` and `MAX_MOUSE_SEQ`)
 // now lives in `remote::scrollview` so the local session frame client shares one
 // implementation; it is imported at the module top and stored in
@@ -3250,14 +3263,16 @@ fn compose_frame(st: &mut ClientState, now: u64) -> Vec<u8> {
             next.title = t;
         }
     }
-    // The safety gate is universal and above both axes (RFC 0007 §5.1): while
-    // the remote PTY has ECHO off (a password prompt) or the alternate screen
-    // is up, NO model's predictions reach the screen — not just optimistic's
-    // (which also drops its overlay via set_echo_safe). Before the
-    // predictor/renderer split the mosh models' tentative hold and adaptive
-    // trigger happened to mask most of this; now the renderer paints
-    // immediately, so the gate must be explicit.
-    st.last_render = if optimistic_echo_on(st) {
+    // The safety gate above both axes (RFC 0007 §5.1): while the remote PTY has
+    // ECHO off (a password prompt) or the alternate screen is up, predictions
+    // do not reach the screen — not just optimistic's (which also drops its
+    // overlay via set_echo_safe). Before the predictor/renderer split the mosh
+    // models' tentative hold and adaptive trigger happened to mask most of
+    // this; now the renderer paints immediately, so the gate must be explicit.
+    // The `always` model is the deliberate exception: it bypasses the gate
+    // entirely (predict immediately everywhere, correct on the next server
+    // frame — see `render_gate_open`).
+    st.last_render = if render_gate_open(st) {
         st.predict.render(&mut next, &*st.renderer)
     } else {
         predict::RenderOutcome::default()
@@ -3593,6 +3608,45 @@ mod tests {
 
         st.echo_on = false;
         assert!(!optimistic_echo_on(&st), "echo off (password) suppresses");
+    }
+
+    #[test]
+    fn always_model_predicts_unconditionally_including_at_a_password_prompt() {
+        // The `always` model bypasses the RFC 0007 §5.1 safety gate entirely:
+        // paint every keystroke immediately in every context — full-screen
+        // TUI, password prompt, ordinary shell — and let the next server frame
+        // correct it. The transient password glyph is accepted by the `always`
+        // selection by name (UX responsiveness over the gate).
+        let mut st = test_state(24, 80);
+        st.predict_model = PredictionModel::Always;
+
+        // Full-screen app (alt-screen up, echo off): the universal gate would
+        // suppress; `always` renders.
+        st.echo_on = false;
+        st.server_term.process(b"\x1b[?1049h");
+        assert!(st.server_term.is_alt_screen());
+        assert!(!optimistic_echo_on(&st), "the universal gate suppresses a TUI");
+        assert!(render_gate_open(&st), "`always` ignores the alt-screen signal");
+
+        // Primary-screen password prompt (echo off, no alt-screen): `always`
+        // predicts here too, by request.
+        st.server_term.process(b"\x1b[?1049l");
+        assert!(!st.server_term.is_alt_screen());
+        assert!(
+            render_gate_open(&st),
+            "`always` predicts even at a primary-screen password prompt"
+        );
+
+        // A normal cooked-mode shell prompt: echo on, primary screen — render.
+        st.echo_on = true;
+        assert!(render_gate_open(&st), "`always` predicts at an ordinary prompt");
+
+        // The exception is scoped to `always`: adaptive keeps the universal
+        // gate and stays suppressed at a password prompt.
+        st.predict_model = PredictionModel::Adaptive;
+        st.echo_on = false;
+        assert!(!st.server_term.is_alt_screen());
+        assert!(!render_gate_open(&st), "adaptive keeps the universal gate");
     }
 
     #[test]

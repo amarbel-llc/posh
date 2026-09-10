@@ -260,6 +260,17 @@ genome only *after* the outcome is observed; without this gate a never-before-
 seen mutant could echo one secret keystroke (e.g. a password) before its fitness
 is assessed.
 
+The gate binds every species and every fixed model by default. The one
+exception is the human-selected `always` model, which is an explicit, informed
+opt-out: it paints every keystroke immediately — including under `ECHO` off or
+on the alternate screen — and relies on the next authoritative frame to correct
+it. This is NOT "making the gate optional" in the sense the Security
+Considerations forbid: the gate remains non-overridable by *genome output* (the
+invariant this section exists for — untrusted machine-evolved code can never
+leak), and `always` is a deliberate operator choice whose transient,
+retroactively-corrected echo of secret input the operator accepts by selecting
+it. No GP species may select this opt-out; only the fixed `always` model has it.
+
 #### 5.2 Lethal fitness (evolutionary backstop)
 
 The evaluator MUST assign a *lethal* rank — a sentinel that selection treats as
@@ -372,9 +383,12 @@ is observable in-session without a debug sink.
 
 **Echo of secret input.** The central risk is echoing secret keystrokes (e.g.
 passwords) locally. This is addressed in depth by the two-layer model of §5: a
-non-overridable runtime gate (§5.1) and lethal fitness (§5.2). An implementation
-that weakens either layer — making the gate optional, or modeling leak avoidance
-as a soft penalty — is non-conformant.
+runtime gate (§5.1) that is non-overridable *by species output*, and lethal
+fitness (§5.2). An implementation that weakens either layer for a GP species —
+making the gate overridable by genome output, or modeling leak avoidance as a
+soft penalty — is non-conformant. The human-selected `always` model (§5.1) is
+the one sanctioned exception: an explicit operator opt-out of the gate for a
+fixed model, never available to an evolved species.
 
 **Metric-vector information exposure.** The metric vector carries sensitive host
 information: frontmost-app identity, process-tree features, and load on both
@@ -405,7 +419,7 @@ Unit-level conformance (the harness, `cargo test --workspace`):
 
 | Requirement | Vehicle | Description |
 |---|---|---|
-| §5.1 runtime gate | `PredictHarness` | with `echo_flag`=0 or `alt_screen`=1, no overlay cells are shown regardless of genome output |
+| §5.1 runtime gate | `PredictHarness` | with `echo_flag`=0 or `alt_screen`=1, no overlay cells are shown regardless of genome output; the human-selected `always` model is the sole exempt case |
 | §5.2 lethal fitness | species `rank()` test | a genome echoing under `echo_flag`=0 ranks strictly worst and is never `scored[0]` |
 | §4.1 controller clamping | controller test | out-of-range `confirm_gate_ms` is clamped to [0, 5000] |
 | §4.2 output cap | from-scratch test | an over-long overlay-op list is truncated, not rejected |

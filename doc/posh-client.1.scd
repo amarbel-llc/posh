@@ -150,7 +150,9 @@ _POSH_PREDICTION_RENDER_
 	predicted and hands the renderer its advice; the renderer decides when
 	a prediction appears and how it looks. Above both sits the safety gate:
 	nothing is painted while the remote PTY has ECHO off or the alternate
-	screen is active.
+	screen is active — except under the _always_ model, which opts out of the
+	gate to paint every keystroke immediately (correcting on the next frame),
+	accepting a transient echo of secret input.
 
 _POSH_PREDICTION_SHOW_
 	When the renderer paints what the model holds: _always_ (default) paints
