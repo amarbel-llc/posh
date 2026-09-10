@@ -327,13 +327,15 @@ enum PeerChannel {
     Awaiting {
         chan: channel::ChannelId,
         target: String,
-        /// The client's frame ceiling to resume above (posh#162): 0 on an
-        /// initial open, the retained channel's `last_frame_num` on a
-        /// reconnect re-drive. Seeds the DaemonLink's `frame_offset` when the
-        /// channel links, so the fresh session daemon's low frame numbers are
-        /// rewrapped above the client's `applied_num` and its reattach `Full`
-        /// is not dropped as stale. RFC 0008 §3.1.
-        resume_base: u64,
+        /// The resume cursor to seed every durable stream when this channel
+        /// links (posh#162 frames + the input/echo continuity this adds):
+        /// `frame` rewraps the fresh producer above the client's `applied_num`
+        /// so the reattach `Full` is not dropped as stale; `input` resumes the
+        /// inbox at the daemon-applied offset so the viewport's re-sent tail is
+        /// accepted, not gap-dropped; `echo` resumes the ack so local echo stays
+        /// confirmed-consistent. `INITIAL` on an initial open. RFC 0008 §3.1,
+        /// `crate::remote::resume`.
+        resume: crate::remote::resume::SessionResume,
     },
     Linked(Box<SessionBridge>),
 }
@@ -898,14 +900,14 @@ fn handle_session_instruction(
                     );
                     return;
                 }
-                // The OPEN body is the target, optionally followed by a
-                // resume base (posh#162 reconnect frame continuity).
-                let (target_bytes, resume_base) =
-                    crate::remote::mux::decode_session_open(&message[1..]);
+                // The OPEN body is the target, plus the resume cursor when
+                // reconnecting (frame + input + echo continuity).
+                let (target_bytes, resume) =
+                    crate::remote::resume::decode_open(&message[1..]);
                 channels.push(PeerChannel::Awaiting {
                     chan,
                     target: String::from_utf8_lossy(target_bytes).into_owned(),
-                    resume_base,
+                    resume,
                 });
             }
             // Confirm the open — for a fresh admit AND for §3.3 duplicate
@@ -934,9 +936,9 @@ fn handle_session_instruction(
             let Ok(msg) = crate::remote::sync::ClientMessage::decode(&message[1..]) else {
                 return;
             };
-            if let PeerChannel::Awaiting { target, resume_base, .. } = &channels[i] {
+            if let PeerChannel::Awaiting { target, resume, .. } = &channels[i] {
                 let target = target.clone();
-                let resume_base = *resume_base;
+                let resume = *resume;
                 let (rows, cols) = (msg.rows.max(1), msg.cols.max(1));
                 let mut content = crate::remote::relay::content_caps(&msg.caps);
                 // RFC 0014 §3: the bridge's own identity on Init; the
@@ -947,14 +949,18 @@ fn handle_session_instruction(
                     pid: std::process::id(),
                     start_unix_ms: unix_now_ms(),
                 }));
-                // posh#162: on a reconnect re-drive the ceiling is the
-                // client's resume base, so this fresh endpoint's leg
-                // continues numbering above it (rather than restarting
-                // low and being dropped as stale). 0 on an initial open.
+                // The resume cursor continues every durable stream on this fresh
+                // endpoint (posh#162 frames + input/echo): the leg numbers frames
+                // above the client's ceiling, the inbox resumes at the
+                // daemon-applied input offset (so the re-sent tail is accepted,
+                // not gap-dropped, and the already-applied prefix is skipped by
+                // InputInbox::accept, not re-fed), and the echo ack resumes so
+                // local echo stays confirmed-consistent. `INITIAL` on an initial
+                // open leaves every offset 0 — today's behavior.
                 match connect_daemon(&target).and_then(|stream| {
                     crate::remote::relay::DaemonLeg::link(
                         stream,
-                        resume_base,
+                        resume.frame,
                         (rows, cols),
                         &content,
                     )
@@ -964,19 +970,18 @@ fn handle_session_instruction(
                             chan,
                             daemon,
                             content,
-                            inbox: crate::remote::sync::InputInbox::new(),
+                            inbox: crate::remote::sync::InputInbox::resume(resume.input),
                             client_size: (rows, cols),
-                            // Seed from the resume base (posh#162) so a
-                            // heartbeat Empty sent before the first real frame
-                            // carries a number at/above the client's ceiling,
-                            // not 0 (which the client would drop as stale).
-                            last_frame_num: resume_base,
+                            // The frame ceiling continues numbering above the
+                            // client's `applied_num` so a heartbeat Empty sent
+                            // before the first real frame is not dropped as stale.
+                            last_frame_num: resume.frame,
                             last_retx: 0,
                             // 0 = "never sent": the first heartbeat goes out
                             // on the next iteration, so the client learns the
                             // channel is live immediately.
                             last_send: 0,
-                            echo: crate::remote::sync::EchoAck::new(),
+                            echo: crate::remote::sync::EchoAck::resume(resume.echo),
                             frame_flags: 0,
                         }));
                     }
@@ -2710,8 +2715,17 @@ mod tests {
 
     /// A minimal linked `SessionBridge` over a UnixStream pair — enough to
     /// drive `bridge_client_message` and inspect what it queued to the daemon
-    /// (`link.write`) without a live daemon.
+    /// (`link.write`) without a live daemon. Fresh (initial-open) offsets.
     fn test_bridge() -> (SessionBridge, std::os::unix::net::UnixStream) {
+        test_bridge_resumed(crate::remote::resume::SessionResume::INITIAL)
+    }
+
+    /// Like [`test_bridge`] but seeded from a resume cursor, exactly as the
+    /// reconnect OPEN→link path seeds a fresh bridge: the frame ceiling, the
+    /// input inbox, and the echo ack all continue from the cursor.
+    fn test_bridge_resumed(
+        resume: crate::remote::resume::SessionResume,
+    ) -> (SessionBridge, std::os::unix::net::UnixStream) {
         let (stream, peer) = std::os::unix::net::UnixStream::pair().unwrap();
         let b = SessionBridge {
             chan: channel::ChannelId::new(false, channel::KIND_SESSION, 2),
@@ -2719,18 +2733,69 @@ mod tests {
                 stream,
                 read: crate::session::ipc::FrameBuffer::new(),
                 write: Vec::new(),
-                frame_offset: 0,
+                frame_offset: resume.frame,
             }),
-            inbox: crate::remote::sync::InputInbox::new(),
+            inbox: crate::remote::sync::InputInbox::resume(resume.input),
             client_size: (24, 80),
-            last_frame_num: 0,
+            last_frame_num: resume.frame,
             last_retx: 0,
             last_send: 0,
-            echo: crate::remote::sync::EchoAck::new(),
+            echo: crate::remote::sync::EchoAck::resume(resume.echo),
             frame_flags: 0,
             content: Vec::new(),
         };
         (b, peer)
+    }
+
+    /// The `Tag::Input` bytes the bridge queued to the daemon link.
+    fn fed_input(b: &SessionBridge) -> Vec<u8> {
+        let mut fb = crate::session::ipc::FrameBuffer::new();
+        fb.feed(&b.daemon.link.write);
+        let mut fed = Vec::new();
+        while let Ok(Some(rec)) = fb.next() {
+            if rec.tag == crate::session::ipc::Tag::Input {
+                fed.extend_from_slice(&rec.payload);
+            }
+        }
+        fed
+    }
+
+    #[test]
+    fn a_reconnect_bridge_seeds_input_from_the_cursor_no_gap_no_dup() {
+        // posh#162 gave FRAME continuity across a mux-wire reconnect; posh#186
+        // preserved the input inbox across a re-HOME. A wire RECONNECT builds a
+        // FRESH bridge, so before the SessionResume cursor its input inbox
+        // restarted at 0 while the viewport's outbox continued at a high offset,
+        // and the re-sent tail was dropped as a gap — silently losing every
+        // keystroke typed across the reconnect. Now the reconnect OPEN carries
+        // the cursor (input = the daemon-applied offset, here 40) and the fresh
+        // bridge is seeded from it, so the resumed tail lands — with no gap and
+        // no duplicate re-apply.
+        let resume = crate::remote::resume::SessionResume { frame: 0, input: 40, echo: 0 };
+        let msg = |input_base, input: &[u8]| crate::remote::sync::ClientMessage {
+            flags: 0,
+            caps: Vec::new(),
+            acked_frame: 0,
+            rows: 24,
+            cols: 80,
+            input_base,
+            input: input.to_vec(),
+        };
+
+        // No gap: the viewport re-sends at input_base 40 (its outbox base == the
+        // resumed offset); the whole tail reaches the daemon.
+        let (mut b, _peer) = test_bridge_resumed(resume);
+        assert!(bridge_client_message(&mut b, &msg(40, b"ls\r")));
+        assert_eq!(fed_input(&b), b"ls\r", "resumed input tail dropped as a gap");
+        assert_eq!(b.inbox.next_offset(), 43, "inbox resumed at 40, advanced by 3");
+
+        // No dup: a viewport whose outbox base LAGS the daemon-applied offset (an
+        // ack lost at the outage) re-sends from the lower base; the inbox skips
+        // the already-applied prefix and feeds only the fresh suffix.
+        let (mut b2, _peer2) = test_bridge_resumed(resume); // inbox at 40
+        assert!(bridge_client_message(&mut b2, &msg(38, b"XYq"))); // 38,39,40 -> only 40 is fresh
+        assert_eq!(fed_input(&b2), b"q", "already-applied prefix must not be re-fed");
+        assert_eq!(b2.inbox.next_offset(), 41);
     }
 
     #[test]

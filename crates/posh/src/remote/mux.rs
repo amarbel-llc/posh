@@ -631,37 +631,11 @@ pub(crate) const SESSION_WIRE_CLOSE: u8 = 2;
 /// reconnect-after-switch survival is lost against an old peer.
 pub(crate) const SESSION_WIRE_SWITCH: u8 = 3;
 
-/// The `SESSION_WIRE_OPEN` body: the RFC 0001 target, optionally followed by
-/// a NUL and a `u64 LE` resume base (posh#162 reconnect frame continuity).
-/// A base of 0 encodes as the BARE target — byte-identical to the original
-/// format, so an initial open and an old peer are unaffected; a nonzero base
-/// (only ever on a reconnect re-drive) appends `\0<base>`. Session targets are
-/// `[user@]host:[group/]session` and never contain NUL, so the split is
-/// unambiguous.
-pub(crate) fn encode_session_open(target: &[u8], resume_base: u64) -> Vec<u8> {
-    if resume_base == 0 {
-        return target.to_vec();
-    }
-    let mut out = Vec::with_capacity(target.len() + 1 + 8);
-    out.extend_from_slice(target);
-    out.push(0);
-    out.extend_from_slice(&resume_base.to_le_bytes());
-    out
-}
-
-/// Decode a [`encode_session_open`] body into `(target_bytes, resume_base)`.
-/// No NUL ⇒ the bare-target original format (`base` 0). A NUL with a
-/// malformed 8-byte tail falls back to `base` 0 and the whole payload as the
-/// target (forward/defensive tolerance — the target still resolves).
-pub(crate) fn decode_session_open(payload: &[u8]) -> (&[u8], u64) {
-    match payload.iter().position(|b| *b == 0) {
-        Some(nul) if payload.len() == nul + 1 + 8 => {
-            let base = u64::from_le_bytes(payload[nul + 1..].try_into().unwrap());
-            (&payload[..nul], base)
-        }
-        _ => (payload, 0),
-    }
-}
+// The `SESSION_WIRE_OPEN` body codec (target + the `SessionResume` cursor) lives
+// in `crate::remote::resume` (`encode_open`/`decode_open`) — the cursor is the
+// single carrier of every offset a reattach must resume, so its wire form lives
+// with the type. posh#162's frame-only resume is a legacy tail `decode_open`
+// still accepts for skew with an old client.
 
 /// How long an unconfirmed session OPEN retransmits (one send per RTO)
 /// before the endpoint gives up and surfaces a remote close to the client
@@ -691,15 +665,15 @@ struct IpcSession {
     queued: Vec<Vec<u8>>,
     open_sends: u32,
     last_open_send: Option<u64>,
-    /// The highest `frame_num` relayed to the foreground client on this
-    /// channel — the client's applied ceiling. On a wire reconnect (posh#162)
-    /// the re-driven OPEN carries this as the RESUME BASE so the fresh remote
-    /// endpoint seeds its `frame_offset` to it: without that, the new endpoint
-    /// reattaches to the surviving session daemon whose fresh producer
-    /// restarts `frame_num` low, and the client drops the reattach `Full` as
-    /// stale (`frame_num < applied_num`) and wedges. The reconnect analog of
-    /// the FDR 0012 retarget's `frame_offset` bump; see RFC 0008 §3.1.
-    last_frame_num: u64,
+    /// The resume cursor for this channel: every offset the re-driven OPEN must
+    /// carry so the fresh remote endpoint CONTINUES, not restarts, each durable
+    /// stream — the frame ceiling (posh#162; without it the reattach `Full`
+    /// lands `frame_num < applied_num` and wedges), the daemon-applied input
+    /// offset (without it the re-sent input tail is dropped as a gap), and the
+    /// echo-ack offset (the `always` predictor's confirm boundary). Tracked from
+    /// the acks on relayed frames; carried by `resume::encode_open`. See RFC
+    /// 0008 §3.1 and `crate::remote::resume`.
+    resume: crate::remote::resume::SessionResume,
 }
 
 /// A close owed to the wire after its IPC conn is gone (or detached):
@@ -1572,18 +1546,24 @@ fn mux_loop(
                                 }
                                 match message.first() {
                                     Some(&SESSION_WIRE_DATA) => {
-                                        // Track the client's applied ceiling for
-                                        // a later reconnect's resume base
-                                        // (posh#162 frame continuity): peek the
-                                        // relayed frame's number. A decode
-                                        // failure or a non-advancing frame (an
-                                        // Empty ack/heartbeat carries the last
-                                        // number) just leaves the ceiling put.
+                                        // Track every durable offset for a later
+                                        // reconnect re-drive by peeking the
+                                        // relayed frame's acks: the frame ceiling
+                                        // (posh#162 frame continuity), the
+                                        // daemon-applied input offset, and the
+                                        // echo-ack offset. `.max` keeps each
+                                        // monotonic — a decode failure or a
+                                        // reordered/Empty frame (which carries the
+                                        // last acks) just leaves the cursor put.
                                         if let Ok(f) =
                                             sync::ServerFrame::decode(&message[1..])
                                         {
-                                            sess.last_frame_num =
-                                                sess.last_frame_num.max(f.frame_num);
+                                            sess.resume.frame =
+                                                sess.resume.frame.max(f.frame_num);
+                                            sess.resume.input =
+                                                sess.resume.input.max(f.input_ack);
+                                            sess.resume.echo =
+                                                sess.resume.echo.max(f.echo_ack);
                                         }
                                         let framed =
                                             encode_session_frame(srtt, &message[1..]);
@@ -1783,7 +1763,7 @@ fn mux_loop(
                             queued: Vec::new(),
                             open_sends: 0,
                             last_open_send: None,
-                            last_frame_num: 0,
+                            resume: crate::remote::resume::SessionResume::INITIAL,
                         });
                         let ack = MuxSessionOpenAck::Granted { ordinal: chan.ordinal() };
                         let _ = send_mux_frame(
@@ -1949,12 +1929,16 @@ fn mux_loop(
                     {
                         s.open_sends += 1;
                         s.last_open_send = Some(now);
-                        // The OPEN carries the resume base (posh#162): 0 on the
-                        // initial open (bare target, byte-identical), the
-                        // client's frame ceiling on a reconnect re-drive so the
-                        // fresh remote endpoint continues numbering above it.
-                        let (chan, body) =
-                            (s.chan, encode_session_open(&s.target, s.last_frame_num));
+                        // The OPEN carries the resume cursor (posh#162 + this
+                        // change): INITIAL on the initial open (bare target,
+                        // byte-identical), else the frame ceiling + the
+                        // daemon-applied input offset + the echo-ack offset, so
+                        // the fresh remote endpoint continues every durable
+                        // stream instead of restarting it.
+                        let (chan, body) = (
+                            s.chan,
+                            crate::remote::resume::encode_open(&s.target, s.resume),
+                        );
                         send_session_wire(
                             &mut conn,
                             &mut fragmenter,
@@ -2887,28 +2871,9 @@ mod tests {
         assert_eq!(MuxHelloAck::decode(&wire), None);
     }
 
-    #[test]
-    fn session_open_resume_base_roundtrips_and_stays_compatible() {
-        // posh#162: base 0 encodes as the BARE target (byte-identical to the
-        // original format, so an initial open and an old peer are
-        // unaffected), and a nonzero base appends \0<u64 LE>.
-        assert_eq!(encode_session_open(b"box:dev", 0), b"box:dev".to_vec());
-        assert_eq!(decode_session_open(b"box:dev"), (&b"box:dev"[..], 0));
-
-        let framed = encode_session_open(b"user@box:work/s-1", 4242);
-        assert_eq!(decode_session_open(&framed), (&b"user@box:work/s-1"[..], 4242));
-
-        // Round-trip a spread of bases, including the u64 ceiling.
-        for base in [1u64, 255, 65_536, u64::MAX] {
-            let enc = encode_session_open(b"h:s", base);
-            assert_eq!(decode_session_open(&enc), (&b"h:s"[..], base));
-        }
-
-        // Defensive: a NUL with a malformed (non-8-byte) tail falls back to
-        // the whole payload as the target and base 0 — the target still
-        // resolves rather than erroring.
-        assert_eq!(decode_session_open(b"h:s\0short"), (&b"h:s\0short"[..], 0));
-    }
+    // The OPEN-body resume codec's round-trip + skew tolerance (bare-target
+    // INITIAL, the versioned cursor, the legacy frame-only tail) is tested in
+    // `crate::remote::resume` — the cursor lives with its wire form now.
 
     #[test]
     fn session_open_ack_roundtrips_ok_and_failure() {

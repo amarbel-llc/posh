@@ -343,6 +343,19 @@ impl EchoAck {
         EchoAck::default()
     }
 
+    /// Resume the ack at `acked` (a mux-wire reconnect / re-home, via
+    /// `SessionResume.echo`): the fresh endpoint continues the echo confirm
+    /// boundary the viewport already reached, so local echo of the durable
+    /// pending input stays confirmed-consistent rather than snapping back to 0.
+    /// Pending grace timers start empty — only the cumulative ack is load-bearing
+    /// on resume.
+    pub fn resume(acked: u64) -> EchoAck {
+        EchoAck {
+            pending: std::collections::VecDeque::new(),
+            acked,
+        }
+    }
+
     /// Records that input through `offset` was written to the application.
     pub fn record(&mut self, offset: u64, now: u64) {
         let newest = self.pending.back().map_or(self.acked, |&(o, _)| o);
@@ -597,6 +610,15 @@ pub struct InputInbox {
 impl InputInbox {
     pub fn new() -> InputInbox {
         InputInbox::default()
+    }
+
+    /// Resume the stream at `next` (a mux-wire reconnect / re-home, via
+    /// `SessionResume.input`): the fresh endpoint continues where the surviving
+    /// daemon has APPLIED input to, so the viewport's re-sent tail (which resumes
+    /// at this offset) is accepted rather than dropped as a gap, and the
+    /// already-applied prefix is not re-fed.
+    pub fn resume(next: u64) -> InputInbox {
+        InputInbox { next }
     }
 
     pub fn next_offset(&self) -> u64 {

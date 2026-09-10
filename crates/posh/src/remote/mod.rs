@@ -77,6 +77,12 @@ pub mod predict;
 /// to a remote roaming client over the AEAD-UDP transport, owning no terminal
 /// model of its own (the single-model collapse).
 pub mod relay;
+/// `SessionResume`: the aggregate of every offset that must stay continuous when
+/// a session's transport is rebuilt under a live viewport (mux-wire reconnect,
+/// posh#162; FDR 0012 re-home, posh#186). The reattach path constructs each
+/// durable stream from this cursor, and the OPEN wire codec carries it, so a new
+/// durable stream is a field the compiler forces every site to handle.
+pub mod resume;
 /// Shared scrollback scroll-view machinery (FDR 0005): the wheel-intercept
 /// `MouseFilter`, the scroll-offset math, and the frozen-history compose. Used
 /// by both this crate's roaming client (`remote::client`) and the local session
