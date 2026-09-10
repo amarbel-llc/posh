@@ -1558,12 +1558,11 @@ fn mux_loop(
                                         if let Ok(f) =
                                             sync::ServerFrame::decode(&message[1..])
                                         {
-                                            sess.resume.frame =
-                                                sess.resume.frame.max(f.frame_num);
-                                            sess.resume.input =
-                                                sess.resume.input.max(f.input_ack);
-                                            sess.resume.echo =
-                                                sess.resume.echo.max(f.echo_ack);
+                                            sess.resume.advance_from_frame(
+                                                f.frame_num,
+                                                f.input_ack,
+                                                f.echo_ack,
+                                            );
                                         }
                                         let framed =
                                             encode_session_frame(srtt, &message[1..]);

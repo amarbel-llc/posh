@@ -221,7 +221,10 @@ the `eng-*(7)` manpages — read them with `man eng-versioning`,
   compiler forces every reattach site and the wire codec to carry — the
   invariant is structural, not per-stream discipline. posh#186 already preserved
   input/echo across an FDR 0012 re-home (same bridge); this extends the same
-  continuity to a reconnect (fresh bridge). RFC 0008 §3.1. The client is
+  continuity to a reconnect (fresh bridge). The cursor's fields, its
+  versioned skew-safe OPEN encoding, and the "durable stream ⇒ a
+  `SessionResume` field" invariant are specified in RFC 0015 (extending
+  RFC 0008 §3.1). The client is
   sent nothing: frames stall, the transport-agnostic "Last contact N ago"
   banner counts up, and the reattach repaint clears it — mosh-parity, a wire
   blip is invisible exactly as on the baseline per-invocation UDP path

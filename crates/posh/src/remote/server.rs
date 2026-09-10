@@ -2799,6 +2799,23 @@ mod tests {
     }
 
     #[test]
+    fn a_reconnect_bridge_seeds_the_echo_confirm_boundary_from_the_cursor() {
+        // The echo-manifestation invariant (RFC 0015 §1): the `always` predictor's
+        // local echo is the on-screen view of the input the daemon has confirmed
+        // (the echo-ack offset). A fresh reconnect bridge that reset its EchoAck to
+        // 0 would re-open the whole confirmed region as "unconfirmed", making the
+        // predictor re-shimmer already-echoed input. Seeding EchoAck from
+        // `SessionResume.echo` keeps the confirm boundary continuous across the
+        // reconnect — the predictor resolves on the same offset the outbox drains.
+        let resume = crate::remote::resume::SessionResume { frame: 0, input: 40, echo: 37 };
+        let (b, _peer) = test_bridge_resumed(resume);
+        assert_eq!(b.echo.ack(), 37, "echo confirm boundary must resume from the cursor");
+        // INITIAL leaves it at 0 — a first-ever open confirms nothing yet.
+        let (b0, _peer0) = test_bridge();
+        assert_eq!(b0.echo.ack(), 0, "an initial open starts the echo boundary at 0");
+    }
+
+    #[test]
     fn switch_wire_target_maps_group_and_default() {
         // FDR 0012 §3.1: the daemon's group\0session switch payload maps to
         // the wire target connect_named_daemon parses — bare session for the

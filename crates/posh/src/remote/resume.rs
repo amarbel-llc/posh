@@ -50,6 +50,18 @@ impl SessionResume {
     pub fn is_initial(&self) -> bool {
         *self == SessionResume::INITIAL
     }
+
+    /// Advance the cursor from the acknowledgements a relayed frame carries: the
+    /// mux daemon calls this for every frame it relays to the foreground viewport
+    /// so a later reconnect re-drives the offsets the client actually reached
+    /// (RFC 0015 §4). Each offset is `max`-combined and so NEVER decreases — a
+    /// reordered or heartbeat `Empty` frame (which repeats the last acks) only
+    /// leaves the cursor put, never rewinds it.
+    pub fn advance_from_frame(&mut self, frame_num: u64, input_ack: u64, echo_ack: u64) {
+        self.frame = self.frame.max(frame_num);
+        self.input = self.input.max(input_ack);
+        self.echo = self.echo.max(echo_ack);
+    }
 }
 
 /// Version byte introducing the multi-offset resume block. The pre-versioned
@@ -155,6 +167,26 @@ mod tests {
             decode_open(&old),
             (b"host:dev".as_slice(), SessionResume { frame: 512, input: 0, echo: 0 })
         );
+    }
+
+    #[test]
+    fn advance_from_frame_is_monotonic_per_offset() {
+        // The daemon's producer duty (RFC 0015 §4): peek each relayed frame's
+        // acks into the cursor, monotonically. A later frame carrying HIGHER acks
+        // advances every offset; a reordered/heartbeat frame with LOWER or equal
+        // acks (an Empty repeats the last acks) must never rewind any of them.
+        let mut r = SessionResume::INITIAL;
+        r.advance_from_frame(300, 40, 37);
+        assert_eq!(r, SessionResume { frame: 300, input: 40, echo: 37 });
+        // A later frame: input/echo climb, frame climbs.
+        r.advance_from_frame(305, 43, 40);
+        assert_eq!(r, SessionResume { frame: 305, input: 43, echo: 40 });
+        // A stale/reordered frame (lower everywhere) leaves the cursor put.
+        r.advance_from_frame(301, 41, 38);
+        assert_eq!(r, SessionResume { frame: 305, input: 43, echo: 40 });
+        // Mixed: only the offset that actually advanced moves; the others hold.
+        r.advance_from_frame(305, 50, 39);
+        assert_eq!(r, SessionResume { frame: 305, input: 50, echo: 40 });
     }
 
     #[test]
