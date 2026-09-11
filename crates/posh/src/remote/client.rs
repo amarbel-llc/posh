@@ -1498,6 +1498,12 @@ struct ClientState {
     /// The command-palette overlay renderer (Ctrl-^ p), spawned lazily on first
     /// summon and kept resident; `None` until then or if it can't be launched.
     palette: Option<Palette>,
+    /// The connect-establishing modal (posh#195): a captured `crap-present`
+    /// process whose rendered progress is composited (like the palette) onto the
+    /// viewport until the first frame. `Some` from the immediate takeover until
+    /// the establish resolves (first frame → `ok`, or timeout/abort → `not_ok`),
+    /// then torn down and cleared. `None` off-tty / crap-present-not-found.
+    establish: Option<crate::remote::connect_progress::CrapModal>,
     /// The last visible-frame body the applier rejected via `ReackAndWait`
     /// (#90/#94 forensics): `(rx_num, rx_base, kind, body_bytes)`. Captured to
     /// disk once per wedge episode so the divergent base can be analysed
@@ -1657,6 +1663,7 @@ fn client_loop(
         debug_banner: debug_banner_env(),
         banner: DebugBanner::default(),
         palette: None,
+        establish: None,
         last_reack: None,
         forensic_captured: false,
         base_history: Vec::new(),
@@ -1689,11 +1696,10 @@ fn client_loop(
     // RFC 0007: collect the compute-timing terminals when a GP species is the
     // startup model, independent of POSH_DEBUG_LOG.
     st.stats.set_gp_active(is_gp_species(model));
-    // Spawn the connect-progress indicator (#1): a `crap-present` child drawing
-    // the establishing spinner on the primary screen. None (no tty / not
-    // installed) => the client takes over the terminal immediately, as before.
-    let crap = crate::remote::connect_progress::spawn();
-    let result = drive_client(&mut st, raw, port, crap, host);
+    // drive_client takes over the terminal immediately and, while establishing,
+    // shows the connect progress as a command-palette-style modal overlay
+    // (posh#195): a captured `crap-present` process it spawns + composites.
+    let result = drive_client(&mut st, raw, port, host);
     // Tear down the palette renderer (if any) before the final stats flush.
     if let Some(p) = st.palette.take() {
         p.shutdown();
@@ -1715,64 +1721,25 @@ fn client_loop(
     result
 }
 
-/// The connect-progress indicator's success resolution (#1): finish the
-/// ndjson-crap stream (so `crap-present` renders its verdict, clears its status
-/// line, and exits), tear the child down, then take over the alt screen
-/// (deferred smcup) unless we already have. Idempotent via the `Option::take`s
-/// and `alt_active`.
-fn connect_progress_ok(
-    crap: &mut Option<std::process::Child>,
-    crap_stdin: &mut Option<std::process::ChildStdin>,
-    alt_active: &mut bool,
-    source: &str,
-) {
-    if let Some(mut sd) = crap_stdin.take() {
-        let mut w = rust_crap::NdjsonCrapWriter::new(&mut sd);
-        let _ = w.plan_ahead(1);
-        let _ = w.ok(&format!("connected to {source}"));
-        let _ = w.finish();
-    } // sd dropped here -> stdin EOF
-    if let Some(c) = crap.take() {
-        crate::remote::connect_progress::teardown(c);
-    }
-    if !*alt_active {
-        write_display_control("smcup (connect)", &display::open());
-        *alt_active = true;
-    }
-}
-
-/// The connect-progress indicator's failure resolution (#1): the establish never
-/// reached a first frame (timeout / abort / error). Mark the ndjson-crap test
-/// failed so `crap-present` shows the failure verdict and exits, then tear it
-/// down. The alt screen was never taken over, so there is nothing to restore.
-fn connect_progress_failed(
-    crap: &mut Option<std::process::Child>,
-    crap_stdin: &mut Option<std::process::ChildStdin>,
-    reason: &str,
-) {
-    if let Some(mut sd) = crap_stdin.take() {
-        let mut w = rust_crap::NdjsonCrapWriter::new(&mut sd);
-        let _ = w.plan_ahead(1);
-        let _ = w.not_ok_diag("establish connection", &[("message", reason)]);
-        let _ = w.finish();
-    }
-    if let Some(c) = crap.take() {
-        crate::remote::connect_progress::teardown(c);
+/// The establish modal's success resolution (posh#195): on the first frame,
+/// finish the ndjson-crap stream with the `ok` verdict (so `crap-present`
+/// renders it and exits) and tear the modal down. Clearing `st.establish`
+/// dismisses the overlay; the alt screen is already ours (immediate takeover),
+/// so there is no deferred smcup here. Idempotent via `Option::take`.
+fn establish_done_ok(st: &mut ClientState) {
+    if let Some(mut m) = st.establish.take() {
+        m.ok();
+        m.teardown();
     }
 }
 
 /// Drives the client event loop until detach, shell exit, timeout, or error.
 /// Split from `client_loop` so the final stats flush runs on every exit path.
-/// `crap` is the connect-progress `crap-present` child (Some only when stdout is
-/// a tty and the binary was found); this fn owns the deferred smcup/rmcup
-/// lifecycle around it (#1). `source` labels the indicator.
-fn drive_client(
-    st: &mut ClientState,
-    raw: &RawMode,
-    port: u16,
-    mut crap: Option<std::process::Child>,
-    source: &str,
-) -> Result<i32> {
+/// Takes over the alt screen IMMEDIATELY and, while establishing, shows the
+/// connect progress as a command-palette-style modal overlay (posh#195): a
+/// captured `crap-present` process (`st.establish`) composited each frame,
+/// dismissed on the first frame. `source` labels the establish/verdict lines.
+fn drive_client(st: &mut ClientState, raw: &RawMode, port: u16, source: &str) -> Result<i32> {
     let mut assembly = FragmentAssembly::new();
 
     // Connect diagnostics (mosh stmclient): before the first authentic
@@ -1787,21 +1754,15 @@ fn drive_client(
         .unwrap_or(15_000);
     let mut heard = false;
 
-    // Connect-progress indicator (#1): while establishing — before the terminal
-    // takeover — draw a spinner on the PRIMARY screen via a `crap-present` child
-    // fed ndjson-crap. `crap` is Some only when stdout is a tty and the binary
-    // was found; otherwise take over the alt screen now, exactly as before. The
-    // smcup/rmcup pair lives here (deferred to the first frame), not in
-    // run/run_over_mux, so the takeover waits for a real connection.
-    let mut crap_stdin = crap.as_mut().and_then(|c| c.stdin.take());
-    let mut alt_active = false;
-    if let Some(sd) = crap_stdin.as_mut() {
-        let mut w = rust_crap::NdjsonCrapWriter::new(sd);
-        let _ = w.header(&format!("establishing {source}"), source);
-    } else {
-        write_display_control("smcup (connect)", &display::open());
-        alt_active = true;
-    }
+    // Immediate takeover (posh#195): open the alt screen NOW, then show the
+    // connect progress as a palette-style modal overlay composited onto the
+    // (empty, greyed) viewport until the first frame. The establish modal is a
+    // captured `crap-present` process fed ndjson-crap; `None` off-tty / binary
+    // not found, in which case there is just no overlay (the "Last contact"
+    // banner covers that case). rmcup on exit is unconditional (we always took
+    // over). smcup/rmcup live here, not in run/run_over_mux.
+    write_display_control("smcup (connect)", &display::open());
+    st.establish = crate::remote::connect_progress::CrapModal::spawn(source, st.rows, st.cols);
 
     // Hello: teaches the server our address and terminal size.
     send_message(st);
@@ -1894,6 +1855,9 @@ fn drive_client(
                 st.cols = size.1;
                 if let Some(p) = st.palette.as_mut() {
                     p.resize(st.rows, st.cols);
+                }
+                if let Some(m) = st.establish.as_mut() {
+                    m.resize(st.rows, st.cols);
                 }
                 st.predict.reset();
                 st.initialized = false; // full repaint at the new size
@@ -2049,7 +2013,7 @@ fn drive_client(
                         st.last_heard = now_ms();
                         if !heard {
                             heard = true;
-                            connect_progress_ok(&mut crap, &mut crap_stdin, &mut alt_active, source);
+                            establish_done_ok(st);
                             first_frame(st, now_ms());
                         }
                         if process_frame(st, &frame) {
@@ -2092,7 +2056,7 @@ fn drive_client(
                         st.last_heard = now_ms();
                         if !heard {
                             heard = true;
-                            connect_progress_ok(&mut crap, &mut crap_stdin, &mut alt_active, source);
+                            establish_done_ok(st);
                             first_frame(st, now_ms());
                         }
                         if process_frame(st, &frame) {
@@ -2168,6 +2132,15 @@ fn drive_client(
             }
         }
 
+        // Establish modal (posh#195): drain crap-present's PTY each iteration so
+        // the composited spinner advances (its fd is not in the poll set). A
+        // cheap no-op once torn down at the first frame; compose recomposites
+        // every iteration while it is `Some` (overlays_live), so the updated
+        // screen is picked up without an explicit repaint arm.
+        if let Some(m) = st.establish.as_mut() {
+            m.pump();
+        }
+
         let now = now_ms();
         if !heard {
             let waited = now.saturating_sub(started);
@@ -2187,10 +2160,11 @@ fn drive_client(
                     )),
                 });
             }
-            // While the connect indicator owns the primary screen (crap-present
-            // draws the spinner), don't also raise our own "Nothing received"
-            // banner — the indicator is the feedback until the first frame.
-            if crap.is_none() && waited >= 250 && st.notify.message().is_empty() {
+            // While the establish modal is up it IS the connect feedback, so
+            // don't also raise our own "Nothing received" banner. When there is
+            // no modal (off-tty / crap-present absent) the banner is the only
+            // feedback, so it still fires.
+            if st.establish.is_none() && waited >= 250 && st.notify.message().is_empty() {
                 let waiting_on = match &st.wire {
                     Wire::Udp(_) => format!("Nothing received from server on UDP port {port}."),
                     Wire::Mux(_) => "Nothing received over the mux session channel yet.".to_string(),
@@ -2198,12 +2172,11 @@ fn drive_client(
                 st.notify.set_message(&waiting_on, true, now);
             }
         }
-        // Skip our own drawing while the connect indicator owns the primary
-        // screen (crap-present is drawing the spinner); once the first frame
-        // lands the indicator is torn down (`crap` taken) and we render as usual.
-        if crap.is_none() {
-            render(st, now);
-        }
+        // Render every iteration (posh#195 immediate takeover): while
+        // establishing this composites the palette-style establish modal onto
+        // the greyed viewport; once the first frame lands the modal is dismissed
+        // (`st.establish` cleared) and we render the live session as usual.
+        render(st, now);
         // Apply-stall detector (#wedge): a visible model frozen past the
         // threshold while diff frames keep arriving. Detection is unconditional
         // and cheap; the log line inside is POSH_DEBUG_LOG-gated.
@@ -2296,16 +2269,18 @@ fn drive_client(
         }
     };
     // The establish never reached a first frame (timeout / abort / error): the
-    // connect indicator never resolved — mark it failed and tear it down.
-    if crap.is_some() {
-        connect_progress_failed(&mut crap, &mut crap_stdin, "connection not established");
+    // modal never resolved — finish its stream with the failure verdict and tear
+    // it down. The failure reason is also the returned Err, which the caller
+    // prints to stderr after rmcup restores the terminal, so it survives the
+    // takeover being torn down (posh#195).
+    if let Some(mut m) = st.establish.take() {
+        m.not_ok("connection not established");
+        m.teardown();
     }
-    // Restore the outer terminal iff we took it over. The smcup is deferred to
-    // the first frame (or written at the top when there was no indicator), and
-    // both live here now instead of in run/run_over_mux (#1).
-    if alt_active {
-        write_display_control("rmcup (exit)", &display::close());
-    }
+    // Restore the outer terminal: the immediate takeover (posh#195) always
+    // smcup'd at the top of this fn, so rmcup is unconditional. smcup/rmcup live
+    // here, not in run/run_over_mux.
+    write_display_control("rmcup (exit)", &display::close());
     result
 }
 
@@ -3261,10 +3236,12 @@ fn render_to<S: TtySink>(st: &mut ClientState, now: u64, sink: &mut S) {
 fn compose_frame(st: &mut ClientState, now: u64) -> Vec<u8> {
     let model_state = (st.applied_num, st.server_term.generation());
     let palette_open = st.palette.as_ref().is_some_and(Palette::is_open);
+    let establishing = st.establish.is_some();
     let overlays_live = st.predict.active()
         || !st.notify.message().is_empty()
         || st.notify.server_late(now)
         || palette_open
+        || establishing
         || st.debug_banner;
     if st.initialized
         && model_state == st.last_render_state
@@ -3372,8 +3349,16 @@ fn compose_frame(st: &mut ClientState, now: u64) -> Vec<u8> {
     } else {
         predict::RenderOutcome::default()
     };
-    // The palette overlay sits above the session (greyed) but below the banner.
-    if palette_open {
+    // The establish modal (posh#195) and the command palette both sit above the
+    // session (greyed) but below the banner, and reuse the same compositing.
+    // They are mutually exclusive: the palette can't open before the session is
+    // up, and the establish modal is torn down on the first frame. The establish
+    // modal takes precedence while it is up.
+    if establishing {
+        if let Some(m) = st.establish.as_ref() {
+            composite_palette(&mut next, m.screen(), st.rows, st.cols);
+        }
+    } else if palette_open {
         if let Some(rterm) = st.palette.as_ref().and_then(Palette::screen) {
             composite_palette(&mut next, rterm, st.rows, st.cols);
         }
@@ -4869,6 +4854,7 @@ mod tests {
             debug_banner: false,
             banner: DebugBanner::default(),
             palette: None,
+            establish: None,
             last_reack: None,
             forensic_captured: false,
             base_history: Vec::new(),

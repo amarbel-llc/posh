@@ -193,15 +193,16 @@ _POSH_NO_TERM_INIT_
 	*--no-init*).
 
 _POSH_CRAP_PRESENT_
-	Path to the *crap-present* viewport binary that draws the "establishing
-	connection" indicator while an attach connects. The client emits
-	ndjson-crap and pipes it to this binary, which spins on the *primary*
-	screen until the first frame arrives; the alternate-screen takeover
-	(smcup) is deferred until then, rather than blanking the screen before
-	the connection is up. Defaults to the *crap-present* found beside the
-	running binary or on _PATH_ (the nix package wraps it in); when it is
-	absent, or when stdout is not a terminal, the indicator is skipped and
-	the client takes over immediately as before.
+	Path to the *crap-present* viewport binary that renders the "establishing
+	connection" progress while an attach connects. The client takes over the
+	alternate screen immediately and shows this progress as a command-palette-
+	style modal overlay: it emits ndjson-crap to *crap-present* over a pipe and
+	captures the binary's rendered output off a PTY, compositing it (greyed
+	background, centred modal) onto the viewport until the first frame arrives,
+	then dismisses it. Defaults to the *crap-present* found beside the running
+	binary or on _PATH_ (the nix package wraps it in); when it is absent, or when
+	stdout is not a terminal, the modal is skipped — the client still takes over
+	immediately, just without the overlay.
 
 _POSH_DEBUG_LOG_
 	When set to a writable path, the client appends periodic one-line

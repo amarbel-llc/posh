@@ -544,15 +544,17 @@ fn remote_client_reports_dead_server_and_times_out() {
     }
     drain_into(master, &mut pane);
     let text = String::from_utf8_lossy(&pane);
-    // An early connect diagnostic must appear before the timeout. Which one
-    // depends on whether the connect-progress viewport (`crap-present`, #1) is on
-    // PATH: with it, it owns the primary screen during establish (posh's own
-    // banner is suppressed) and shows the "establishing …" spinner / failure
-    // verdict; without it, posh falls back to its "Nothing received" banner.
+    // An early connect diagnostic must appear before the timeout. posh#195
+    // takes over the alt screen immediately and, while establishing, composites
+    // a palette-style modal. Which diagnostic shows depends on whether the
+    // establish modal's `crap-present` renderer is on PATH: with it, the modal
+    // shows the "establishing …" progress (composited into the frame); without
+    // it (this hermetic test), posh's own "Nothing received" banner is the
+    // feedback. Either way the bytes land in the captured pane.
     assert!(
         text.contains("Nothing received from server on UDP port 62999")
             || text.contains("establishing 127.0.0.1"),
-        "no early connect diagnostic (banner or establish spinner) in pane: {text:?}"
+        "no early connect diagnostic (banner or establish modal) in pane: {text:?}"
     );
     assert!(
         text.contains("imed out waiting for server"),

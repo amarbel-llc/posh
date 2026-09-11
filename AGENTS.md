@@ -127,17 +127,22 @@ the `eng-*(7)` manpages — read them with `man eng-versioning`,
   any client. Detach/disconnect/roam leave it running; the daemon exits
   (killing its process group, propagating the shell's exit code) only when
   the shell itself exits. `crates/posh/src/session/daemon.rs`.
-- **Connect shows a spinner, then takes over (#1):** an attach does NOT smcup
-  up front. While the connection establishes, the client draws a `crap-present`
-  "establishing connection" spinner on the PRIMARY screen (ndjson-crap over a
-  pipe via the `rust-crap` writer, `remote/connect_progress.rs`), and DEFERS the
-  alt-screen takeover (smcup) — and its paired rmcup — into `drive_client`,
-  firing on the first frame (or a failure verdict + no takeover on
-  timeout/abort). `run`/`run_over_mux` no longer smcup. `crap-present` is wrapped
-  onto posh's PATH by the flake (the mesa pattern); `POSH_CRAP_PRESENT` overrides
-  it, and no-tty / not-found degrades to today's immediate takeover. `rust-crap`
-  is a public-forge git cargo dep unified with mephisto's transitive one via a
-  workspace `[patch]` (drop the patch once mephisto points at the forge).
+- **Connect takes over immediately, showing a palette-style establish modal
+  (#1 → posh#195):** `drive_client` smcups the alt screen IMMEDIATELY (not
+  deferred), then — while establishing — composites the connect progress as a
+  command-palette-STYLE modal (greyed background, centred) onto the empty
+  viewport, dismissed on the first frame. The renderer is still `crap-present`
+  fed ndjson-crap (`rust-crap` writer; CRAP producer→viewport split), but its
+  output is CAPTURED off a PTY representing the modal — like the palette
+  renderer — not drawn to the primary screen. `connect_progress::CrapModal` is
+  the crap-present analog of `palette::Palette`; `pty::spawn_capture` wires
+  stdin=pipe (ndjson) + stdout=PTY. It lives in `ClientState.establish`,
+  composited via `composite_palette` each frame (mutually exclusive with the
+  command palette). First frame → `ok` + teardown + cleared; timeout/abort →
+  `not_ok` + teardown, the reason also the returned Err on stderr after the
+  (unconditional) rmcup. `run`/`run_over_mux` don't smcup. `POSH_CRAP_PRESENT`
+  overrides the binary (flake-wrapped onto PATH); no-tty / not-found degrades to
+  immediate takeover with NO modal (the "Last contact" banner covers it).
 - **Multi-client sizing is smallest-wins, and the DAEMON owns it:** the
   session daemon sizes the pty to the elementwise MINIMUM across all attached
   clients (`min_client_size`/`apply_client_size`, `session/daemon.rs`; tmux
@@ -440,18 +445,17 @@ read-only, `debug` group):
   costs (posh#142). Needs client dumps taken while forwarding was active
   (`debug-posh-dump`, or the palette's agent info).
 - **Agent-ownership breadcrumbs (posh#196):** the always-on
-  `agent/mux-<client-id>.log` carries three `pid=`-keyed lines that pin whether a
-  wedged forwarded agent is an orphan-ownership problem or a failed
-  establishment. `agent endpoint up: pid=… sock=…` maps each pid to its bound
-  socket (sibling daemons — respawns, competitors — share one per-client-id log).
-  `agent consumer accepted: pid=… channel=N` prints on every consumer connect: if
-  a `git`/`ssh` request fails yet the LIVE daemon logged no accept, the connect
-  landed on a different daemon holding `agent/sock` (not a fast-fail). The WARN
-  `agent/sock held by a sibling while our peer is live: pid=… points_at=…` is the
-  direct orphan-ownership tell — a peer-active daemon that cannot own `agent/sock`
-  because a sibling's socket is merely *bound* (`symlink_needs_takeover` judges
-  socket-liveness, not agent-peer liveness). Diagnostic only; the self-heal fix
-  is pending live capture.
+  `agent/mux-<client-id>.log` carries three `pid=`-keyed lines pinning whether a
+  wedged forwarded agent is orphan-ownership vs failed-establishment.
+  `agent endpoint up: pid=… sock=…` maps each pid to its socket (sibling daemons
+  share one per-client-id log). `agent consumer accepted: pid=… channel=N` prints
+  on every consumer connect: a failing `git`/`ssh` request with NO accept on the
+  live daemon means the connect landed on a different daemon holding `agent/sock`
+  (not a fast-fail). The WARN `agent/sock held by a sibling while our peer is
+  live: …` is the direct orphan tell — a peer-active daemon that can't own
+  `agent/sock` because a sibling's socket is merely *bound*
+  (`symlink_needs_takeover` judges socket- not agent-peer-liveness). Diagnostic
+  only; the self-heal fix is pending live capture.
 - `just debug-posh-mux-log` — the LOCAL mux daemons' state (posh#161 triage):
   `posh mux ls`, each daemon socket's pid, and each always-on `mux/<key>.log`
   tail, where the ref-lifecycle lines (which invocations pin the daemon,

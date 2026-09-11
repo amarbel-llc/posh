@@ -263,6 +263,97 @@ pub fn spawn_with_control(bin: &CString, rows: u16, cols: u16) -> Result<PtyCont
     }
 }
 
+pub struct PtyCaptureChild {
+    /// Host end of the child's stdout/stderr PTY — read the child's rendered
+    /// terminal output here.
+    pub master: RawFd,
+    /// Host (write) end of the pipe feeding the child's stdin — write the data
+    /// stream (e.g. ndjson-crap) the child consumes here.
+    pub stdin: RawFd,
+    pub pid: libc::pid_t,
+}
+
+/// Spawn a co-process whose STDOUT is a captured PTY but whose STDIN is a plain
+/// pipe: the child renders to a terminal (fds 1+2 on the PTY slave, so it sizes
+/// to `rows`×`cols` and emits full terminal control) while it consumes a data
+/// stream on stdin (fd 0 = the pipe read end). The host reads the rendered
+/// output from `master` and writes the input stream to `stdin`. Used to host
+/// `crap-present` as a captured modal (posh#195): posh feeds it ndjson-crap on
+/// the pipe and composites its rendered PTY like the command-palette renderer,
+/// rather than letting it draw to the real primary screen. No control channel
+/// and no login-shell/env massaging.
+pub fn spawn_capture(bin: &CString, rows: u16, cols: u16) -> Result<PtyCaptureChild> {
+    let argv: [*const libc::c_char; 2] = [bin.as_ptr(), std::ptr::null()];
+    let ws = libc::winsize {
+        ws_row: rows,
+        ws_col: cols,
+        ws_xpixel: 0,
+        ws_ypixel: 0,
+    };
+    let mut master: libc::c_int = -1;
+    let mut slave: libc::c_int = -1;
+    let mut pipe_fds: [libc::c_int; 2] = [-1, -1];
+    // SAFETY: as spawn_with_control — every pointer outlives the call and the
+    // forked child touches only async-signal-safe functions with no allocation
+    // between fork and exec.
+    unsafe {
+        if libc::pipe(pipe_fds.as_mut_ptr()) != 0 {
+            return Err(std::io::Error::last_os_error().into());
+        }
+        let (child_stdin, host_stdin) = (pipe_fds[0], pipe_fds[1]);
+        if libc::openpty(
+            &mut master,
+            &mut slave,
+            std::ptr::null_mut(),
+            std::ptr::null::<libc::termios>() as *mut _,
+            &ws as *const _ as *mut _,
+        ) < 0
+        {
+            let e = std::io::Error::last_os_error();
+            libc::close(child_stdin);
+            libc::close(host_stdin);
+            return Err(e.into());
+        }
+        let pid = libc::fork();
+        if pid < 0 {
+            let e = std::io::Error::last_os_error();
+            libc::close(master);
+            libc::close(slave);
+            libc::close(child_stdin);
+            libc::close(host_stdin);
+            return Err(e.into());
+        }
+        if pid == 0 {
+            // Child: stdin is the pipe read end (the data stream); stdout+stderr
+            // are the PTY slave (so it renders to a terminal sized to the
+            // winsize). It is a session leader with the slave as controlling
+            // terminal so TIOCGWINSZ on stdout resolves.
+            libc::setsid();
+            libc::ioctl(slave, libc::TIOCSCTTY as _, 0);
+            libc::dup2(child_stdin, 0);
+            libc::dup2(slave, 1);
+            libc::dup2(slave, 2);
+            libc::close(master);
+            libc::close(host_stdin);
+            if child_stdin > 2 {
+                libc::close(child_stdin);
+            }
+            if slave > 2 {
+                libc::close(slave);
+            }
+            libc::execv(bin.as_ptr(), argv.as_ptr());
+            libc::_exit(127);
+        }
+        libc::close(slave);
+        libc::close(child_stdin);
+        Ok(PtyCaptureChild {
+            master,
+            stdin: host_stdin,
+            pid,
+        })
+    }
+}
+
 fn build_argv(command: Option<&[String]>) -> Result<(CString, Vec<CString>)> {
     match command {
         Some(args) if !args.is_empty() => {
