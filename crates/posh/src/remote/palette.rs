@@ -69,6 +69,9 @@ pub struct Palette {
     /// (an unknown view on an older renderer) surfaces as
     /// [`PaletteEvent::ViewRejected`] rather than being ignored.
     pending_show: Option<i64>,
+    /// Observational guard: catches a query answer posh wrote to this PTY echoing
+    /// back into `rterm` (posh#195). Silent unless the slave's ECHO was left on.
+    echo_watch: EchoWatch,
 }
 
 /// Locate the `posh-palette` binary: `$POSH_PALETTE` override, else next to the
@@ -132,6 +135,7 @@ impl Palette {
             next_id: 0,
             dialog_body: String::new(),
             pending_show: None,
+            echo_watch: EchoWatch::default(),
         };
         if p.handshake() {
             Some(p)
@@ -200,11 +204,15 @@ impl Palette {
         if n <= 0 {
             return false;
         }
+        let read = &buf[..n as usize];
+        // Did our last query answer echo back (slave ECHO on)? Observational.
+        self.echo_watch.saw_read(read, "palette");
         let before = self.rterm.generation();
-        self.rterm.process(&buf[..n as usize]);
+        self.rterm.process(read);
         let replies = self.rterm.take_responses();
         if !replies.is_empty() {
             write_all(self.master, &replies);
+            self.echo_watch.wrote(&replies);
         }
         self.rterm.generation() != before
     }
@@ -350,6 +358,51 @@ impl Palette {
             if read_fd_into(self.ctrl, &mut self.ctrl_buf) <= 0 {
                 return None;
             }
+        }
+    }
+}
+
+/// Observational echo-back detector for a posh-hosted emulator PTY (posh#195
+/// hardening guard). posh drives these PTYs as the terminal, so a query answer
+/// it WRITES to the master must never come BACK on a read — that would be the
+/// slave line discipline echoing it (ECHO left on), which posh then ingests into
+/// its emulator model as stray input. Records the last query answer written and,
+/// on a later read that contains it, latches + logs once. Detection-only; never
+/// alters the stream. Only query ANSWERS are watched — not forwarded keystrokes,
+/// which a text field legitimately re-renders — so a match is unambiguous. This
+/// should stay silent given `pty::quiet_emulator_slave`; a fire is a regression.
+#[derive(Default)]
+pub(crate) struct EchoWatch {
+    last_written: Vec<u8>,
+    warned: bool,
+}
+
+impl EchoWatch {
+    /// Record a query answer just written to the master (the only write worth
+    /// watching for an echo).
+    pub fn wrote(&mut self, bytes: &[u8]) {
+        if !self.warned && !bytes.is_empty() {
+            self.last_written = bytes.to_vec();
+        }
+    }
+
+    /// Check a freshly-read chunk for the last-written answer echoed back; logs +
+    /// latches once. `who` labels the emulator in the log line.
+    pub fn saw_read(&mut self, read: &[u8], who: &str) {
+        if self.warned || self.last_written.is_empty() {
+            return;
+        }
+        let needle = self.last_written.as_slice();
+        if read.windows(needle.len()).any(|w| w == needle) {
+            self.warned = true;
+            util::log_write(
+                "echo",
+                &format!(
+                    "{who}: {} bytes written to the emulator PTY echoed back on read \
+                     (slave ECHO left on?) — stray input into the model",
+                    needle.len()
+                ),
+            );
         }
     }
 }
@@ -579,6 +632,7 @@ mod tests {
             next_id: 0,
             dialog_body: String::new(),
             pending_show: None,
+            echo_watch: EchoWatch::default(),
         };
         (p, sp[1])
     }

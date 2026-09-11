@@ -26,6 +26,8 @@ use std::time::{Duration, Instant};
 
 use posh_term::Terminal;
 
+use crate::remote::palette::EchoWatch;
+
 const BINARY_NAME: &str = "crap-present";
 /// Grace for `crap-present` to render its verdict, clear its status line, and
 /// exit after the stream's summary record + stdin EOF, before we SIGKILL it, so
@@ -82,6 +84,9 @@ pub struct CrapModal {
     rterm: Terminal,
     /// The attach target, e.g. "flac:dev" — named in the establish/verdict lines.
     source: String,
+    /// Observational guard: catches a query answer posh wrote to this PTY echoing
+    /// back into `rterm` (posh#195). Silent unless the slave's ECHO was left on.
+    echo_watch: EchoWatch,
 }
 
 impl CrapModal {
@@ -108,6 +113,7 @@ impl CrapModal {
             pid: child.pid,
             rterm: Terminal::new(rows, cols),
             source: source.to_string(),
+            echo_watch: EchoWatch::default(),
         };
         let mut w = rust_crap::NdjsonCrapWriter::new(&mut m.stdin);
         let _ = w.header(&format!("establishing {source}"), source);
@@ -127,13 +133,17 @@ impl CrapModal {
         if n <= 0 {
             return false;
         }
+        let read = &buf[..n as usize];
+        // Did our last query answer echo back (slave ECHO on)? Observational.
+        self.echo_watch.saw_read(read, "crap-present");
         let before = self.rterm.generation();
-        self.rterm.process(&buf[..n as usize]);
+        self.rterm.process(read);
         let replies = self.rterm.take_responses();
         if !replies.is_empty() {
             let _ = unsafe {
                 libc::write(self.master, replies.as_ptr() as *const libc::c_void, replies.len())
             };
+            self.echo_watch.wrote(&replies);
         }
         self.rterm.generation() != before
     }

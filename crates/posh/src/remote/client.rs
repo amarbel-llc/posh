@@ -2393,6 +2393,12 @@ fn process_user_input(st: &mut ClientState, buf: &[u8], key_at: Instant) -> bool
     let now = now_ms();
     let mut dirty = false;
 
+    // Live stray-input latch (observational, posh#195-adjacent): a terminal query
+    // RESPONSE (DA/CPR/kitty/OSC-11) in the raw bytes we're about to forward is a
+    // stray reply that leaked in as if typed, not real input. Detect + log once;
+    // this NEVER alters the bytes (they still forward as-is).
+    st.stats.check_stray_input(buf);
+
     // Dismiss the sticky wedge banner (#wedge) on the user's next keystroke: they
     // have seen it, and typing is also the action that tends to break the stall.
     // Gated on the message so it only clears our own banner, not another notice.

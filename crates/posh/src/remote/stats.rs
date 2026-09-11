@@ -22,6 +22,53 @@ const FLUSH_INTERVAL_MS: u64 = 1000;
 /// arriving is the apply-stall wedge signature the detector self-logs (#wedge).
 const WEDGE_FROZEN_MS: u64 = 3000;
 
+/// Scan bytes FORWARDED to the session for a terminal query RESPONSE signature —
+/// DA (`CSI ?…c` / `CSI >…c`), cursor-position report (`CSI …;… R`), kitty flags
+/// (`CSI ?…u`), or OSC-11 bg-color (`ESC ] 1 1 ;`). Returns the kind on the first
+/// match. A user never TYPES these, so a match in the input stream is a stray
+/// terminal reply that reached the session as if typed — the live signature of
+/// the stray-escape-sequence class. Deliberately tight to avoid false positives:
+/// kitty keyboard INPUT (`CSI …u` WITHOUT the `?` prefix), cursor keys
+/// (`CSI A/B/C/D`), and SGR mouse input (`CSI <…M/m`) do NOT match.
+fn input_query_response_kind(buf: &[u8]) -> Option<&'static str> {
+    let mut i = 0;
+    while i < buf.len() {
+        if buf[i] != 0x1b {
+            i += 1;
+            continue;
+        }
+        // OSC 11 bg-color response: ESC ] 1 1 ;
+        if buf[i + 1..].starts_with(b"]11;") {
+            return Some("osc11-bgcolor");
+        }
+        if buf.get(i + 1) == Some(&b'[') {
+            // CSI: an optional private prefix, numeric params, then a final byte.
+            let mut j = i + 2;
+            let prefix = buf.get(j).copied().filter(|b| matches!(b, b'?' | b'>' | b'='));
+            if prefix.is_some() {
+                j += 1;
+            }
+            let params_start = j;
+            while j < buf.len() && matches!(buf[j], b'0'..=b'9' | b';' | b':') {
+                j += 1;
+            }
+            if let Some(&final_byte) = buf.get(j) {
+                let has_params = j > params_start;
+                match final_byte {
+                    b'c' if matches!(prefix, Some(b'?') | Some(b'>')) => return Some("da-response"),
+                    b'u' if prefix == Some(b'?') => return Some("kitty-flags-response"),
+                    b'R' if prefix.is_none() && has_params => {
+                        return Some("cursor-position-report")
+                    }
+                    _ => {}
+                }
+            }
+        }
+        i += 1;
+    }
+    None
+}
+
 /// Frame inter-arrival gap that trips the client's "Last contact" banner
 /// (#false-disconnect): mirrors `posh_proto::display::SERVER_LATE_AFTER` so the
 /// stats collector counts a "late" arrival gap by the SAME threshold the banner
@@ -182,6 +229,12 @@ pub struct Stats {
     wedge_term_gen_since: u64,
     wedge_diff_at_change: u64,
     wedge_warned: bool,
+
+    /// Stray-input latch: a terminal QUERY RESPONSE (DA/CPR/kitty/OSC-11) seen
+    /// in the bytes forwarded to the session is almost certainly a leak — a user
+    /// never types one — not real input. Latched so it self-logs once. Purely
+    /// observational: it never drops or rewrites the input.
+    stray_input_warned: bool,
 }
 
 /// Client prediction gauges sampled at flush time (POSH_DEBUG_LOG). Bundled so
@@ -613,6 +666,33 @@ impl Stats {
             );
         }
         self.wedge_warned = true;
+        true
+    }
+
+    /// Latched, observational stray-input detector: logs once when a terminal
+    /// query RESPONSE (DA/CPR/kitty/OSC-11) appears in the bytes being forwarded
+    /// to the session — a reply that leaked in as if typed. Returns whether it
+    /// fired (for tests). Detection is unconditional; the log line is gated on
+    /// `enabled`, like the wedge detector. It NEVER drops or rewrites the input
+    /// (purely observational).
+    pub fn check_stray_input(&mut self, buf: &[u8]) -> bool {
+        if self.stray_input_warned {
+            return false;
+        }
+        let Some(kind) = input_query_response_kind(buf) else {
+            return false;
+        };
+        self.stray_input_warned = true;
+        if self.enabled {
+            let shown = &buf[..buf.len().min(64)];
+            util::log_write(
+                "stray-input",
+                &format!(
+                    "terminal query response ({kind}) in session input — a stray reply forwarded as if typed: {:?}",
+                    String::from_utf8_lossy(shown)
+                ),
+            );
+        }
         true
     }
 
@@ -1080,6 +1160,41 @@ mod tests {
         assert!(!s.check_wedge(WEDGE_FROZEN_MS + 5000, 5, 100, "morph"));
         // The model advances: re-arms (no immediate re-fire).
         assert!(!s.check_wedge(WEDGE_FROZEN_MS + 5000, 6, 100, "morph"));
+    }
+
+    #[test]
+    fn query_response_scanner_matches_replies_not_normal_input() {
+        // Terminal query RESPONSES a user never types → detected.
+        assert_eq!(input_query_response_kind(b"\x1b[?62;22c"), Some("da-response"));
+        assert_eq!(input_query_response_kind(b"\x1b[>0;276;0c"), Some("da-response"));
+        assert_eq!(input_query_response_kind(b"\x1b[?0u"), Some("kitty-flags-response"));
+        assert_eq!(input_query_response_kind(b"\x1b[24;80R"), Some("cursor-position-report"));
+        assert_eq!(
+            input_query_response_kind(b"\x1b]11;rgb:1c1c/1c1c/1c1c\x1b\\"),
+            Some("osc11-bgcolor")
+        );
+        // Detected even embedded in a burst.
+        assert!(input_query_response_kind(b"ls\r\x1b[?62;22c").is_some());
+
+        // Normal INPUT must NOT match: plain text, cursor keys, function keys,
+        // SGR mouse, and — critically — kitty keyboard INPUT (`CSI …u` with no
+        // `?`, e.g. Shift+Enter = `CSI 13;2u`).
+        assert_eq!(input_query_response_kind(b"ls -la\r"), None);
+        assert_eq!(input_query_response_kind(b"\x1b[A\x1b[B\x1b[C\x1b[D"), None);
+        assert_eq!(input_query_response_kind(b"\x1b[15~"), None);
+        assert_eq!(input_query_response_kind(b"\x1b[<0;10;5M"), None);
+        assert_eq!(input_query_response_kind(b"\x1b[13;2u"), None, "kitty key input, not a reply");
+    }
+
+    #[test]
+    fn stray_input_latch_fires_once() {
+        let mut s = enabled_stats();
+        assert!(!s.check_stray_input(b"ls\r"), "normal input never fires");
+        assert!(s.check_stray_input(b"\x1b[?62;22c"), "a DA response fires");
+        assert!(
+            !s.check_stray_input(b"\x1b[24;80R"),
+            "latched: does not re-fire after the first stray reply"
+        );
     }
 
     #[test]
