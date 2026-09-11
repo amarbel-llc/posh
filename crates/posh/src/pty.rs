@@ -29,6 +29,29 @@ pub fn set_term_size(fd: RawFd, rows: u16, cols: u16) {
     }
 }
 
+/// Quiet the INPUT line discipline on a PTY slave that posh itself drives as the
+/// terminal (the command-palette and connect-establish `crap-present` emulators):
+/// clear `ECHO` and `ICANON` so a byte posh writes to the master can never be
+/// echoed back onto the master — where posh would read it into its emulator model
+/// as stray input — nor line-buffered pending a newline. Output processing
+/// (`OPOST`/`ONLCR`) is left INTACT so the child's rendering is unaffected. This
+/// is defensive hardening: a full-screen child (bubbletea) sets its own raw mode
+/// regardless, but a child that renders to the PTY without reading it (or before
+/// it configures the tty) would otherwise leave the kernel-default cooked+echo
+/// discipline in place. Best-effort — a failure only leaves the default. NOT used
+/// for `spawn_shell`, where a login shell wants a normal cooked+echo tty.
+fn quiet_emulator_slave(slave: RawFd) {
+    // SAFETY: tcgetattr writes through a valid &mut termios before it is read;
+    // tcsetattr reads a valid reference. A non-tty / failure is ignored.
+    unsafe {
+        let mut tio: libc::termios = std::mem::zeroed();
+        if libc::tcgetattr(slave, &mut tio) == 0 {
+            tio.c_lflag &= !(libc::ICANON | libc::ECHO);
+            let _ = libc::tcsetattr(slave, libc::TCSANOW, &tio);
+        }
+    }
+}
+
 /// Whether the tty's line discipline currently echoes input (`c_lflag & ECHO`).
 /// Reading `c_lflag` off the pty master reflects the slave's termios on Linux,
 /// so the server can tell an optimistic-echo client when local echo is safe
@@ -221,6 +244,10 @@ pub fn spawn_with_control(bin: &CString, rows: u16, cols: u16) -> Result<PtyCont
             libc::close(child_ctrl);
             return Err(e.into());
         }
+        // posh drives this PTY as the terminal (palette renderer): present a
+        // no-echo, non-canonical INPUT discipline so a master write can't echo
+        // back into posh's model or line-buffer. Output processing stays intact.
+        quiet_emulator_slave(slave);
         let pid = libc::fork();
         if pid < 0 {
             let e = std::io::Error::last_os_error();
@@ -314,6 +341,13 @@ pub fn spawn_capture(bin: &CString, rows: u16, cols: u16) -> Result<PtyCaptureCh
             libc::close(host_stdin);
             return Err(e.into());
         }
+        // posh drives this PTY as the terminal (crap-present modal): present a
+        // no-echo, non-canonical INPUT discipline so a master write (a query
+        // answer) can't echo back into posh's model or line-buffer. crap-present
+        // reads its data stream from the stdin PIPE and renders to this PTY, so
+        // it may never configure the tty itself — hence hardening it here.
+        // Output processing stays intact so its rendering is unaffected.
+        quiet_emulator_slave(slave);
         let pid = libc::fork();
         if pid < 0 {
             let e = std::io::Error::last_os_error();
@@ -518,6 +552,48 @@ mod tests {
             let mut r: libc::termios = std::mem::zeroed();
             assert_eq!(libc::tcgetattr(s, &mut r), 0);
             assert_ne!(r.c_lflag & libc::ICANON, 0, "drop restores the termios");
+        }
+    }
+
+    /// `quiet_emulator_slave`: a posh-hosted emulator PTY (palette / crap-present)
+    /// must present a no-echo, non-canonical INPUT discipline so a master write
+    /// can't echo back into posh's model, while OUTPUT processing stays intact so
+    /// the child's rendering is unaffected. The openpty default is cooked+echo, so
+    /// this asserts the flags actually flip.
+    #[test]
+    fn quiet_emulator_slave_clears_echo_and_icanon_keeps_opost() {
+        // SAFETY: openpty fills m/s with valid fds; tcgetattr writes a valid
+        // &mut termios. The fds intentionally leak for the test.
+        unsafe {
+            let (mut m, mut s) = (0, 0);
+            assert_eq!(
+                libc::openpty(
+                    &mut m,
+                    &mut s,
+                    std::ptr::null_mut(),
+                    std::ptr::null_mut(),
+                    std::ptr::null_mut(),
+                ),
+                0,
+                "openpty"
+            );
+            let _ = m;
+            // Default discipline is cooked+echo — the state the hardening fixes.
+            let mut d: libc::termios = std::mem::zeroed();
+            assert_eq!(libc::tcgetattr(s, &mut d), 0);
+            assert_ne!(d.c_lflag & libc::ECHO, 0, "openpty default echoes");
+            assert_ne!(d.c_lflag & libc::ICANON, 0, "openpty default is canonical");
+
+            quiet_emulator_slave(s);
+
+            let mut t: libc::termios = std::mem::zeroed();
+            assert_eq!(libc::tcgetattr(s, &mut t), 0);
+            assert_eq!(
+                t.c_lflag & (libc::ICANON | libc::ECHO),
+                0,
+                "no echo, non-canonical input"
+            );
+            assert_ne!(t.c_oflag & libc::OPOST, 0, "output processing intact");
         }
     }
 
