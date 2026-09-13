@@ -1995,25 +1995,22 @@ fn drive_client(st: &mut ClientState, raw: &RawMode, port: u16, source: &str) ->
                                 String::from_utf8_lossy(&payload)
                             )));
                         }
-                        // FDR 0016 auto-pop: an established channel closing
-                        // under us is a LOST session unless we asked to leave
-                        // — or the daemon's exit status rode the close (a
-                        // pre-posh#194 bridge sends the raw `Tag::Exit` bytes
-                        // and no shutdown frame): then the session ENDED.
-                        let end = if st.shutdown_requested || st.shutdown_seen {
-                            crate::picker::AttachEnd::Quit
-                        } else if let Some(code) = crate::session::ipc::decode_exit(&payload) {
-                            st.exit_status = code;
-                            crate::picker::AttachEnd::Ended { code, cause: None }
-                        } else {
-                            let why = String::from_utf8_lossy(&payload);
-                            crate::picker::AttachEnd::Lost(if why.trim().is_empty() {
-                                "mux channel closed".to_string()
-                            } else {
-                                format!("mux channel closed: {}", why.trim())
-                            })
-                        };
-                        if !st.shutdown_seen {
+                        // FDR 0016 auto-pop: `mux_channel_close_end` decides,
+                        // from `st`, whether an established channel closing
+                        // under us is a Quit (we asked to leave), an Ended (the
+                        // shell exited — a FLAG_SHUTDOWN frame carried the
+                        // status+cause, or a pre-posh#194 bridge's raw
+                        // `Tag::Exit` bytes ride the close), or a Lost.
+                        if let Some(end) = mux_channel_close_end(
+                            st.shutdown_requested,
+                            st.shutdown_seen,
+                            st.exit_status,
+                            st.exit_cause,
+                            &payload,
+                        ) {
+                            if let crate::picker::AttachEnd::Ended { code, .. } = end {
+                                st.exit_status = code;
+                            }
                             crate::picker::note_attach_end(end);
                         }
                         break 'client Ok(st.exit_status);
@@ -2339,6 +2336,52 @@ fn request_shutdown(st: &mut ClientState) {
         st.notify
             .set_message("Exiting on user request...", true, now_ms());
     }
+}
+
+/// The [`crate::picker::AttachEnd`] to record when an ESTABLISHED mux session
+/// channel closes (`Rx::Closed` in `drive_client`), or `None` to record
+/// nothing.
+///
+/// A shell that exits over an M2 session channel sends a `FLAG_SHUTDOWN` frame
+/// — setting `shutdown_seen` and carrying its exit status+cause into `st` —
+/// and then closes the channel; both are drained in ONE poll turn, so the
+/// close's `break 'client` runs before the loop's own note-Ended path. This
+/// helper is the note-Ended path for that same-drain case, so it MUST record
+/// the shell exit here. posh#194 / FDR 0016: before this it did not — a
+/// `shutdown_seen` close was mis-scored `Quit` and then skipped, so a remote
+/// shell exiting over mux recorded no end at all, `run()` popped nothing, and
+/// the whole viewport exited instead of returning to the session beneath.
+fn mux_channel_close_end(
+    shutdown_requested: bool,
+    shutdown_seen: bool,
+    exit_status: i32,
+    exit_cause: Option<posh_proto::caps::SessionEnd>,
+    payload: &[u8],
+) -> Option<crate::picker::AttachEnd> {
+    use crate::picker::AttachEnd;
+    // Ordered by how we know the close came about: a leave WE asked for pins
+    // Quit (never pops); a FLAG_SHUTDOWN frame means the shell exited and the
+    // status+cause are already on `st`; a pre-posh#194 bridge instead rides the
+    // raw `Tag::Exit` bytes on the close; anything else lost the session. Every
+    // close is recorded (the earlier `!shutdown_seen` skip is the bug this
+    // fixes) — `run()`'s auto-pop ignores a Quit but acts on Ended / Lost.
+    Some(if shutdown_requested {
+        AttachEnd::Quit
+    } else if shutdown_seen {
+        AttachEnd::Ended {
+            code: exit_status,
+            cause: exit_cause,
+        }
+    } else if let Some(code) = crate::session::ipc::decode_exit(payload) {
+        AttachEnd::Ended { code, cause: None }
+    } else {
+        let why = String::from_utf8_lossy(payload);
+        AttachEnd::Lost(if why.trim().is_empty() {
+            "mux channel closed".to_string()
+        } else {
+            format!("mux channel closed: {}", why.trim())
+        })
+    })
 }
 
 /// Whether the client intercepts the outer terminal's wheel right now (delegates
@@ -3797,6 +3840,49 @@ mod tests {
         let send = dispatch_palette_action(&mut st, &raw, "app.quit", &json!({}), 0);
         assert!(send, "quit asks to send promptly");
         assert!(st.shutdown_requested, "quit requests shutdown");
+    }
+
+    /// posh#194 / FDR 0016 regression: a remote shell exiting over an M2 mux
+    /// session channel sends FLAG_SHUTDOWN (→ shutdown_seen, with the exit
+    /// status + cause on `st`) and then closes the channel in the SAME poll
+    /// drain, so the close is the last place that can record the end. It MUST
+    /// record `Ended` — before the fix the shell-exit close was mis-scored
+    /// `Quit` and then dropped entirely, so `run()`'s auto-pop had no end to
+    /// act on and the whole viewport exited instead of returning to the
+    /// session beneath.
+    #[test]
+    fn mux_channel_close_records_the_shell_exit_so_auto_pop_can_fire() {
+        use crate::picker::AttachEnd;
+        use posh_proto::caps::SessionEnd;
+
+        // Shell exited: FLAG_SHUTDOWN seen (status 3, cause Exited), we did NOT
+        // ask to leave. The close must be recorded as Ended — the red case.
+        assert_eq!(
+            mux_channel_close_end(false, true, 3, Some(SessionEnd::Exited), b""),
+            Some(AttachEnd::Ended {
+                code: 3,
+                cause: Some(SessionEnd::Exited),
+            }),
+            "a shell-exit close over mux must record Ended so the stack pops",
+        );
+        // We asked to leave (quit / detach / switch): a Quit, which never pops.
+        assert_eq!(
+            mux_channel_close_end(true, true, 0, None, b""),
+            Some(AttachEnd::Quit),
+        );
+        // Pre-posh#194 bridge: no shutdown frame, the exit status rides the
+        // close payload.
+        assert_eq!(
+            mux_channel_close_end(false, false, 0, None, &crate::session::ipc::encode_exit(7)),
+            Some(AttachEnd::Ended { code: 7, cause: None }),
+        );
+        // Neither: the daemon/endpoint dropped us — a Lost carrying the reason.
+        // (The payload must not be a bare 4-byte exit code, which `decode_exit`
+        // would read as a pre-posh#194 Ended.)
+        assert!(matches!(
+            mux_channel_close_end(false, false, 0, None, b"endpoint gone"),
+            Some(AttachEnd::Lost(_)),
+        ));
     }
 
     /// FDR 0016: a picker selection records its target for the front door's
