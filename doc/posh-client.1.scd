@@ -87,7 +87,7 @@ standing.
 	render style, the prediction gauges, the keystroke→paint record, the
 	event-loop wake rate, and the frame / apply counters, refreshed four times
 	a second; _POSH_DEBUG_BANNER=1_ starts with it up), show agent-forwarding debug info (the
-		SSH agent-forwarding state on both the client and server ends, FDR 0004), suspend the client, and quit. Type to filter, arrows to
+		SSH agent-forwarding state on both the client and server ends, FDR 0004), start or stop viewport recording (FDR 0018), suspend the client, and quit. Type to filter, arrows to
 	choose, Enter to run, Esc to
 	dismiss. Rendered by the *posh-palette* helper over a JSON-RPC control
 	channel; the session greys behind it.
@@ -95,6 +95,13 @@ standing.
 	If that helper cannot be launched, *Ctrl-^* instead arms a one-shot
 	fallback: *Ctrl-^* then *.* quits, and *Ctrl-^* then *Ctrl-^* (or *^*)
 	sends a literal *Ctrl-^* to the remote.
+
+	*Start recording* (FDR 0018) tees the client viewport — its output, your
+	keystrokes, and resizes — to a poshterity _.castx_ under the diagnostic-sink
+	directory (_POSH_DIR_ / the socket dir), replayable with *poshterity step* /
+	*replay*; the palette prints the path on start and on stop. It captures
+	keystrokes and the screen VERBATIM, so anything secret typed while recording
+	is written to the file — record deliberately, and *Stop recording* when done.
 
 # ENVIRONMENT
 

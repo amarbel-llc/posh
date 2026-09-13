@@ -8,6 +8,7 @@ use std::net::{SocketAddr, ToSocketAddrs};
 use std::time::Instant;
 
 use posh_term::Terminal;
+use poshterity::castx;
 use serde_json::{json, Value};
 
 use crate::pty::{self, RawMode};
@@ -226,6 +227,74 @@ fn set_logging(st: &mut ClientState, enabled: bool, now: u64) {
     }
 }
 
+/// A live viewport recording (posh#197): the palette's Start/Stop recording
+/// (RFC 0005 `record.set`) tees the client's tty OUTPUT, the user's INPUT
+/// keystrokes, and RESIZES into a poshterity `.castx` (RFC 0003) that
+/// `poshterity step`/`replay` reconstruct frame-by-frame — the sub-frame
+/// cursor-vs-content ordering the deterministic snapshot tests cannot see.
+/// `Drop` finalizes the file, so every client-exit path closes it cleanly.
+/// Timestamps are seconds since [`start`](Self::start).
+struct ViewportRecorder {
+    rec: castx::Recorder<std::io::BufWriter<std::fs::File>>,
+    start: Instant,
+    path: std::path::PathBuf,
+}
+
+impl ViewportRecorder {
+    /// Open a `.castx` at `path`, sized `rows`x`cols`, tagged with the emulator
+    /// revision (golden-frame auditing, like `poshterity record`). `None` if the
+    /// file can't be created or the header can't be written — the caller reports
+    /// the failure and leaves recording off.
+    fn start(path: std::path::PathBuf, rows: u16, cols: u16) -> Option<ViewportRecorder> {
+        let file = std::fs::File::create(&path).ok()?;
+        let mut rec = castx::Recorder::new(std::io::BufWriter::new(file));
+        rec.write_header(&castx::Header {
+            version: 2,
+            width: cols,
+            height: rows,
+            poshterity: Some(castx::Poshterity {
+                v: 1,
+                emu_rev: posh_term::emu_rev(),
+            }),
+        })
+        .ok()?;
+        Some(ViewportRecorder {
+            rec,
+            start: Instant::now(),
+            path,
+        })
+    }
+
+    fn secs(&self) -> f64 {
+        self.start.elapsed().as_secs_f64()
+    }
+
+    /// Record tty output bytes (`o`) — the composed viewport the client painted.
+    fn output(&mut self, bytes: &[u8]) {
+        let t = self.secs();
+        let _ = self.rec.output(t, bytes);
+    }
+
+    /// Record the user's raw keystrokes (`i`); not replayed, but they say which
+    /// key caused which frame.
+    fn input(&mut self, bytes: &[u8]) {
+        let t = self.secs();
+        let _ = self.rec.input(t, bytes);
+    }
+
+    /// Record a terminal resize (`r`) so replay geometry stays faithful.
+    fn resize(&mut self, cols: u16, rows: u16) {
+        let t = self.secs();
+        let _ = self.rec.resize(t, cols, rows);
+    }
+}
+
+impl Drop for ViewportRecorder {
+    fn drop(&mut self) {
+        let _ = self.rec.finish();
+    }
+}
+
 /// The palette's command list (RFC 0005 §5): the discoverable surface for the
 /// escape commands. Ctrl-^ opens this in lieu of a key-prefix menu, so every
 /// escape action lives here. The logging entries reflect the current state —
@@ -235,6 +304,7 @@ fn palette_commands(
     server_log_on: bool,
     scroll_opt: bool,
     debug_banner: bool,
+    recording: bool,
     back_to: Option<&str>,
 ) -> Value {
     // The live debug banner (FDR 0007): a reverse-video line or two under
@@ -265,6 +335,13 @@ fn palette_commands(
     } else {
         ("Enable scroll-region optimization", true)
     };
+    // Viewport recording (posh#197): tee the live viewport to a `.castx` for
+    // frame-by-frame replay. Imperative label like the toggles above.
+    let (record_name, record_enabled): (&str, bool) = if recording {
+        ("Stop recording", false)
+    } else {
+        ("Start recording", true)
+    };
     let mut commands = vec![
         // FDR 0016: the palette as picker — list the reachable sessions and
         // switch this viewport to one (the client ends with a switch outcome
@@ -290,6 +367,7 @@ fn palette_commands(
         json!({ "name": server_log_name, "action": { "method": "logging.set", "params": { "scope": "server", "enabled": server_log_enabled } } }),
         json!({ "name": scroll_opt_name, "action": { "method": "render.scroll_opt", "params": { "enabled": scroll_opt_enabled } } }),
         json!({ "name": banner_name, "action": { "method": "debug.banner", "params": { "enabled": banner_enabled } } }),
+        json!({ "name": record_name, "action": { "method": "record.set", "params": { "enabled": record_enabled } } }),
         json!({ "name": "Shell out (server)", "action": { "method": "shell.open" } }),
         json!({ "name": "Reset & resync (force redraw)", "action": { "method": "session.resync" } }),
         json!({ "name": "Dump wedge forensics", "action": { "method": "session.forensics" } }),
@@ -335,7 +413,7 @@ fn open_palette(st: &mut ClientState) -> bool {
     }
     let back_to = crate::picker::stack_top();
     let commands =
-        palette_commands(st.server_log_on, st.scroll_opt, st.debug_banner, back_to.as_deref());
+        palette_commands(st.server_log_on, st.scroll_opt, st.debug_banner, st.record.is_some(), back_to.as_deref());
     let title = palette_title(st.wire.srtt(), st.predict_model, st.echo_escalation.escalated());
     if let Some(p) = st.palette.as_mut() {
         // A persisted (spawned-then-closed) palette is not resized while closed,
@@ -895,6 +973,38 @@ fn dispatch_palette_action(
                     false,
                     now,
                 );
+            }
+            false
+        }
+        "record.set" => {
+            // Viewport recording (posh#197): start tees the client's output /
+            // input / resize into a `.castx`; stop drops the recorder, whose
+            // `Drop` finalizes the file. Client-local — no wire send.
+            let enabled = params
+                .get("enabled")
+                .and_then(Value::as_bool)
+                .unwrap_or(false);
+            if enabled {
+                if st.record.is_none() {
+                    let path = diag::record_path();
+                    match ViewportRecorder::start(path.clone(), st.rows, st.cols) {
+                        Some(rec) => {
+                            st.record = Some(rec);
+                            st.notify
+                                .set_message(&format!("recording: on ({})", path.display()), false, now);
+                        }
+                        None => st.notify.set_message(
+                            &format!("recording: could not open {}", path.display()),
+                            false,
+                            now,
+                        ),
+                    }
+                }
+            } else if let Some(rec) = st.record.take() {
+                let path = rec.path.clone();
+                drop(rec); // Drop finalizes the .castx (flush held UTF-8 + writer)
+                st.notify
+                    .set_message(&format!("recording saved: {}", path.display()), false, now);
             }
             false
         }
@@ -1516,6 +1626,10 @@ struct ClientState {
     /// the establish resolves (first frame → `ok`, or timeout/abort → `not_ok`),
     /// then torn down and cleared. `None` off-tty / crap-present-not-found.
     establish: Option<crate::remote::connect_progress::CrapModal>,
+    /// Live viewport recording (posh#197), toggled by the palette's Start/Stop
+    /// recording (`record.set`); `None` unless recording. Tees output / input /
+    /// resize into a `.castx`; finalized on `Drop`.
+    record: Option<ViewportRecorder>,
     /// The last visible-frame body the applier rejected via `ReackAndWait`
     /// (#90/#94 forensics): `(rx_num, rx_base, kind, body_bytes)`. Captured to
     /// disk once per wedge episode so the divergent base can be analysed
@@ -1676,6 +1790,7 @@ fn client_loop(
         banner: DebugBanner::default(),
         palette: None,
         establish: None,
+        record: None,
         last_reack: None,
         forensic_captured: false,
         base_history: Vec::new(),
@@ -1870,6 +1985,11 @@ fn drive_client(st: &mut ClientState, raw: &RawMode, port: u16, source: &str) ->
                 }
                 if let Some(m) = st.establish.as_mut() {
                     m.resize(st.rows, st.cols);
+                }
+                // Viewport recording (posh#197): record the resize so replay
+                // geometry follows the live terminal.
+                if let Some(rec) = st.record.as_mut() {
+                    rec.resize(st.cols, st.rows);
                 }
                 st.predict.reset();
                 st.initialized = false; // full repaint at the new size
@@ -2453,6 +2573,13 @@ fn process_user_input(st: &mut ClientState, buf: &[u8], key_at: Instant) -> bool
     // stray reply that leaked in as if typed, not real input. Detect + log once;
     // this NEVER alters the bytes (they still forward as-is).
     st.stats.check_stray_input(buf);
+
+    // Viewport recording (posh#197): the raw keystrokes as read (before mouse
+    // filtering and palette routing), so the recording says which key caused
+    // which frame.
+    if let Some(rec) = st.record.as_mut() {
+        rec.input(buf);
+    }
 
     // Dismiss the sticky wedge banner (#wedge) on the user's next keystroke: they
     // have seen it, and typing is also the action that tends to break the stall.
@@ -3267,6 +3394,13 @@ fn render_to<S: TtySink>(st: &mut ClientState, now: u64, sink: &mut S) {
             Ok(n) if n == bytes.len() => {
                 // #wedge (#83): the model generation now actually on the tty.
                 st.last_painted_gen = st.server_term.generation();
+                // Viewport recording (posh#197): tee exactly what reached the
+                // tty — the composed viewport, predictions and walk-back
+                // included. Only the full-write case; a dropped paint forces a
+                // resync repaint next tick, which is recorded then.
+                if let Some(rec) = st.record.as_mut() {
+                    rec.output(&bytes);
+                }
             }
             // A short write (n < len) dropped the rest, or a real I/O error hit
             // mid-paint: either way the tty diverged from last_drawn. Resync.
@@ -3842,6 +3976,105 @@ mod tests {
         assert!(st.shutdown_requested, "quit requests shutdown");
     }
 
+    /// posh#197: the palette entry is a state-reflecting toggle — "Start
+    /// recording" when off, "Stop recording" while a recording is live.
+    #[test]
+    fn palette_commands_recording_toggle_reflects_state() {
+        let names = |recording: bool| -> Vec<String> {
+            palette_commands(false, true, false, recording, None)
+                .as_array()
+                .unwrap()
+                .iter()
+                .filter_map(|c| c["name"].as_str().map(String::from))
+                .collect()
+        };
+        assert!(
+            names(false).iter().any(|n| n == "Start recording"),
+            "{:?}",
+            names(false)
+        );
+        assert!(
+            names(true).iter().any(|n| n == "Stop recording"),
+            "{:?}",
+            names(true)
+        );
+    }
+
+    /// posh#197: `record.set` is a client-local toggle that starts a `.castx`
+    /// (writing a real file under the socket-dir scheme) and stops it, dropping
+    /// the recorder so its `Drop` finalizes the file.
+    #[test]
+    fn dispatch_record_set_toggles_recording() {
+        let raw = pty_raw_mode();
+        let mut st = test_state(6, 40);
+        assert!(
+            !dispatch_palette_action(&mut st, &raw, "record.set", &json!({ "enabled": true }), 0),
+            "record.set is client-local — no wire send"
+        );
+        assert!(st.record.is_some(), "recording started");
+        let path = st.record.as_ref().unwrap().path.clone();
+        dispatch_palette_action(&mut st, &raw, "record.set", &json!({ "enabled": false }), 0);
+        assert!(st.record.is_none(), "recording stopped");
+        assert!(path.exists(), "the .castx was written to {}", path.display());
+        let _ = std::fs::remove_file(&path);
+    }
+
+    /// posh#197 end-to-end at the tee layer: with a recorder live, a rendered
+    /// server frame lands as `o` events and a keystroke as an `i` event in the
+    /// `.castx`, and the header carries the poshterity block. This is the
+    /// instrument #197 will be captured with — replayable by `poshterity`.
+    #[test]
+    fn recording_tees_output_and_input_into_a_castx() {
+        use poshterity::castx::{EventCode, Reader};
+        let (rows, cols) = (6u16, 40u16);
+        let mut st = test_state(rows, cols);
+        st.echo_on = true;
+        let (p, r) = predict::build(PredictionModel::Always, RenderStyle::Replace, false);
+        st.predict = p;
+        st.renderer = r;
+        st.predict_model = PredictionModel::Always;
+
+        let path =
+            std::env::temp_dir().join(format!("posh-rectest-{}.castx", std::process::id()));
+        let _ = std::fs::remove_file(&path);
+        st.record = ViewportRecorder::start(path.clone(), rows, cols);
+        assert!(st.record.is_some(), "recorder opened");
+
+        let mut term = Terminal::with_scrollback(rows, cols, 0);
+        term.process(b"$ ");
+        let frame = ServerFrame {
+            flags: 0,
+            caps: vec![],
+            frame_num: 1,
+            input_ack: 0,
+            echo_ack: 0,
+            body: FrameBody::Full(term.dump_vt()),
+        };
+        assert!(apply_frame(&mut st, &frame));
+        render_to(&mut st, 0, &mut SwallowSink); // output teed
+        assert!(process_user_input(&mut st, b"x", Instant::now())); // input teed
+        render_to(&mut st, 1, &mut SwallowSink);
+
+        st.record = None; // Drop finalizes the .castx
+        let doc = std::fs::read_to_string(&path).expect("recording written");
+        let _ = std::fs::remove_file(&path);
+
+        let mut rd = Reader::new(&doc);
+        let hdr = rd.header().expect("header");
+        assert_eq!((hdr.width, hdr.height), (cols, rows));
+        assert!(hdr.poshterity.is_some(), "poshterity header block present");
+        let (mut saw_output, mut saw_input) = (false, false);
+        while let Some(ev) = rd.next_event() {
+            match ev.unwrap().code {
+                EventCode::Output => saw_output = true,
+                EventCode::Input => saw_input = true,
+                _ => {}
+            }
+        }
+        assert!(saw_output, "the viewport output was teed as `o` events");
+        assert!(saw_input, "the keystroke was teed as an `i` event");
+    }
+
     /// posh#194 / FDR 0016 regression: a remote shell exiting over an M2 mux
     /// session channel sends FLAG_SHUTDOWN (→ shutdown_seen, with the exit
     /// status + cause on `st`) and then closes the channel in the SAME poll
@@ -4330,7 +4563,7 @@ mod tests {
 
     #[test]
     fn palette_commands_includes_both_logging_scopes() {
-        let cmds = palette_commands(false, true, false, None);
+        let cmds = palette_commands(false, true, false, false, None);
         let arr = cmds.as_array().expect("commands is an array");
         let names: Vec<&str> = arr.iter().filter_map(|c| c["name"].as_str()).collect();
         assert!(
@@ -4375,7 +4608,7 @@ mod tests {
             names.iter().any(|n| n.contains("Disable scroll-region optimization")),
             "scroll-opt disable command missing: {names:?}"
         );
-        let off: Vec<String> = palette_commands(false, false, true, Some("box:dev"))
+        let off: Vec<String> = palette_commands(false, false, true, false, Some("box:dev"))
             .as_array()
             .unwrap()
             .iter()
@@ -4395,7 +4628,7 @@ mod tests {
         assert!(off.iter().any(|n| n == "Hide live debug banner"), "{off:?}");
         // FDR 0016: the switcher leads the list.
         assert_eq!(names.first().copied(), Some("Switch session…"), "{names:?}");
-        assert_eq!(arr.len(), 21, "expected 21 commands, got {names:?}");
+        assert_eq!(arr.len(), 22, "expected 22 commands, got {names:?}");
     }
 
     #[test]
@@ -4959,6 +5192,7 @@ mod tests {
             banner: DebugBanner::default(),
             palette: None,
             establish: None,
+            record: None,
             last_reack: None,
             forensic_captured: false,
             base_history: Vec::new(),

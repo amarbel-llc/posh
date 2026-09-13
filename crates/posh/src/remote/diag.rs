@@ -274,6 +274,19 @@ fn default_dump_path(role: &str) -> PathBuf {
     sink_base().join(format!("posh-{role}-{}.log", std::process::id()))
 }
 
+/// The `.castx` viewport-recording path for the palette's Start/Stop recording
+/// (posh#197 capture): beside the debug log / SIGUSR2 dump under the same
+/// socket-dir scheme, per-pid plus a wall-clock stamp so repeated recordings in
+/// one session don't clobber each other. The caller's `File::create` reports any
+/// real failure.
+pub fn record_path() -> PathBuf {
+    let ts = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_secs())
+        .unwrap_or(0);
+    sink_base().join(format!("posh-record-{}-{ts}.castx", std::process::id()))
+}
+
 /// Enable debug logging at runtime to the default per-pid sink (if not already
 /// active), returning the sink path. The runtime counterpart of `POSH_DEBUG_LOG`
 /// for the `Ctrl-^ d` toggle; mirrors `dump`'s lazy-open + path scheme.
