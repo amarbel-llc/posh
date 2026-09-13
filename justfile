@@ -924,6 +924,58 @@ debug-record-posht transport host *ARGS:
     echo ">> wrote recording: $out" >&2
     echo ">> diff a posh vs ssh capture to localize the drawing bug" >&2
 
+# Capture posh's LOCAL-ECHO prediction rendering natively as a posh CLIENT
+# VIEWPORT (posh#197: predicted characters briefly appearing BEYOND the cursor,
+# then walking back, under the `always` model). poshterity records the viewport
+# of a shell run inside a posh roaming session on HOST — the real client-side
+# prediction/echo path, so predictions and their walk-back are in the .castx,
+# then `step`/`replay` replay it frame-by-frame (the per-frame cursor-vs-content
+# ordering the deterministic snapshot tests in client.rs, always_echo_*, cannot
+# see — they collapse each frame atomically).
+#
+# The overshoot is a ROUND-TRIP artifact: a prediction is visible only while it
+# is ahead of the server's echo, so a REAL remote HOST (real RTT) is needed. A
+# loopback link (~0 RTT) confirms predictions instantly and will NOT show it.
+# `always` is the default model now; this pins it + RENDER explicitly so the
+# capture is unambiguous. Type into the recorded shell to reproduce, then quit
+# it (exit / ^D) to finalize the file.
+#
+# Usage:   just debug-record-echo <host> [session] [shell] [render]
+# Inspect: poshterity step  <file> --by frame --dump vt   (frame by frame)
+#          poshterity replay <file>                        (final screen)
+#
+# capture posh's always-echo viewport over a real posh link to a .castx (posh#197)
+[group("debug")]
+debug-record-echo host session="echo197" shell="bash" render="lookalike":
+    #!/usr/bin/env bash
+    set -uo pipefail
+    cd '{{ justfile_directory() }}'
+    # posh is the roaming transport (--via posh); poshterity is the recorder.
+    nix develop --command cargo build -p posh -p poshterity
+    export PATH="$PWD/target/debug:$PATH"
+    # `always` is the default, but pin model + render so the capture does not
+    # depend on the ambient env; the posh CLIENT poshterity spawns inherits these.
+    export POSH_PREDICTION_MODEL=always
+    export POSH_PREDICTION_RENDER='{{ render }}'
+    mkdir -p "$PWD/.tmp"
+    out="$PWD/.tmp/echo197-$(date +%Y%m%dT%H%M%S).castx"
+    echo ">> recording an always-echo '{{ shell }}' over posh on '{{ host }}' -> $out" >&2
+    echo ">> TYPE to reproduce posh#197 (chars past the cursor, then walk back); quit the shell (exit/^D) to finish" >&2
+    # A non-zero exit (the shell's own, or ^C/^D teardown) is normal — the
+    # recording is the artifact; only a missing/empty file is a real failure.
+    set +e
+    poshterity record --out "$out" --via posh --host '{{ host }}:{{ session }}' -- '{{ shell }}'
+    rc=$?
+    set -e
+    if [ ! -s "$out" ]; then
+      echo ">> recording failed (rc=$rc, no output written)" >&2
+      exit "$rc"
+    fi
+    echo >&2
+    echo ">> wrote $out ($(wc -c < "$out") bytes)" >&2
+    echo ">> frame-by-frame:   poshterity step '$out' --by frame --dump vt" >&2
+    echo ">> final screen:     poshterity replay '$out'" >&2
+
 # --- debug: live-session triage (a wedged roaming session) -----------------
 # Read-only diagnostics for a posh session that has stopped updating on a
 # remote client. The roaming server (remote/server.rs) owns the PTY directly
