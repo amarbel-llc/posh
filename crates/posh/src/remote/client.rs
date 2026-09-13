@@ -5487,6 +5487,167 @@ mod tests {
         assert_eq!(paint.unpainted, 1, "{}", paint.format());
     }
 
+    /// posh#197 exploration: with `always` echo, predicted characters are
+    /// reported appearing BEYOND the cursor before walking back. This drives the
+    /// real `process_user_input` + `render_to` into a `Terminal` (the physical
+    /// tty the user sees) and asserts the invariant the report says is violated:
+    /// on the composed screen the cursor is never LEFT of the last painted
+    /// glyph on its row (no character sits past the cursor). Covers plain
+    /// end-of-line typing and a partial server confirm (the round-trip window).
+    ///
+    /// NOTE: this is an instrument. If it stays green, the model+compose path
+    /// upholds the invariant and the live over-render is elsewhere (terminal
+    /// write-ordering, or a server-frame sequence not modeled here) — a live
+    /// capture is then the next step; do not read a green here as "no bug".
+    #[test]
+    fn always_echo_never_paints_a_glyph_beyond_the_cursor() {
+        // Rightmost non-blank column on `row`, and the cursor column, as they
+        // land on the physical tty after a compose.
+        fn glyph_and_cursor(tty: &Terminal, row: u16) -> (Option<u16>, u16) {
+            let snap = Snapshot::from_term(tty);
+            let mut rightmost = None;
+            for col in 0..snap.cols {
+                if snap.cell(row, col).is_some_and(|c| !c.is_blank()) {
+                    rightmost = Some(col);
+                }
+            }
+            (rightmost, snap.cursor_col)
+        }
+        fn full_frame(num: u64, dump: Vec<u8>) -> ServerFrame {
+            ServerFrame {
+                flags: 0,
+                caps: vec![],
+                frame_num: num,
+                input_ack: 0,
+                echo_ack: 0,
+                body: FrameBody::Full(dump),
+            }
+        }
+        fn dump_of(rows: u16, cols: u16, bytes: &[u8]) -> Vec<u8> {
+            let mut t = Terminal::with_scrollback(rows, cols, 0);
+            t.process(bytes);
+            t.dump_vt()
+        }
+
+        let (rows, cols) = (6u16, 40u16);
+        let mut st = test_state(rows, cols);
+        st.echo_on = true;
+        let (p, r) = predict::build(PredictionModel::Always, RenderStyle::Replace, false);
+        st.predict = p;
+        st.renderer = r;
+        st.predict_model = PredictionModel::Always;
+
+        let mut sink = LossySink {
+            tty: Terminal::with_scrollback(rows, cols, 0),
+            frame: 0,
+            drop_on: None,
+        };
+
+        // Prompt established by the server: "$ " with the cursor at column 2.
+        assert!(apply_frame(&mut st, &full_frame(1, dump_of(rows, cols, b"$ "))));
+        render_to(&mut st, 0, &mut sink);
+
+        // Type "abc" ahead of any echo: `always` predicts each glyph and the
+        // cursor immediately. The cursor must stay to the RIGHT of "abc".
+        let mut fnum = 1u64;
+        for b in b"abc" {
+            assert!(process_user_input(&mut st, &[*b], Instant::now()));
+            render_to(&mut st, fnum, &mut sink);
+            fnum += 1;
+            let (rightmost, cursor) = glyph_and_cursor(&sink.tty, 0);
+            assert!(
+                rightmost.is_none_or(|g| cursor > g),
+                "typed ahead: glyph at col {rightmost:?} is not left of cursor col {cursor}",
+            );
+        }
+
+        // Partial server confirm mid-round-trip: the server has echoed only
+        // "a" (cursor at column 3), while "bc" are still local predictions.
+        assert!(apply_frame(&mut st, &full_frame(2, dump_of(rows, cols, b"$ a"))));
+        render_to(&mut st, fnum, &mut sink);
+        let (rightmost, cursor) = glyph_and_cursor(&sink.tty, 0);
+        assert!(
+            rightmost.is_none_or(|g| cursor > g),
+            "partial confirm: glyph at col {rightmost:?} is not left of cursor col {cursor}",
+        );
+    }
+
+    /// posh#197, one layer down (the walk-back / erase path): when `always`
+    /// predicts characters the server then does NOT echo — input consumed
+    /// silently (a password prompt, a program that ate the keystrokes) — the
+    /// optimistic glyphs must WALK BACK: `render_to`'s diff has to ERASE them
+    /// from the physical tty, not leave them lingering beyond the cursor. This
+    /// drives the real process_user_input -> process_frame (with acks past the
+    /// predictions' expiry, forcing the cull) -> render_to, and asserts the tty
+    /// has no glyph past the composed cursor after the walk-back. Same
+    /// instrument caveat as the sibling test: a green here narrows #197 further
+    /// (the diff erases correctly), it is not proof the live symptom is absent.
+    #[test]
+    fn always_echo_walk_back_erases_unechoed_predictions_from_the_tty() {
+        fn dump_of(rows: u16, cols: u16, bytes: &[u8]) -> Vec<u8> {
+            let mut t = Terminal::with_scrollback(rows, cols, 0);
+            t.process(bytes);
+            t.dump_vt()
+        }
+        let (rows, cols) = (6u16, 40u16);
+        let mut st = test_state(rows, cols);
+        st.echo_on = true;
+        let (p, r) = predict::build(PredictionModel::Always, RenderStyle::Replace, false);
+        st.predict = p;
+        st.renderer = r;
+        st.predict_model = PredictionModel::Always;
+        let mut sink = LossySink {
+            tty: Terminal::with_scrollback(rows, cols, 0),
+            frame: 0,
+            drop_on: None,
+        };
+
+        // Prompt, then type "abcd" ahead — `always` paints them optimistically.
+        let full = |num: u64, d: Vec<u8>| ServerFrame {
+            flags: 0,
+            caps: vec![],
+            frame_num: num,
+            input_ack: 0,
+            echo_ack: 0,
+            body: FrameBody::Full(d),
+        };
+        assert!(apply_frame(&mut st, &full(1, dump_of(rows, cols, b"$ "))));
+        render_to(&mut st, 0, &mut sink);
+        for b in b"abcd" {
+            assert!(process_user_input(&mut st, &[*b], Instant::now()));
+        }
+        render_to(&mut st, 1, &mut sink);
+        assert_eq!(
+            row_text(&Snapshot::from_term(&sink.tty), 0).trim_end(),
+            "$ abcd",
+            "the optimistic predictions are on the tty before the walk-back",
+        );
+
+        // The server consumed the input (input_ack/echo_ack past every
+        // prediction's expiration frame, 1..=4) but the screen still shows just
+        // "$ " — unechoed. The predictions expire and are culled, so the
+        // composed line shrinks back to the prompt; the diff must erase "abcd".
+        let mut settle = full(2, dump_of(rows, cols, b"$ "));
+        settle.input_ack = 10;
+        settle.echo_ack = 10;
+        process_frame(&mut st, &settle);
+        render_to(&mut st, 2, &mut sink);
+
+        let snap = Snapshot::from_term(&sink.tty);
+        let mut rightmost = None;
+        for col in 0..snap.cols {
+            if snap.cell(0, col).is_some_and(|c| !c.is_blank()) {
+                rightmost = Some(col);
+            }
+        }
+        assert!(
+            rightmost.is_none_or(|g| snap.cursor_col > g),
+            "walk-back left a glyph at col {rightmost:?} beyond cursor col {} (row: {:?})",
+            snap.cursor_col,
+            row_text(&snap, 0),
+        );
+    }
+
     /// A lossy in-memory paint destination for driving the real `render_to`.
     /// Feeds an outer `Terminal` (the physical tty the user sees), but DROPS the
     /// whole write on the frame index in `drop_on` — modeling write_all_retry
