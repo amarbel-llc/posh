@@ -495,6 +495,86 @@ debug-ph-picker-smoke: build-palette
     cat "$dir/stderr.log" || true
     tmux kill-session -t posh-phpick 2>/dev/null || true
 
+# Provoke the FDR 0016 stacked-switch flow end-to-end in a detached tmux pane, to
+# see whether the two reported symptoms reproduce: (1) after a keep-switch a->b,
+# does b's palette offer "Back to a"? (2) does exiting b auto-pop back to a?
+# Attaches to `a` via the `ph` FRONT DOOR so run()'s in-process re-attach loop is
+# engaged — the stack is a process-local static, and ONLY that loop populates it.
+#
+# ISOLATION (the whole recipe MUST stay off the operator's real sessions — an
+# earlier version leaked POSH_DIR + POSH_SESSION and re-homed the caller's own
+# viewport, disconnecting it):
+#   - POSH_DIR="$dir/posh" is the socket-base knob (POSH_DIR wins over
+#     XDG_RUNTIME_DIR; session/mod.rs:22), so every session/socket lives in the
+#     throwaway dir. A guard refuses to run unless POSH_DIR is under .tmp.
+#   - `env -u POSH_SESSION -u POSH_KEY` on EVERY posh/ph invocation: with
+#     POSH_SESSION set, `ph a` takes the in-session re-home branch and switches
+#     the ENCLOSING session instead of attaching (session/client.rs:163) — the
+#     exact bug that consumed the caller's session. Unset, `ph a` is a genuine
+#     standalone attach through run().
+#   - a DEDICATED tmux server socket (`tmux -L posh-phstack`) started by this
+#     recipe, so the pane's env comes from here (not a pre-existing tmux
+#     server's globals) and the operator's own tmux is never touched.
+# Two detached local sessions with distinct banners; `cat` keeps each alive so a
+# Ctrl-D (0x04) EOF is how we exit b. The pane is captured at each step and the
+# debug log dumped; interactive picker navigation is timing-sensitive, so read
+# the captures rather than trusting a single run. Best-effort; not a hermetic test.
+#
+# drive the stacked-switch flow in an isolated tmux pane; capture whether Back/auto-pop work
+[group("debug")]
+debug-ph-stack-repro: build-palette
+    #!/usr/bin/env bash
+    set -uo pipefail
+    root="{{ justfile_directory() }}"
+    dir="$root/.tmp/phstack"
+    sock="$dir/posh"
+    # Guard: never run against anything but the throwaway socket base.
+    case "$sock" in "$root"/.tmp/*/posh) : ;; *) echo "refusing: POSH_DIR '$sock' not under .tmp"; exit 1 ;; esac
+    rm -rf "$dir"; mkdir -p "$sock"; chmod 700 "$dir" "$sock"
+    log="$dir/posh.log"
+    nix develop --command cargo build -p posh
+    P="$root/target/debug/posh"
+    ln -sfn "$P" "$dir/ph"
+    pal="$root/result-posh-palette/bin/posh-palette"
+    # Isolated env for every posh/ph invocation: throwaway socket base, no
+    # enclosing-session leakage (the two isolation failures documented above).
+    iso=(env -u POSH_SESSION -u POSH_KEY "POSH_DIR=$sock" POSH_GROUP=default "POSH_DEBUG_LOG=$log" "POSH_PALETTE=$pal")
+    TM=(tmux -L posh-phstack)
+    "${TM[@]}" kill-server 2>/dev/null || true
+    # Two detached local sessions with distinct banners; `cat` keeps each alive
+    # (a later Ctrl-D EOF ends it — that is how we "exit" b to test auto-pop).
+    "${iso[@]}" "$P" attach --detach a -- bash --norc -c 'echo ===PANE_A===; cat' || true
+    "${iso[@]}" "$P" attach --detach b -- bash --norc -c 'echo ===PANE_B===; cat' || true
+    echo "== sessions (isolated POSH_DIR=$sock) =="; "${iso[@]}" "$P" list || true; echo
+    # The pane command re-applies the isolated env inline (a fresh tmux -L server
+    # inherits this recipe's env, but be explicit — this is the safety boundary).
+    "${TM[@]}" new-session -d -s s -x 100 -y 30 \
+      "env -u POSH_SESSION -u POSH_KEY POSH_DIR='$sock' POSH_GROUP=default POSH_PALETTE='$pal' POSH_DEBUG_LOG='$log' \
+        '$dir/ph' a 2>'$dir/stderr.log'; echo PH_EXITED_\$?; sleep 120"
+    sleep 4
+    cap() { echo "== $1 =="; "${TM[@]}" capture-pane -p -t s 2>/dev/null; echo; }
+    key() { "${TM[@]}" send-keys -t s "$@"; }
+    cap "attached to a (expect ===PANE_A===)"
+    # Ctrl-^ (0x1e) opens the palette; navigate to the switch/picker from there.
+    key -H 1e; sleep 1; cap "palette on a"
+    key Enter; sleep 1; cap "after Enter (session picker?)"
+    key b;     sleep 1; cap "picker filtered to b"
+    key Enter; sleep 1; cap "leave question (keep/kill/cancel)"
+    # "Keep it running" is the first answer -> keep-switch, pushes a onto the stack.
+    key Enter; sleep 3; cap "after keep-switch (expect ===PANE_B===)"
+    # SYMPTOM 1: on b, does the palette offer "Back to a"?
+    key -H 1e; sleep 1; cap "palette on b (SYMPTOM 1: expect 'Back to a')"
+    key Escape; sleep 1
+    # SYMPTOM 2: exit b (Ctrl-D EOF to cat) -> Ended -> auto-pop back to a.
+    key -H 04; sleep 3
+    cap "after exiting b (SYMPTOM 2: expect auto-pop to a, ===PANE_A===)"
+    echo "== posh debug log (tail) =="; tail -n 120 "$log" 2>/dev/null || true; echo
+    echo "== stderr =="; cat "$dir/stderr.log" 2>/dev/null || true
+    # Teardown: kill the dedicated tmux server and both isolated sessions.
+    "${TM[@]}" kill-server 2>/dev/null || true
+    "${iso[@]}" "$P" kill a 2>/dev/null || true
+    "${iso[@]}" "$P" kill b 2>/dev/null || true
+
 # (Re)bless the mosh terminal characterization goldens (task #4). The driver is
 # the mosh-ffi C++ FFI shim, so a fixed VT script always renders the same grid
 # (no clock, no network). Assert with the normal loop: `just debug-cargo test
