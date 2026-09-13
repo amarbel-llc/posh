@@ -105,31 +105,31 @@ _POSH_KEY_
 	process's argv (which is world-readable via *ps*(1)). Required.
 
 _POSH_PREDICTION_MODEL_
-	Local-echo prediction model: _always_, _never_, _adaptive_
-	(default), _experimental_, or _optimistic_. The first four are the
+	Local-echo prediction model: _always_ (default), _never_,
+	_adaptive_, _experimental_, or _optimistic_. The first four are the
 	mosh _MOSH_PREDICTION_DISPLAY_ analog; _optimistic_ (FDR 0006) echoes
 	keystrokes immediately and lets the next paint correct them, gated on
 	the remote PTY's ECHO flag and alt-screen. _POSH_PREDICTION_ is a
 	deprecated alias, honored when _POSH_PREDICTION_MODEL_ is unset.
 
-	The default _adaptive_ auto-escalates on a slow link (see
-	_POSH_ECHO_ESCALATE_): _adaptive_ and _always_ both hide the first
-	keystrokes after Enter or any control key for a full round trip (the
-	tentative-epoch gate), which on a slow link is what the user feels, so
-	once the smoothed RTT has stayed above 150 ms for 3 s the client
-	switches to _optimistic_ — banner _echo: optimistic (auto: slow link)_
-	— and back to _adaptive_ after the RTT has stayed under 80 ms for 15 s
-	(a link that settles between the two thresholds stays escalated:
-	optimistic is no worse there, and recovering at the escalate threshold
-	would flap). Any explicit model pins the choice and disables the
-	escalation — this variable, _adaptive_ included (naming it is a choice,
-	unlike leaving it unset), and the palette's *Echo:* commands — except
-	*Echo: adaptive* from the palette, which re-arms it.
+	The default _always_ paints every keystroke immediately (bypassing the
+	gate below), so it does not hide the first keystrokes after Enter and
+	never auto-escalates. An explicitly chosen _adaptive_ auto-escalates on a
+	slow link (see _POSH_ECHO_ESCALATE_): it hides the first keystrokes after
+	Enter or any control key for a full round trip (the tentative-epoch gate),
+	which on a slow link is what the user feels, so once the smoothed RTT has
+	stayed above 150 ms for 3 s the client switches to _optimistic_ — banner
+	_echo: optimistic (auto: slow link)_ — and back to _adaptive_ after the RTT
+	has stayed under 80 ms for 15 s (a link that settles between the two
+	thresholds stays escalated: optimistic is no worse there, and recovering at
+	the escalate threshold would flap). Any explicit model pins the choice and
+	disables the escalation — this variable included — except *Echo: adaptive*
+	from the palette, which re-arms it.
 
 _POSH_ECHO_ESCALATE_
 	The slow-link auto-escalation above, default ON; _0_ (or *false*,
-	*off*, *no*) keeps the default model at plain _adaptive_ whatever the
-	RTT. The palette heading shows the live RTT and the model in effect —
+	*off*, *no*) keeps an _adaptive_ viewport un-escalated whatever the RTT
+	(the default _always_ never escalates regardless). The palette heading shows the live RTT and the model in effect —
 	_rtt 412ms · echo: optimistic (auto)_ while escalated — and *Show echo
 	prediction stats* reports the escalation state and thresholds; each
 	automatic switch is logged with the outgoing model's outcome counters
@@ -142,7 +142,9 @@ _POSH_PREDICTION_RENDER_
 	Cyrillic / Latin-extended homoglyph, or a symbol of the same
 	silhouette — re-picked every 150 ms so the text reads right but
 	visibly shimmers until the server confirms it, then snaps to the
-	real glyph; a cell with no look-alike, such as a space, is
+	real glyph — on a dark-green background while pending; a predicted
+	deletion shows a dark-red-background tofu box (glyph-not-found) until
+	the erase is confirmed; a cell with no look-alike, such as a space, is
 	underlined as _replace_ would), _replace_ (the original look:
 	replace the glyph and underline it), or _dim_ (replace the glyph
 	and mark it faint). The render style, the show policy, and the

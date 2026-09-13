@@ -7,7 +7,7 @@ use std::collections::HashMap;
 use std::time::{Duration, Instant};
 
 use posh_proto::lookalike::{cell_seed, has_lookalike, next_lookalike};
-use posh_term::{Cell, UnderlineStyle};
+use posh_term::{Cell, Color, UnderlineStyle};
 
 use crate::remote::display::Snapshot;
 
@@ -93,8 +93,36 @@ impl LookalikeRenderer {
     }
 }
 
+/// The glyph a predicted deletion shows in the erased cell: the "tofu" box a
+/// terminal draws for a glyph its font cannot render. A pending erase is drawn
+/// as tofu (rather than silently blanked) so the deletion is visible until the
+/// server confirms it, then the real blank lands — the erase analogue of the
+/// look-alike shimmer for typed glyphs.
+const DELETED_GLYPH: char = '\u{25af}'; // ▯ WHITE VERTICAL RECTANGLE
+/// Background flagging an unconfirmed prediction: a dark red behind a pending
+/// deletion (tofu), a dark green behind a pending added glyph — dim enough to
+/// read the glyph over, distinct enough to spot at a glance.
+const DELETED_BG: Color = Color::Rgb(95, 0, 0); // dark red
+const ADDED_BG: Color = Color::Rgb(0, 95, 0); // dark green
+
 impl PredictionRenderer for LookalikeRenderer {
     fn paint_cell(&self, fb: &mut Snapshot, row: u16, col: u16, replacement: &Cell, hint: CellHint) {
+        // A predicted ERASE — a blank replacement landing over a cell that still
+        // shows content — is drawn as the tofu box on a red background, so a
+        // pending deletion is visible until confirmed. A blank over an
+        // already-blank cell (an insert-shift's padding, a trailing space) stays
+        // untouched: no stray box.
+        if !hint.unknown && replacement.is_blank() {
+            let erasing = fb.cell(row, col).map(|c| !c.is_blank()).unwrap_or(false);
+            if erasing {
+                if let Some(cell) = fb.cell_mut(row, col) {
+                    *cell = replacement.clone();
+                    cell.ch = DELETED_GLYPH;
+                    cell.style.bg = DELETED_BG;
+                }
+            }
+            return;
+        }
         if hint.unknown || !has_lookalike(replacement.ch) {
             return ReplaceRenderer.paint_cell(fb, row, col, replacement, hint);
         }
@@ -104,10 +132,12 @@ impl PredictionRenderer for LookalikeRenderer {
         if fb.cell(row, col) == Some(replacement) {
             return;
         }
+        // A pending added glyph: the shimmering look-alike on a green background.
         let glyph = self.glyph(row, col, replacement.ch);
         if let Some(cell) = fb.cell_mut(row, col) {
             *cell = replacement.clone();
             cell.ch = glyph;
+            cell.style.bg = ADDED_BG;
         }
     }
 

@@ -327,12 +327,12 @@ the `eng-*(7)` manpages — read them with `man eng-versioning`,
   tmux pane).
   Its heading carries the live `rtt` and the echo model in effect
   (`palette_title`, kept under the renderer's ~42 content columns).
-  **Slow-link echo escalation (FDR 0006 A/B):** the un-pinned default
-  `adaptive` auto-switches to `optimistic` once a MEASURED SRTT holds
+  **Default echo model is `always`** (unset env): paints every keystroke and
+  bypasses the §5.1 gate (below). **Slow-link escalation (FDR 0006 A/B):** an
+  *adaptive* viewport auto-switches to `optimistic` once a MEASURED SRTT holds
   >150 ms for 3 s and back <80 ms for 15 s (`predict::EchoEscalation`;
-  in-band stays escalated by design; `POSH_ECHO_ESCALATE=0` opts out); any
-  explicit model pins — env `adaptive` included — and the palette's
-  `Echo: adaptive` re-arms. **Predictor vs renderer are orthogonal axes
+  `POSH_ECHO_ESCALATE=0` opts out); the default `always` never escalates (a
+  downgrade) — only the palette's `Echo: adaptive` re-arms, any explicit pins. **Predictor vs renderer are orthogonal axes
   (2026-08-25 split):** the model decides WHAT is predicted and hands the
   renderer a `RenderAdvice` — its recommendation on showing (adaptive's
   srtt/glitch trigger), holding (the tentative epoch), and marking (the

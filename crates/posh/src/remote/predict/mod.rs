@@ -348,8 +348,10 @@ impl PredictionModel {
     /// `$MOSH_PREDICTION_DISPLAY`). Both share the same value set.
     pub fn parse(value: Option<&str>) -> Result<PredictionModel, String> {
         match value {
-            None | Some("") | Some("adaptive") => Ok(PredictionModel::Adaptive),
-            Some("always") => Ok(PredictionModel::Always),
+            // Unset (the default) is `always`: paint every keystroke immediately.
+            // An explicit `adaptive` still selects the srtt/glitch-gated model.
+            None | Some("") | Some("always") => Ok(PredictionModel::Always),
+            Some("adaptive") => Ok(PredictionModel::Adaptive),
             Some("never") => Ok(PredictionModel::Never),
             Some("experimental") => Ok(PredictionModel::Experimental),
             Some("optimistic") => Ok(PredictionModel::Optimistic),
@@ -619,10 +621,16 @@ mod tests {
 
     #[test]
     fn prediction_model_parsing() {
-        assert_eq!(PredictionModel::parse(None), Ok(PredictionModel::Adaptive));
+        // Unset defaults to `always`; `adaptive` is now an explicit opt-in.
+        assert_eq!(PredictionModel::parse(None), Ok(PredictionModel::Always));
+        assert_eq!(PredictionModel::parse(Some("")), Ok(PredictionModel::Always));
         assert_eq!(
             PredictionModel::parse(Some("always")),
             Ok(PredictionModel::Always)
+        );
+        assert_eq!(
+            PredictionModel::parse(Some("adaptive")),
+            Ok(PredictionModel::Adaptive)
         );
         assert_eq!(
             PredictionModel::parse(Some("never")),

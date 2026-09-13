@@ -6,10 +6,12 @@
 //! network — just the terminal, so the rendering can be judged by eye.
 //!
 //! Run: `just debug-lookalike-echo [rtt_ms] [period_ms]` (defaults 800 / 150).
-//! Keys: type freely; Backspace deletes; Enter confirms the line into the
-//! history; Tab toggles the underline on unconfirmed cells; Ctrl-C, Ctrl-D,
-//! or Esc quits. Raw mode is entered via `stty` (no libc here) and restored
-//! on exit.
+//! Keys: type freely; Backspace deletes — the erased cell shows the "tofu"
+//! (glyph-not-found) box until a simulated round trip confirms the deletion,
+//! then it vanishes (the erase analogue of the type shimmer, matching the
+//! client's `LookalikeRenderer`); Enter confirms the line into the history;
+//! Tab toggles the underline on unconfirmed cells; Ctrl-C, Ctrl-D, or Esc
+//! quits. Raw mode is entered via `stty` (no libc here) and restored on exit.
 
 use std::io::{Read, Write};
 use std::process::Command;
@@ -18,9 +20,17 @@ use std::time::{Duration, Instant};
 
 use posh_proto::lookalike::{cell_seed, next_lookalike};
 
+/// The glyph a pending deletion shows: the "tofu" box a terminal draws for a
+/// glyph its font cannot render. Mirrors the client `LookalikeRenderer`'s
+/// `DELETED_GLYPH` (U+25AF).
+const TOFU: char = '\u{25af}'; // ▯ WHITE VERTICAL RECTANGLE
+
 struct Pending {
     ch: char,
     confirm_at: Instant,
+    /// A pending DELETION (backspace) rather than an insert: it shows the tofu
+    /// box until `confirm_at`, then the cell is dropped.
+    erasing: bool,
     /// The look-alike on screen, and the tick it was picked at — re-picked
     /// (never the same glyph) on each tick.
     shown: Option<(char, u64)>,
@@ -82,9 +92,27 @@ fn main() {
         let tick = (now - started).as_millis() as u64 / period.as_millis().max(1) as u64;
         let mut frame = String::from("$ ");
         for (cell, p) in line.iter_mut().enumerate() {
-            if now >= p.confirm_at {
+            if p.erasing {
+                // Pending deletion: the tofu box on a red background lingers
+                // until the round trip confirms the erase; once confirmed it
+                // renders nothing and is pruned below.
+                if now < p.confirm_at {
+                    frame.push_str("\x1b[48;2;95;0;0m"); // dark red background
+                    if underline {
+                        frame.push_str("\x1b[4m");
+                    }
+                    frame.push(TOFU);
+                    if underline {
+                        frame.push_str("\x1b[24m");
+                    }
+                    frame.push_str("\x1b[49m"); // reset background
+                }
+            } else if now >= p.confirm_at {
                 frame.push(p.ch);
             } else {
+                // Pending added glyph: the shimmering look-alike on a green
+                // background until the round trip confirms it.
+                frame.push_str("\x1b[48;2;0;95;0m"); // dark green background
                 if underline {
                     frame.push_str("\x1b[4m");
                 }
@@ -97,8 +125,12 @@ fn main() {
                 if underline {
                     frame.push_str("\x1b[24m");
                 }
+                frame.push_str("\x1b[49m"); // reset background
             }
         }
+        // Drop deletions the round trip has now confirmed: their tofu has
+        // served its time and the cell is gone.
+        line.retain(|p| !(p.erasing && now >= p.confirm_at));
         if frame != last_drawn {
             let _ = write!(out, "\r\x1b[2K{frame}");
             let _ = out.flush();
@@ -118,11 +150,19 @@ fn main() {
                     last_drawn.clear();
                 }
                 0x7f | 0x08 => {
-                    line.pop();
+                    // Mark the last still-present cell as a pending erase: it
+                    // shows the tofu box until the round trip confirms the
+                    // deletion. Repeated backspaces walk leftward.
+                    if let Some(p) = line.iter_mut().rev().find(|p| !p.erasing) {
+                        p.erasing = true;
+                        p.confirm_at = Instant::now() + rtt;
+                        p.shown = None;
+                    }
                 }
                 b if b.is_ascii_graphic() || b == b' ' => line.push(Pending {
                     ch: b as char,
                     confirm_at: Instant::now() + rtt,
+                    erasing: false,
                     shown: None,
                 }),
                 _ => {}
