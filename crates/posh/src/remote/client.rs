@@ -1015,7 +1015,10 @@ fn dispatch_palette_action(
             let previous = params.get("previous").and_then(Value::as_str);
             if previous.is_none() {
                 if let (Some(p), Some(leaving)) = (st.palette.as_mut(), crate::picker::current()) {
-                    p.open(&format!("switch to {target}"), crate::picker::leave_commands(target, &leaving));
+                    p.open(
+                        &format!("Switch to {target} — leave {leaving}:"),
+                        crate::picker::leave_commands(target),
+                    );
                     return false;
                 }
             }
@@ -1040,7 +1043,10 @@ fn dispatch_palette_action(
             };
             if previous.is_none() {
                 if let (Some(p), Some(leaving)) = (st.palette.as_mut(), crate::picker::current()) {
-                    p.open(&format!("back to {top}"), crate::picker::back_commands(&leaving));
+                    p.open(
+                        &format!("Back to {top} — leave {leaving}:"),
+                        crate::picker::back_commands(),
+                    );
                     return false;
                 }
             }
@@ -1183,11 +1189,17 @@ fn client_env_config() -> Result<(PredictionModel, RenderStyle, bool, GrabMouse,
         .ok()
         .or_else(|| std::env::var("POSH_PREDICTION").ok());
     let model = PredictionModel::parse(model_env.as_deref()).map_err(Error::Msg)?;
-    // Slow-link escalation governs only the UN-PINNED default: a model named
-    // in the environment — `adaptive` included, which parses to the same
-    // variant as unset — is an explicit choice and pins (the palette's
-    // `Echo: adaptive` is the one re-arm affordance).
-    let echo_escalate = echo_escalation_governs(model_env.as_deref(), predict::escalation_selected());
+    // Slow-link auto-escalation only ever governed the un-pinned default model
+    // (adaptive → optimistic on a slow link). The default is now `always`, which
+    // is already maximally aggressive AND pins the safety gate open, so there is
+    // no startup model to escalate — the machine stays off (escalating `always`
+    // down to `optimistic` would be a downgrade). Choosing `adaptive` at runtime
+    // (palette `Echo: adaptive`) re-arms it via `on_explicit`; an explicit env
+    // model still pins. So the machine governs at startup only for an explicit
+    // `adaptive`, which pins anyway — i.e. never — but the guard keeps the intent
+    // legible rather than relying on that coincidence.
+    let echo_escalate = model == PredictionModel::Adaptive
+        && echo_escalation_governs(model_env.as_deref(), predict::escalation_selected());
     let render_env = std::env::var("POSH_PREDICTION_RENDER").ok();
     let render = RenderStyle::parse(render_env.as_deref()).map_err(Error::Msg)?;
     // The show policy is read again inside `predict::build` (it rides the

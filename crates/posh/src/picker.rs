@@ -176,19 +176,23 @@ impl Previous {
 /// re-issues `session.switch` with the same `target` and a `previous`.
 /// Keeping it is a PUSH: the session goes on the stack and *Back* returns
 /// to it (FDR 0016, stacked switching).
-pub fn leave_commands(target: &str, leaving: &str) -> Value {
-    leave_commands_for("session.switch", "Switch", Some(target), leaving)
+pub fn leave_commands(target: &str) -> Value {
+    leave_commands_for("session.switch", Some(target))
 }
 
 /// The leave question for *Back* (`session.pop`): the same three fates for
 /// the session being left, re-issued as `session.pop` with a `previous`
 /// (the target is the stack's top, never named by the renderer).
-pub fn back_commands(leaving: &str) -> Value {
-    leave_commands_for("session.pop", "Back", None, leaving)
+pub fn back_commands() -> Value {
+    leave_commands_for("session.pop", None)
 }
 
-fn leave_commands_for(method: &str, verb: &str, target: Option<&str>, leaving: &str) -> Value {
-    let cmd = |name: String, previous: Previous| {
+/// The three fates (+ cancel) for the session being LEFT, each re-issuing
+/// `method` with a `previous`. The session being left is named ONCE by the
+/// CALLER in the dialog title (RFC 0005 `title`), NOT repeated in every answer,
+/// so the answers read as fates of "it".
+fn leave_commands_for(method: &str, target: Option<&str>) -> Value {
+    let cmd = |name: &str, previous: Previous| {
         let mut params = json!({ "previous": previous.as_str() });
         if let Some(t) = target {
             params["target"] = json!(t);
@@ -199,9 +203,9 @@ fn leave_commands_for(method: &str, verb: &str, target: Option<&str>, leaving: &
         })
     };
     json!([
-        cmd(format!("{verb}, keep {leaving} running"), Previous::Keep),
-        cmd(format!("{verb}, kill {leaving} (kept if other viewports are attached)"), Previous::Kill),
-        cmd(format!("{verb}, kill {leaving} even with other viewports attached"), Previous::ForceKill),
+        cmd("Keep it running", Previous::Keep),
+        cmd("Kill it (kept if other viewports are attached)", Previous::Kill),
+        cmd("Kill it even with other viewports attached", Previous::ForceKill),
         { "name": "Cancel" },
     ])
 }
@@ -666,13 +670,15 @@ mod tests {
         assert_eq!(stack_top().as_deref(), Some(":s-1"));
         stack_pop();
         // The back question re-issues session.pop with a previous, no target.
-        let cmds = back_commands(":s-1");
+        // The session being left is named in the dialog title (the caller), NOT
+        // in every answer — so the answers are generic fates of "it".
+        let cmds = back_commands();
         let arr = cmds.as_array().unwrap();
         assert_eq!(arr.len(), 4);
         assert_eq!(arr[0]["action"]["method"], "session.pop");
         assert!(arr[0]["action"]["params"].get("target").is_none());
         assert_eq!(arr[1]["action"]["params"]["previous"], "kill");
-        assert!(arr[0]["name"].as_str().unwrap().starts_with("Back, keep :s-1"));
+        assert_eq!(arr[0]["name"], "Keep it running");
     }
 
     /// The automatic pop: a top session that ENDED or was LOST returns the
@@ -724,18 +730,24 @@ mod tests {
 
     /// The leave step: three `session.switch` re-issues carrying the chosen
     /// target and a `previous`, plus a no-op cancel; `previous` parses back,
-    /// and an unknown spelling is rejected (absent = keep).
+    /// and an unknown spelling is rejected (absent = keep). The session being
+    /// left is named in the dialog title (the caller), not in the answers, so
+    /// each answer is a generic fate of "it".
     #[test]
     fn leave_commands_carry_target_and_previous() {
-        let cmds = leave_commands("box:dev", ":s-1");
+        let cmds = leave_commands("box:dev");
         let arr = cmds.as_array().unwrap();
         assert_eq!(arr.len(), 4);
+        let names = ["Keep it running", "Kill it", "Kill it"];
         for (i, want) in ["keep", "kill", "force-kill"].iter().enumerate() {
             assert_eq!(arr[i]["action"]["method"], "session.switch");
             assert_eq!(arr[i]["action"]["params"]["target"], "box:dev");
             assert_eq!(arr[i]["action"]["params"]["previous"], *want);
             assert_eq!(Previous::parse(Some(want)).map(Previous::as_str), Some(*want));
-            assert!(arr[i]["name"].as_str().unwrap().contains(":s-1"));
+            // The answer names the fate, never the leaving session id.
+            let name = arr[i]["name"].as_str().unwrap();
+            assert!(name.starts_with(names[i]), "{name:?}");
+            assert!(!name.contains(':'), "answer must not repeat a session id: {name:?}");
         }
         assert!(arr[3]["action"].is_null(), "Cancel is a no-op entry");
         assert_eq!(Previous::parse(None), Some(Previous::Keep));

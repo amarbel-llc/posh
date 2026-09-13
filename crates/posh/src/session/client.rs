@@ -1689,8 +1689,8 @@ fn client_loop(
                                     (palette.as_mut(), crate::picker::current())
                                 {
                                     p.open(
-                                        &format!("switch to {target}"),
-                                        crate::picker::leave_commands(&target, &leaving),
+                                        &format!("Switch to {target} — leave {leaving}:"),
+                                        crate::picker::leave_commands(&target),
                                     );
                                 }
                             }
@@ -1699,8 +1699,8 @@ fn client_loop(
                                     (palette.as_mut(), crate::picker::current())
                                 {
                                     p.open(
-                                        &format!("back to {top}"),
-                                        crate::picker::back_commands(&leaving),
+                                        &format!("Back to {top} — leave {leaving}:"),
+                                        crate::picker::back_commands(),
                                     );
                                 }
                             }
