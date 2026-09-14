@@ -300,11 +300,17 @@ impl<R: PredictionRenderer> PredictionRenderer for Policed<R> {
 }
 
 /// Model state a renderer MAY use when painting a cell: `flagged` =
-/// slow-link/glitch, `unknown` = uncertain position (no glyph to draw).
+/// slow-link/glitch, `unknown` = uncertain position (no glyph to draw),
+/// `erase` = this prediction is part of a user DELETE (a backspace), as
+/// opposed to a typed char or an insert-shift — set only by
+/// `OverlayBuffer::handle_backspace`. Lets a renderer show a distinct
+/// delete cue only for genuine deletes (posh#197: the tofu was firing on
+/// insert-shift blanks too).
 #[derive(Clone, Copy)]
 pub struct CellHint {
     pub flagged: bool,
     pub unknown: bool,
+    pub erase: bool,
 }
 
 /// Display gauges sampled from a predictor (mirrors the old engine getters).

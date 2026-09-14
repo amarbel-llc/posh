@@ -94,10 +94,9 @@ impl LookalikeRenderer {
 }
 
 /// The glyph a predicted deletion shows in the erased cell: the "tofu" box a
-/// terminal draws for a glyph its font cannot render. A pending erase is drawn
-/// as tofu (rather than silently blanked) so the deletion is visible until the
-/// server confirms it, then the real blank lands — the erase analogue of the
-/// look-alike shimmer for typed glyphs.
+/// terminal draws for a glyph its font cannot render. Drawn on a red background
+/// so a pending backspace is visible until the server confirms it, then the
+/// real blank lands — the erase analogue of the look-alike shimmer.
 const DELETED_GLYPH: char = '\u{25af}'; // ▯ WHITE VERTICAL RECTANGLE
 /// Background flagging an unconfirmed prediction: a dark red behind a pending
 /// deletion (tofu), a dark green behind a pending added glyph — dim enough to
@@ -107,21 +106,23 @@ const ADDED_BG: Color = Color::Rgb(0, 95, 0); // dark green
 
 impl PredictionRenderer for LookalikeRenderer {
     fn paint_cell(&self, fb: &mut Snapshot, row: u16, col: u16, replacement: &Cell, hint: CellHint) {
-        // A predicted ERASE — a blank replacement landing over a cell that still
-        // shows content — is drawn as the tofu box on a red background, so a
-        // pending deletion is visible until confirmed. A blank over an
-        // already-blank cell (an insert-shift's padding, a trailing space) stays
-        // untouched: no stray box.
+        // A blank prediction from a genuine backspace (`hint.erase`) is drawn as
+        // the tofu box on a red background — the visible delete cue. A blank
+        // from anything else (an insert-shift moving a blank over the input
+        // box's border or a fish autosuggestion, a typed space, Enter's
+        // last-row blank) is NOT a delete, so it renders quietly like
+        // `replace` — no stray red box (posh#197: the tofu used to fire on
+        // every blank-over-non-blank, spraying red while typing).
         if !hint.unknown && replacement.is_blank() {
-            let erasing = fb.cell(row, col).map(|c| !c.is_blank()).unwrap_or(false);
-            if erasing {
+            if hint.erase {
                 if let Some(cell) = fb.cell_mut(row, col) {
                     *cell = replacement.clone();
                     cell.ch = DELETED_GLYPH;
                     cell.style.bg = DELETED_BG;
                 }
+                return;
             }
-            return;
+            return ReplaceRenderer.paint_cell(fb, row, col, replacement, hint);
         }
         if hint.unknown || !has_lookalike(replacement.ch) {
             return ReplaceRenderer.paint_cell(fb, row, col, replacement, hint);
@@ -256,6 +257,43 @@ mod tests {
         assert_ne!(
             replaced_style, dimmed_style,
             "the two render styles must produce distinct cell styles"
+        );
+    }
+
+    /// posh#197: the deletion tofu fires ONLY for a genuine backspace-erase,
+    /// not for the blank an insert-shift moves over trailing content (the input
+    /// box's border, a fish autosuggestion). A forward insert never shows a
+    /// tofu; a real backspace at end-of-line does.
+    #[test]
+    fn lookalike_tofu_only_on_a_real_delete_not_an_insert_shift() {
+        use crate::remote::predict::{MoshPredictor, PredictionModel, Predictor as _};
+        const TOFU: char = '\u{25af}';
+        let has_tofu =
+            |s: &Snapshot| (0..s.cols).any(|c| s.cell(0, c).map(|x| x.ch) == Some(TOFU));
+
+        // Content after the cursor ("$ abc", cursor back on 'b'); inserting a
+        // space shifts "bc" right and lays a BLANK over 'b' — not a delete.
+        let fb = snapshot(5, 20, b"$ abc\x1b[1;4H");
+        let mut ins = MoshPredictor::new(PredictionModel::Always, false);
+        ins.set_frame_sent(0);
+        ins.on_user_byte(b' ', &fb, 100);
+        let mut out = fb.clone();
+        ins.render(&mut out, &LookalikeRenderer::new());
+        assert!(
+            !has_tofu(&out),
+            "an insert-shift blank must not render the deletion tofu"
+        );
+
+        // A real backspace at end-of-line blanks the deleted cell → tofu.
+        let fb2 = snapshot(5, 20, b"$ abc");
+        let mut del = MoshPredictor::new(PredictionModel::Always, false);
+        del.set_frame_sent(0);
+        del.on_user_byte(0x7f, &fb2, 100);
+        let mut out2 = fb2.clone();
+        del.render(&mut out2, &LookalikeRenderer::new());
+        assert!(
+            has_tofu(&out2),
+            "a real backspace at end-of-line must render the deletion tofu"
         );
     }
 

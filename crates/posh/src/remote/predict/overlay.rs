@@ -52,6 +52,10 @@ pub(super) struct OverlayCell {
     pub col: u16,
     pub unknown: bool,
     pub replacement: Cell,
+    /// This cell is part of a user DELETE (set only by `handle_backspace`), so
+    /// a renderer can show a delete cue only for genuine deletes — not for the
+    /// blank an insert-shift moves over trailing content (posh#197).
+    pub erase: bool,
     /// No credit for predictions that match what was already there.
     pub original_contents: Vec<Cell>,
 }
@@ -66,6 +70,7 @@ impl OverlayCell {
             col,
             unknown: false,
             replacement: blank_cell(),
+            erase: false,
             original_contents: Vec::new(),
         }
     }
@@ -77,6 +82,7 @@ impl OverlayCell {
     pub fn reset(&mut self) {
         self.active = false;
         self.unknown = false;
+        self.erase = false;
         self.tentative_until_epoch = u64::MAX;
         self.expiration_frame = u64::MAX;
         self.original_contents.clear();
@@ -167,6 +173,7 @@ impl OverlayCell {
                     CellHint {
                         flagged: true,
                         unknown: true,
+                        erase: self.erase,
                     },
                 );
                 return CellRendered::Painted { marked: true };
@@ -181,6 +188,7 @@ impl OverlayCell {
             CellHint {
                 flagged: flag,
                 unknown: false,
+                erase: self.erase,
             },
         );
         CellRendered::Painted { marked: flag }
@@ -718,6 +726,7 @@ impl OverlayBuffer {
             cell.active = true;
             cell.tentative_until_epoch = epoch;
             cell.expire(expiration, now);
+            cell.erase = true;
             let mut replacement = orig.clone();
             cell.original_contents.push(orig);
             replacement.ch = ' ';
@@ -749,6 +758,7 @@ impl OverlayBuffer {
             cell.active = true;
             cell.tentative_until_epoch = epoch;
             cell.expire(expiration, now);
+            cell.erase = true;
             cell.original_contents.push(orig);
             match next_state {
                 None => cell.unknown = true,
