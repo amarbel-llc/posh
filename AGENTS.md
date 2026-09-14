@@ -131,20 +131,16 @@ the `eng-*(7)` manpages — read them with `man eng-versioning`,
   establishment — the bootstrap ssh included — in a palette-style modal (#1
   → posh#195 → FDR 0019):** `cmd_ssh_session` / `cmd_ssh` begin a
   `connect_progress::Takeover` before the mux endpoint ensure (raw mode,
-  smcup, a stderr CAPTURE replayed after rmcup so a fallback warning never
-  draws over the modal; dropped at return). `CrapModal` (progress:
-  `crap-present` fed ndjson-crap, captured off a PTY via `pty::spawn_capture`)
-  shows before/after the ssh phase; `SshModal` DURING it —
-  `sshwrap::bootstrap_in_modal` runs ssh on a cooked+echo PTY that is its
-  controlling tty (prompts land in the modal, keystrokes forward to it, Ctrl-C
-  is its SIGINT), the `POSH …` handshake scraped off by the byte-fed
-  `LineScraper` so the key never renders. `Takeover::handoff` gives the
-  client loop the modal + painter state (`Handoff`; `drive_client(inherited)`
-  neither smcups nor rmcups). Off-tty there is no takeover and every path
-  keeps its old shape. A `run_daemon` spawned under the takeover
-  `close_inherited_fds` so it never pins the modal's pipe/PTY. Phase 2 (not
-  done): the endpoint's tty-less bootstrap — a prompt fails there and the
-  foreground fallback's modal answers it. `just debug-verify-establish-modal`.
+  smcup, a stderr CAPTURE replayed after rmcup; dropped at return).
+  `CrapModal` (progress: `crap-present` captured off a PTY) shows before/after
+  the ssh phase; `SshModal` DURING it — `sshwrap::bootstrap_in_modal` runs ssh
+  on a cooked+echo PTY that is its controlling tty (prompts land in the modal,
+  keystrokes forward to it), the `POSH …` handshake scraped off by the
+  byte-fed `LineScraper` so the key never renders. `Takeover::handoff` gives
+  the client loop the modal + painter state (`drive_client(inherited)` neither
+  smcups nor rmcups). Off-tty there is no takeover. A `run_daemon` spawned
+  under the takeover `close_inherited_fds`. Phase 2 (not done): the endpoint's
+  tty-less bootstrap. Live check: `just debug-verify-establish-modal`.
 - **Multi-client sizing is smallest-wins, and the DAEMON owns it:** the
   session daemon sizes the pty to the elementwise MINIMUM across all attached
   clients (`min_client_size`/`apply_client_size`, `session/daemon.rs`; tmux
