@@ -14,6 +14,7 @@ use serde_json::{json, Value};
 use crate::pty::{self, RawMode};
 use crate::remote::caps;
 use crate::remote::channel;
+use crate::remote::connect_progress::Handoff;
 use crate::remote::crypto::Key;
 use crate::remote::datagram::{Connection, Family};
 use crate::remote::diag;
@@ -1200,12 +1201,16 @@ impl GrabMouse {
     }
 }
 
+/// The per-invocation UDP entry. `handoff` is a live terminal takeover to
+/// inherit (FDR 0019: the front door took over before the bootstrap and the
+/// establish modal is already up); `None` takes over here, as before.
 pub fn run(
     host: &str,
     port: u16,
     family: Family,
     agent_source: Option<std::path::PathBuf>,
     channels: bool,
+    handoff: Option<Handoff>,
 ) -> Result<()> {
     util::check_utf8_locale("posh-client")?;
 
@@ -1231,10 +1236,9 @@ pub fn run(
     // consumes the flag in drive_client, arms it.
     util::install_sigusr2_handler();
     let raw = RawMode::enable(STDIN)?;
-    // The alt-screen takeover (smcup) is deferred into the client loop (#1): it
-    // waits for the connection to establish, showing a `crap-present` spinner on
-    // the primary screen meanwhile; rmcup on exit is the loop's too, gated on
-    // whether it actually took over.
+    // The alt-screen takeover (smcup) and the establish modal are the client
+    // loop's (posh#195) — or the front door's, inherited through `handoff`
+    // (FDR 0019); rmcup on exit belongs to whoever took over.
     let result = client_loop(
         Wire::Udp(Box::new(conn)),
         model,
@@ -1247,6 +1251,7 @@ pub fn run(
         agent_source,
         host,
         channels,
+        handoff,
     );
     drop(raw);
     eprintln!("\nposh: [client exited]");
@@ -1266,6 +1271,7 @@ pub fn run(
 pub fn run_over_mux(
     transport: crate::remote::mux::MuxSessionTransport,
     host: &str,
+    handoff: Option<Handoff>,
 ) -> Result<i32> {
     util::check_utf8_locale("posh-client")?;
     let (model, render, predict_overwrite, grab_mouse, echo_escalate) = client_env_config()?;
@@ -1273,7 +1279,7 @@ pub fn run_over_mux(
     util::install_client_signal_handlers();
     util::install_sigusr2_handler();
     let raw = RawMode::enable(STDIN)?;
-    // smcup/rmcup deferred into the client loop (#1); see `run`.
+    // smcup/rmcup are the client loop's or the inherited takeover's; see `run`.
     let result = client_loop(
         Wire::Mux(transport),
         model,
@@ -1286,6 +1292,7 @@ pub fn run_over_mux(
         None,
         host,
         false,
+        handoff,
     );
     drop(raw);
     eprintln!("\nposh: [client exited]");
@@ -1719,6 +1726,7 @@ fn client_loop(
     agent_source: Option<std::path::PathBuf>,
     host: &str,
     enveloped: bool,
+    handoff: Option<Handoff>,
 ) -> Result<i32> {
     util::set_nonblocking(STDIN)?;
 
@@ -1826,10 +1834,22 @@ fn client_loop(
     // RFC 0007: collect the compute-timing terminals when a GP species is the
     // startup model, independent of POSH_DEBUG_LOG.
     st.stats.set_gp_active(is_gp_species(model));
-    // drive_client takes over the terminal immediately and, while establishing,
-    // shows the connect progress as a command-palette-style modal overlay
-    // (posh#195): a captured `crap-present` process it spawns + composites.
-    let result = drive_client(&mut st, raw, port, host);
+    // An inherited takeover (FDR 0019): the front door already holds the alt
+    // screen and painted the establish modal; continue compositing that modal
+    // and diff the first frame against what it drew (unless the terminal was
+    // resized in between, when a full repaint is due anyway). Otherwise
+    // drive_client takes over the terminal immediately itself and, while
+    // establishing, shows the connect progress as a command-palette-style
+    // modal overlay (posh#195): a captured `crap-present` process it spawns.
+    let inherited = handoff.is_some();
+    if let Some(h) = handoff {
+        st.establish = h.modal;
+        if (h.last_drawn.rows, h.last_drawn.cols) == (rows, cols) {
+            st.last_drawn = h.last_drawn;
+            st.initialized = h.initialized;
+        }
+    }
+    let result = drive_client(&mut st, raw, port, host, inherited);
     // Tear down the palette renderer (if any) before the final stats flush.
     if let Some(p) = st.palette.take() {
         p.shutdown();
@@ -1869,7 +1889,15 @@ fn establish_done_ok(st: &mut ClientState) {
 /// connect progress as a command-palette-style modal overlay (posh#195): a
 /// captured `crap-present` process (`st.establish`) composited each frame,
 /// dismissed on the first frame. `source` labels the establish/verdict lines.
-fn drive_client(st: &mut ClientState, raw: &RawMode, port: u16, source: &str) -> Result<i32> {
+/// With `inherited` the front door's takeover owns smcup/rmcup and already
+/// supplied the modal (`st.establish`), so neither happens here.
+fn drive_client(
+    st: &mut ClientState,
+    raw: &RawMode,
+    port: u16,
+    source: &str,
+    inherited: bool,
+) -> Result<i32> {
     let mut assembly = FragmentAssembly::new();
 
     // Connect diagnostics (mosh stmclient): before the first authentic
@@ -1890,9 +1918,12 @@ fn drive_client(st: &mut ClientState, raw: &RawMode, port: u16, source: &str) ->
     // captured `crap-present` process fed ndjson-crap; `None` off-tty / binary
     // not found, in which case there is just no overlay (the "Last contact"
     // banner covers that case). rmcup on exit is unconditional (we always took
-    // over). smcup/rmcup live here, not in run/run_over_mux.
-    write_display_control("smcup (connect)", &display::open());
-    st.establish = crate::remote::connect_progress::CrapModal::spawn(source, st.rows, st.cols);
+    // over). smcup/rmcup live here, not in run/run_over_mux — unless the
+    // takeover was inherited from the front door (FDR 0019).
+    if !inherited {
+        write_display_control("smcup (connect)", &display::open());
+        st.establish = crate::remote::connect_progress::CrapModal::spawn(source, st.rows, st.cols);
+    }
 
     // Hello: teaches the server our address and terminal size.
     send_message(st);
@@ -2409,10 +2440,14 @@ fn drive_client(st: &mut ClientState, raw: &RawMode, port: u16, source: &str) ->
         m.not_ok("connection not established");
         m.teardown();
     }
-    // Restore the outer terminal: the immediate takeover (posh#195) always
-    // smcup'd at the top of this fn, so rmcup is unconditional. smcup/rmcup live
-    // here, not in run/run_over_mux.
-    write_display_control("rmcup (exit)", &display::close());
+    // Restore the outer terminal: the immediate takeover (posh#195) smcup'd at
+    // the top of this fn, so rmcup is unconditional — except under an inherited
+    // takeover, whose owner restores the terminal (after a fallback it may
+    // keep the alt screen for the next attempt). smcup/rmcup live here, not in
+    // run/run_over_mux.
+    if !inherited {
+        write_display_control("rmcup (exit)", &display::close());
+    }
     result
 }
 

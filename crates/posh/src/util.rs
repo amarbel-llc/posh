@@ -525,6 +525,39 @@ pub fn double_fork() -> Result<bool> {
     Ok(false)
 }
 
+/// Close every fd above stderr except `keep` — for a double-forked daemon
+/// that inherited its spawner's descriptors: no exec follows, so `CLOEXEC`
+/// never fires, and a spawner holding a terminal takeover (FDR 0019: the
+/// establish modal's PTY + ndjson pipe, the stderr capture) would otherwise
+/// leave the daemon pinning them for its lifetime — a pipe whose EOF the
+/// modal's renderer waits on, a pty never released. Linux enumerates
+/// `/proc/self/fd`; elsewhere the descriptor table is swept up to
+/// `sysconf(_SC_OPEN_MAX)`.
+pub fn close_inherited_fds(keep: &[RawFd]) {
+    let mut fds: Vec<RawFd> = Vec::new();
+    #[cfg(target_os = "linux")]
+    if let Ok(entries) = std::fs::read_dir("/proc/self/fd") {
+        for e in entries.flatten() {
+            if let Some(fd) = e.file_name().to_str().and_then(|s| s.parse::<RawFd>().ok()) {
+                fds.push(fd);
+            }
+        }
+    }
+    if fds.is_empty() {
+        // SAFETY: sysconf on a constant name; a failure (-1) means no sweep.
+        let max = unsafe { libc::sysconf(libc::_SC_OPEN_MAX) };
+        let max = if max <= 0 { 1024 } else { max.min(65_536) } as RawFd;
+        fds.extend(3..max);
+    }
+    for fd in fds {
+        if fd > 2 && !keep.contains(&fd) {
+            // SAFETY: close(2) on an integer fd; an already-closed fd (EBADF)
+            // is harmless here.
+            unsafe { libc::close(fd) };
+        }
+    }
+}
+
 pub fn redirect_stdio_devnull() {
     // SAFETY: open(2)/dup2(2)/close(2) on integer fds; the path is a
     // static NUL-terminated literal.

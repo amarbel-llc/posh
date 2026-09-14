@@ -1,13 +1,35 @@
 //! ssh bootstrap wrapper (mosh.pl port, simplified): run `posh server new`
 //! on the remote host over ssh, parse the POSH IP / POSH CONNECT lines,
 //! then run the UDP client locally with the key in the environment.
+//!
+//! Two ways to drive the ssh (FDR 0019): under a live terminal [`Takeover`]
+//! the foreground attach hosts it in the interactive establish modal
+//! ([`bootstrap_in_modal`] — prompts answered by typing, output composited
+//! onto the taken-over viewport); otherwise (off-tty, the mux daemon's
+//! detached bootstrap) it runs with piped stdout and inherited or captured
+//! stderr as it always did ([`bootstrap_piped`]).
 
 use std::io::{BufRead, BufReader};
 use std::net::{IpAddr, ToSocketAddrs};
 use std::process::{Command, Stdio};
+use std::time::{Duration, Instant};
 
+use crate::remote::connect_progress::{SshModal, Takeover};
 use crate::remote::datagram::Family;
-use crate::util::{Error, Result};
+use crate::util::{self, Error, Result};
+
+const STDIN: std::os::fd::RawFd = libc::STDIN_FILENO;
+const STDOUT: std::os::fd::RawFd = libc::STDOUT_FILENO;
+
+/// The modal-hosted bootstrap's error prefix when ssh was STOPPED (a
+/// terminating signal, the user's terminal closing) rather than failed.
+const ABORTED: &str = "establishment aborted";
+
+/// How long the modal-hosted ssh may linger after `POSH CONNECT` (it exits on
+/// its own once the detached server closes its end) before it is reaped, so a
+/// remote that keeps the channel open cannot hold up the roaming connect. Also
+/// the reap grace for an aborted ssh.
+const SSH_EXIT_GRACE: Duration = Duration::from_secs(3);
 
 #[derive(Clone)]
 pub struct SshOptions {
@@ -153,6 +175,78 @@ impl ServerReport {
             return Ok(true);
         }
         Ok(false)
+    }
+}
+
+/// The line-start marker of a bootstrap protocol line (`POSH IP`, `POSH
+/// CONNECT`, [`AGENT_EXPORT_ACK_LINE`]).
+const PROTO_PREFIX: &[u8] = b"POSH ";
+
+/// Byte-fed (ADR-0003) splitter of the modal-hosted ssh's PTY stream into the
+/// protocol lines a [`ServerReport`] parses and the bytes the modal shows.
+/// A line is withheld from the screen only while it could still be a protocol
+/// line — while it is a prefix of `POSH `, or once it starts with it — and is
+/// consumed whole at its newline; everything else (a prompt with no trailing
+/// newline included) flows through the moment it is disambiguated, at most
+/// [`PROTO_PREFIX`]-many bytes late. Once `POSH CONNECT` has been parsed
+/// nothing further is scraped. The session key on the CONNECT line is thus
+/// never rendered.
+#[derive(Default)]
+pub struct LineScraper {
+    report: ServerReport,
+    /// The current line so far, while it may still be a protocol line.
+    held: Vec<u8>,
+    /// The current line is known not to be a protocol line: pass it through
+    /// to its newline.
+    passthrough: bool,
+    done: bool,
+}
+
+impl LineScraper {
+    /// Feed a read; returns the bytes to show. A malformed protocol line is
+    /// the bootstrap's error, exactly as on the piped path.
+    pub fn feed(&mut self, bytes: &[u8]) -> Result<Vec<u8>> {
+        let mut shown = Vec::with_capacity(bytes.len());
+        for &b in bytes {
+            if self.passthrough || self.done {
+                shown.push(b);
+                if b == b'\n' {
+                    self.passthrough = false;
+                }
+                continue;
+            }
+            if b == b'\n' {
+                let line = std::mem::take(&mut self.held);
+                if line.starts_with(PROTO_PREFIX) {
+                    let text = String::from_utf8_lossy(&line);
+                    if self.report.feed(text.trim_end_matches('\r'))? {
+                        self.done = true;
+                    }
+                } else {
+                    shown.extend_from_slice(&line);
+                    shown.push(b);
+                }
+                continue;
+            }
+            let at = self.held.len();
+            if at < PROTO_PREFIX.len() && b != PROTO_PREFIX[at] {
+                shown.extend_from_slice(&self.held);
+                shown.push(b);
+                self.held.clear();
+                self.passthrough = true;
+                continue;
+            }
+            self.held.push(b);
+        }
+        Ok(shown)
+    }
+
+    pub fn report(&self) -> &ServerReport {
+        &self.report
+    }
+
+    pub fn into_report(self) -> ServerReport {
+        self.report
     }
 }
 
@@ -538,33 +632,77 @@ pub(crate) fn ssh_args(opts: &SshOptions) -> Vec<String> {
     args
 }
 
+/// The complete bootstrap command line, `ssh` first: the [`ssh_args`] flags,
+/// the dial decision's options, the target, `--`, the remote command. One
+/// shape for both drivers (piped and modal-hosted), pinned by test.
+pub(crate) fn ssh_argv(opts: &SshOptions, dest: &SshDest, server_cmd: &str) -> Vec<String> {
+    let mut argv = vec!["ssh".to_string()];
+    argv.extend(ssh_args(opts));
+    argv.extend(dest.ssh_args());
+    argv.push(dest.target());
+    argv.push("--".to_string());
+    argv.push(server_cmd.to_string());
+    argv
+}
+
+/// Drive the bootstrap ssh: hosted in the establish modal when the caller
+/// holds a terminal takeover (FDR 0019 — prompts are answered inside it),
+/// piped otherwise. Returns `(host, port, key)` for the caller to stand up
+/// its own UDP connection; the key is returned, never exported — only
+/// [`run`]'s foreground path uses the `POSH_KEY` env convention.
 pub fn bootstrap(
     target: &str,
     remote_cmd: &[String],
     opts: &SshOptions,
+    takeover: Option<&mut Takeover>,
 ) -> Result<(String, u16, String)> {
     let server_cmd = remote_command(opts, remote_cmd, &forwarded_env_vars());
 
     // posh#182: resolved per attempt (the mux daemon re-runs this on every
     // reconnect, so a tailnet address change is picked up, not cached).
     let dest = SshDest::resolve(target);
-    if let Some(notice) = dest.notice() {
-        eprintln!("{notice}");
+    let argv = ssh_argv(opts, &dest, &server_cmd);
+    let (report, ssh_said) = match takeover {
+        Some(t) => bootstrap_in_modal(t, &argv, dest.notice())?,
+        None => {
+            if let Some(notice) = dest.notice() {
+                eprintln!("{notice}");
+            }
+            bootstrap_piped(&argv)?
+        }
+    };
+
+    let (Some(port), Some(key)) = (report.port, report.key) else {
+        return Err(startup_failure(&ssh_said));
+    };
+    // Under a takeover this lands in the stderr capture and is replayed once
+    // the terminal is restored — where a pre-takeover warning used to print.
+    if let Some(warning) = export_unacked_warning(opts.agent_export, report.agent_export) {
+        eprintln!("{warning}");
     }
-    let mut ssh = Command::new("ssh");
-    ssh.args(ssh_args(opts));
-    ssh.args(dest.ssh_args());
+
+    // Prefer the address the server reported (third field of its
+    // $SSH_CONNECTION: the IP we actually reached it on); fall back to
+    // resolving the hostname we dialed, as mosh.pl does.
+    let host = report.ip.unwrap_or(dest.dial_host);
+    Ok((host, port, key))
+}
+
+/// The pre-FDR-0019 driver: ssh with piped stdout for the handshake, stdin
+/// inherited (a prompt reaches the tty when there is one), stderr inherited on
+/// a tty or captured otherwise. Returns the report plus what ssh said on a
+/// captured stderr (the failure message's tail).
+fn bootstrap_piped(argv: &[String]) -> Result<(ServerReport, String)> {
+    let mut ssh = Command::new(&argv[0]);
+    ssh.args(&argv[1..]);
     // ssh's stderr: on a tty it streams through (auth prompts, warnings);
     // with no tty (the mux daemon's bootstrap) it is captured so a failed
     // attempt can SAY why — the generic "no startup message" hid the real
     // ssh error (resolution, an agent prompt refused without a tty, a host
     // key) behind a PATH hint. Drained on a thread so a chatty ssh can never
     // fill the pipe while stdout is being read.
-    let capture_stderr = !crate::util::is_tty(libc::STDERR_FILENO);
+    let capture_stderr = !util::is_tty(libc::STDERR_FILENO);
     let mut child = ssh
-        .arg(dest.target())
-        .arg("--")
-        .arg(&server_cmd)
         .stdin(Stdio::inherit()) // keep the tty for auth prompts
         .stdout(Stdio::piped())
         .stderr(if capture_stderr { Stdio::piped() } else { Stdio::inherit() })
@@ -595,25 +733,112 @@ pub fn bootstrap(
         .and_then(|h| h.join().ok())
         .map(|bytes| String::from_utf8_lossy(&bytes).into_owned())
         .unwrap_or_default();
-
-    let (Some(port), Some(key)) = (report.port, report.key) else {
-        return Err(startup_failure(&ssh_stderr));
-    };
-    if let Some(warning) = export_unacked_warning(opts.agent_export, report.agent_export) {
-        eprintln!("{warning}");
-    }
-
-    // Prefer the address the server reported (third field of its
-    // $SSH_CONNECTION: the IP we actually reached it on); fall back to
-    // resolving the hostname we dialed, as mosh.pl does.
-    let host = report.ip.unwrap_or(dest.dial_host);
-    Ok((host, port, key))
+    Ok((report, ssh_stderr))
 }
 
-pub fn run(target: &str, remote_cmd: &[String], opts: &SshOptions) -> Result<()> {
-    let (host, port, key) = bootstrap(target, remote_cmd, opts)?;
+/// The FDR 0019 driver: ssh hosted in the interactive establish modal on a
+/// PTY, the user's keystrokes forwarded to it, its output composited onto the
+/// taken-over viewport, the handshake scraped off the stream. Runs until ssh
+/// exits (it does so on its own after `POSH CONNECT`, bounded by
+/// [`SSH_EXIT_GRACE`]), the user's tty closes, or a terminating signal
+/// arrives. Returns the report plus the modal's text (the failure message's
+/// tail). `preface` is shown above ssh's output.
+fn bootstrap_in_modal(
+    t: &mut Takeover,
+    argv: &[String],
+    preface: Option<String>,
+) -> Result<(ServerReport, String)> {
+    t.close_modal();
+    let preface: Vec<String> = preface.into_iter().collect();
+    let mut modal = SshModal::spawn(argv, t.rows, t.cols, &preface)
+        .map_err(|e| Error::Msg(format!("cannot exec ssh: {e}")))?;
+    t.paint_screen(modal.screen());
+    let mut exit_deadline: Option<Instant> = None;
+    let outcome: Result<()> = loop {
+        let mut fds = [
+            util::pollfd(STDIN, libc::POLLIN),
+            util::pollfd(modal.master_fd(), libc::POLLIN),
+        ];
+        match util::poll(&mut fds, 250) {
+            Ok(_) => {}
+            Err(e) if e.kind() == std::io::ErrorKind::Interrupted => {}
+            Err(e) => break Err(e.into()),
+        }
+        if util::take_flag(&util::SIGWINCH_RECEIVED) {
+            let (rows, cols) = crate::pty::term_size(STDOUT);
+            if (rows, cols) != (t.rows, t.cols) {
+                t.resize(rows, cols);
+                modal.resize(rows, cols);
+                t.paint_screen(modal.screen());
+            }
+        }
+        if util::take_flag(&util::SIGTERM_RECEIVED) {
+            modal.interrupt();
+            break Err(Error::Msg(format!("{ABORTED} (signal)")));
+        }
+        if fds[0].revents & libc::POLLIN != 0 {
+            let mut buf = [0u8; 1024];
+            match util::read_fd(STDIN, &mut buf) {
+                Ok(0) => {
+                    modal.interrupt();
+                    break Err(Error::Msg(format!("{ABORTED} (terminal closed)")));
+                }
+                Ok(n) => modal.forward_input(&buf[..n]),
+                Err(e) if e.kind() == std::io::ErrorKind::WouldBlock => {}
+                Err(e) if e.kind() == std::io::ErrorKind::Interrupted => {}
+                Err(e) => {
+                    modal.interrupt();
+                    break Err(e.into());
+                }
+            }
+        }
+        if fds[1].revents & (libc::POLLIN | libc::POLLHUP | libc::POLLERR) != 0 {
+            match modal.pump() {
+                Ok(true) => t.paint_screen(modal.screen()),
+                Ok(false) => {}
+                Err(e) => {
+                    modal.interrupt();
+                    break Err(e);
+                }
+            }
+        }
+        if modal.eof() {
+            break Ok(());
+        }
+        if modal.connected() {
+            let deadline = *exit_deadline.get_or_insert(Instant::now() + SSH_EXIT_GRACE);
+            if Instant::now() >= deadline {
+                break Ok(());
+            }
+        }
+    };
+    let said = modal.screen_text();
+    let report = modal.finish(SSH_EXIT_GRACE);
+    outcome.map(|()| (report, said))
+}
+
+/// The foreground attach: bootstrap, then the roaming client. Under a live
+/// terminal [`Takeover`] (FDR 0019) the ssh runs in the interactive establish
+/// modal and the client inherits the takeover (its progress modal, its alt
+/// screen) instead of taking over itself.
+pub fn run(
+    target: &str,
+    remote_cmd: &[String],
+    opts: &SshOptions,
+    takeover: Option<&mut Takeover>,
+) -> Result<()> {
+    let mut takeover = takeover;
+    let (host, port, key) = bootstrap(target, remote_cmd, opts, takeover.as_deref_mut())?;
     std::env::set_var("POSH_KEY", key);
-    crate::remote::client::run(&host, port, opts.family, opts.agent_source.clone(), opts.channels)
+    let handoff = takeover.map(Takeover::handoff);
+    crate::remote::client::run(
+        &host,
+        port,
+        opts.family,
+        opts.agent_source.clone(),
+        opts.channels,
+        handoff,
+    )
 }
 
 /// #67: create-or-ensure a DETACHED session on the remote host and return,
@@ -804,6 +1029,76 @@ mod tests {
         assert_eq!(plain.notice(), None);
         assert_eq!(SshDest::verbatim("@box").user, None);
         assert_eq!(SshDest::verbatim("u@v@box").user.as_deref(), Some("u@v"));
+    }
+
+    /// The byte-fed scraper (FDR 0019): protocol lines are consumed whole and
+    /// never shown, a prompt with no trailing newline shows at once, a line
+    /// that merely starts like the prefix is released the moment it diverges,
+    /// and splits across reads change nothing.
+    #[test]
+    fn line_scraper_withholds_only_protocol_lines() {
+        let mut s = LineScraper::default();
+        // A prompt without a newline flows through immediately (first byte
+        // disambiguates).
+        assert_eq!(s.feed(b"Are you sure (yes/no)? ").unwrap(), b"Are you sure (yes/no)? ");
+        // Echoed answer + a line that starts like the prefix but is not one:
+        // "Password:" is held for "P" only and released on "a".
+        assert_eq!(s.feed(b"yes\r\nPassword: ").unwrap(), b"yes\r\nPassword: ");
+        // A protocol line, split mid-prefix and mid-line across reads, never
+        // reaches the screen; the report has it.
+        assert_eq!(s.feed(b"\r\nPO").unwrap(), b"\r\n");
+        assert_eq!(s.feed(b"SH IP 192.0.2.7\r\nmotd").unwrap(), b"motd");
+        assert_eq!(s.report().ip.as_deref(), Some("192.0.2.7"));
+        assert_eq!(s.feed(b"\r\nPOSH AGENT_EXPORT\r\n").unwrap(), b"\r\n");
+        assert!(s.report().agent_export);
+        assert_eq!(
+            s.feed(b"POSH CONNECT 60001 AAAAAAAAAAAAAAAAAAAAAA\r\n").unwrap(),
+            b""
+        );
+        assert_eq!(s.report().port, Some(60001));
+        // After CONNECT nothing is scraped — even a POSH-looking line shows.
+        assert_eq!(s.feed(b"POSH later\r\n").unwrap(), b"POSH later\r\n");
+        // An empty line passes as itself.
+        let mut e = LineScraper::default();
+        assert_eq!(e.feed(b"\n\n").unwrap(), b"\n\n");
+        // A malformed protocol line is the bootstrap's error, as on the pipe.
+        let mut bad = LineScraper::default();
+        assert!(bad.feed(b"POSH CONNECT nope nope\n").is_err());
+    }
+
+    #[test]
+    fn ssh_argv_is_ssh_flags_dial_options_target_then_the_command() {
+        let opts = SshOptions {
+            family: Family::Inet,
+            port_range: None,
+            agent_source: None,
+            real_ssh_agent_forward: None,
+            channels: false,
+            connect_timeout_secs: Some(10),
+            agent_export: true,
+        };
+        let dest = SshDest {
+            user: Some("me".into()),
+            typed_host: "flac".into(),
+            dial_host: "100.96.0.8".into(),
+            host_key_alias: Some("flac".into()),
+        };
+        assert_eq!(
+            ssh_argv(&opts, &dest, "posh-server new"),
+            [
+                "ssh",
+                "-4",
+                "-a",
+                "-o",
+                "ConnectTimeout=10",
+                "-o",
+                "HostKeyAlias=flac",
+                "me@100.96.0.8",
+                "--",
+                "posh-server new"
+            ]
+            .map(String::from)
+        );
     }
 
     #[test]

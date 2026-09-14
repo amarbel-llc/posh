@@ -127,22 +127,37 @@ the `eng-*(7)` manpages — read them with `man eng-versioning`,
   any client. Detach/disconnect/roam leave it running; the daemon exits
   (killing its process group, propagating the shell's exit code) only when
   the shell itself exits. `crates/posh/src/session/daemon.rs`.
-- **Connect takes over immediately, showing a palette-style establish modal
-  (#1 → posh#195):** `drive_client` smcups the alt screen IMMEDIATELY (not
-  deferred), then — while establishing — composites the connect progress as a
-  command-palette-STYLE modal (greyed background, centred) onto the empty
-  viewport, dismissed on the first frame. The renderer is still `crap-present`
-  fed ndjson-crap (`rust-crap` writer; CRAP producer→viewport split), but its
-  output is CAPTURED off a PTY representing the modal — like the palette
-  renderer — not drawn to the primary screen. `connect_progress::CrapModal` is
-  the crap-present analog of `palette::Palette`; `pty::spawn_capture` wires
-  stdin=pipe (ndjson) + stdout=PTY. It lives in `ClientState.establish`,
-  composited via `composite_palette` each frame (mutually exclusive with the
-  command palette). First frame → `ok` + teardown + cleared; timeout/abort →
-  `not_ok` + teardown, the reason also the returned Err on stderr after the
-  (unconditional) rmcup. `run`/`run_over_mux` don't smcup. `POSH_CRAP_PRESENT`
-  overrides the binary (flake-wrapped onto PATH); no-tty / not-found degrades to
-  immediate takeover with NO modal (the "Last contact" banner covers it).
+- **A remote attach takes over the terminal FIRST and hosts its whole
+  establishment — the bootstrap ssh included — in a palette-style modal (#1
+  → posh#195 → FDR 0019):** `cmd_ssh_session` / `cmd_ssh` begin a
+  `connect_progress::Takeover` before anything else (raw mode, smcup, a stderr
+  CAPTURE — every `eprintln!` while the alt screen is up lands in an anonymous
+  file and is replayed onto the real stderr after rmcup, so a mux-fallback
+  warning never draws over the modal; dropped at return = rmcup). The
+  takeover spans the mux endpoint ensure (a cold `run_daemon` bootstraps ssh
+  detached — its grandchild now `close_inherited_fds` so it never pins the
+  modal's pipe/PTY), the session open, and, on the fallback, the foreground
+  ssh. Three modals, one visual: `CrapModal` (progress: `crap-present` fed
+  ndjson-crap via `pty::spawn_capture`, stdin=pipe + stdout=PTY, the
+  crap-present analog of `palette::Palette`) before/after the ssh phase;
+  `SshModal` DURING it — `sshwrap::bootstrap_in_modal` runs the bootstrap ssh
+  on a full cooked+echo PTY (`pty::spawn_shell`, its controlling terminal, so
+  a host-key `yes/no`, a password, or a 2FA prompt lands in the modal and is
+  answered by typing; keystrokes forward to its master; Ctrl-C reaches ssh
+  as SIGINT), the `POSH …` handshake scraped off the byte stream by the
+  byte-fed `sshwrap::LineScraper` so the CONNECT line's key never renders;
+  then `Takeover::handoff` gives the client loop a fresh progress modal plus
+  the painter's state (`Handoff` → `ClientState.establish` + `last_drawn`;
+  `drive_client(inherited=true)` neither smcups nor rmcups). All composite via
+  `composite_palette` (mutually exclusive with the command palette). First
+  frame → `ok` + teardown + cleared; timeout/abort → `not_ok` + teardown, the
+  reason also the returned Err. Off-tty `Takeover::begin` is `None` and every
+  path keeps its old shape (`bootstrap_piped`, `drive_client` smcups itself
+  with no modal); `POSH_CRAP_PRESENT` overrides the progress binary. NOT
+  covered yet (FDR 0019 Phase 2): the endpoint's own detached bootstrap — a
+  prompt there has no tty, so ssh fails and the attach falls through to the
+  foreground path, where the modal answers it. Live check: `just
+  debug-verify-establish-modal` (a stub `ssh` prompts inside the modal).
 - **Multi-client sizing is smallest-wins, and the DAEMON owns it:** the
   session daemon sizes the pty to the elementwise MINIMUM across all attached
   clients (`min_client_size`/`apply_client_size`, `session/daemon.rs`; tmux

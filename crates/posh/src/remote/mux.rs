@@ -1184,7 +1184,11 @@ fn establish_wire(dest: &str, family: Family, port_range: Option<String>) -> Res
         "--client-id".to_string(),
         client_id(),
     ];
-    let (host, port, key_b64) = crate::remote::sshwrap::bootstrap(dest, &tail, &opts)?;
+    // Detached (no tty), so never the modal-hosted driver: a prompt here
+    // cannot be answered — ssh fails fast and the foreground attach's own
+    // modal gets to answer it on the fallback path (FDR 0019 Phase 2 is the
+    // interactive endpoint bootstrap).
+    let (host, port, key_b64) = crate::remote::sshwrap::bootstrap(dest, &tail, &opts, None)?;
     let addr = crate::remote::client::resolve(&host, port, family)?;
     let udp_key = crate::remote::crypto::Key::from_base64(key_b64.trim())?;
     Connection::client(addr, &udp_key)
@@ -1218,7 +1222,12 @@ pub fn run_daemon(
 
     // The daemon grandchild. Mirror daemon_main: detach stdio, log to a
     // per-key file beside the socket, record panics, name terminating
-    // signals.
+    // signals. Drop the spawner's other descriptors first (FDR 0019): the
+    // foreground attach holds its terminal takeover — the establish modal's
+    // PTY and ndjson pipe, the stderr capture — across this spawn, and a
+    // daemon pinning that pipe would keep the modal's renderer from ever
+    // seeing EOF (a SIGKILL-after-grace stall on every first frame).
+    util::close_inherited_fds(&[listener.as_raw_fd()]);
     util::redirect_stdio_devnull();
     let _ = util::log_init(&sock.with_extension("log"));
     std::panic::set_hook(Box::new(|info| {

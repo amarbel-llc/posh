@@ -1077,7 +1077,7 @@ fn cmd_client(args: &[String]) -> Result<()> {
     // low-level transport entrypoint); agent forwarding is resolved on the
     // `posh host:session` path. Off here. No bootstrap either, so no channel
     // selection (RFC 0011 §6) — baseline.
-    remote::client::run(host, port, family, None, false)
+    remote::client::run(host, port, family, None, false, None)
 }
 
 /// `posh [user@]host:[group/]session` (RFC 0001 §2): attach to (creating
@@ -1133,6 +1133,18 @@ fn cmd_ssh_session(
         };
         return remote::sshwrap::run_detached(&dest, &inner, &opts);
     }
+    // Take over the terminal NOW (FDR 0019): the alt screen is posh's from
+    // this point, with the establish modal up, across the mux endpoint
+    // ensure (a cold one bootstraps ssh, detached), the session open, and —
+    // on the fallback — the foreground ssh, which the modal then hosts
+    // interactively. `None` off a tty: every path below keeps its
+    // pre-takeover behavior. Dropped at return: rmcup + the captured stderr
+    // replayed (every warning printed meanwhile lands on the primary screen).
+    let mut takeover = remote::connect_progress::Takeover::begin(&picker::target_for(
+        Some(&dest),
+        group,
+        &session,
+    ));
     // M2 session sharing (POSH_MUX_SESSIONS, default ON since 2026-09-03;
     // `=0` opts out): the attach rides the mux daemon's one connection as a
     // session channel — no ssh bootstrap, no per-invocation transport; agent
@@ -1151,16 +1163,24 @@ fn cmd_ssh_session(
                 .and_then(|handle| handle.open_session(&target))
             {
                 Ok(transport) => {
-                    match remote::client::run_over_mux(transport, &dest) {
+                    let handoff = takeover
+                        .as_mut()
+                        .map(remote::connect_progress::Takeover::handoff);
+                    match remote::client::run_over_mux(transport, &dest, handoff) {
                         // The exit status was noted for `run()` to exit with.
                         Ok(_) => return Ok(()),
                         // A close BEFORE any frame arrived (the remote
                         // refused/failed the channel after the local grant)
                         // or no frame within the connect timeout (the daemon
                         // mid-reconnect) — fall through to the per-invocation
-                        // path, like every other establishment failure.
+                        // path, like every other establishment failure. The
+                        // takeover stays; its modal is re-raised for the
+                        // next attempt.
                         Err(e) if mux_establish_failed(&e) => {
                             warn_mux_fallback(&e);
+                            if let Some(t) = takeover.as_mut() {
+                                t.ensure_modal();
+                            }
                         }
                         Err(e) => return Err(e),
                     }
@@ -1200,7 +1220,7 @@ fn cmd_ssh_session(
     // `Tag::Output` fallback (a frames-off/pre-frames daemon) is handled
     // server-side inside the relay, so a relay bootstrap works against either.
     let tail = foreground_server_tail(relay_enabled(), group, &session, command);
-    remote::sshwrap::run(&dest, &tail, &opts)
+    remote::sshwrap::run(&dest, &tail, &opts, takeover.as_mut())
 }
 
 /// The single-model relay is the default bootstrap; `POSH_RELAY=0` forces the
@@ -1544,6 +1564,9 @@ fn cmd_ssh(args: &[String], forward: &remote::agent::ForwardFlag) -> Result<()> 
         target,
         remote_cmd,
     } = parse_ssh_args(args)?;
+    // Take over the terminal first (FDR 0019), as `host:session` does: the
+    // establish modal spans the endpoint ensure and hosts the bootstrap ssh.
+    let mut takeover = remote::connect_progress::Takeover::begin(target);
     // Resolve agent forwarding for the roaming shell.
     // POSH_MUX (default ON since the FDR 0014 promotion; `=0` opts out):
     // with forwarding resolved on, the
@@ -1576,7 +1599,7 @@ fn cmd_ssh(args: &[String], forward: &remote::agent::ForwardFlag) -> Result<()> 
         tail.push("--".into());
         tail.extend_from_slice(remote_cmd);
     }
-    remote::sshwrap::run(target, &tail, &opts)
+    remote::sshwrap::run(target, &tail, &opts, takeover.as_mut())
 }
 
 /// `posh list`'s flag shape: format, watch mode, and the watch interval.

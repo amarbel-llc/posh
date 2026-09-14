@@ -205,15 +205,20 @@ _POSH_NO_TERM_INIT_
 
 _POSH_CRAP_PRESENT_
 	Path to the *crap-present* viewport binary that renders the "establishing
-	connection" progress while an attach connects. The client takes over the
-	alternate screen immediately and shows this progress as a command-palette-
-	style modal overlay: it emits ndjson-crap to *crap-present* over a pipe and
-	captures the binary's rendered output off a PTY, compositing it (greyed
-	background, centred modal) onto the viewport until the first frame arrives,
-	then dismisses it. Defaults to the *crap-present* found beside the running
-	binary or on _PATH_ (the nix package wraps it in); when it is absent, or when
-	stdout is not a terminal, the modal is skipped — the client still takes over
-	immediately, just without the overlay.
+	connection" progress while an attach connects. A remote attach takes over
+	the alternate screen before anything else and shows its whole establishment
+	as a command-palette-style modal overlay (greyed background, centred): this
+	progress before and after the ssh bootstrap — the client emits ndjson-crap
+	to *crap-present* over a pipe and captures the binary's rendered output off
+	a PTY — and, while the bootstrap *ssh* itself runs, that ssh's own terminal:
+	its output and any prompt it raises (a first-connect host-key question, a
+	password, a second factor) appear inside the modal and are answered by
+	typing there; Ctrl-C interrupts it. The modal is dismissed on the first
+	frame. Defaults to the *crap-present* found beside the running binary or on
+	_PATH_ (the nix package wraps it in); when it is absent the progress panels
+	are skipped (the ssh phase still shows). When stdout is not a terminal there
+	is no takeover at all: ssh runs with the inherited standard streams and the
+	client takes over only once connected, as before.
 
 _POSH_DEBUG_LOG_
 	When set to a writable path, the client appends periodic one-line

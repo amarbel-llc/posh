@@ -495,6 +495,70 @@ debug-ph-picker-smoke: build-palette
     cat "$dir/stderr.log" || true
     tmux kill-session -t posh-phpick 2>/dev/null || true
 
+# Verify the FDR 0019 interactive establish modal end to end in an isolated tmux
+# pane, with NO remote: a stub `ssh` first on PATH plays the bootstrap — it
+# answers `ssh -G` (the dial resolver), raises a host-key-style prompt on its
+# tty, waits for the typed answer, then runs the remote command LOCALLY
+# (`posh-server` beside it is a symlink to the worktree posh), so a real
+# roaming server comes up on loopback and the attach proceeds to a live
+# session. Captures the pane at each step — the prompt inside the modal on the
+# taken-over screen, the live session after the answer (the POSH CONNECT line
+# and key must never appear), the restored primary screen after `exit` — then
+# prints the stderr the takeover captured and replayed. Isolated like
+# debug-ph-stack-repro (throwaway POSH_DIR, a dedicated tmux server, the mux
+# endpoint gated off so only the foreground path runs). Best-effort; the
+# hermetic signal is the connect_progress/sshwrap unit tests.
+#
+# verify the interactive establish modal against a stub ssh in a tmux pane
+[group("debug")]
+debug-verify-establish-modal: build-palette
+    #!/usr/bin/env bash
+    set -uo pipefail
+    root="{{ justfile_directory() }}"
+    dir="$root/.tmp/estmodal"
+    sock="$dir/posh"
+    case "$sock" in "$root"/.tmp/*/posh) : ;; *) echo "refusing: POSH_DIR '$sock' not under .tmp"; exit 1 ;; esac
+    rm -rf "$dir"; mkdir -p "$sock" "$dir/bin"; chmod 700 "$dir" "$sock"
+    nix develop --command cargo build -p posh
+    P="$root/target/debug/posh"
+    ln -sfn "$P" "$dir/bin/posh-server"
+    ln -sfn "$P" "$dir/ph"
+    {
+      echo '#!/bin/sh'
+      echo '# stub ssh: `-G -- host` answers the dial resolver; otherwise prompt on the'
+      echo '# tty like a first connect, then run the remote command locally.'
+      echo 'if [ "$1" = "-G" ]; then echo "hostname $3"; exit 0; fi'
+      echo 'for last; do :; done'
+      echo "printf \"The authenticity of host 'stub' can't be established.\\\\n\""
+      echo 'printf "Are you sure you want to continue connecting (yes/no)? "'
+      echo 'read -r answer'
+      echo "echo \"Warning: Permanently added 'stub' (you answered: \$answer).\" >&2"
+      echo 'eval "$last"'
+    } >"$dir/bin/ssh"
+    chmod +x "$dir/bin/ssh"
+    pal="$root/result-posh-palette/bin/posh-palette"
+    crap="$(nix develop --command sh -c 'command -v crap-present' 2>/dev/null || true)"
+    TM=(tmux -L posh-estmodal)
+    "${TM[@]}" kill-server 2>/dev/null || true
+    "${TM[@]}" new-session -d -s s -x 100 -y 30 \
+      "env -u POSH_SESSION -u POSH_KEY PATH='$dir/bin':\"\$PATH\" POSH_DIR='$sock' POSH_GROUP=default \
+        POSH_MUX=0 POSH_MUX_SESSIONS=0 POSH_PALETTE='$pal' POSH_CRAP_PRESENT='$crap' POSH_DEBUG_LOG='$dir/posh.log' \
+        '$dir/ph' 127.0.0.1:dev 2>'$dir/stderr.log'; echo PH_EXITED_\$?; sleep 60"
+    sleep 3
+    cap() { echo "== $1 =="; "${TM[@]}" capture-pane -p -t s 2>/dev/null; echo; }
+    key() { "${TM[@]}" send-keys -t s "$@"; }
+    cap "modal hosting the stub ssh (expect the yes/no question on the taken-over screen)"
+    key -l 'yes'; key Enter; sleep 5
+    cap "after answering yes (expect a live session prompt; never POSH CONNECT or a key)"
+    key -l 'exit'; key Enter; sleep 3
+    cap "after exit (expect the restored primary screen with PH_EXITED_0)"
+    echo "== stderr (replayed after rmcup: expect [client exited]; the stub's Warning went to ITS tty, i.e. the modal) =="
+    cat "$dir/stderr.log" 2>/dev/null || true
+    echo "== posh.log tail =="
+    tail -n 15 "$dir/posh.log" 2>/dev/null || true
+    "${TM[@]}" kill-server 2>/dev/null || true
+    env POSH_DIR="$sock" "$P" kill dev >/dev/null 2>&1 || true
+
 # Provoke the FDR 0016 stacked-switch flow end-to-end in a detached tmux pane, to
 # see whether the two reported symptoms reproduce: (1) after a keep-switch a->b,
 # does b's palette offer "Back to a"? (2) does exiting b auto-pop back to a?
