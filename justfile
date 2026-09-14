@@ -505,13 +505,18 @@ debug-ph-picker-smoke: build-palette
 # taken-over screen, the live session after the answer (the POSH CONNECT line
 # and key must never appear), the restored primary screen after `exit` — then
 # prints the stderr the takeover captured and replayed. Isolated like
-# debug-ph-stack-repro (throwaway POSH_DIR, a dedicated tmux server, the mux
-# endpoint gated off so only the foreground path runs). Best-effort; the
-# hermetic signal is the connect_progress/sshwrap unit tests.
+# debug-ph-stack-repro (throwaway POSH_DIR, a dedicated tmux server). With
+# the default `mux=0` the endpoint is gated off so only the foreground path
+# runs; `mux=1` exercises the posh#198 seeded path instead — the stub's
+# prompt is the ENDPOINT bootstrap's, answered once in the modal, and the
+# session then rides the mux channel with no second prompt and no fallback
+# warning in the replayed stderr (a lingering mux daemon under the throwaway
+# dir exits on its own after its linger). Best-effort; the hermetic signal is
+# the connect_progress/sshwrap unit tests.
 #
 # verify the interactive establish modal against a stub ssh in a tmux pane
 [group("debug")]
-debug-verify-establish-modal: build-palette
+debug-verify-establish-modal mux="0": build-palette
     #!/usr/bin/env bash
     set -uo pipefail
     root="{{ justfile_directory() }}"
@@ -542,7 +547,7 @@ debug-verify-establish-modal: build-palette
     "${TM[@]}" kill-server 2>/dev/null || true
     "${TM[@]}" new-session -d -s s -x 100 -y 30 \
       "env -u POSH_SESSION -u POSH_KEY PATH='$dir/bin':\"\$PATH\" POSH_DIR='$sock' POSH_GROUP=default \
-        POSH_MUX=0 POSH_MUX_SESSIONS=0 POSH_PALETTE='$pal' POSH_CRAP_PRESENT='$crap' POSH_DEBUG_LOG='$dir/posh.log' \
+        POSH_MUX='{{ mux }}' POSH_MUX_SESSIONS='{{ mux }}' POSH_PALETTE='$pal' POSH_CRAP_PRESENT='$crap' POSH_DEBUG_LOG='$dir/posh.log' \
         '$dir/ph' 127.0.0.1:dev 2>'$dir/stderr.log'; echo PH_EXITED_\$?; sleep 60"
     sleep 3
     cap() { echo "== $1 =="; "${TM[@]}" capture-pane -p -t s 2>/dev/null; echo; }

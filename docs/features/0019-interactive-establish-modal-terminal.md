@@ -6,9 +6,9 @@ promotion-criteria: >
   regressions — no lost keystrokes across the ssh→roaming hand-off, no stranded
   alt screen on a failed or interrupted bootstrap, every fallback warning
   readable on the primary screen afterwards — and a real first-connect host-key
-  prompt has been answered inside the modal on a live remote; accepted once the
-  mux-endpoint bootstrap (Phase 2) carries the same modal so a first connect no
-  longer needs the foreground fallback to answer its prompt.
+  prompt has been answered inside the modal on a live remote through the
+  seeded endpoint path (no fallback warning); accepted once that has held for
+  a further week with no lever adjustments.
 ---
 
 # Interactive establish modal terminal (take over first, host ssh in the modal)
@@ -56,10 +56,12 @@ The observable behavior for a remote attach on a terminal:
   The `POSH CONNECT` line, and the session key on it, are never rendered.
 - **No ssh, no interactive phase.** When the attach rides an already-warm mux
   endpoint (the `POSH_MUX_SESSIONS` default — no ssh is run) the modal shows
-  progress only and dismisses on the first frame. A cold endpoint's own
-  bootstrap runs detached, behind the progress modal; if it cannot complete
-  (a prompt it has no tty to answer), the attach falls back to the foreground
-  ssh — now inside the same takeover, where the modal hosts it.
+  progress only and dismisses on the first frame. A COLD endpoint's bootstrap
+  ssh (`posh-server agent`) runs in the modal too (posh#198): its prompt is
+  answered there, once, and the endpoint daemon is seeded with the resulting
+  connection, so a first connect never needs the foreground fallback to
+  answer a prompt. If that bootstrap fails, the attach falls back to the
+  foreground ssh inside the same takeover, exactly as any endpoint failure.
 - **Messages wait for the terminal.** Anything posh would have printed to
   stderr while the alt screen is up (a mux fallback warning, an unacknowledged
   agent-export warning, the client's own exit line) is captured and replayed on
@@ -145,11 +147,17 @@ above the bootstrap. Three pieces, in `remote::connect_progress`:
 The establishment is one takeover across the phases:
 
 1. **Takeover + progress modal** at the top of the attach path.
-2. **Endpoint ensure / session open** (unchanged, behind the modal). A warm
-   endpoint hands the takeover to the client loop directly (`Takeover::handoff`
-   → `Handoff`: the progress modal plus the painter's last frame, so the
-   client's first paint diffs against what the takeover drew). A fallback keeps
-   the takeover and re-raises the progress modal for the next attempt.
+2. **Endpoint ensure / session open.** A cold endpoint (its socket not
+   connectable) first runs the endpoint's bootstrap ssh in the interactive
+   modal (`mux::seed_cold_endpoint`, posh#198) and hands the report to
+   `ensure_mux` as a `SeededEndpoint`; the daemon's FIRST establish connects to
+   that already-bootstrapped remote (the key rides in memory across the double
+   fork), and its reconnects bootstrap detached as before, trust now existing.
+   A warm endpoint runs no ssh. Either way the takeover is handed to the
+   client loop (`Takeover::handoff` → `Handoff`: the progress modal plus the
+   painter's last frame, so the client's first paint diffs against what the
+   takeover drew). A fallback keeps the takeover and re-raises the progress
+   modal for the next attempt.
 3. **Phase A (ssh bootstrap):** `sshwrap::bootstrap_in_modal` retires the
    progress modal, spawns the `SshModal`, and runs an event loop over STDIN and
    the ssh master — forwarding input, pumping output, painting on change,
@@ -175,13 +183,14 @@ EOF `crap-present` waits on) or its PTY.
 
 ## Limitations
 
-- **Phase 1 is the foreground attach.** The per-destination mux endpoint's
-  bootstrap (`run_daemon` → `establish_wire`) is detached, with no tty: a prompt
-  there cannot be answered, the bootstrap fails, and the attach falls through
-  to the foreground path — where the modal answers it. Making the endpoint's
-  first connect interactive (bootstrap in the foreground modal, then hand the
-  connection to the daemon) is Phase 2. The `--detach` remote spawn
-  (`run_detached`) is untouched too.
+- **Only the FIRST connect of an endpoint is interactive.** The daemon's own
+  reconnects (`establish_wire` after a dead-wire verdict) are detached, with
+  no tty; a prompt there — a host key that CHANGED after trust was
+  established — fails the reconnect, and the endpoint keeps retrying until an
+  invocation's foreground ssh answers it. The `--detach` remote spawn
+  (`run_detached`) is untouched too. A seeded bootstrap whose daemon spawn
+  loses the bind race leaves its remote `posh-server agent` to time out on its
+  own.
 - **`BatchMode=yes` paths stay non-interactive** by design (the picker's remote
   kills, endpoint probes). A prompt there still fails fast rather than blocking.
 - **Off-tty has no takeover at all.** With no viewport to type into, the ssh
@@ -190,15 +199,16 @@ EOF `crap-present` waits on) or its PTY.
 - **The modal hosts one subprocess at a time.** ssh runs to `POSH CONNECT` and
   exits before Phase B; posh does not keep an interactive ssh alive underneath
   a live session.
-- **A blocking step freezes the spinner.** The endpoint ensure (a cold one
-  bootstraps ssh, up to its 10 s connect timeout) and the session open block
-  the foreground process, so the progress modal's animation stands still until
-  the client loop starts pumping it; the header is rendered before the step
-  begins so the screen is never empty. A terminating signal during such a step
-  is noted and acted on when the next loop runs.
-- **Keystrokes typed during establishment are not discarded.** In raw mode
-  they queue in the tty: during Phase A they go to ssh (a prompt typed ahead of
-  itself is ssh's to re-ask), afterwards to the session.
+- **A blocking step freezes the spinner (posh#199).** The endpoint's socket
+  connect, spawn, and hello, and the session open, block the foreground
+  process, so the progress modal's animation stands still until the client
+  loop starts pumping it; the header is rendered before the step begins so the
+  screen is never empty. A terminating signal during such a step is noted and
+  acted on when the next loop runs. The long piece — a cold endpoint's ssh —
+  no longer blocks (it runs in the modal, posh#198).
+- **Type-ahead reaches the session, not ssh.** Keys typed before the ssh
+  phase are flushed as it starts (posh#201), so a prompt is never answered by
+  stale input; keys typed after the hand-off are the session's (mosh parity).
 
 ## Tuning Levers
 

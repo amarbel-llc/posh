@@ -139,8 +139,9 @@ the `eng-*(7)` manpages — read them with `man eng-versioning`,
   byte-fed `LineScraper` so the key never renders. `Takeover::handoff` gives
   the client loop the modal + painter state (`drive_client(inherited)` neither
   smcups nor rmcups). Off-tty there is no takeover. A `run_daemon` spawned
-  under the takeover `close_inherited_fds`. Phase 2 (not done): the endpoint's
-  tty-less bootstrap.
+  under the takeover `close_inherited_fds`. A COLD endpoint's bootstrap runs
+  in the modal too (`mux::seed_cold_endpoint` → `SeededEndpoint` for the
+  daemon's first establish, posh#198); only its reconnects stay tty-less.
 - **Multi-client sizing is smallest-wins, and the DAEMON owns it:** the
   session daemon sizes the pty to the elementwise MINIMUM across all attached
   clients (`min_client_size`/`apply_client_size`, `session/daemon.rs`; tmux

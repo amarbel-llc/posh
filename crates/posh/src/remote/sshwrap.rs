@@ -749,6 +749,12 @@ fn bootstrap_in_modal(
     preface: Option<String>,
 ) -> Result<(ServerReport, String)> {
     t.close_modal();
+    // posh#201: keys typed while the takeover sat in a blocking step queued in
+    // the tty; forwarded now they would answer ssh's first prompt before it
+    // is asked. Discard them here only — type-ahead into the SESSION after the
+    // hand-off stays (mosh parity).
+    // SAFETY: tcflush on an integer fd; a non-tty stdin just fails harmlessly.
+    unsafe { libc::tcflush(STDIN, libc::TCIFLUSH) };
     let preface: Vec<String> = preface.into_iter().collect();
     let mut modal = SshModal::spawn(argv, t.rows, t.cols, &preface)
         .map_err(|e| Error::Msg(format!("cannot exec ssh: {e}")))?;

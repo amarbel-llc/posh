@@ -160,11 +160,29 @@ pub fn spawn_shell(
         {
             return Err(std::io::Error::last_os_error().into());
         }
-        let pid = libc::fork();
-        if pid < 0 {
+        // Exec-failure report (posh#200): a close-on-exec pipe the child writes
+        // its errno to if execvp returns. A successful exec closes it, so the
+        // parent's read yields nothing on success and the errno on failure —
+        // the caller gets `cannot exec …` instead of a child that silently
+        // `_exit`s behind an empty PTY.
+        let mut err_pipe: [libc::c_int; 2] = [-1, -1];
+        if libc::pipe(err_pipe.as_mut_ptr()) != 0 {
+            let e = std::io::Error::last_os_error();
             libc::close(master);
             libc::close(slave);
-            return Err(std::io::Error::last_os_error().into());
+            return Err(e.into());
+        }
+        for fd in err_pipe {
+            libc::fcntl(fd, libc::F_SETFD, libc::FD_CLOEXEC);
+        }
+        let pid = libc::fork();
+        if pid < 0 {
+            let e = std::io::Error::last_os_error();
+            libc::close(master);
+            libc::close(slave);
+            libc::close(err_pipe[0]);
+            libc::close(err_pipe[1]);
+            return Err(e.into());
         }
         if pid == 0 {
             // Child: new session, slave PTY becomes the controlling terminal.
@@ -190,9 +208,34 @@ pub fn spawn_shell(
                 libc::putenv(env.as_ptr() as *mut libc::c_char);
             }
             libc::execvp(exec_path.as_ptr(), argv.as_ptr());
-            libc::_exit(1);
+            // exec failed: report errno (an alloc-free read) and leave.
+            let errno: libc::c_int = std::io::Error::last_os_error().raw_os_error().unwrap_or(0);
+            libc::write(
+                err_pipe[1],
+                &errno as *const libc::c_int as *const libc::c_void,
+                std::mem::size_of::<libc::c_int>(),
+            );
+            libc::_exit(127);
         }
         libc::close(slave);
+        libc::close(err_pipe[1]);
+        let mut errno: libc::c_int = 0;
+        let n = libc::read(
+            err_pipe[0],
+            &mut errno as *mut libc::c_int as *mut libc::c_void,
+            std::mem::size_of::<libc::c_int>(),
+        );
+        libc::close(err_pipe[0]);
+        if n == std::mem::size_of::<libc::c_int>() as isize {
+            let mut status: libc::c_int = 0;
+            libc::waitpid(pid, &mut status, 0);
+            libc::close(master);
+            return Err(Error::Msg(format!(
+                "cannot exec {}: {}",
+                exec_path.to_string_lossy(),
+                std::io::Error::from_raw_os_error(errno)
+            )));
+        }
         Ok(PtyChild { master, pid })
     }
 }
@@ -595,6 +638,19 @@ mod tests {
             );
             assert_ne!(t.c_oflag & libc::OPOST, 0, "output processing intact");
         }
+    }
+
+    /// posh#200: a command that cannot be exec'd is the spawn's error, named
+    /// with the OS reason — not a child that `_exit`s behind an empty PTY.
+    #[test]
+    fn spawn_shell_reports_an_exec_failure() {
+        let cmd = vec!["/nonexistent/no-such-binary".to_string()];
+        let err = match spawn_shell(Some(&cmd), 24, 80, &[], None) {
+            Err(e) => e.to_string(),
+            Ok(_) => panic!("a nonexistent command must not spawn"),
+        };
+        assert!(err.starts_with("cannot exec /nonexistent/no-such-binary:"), "{err}");
+        assert!(err.contains("No such file"), "{err}");
     }
 
     /// `spawn_shell(cwd=...)` lands the child in that directory: run `pwd -P`

@@ -1159,7 +1159,15 @@ fn cmd_ssh_session(
         if let Some(source) = resolve_agent_source(forward_flag) {
             let target =
                 group.map_or_else(|| session.clone(), |g| format!("{g}/{session}"));
-            match remote::mux::ensure_mux(&dest, Family::Auto, None, &source)
+            // posh#198: a cold endpoint's bootstrap ssh runs in the takeover's
+            // modal (its prompt answered there, once) and seeds the daemon;
+            // a warm endpoint — or no takeover — seeds nothing.
+            let seeded = match takeover.as_mut() {
+                Some(t) => remote::mux::seed_cold_endpoint(&dest, Family::Auto, None, t),
+                None => Ok(None),
+            };
+            match seeded
+                .and_then(|seed| remote::mux::ensure_mux(&dest, Family::Auto, None, &source, seed))
                 .and_then(|handle| handle.open_session(&target))
             {
                 Ok(transport) => {
@@ -1201,7 +1209,7 @@ fn cmd_ssh_session(
     let (agent_source, mux_ref) = remote::mux::apply_mux_gate(
         remote::mux::mux_selected(),
         resolve_agent_source(forward_flag),
-        |source| remote::mux::ensure_mux(&dest, Family::Auto, None, source),
+        |source| remote::mux::ensure_mux(&dest, Family::Auto, None, source, None),
     );
     let opts = remote::sshwrap::SshOptions {
         family: Family::Auto,
@@ -1577,7 +1585,7 @@ fn cmd_ssh(args: &[String], forward: &remote::agent::ForwardFlag) -> Result<()> 
     let (agent_source, mux_ref) = remote::mux::apply_mux_gate(
         remote::mux::mux_selected(),
         resolve_agent_source(forward),
-        |source| remote::mux::ensure_mux(target, family, port_range.as_deref(), source),
+        |source| remote::mux::ensure_mux(target, family, port_range.as_deref(), source, None),
     );
     // posh#161: the endpoint owning forwarding ⇒ the session still gets
     // agent/sock and the bootstrap ssh runs -a (see `SshOptions::agent_export`).

@@ -1179,19 +1179,66 @@ fn mux_ssh_options(
 /// bounded by the ssh [`MUX_BOOTSTRAP_CONNECT_TIMEOUT_SECS`].
 fn establish_wire(dest: &str, family: Family, port_range: Option<String>) -> Result<Connection> {
     let opts = mux_ssh_options(family, port_range);
-    let tail = vec![
-        "agent".to_string(),
-        "--client-id".to_string(),
-        client_id(),
-    ];
     // Detached (no tty), so never the modal-hosted driver: a prompt here
-    // cannot be answered — ssh fails fast and the foreground attach's own
-    // modal gets to answer it on the fallback path (FDR 0019 Phase 2 is the
-    // interactive endpoint bootstrap).
-    let (host, port, key_b64) = crate::remote::sshwrap::bootstrap(dest, &tail, &opts, None)?;
-    let addr = crate::remote::client::resolve(&host, port, family)?;
+    // cannot be answered. The cold first connect under a live takeover runs
+    // this same bootstrap in the foreground modal instead and seeds the
+    // daemon ([`seed_cold_endpoint`], posh#198); a reconnect has trust
+    // already and runs here.
+    let (host, port, key_b64) =
+        crate::remote::sshwrap::bootstrap(dest, &agent_tail(), &opts, None)?;
+    wire_from_report(&host, port, &key_b64, family)
+}
+
+/// The endpoint's bootstrap tail: `posh-server agent --client-id <id>`.
+fn agent_tail() -> Vec<String> {
+    vec!["agent".to_string(), "--client-id".to_string(), client_id()]
+}
+
+/// The tail of a wire establish: the bootstrap's `(host, port, key)` report →
+/// address resolve → key decode → connected UDP socket.
+fn wire_from_report(host: &str, port: u16, key_b64: &str, family: Family) -> Result<Connection> {
+    let addr = crate::remote::client::resolve(host, port, family)?;
     let udp_key = crate::remote::crypto::Key::from_base64(key_b64.trim())?;
     Connection::client(addr, &udp_key)
+}
+
+/// A bootstrap the foreground attach already ran for the endpoint (FDR 0019
+/// Phase 2, posh#198): the remote `posh-server agent` is up and waiting for
+/// its first datagram, and the daemon's FIRST establish uses this report
+/// instead of bootstrapping itself. The key rides in memory across the
+/// double fork, never on argv or the environment.
+pub struct SeededEndpoint {
+    host: String,
+    port: u16,
+    key: String,
+}
+
+/// The cold first connect under a live terminal takeover (posh#198): when
+/// the endpoint socket for `dest` is not connectable, run the endpoint's
+/// bootstrap ssh in the takeover's interactive modal — so a first-connect
+/// host-key / password / 2FA prompt is answered ONCE, there — and return the
+/// report for [`ensure_mux`] to seed the daemon with. `None` when the socket
+/// is connectable (a warm endpoint: no ssh runs, nothing changes). A
+/// bootstrap failure is the ensure's failure, so the front door's fallback
+/// applies exactly as to a detached bootstrap that failed.
+pub fn seed_cold_endpoint(
+    dest: &str,
+    family: Family,
+    port_range: Option<&str>,
+    takeover: &mut crate::remote::connect_progress::Takeover,
+) -> Result<Option<SeededEndpoint>> {
+    let (user, host) = split_dest(dest);
+    let key = dest_key(user, host, family, port_range);
+    if UnixStream::connect(mux_socket_path(&key)?).is_ok() {
+        return Ok(None);
+    }
+    let opts = mux_ssh_options(family, port_range.map(str::to_string));
+    let (host, port, key) =
+        crate::remote::sshwrap::bootstrap(dest, &agent_tail(), &opts, Some(takeover))?;
+    // The ssh phase retired the progress modal; the spawn + hello that follow
+    // run behind a fresh one.
+    takeover.ensure_modal();
+    Ok(Some(SeededEndpoint { host, port, key }))
 }
 
 /// Returns in the SPAWNER only; the daemon grandchild exits the process.
@@ -1201,6 +1248,7 @@ pub fn run_daemon(
     family: Family,
     port_range: Option<String>,
     agent_source: PathBuf,
+    seed: Option<SeededEndpoint>,
 ) -> Result<MuxSpawn> {
     let sock = mux_socket_path(key)?;
     let listener = match bind_or_probe(&sock)? {
@@ -1241,7 +1289,12 @@ pub fn run_daemon(
     util::install_sigusr2_handler();
 
     let result = (|| -> Result<()> {
-        let conn = establish_wire(dest, family, port_range.clone())?;
+        // posh#198: a seeded first establish connects to the remote the
+        // foreground modal already bootstrapped; reconnects bootstrap here.
+        let conn = match seed {
+            Some(s) => wire_from_report(&s.host, s.port, &s.key, family)?,
+            None => establish_wire(dest, family, port_range.clone())?,
+        };
         let peer = conn
             .remote()
             .map_or_else(|| "unknown".to_string(), |a| a.to_string());
@@ -2290,16 +2343,21 @@ fn variant_key(key: &str) -> String {
 /// held for the invocation's lifetime; dropping it is the unref.
 ///
 /// `agent_source` is the invocation's FDR 0004-resolved local agent socket,
-/// inherited by a daemon this call spawns (design doc "Security").
+/// inherited by a daemon this call spawns (design doc "Security"). `seed`
+/// (posh#198, from [`seed_cold_endpoint`]) is consumed by the first daemon
+/// this call spawns, if any; a spawn that loses the bind race leaves the
+/// seeded remote to time out on its own.
 pub fn ensure_mux(
     dest: &str,
     family: Family,
     port_range: Option<&str>,
     agent_source: &Path,
+    seed: Option<SeededEndpoint>,
 ) -> Result<MuxHandle> {
     let (user, host) = split_dest(dest);
     let key = dest_key(user, host, family, port_range);
     let dir = mux_dir()?;
+    let mut seed = seed;
     let mut spawn = |k: &str| {
         run_daemon(
             k,
@@ -2307,6 +2365,7 @@ pub fn ensure_mux(
             family,
             port_range.map(str::to_string),
             agent_source.to_path_buf(),
+            seed.take(),
         )
     };
     let handle = ensure_mux_conn(&dir, &key, &mut spawn, HELLO_TIMEOUT, agent_source)?;
