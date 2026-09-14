@@ -251,11 +251,12 @@ fn run_once() -> Result<()> {
             // `--unless-attached` (FDR 0016): keep a session other viewports
             // are attached to — the switcher's non-forced cleanup.
             let unless_attached = args.iter().any(|a| a == "--unless-attached");
-            let name = args
-                .iter()
-                .find(|a| !a.starts_with("--"))
-                .ok_or_else(|| Error::from("kill requires a session name"))?;
-            session::cmd_kill(&Config::new(&group)?, name, unless_attached)
+            let names: Vec<&str> =
+                args.iter().filter(|a| !a.starts_with("--")).map(String::as_str).collect();
+            if names.is_empty() {
+                return Err(Error::from("kill requires a session name"));
+            }
+            session::cmd_kill(&Config::new(&group)?, &names, unless_attached)
         }
         "detach" | "d" => {
             session::cmd_detach(&Config::new(&group)?, args.first().map(|s| s.as_str()))
@@ -1836,8 +1837,10 @@ SESSION COMMANDS (local persistence)
         name, the enclosing session ($POSH_SESSION) — the in-session answer
         to: which echo mode am I being viewed through? (RFC 0014)
 
-    kill [--unless-attached] <name>            (alias: k)
-        Kill a session, its shell, and all attached clients. With
+    kill [--unless-attached] <name>...         (alias: k)
+        Kill a session, its shell, and all attached clients. Accepts
+        several names, killing each in turn (best-effort: a missing or
+        unresponsive one is reported after the rest are tried). With
         --unless-attached a session that still has attached clients is
         kept (prints `kept session NAME: N client(s) attached`) — the
         switcher's non-forced cleanup (FDR 0016).

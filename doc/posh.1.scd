@@ -249,10 +249,12 @@ Local persistence over Unix sockets.
 	client that reported nothing renders _echo=unknown_, distinct from
 	_echo=none_ (a client that reported it has no predictor).
 
-*kill* [*--unless-attached*] _name_ (alias: *k*)
-	Kill a session, its shell, and all attached clients. With
-	*--unless-attached* a session that still has attached clients is kept
-	and reported (_kept session NAME: N client(s) attached_) — the
+*kill* [*--unless-attached*] _name_... (alias: *k*)
+	Kill a session, its shell, and all attached clients. Accepts several
+	names, killing each in turn — best-effort, so a missing or unresponsive
+	session is reported after the rest have been tried rather than sparing
+	them. With *--unless-attached* a session that still has attached clients
+	is kept and reported (_kept session NAME: N client(s) attached_) — the
 	non-forced cleanup the session switcher (FDR 0016) runs on the
 	session a viewport is leaving; its forced form is a plain *kill*.
 

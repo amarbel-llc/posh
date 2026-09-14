@@ -757,17 +757,30 @@ pub fn kill_session(cfg: &Config, name: &str, unless_attached: bool) -> Result<K
     }
 }
 
-/// `posh kill [--unless-attached] <name>`. The wording is what the FDR 0016
-/// remote kill parses back over ssh — keep it byte-for-byte.
-pub fn cmd_kill(cfg: &Config, name: &str, unless_attached: bool) -> Result<()> {
-    match kill_session(cfg, name, unless_attached)? {
-        KillOutcome::Killed => println!("killed session {name}"),
-        KillOutcome::CleanedStale => println!("cleaned up stale session {name}"),
-        KillOutcome::Kept { clients } => {
-            println!("kept session {name}: {clients} client(s) attached")
+/// `posh kill [--unless-attached] <name>...`. Kills each named session in
+/// turn, best-effort: a failure on one name is collected and reported after
+/// every name has been tried, so one missing or unresponsive session never
+/// spares the rest. A single failed name returns its error verbatim (no
+/// success line printed), so the per-session wording the FDR 0016 remote kill
+/// parses back over ssh — which only ever passes ONE session — stays
+/// byte-for-byte.
+pub fn cmd_kill(cfg: &Config, names: &[&str], unless_attached: bool) -> Result<()> {
+    let mut errors = Vec::new();
+    for name in names {
+        match kill_session(cfg, name, unless_attached) {
+            Ok(KillOutcome::Killed) => println!("killed session {name}"),
+            Ok(KillOutcome::CleanedStale) => println!("cleaned up stale session {name}"),
+            Ok(KillOutcome::Kept { clients }) => {
+                println!("kept session {name}: {clients} client(s) attached")
+            }
+            Err(e) => errors.push(e.to_string()),
         }
     }
-    Ok(())
+    if errors.is_empty() {
+        Ok(())
+    } else {
+        Err(Error::Msg(errors.join("; ")))
+    }
 }
 
 /// Detaches all clients from a named session (or, with None, the session
