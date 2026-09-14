@@ -990,8 +990,12 @@ fn dispatch_palette_action(
                     match ViewportRecorder::start(path.clone(), st.rows, st.cols) {
                         Some(rec) => {
                             st.record = Some(rec);
-                            st.notify
-                                .set_message(&format!("recording: on ({})", path.display()), false, now);
+                            // Present the path in the copyable, dismissable
+                            // About-style dialog (#99 `show_dialog` + OSC 52
+                            // *Copy*), not a fleeting banner that scrolls past
+                            // before it can be read or copied. The body is the
+                            // BARE path so *Copy* yields exactly it.
+                            show_debug_info(st, "recording started", &path.display().to_string(), now);
                         }
                         None => st.notify.set_message(
                             &format!("recording: could not open {}", path.display()),
@@ -1003,8 +1007,7 @@ fn dispatch_palette_action(
             } else if let Some(rec) = st.record.take() {
                 let path = rec.path.clone();
                 drop(rec); // Drop finalizes the .castx (flush held UTF-8 + writer)
-                st.notify
-                    .set_message(&format!("recording saved: {}", path.display()), false, now);
+                show_debug_info(st, "recording saved", &path.display().to_string(), now);
             }
             false
         }

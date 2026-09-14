@@ -29,8 +29,10 @@ demand, from inside any session it is already in.
 - **Output:** a poshterity `.castx` (RFC 0003 — asciinema `.cast` v2 superset)
   under the diagnostic-sink directory (`$POSH_DIR` / the socket dir, the same
   scheme as the debug log and the SIGUSR2 dump), named
-  `posh-record-<pid>-<unixtime>.castx`. The palette prints the full path on start
-  and on stop.
+  `posh-record-<pid>-<unixtime>.castx`. On start and stop the path is presented
+  in a copyable, dismissable dialog — the same panel as *About / transport
+  info* (`show_debug_info` → `show_dialog`), whose *Copy* puts the path on the
+  clipboard via OSC 52 — rather than a fleeting banner.
 - **Captured:** the client VIEWPORT — the composed tty output (`o` events, the
   predictions and their walk-back included), the user's raw keystrokes (`i`
   events), and terminal resizes (`r` events). The header carries the emulator

@@ -99,9 +99,11 @@ standing.
 	*Start recording* (FDR 0018) tees the client viewport — its output, your
 	keystrokes, and resizes — to a poshterity _.castx_ under the diagnostic-sink
 	directory (_POSH_DIR_ / the socket dir), replayable with *poshterity step* /
-	*replay*; the palette prints the path on start and on stop. It captures
-	keystrokes and the screen VERBATIM, so anything secret typed while recording
-	is written to the file — record deliberately, and *Stop recording* when done.
+	*replay*; on start and stop it presents the path in a copyable, dismissable
+	dialog (the same panel as *About / transport info*, whose *Copy* puts the
+	path on the clipboard via OSC 52). It captures keystrokes and the screen
+	VERBATIM, so anything secret typed while recording is written to the file —
+	record deliberately, and *Stop recording* when done.
 
 # ENVIRONMENT
 
