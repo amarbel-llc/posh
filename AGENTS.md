@@ -140,7 +140,7 @@ the `eng-*(7)` manpages — read them with `man eng-versioning`,
   the client loop the modal + painter state (`drive_client(inherited)` neither
   smcups nor rmcups). Off-tty there is no takeover. A `run_daemon` spawned
   under the takeover `close_inherited_fds`. Phase 2 (not done): the endpoint's
-  tty-less bootstrap. Live check: `just debug-verify-establish-modal`.
+  tty-less bootstrap.
 - **Multi-client sizing is smallest-wins, and the DAEMON owns it:** the
   session daemon sizes the pty to the elementwise MINIMUM across all attached
   clients (`min_client_size`/`apply_client_size`, `session/daemon.rs`; tmux
@@ -188,8 +188,7 @@ the `eng-*(7)` manpages — read them with `man eng-versioning`,
   bootstrap ssh under endpoint ownership runs with the real `-a` (derived in
   `sshwrap::ssh_args` from the export, unless the flag was explicit) — an
   sshd-forwarded socket in the session env is a connection-bound competitor
-  the host's login rendezvous latches onto. Triage "which agent does this
-  shell actually reach" with `just debug-posh-agent-resolve [pid|path]`.
+  the host's login rendezvous latches onto.
   Any endpoint failure (old remote without the `agent` verb included) falls
   back to per-connection forwarding with a one-line warning. The FDR 0004
   symlink election code PERSISTS for the opt-out, mixed versions, and the
@@ -320,9 +319,6 @@ the `eng-*(7)` manpages — read them with `man eng-versioning`,
   (`session::activity::PROBE_INTERVAL_MS`).
   An older renderer answers
   `-32602` → `PaletteEvent::ViewRejected` → the non-TUI candidate list.
-  Dev-loop: `just debug-palette-e2e` (round-trips against a fresh renderer
-  build), `just debug-ph-picker-smoke` (draws the real picker in a detached
-  tmux pane).
   Its heading carries the live `rtt` and the echo model in effect
   (`palette_title`, kept under the renderer's ~42 content columns).
   **Default echo model is `always`** (unset env): paints every keystroke and
@@ -367,8 +363,7 @@ the `eng-*(7)` manpages — read them with `man eng-versioning`,
   write µs) when a predicted cell reached the tty, else `unpainted`
   (`Stats::record_paint*`, `PaintLatency`). Read it as `time-to-paint:` in
   the echo stats dialog, `paint(...)` in the SIGUSR2 dump, `paint_us=` in
-  the `[stats]` line; `just debug-perf-echo` is the offline per-model probe
-  (`never` = the compose+diff floor every model pays).
+  the `[stats]` line (`never` = the compose+diff floor every model pays).
 - **A lossy client keeps its recent diff bases (posh#189, `POSH_BASE_HISTORY`,
   default on):** the session daemon anchors every unacked frame for a lossy
   (relay / mux-bridge) client at the last frame it saw ACKED and emits one
