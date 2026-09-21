@@ -13,6 +13,8 @@ use std::os::unix::net::UnixStream;
 use std::path::{Path, PathBuf};
 use std::time::Duration;
 
+use posh_proto::caps::SessionKind;
+
 use crate::util::{self, Error, Result};
 use ipc::{SessionInfo, Tag};
 
@@ -192,14 +194,16 @@ pub fn cmd_status(cfg: &Config, name: Option<&str>) -> Result<()> {
 /// not) and return a fresh client connection to its socket. Factored from the
 /// ensure-then-connect that `client::cmd_attach` did inline (github: RFC 0008
 /// §3) so the local attach client and the frame relay (`remote::relay`) share
-/// one connect path. `command` seeds a freshly created session's shell and is
-/// ignored when the session already exists.
+/// one connect path. `command` seeds a freshly created session's shell and
+/// `kind` states what the created session is; both are ignored when the
+/// session already exists.
 pub(crate) fn connect_or_create(
     cfg: &Config,
     name: &str,
     command: Option<Vec<String>>,
+    kind: SessionKind,
 ) -> Result<UnixStream> {
-    daemon::ensure_session(cfg, name, command)?;
+    daemon::ensure_session(cfg, name, command, kind)?;
     let path = cfg.socket_path(name)?;
     UnixStream::connect(&path).map_err(|e| Error::Msg(format!("connect {}: {e}", path.display())))
 }
@@ -840,7 +844,7 @@ pub fn cmd_detach_all(cfg: &Config) -> Result<()> {
 /// Runs a command inside a session (creating it if needed) without attaching:
 /// the command text is written to the session PTY as if typed.
 pub fn cmd_run(cfg: &Config, name: &str, args: &[String]) -> Result<()> {
-    let created = daemon::ensure_session(cfg, name, None)?;
+    let created = daemon::ensure_session(cfg, name, None, SessionKind::Named)?;
     if created {
         println!("session \"{name}\" created");
     }
@@ -919,7 +923,7 @@ pub fn cmd_fork(cfg: &Config, target: Option<&str>) -> Result<()> {
         }
     }
 
-    let created = daemon::ensure_session(cfg, &target_name, command)?;
+    let created = daemon::ensure_session(cfg, &target_name, command, SessionKind::Named)?;
     if created {
         println!("forked session \"{source}\" into \"{target_name}\"");
     }

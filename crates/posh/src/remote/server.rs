@@ -252,7 +252,7 @@ fn connect_named_daemon(target: &str) -> Result<std::os::unix::net::UnixStream> 
         return Err(crate::util::Error::from("mux open: empty session name"));
     }
     let cfg = crate::session::Config::new(group)?;
-    let stream = crate::session::connect_or_create(&cfg, name, None)?;
+    let stream = crate::session::connect_or_create(&cfg, name, None, caps::SessionKind::Named)?;
     stream.set_nonblocking(true)?;
     Ok(stream)
 }

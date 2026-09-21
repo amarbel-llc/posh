@@ -452,7 +452,7 @@ pub(crate) fn run(
     //    re-assert, since a strict daemon drops a non-4-byte Init's size).
     //    `command` is cloned in so a legacy fallback (below) can rebuild the
     //    inner `posh attach` argv.
-    let stream = session::connect_or_create(cfg, name, command.clone())?;
+    let stream = session::connect_or_create(cfg, name, command.clone(), caps::SessionKind::Named)?;
     stream.set_nonblocking(true)?;
     let mut link = DaemonLink {
         stream,
@@ -736,7 +736,7 @@ fn wait_for_handshake(conn: &mut Connection, enveloped: bool) -> Result<(u16, u1
 /// `$SHELL`, as the endpoint's `connect_named_daemon` does).
 fn switch_connector(group: &str, session: &str) -> Result<UnixStream> {
     let cfg = Config::new(group)?;
-    session::connect_or_create(&cfg, session, None)
+    session::connect_or_create(&cfg, session, None, caps::SessionKind::Named)
 }
 
 /// The relay poll loop (a substituted `server_loop`: the daemon socket fd

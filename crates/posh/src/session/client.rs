@@ -5,6 +5,7 @@ use std::io::Write;
 use std::os::fd::AsRawFd;
 use std::os::unix::net::UnixStream;
 
+use posh_proto::caps::SessionKind;
 use posh_term::Terminal;
 use serde_json::{json, Value};
 
@@ -75,7 +76,7 @@ fn restore_seq(bracket: &Option<(Vec<u8>, Vec<u8>)>) -> Vec<u8> {
 /// `posh start --detach`. The "created" / "already exists" wording is asserted
 /// by the integration suite — keep it byte-for-byte.
 fn ensure_detached(cfg: &Config, name: &str, command: Option<Vec<String>>) -> Result<()> {
-    let created = daemon::ensure_session(cfg, name, command)?;
+    let created = daemon::ensure_session(cfg, name, command, SessionKind::Named)?;
     if created {
         println!("session \"{name}\" created");
     } else {
@@ -180,7 +181,7 @@ pub fn cmd_attach(
     // (remote::relay) uses connect_or_create directly, so remote host:session
     // stays create-or-attach.
     let stream = if create_flag {
-        crate::session::connect_or_create(cfg, name, command)?
+        crate::session::connect_or_create(cfg, name, command, SessionKind::Named)?
     } else {
         crate::session::attach_existing(cfg, name)?
     };
@@ -240,10 +241,10 @@ fn switch_in_place(
             }
         }
         SwitchCreate::Ensure(command) => {
-            daemon::ensure_session(target_cfg, target, command)?;
+            daemon::ensure_session(target_cfg, target, command, SessionKind::Named)?;
         }
         SwitchCreate::Strict(command) => {
-            if !daemon::ensure_session(target_cfg, target, command)? {
+            if !daemon::ensure_session(target_cfg, target, command, SessionKind::Named)? {
                 return Err(Error::Msg(format!(
                     "session \"{target}\" already exists (use `posh attach {target}`)"
                 )));
@@ -283,7 +284,7 @@ pub fn cmd_start_local(
 
     // Strict create: `ensure_session` returns false when the session is already
     // live, which for `start` is an error (unlike attach's create-or-attach).
-    let created = daemon::ensure_session(cfg, name, command)?;
+    let created = daemon::ensure_session(cfg, name, command, SessionKind::Named)?;
     if !created {
         return Err(Error::Msg(format!(
             "session \"{name}\" already exists (use `posh attach {name}`)"

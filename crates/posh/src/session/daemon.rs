@@ -64,7 +64,15 @@ const MAX_CLIENT_BACKLOG: usize = 16 * 1024 * 1024;
 /// Ensures the session exists, forking off a daemon when needed. Returns
 /// true when a new session was created. The daemon is a double-forked
 /// grandchild that never returns from this function (it exits the process).
-pub fn ensure_session(cfg: &Config, name: &str, command: Option<Vec<String>>) -> Result<bool> {
+/// `kind` is what the creator states the session IS (design 2026-09-21 §1);
+/// a freshly created daemon stores it for life and reports it in `Tag::Info`.
+/// Like `command`, it is ignored when the session already exists.
+pub fn ensure_session(
+    cfg: &Config,
+    name: &str,
+    command: Option<Vec<String>>,
+    kind: SessionKind,
+) -> Result<bool> {
     let path = cfg.socket_path(name)?;
     if session::session_socket_exists(&path) {
         match session::probe_session(&path) {
@@ -102,7 +110,7 @@ pub fn ensure_session(cfg: &Config, name: &str, command: Option<Vec<String>>) ->
         std::thread::sleep(std::time::Duration::from_millis(10));
         return Ok(true);
     }
-    daemon_main(cfg, name, listener, command);
+    daemon_main(cfg, name, listener, command, kind);
 }
 
 struct ClientConn {
@@ -918,6 +926,7 @@ fn daemon_main(
     name: &str,
     listener: UnixListener,
     command: Option<Vec<String>>,
+    kind: SessionKind,
 ) -> ! {
     util::redirect_stdio_devnull();
     let _ = util::log_init(&cfg.log_path(name));
@@ -955,7 +964,11 @@ fn daemon_main(
     };
     util::log_write(
         "info",
-        &format!("daemon started session={name} pid={}", child.pid),
+        &format!(
+            "daemon started session={name} kind={} pid={}",
+            kind.as_str(),
+            child.pid
+        ),
     );
 
     let _ = listener.set_nonblocking(true);
@@ -1000,6 +1013,7 @@ fn daemon_main(
         &mut clients,
         &info_cmd,
         &cwd,
+        kind,
         recorder,
     );
     // The status socket is introspection, not a rendezvous: always removed.
@@ -1091,6 +1105,7 @@ fn daemon_loop(
     clients: &mut Vec<ClientConn>,
     info_cmd: &str,
     cwd: &str,
+    kind: SessionKind,
     mut recorder: Option<SessionRecorder>,
 ) -> caps::SessionEnd {
     let listener_fd = listener.as_raw_fd();
@@ -1549,7 +1564,7 @@ fn daemon_loop(
                                         cmd: info_cmd.to_string(),
                                         cwd: cwd.to_string(),
                                         activity,
-                                        kind: SessionKind::Unknown,
+                                        kind,
                                     };
                                     c.queue(Tag::Info, &info.encode());
                                 }
@@ -1900,6 +1915,105 @@ mod tests {
         }
         assert_eq!(lines.next().unwrap(), "client build=unknown echo=unknown");
         assert!(lines.next().is_none());
+    }
+
+    // ---- An in-process session daemon (design 2026-09-21 §1) ----
+
+    /// A private, SHORT-path base dir (the `mux.rs` / `agent.rs` `temp_base`
+    /// pattern: the scratch `$TMPDIR` is too deep for sun_path).
+    fn temp_base() -> std::path::PathBuf {
+        use std::os::unix::fs::DirBuilderExt;
+        use std::sync::atomic::{AtomicU32, Ordering};
+        static COUNTER: AtomicU32 = AtomicU32::new(0);
+        let n = COUNTER.fetch_add(1, Ordering::Relaxed);
+        let base = std::path::PathBuf::from(format!("/tmp/posh-daemon-{}-{n}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&base);
+        std::fs::DirBuilder::new()
+            .recursive(true)
+            .mode(0o700)
+            .create(&base)
+            .unwrap();
+        base
+    }
+
+    /// The PRODUCTION [`daemon_loop`] running on a thread over a bound
+    /// session socket and a real PTY child — no double-fork, no stdio
+    /// redirect, no process exit — so a test talks to it through the socket
+    /// exactly as a client does. `shutdown` ends it the way `posh kill` does.
+    struct TestDaemon {
+        socket: std::path::PathBuf,
+        child_pid: libc::pid_t,
+        master: RawFd,
+        thread: Option<std::thread::JoinHandle<caps::SessionEnd>>,
+    }
+
+    impl TestDaemon {
+        /// `Tag::Kill` the loop, join it, then reap the PTY child (the test's
+        /// stand-in for `daemon_main`'s teardown).
+        fn shutdown(mut self) -> caps::SessionEnd {
+            let stream = UnixStream::connect(&self.socket).unwrap();
+            ipc::send(stream.as_raw_fd(), Tag::Kill, b"").unwrap();
+            let end = self.thread.take().unwrap().join().unwrap();
+            util::kill_pgroup(self.child_pid, libc::SIGKILL);
+            util::reap(self.child_pid);
+            util::close_fd(self.master);
+            end
+        }
+    }
+
+    /// Binds `cfg`'s socket for `name` and runs [`daemon_loop`] on a thread
+    /// with `command` (default: a 30 s `sleep`, a quiet child) and `kind`.
+    fn spawn_test_daemon(
+        cfg: &Config,
+        name: &str,
+        command: Option<Vec<String>>,
+        kind: SessionKind,
+    ) -> TestDaemon {
+        let socket = cfg.socket_path(name).unwrap();
+        let listener = UnixListener::bind(&socket).unwrap();
+        listener.set_nonblocking(true).unwrap();
+        let command = command.unwrap_or_else(|| vec!["sleep".into(), "30".into()]);
+        let child = pty::spawn_shell(Some(&command), 24, 80, &[], None).unwrap();
+        util::set_nonblocking(child.master).unwrap();
+        let (child_pid, master) = (child.pid, child.master);
+        let (name, group) = (name.to_string(), cfg.group.clone());
+        let thread = std::thread::spawn(move || {
+            let mut term = Terminal::with_scrollback(24, 80, SCROLLBACK);
+            let mut clients = Vec::new();
+            daemon_loop(
+                &listener,
+                None,
+                &name,
+                &group,
+                &child,
+                &mut term,
+                &mut clients,
+                &command.join("\0"),
+                "",
+                kind,
+                None,
+            )
+        });
+        TestDaemon {
+            socket,
+            child_pid,
+            master,
+            thread: Some(thread),
+        }
+    }
+
+    #[test]
+    fn info_reports_the_kind_the_session_was_created_with() {
+        let dir = temp_base();
+        let cfg = Config {
+            socket_dir: dir.clone(),
+            group: "default".into(),
+        };
+        let handle = spawn_test_daemon(&cfg, "k1", None, SessionKind::Anonymous);
+        let probe = crate::session::probe_session(&cfg.socket_path("k1").unwrap()).unwrap();
+        assert_eq!(probe.info.kind, SessionKind::Anonymous);
+        assert_eq!(handle.shutdown(), caps::SessionEnd::Killed);
+        let _ = std::fs::remove_dir_all(&dir);
     }
 
     fn new_term() -> Terminal {
