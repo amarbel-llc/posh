@@ -315,6 +315,67 @@ impl SessionActivity {
     }
 }
 
+/// What a session IS, as its creator stated at create time and the daemon
+/// stores for the session's life (design: docs/plans/2026-09-21-session-
+/// stack-ux-design.md §1). `Anonymous` is a `:+` / picker create-new
+/// auto-id session; `Named` is one the user named (the default for every
+/// caller that says nothing); `System` is reserved for a daemon-owned
+/// session hosting a tool instead of a shell (nothing creates one yet).
+/// `Unknown` is the reading of a daemon that predates the field. A
+/// session never changes kind; naming is never consulted.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum SessionKind {
+    #[default]
+    Unknown,
+    Anonymous,
+    Named,
+    System,
+}
+
+impl SessionKind {
+    /// The one-byte wire form (`0` unknown, `1` anonymous, `2` named,
+    /// `3` system): the IPC `SessionInfo` tail and the on-frame activity
+    /// entry both carry it.
+    pub fn to_byte(self) -> u8 {
+        match self {
+            SessionKind::Unknown => 0,
+            SessionKind::Anonymous => 1,
+            SessionKind::Named => 2,
+            SessionKind::System => 3,
+        }
+    }
+
+    /// Any byte outside the known set reads `Unknown` (a newer origin).
+    pub fn from_byte(b: u8) -> SessionKind {
+        match b {
+            1 => SessionKind::Anonymous,
+            2 => SessionKind::Named,
+            3 => SessionKind::System,
+            _ => SessionKind::Unknown,
+        }
+    }
+
+    /// The CLI (`--kind`) and JSON (`"kind"`) spelling.
+    pub fn as_str(self) -> &'static str {
+        match self {
+            SessionKind::Unknown => "unknown",
+            SessionKind::Anonymous => "anonymous",
+            SessionKind::Named => "named",
+            SessionKind::System => "system",
+        }
+    }
+
+    /// Parse a `--kind` value. Only the CREATABLE kinds parse: `system` is
+    /// reserved and `unknown` is never stated.
+    pub fn parse(s: &str) -> Option<SessionKind> {
+        match s {
+            "anonymous" => Some(SessionKind::Anonymous),
+            "named" => Some(SessionKind::Named),
+            _ => None,
+        }
+    }
+}
+
 /// Format version of the [`SessionActivity`] payload (§5.1).
 const SESSION_ACTIVITY_FMT: u8 = 1;
 
@@ -1224,5 +1285,27 @@ mod tests {
         assert!(find(&got, CAP_AGENT_FORWARD).is_some());
         assert_eq!(find_all(&got, CAP_AGENT_DATA).count(), 2);
         assert_eq!(decode_agent_ack(&find(&got, CAP_AGENT_ACK).unwrap().payload).unwrap(), 100);
+    }
+
+    #[test]
+    fn session_kind_byte_roundtrip_and_unknown() {
+        for k in [SessionKind::Anonymous, SessionKind::Named, SessionKind::System] {
+            assert_eq!(SessionKind::from_byte(k.to_byte()), k);
+        }
+        assert_eq!(SessionKind::from_byte(0), SessionKind::Unknown);
+        assert_eq!(SessionKind::from_byte(200), SessionKind::Unknown);
+        assert_eq!(SessionKind::Unknown.to_byte(), 0);
+    }
+
+    #[test]
+    fn session_kind_names_are_the_cli_and_json_spellings() {
+        assert_eq!(SessionKind::Anonymous.as_str(), "anonymous");
+        assert_eq!(SessionKind::Named.as_str(), "named");
+        assert_eq!(SessionKind::System.as_str(), "system");
+        assert_eq!(SessionKind::Unknown.as_str(), "unknown");
+        assert_eq!(SessionKind::parse("anonymous"), Some(SessionKind::Anonymous));
+        assert_eq!(SessionKind::parse("named"), Some(SessionKind::Named));
+        assert_eq!(SessionKind::parse("system"), None, "system is reserved, not creatable");
+        assert_eq!(SessionKind::parse("bogus"), None);
     }
 }
