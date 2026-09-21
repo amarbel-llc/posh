@@ -59,7 +59,6 @@ pub struct Palette {
     pid: libc::pid_t,
     /// The renderer's emulated screen (the palette pixels).
     rterm: Terminal,
-    open: bool,
     ctrl_buf: Vec<u8>,
     next_id: i64,
     /// The body of the most recent info dialog (RFC 0005 §3.2), held so a
@@ -73,8 +72,8 @@ pub struct Palette {
     /// back into `rterm` (posh#195). Silent unless the slave's ECHO was left on.
     echo_watch: EchoWatch,
     /// The `picker::Overlay` kind recorded for the view on screen (RFC 0014
-    /// §6), `None` while hidden. Kept here — the one place `open` toggles —
-    /// so the record follows VISIBLE state in every host (both clients, the
+    /// §6), `None` while hidden — THE open/hidden state (`is_open`), so the
+    /// record follows VISIBLE state in every host (both clients, the
     /// standalone chooser), never a persisted-but-hidden renderer.
     overlay: Option<&'static str>,
 }
@@ -135,7 +134,6 @@ impl Palette {
             ctrl: child.control,
             pid: child.pid,
             rterm: Terminal::new(rows, cols),
-            open: false,
             ctrl_buf: Vec::new(),
             next_id: 0,
             dialog_body: String::new(),
@@ -153,11 +151,11 @@ impl Palette {
 
     /// The renderer's screen to composite, or `None` while the palette is hidden.
     pub fn screen(&self) -> Option<&Terminal> {
-        self.open.then_some(&self.rterm)
+        self.is_open().then_some(&self.rterm)
     }
 
     pub fn is_open(&self) -> bool {
-        self.open
+        self.overlay.is_some()
     }
 
     pub fn master_fd(&self) -> RawFd {
@@ -185,7 +183,7 @@ impl Palette {
         self.set_visible(Some(kind));
     }
 
-    /// Toggle `open`, keeping the RFC 0014 §6 overlay record in step: a
+    /// Show or hide, keeping the RFC 0014 §6 overlay record in step: a
     /// re-show while up swaps the kind, a hide removes it.
     fn set_visible(&mut self, kind: Option<&'static str>) {
         if let Some(prev) = self.overlay.take() {
@@ -195,7 +193,6 @@ impl Palette {
             crate::picker::overlay_open(kind);
         }
         self.overlay = kind;
-        self.open = kind.is_some();
     }
 
     /// Summon an info dialog (RFC 0005 §3.2 `ui.show` view="dialog"): `body` is
@@ -651,13 +648,12 @@ mod tests {
             ctrl: sp[0],
             pid: 0,
             rterm: Terminal::new(24, 80),
-            open: true,
             ctrl_buf: Vec::new(),
             next_id: 0,
             dialog_body: String::new(),
             pending_show: None,
             echo_watch: EchoWatch::default(),
-            overlay: None,
+            overlay: Some("test"), // on screen, without a recorded overlay
         };
         (p, sp[1])
     }

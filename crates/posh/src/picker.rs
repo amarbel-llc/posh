@@ -511,10 +511,8 @@ static OVERLAYS: Mutex<Vec<Overlay>> = Mutex::new(Vec::new());
 
 /// A view of `kind` became visible over the current attach.
 pub fn overlay_open(kind: &'static str) {
-    OVERLAYS
-        .lock()
-        .unwrap_or_else(|e| e.into_inner())
-        .push(Overlay { kind, over: current() });
+    let over = current(); // before the OVERLAYS lock: no nested acquisition
+    OVERLAYS.lock().unwrap_or_else(|e| e.into_inner()).push(Overlay { kind, over });
     crate::viewport_status::refresh_now();
 }
 

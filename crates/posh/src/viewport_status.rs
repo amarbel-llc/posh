@@ -137,7 +137,6 @@ fn bind_in(dir: &Path, enabled: bool) -> Option<ViewportStatus> {
     if !enabled {
         return None;
     }
-    reap_dead_in(dir);
     let pid = std::process::id();
     let sock = sock_path(dir, pid);
     let pidfile = pid_path(dir, pid);
@@ -170,12 +169,24 @@ fn bind_in(dir: &Path, enabled: bool) -> Option<ViewportStatus> {
     Some(status)
 }
 
-/// 0700 dir, pidfile first, a stale socket removed, then the nonblocking bind.
-fn bind_listener(dir: &Path, pid: u32) -> std::io::Result<UnixListener> {
-    let sock = sock_path(dir, pid);
+/// The dir hardened like every socket dir (`session::Config::new`,
+/// `AgentEndpoint::build_named`; github #7): the base must be a real,
+/// self-owned directory and the 0700 leaf private and self-owned — a
+/// recursive create would silently trust a symlink or a foreign dir an
+/// attacker planted under the world-writable `/tmp` fallback. Only then the
+/// dead siblings are reaped, the pidfile written, a stale socket removed,
+/// and the listener bound nonblocking.
+fn bind_listener(dir: &Path, pid: u32) -> Result<UnixListener> {
+    let uid = util::uid();
+    if let Some(base) = dir.parent() {
+        session::validate_session_dir(base, uid, false)?;
+    }
     let mut b = std::fs::DirBuilder::new();
     b.recursive(true).mode(0o700);
     b.create(dir)?;
+    session::validate_session_dir(dir, uid, true)?;
+    reap_dead_in(dir);
+    let sock = sock_path(dir, pid);
     std::fs::write(pid_path(dir, pid), pid.to_string())?;
     let _ = std::fs::remove_file(&sock);
     let l = UnixListener::bind(&sock)?;
@@ -243,24 +254,35 @@ fn registered_pids(dir: &Path) -> Vec<u32> {
 }
 
 /// The §6 response, pure: `pid` is a parameter so the golden tests are
-/// deterministic.
+/// deterministic. Targets are flattened ([`flat`]): a session name may
+/// legally hold a space or a line break (`util::encode_session_name`
+/// escapes only `/ \ %` and NUL), and only a line break would break the
+/// one-record-per-line grammar — a space inside a value is fine, fields
+/// being `key=value` read by key prefix.
 pub(crate) fn render(snap: &Snapshot, pid: u32) -> String {
     let mut out = String::new();
     match &snap.current {
         Some((target, kind, anon)) => out.push_str(&format!(
-            "viewport pid={pid} current={target} kind={} anonymous_create={}\n",
+            "viewport pid={pid} current={} kind={} anonymous_create={}\n",
+            flat(target),
             kind.as_str(),
             u8::from(*anon)
         )),
         None => out.push_str(&format!("viewport pid={pid} current=- kind=unknown anonymous_create=0\n")),
     }
     for (i, e) in snap.stack.iter().enumerate() {
-        out.push_str(&format!("stack depth={} target={} kind={}\n", i + 1, e.target, e.kind.as_str()));
+        out.push_str(&format!("stack depth={} target={} kind={}\n", i + 1, flat(&e.target), e.kind.as_str()));
     }
     for o in &snap.overlays {
-        out.push_str(&format!("overlay kind={} over={}\n", o.kind, o.over.as_deref().unwrap_or("-")));
+        out.push_str(&format!("overlay kind={} over={}\n", o.kind, o.over.as_deref().map_or("-".into(), flat)));
     }
     out
+}
+
+/// A target as one line: tab / newline / carriage return become a space
+/// (the `completion_summary` flattening).
+fn flat(s: &str) -> String {
+    s.replace(['\t', '\n', '\r'], " ")
 }
 
 /// `posh status --viewport [pid]`: print one viewport's response, or (no
@@ -334,11 +356,40 @@ mod tests {
              overlay kind=palette over=box:work/s-3\n\
              overlay kind=picker over=-\n"
         );
+
+        // A line break inside a session name never breaks a record; a space
+        // is kept as is.
+        let odd = Snapshot {
+            current: Some((":two\nlines".into(), SessionKind::Named, false)),
+            stack: vec![StackEntry { target: "box:a b\r\nc\td".into(), kind: SessionKind::Named }],
+            overlays: vec![Overlay { kind: "palette", over: Some(":two\nlines".into()) }],
+        };
+        assert_eq!(
+            render(&odd, 3),
+            "viewport pid=3 current=:two lines kind=named anonymous_create=0\n\
+             stack depth=1 target=box:a b  c d kind=named\n\
+             overlay kind=palette over=:two lines\n"
+        );
+    }
+
+    /// github #7: a symlink planted at the leaf path is refused, so the
+    /// bind degrades to None and writes nothing through it.
+    #[test]
+    fn a_symlinked_viewports_dir_is_refused() {
+        let base = tmp("symlink");
+        let elsewhere = base.join("elsewhere");
+        std::fs::create_dir_all(&elsewhere).unwrap();
+        let leaf = base.join("viewports");
+        std::os::unix::fs::symlink(&elsewhere, &leaf).unwrap();
+        assert!(bind_in(&leaf, true).is_none());
+        assert!(std::fs::read_dir(&elsewhere).unwrap().next().is_none(), "nothing written through the link");
+        assert!(session::validate_session_dir(&leaf, util::uid(), true).is_err());
+        let _ = std::fs::remove_dir_all(&base);
     }
 
     #[test]
     fn disabled_binds_nothing_and_creates_nothing() {
-        let dir = tmp("off");
+        let dir = tmp("off").join("viewports");
         assert!(bind_in(&dir, false).is_none());
         assert!(!dir.exists());
     }
@@ -353,7 +404,8 @@ mod tests {
     fn first_attach_binds_once_and_shutdown_cleans_up() {
         let _g = picker::switch_test_guard();
         while picker::stack_pop().is_some() {}
-        let dir = tmp("bind");
+        let base = tmp("bind");
+        let dir = base.join("viewports");
         let pid = std::process::id();
         shutdown();
         *TEST_BASE.lock().unwrap() = Some(dir.clone());
@@ -408,7 +460,7 @@ mod tests {
         refresh_now(); // a no-op once unbound
         picker::set_current(":vs-after");
         assert!(HANDLE.lock().unwrap().is_none(), "no base under test: no bind");
-        let _ = std::fs::remove_dir_all(&dir);
+        let _ = std::fs::remove_dir_all(&base);
     }
 
     /// Reaping unlinks a pair whose pid is gone and keeps a live pid's.
