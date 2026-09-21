@@ -4,7 +4,7 @@
 
 **Goal:** Give every posh session a daemon-owned kind (anonymous / named / system), make the viewport the registry for its own session stack, show the predecessor in the palette heading, and ask on detach what to do with anonymous sessions the viewport created.
 
-**Architecture:** Section 1 adds a `SessionKind` to `posh_proto`, appends it skew-tolerantly to the daemon's `SessionInfo` record, and threads it from `posh start` / `posh attach --create` into `ensure_session`; a remote auto-id create becomes a remote-atomic `posh start --detach --kind anonymous` over ssh followed by an ordinary attach, so no roaming wire changes. Section 2 types the front door's stack with the kind and binds a per-viewport status socket. Section 3 splits a `StackView` schema from a `palette_view` presentation module. Section 4 adds the `POSH_LEAVE_ANONYMOUS` prompt in the front door's re-attach loop.
+**Architecture:** Section 1 adds a `SessionKind` to `posh_proto`, appends it skew-tolerantly to the daemon's `SessionInfo` record, and threads it from `posh start` / `posh attach --create` into `ensure_session`; a remote auto-id create becomes a remote-atomic `POSH_HANDSHAKE=1 posh start --detach --kind anonymous` over ssh that answers with a `POSH START 1 <name> <kind>` handshake line (the go-plugin / `POSH CONNECT` shape: one structured stdout line before anything else, version field first; the env prefix is the magic cookie and keeps the pinned prose unchanged for every other caller), followed by an ordinary attach, so no roaming wire changes. The space-separated `POSH …` family is kept for now; a pipe-delimited cutover is tracked as posh#202. Section 2 types the front door's stack with the kind and binds a per-viewport status socket. Section 3 splits a `StackView` schema from a `palette_view` presentation module. Section 4 adds the `POSH_LEAVE_ANONYMOUS` prompt in the front door's re-attach loop.
 
 **Tech Stack:** Rust (Cargo workspace: `crates/posh`, `crates/posh-proto`), hand-rolled IPC framing (`session/ipc.rs`), RFC 0005 JSON palette control, scdoc man pages, nix build (`just build-rust` / `just debug-cargo test -p posh`).
 
@@ -422,6 +422,48 @@ fn start_kind(class: &StartClass, explicit: Option<SessionKind>) -> SessionKind 
 }
 ```
 
+The handshake line (go-plugin shape, `POSH CONNECT` family). Add to `session/client.rs` beside `ensure_detached`:
+
+```rust
+/// The `posh start --detach` handshake line, printed to stdout BEFORE the
+/// pinned prose when the caller asked for it with the `POSH_HANDSHAKE=1`
+/// env (the ssh-crossing env-prefix convention of `sshwrap::remote_command`,
+/// doubling as go-plugin's magic cookie): `POSH START <version> <name>
+/// <kind>`. Version 1; a later version appends fields, never reorders.
+/// Same family as `POSH IP` / `POSH CONNECT` (remote/server.rs) so every
+/// posh-over-ssh exchange reads alike; the pipe-delimited cutover is a
+/// tracked follow-on.
+pub fn start_handshake_line(name: &str, kind: SessionKind) -> String {
+    format!("POSH START 1 {name} {}", kind.as_str())
+}
+
+/// `POSH_HANDSHAKE=1|on|true|yes` requests the handshake line.
+fn handshake_requested() -> bool {
+    matches!(
+        std::env::var("POSH_HANDSHAKE").as_deref(),
+        Ok("1") | Ok("on") | Ok("true") | Ok("yes")
+    )
+}
+```
+
+and in `ensure_detached`, before the `println!` pair:
+
+```rust
+    if handshake_requested() {
+        println!("{}", start_handshake_line(name, kind));
+    }
+```
+
+with a test (pure, no env):
+
+```rust
+#[test]
+fn start_handshake_line_is_the_posh_family_with_a_version_first() {
+    assert_eq!(start_handshake_line("s-3", SessionKind::Anonymous), "POSH START 1 s-3 anonymous");
+    assert_eq!(start_handshake_line("dev", SessionKind::Named), "POSH START 1 dev named");
+}
+```
+
 Thread the kind: `cmd_start` computes `let kind = start_kind(&class, explicit);` and passes it to `cmd_start_local(cfg, name, command, detach, kind)`; `cmd_start_local` passes it to `ensure_detached` / `switch_in_place`'s `SwitchCreate::Strict` (add a `kind` field to `Ensure` and `Strict`) / `ensure_session`. `cmd_attach` (main.rs) passes the parsed `kind.unwrap_or(SessionKind::Named)` to `session::client::cmd_attach`, which passes it to `connect_or_create` / `SwitchCreate::Ensure` / `ensure_detached`. The remote branches of `cmd_start` / `cmd_attach` do NOT change in this task (Task 5 owns the remote auto path; a remote named create stays `Named` by default).
 
 **Step 4: Run tests to verify they pass**
@@ -438,9 +480,9 @@ git commit -m "posh: --kind on start/attach --create, derived from the target cl
 
 ---
 
-### Task 5: remote auto-id create is remote-atomic and anonymous
+### Task 5: remote auto-id create is remote-atomic and anonymous, answered by a handshake line
 
-**Promotion criteria:** the pre-existing probe-then-attach path (`remote_session_names` + `first_free_autoid`) can be removed once every fleet host runs a `--kind`-aware posh (signal: no `falling back to probe` log line for 30 days).
+**Promotion criteria:** the pre-existing probe-then-attach path (`remote_session_names` + `first_free_autoid`) can be removed once every fleet host runs a `--kind`-aware posh (signal: no `falling back to probe` log line for 30 days). The space-separated `POSH START` line is itself slated for a pipe-delimited go-plugin-style cutover, tracked as posh#202.
 
 **Files:**
 - Modify: `crates/posh/src/main.rs:654-670` (`start_remote_auto`), plus a new `remote_start_argv` beside `remote_list_argv` (`:1345`)
@@ -450,26 +492,43 @@ git commit -m "posh: --kind on start/attach --create, derived from the target cl
 
 ```rust
 #[test]
-fn remote_start_argv_creates_detached_anonymous() {
+fn remote_start_argv_creates_detached_anonymous_with_the_handshake_cookie() {
     let dest = remote::sshwrap::SshDest::resolve("box");
     assert_eq!(
         remote_start_argv(&dest, "default", true),
-        ["ssh", "-o", "BatchMode=yes", "box", "posh", "start", "--detach", "--kind", "anonymous"]
+        ["ssh", "-o", "BatchMode=yes", "box", "POSH_HANDSHAKE=1", "posh", "start", "--detach", "--kind", "anonymous"]
             .map(String::from)
     );
     assert_eq!(
         remote_start_argv(&dest, "grp", false),
-        ["ssh", "box", "posh", "-g", "grp", "start", "--detach", "--kind", "anonymous"]
+        ["ssh", "box", "POSH_HANDSHAKE=1", "posh", "-g", "grp", "start", "--detach", "--kind", "anonymous"]
             .map(String::from)
     );
 }
 
 #[test]
-fn created_name_is_parsed_from_the_ensure_detached_line() {
-    assert_eq!(parse_created_name("session \"s-3\" created\n"), Some("s-3".to_string()));
-    assert_eq!(parse_created_name("warning: x\nsession \"s-12\" created\n"), Some("s-12".to_string()));
-    assert_eq!(parse_created_name("session \"s-3\" already exists\n"), None);
-    assert_eq!(parse_created_name(""), None);
+fn start_handshake_is_parsed_and_prose_is_not() {
+    // The new remote: handshake line first, then the pinned prose.
+    assert_eq!(
+        parse_start_handshake("POSH START 1 s-3 anonymous\nsession \"s-3\" created\n"),
+        Some(("s-3".to_string(), SessionKind::Anonymous))
+    );
+    // Noise before the line (a motd, a warning) is skipped, like LineScraper.
+    assert_eq!(
+        parse_start_handshake("warning: x\nPOSH START 1 s-12 named\n"),
+        Some(("s-12".to_string(), SessionKind::Named))
+    );
+    // A newer version with extra fields still yields the first three.
+    assert_eq!(
+        parse_start_handshake("POSH START 2 s-3 anonymous extra=1\n"),
+        Some(("s-3".to_string(), SessionKind::Anonymous))
+    );
+    // Prose alone is an OLD remote (no handshake) — None, so the caller falls back.
+    assert_eq!(parse_start_handshake("session \"s-3\" created\n"), None);
+    assert_eq!(parse_start_handshake("session \"s-3\" already exists\n"), None);
+    assert_eq!(parse_start_handshake(""), None);
+    // A version we cannot read (0, or non-numeric) is rejected, not guessed.
+    assert_eq!(parse_start_handshake("POSH START x s-3 anonymous\n"), None);
 }
 ```
 
@@ -483,10 +542,12 @@ Expected: compile FAIL.
 **Step 3: Write minimal implementation**
 
 ```rust
-/// `ssh [-o BatchMode=yes] … <dest> posh [-g G] start --detach --kind anonymous`:
-/// the remote-atomic auto-id create (design 2026-09-21 §1). The remote picks
-/// the free `s-N` itself and prints `session "s-N" created`, which
-/// `parse_created_name` reads; the attach that follows finds it live.
+/// `ssh [-o BatchMode=yes] … <dest> POSH_HANDSHAKE=1 posh [-g G] start --detach
+/// --kind anonymous`: the remote-atomic auto-id create (design 2026-09-21
+/// §1). The env prefix is the ssh-crossing cookie (`sshwrap::remote_command`
+/// precedent) that asks the remote for the `POSH START` handshake line; the
+/// remote picks the free `s-N` itself, and the attach that follows finds it
+/// live.
 fn remote_start_argv(dest: &remote::sshwrap::SshDest, group: &str, batch: bool) -> Vec<String> {
     let mut argv: Vec<String> = vec!["ssh".to_string()];
     if batch {
@@ -495,6 +556,7 @@ fn remote_start_argv(dest: &remote::sshwrap::SshDest, group: &str, batch: bool) 
     }
     argv.extend(dest.ssh_args());
     argv.push(dest.target());
+    argv.push("POSH_HANDSHAKE=1".into());
     argv.push("posh".into());
     if group != "default" {
         argv.push("-g".into());
@@ -504,11 +566,20 @@ fn remote_start_argv(dest: &remote::sshwrap::SshDest, group: &str, batch: bool) 
     argv
 }
 
-/// The name in `ensure_detached`'s `session "<name>" created` line (the
-/// wording the integration suite pins); `None` for anything else.
-fn parse_created_name(stdout: &str) -> Option<String> {
+/// The `POSH START <version> <name> <kind>` handshake line
+/// (`session::client::start_handshake_line`), scanned line by line past any
+/// motd noise the way `LineScraper` scans for `POSH CONNECT`. `None` when no
+/// such line is present — the prose-only answer of a remote that predates
+/// the handshake, the caller's cue to fall back. A version we cannot parse
+/// is `None` too; extra trailing fields from a newer version are ignored.
+fn parse_start_handshake(stdout: &str) -> Option<(String, SessionKind)> {
     stdout.lines().find_map(|l| {
-        l.strip_prefix("session \"")?.strip_suffix("\" created").map(str::to_string)
+        let rest = l.strip_prefix("POSH START ")?;
+        let mut f = rest.split_whitespace();
+        let _version: u32 = f.next()?.parse().ok()?;
+        let name = f.next()?.to_string();
+        let kind = SessionKind::parse(f.next()?)?;
+        Some((name, kind))
     })
 }
 ```
@@ -527,17 +598,19 @@ fn start_remote_auto(
     let grp = target_group.clone().unwrap_or_else(|| global_group.to_string());
     let dest = remote::sshwrap::SshDest::resolve(&ph_dest(user.as_deref(), &host));
     let batch = !util::is_tty(0);
-    // Remote-atomic anonymous create; a remote too old for --kind fails the
-    // exec, and we fall back to the probe-then-attach path (kind unknown).
+    // Remote-atomic anonymous create answered by the POSH START handshake
+    // line. A remote too old for --kind fails the exec, and one too old for
+    // the handshake answers prose only; both fall back to the
+    // probe-then-attach path (kind unknown).
     let argv = remote_start_argv(&dest, &grp, batch);
     let created = std::process::Command::new(&argv[0])
         .args(&argv[1..])
         .output()
         .ok()
         .filter(|o| o.status.success())
-        .and_then(|o| parse_created_name(&String::from_utf8_lossy(&o.stdout)));
+        .and_then(|o| parse_start_handshake(&String::from_utf8_lossy(&o.stdout)));
     let id = match created {
-        Some(id) => id,
+        Some((id, _kind)) => id,
         None => {
             util::log_write("info", "remote start --kind unavailable; falling back to probe");
             let names = remote_session_names(user.as_deref(), &host, &grp)?;
@@ -638,7 +711,7 @@ git commit -m "posh: list/picker/table carry the session kind; JSON omits it whe
 ### Task 7: man pages and the FDR 0015 note
 
 **Files:**
-- Modify: `doc/posh.1.scd` (`start` and `attach` synopses: `[--kind anonymous|named]`; a KIND paragraph under `list`)
+- Modify: `doc/posh.1.scd` (`start` and `attach` synopses: `[--kind anonymous|named]`; a KIND paragraph under `list`; ENVIRONMENT gains `POSH_HANDSHAKE` and a HANDSHAKE paragraph under `start --detach` documenting `POSH START 1 <name> <kind>` beside the existing `POSH CONNECT` description in `posh-server(1)`)
 - Modify: `docs/features/0015-ph-front-door.md` (one sentence: `:+` / create-new sessions are created with kind `anonymous`, recorded by the daemon)
 - Modify: `docs/rfcs/0001-target-grammar-and-caps.md` only if a capability id changes (it does not in Section 1; skip)
 
