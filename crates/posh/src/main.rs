@@ -996,7 +996,7 @@ fn dispatch_ph(route: PhRoute, group: &str) -> Result<()> {
 fn cmd_ph_picker(scope: Option<(Option<String>, String)>, group: &str) -> Result<()> {
     let title = match &scope {
         Some((user, host)) => format!("{} on {}", picker::TITLE, ph_dest(user.as_deref(), host)),
-        None => picker::TITLE.to_string(),
+        None => remote::palette_view::picker_title(&picker::stack_view()),
     };
     let rows = picker::rows(scope, group)?;
     let candidates = || picker::candidates(&rows);

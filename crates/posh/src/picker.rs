@@ -108,7 +108,7 @@ fn split_dest(dest: &str) -> (Option<&str>, &str) {
 /// The RFC 0005 §3.5 `rows` array: each row's cells plus a
 /// `session.switch {target}` action (§7). No `previous` yet — the client
 /// asks about the session it is leaving in a second step
-/// ([`leave_commands`]) when there is one.
+/// (`crate::remote::palette_view::leave_commands`) when there is one.
 pub fn rows_json(rows: &[PickerRow]) -> Value {
     Value::Array(
         rows.iter()
@@ -172,45 +172,6 @@ impl Previous {
     }
 }
 
-/// The second step after a picker row is chosen from INSIDE a session: the
-/// palette asking what to do with the session being left. Each command
-/// re-issues `session.switch` with the same `target` and a `previous`.
-/// Keeping it is a PUSH: the session goes on the stack and *Back* returns
-/// to it (FDR 0016, stacked switching).
-pub fn leave_commands(target: &str) -> Value {
-    leave_commands_for("session.switch", Some(target))
-}
-
-/// The leave question for *Back* (`session.pop`): the same three fates for
-/// the session being left, re-issued as `session.pop` with a `previous`
-/// (the target is the stack's top, never named by the renderer).
-pub fn back_commands() -> Value {
-    leave_commands_for("session.pop", None)
-}
-
-/// The three fates (+ cancel) for the session being LEFT, each re-issuing
-/// `method` with a `previous`. The session being left is named ONCE by the
-/// CALLER in the dialog title (RFC 0005 `title`), NOT repeated in every answer,
-/// so the answers read as fates of "it".
-fn leave_commands_for(method: &str, target: Option<&str>) -> Value {
-    let cmd = |name: &str, previous: Previous| {
-        let mut params = json!({ "previous": previous.as_str() });
-        if let Some(t) = target {
-            params["target"] = json!(t);
-        }
-        json!({
-            "name": name,
-            "action": { "method": method, "params": params },
-        })
-    };
-    json!([
-        cmd("Keep it running", Previous::Keep),
-        cmd("Kill it (kept if other viewports are attached)", Previous::Kill),
-        cmd("Kill it even with other viewports attached", Previous::ForceKill),
-        { "name": "Cancel" },
-    ])
-}
-
 /// A recorded switch: the target to re-attach to, what to do with the
 /// session being left, and whether this is a POP (the target came off the
 /// stack; the front door pops it) or a push (the front door pushes the
@@ -246,14 +207,20 @@ pub fn stack_depth() -> usize {
     STACK.lock().unwrap_or_else(|e| e.into_inner()).len()
 }
 
-/// The picker's heading: [`TITLE`], plus how deep the session stack is when
-/// a *Back* would return somewhere (`sessions · 2 to go back`).
-pub fn title() -> String {
-    match stack_depth() {
-        0 => TITLE.to_string(),
-        1 => format!("{TITLE} \u{b7} 1 to go back"),
-        n => format!("{TITLE} \u{b7} {n} to go back"),
-    }
+/// The stack as a VIEW MODEL (design 2026-09-21 §3): the session *Back*
+/// returns to, how many are stacked, and the attach in progress. The only
+/// producer; `crate::remote::palette_view` is the only consumer that turns
+/// it into RFC 0005 JSON or a heading — so the palette redesign changes that
+/// module and nothing here.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct StackView {
+    pub top: Option<StackEntry>,
+    pub depth: usize,
+    pub current: Option<StackEntry>,
+}
+
+pub fn stack_view() -> StackView {
+    StackView { top: stack_top(), depth: stack_depth(), current: current_entry() }
 }
 
 /// Push the session a switch is leaving — the attach in progress, with the
@@ -403,7 +370,7 @@ pub fn auto_pop(end: Option<&AttachEnd>) -> Option<Switch> {
 
 /// A target for a notice: a local `:session` names this machine, like the
 /// picker's rows and the default title do.
-fn display_target(target: &str) -> String {
+pub(crate) fn display_target(target: &str) -> String {
     match target.strip_prefix(':') {
         Some(rest) => format!("{}:{rest}", crate::remote::mux::hostname()),
         None => target.to_string(),
@@ -571,19 +538,29 @@ pub fn snapshot() -> Snapshot {
 /// `host:session · process` — so an auto-named session reads as what it is
 /// running, `flac:ff9fe216 · clown`, not just an id.
 pub fn default_title_with(process: Option<&str>) -> Option<String> {
-    let cur = current()?;
-    let (dest, session) = cur.rsplit_once(':')?;
-    let host = if dest.is_empty() {
-        crate::remote::mux::hostname()
-    } else {
-        short_host(dest.rsplit_once('@').map_or(dest, |(_, h)| h))
-    };
-    let mut title = format!("{host}:{}", short_session(session));
+    let (host, session) = short_target(&current()?)?;
+    let mut title = format!("{host}:{session}");
     if let Some(p) = process.map(str::trim).filter(|p| !p.is_empty()) {
         title.push_str(" \u{b7} ");
         title.push_str(p);
     }
     Some(title)
+}
+
+/// A target's `(host, session)` halves abbreviated for a title: the host as
+/// typed minus any `user@` and trailing domain labels ([`short_host`]), this
+/// machine's hostname for a local `:session`; the session with a UUID name
+/// cut short ([`short_session`]). `None` for a string with no `:` (not a
+/// target). Shared by the default title and the palette headings
+/// (`crate::remote::palette_view`).
+pub(crate) fn short_target(target: &str) -> Option<(String, String)> {
+    let (dest, session) = target.rsplit_once(':')?;
+    let host = if dest.is_empty() {
+        crate::remote::mux::hostname()
+    } else {
+        short_host(dest.rsplit_once('@').map_or(dest, |(_, h)| h))
+    };
+    Some((host, short_session(session)))
 }
 
 /// A `[group/]name` for the title: an auto-generated UUID name (what clown
@@ -592,7 +569,7 @@ pub fn default_title_with(process: Option<&str>) -> Option<String> {
 /// rather than a 36-character id — while any other name is kept whole.
 /// Until the RFC 0013 §5 activity label rides frames (it reaches only the
 /// unattached listing today), the name is all an attached viewport knows.
-fn short_session(scoped: &str) -> String {
+pub(crate) fn short_session(scoped: &str) -> String {
     let (group, name) = match scoped.rsplit_once('/') {
         Some((g, n)) => (Some(g), n),
         None => (None, scoped),
@@ -609,7 +586,7 @@ fn short_session(scoped: &str) -> String {
 }
 
 /// `box.example.com` → `box`; a bracketed / numeric address is kept whole.
-fn short_host(host: &str) -> String {
+pub(crate) fn short_host(host: &str) -> String {
     let literal = host.starts_with('[') || host.chars().all(|c| c.is_ascii_digit() || c == '.' || c == ':');
     if literal {
         host.to_string()
@@ -810,7 +787,7 @@ mod tests {
     fn back_pops_the_stack_and_an_empty_stack_records_nothing() {
         let _g = switch_test_guard();
         while stack_pop().is_some() {}
-        assert_eq!(title(), TITLE);
+        assert_eq!(stack_depth(), 0);
         assert_eq!(request_pop(Previous::Keep), None, "nothing to go back to");
         assert_eq!(take_switch(), None);
         set_current(":s-1");
@@ -818,7 +795,6 @@ mod tests {
         set_current("box:dev");
         stack_push_current();
         assert_eq!(stack_depth(), 2);
-        assert_eq!(title(), "sessions \u{b7} 2 to go back");
         assert_eq!(stack_top().map(|e| e.target).as_deref(), Some("box:dev"));
         assert_eq!(request_pop(Previous::Kill).as_deref(), Some("box:dev"));
         assert_eq!(
@@ -830,16 +806,30 @@ mod tests {
         assert_eq!(stack_pop().map(|e| e.target).as_deref(), Some("box:dev"));
         assert_eq!(stack_top().map(|e| e.target).as_deref(), Some(":s-1"));
         stack_pop();
-        // The back question re-issues session.pop with a previous, no target.
-        // The session being left is named in the dialog title (the caller), NOT
-        // in every answer — so the answers are generic fates of "it".
-        let cmds = back_commands();
-        let arr = cmds.as_array().unwrap();
-        assert_eq!(arr.len(), 4);
-        assert_eq!(arr[0]["action"]["method"], "session.pop");
-        assert!(arr[0]["action"]["params"].get("target").is_none());
-        assert_eq!(arr[1]["action"]["params"]["previous"], "kill");
-        assert_eq!(arr[0]["name"], "Keep it running");
+    }
+
+    /// The view model reads the three stack facts in one go: nothing on an
+    /// empty stack with no attach; the top, the depth, and the attach in
+    /// progress (with its kind) otherwise.
+    #[test]
+    fn stack_view_reports_top_depth_and_current() {
+        let _g = switch_test_guard();
+        while stack_pop().is_some() {}
+        *CURRENT.lock().unwrap() = None;
+        assert_eq!(stack_view(), StackView { top: None, depth: 0, current: None });
+        set_current(":s-1");
+        set_current_kind(SessionKind::Anonymous);
+        stack_push_current();
+        set_current("box:dev");
+        set_current_kind(SessionKind::Named);
+        let v = stack_view();
+        assert_eq!(v.depth, 1);
+        assert_eq!(v.top.as_ref().map(|e| e.target.as_str()), Some(":s-1"));
+        assert_eq!(
+            v.current.as_ref().map(|e| (e.target.as_str(), e.kind)),
+            Some(("box:dev", SessionKind::Named))
+        );
+        while stack_pop().is_some() {}
     }
 
     /// The automatic pop: a top session that ENDED or was LOST returns the
@@ -986,32 +976,6 @@ mod tests {
         let snap = snapshot();
         assert_eq!(snap.current, None);
         assert!(snap.stack.is_empty());
-    }
-
-    /// The leave step: three `session.switch` re-issues carrying the chosen
-    /// target and a `previous`, plus a no-op cancel; `previous` parses back,
-    /// and an unknown spelling is rejected (absent = keep). The session being
-    /// left is named in the dialog title (the caller), not in the answers, so
-    /// each answer is a generic fate of "it".
-    #[test]
-    fn leave_commands_carry_target_and_previous() {
-        let cmds = leave_commands("box:dev");
-        let arr = cmds.as_array().unwrap();
-        assert_eq!(arr.len(), 4);
-        let names = ["Keep it running", "Kill it", "Kill it"];
-        for (i, want) in ["keep", "kill", "force-kill"].iter().enumerate() {
-            assert_eq!(arr[i]["action"]["method"], "session.switch");
-            assert_eq!(arr[i]["action"]["params"]["target"], "box:dev");
-            assert_eq!(arr[i]["action"]["params"]["previous"], *want);
-            assert_eq!(Previous::parse(Some(want)).map(Previous::as_str), Some(*want));
-            // The answer names the fate, never the leaving session id.
-            let name = arr[i]["name"].as_str().unwrap();
-            assert!(name.starts_with(names[i]), "{name:?}");
-            assert!(!name.contains(':'), "answer must not repeat a session id: {name:?}");
-        }
-        assert!(arr[3]["action"].is_null(), "Cancel is a no-op entry");
-        assert_eq!(Previous::parse(None), Some(Previous::Keep));
-        assert_eq!(Previous::parse(Some("nuke")), None);
     }
 
     /// The remote kill runs non-interactively through the resolved

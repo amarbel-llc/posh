@@ -64,6 +64,10 @@ pub mod mux_ls;
 /// the palette hosts and overlays identically over a roaming and a local
 /// session (FDR 0011 Phase 2.3).
 pub mod palette;
+/// The FDR 0016 session stack's presentation for the palette renderer: the
+/// only module that turns a `picker::StackView` into a heading or a row
+/// (design 2026-09-21 §3). Shared by both clients like `palette`.
+pub mod palette_view;
 /// The loaded-mux measurement harness (posh#143/#144, RFC 0011 §9.2/§9.3):
 /// real transport through an in-process impairment relay, `#[ignore]`d
 /// scenarios run via `just debug-mux-load`.

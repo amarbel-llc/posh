@@ -1116,7 +1116,11 @@ fn dispatch_palette_action(
             match crate::picker::rows(None, &crate::picker::default_group()) {
                 Ok(rows) => {
                     if let Some(p) = st.palette.as_mut() {
-                        p.show_picker(&crate::picker::title(), crate::picker::rows_json(&rows), crate::picker::EMPTY);
+                        p.show_picker(
+                            &super::palette_view::picker_title(&crate::picker::stack_view()),
+                            crate::picker::rows_json(&rows),
+                            crate::picker::EMPTY,
+                        );
                     }
                 }
                 Err(e) => st.notify.set_message(&format!("session list failed: {e}"), false, now),
@@ -1137,7 +1141,7 @@ fn dispatch_palette_action(
                 if let (Some(p), Some(leaving)) = (st.palette.as_mut(), crate::picker::current()) {
                     p.open(
                         &format!("Switch to {target} — leave {leaving}:"),
-                        crate::picker::leave_commands(target),
+                        super::palette_view::leave_commands(target),
                     );
                     return false;
                 }
@@ -1165,7 +1169,7 @@ fn dispatch_palette_action(
                 if let (Some(p), Some(leaving)) = (st.palette.as_mut(), crate::picker::current()) {
                     p.open(
                         &format!("Back to {top} — leave {leaving}:"),
-                        crate::picker::back_commands(),
+                        super::palette_view::back_commands(),
                     );
                     return false;
                 }

@@ -1106,10 +1106,10 @@ enum LocalAction {
     /// holds the `Palette`; dispatch does not).
     ShowPicker,
     /// A picker row was chosen from inside a session: ask what to do with
-    /// the session being left (`picker::leave_commands` for this target).
+    /// the session being left (`palette_view::leave_commands` for this target).
     AskLeave(String),
     /// *Back* was chosen: ask what to do with the session being left
-    /// (`picker::back_commands`); the target is the stack top named here.
+    /// (`palette_view::back_commands`); the target is the stack top named here.
     AskBack(String),
 }
 
@@ -1749,7 +1749,7 @@ fn client_loop(
                                     Ok(rows) => {
                                         if let Some(p) = palette.as_mut() {
                                             p.show_picker(
-                                                &crate::picker::title(),
+                                                &crate::remote::palette_view::picker_title(&crate::picker::stack_view()),
                                                 crate::picker::rows_json(&rows),
                                                 crate::picker::EMPTY,
                                             );
@@ -1764,7 +1764,7 @@ fn client_loop(
                                 {
                                     p.open(
                                         &format!("Switch to {target} — leave {leaving}:"),
-                                        crate::picker::leave_commands(&target),
+                                        crate::remote::palette_view::leave_commands(&target),
                                     );
                                 }
                             }
@@ -1774,7 +1774,7 @@ fn client_loop(
                                 {
                                     p.open(
                                         &format!("Back to {top} — leave {leaving}:"),
-                                        crate::picker::back_commands(),
+                                        crate::remote::palette_view::back_commands(),
                                     );
                                 }
                             }
