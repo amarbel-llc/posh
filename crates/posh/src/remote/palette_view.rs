@@ -23,8 +23,6 @@ const COMMANDS: &str = "Commands";
 /// the whole line still exceeds the budget the host is dropped from the back
 /// target (`:session`), then the prefix is truncated with `…` — the stack
 /// part is the reason the user opened it.
-// Wired into both clients' `open_palette` by the next change (plan Task 13).
-#[allow(dead_code)]
 pub fn commands_title(view: &StackView, prefix: Option<&str>) -> String {
     let prefix = prefix.unwrap_or(COMMANDS);
     let Some(top) = view.top.as_ref() else {
@@ -52,12 +50,30 @@ pub fn commands_title(view: &StackView, prefix: Option<&str>) -> String {
     format!("{}\u{2026}{suffix}", head.trim_end())
 }
 
-/// `Back to <top>` → `session.pop`, or None without a stack.
-// Wired into both clients' `palette_commands` by the next change (plan Task 13).
-#[allow(dead_code)]
+/// `Back to <top>` → `session.pop`, or None without a stack. Both clients
+/// put it FIRST in the Commands palette while there is a top, so `Ctrl-^`
+/// Enter is "go back".
 pub fn back_row(view: &StackView) -> Option<Value> {
     let top = view.top.as_ref()?;
     Some(json!({ "name": format!("Back to {}", top.target), "action": { "method": "session.pop" } }))
+}
+
+/// The leave question's heading for a switch (RFC 0005 `title`): the target
+/// chosen and the session being left, named ONCE here so the answers
+/// ([`leave_commands`]) stay generic fates of "it".
+pub fn leave_dialog_title(target: &str, leaving: &str) -> String {
+    format!("Switch to {target} \u{2014} leave {leaving}:")
+}
+
+/// The leave question's heading for a *Back*: the stack top being returned
+/// to and the session being left ([`back_commands`] never names either).
+pub fn back_dialog_title(top: &str, leaving: &str) -> String {
+    format!("Back to {top} \u{2014} leave {leaving}:")
+}
+
+/// The notice for a `session.pop` with nothing stacked.
+pub fn no_back_notice() -> &'static str {
+    "nothing to go back to"
 }
 
 /// The picker heading: [`picker::TITLE`], plus how deep the session stack
@@ -191,6 +207,15 @@ mod tests {
             back_row(&one),
             Some(json!({ "name": "Back to box:dev", "action": { "method": "session.pop" } }))
         );
+    }
+
+    /// The dialog headings name the two sessions once each (the answers do
+    /// not repeat them), with the same em-dash shape for a switch and a Back.
+    #[test]
+    fn dialog_titles_name_the_target_and_the_session_left() {
+        assert_eq!(leave_dialog_title("box:dev", ":here"), "Switch to box:dev \u{2014} leave :here:");
+        assert_eq!(back_dialog_title(":prev", ":here"), "Back to :prev \u{2014} leave :here:");
+        assert_eq!(no_back_notice(), "nothing to go back to");
     }
 
     #[test]

@@ -1001,7 +1001,7 @@ fn palette_commands(
     scroll_opt: bool,
     coalesce_on: bool,
     coalesce_available: bool,
-    back_to: Option<&str>,
+    view: &crate::picker::StackView,
 ) -> Value {
     // Imperative label (the verb is the action), matching the remote palette:
     // enabled now => offer "Disable"; disabled now => offer "Enable".
@@ -1010,16 +1010,13 @@ fn palette_commands(
     } else {
         ("Enable scroll-region optimization", true)
     };
-    let mut commands = vec![
+    // Stacked switching: *Back* pops the session this viewport left — the
+    // FIRST row while there is one (design 2026-09-21 §3), then the picker.
+    let mut commands: Vec<Value> = crate::remote::palette_view::back_row(view).into_iter().collect();
+    commands.extend([
         // FDR 0016: the palette as picker — list the reachable sessions and
         // switch this viewport to one (detach, then the front door re-attaches).
         json!({ "name": "Switch session…", "action": { "method": "session.list" } }),
-    ];
-    // Stacked switching: *Back* pops the session this viewport left.
-    if let Some(t) = back_to {
-        commands.push(json!({ "name": format!("Back to {t}"), "action": { "method": "session.pop" } }));
-    }
-    commands.extend([
         json!({ "name": "Suspend client", "action": { "method": "client.suspend" } }),
         json!({ "name": "Shell out", "action": { "method": "shell.open" } }),
         json!({ "name": scroll_opt_name, "action": { "method": "render.scroll_opt", "params": { "enabled": scroll_opt_enabled } } }),
@@ -1069,15 +1066,10 @@ fn open_local_palette(
     // current tty size before summoning — else it renders at the size it had
     // when last open, misaligned against a since-resized screen (posh#135).
     p.resize(rows, cols);
-    let back_to = crate::picker::stack_top();
+    let view = crate::picker::stack_view();
     p.open(
-        "Commands",
-        palette_commands(
-            fr.scroll_opt,
-            coalesce_on,
-            coalesce_available,
-            back_to.as_ref().map(|e| e.target.as_str()),
-        ),
+        &crate::remote::palette_view::commands_title(&view, None),
+        palette_commands(fr.scroll_opt, coalesce_on, coalesce_available, &view),
     );
     fr.set_scroll(0);
     fr.invalidate();
@@ -1763,7 +1755,7 @@ fn client_loop(
                                     (palette.as_mut(), crate::picker::current())
                                 {
                                     p.open(
-                                        &format!("Switch to {target} — leave {leaving}:"),
+                                        &crate::remote::palette_view::leave_dialog_title(&target, &leaving),
                                         crate::remote::palette_view::leave_commands(&target),
                                     );
                                 }
@@ -1773,7 +1765,7 @@ fn client_loop(
                                     (palette.as_mut(), crate::picker::current())
                                 {
                                     p.open(
-                                        &format!("Back to {top} — leave {leaving}:"),
+                                        &crate::remote::palette_view::back_dialog_title(&top, &leaving),
                                         crate::remote::palette_view::back_commands(),
                                     );
                                 }
@@ -2795,9 +2787,45 @@ mod tests {
                 pop: true
             })
         );
-        let text = serde_json::to_string(&palette_commands(true, false, false, Some(":prev"))).unwrap();
-        assert!(text.contains("Back to :prev"), "{text}");
+        let names = palette_names(&palette_commands(true, false, false, &stacked(":prev")));
+        assert_eq!(names[0], "Back to :prev", "{names:?}");
         crate::picker::stack_pop();
+    }
+
+    /// An empty session stack (no *Back* row) for the palette tests.
+    fn no_stack() -> crate::picker::StackView {
+        crate::picker::StackView { top: None, depth: 0, current: None }
+    }
+
+    /// A one-deep stack whose top is `target`.
+    fn stacked(target: &str) -> crate::picker::StackView {
+        crate::picker::StackView {
+            top: Some(crate::picker::StackEntry { target: target.into(), kind: SessionKind::Named }),
+            depth: 1,
+            current: None,
+        }
+    }
+
+    fn palette_names(cmds: &Value) -> Vec<String> {
+        cmds.as_array()
+            .unwrap()
+            .iter()
+            .filter_map(|c| c["name"].as_str().map(String::from))
+            .collect()
+    }
+
+    /// The local Commands palette with a stack top leads with *Back to
+    /// <top>* and the switcher second; without one the switcher leads and
+    /// no row is a Back (design 2026-09-21 §3).
+    #[test]
+    fn palette_commands_lead_with_back_only_with_a_stack_top() {
+        let with = palette_names(&palette_commands(true, false, false, &stacked("box:dev")));
+        assert_eq!(with[0], "Back to box:dev", "{with:?}");
+        assert_eq!(with[1], "Switch session…", "{with:?}");
+        let without = palette_names(&palette_commands(true, false, false, &no_stack()));
+        assert_eq!(without[0], "Switch session…", "{without:?}");
+        assert!(!without.iter().any(|n| n.starts_with("Back to")), "{without:?}");
+        assert_eq!(with.len(), without.len() + 1);
     }
 
     /// A named `posh start <name>` never arms the anonymous-create fallback;
@@ -2850,7 +2878,7 @@ mod tests {
         ));
         assert!(buf.is_empty(), "listing sends nothing to the daemon");
         assert!(
-            serde_json::to_string(&palette_commands(true, false, false, None))
+            serde_json::to_string(&palette_commands(true, false, false, &no_stack()))
                 .unwrap()
                 .contains("Switch session"),
             "the local palette offers the switcher"
@@ -2917,13 +2945,13 @@ mod tests {
     #[test]
     fn palette_commands_labels_the_scroll_opt_toggle_by_state() {
         let text = |cmds: &Value| serde_json::to_string(cmds).unwrap();
-        let on = palette_commands(true, true, true, None);
+        let on = palette_commands(true, true, true, &no_stack());
         assert!(
             text(&on).contains("Disable scroll-region optimization"),
             "enabled now => offer Disable: {}",
             text(&on)
         );
-        let off = palette_commands(false, true, true, None);
+        let off = palette_commands(false, true, true, &no_stack());
         assert!(
             text(&off).contains("Enable scroll-region optimization"),
             "disabled now => offer Enable: {}",
@@ -2938,20 +2966,20 @@ mod tests {
     #[test]
     fn palette_commands_labels_the_coalesce_toggle_by_state() {
         let text = |cmds: &Value| serde_json::to_string(cmds).unwrap();
-        let on = palette_commands(true, true, true, None);
+        let on = palette_commands(true, true, true, &no_stack());
         assert!(
             text(&on).contains("Frame coalescing: on (disable)"),
             "coalescing on now => offer disable: {}",
             text(&on)
         );
-        let off = palette_commands(true, false, true, None);
+        let off = palette_commands(true, false, true, &no_stack());
         assert!(
             text(&off).contains("Frame coalescing: off (enable)"),
             "coalescing off now => offer enable: {}",
             text(&off)
         );
         // Unavailable (POSH_COALESCE unset ⇒ cap not advertised): no toggle at all.
-        let unavailable = palette_commands(true, false, false, None);
+        let unavailable = palette_commands(true, false, false, &no_stack());
         assert!(
             !text(&unavailable).contains("Frame coalescing"),
             "no coalescing command when unavailable: {}",

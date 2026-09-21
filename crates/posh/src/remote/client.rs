@@ -307,7 +307,7 @@ fn palette_commands(
     scroll_opt: bool,
     debug_banner: bool,
     recording: bool,
-    back_to: Option<&str>,
+    view: &crate::picker::StackView,
 ) -> Value {
     // The live debug banner (FDR 0007): a reverse-video line or two under
     // the connection banner with the transport / echo / time-to-paint gauges,
@@ -344,18 +344,15 @@ fn palette_commands(
     } else {
         ("Start recording", true)
     };
-    let mut commands = vec![
+    // Stacked switching: *Back* pops the session this viewport switched
+    // away from (kept running) — the FIRST row while there is one (design
+    // 2026-09-21 §3: Ctrl-^ Enter is "go back"), then the picker.
+    let mut commands: Vec<Value> = super::palette_view::back_row(view).into_iter().collect();
+    commands.extend([
         // FDR 0016: the palette as picker — list the reachable sessions and
         // switch this viewport to one (the client ends with a switch outcome
         // and the front door re-attaches).
         json!({ "name": "Switch session…", "action": { "method": "session.list" } }),
-    ];
-    // Stacked switching: *Back* pops the session this viewport switched
-    // away from (kept running), shown only while there is one.
-    if let Some(t) = back_to {
-        commands.push(json!({ "name": format!("Back to {t}"), "action": { "method": "session.pop" } }));
-    }
-    commands.extend([
         json!({ "name": "Echo: adaptive", "action": { "method": "echo.set", "params": { "model": "adaptive" } } }),
         json!({ "name": "Echo: optimistic", "action": { "method": "echo.set", "params": { "model": "optimistic" } } }),
         json!({ "name": "Echo: always", "action": { "method": "echo.set", "params": { "model": "always" } } }),
@@ -406,6 +403,18 @@ fn palette_title(srtt_ms: f64, model: PredictionModel, auto_escalated: bool) -> 
     format!("rtt {srtt_ms:.0}ms · echo: {}{auto}", model.name())
 }
 
+/// What `open_palette` hands the renderer as the heading: the rtt / echo
+/// line with the session stack's predecessor appended by `palette_view`
+/// (`… · back: <top> [+N]`, abbreviated to the renderer's budget).
+fn palette_heading(
+    view: &crate::picker::StackView,
+    srtt_ms: f64,
+    model: PredictionModel,
+    auto_escalated: bool,
+) -> String {
+    super::palette_view::commands_title(view, Some(&palette_title(srtt_ms, model, auto_escalated)))
+}
+
 /// Summon the command palette: spawn the renderer on first use, then show it.
 /// Returns whether it opened (false if the renderer can't be spawned, leaving
 /// the caller to fall back to the emergency-quit prefix).
@@ -413,15 +422,9 @@ fn open_palette(st: &mut ClientState) -> bool {
     if st.palette.is_none() {
         st.palette = Palette::spawn(st.rows, st.cols);
     }
-    let back_to = crate::picker::stack_top();
-    let commands = palette_commands(
-        st.server_log_on,
-        st.scroll_opt,
-        st.debug_banner,
-        st.record.is_some(),
-        back_to.as_ref().map(|e| e.target.as_str()),
-    );
-    let title = palette_title(st.wire.srtt(), st.predict_model, st.echo_escalation.escalated());
+    let view = crate::picker::stack_view();
+    let commands = palette_commands(st.server_log_on, st.scroll_opt, st.debug_banner, st.record.is_some(), &view);
+    let title = palette_heading(&view, st.wire.srtt(), st.predict_model, st.echo_escalation.escalated());
     if let Some(p) = st.palette.as_mut() {
         // A persisted (spawned-then-closed) palette is not resized while closed,
         // so re-sync it to the current tty size before summoning — else it
@@ -1140,7 +1143,7 @@ fn dispatch_palette_action(
             if previous.is_none() {
                 if let (Some(p), Some(leaving)) = (st.palette.as_mut(), crate::picker::current()) {
                     p.open(
-                        &format!("Switch to {target} — leave {leaving}:"),
+                        &super::palette_view::leave_dialog_title(target, &leaving),
                         super::palette_view::leave_commands(target),
                     );
                     return false;
@@ -1162,13 +1165,13 @@ fn dispatch_palette_action(
             // attach like a switch. An empty stack just says so.
             let previous = params.get("previous").and_then(Value::as_str);
             let Some(top) = crate::picker::stack_top().map(|e| e.target) else {
-                st.notify.set_message("nothing to go back to", false, now);
+                st.notify.set_message(super::palette_view::no_back_notice(), false, now);
                 return false;
             };
             if previous.is_none() {
                 if let (Some(p), Some(leaving)) = (st.palette.as_mut(), crate::picker::current()) {
                     p.open(
-                        &format!("Back to {top} — leave {leaving}:"),
+                        &super::palette_view::back_dialog_title(&top, &leaving),
                         super::palette_view::back_commands(),
                     );
                     return false;
@@ -4043,7 +4046,7 @@ mod tests {
     #[test]
     fn palette_commands_recording_toggle_reflects_state() {
         let names = |recording: bool| -> Vec<String> {
-            palette_commands(false, true, false, recording, None)
+            palette_commands(false, true, false, recording, &no_stack())
                 .as_array()
                 .unwrap()
                 .iter()
@@ -4623,9 +4626,54 @@ mod tests {
         );
     }
 
+    /// An empty session stack (no *Back* row) for the palette tests.
+    fn no_stack() -> crate::picker::StackView {
+        crate::picker::StackView { top: None, depth: 0, current: None }
+    }
+
+    /// A stack whose top is `target`, `depth` deep.
+    fn stacked(target: &str, depth: usize) -> crate::picker::StackView {
+        crate::picker::StackView {
+            top: Some(crate::picker::StackEntry { target: target.into(), kind: SessionKind::Named }),
+            depth,
+            current: None,
+        }
+    }
+
+    /// The Commands palette with a stack top leads with *Back to <top>*
+    /// (Ctrl-^ Enter = go back) and the switcher second; without one the
+    /// switcher leads and no row is a Back. The heading handed to the
+    /// renderer is the rtt / echo line, with the predecessor appended by
+    /// `palette_view` only with a stack.
+    #[test]
+    fn palette_commands_lead_with_back_and_the_heading_names_the_predecessor() {
+        let names = |v: &crate::picker::StackView| -> Vec<String> {
+            palette_commands(false, true, false, false, v)
+                .as_array()
+                .unwrap()
+                .iter()
+                .filter_map(|c| c["name"].as_str().map(String::from))
+                .collect()
+        };
+        let with = names(&stacked("box:dev", 1));
+        assert_eq!(with[0], "Back to box:dev", "{with:?}");
+        assert_eq!(with[1], "Switch session…", "{with:?}");
+        let without = names(&no_stack());
+        assert_eq!(without[0], "Switch session…", "{without:?}");
+        assert!(!without.iter().any(|n| n.starts_with("Back to")), "{without:?}");
+        assert_eq!(with.len(), without.len() + 1);
+        let bare = palette_heading(&no_stack(), 12.0, PredictionModel::Always, false);
+        assert_eq!(bare, palette_title(12.0, PredictionModel::Always, false));
+        assert_eq!(bare, "rtt 12ms · echo: always");
+        assert_eq!(
+            palette_heading(&stacked("me@box.example.com:dev", 3), 12.0, PredictionModel::Always, false),
+            "rtt 12ms · echo: always · back: box:dev +2"
+        );
+    }
+
     #[test]
     fn palette_commands_includes_both_logging_scopes() {
-        let cmds = palette_commands(false, true, false, false, None);
+        let cmds = palette_commands(false, true, false, false, &no_stack());
         let arr = cmds.as_array().expect("commands is an array");
         let names: Vec<&str> = arr.iter().filter_map(|c| c["name"].as_str()).collect();
         assert!(
@@ -4670,15 +4718,15 @@ mod tests {
             names.iter().any(|n| n.contains("Disable scroll-region optimization")),
             "scroll-opt disable command missing: {names:?}"
         );
-        let off: Vec<String> = palette_commands(false, false, true, false, Some("box:dev"))
+        let off: Vec<String> = palette_commands(false, false, true, false, &stacked("box:dev", 1))
             .as_array()
             .unwrap()
             .iter()
             .filter_map(|c| c["name"].as_str().map(String::from))
             .collect();
-        // Stacked switching: *Back* appears right after the switcher, only
-        // while the stack has a top, and names it.
-        assert_eq!(off[1], "Back to box:dev", "{off:?}");
+        // Stacked switching: *Back* is the FIRST row, only while the stack
+        // has a top, and names it.
+        assert_eq!(off[0], "Back to box:dev", "{off:?}");
         assert!(!names.iter().any(|n| n.starts_with("Back to")), "{names:?}");
         assert_eq!(off.len(), names.len() + 1);
         assert!(
