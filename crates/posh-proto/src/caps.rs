@@ -334,8 +334,9 @@ pub enum SessionKind {
 
 impl SessionKind {
     /// The one-byte wire form (`0` unknown, `1` anonymous, `2` named,
-    /// `3` system): the IPC `SessionInfo` tail and the on-frame activity
-    /// entry both carry it.
+    /// `3` system): the IPC `SessionInfo` tail carries it and, once Task 9
+    /// of the 2026-09-21 plan threads it onto the activity frame, that
+    /// entry too.
     pub fn to_byte(self) -> u8 {
         match self {
             SessionKind::Unknown => 0,
@@ -355,7 +356,8 @@ impl SessionKind {
         }
     }
 
-    /// The CLI (`--kind`) and JSON (`"kind"`) spelling.
+    /// The spelling the `--kind` flag (added by Task 4 of the 2026-09-21
+    /// plan) and the `posh list --json` `kind` field (Task 6) use.
     pub fn as_str(self) -> &'static str {
         match self {
             SessionKind::Unknown => "unknown",
@@ -365,8 +367,8 @@ impl SessionKind {
         }
     }
 
-    /// Parse a `--kind` value. Only the CREATABLE kinds parse: `system` is
-    /// reserved and `unknown` is never stated.
+    /// Parse a `--kind` value (the flag Task 4 adds). Only the CREATABLE
+    /// kinds parse: `system` is reserved and `unknown` is never stated.
     pub fn parse(s: &str) -> Option<SessionKind> {
         match s {
             "anonymous" => Some(SessionKind::Anonymous),

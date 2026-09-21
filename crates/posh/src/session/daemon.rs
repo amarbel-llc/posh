@@ -1939,12 +1939,17 @@ mod tests {
     /// The PRODUCTION [`daemon_loop`] running on a thread over a bound
     /// session socket and a real PTY child — no double-fork, no stdio
     /// redirect, no process exit — so a test talks to it through the socket
-    /// exactly as a client does. `shutdown` ends it the way `posh kill` does.
+    /// exactly as a client does. `shutdown` ends it the way `posh kill` does;
+    /// dropping it without one (a failed assertion) still reaps the child,
+    /// closes the PTY, and removes the socket dir — the daemon thread is
+    /// left to die with the test binary rather than joined without a kill.
     struct TestDaemon {
+        base: std::path::PathBuf,
         socket: std::path::PathBuf,
         child_pid: libc::pid_t,
         master: RawFd,
         thread: Option<std::thread::JoinHandle<caps::SessionEnd>>,
+        torn_down: bool,
     }
 
     impl TestDaemon {
@@ -1954,15 +1959,35 @@ mod tests {
             let stream = UnixStream::connect(&self.socket).unwrap();
             ipc::send(stream.as_raw_fd(), Tag::Kill, b"").unwrap();
             let end = self.thread.take().unwrap().join().unwrap();
+            self.teardown();
+            end
+        }
+
+        /// Best-effort, idempotent: the child, the master fd, the dir.
+        fn teardown(&mut self) {
+            if self.torn_down {
+                return;
+            }
+            self.torn_down = true;
             util::kill_pgroup(self.child_pid, libc::SIGKILL);
             util::reap(self.child_pid);
             util::close_fd(self.master);
-            end
+            let _ = std::fs::remove_dir_all(&self.base);
+        }
+    }
+
+    impl Drop for TestDaemon {
+        fn drop(&mut self) {
+            self.teardown();
         }
     }
 
     /// Binds `cfg`'s socket for `name` and runs [`daemon_loop`] on a thread
     /// with `command` (default: a 30 s `sleep`, a quiet child) and `kind`.
+    /// The handle owns `cfg.socket_dir` (removed on drop). NOTE: `daemon_loop`
+    /// reads the process-global `util::SIGTERM_RECEIVED` flag, so a future
+    /// test that raises a signal at the test binary can bleed into a
+    /// concurrent in-process daemon.
     fn spawn_test_daemon(
         cfg: &Config,
         name: &str,
@@ -1995,25 +2020,25 @@ mod tests {
             )
         });
         TestDaemon {
+            base: cfg.socket_dir.clone(),
             socket,
             child_pid,
             master,
             thread: Some(thread),
+            torn_down: false,
         }
     }
 
     #[test]
     fn info_reports_the_kind_the_session_was_created_with() {
-        let dir = temp_base();
         let cfg = Config {
-            socket_dir: dir.clone(),
+            socket_dir: temp_base(),
             group: "default".into(),
         };
         let handle = spawn_test_daemon(&cfg, "k1", None, SessionKind::Anonymous);
         let probe = crate::session::probe_session(&cfg.socket_path("k1").unwrap()).unwrap();
         assert_eq!(probe.info.kind, SessionKind::Anonymous);
         assert_eq!(handle.shutdown(), caps::SessionEnd::Killed);
-        let _ = std::fs::remove_dir_all(&dir);
     }
 
     fn new_term() -> Terminal {
