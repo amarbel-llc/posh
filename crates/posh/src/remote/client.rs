@@ -4626,19 +4626,7 @@ mod tests {
         );
     }
 
-    /// An empty session stack (no *Back* row) for the palette tests.
-    fn no_stack() -> crate::picker::StackView {
-        crate::picker::StackView { top: None, depth: 0, current: None }
-    }
-
-    /// A stack whose top is `target`, `depth` deep.
-    fn stacked(target: &str, depth: usize) -> crate::picker::StackView {
-        crate::picker::StackView {
-            top: Some(crate::picker::StackEntry { target: target.into(), kind: SessionKind::Named }),
-            depth,
-            current: None,
-        }
-    }
+    use crate::picker::{no_stack, stacked};
 
     /// The Commands palette with a stack top leads with *Back to <top>*
     /// (Ctrl-^ Enter = go back) and the switcher second; without one the

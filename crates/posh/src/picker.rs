@@ -682,6 +682,23 @@ pub(crate) fn switch_test_guard() -> std::sync::MutexGuard<'static, ()> {
     GUARD.lock().unwrap_or_else(|e| e.into_inner())
 }
 
+/// An empty session stack view (no *Back*), for the palette tests in both
+/// clients and `palette_view` — pure, no statics touched.
+#[cfg(test)]
+pub(crate) fn no_stack() -> StackView {
+    StackView { top: None, depth: 0, current: None }
+}
+
+/// A stack view whose top is `target` (a named session), `depth` deep.
+#[cfg(test)]
+pub(crate) fn stacked(target: &str, depth: usize) -> StackView {
+    StackView {
+        top: Some(StackEntry { target: target.into(), kind: SessionKind::Named }),
+        depth,
+        current: None,
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

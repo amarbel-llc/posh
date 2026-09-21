@@ -2787,24 +2787,14 @@ mod tests {
                 pop: true
             })
         );
-        let names = palette_names(&palette_commands(true, false, false, &stacked(":prev")));
-        assert_eq!(names[0], "Back to :prev", "{names:?}");
+        // A local target is spelled as the heading spells it: this machine's name.
+        let names = palette_names(&palette_commands(true, false, false, &stacked(":prev", 1)));
+        assert!(names[0].starts_with("Back to ") && names[0].ends_with(":prev"), "{names:?}");
+        assert!(!names[0].starts_with("Back to :"), "{names:?}");
         crate::picker::stack_pop();
     }
 
-    /// An empty session stack (no *Back* row) for the palette tests.
-    fn no_stack() -> crate::picker::StackView {
-        crate::picker::StackView { top: None, depth: 0, current: None }
-    }
-
-    /// A one-deep stack whose top is `target`.
-    fn stacked(target: &str) -> crate::picker::StackView {
-        crate::picker::StackView {
-            top: Some(crate::picker::StackEntry { target: target.into(), kind: SessionKind::Named }),
-            depth: 1,
-            current: None,
-        }
-    }
+    use crate::picker::{no_stack, stacked};
 
     fn palette_names(cmds: &Value) -> Vec<String> {
         cmds.as_array()
@@ -2819,7 +2809,7 @@ mod tests {
     /// no row is a Back (design 2026-09-21 §3).
     #[test]
     fn palette_commands_lead_with_back_only_with_a_stack_top() {
-        let with = palette_names(&palette_commands(true, false, false, &stacked("box:dev")));
+        let with = palette_names(&palette_commands(true, false, false, &stacked("box:dev", 1)));
         assert_eq!(with[0], "Back to box:dev", "{with:?}");
         assert_eq!(with[1], "Switch session…", "{with:?}");
         let without = palette_names(&palette_commands(true, false, false, &no_stack()));
