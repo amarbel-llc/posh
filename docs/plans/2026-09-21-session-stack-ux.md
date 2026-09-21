@@ -482,7 +482,7 @@ git commit -m "posh: --kind on start/attach --create, derived from the target cl
 
 ### Task 5: remote auto-id create is remote-atomic and anonymous, answered by a handshake line
 
-**Promotion criteria:** the pre-existing probe-then-attach path (`remote_session_names` + `first_free_autoid`) can be removed once every fleet host runs a `--kind`-aware posh (signal: no `falling back to probe` log line for 30 days). The space-separated `POSH START` line is itself slated for a pipe-delimited go-plugin-style cutover, tracked as posh#202.
+**Promotion criteria:** the pre-existing probe-then-attach path (`remote_session_names` + `first_free_autoid`) can be removed once every fleet host runs a `--kind`-aware posh (signal: no `remote start --kind unavailable` log line for 30 days). The space-separated `POSH START` line is itself slated for a pipe-delimited go-plugin-style cutover, tracked as posh#202.
 
 **Files:**
 - Modify: `crates/posh/src/main.rs:654-670` (`start_remote_auto`), plus a new `remote_start_argv` beside `remote_list_argv` (`:1345`)

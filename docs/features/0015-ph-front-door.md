@@ -87,7 +87,10 @@ local-vs-host decision differs (colon required).
 ### Auto-id sessions are managed by their activity label, not their id
 
 `:+` and the picker's create-new make a durable session with an **auto-generated
-id the user never types**. This is only usable because FDR 0011 + RFC 0013 §5
+id the user never types**. Those sessions are created with kind `anonymous`,
+recorded by the daemon at create time (design 2026-09-21 §1; `posh start --kind`),
+so the kind is an attribute the daemon holds, not an inference from the `s-N`
+name. This is only usable because FDR 0011 + RFC 0013 §5
 surface each session by its **frontmost activity label** (the terminal title
 plus the foreground-process command — RFC 0013 §5) in `posh list`, the
 picker, and completion. The auto-id is the stable machine key; the activity

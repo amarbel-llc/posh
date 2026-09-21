@@ -150,11 +150,15 @@ is the real *ssh* flag on the bootstrap, not posh forwarding.
 
 Local persistence over Unix sockets.
 
-*attach* [*--detach*] [*--create*] _name_ [*--*] [_command_...] (alias: *a*)
+*attach* [*--detach*] [*--create*] [*--kind* *anonymous*|*named*] _name_ [*--*] [_command_...] (alias: *a*)
 	Attach to an *existing* session; errors if it is absent (use *start*,
 	or *--create*). With *--create*, create-or-attach (running _command_,
 	default _$SHELL_, when created). With *--detach*, ensure the session
-	exists, print status, and exit without attaching. A *--* ends option
+	exists, print status, and exit without attaching. *--kind* sets the
+	kind a create makes (see *start*; default _named_, since the caller
+	chose the name) — it matters only with *--create*, a live session
+	keeps its own, and on a _host_*:*_session_ target it is currently
+	parsed and ignored. A *--* ends option
 	parsing so _command_ is taken literally. Detach key: *Ctrl-\\*.
 	Inside a session (_$POSH_SESSION_ set) this is the in-place
 	*switch* (FDR 0012): the viewport you typed it in re-homes onto
@@ -168,7 +172,7 @@ Local persistence over Unix sockets.
 	words included — is a *literal local* session name (the RFC 0001
 	escape hatch for names the namespace grammar shadows).
 
-*start* [*--detach*] [_target_] [*--*] [_command_...] (alias: *s*)
+*start* [*--detach*] [*--kind* *anonymous*|*named*] [_target_] [*--*] [_command_...] (alias: *s*)
 	Create a durable session (running _command_, default _$SHELL_) and
 	attach. Unlike *attach* this is strict: it errors if a named session
 	already exists (use *attach*). With no _target_ (or *:+*), create a
@@ -176,7 +180,16 @@ Local persistence over Unix sockets.
 	activity label. Remote targets work the same way: _host_*:*_name_
 	creates a named session on _host_ (strict — the host's session list
 	is probed first, and an existing name errors), while _host_*:* or
-	_host_*:+* creates a remote auto-id session (first free _s-N_).
+	_host_*:+* creates a remote auto-id session (first free _s-N_ — the
+	host picks it itself, answered by the *POSH START* handshake below;
+	a host too old for *--kind* or the handshake falls back to the
+	list-then-attach probe).
+	Every session has a *kind* — _anonymous_, _named_, or the reserved
+	_system_ — stated at create time and held by the daemon for the
+	session's life; it is never derived from the name, and a daemon
+	predating it reads _unknown_. *--kind* overrides the kind derived
+	from the target: an auto-id target (*:+*, _host_*:+*, no target) is
+	_anonymous_, a named one _named_; _system_ is not creatable.
 	With *--detach*, ensure-and-return, idempotent like
 	*attach --detach*. Inside a session, a local *start* creates the
 	session and then *switches* the issuing viewport onto it (FDR
@@ -184,17 +197,39 @@ Local persistence over Unix sockets.
 	non-durable throwaway roaming shell instead — see REMOTE
 	COMMANDS below.
 
+	*Handshake.* With _$POSH_HANDSHAKE_ set (*1*, *true*, *on*, or
+	*yes*), *start --detach* and *attach --detach* print one line on
+	stdout, before the usual _session "NAME" created_ / _already exists_
+	prose:
+
+	```
+	POSH START 1 <name> <kind>
+	```
+
+	where _1_ is the line's version, followed by the session name and
+	its kind; a later version appends fields after these, never reorders
+	them. For a session that already existed the kind is the *live* one
+	its daemon reports (_unknown_ from an older daemon); when the daemon
+	cannot be probed no line is printed. The same family as the
+	*POSH CONNECT* / *POSH IP* lines of *posh-server*(1): a script reads
+	the *POSH* line and ignores the prose. *ph* _host_*:+* is the
+	consumer — it runs *start --detach --kind anonymous* over ssh with
+	the variable set, reads the name, then attaches.
+
 *list* [*--short*] [*-j*|*--json*] [*--complete*] [*-w*|*--watch* [*--interval* _N_]] (aliases: *ls*, *l*)
 	List sessions in the group: name, pid, attached client count.
 	When stdout is a terminal the default output is a styled table
 	with a state-colored status dot (attached, detached, or stale),
+	a KIND column (_anonymous_, _named_, or _system_ — see *start*;
+	empty for a daemon that predates the kind),
 	the working directory and command of each session, and an ECHO
 	column condensing the first attached client's echo model, control,
 	and rtt from the session's status socket (see *status*; empty for a
 	daemon that predates RFC 0014); when
 	piped it is plain tab-separated lines, unchanged for scripts. The
 	mux endpoints have their own table, *mux ls*. *--short* prints names only; *--json*
-	prints a machine-readable array; *--complete* prints
+	prints a machine-readable array, each row carrying a _kind_ field
+	(_anonymous_, _named_, or _system_; omitted when unknown); *--complete* prints
 	_name_<TAB>_summary_ lines (the RFC 0013 §5 activity label,
 	else the launch command) for shell completion — the *ph* fish
 	completion renders the summary as each candidate's description.
@@ -367,6 +402,12 @@ _POSH_SESSION_
 _POSH_KEY_
 	Remote session key, read by *posh client* (never passed on the
 	command line). See *posh-client*(1).
+
+_POSH_HANDSHAKE_
+	When set (*1*, *true*, *on*, or *yes*), *start --detach* and
+	*attach --detach* print the *POSH START 1* _name_ _kind_ handshake
+	line on stdout ahead of their status prose (see *start*). Off by
+	default; *ph* _host_*:+* sets it on the ssh command it runs.
 
 _POSH_PREDICTION_MODEL_
 	Local-echo prediction model: _always_, _never_, _adaptive_

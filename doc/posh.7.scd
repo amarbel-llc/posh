@@ -76,6 +76,12 @@ The persistence rules:
   attached clients with the real exit code, removes the socket, and
   exits with that code. A subsequent attach to the same name creates a
   fresh session.
+- *A session's kind is a daemon-held attribute, not a naming
+  convention.* Every session is created as _anonymous_ (the auto-id
+  *:+* / _host_*:+* / bare *start* forms), _named_, or the reserved
+  _system_, and the daemon holds that kind for the session's life; a
+  session is never reclassified by what its name looks like. See
+  *start --kind* in *posh*(1).
 
 For remote sessions the transport pair (*posh-server*(1) plus an inner
 *posh attach*) is disposable — one pair per roaming client — while the
