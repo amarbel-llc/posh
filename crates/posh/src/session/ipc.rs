@@ -4,6 +4,8 @@
 
 use std::os::fd::RawFd;
 
+use posh_proto::caps::SessionKind;
+
 use crate::util;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -299,7 +301,8 @@ pub const MAX_ACTIVITY_LEN: usize = 256;
 /// activity label after this core (a u16 length prefix + up to MAX_ACTIVITY_LEN
 /// bytes, RFC 0013 §5); `decode` tolerates its absence so a core-only record
 /// from a pre-activity daemon still decodes (label reads empty). The encoded
-/// length is INFO_LEN + 2 + label for a newer record.
+/// length is INFO_LEN + 2 + label for a newer record, plus one trailing
+/// session-kind byte (design 2026-09-21 §1) from a kind-aware daemon.
 pub const INFO_LEN: usize = 8 + 4 + 2 + 2 + MAX_CMD_LEN + MAX_CWD_LEN;
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -311,6 +314,9 @@ pub struct SessionInfo {
     /// The RFC 0013 §5 activity label (`title · process`, or empty). Appended
     /// after the fixed core on the wire; empty from a pre-activity daemon.
     pub activity: String,
+    /// The session's kind (design 2026-09-21 §1), one byte appended after
+    /// the activity label; `Unknown` from a daemon that predates it.
+    pub kind: SessionKind,
 }
 
 impl SessionInfo {
@@ -355,6 +361,9 @@ impl SessionInfo {
         let act_len = act.len().min(MAX_ACTIVITY_LEN);
         out.extend_from_slice(&(act_len as u16).to_le_bytes());
         out.extend_from_slice(&act[..act_len]);
+        // The session kind rides one byte after the label; a pre-kind client
+        // stops reading after the label and never sees it.
+        out.push(self.kind.to_byte());
         out
     }
 
@@ -373,16 +382,24 @@ impl SessionInfo {
         let cwd = String::from_utf8_lossy(&payload[cwd_start..cwd_start + cwd_len]).into_owned();
         // The activity label (RFC 0013 §5) is appended after the fixed core by a
         // newer daemon; a pre-activity record ends at INFO_LEN and reads empty.
+        // The session kind (design 2026-09-21 §1) is one byte after the
+        // label; absent from a pre-kind daemon and read as `Unknown`.
         let tail = &payload[INFO_LEN..];
-        let activity = if tail.len() >= 2 {
+        let (activity, kind) = if tail.len() >= 2 {
             let len = (u16::from_le_bytes([tail[0], tail[1]]) as usize).min(MAX_ACTIVITY_LEN);
             if tail.len() >= 2 + len {
-                String::from_utf8_lossy(&tail[2..2 + len]).into_owned()
+                let activity = String::from_utf8_lossy(&tail[2..2 + len]).into_owned();
+                let kind = tail
+                    .get(2 + len)
+                    .copied()
+                    .map(SessionKind::from_byte)
+                    .unwrap_or_default();
+                (activity, kind)
             } else {
-                String::new()
+                (String::new(), SessionKind::Unknown)
             }
         } else {
-            String::new()
+            (String::new(), SessionKind::Unknown)
         };
         Some(SessionInfo {
             clients,
@@ -390,6 +407,7 @@ impl SessionInfo {
             cmd,
             cwd,
             activity,
+            kind,
         })
     }
 }
@@ -576,10 +594,45 @@ mod tests {
             cmd: "htop -d 10".to_string(),
             cwd: "/home/user/project".to_string(),
             activity: "htop".to_string(),
+            kind: SessionKind::Named,
         };
         let bytes = info.encode();
-        assert_eq!(bytes.len(), INFO_LEN + 2 + "htop".len());
+        assert_eq!(bytes.len(), INFO_LEN + 2 + "htop".len() + 1);
         assert_eq!(SessionInfo::decode(&bytes), Some(info));
+    }
+
+    #[test]
+    fn info_kind_roundtrip() {
+        let info = SessionInfo {
+            clients: 0,
+            pid: 1,
+            cmd: "bash".to_string(),
+            cwd: String::new(),
+            activity: String::new(),
+            kind: SessionKind::Anonymous,
+        };
+        let bytes = info.encode();
+        // core + (u16 len + 0 activity bytes) + 1 kind byte
+        assert_eq!(bytes.len(), INFO_LEN + 2 + 1);
+        assert_eq!(SessionInfo::decode(&bytes).unwrap().kind, SessionKind::Anonymous);
+    }
+
+    #[test]
+    fn info_decodes_pre_kind_record_as_unknown() {
+        // A daemon with the activity tail but no kind byte (2026-09 builds).
+        let info = SessionInfo {
+            clients: 0,
+            pid: 1,
+            cmd: "bash".to_string(),
+            cwd: String::new(),
+            activity: "vim".to_string(),
+            kind: SessionKind::Named,
+        };
+        let mut bytes = info.encode();
+        bytes.truncate(INFO_LEN + 2 + "vim".len());
+        let decoded = SessionInfo::decode(&bytes).unwrap();
+        assert_eq!(decoded.activity, "vim");
+        assert_eq!(decoded.kind, SessionKind::Unknown);
     }
 
     #[test]
@@ -597,6 +650,7 @@ mod tests {
             cmd: argv.join("\0"),
             cwd: String::new(),
             activity: String::new(),
+            kind: SessionKind::Unknown,
         };
         let decoded = SessionInfo::decode(&info.encode()).unwrap();
         assert_eq!(decoded.cmd_argv(), argv);
@@ -611,6 +665,7 @@ mod tests {
             cmd: "x".repeat(400),
             cwd: "y".repeat(300),
             activity: "z".repeat(400),
+            kind: SessionKind::Unknown,
         };
         let decoded = SessionInfo::decode(&info.encode()).unwrap();
         assert_eq!(decoded.cmd.len(), MAX_CMD_LEN);
@@ -626,6 +681,7 @@ mod tests {
             cmd: "bash".to_string(),
             cwd: String::new(),
             activity: "~/notes · vim".to_string(),
+            kind: SessionKind::Unknown,
         };
         assert_eq!(
             SessionInfo::decode(&info.encode()).unwrap().activity,
@@ -643,6 +699,7 @@ mod tests {
             cmd: "bash".to_string(),
             cwd: "/tmp".to_string(),
             activity: "dropped".to_string(),
+            kind: SessionKind::Unknown,
         };
         let mut core = info.encode();
         core.truncate(INFO_LEN); // drop the appended activity, as an old daemon would

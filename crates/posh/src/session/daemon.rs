@@ -5,6 +5,7 @@ use std::io::Write;
 use std::os::fd::{AsRawFd, RawFd};
 use std::os::unix::net::{UnixListener, UnixStream};
 
+use posh_proto::caps::SessionKind;
 use posh_term::{ScreenSwitch, Terminal};
 
 use crate::overlay::{close_overlay, escape_command, Overlay};
@@ -1548,6 +1549,7 @@ fn daemon_loop(
                                         cmd: info_cmd.to_string(),
                                         cwd: cwd.to_string(),
                                         activity,
+                                        kind: SessionKind::Unknown,
                                     };
                                     c.queue(Tag::Info, &info.encode());
                                 }
