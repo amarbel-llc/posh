@@ -27,7 +27,11 @@ const VERSION: &str = env!("POSH_VERSION");
 const GIT_SHA: &str = env!("POSH_GIT_SHA");
 
 fn main() {
-    if let Err(e) = run() {
+    let result = run();
+    // The viewport status socket (RFC 0014 §6) lives in a static: unbind on
+    // every way out so its files never outlive the process.
+    viewport_status::shutdown();
+    if let Err(e) = result {
         eprintln!("posh: {e}");
         std::process::exit(1);
     }
@@ -45,25 +49,17 @@ fn main() {
 /// viewport returns to the session under it, with a banner saying why. With
 /// nothing to pop, the ended session's exit status becomes the process's,
 /// and a lost one is reported on stderr. The viewport status socket (RFC
-/// 0014 §6) is bound for the whole loop and refreshed at every stack /
-/// current change; the overlay helpers refresh it themselves.
+/// 0014 §6), bound by the first attach, is refreshed at every stack /
+/// current change here; the overlay helpers refresh it themselves.
 fn run() -> Result<()> {
-    // A `posh-server` process is a remote's server, never a viewport.
-    let status = if invoked_as("posh-server") { None } else { viewport_status::ViewportStatus::bind() };
-    let refresh = || {
-        if let Some(s) = &status {
-            s.refresh();
-        }
-    };
     let once = run_once();
-    refresh();
+    viewport_status::refresh_now();
     once?;
     loop {
         let end = picker::take_attach_end();
         let Some(sw) = picker::take_switch().or_else(|| picker::auto_pop(end.as_ref())) else {
-            // Unbind before a `process::exit` inside: that skips Drop, and
-            // the socket + pidfile would outlive the viewport until reaped.
-            drop(status);
+            // Unbind before the `process::exit` inside, which skips `main`'s.
+            viewport_status::shutdown();
             return exit_with_attach_end(end);
         };
         // Kill-after-attach: arm the kill of the session being LEFT for the
@@ -82,9 +78,9 @@ fn run() -> Result<()> {
         } else if force.is_none() {
             picker::stack_push_current();
         }
-        refresh();
+        viewport_status::refresh_now();
         let dispatched = dispatch_ph(ph_parse(Some(&sw.target)), &picker::default_group());
-        refresh();
+        viewport_status::refresh_now();
         if let Err(e) = dispatched {
             picker::disarm_kill();
             // An automatic pop whose re-dial failed: say what happened to the

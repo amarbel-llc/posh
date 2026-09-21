@@ -1,13 +1,15 @@
 //! RFC 0014 §6: the viewport is the daemon for its own history. One
 //! `<base>/viewports/<pid>.status.sock` (+ `.status.pid`) per front-door
 //! process, answering connect → response → EOF like a session daemon's
-//! status socket (§4.1). The response is rebuilt by [`ViewportStatus::refresh`]
-//! whenever the stack, the current attach, or an overlay changes (the
-//! front door's re-attach loop calls it; the overlay helpers call
-//! [`refresh_now`] through the hook the bind registers); the accept thread
-//! serves the latest snapshot. `POSH_VIEWPORT_STATUS=0|off|false|no` skips
-//! the bind (diagnostic only; nothing depends on it). Best-effort
-//! throughout: a bind failure is a warn line, never a failed attach.
+//! status socket (§4.1). Bound on the process's FIRST attach
+//! ([`ensure_bound`] from `picker::set_current` — design §2; a listing never
+//! binds), held in a static until [`shutdown`] on the way out. The response
+//! is rebuilt by [`refresh_now`] whenever the stack, the current attach, or
+//! an overlay changes (the front door's re-attach loop and the overlay
+//! helpers call it); the accept thread serves the latest snapshot.
+//! `POSH_VIEWPORT_STATUS=0|off|false|no` skips the bind (diagnostic only;
+//! nothing depends on it). Best-effort throughout: a bind failure is a warn
+//! line, never a failed attach.
 //!
 //! Response grammar (design 2026-09-21 §2):
 //!
@@ -58,22 +60,53 @@ fn enabled_by_env() -> bool {
     }
 }
 
-/// The text the overlay helpers refresh without owning the handle: the
-/// bound socket's shared response, registered by [`bind_in`], cleared on
-/// drop. One per process — a front door binds once.
-static HOOK: Mutex<Option<Arc<Mutex<String>>>> = Mutex::new(None);
+/// The process's one bound socket (design §2: the front door binds on its
+/// FIRST attach — `picker::set_current`, which every attach entry point
+/// calls and no listing does). `None` until then, after [`shutdown`], under
+/// the env opt-out, or when the bind failed.
+static HANDLE: Mutex<Option<ViewportStatus>> = Mutex::new(None);
+
+/// Under test the base is an explicit override, else there is NO bind: the
+/// many tests that call `set_current` must never touch the real socket dir.
+#[cfg(test)]
+static TEST_BASE: Mutex<Option<PathBuf>> = Mutex::new(None);
+
+fn bind_base() -> Option<PathBuf> {
+    #[cfg(test)]
+    {
+        TEST_BASE.lock().unwrap_or_else(|e| e.into_inner()).clone()
+    }
+    #[cfg(not(test))]
+    {
+        Some(dir())
+    }
+}
+
+/// Bind this process's socket if it is not bound yet (idempotent; honors
+/// the env gate). Called by `picker::set_current` — the first attach.
+pub fn ensure_bound() {
+    let mut handle = HANDLE.lock().unwrap_or_else(|e| e.into_inner());
+    if handle.is_some() {
+        return;
+    }
+    if let Some(base) = bind_base() {
+        *handle = bind_in(&base, enabled_by_env());
+    }
+}
+
+/// Unbind: stop serving and remove the socket + pidfile. The handle is a
+/// static, so nothing drops it at exit — the front door calls this on
+/// every way out (before a `process::exit`, and after `run()` returns).
+pub fn shutdown() {
+    HANDLE.lock().unwrap_or_else(|e| e.into_inner()).take();
+}
 
 /// Rebuild the bound socket's response from the picker state; a no-op when
 /// no socket is bound (a `posh list`, a test, the env opt-out).
 pub fn refresh_now() {
-    let hook = HOOK.lock().unwrap_or_else(|e| e.into_inner()).clone();
-    if let Some(text) = hook {
-        render_into(&text);
+    if let Some(s) = HANDLE.lock().unwrap_or_else(|e| e.into_inner()).as_ref() {
+        s.refresh();
     }
-}
-
-fn render_into(text: &Mutex<String>) {
-    *text.lock().unwrap_or_else(|e| e.into_inner()) = render(&picker::snapshot(), std::process::id());
 }
 
 /// The bound socket: dropping it stops the accept thread and removes the
@@ -87,28 +120,20 @@ pub struct ViewportStatus {
 }
 
 impl ViewportStatus {
-    /// Bind this process's socket under [`dir`], unless the env opts out.
-    pub fn bind() -> Option<ViewportStatus> {
-        bind_in(&dir(), enabled_by_env())
-    }
-
-    /// Rebuild the response from the picker state (after a stack push / pop
-    /// or an attach's return).
-    pub fn refresh(&self) {
-        render_into(&self.text);
-    }
-
-    #[cfg(test)]
-    fn text(&self) -> String {
-        self.text.lock().unwrap_or_else(|e| e.into_inner()).clone()
+    /// Rebuild the response from the picker state.
+    fn refresh(&self) {
+        *self.text.lock().unwrap_or_else(|e| e.into_inner()) = render(&picker::snapshot(), std::process::id());
     }
 }
 
-/// [`ViewportStatus::bind`] against an explicit base and gate, so tests
-/// touch neither the env nor the real socket dir. Reaps dead siblings first;
-/// mirrors `server.rs::bind_remote_status_socket` (pidfile first, a stale
-/// socket removed, 0700 dir) and degrades to `None` with a warn line.
-pub(crate) fn bind_in(dir: &Path, enabled: bool) -> Option<ViewportStatus> {
+#[cfg(test)]
+static BINDS: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
+
+/// The bind against an explicit base and gate, so tests touch neither the
+/// env nor the real socket dir. Reaps dead siblings first; mirrors
+/// `server.rs::bind_remote_status_socket` (pidfile first, a stale socket
+/// removed, 0700 dir) and degrades to `None` with a warn line.
+fn bind_in(dir: &Path, enabled: bool) -> Option<ViewportStatus> {
     if !enabled {
         return None;
     }
@@ -138,7 +163,8 @@ pub(crate) fn bind_in(dir: &Path, enabled: bool) -> Option<ViewportStatus> {
         let _ = std::fs::remove_file(&pidfile);
         return None;
     }
-    *HOOK.lock().unwrap_or_else(|e| e.into_inner()) = Some(Arc::clone(&text));
+    #[cfg(test)]
+    BINDS.fetch_add(1, Ordering::Relaxed);
     let status = ViewportStatus { sock, pidfile, text, thread, stop };
     status.refresh();
     Some(status)
@@ -179,12 +205,6 @@ fn serve(listener: UnixListener, text: &Mutex<String>, stop: &AtomicBool) {
 impl Drop for ViewportStatus {
     fn drop(&mut self) {
         self.stop.store(true, Ordering::Relaxed);
-        {
-            let mut hook = HOOK.lock().unwrap_or_else(|e| e.into_inner());
-            if hook.as_ref().is_some_and(|h| Arc::ptr_eq(h, &self.text)) {
-                *hook = None;
-            }
-        }
         // The thread wakes every tick; the join is bounded by that.
         if let Some(t) = self.thread.take() {
             let _ = t.join();
@@ -244,8 +264,8 @@ pub(crate) fn render(snap: &Snapshot, pid: u32) -> String {
 }
 
 /// `posh status --viewport [pid]`: print one viewport's response, or (no
-/// pid) reap the dead and list every live viewport pid, one per line — the
-/// asking process excluded (the front door binds for every invocation).
+/// pid) reap the dead and list every live viewport pid, one per line (a
+/// listing process never binds, so it never lists itself).
 pub fn cmd_status(pid: Option<u32>) -> Result<()> {
     let dir = dir();
     match pid {
@@ -257,7 +277,7 @@ pub fn cmd_status(pid: Option<u32>) -> Result<()> {
         }
         None => {
             reap_dead_in(&dir);
-            for pid in registered_pids(&dir).into_iter().filter(|p| *p != std::process::id()) {
+            for pid in registered_pids(&dir) {
                 println!("{pid}");
             }
         }
@@ -323,38 +343,58 @@ mod tests {
         assert!(!dir.exists());
     }
 
-    /// The socket answers the rendered text and an overlay change reaches it
-    /// through the hook; dropping removes both files and unregisters.
+    /// The first attach (`set_current`) binds once under the test base; a
+    /// second attach does not rebind. The socket answers the rendered text,
+    /// an overlay change reaches it on its own, an explicit `refresh_now`
+    /// picks up a stack change, and `shutdown` removes both files. Other
+    /// tests may call `set_current` concurrently: with the base set they hit
+    /// the idempotent path, with it cleared they bind nothing.
     #[test]
-    fn bound_socket_serves_the_rendered_text_and_drop_cleans_up() {
+    fn first_attach_binds_once_and_shutdown_cleans_up() {
         let _g = picker::switch_test_guard();
+        while picker::stack_pop().is_some() {}
         let dir = tmp("bind");
         let pid = std::process::id();
-        let s = bind_in(&dir, true)
-            .unwrap_or_else(|| panic!("bind under {}: {:?}", dir.display(), bind_listener(&dir, pid).err()));
+        shutdown();
+        *TEST_BASE.lock().unwrap() = Some(dir.clone());
+        let binds = BINDS.load(Ordering::Relaxed);
+        picker::set_current(":vs-test");
+        assert!(
+            HANDLE.lock().unwrap().is_some(),
+            "bind under {}: {:?}",
+            dir.display(),
+            bind_listener(&dir, pid).err()
+        );
+        assert_eq!(BINDS.load(Ordering::Relaxed), binds + 1);
+        picker::set_current(":vs-test");
+        assert_eq!(BINDS.load(Ordering::Relaxed), binds + 1, "a second attach does not rebind");
         let sock = sock_path(&dir, pid);
         let pidfile = pid_path(&dir, pid);
         assert_eq!(std::fs::read_to_string(&pidfile).unwrap(), pid.to_string());
         let served = session::read_status_socket(&sock).unwrap();
-        assert_eq!(served, s.text());
         assert!(served.starts_with(&format!("viewport pid={pid} ")), "{served}");
-        // The overlay helpers refresh without the handle.
-        picker::set_current(":vs-test");
-        picker::overlay_open("picker");
+        // The overlay helpers refresh on their own. The `leave` kind is the
+        // one no concurrent renderer test opens (they record palette / picker
+        // over whatever `current` is), so its line is this test's alone.
+        picker::overlay_open("leave");
         let served = session::read_status_socket(&sock).unwrap();
-        assert!(served.contains("overlay kind=picker over=:vs-test\n"), "{served}");
-        picker::overlay_close("picker");
-        assert!(!session::read_status_socket(&sock).unwrap().contains("over=:vs-test"));
+        assert!(served.contains("overlay kind=leave over=:vs-test\n"), "{served}");
+        picker::overlay_close("leave");
+        assert!(!session::read_status_socket(&sock).unwrap().contains("kind=leave"));
         // An explicit refresh picks up a picker change made without one.
         picker::stack_push_current();
-        assert!(!s.text().contains("stack depth=1 target=:vs-test"));
-        s.refresh();
-        assert!(s.text().contains("stack depth=1 target=:vs-test kind=unknown\n"), "{}", s.text());
+        assert!(!session::read_status_socket(&sock).unwrap().contains("stack depth=1 target=:vs-test"));
+        refresh_now();
+        let served = session::read_status_socket(&sock).unwrap();
+        assert!(served.contains("stack depth=1 target=:vs-test kind=unknown\n"), "{served}");
         picker::stack_pop();
-        drop(s);
+        *TEST_BASE.lock().unwrap() = None;
+        shutdown();
         assert!(!sock.exists() && !pidfile.exists());
-        assert!(HOOK.lock().unwrap().is_none());
+        assert!(HANDLE.lock().unwrap().is_none());
         refresh_now(); // a no-op once unbound
+        picker::set_current(":vs-after");
+        assert!(HANDLE.lock().unwrap().is_none(), "no base under test: no bind");
         let _ = std::fs::remove_dir_all(&dir);
     }
 

@@ -412,7 +412,9 @@ fn display_target(target: &str) -> String {
 
 /// A new attach: the kind is `Unknown` until its daemon says; an anonymous
 /// create iff a creator flagged this attach (`next_attach_is_anonymous_create`,
-/// consumed here).
+/// consumed here). The FIRST attach of the process binds the RFC 0014 §6
+/// viewport status socket (design §2) — every attach entry point passes
+/// here, no listing does.
 pub fn set_current(target: &str) {
     let anonymous_create =
         std::mem::take(&mut *NEXT_ATTACH_ANONYMOUS_CREATE.lock().unwrap_or_else(|e| e.into_inner()));
@@ -421,6 +423,7 @@ pub fn set_current(target: &str) {
         kind: SessionKind::Unknown,
         anonymous_create,
     });
+    crate::viewport_status::ensure_bound();
 }
 
 /// Flag the next attach as an anonymous session this front door is creating
