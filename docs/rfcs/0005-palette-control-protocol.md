@@ -138,6 +138,7 @@ Show a view. `result` is an empty object `{}` acknowledging the view is up
 | `commands` | command[] | for `palette` | The command list (§5).             |
 | `title`    | string    | no       | Heading; default `"Commands"` (palette) / `"Info"` (dialog) / `"Sessions"` (picker). |
 | `prompt`   | string    | no       | Filter-input prompt; default `"/ "` (palette and picker). |
+| `description` | string | no       | Free text a `palette` or `picker` shows between the heading and the filter input, word-wrapped to the panel; never matched by the filter. Absent or empty: nothing is shown and the layout is unchanged. |
 | `body`     | string    | for `dialog` | The text the `dialog` view displays.   |
 | `rows`     | row[]     | for `picker` | The table rows (§3.5).                 |
 | `empty`    | string    | no       | Text shown by a `picker` with no rows; default `"(no sessions)"`. |
@@ -309,5 +310,8 @@ version **1**. Backward-compatible growth (new optional `params` fields, new
 `view` kinds, new §7 methods) does NOT bump the version — a peer MUST ignore
 unknown object fields and answer unknown methods/views with the appropriate
 error. A breaking change bumps the version and is negotiated by the handshake.
+So a renderer that predates the `description` param (§3.2) simply shows the
+`palette` / `picker` without it — the field is an unknown object field it MUST
+ignore, never a `-32602`.
 
 [JSON-RPC 2.0]: https://www.jsonrpc.org/specification

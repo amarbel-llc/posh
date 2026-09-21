@@ -127,6 +127,9 @@ type showParams struct {
 	Commands []command `json:"commands,omitempty"`
 	Title    string    `json:"title,omitempty"`
 	Prompt   string    `json:"prompt,omitempty"`
+	// Description is free text a "palette" or "picker" shows between the
+	// heading and the filter input (RFC 0005 §3.2); never filtered on.
+	Description string `json:"description,omitempty"`
 	// Body is the text rendered by the "dialog" view (RFC 0005 §3.2).
 	Body string `json:"body,omitempty"`
 	// Rows and Empty belong to the "picker" view (RFC 0005 §3.5): the table
@@ -192,9 +195,12 @@ type model struct {
 	input    textinput.Model
 	keys     keymap
 	title    string
-	commands []command
-	filtered []command
-	selected int
+	// description is the RFC 0005 §3.2 free-text block a palette or picker
+	// draws under its heading; empty when the show carried none.
+	description string
+	commands    []command
+	filtered    []command
+	selected    int
 	// Picker view (RFC 0005 §3.5): the table rows, the filtered subset the
 	// list and `selected` index over, and the no-rows text.
 	rows         []row
@@ -239,6 +245,7 @@ func (m model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 			if m.title == "" {
 				m.title = "Commands"
 			}
+			m.description = msg.Description // cleared when the show carried none
 			if msg.Prompt != "" {
 				m.input.Prompt = msg.Prompt
 			}
@@ -265,6 +272,7 @@ func (m model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 			if m.empty == "" {
 				m.empty = "(no sessions)"
 			}
+			m.description = msg.Description // cleared when the show carried none
 			if msg.Prompt != "" {
 				m.input.Prompt = msg.Prompt
 			}
@@ -422,6 +430,7 @@ func (m model) pickerView() string {
 	var b strings.Builder
 	b.WriteString(titleStyle.Render(m.title))
 	b.WriteByte('\n')
+	m.writeDescription(&b)
 	b.WriteString(m.input.View())
 	b.WriteString("\n\n")
 	// The panel width tracks the terminal (capped); the rows get what is left
@@ -523,10 +532,24 @@ func (m model) dialogView() string {
 	return style.Render(b.String())
 }
 
+// writeDescription puts the RFC 0005 §3.2 description block (dim, followed
+// by a blank line) between the title line and the filter input of a palette
+// or picker. Nothing is written when there is none, so the layout without a
+// description is unchanged. Wrapping is the panel's: the style's Width folds
+// long lines inside the frame, as it does the dialog body.
+func (m model) writeDescription(b *strings.Builder) {
+	if m.description == "" {
+		return
+	}
+	b.WriteString(dimStyle.Render(m.description))
+	b.WriteString("\n\n")
+}
+
 func (m model) paletteView() string {
 	var b strings.Builder
 	b.WriteString(titleStyle.Render(m.title))
 	b.WriteByte('\n')
+	m.writeDescription(&b)
 	b.WriteString(m.input.View())
 	b.WriteString("\n\n")
 	if len(m.filtered) == 0 {

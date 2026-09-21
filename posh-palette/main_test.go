@@ -214,6 +214,72 @@ func TestPickerViewAlignsColumns(t *testing.T) {
 	}
 }
 
+// A `description` (RFC 0005 §3.2) is drawn dim between the heading and the
+// filter input of a palette and of a picker — every line of it, in order —
+// and is never part of what the filter matches.
+func TestDescriptionRendersBetweenTitleAndInput(t *testing.T) {
+	for _, view := range []string{"palette", "picker"} {
+		updated, _ := newModel(&conn{}).Update(showMsg{
+			View: view, Title: "Leaving", Description: "alpha\nbeta",
+			Commands: []command{{Name: "Keep"}},
+			Rows:     []row{{Cells: []string{"Keep"}}},
+		})
+		m := updated.(model)
+		if m.description != "alpha\nbeta" {
+			t.Fatalf("%s: description = %q", view, m.description)
+		}
+		out := m.paletteView()
+		if view == "picker" {
+			out = m.pickerView()
+		}
+		title, a, b, prompt := strings.Index(out, "Leaving"), strings.Index(out, "alpha"), strings.Index(out, "beta"), strings.Index(out, "/ ")
+		if title < 0 || a < 0 || b < 0 || prompt < 0 {
+			t.Fatalf("%s: missing a part (title=%d alpha=%d beta=%d prompt=%d) in:\n%s", view, title, a, b, prompt, out)
+		}
+		if !(title < a && a < b && b < prompt) {
+			t.Errorf("%s: want title < alpha < beta < prompt, got %d %d %d %d in:\n%s", view, title, a, b, prompt, out)
+		}
+		// The description is not filterable: a query only it contains matches nothing.
+		m.input.SetValue("alpha")
+		m.recompute()
+		if m.listLen() != 0 {
+			t.Errorf("%s: the description must not match the filter (listLen=%d)", view, m.listLen())
+		}
+		// A later show without a description clears it.
+		updated, _ = m.Update(showMsg{View: view, Title: "Leaving"})
+		if d := updated.(model).description; d != "" {
+			t.Errorf("%s: description not cleared by a show without one: %q", view, d)
+		}
+	}
+}
+
+// Without a description the layout is what it was: the filter input sits on
+// the line right after the heading, no block in between.
+func TestNoDescriptionKeepsInputUnderTitle(t *testing.T) {
+	for _, view := range []string{"palette", "picker"} {
+		updated, _ := newModel(&conn{}).Update(showMsg{View: view, Title: "Leaving"})
+		m := updated.(model)
+		out := m.paletteView()
+		if view == "picker" {
+			out = m.pickerView()
+		}
+		lines := strings.Split(out, "\n")
+		at := -1
+		for i, l := range lines {
+			if strings.Contains(l, "Leaving") {
+				at = i
+				break
+			}
+		}
+		if at < 0 || at+1 >= len(lines) {
+			t.Fatalf("%s: no title line in:\n%s", view, out)
+		}
+		if !strings.Contains(lines[at+1], "/ ") {
+			t.Errorf("%s: the input must follow the title directly, got %q in:\n%s", view, lines[at+1], out)
+		}
+	}
+}
+
 // ui.show accepts exactly the three RFC 0005 views.
 func TestKnownViews(t *testing.T) {
 	for _, v := range []string{"palette", "dialog", "picker"} {
