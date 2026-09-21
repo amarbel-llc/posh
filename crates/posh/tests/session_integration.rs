@@ -76,13 +76,17 @@ fn daemon_lifecycle_create_list_kill() {
     let lines: Vec<&str> = stdout.lines().collect();
     assert_eq!(lines.len(), 2, "expected header + 1 row: {stdout}");
     let fields: Vec<&str> = lines[1].split('\t').collect();
-    assert_eq!(fields.len(), 7, "row: {fields:?}");
+    // NAME STATUS PID CLIENTS KIND STARTED-IN ACTIVITY ECHO
+    assert_eq!(fields.len(), 8, "row: {fields:?}");
     assert_eq!(fields[0], "itest", "row: {fields:?}"); // NAME
     assert_eq!(fields[3], "0", "row: {fields:?}"); // CLIENTS
+    // A plain `attach --detach <name>` creates a named session (2026-09-21
+    // session-stack plan §1), and the daemon reports that kind on Info.
+    assert_eq!(fields[4], "named", "row: {fields:?}"); // KIND
     // ACTIVITY prefers the RFC 0013 activity label over the launch cmd once
     // the daemon has one (here, the foreground process name); either way it
     // names the `sleep` process.
-    assert!(fields[5].contains("sleep"), "row: {fields:?}"); // ACTIVITY
+    assert!(fields[6].contains("sleep"), "row: {fields:?}"); // ACTIVITY
 
     // Creating it again is a no-op.
     let out = posh(&dir, &["attach", "--detach", "itest"]);
