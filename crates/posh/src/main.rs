@@ -359,7 +359,8 @@ fn cmd_attach(
     args: &[String],
     forward_flag: &remote::agent::ForwardFlag,
 ) -> Result<()> {
-    let (detach_flag, create_flag, kind, name, command) = parse_attach_args(args)?;
+    let AttachArgs { detach: detach_flag, create: create_flag, kind, name, command } =
+        parse_attach_args(args)?;
     let command = (!command.is_empty()).then(|| command.to_vec());
     // A `--kind` on attach names the kind a create-or-attach / ensure would
     // create with; absent, an attach-created session is named (its name was
@@ -473,9 +474,7 @@ impl SessionFlags {
 /// migration target); in Phase A it is behaviourally identical to the bare
 /// form, which stays create-or-attach. `--kind` is the created session's kind
 /// (absent = the caller's default).
-fn parse_attach_args(
-    args: &[String],
-) -> Result<(bool, bool, Option<SessionKind>, &str, &[String])> {
+fn parse_attach_args(args: &[String]) -> Result<AttachArgs<'_>> {
     let mut flags = SessionFlags::default();
     let mut i = 0;
     flags.consume(args, &mut i, true)?;
@@ -487,7 +486,34 @@ fn parse_attach_args(
     if args.get(i).map(String::as_str) == Some("--") {
         i += 1;
     }
-    Ok((flags.detach, flags.create, flags.kind, name, &args[i..]))
+    Ok(AttachArgs {
+        detach: flags.detach,
+        create: flags.create,
+        kind: flags.kind,
+        name,
+        command: &args[i..],
+    })
+}
+
+/// The parse of `posh attach`'s argv (`parse_attach_args`): the flags, the
+/// mandatory name, and the opaque create-command after it.
+#[derive(Debug, PartialEq, Eq)]
+struct AttachArgs<'a> {
+    detach: bool,
+    create: bool,
+    kind: Option<SessionKind>,
+    name: &'a str,
+    command: &'a [String],
+}
+
+/// The parse of `posh start`'s argv (`parse_start_args`): the flags, the
+/// OPTIONAL target (`None` = auto-id), and the opaque create-command.
+#[derive(Debug, PartialEq, Eq)]
+struct StartArgs<'a> {
+    detach: bool,
+    kind: Option<SessionKind>,
+    target: Option<&'a str>,
+    command: &'a [String],
 }
 
 /// Parse `start` args as `[--detach|--kind K]... [target] [--detach|--kind K]...
@@ -495,9 +521,7 @@ fn parse_attach_args(
 /// leading `--`) means an auto-id session (`posh start` / `posh start -- cmd`).
 /// `--` ends option parsing so the create-command stays opaque. `--kind` absent
 /// is `None`: the caller derives it from the target class (`start_kind`).
-fn parse_start_args(
-    args: &[String],
-) -> Result<(bool, Option<SessionKind>, Option<&str>, &[String])> {
+fn parse_start_args(args: &[String]) -> Result<StartArgs<'_>> {
     let mut flags = SessionFlags::default();
     let mut i = 0;
     flags.consume(args, &mut i, false)?;
@@ -513,7 +537,7 @@ fn parse_start_args(
     if args.get(i).map(String::as_str) == Some("--") {
         i += 1;
     }
-    Ok((flags.detach, flags.kind, target, &args[i..]))
+    Ok(StartArgs { detach: flags.detach, kind: flags.kind, target, command: &args[i..] })
 }
 
 /// How a `posh start` target resolves. Local targets create through the strict
@@ -596,7 +620,8 @@ fn cmd_start(
     if args.first().map(String::as_str) == Some("--ephemeral") {
         return cmd_start_ephemeral(&args[1..], forward_flag);
     }
-    let (detach, explicit_kind, target, command_slice) = parse_start_args(args)?;
+    let StartArgs { detach, kind: explicit_kind, target, command: command_slice } =
+        parse_start_args(args)?;
     let command = (!command_slice.is_empty()).then(|| command_slice.to_vec());
     let class = classify_start_target(target);
     let kind = start_kind(&class, explicit_kind);
@@ -2345,47 +2370,47 @@ mod tests {
 
         // Name only.
         let a = v(&["dev"]);
-        let (d, _create, _k, n, c) = parse_attach_args(&a).unwrap();
-        assert!(!d);
-        assert_eq!(n, "dev");
-        assert!(c.is_empty());
+        let p = parse_attach_args(&a).unwrap();
+        assert!(!p.detach);
+        assert_eq!(p.name, "dev");
+        assert!(p.command.is_empty());
 
         // Leading --detach (the form the integration tests and clown use).
         let a = v(&["--detach", "dev", "sleep", "300"]);
-        let (d, _create, _k, n, c) = parse_attach_args(&a).unwrap();
-        assert!(d);
-        assert_eq!(n, "dev");
-        assert_eq!(c, &v(&["sleep", "300"])[..]);
+        let p = parse_attach_args(&a).unwrap();
+        assert!(p.detach);
+        assert_eq!(p.name, "dev");
+        assert_eq!(p.command, &v(&["sleep", "300"])[..]);
 
         // Post-name --detach (the remote inner-argv form).
         let a = v(&["dev", "--detach", "worker"]);
-        let (d, _create, _k, n, c) = parse_attach_args(&a).unwrap();
-        assert!(d);
-        assert_eq!(n, "dev");
-        assert_eq!(c, &v(&["worker"])[..]);
+        let p = parse_attach_args(&a).unwrap();
+        assert!(p.detach);
+        assert_eq!(p.name, "dev");
+        assert_eq!(p.command, &v(&["worker"])[..]);
 
         // The #1 fix: a `--` makes the command OPAQUE, so a `--detach` inside
         // it is preserved as a command word, not swallowed as the flag.
         let a = v(&["dev", "--detach", "--", "worker", "--detach"]);
-        let (d, _create, _k, n, c) = parse_attach_args(&a).unwrap();
-        assert!(d);
-        assert_eq!(n, "dev");
-        assert_eq!(c, &v(&["worker", "--detach"])[..]);
+        let p = parse_attach_args(&a).unwrap();
+        assert!(p.detach);
+        assert_eq!(p.name, "dev");
+        assert_eq!(p.command, &v(&["worker", "--detach"])[..]);
 
         // A `--` separator without `--detach`: opaque command, no detach.
         let a = v(&["dev", "--", "vim", "-u", "NONE"]);
-        let (d, _create, _k, n, c) = parse_attach_args(&a).unwrap();
-        assert!(!d);
-        assert_eq!(n, "dev");
-        assert_eq!(c, &v(&["vim", "-u", "NONE"])[..]);
+        let p = parse_attach_args(&a).unwrap();
+        assert!(!p.detach);
+        assert_eq!(p.name, "dev");
+        assert_eq!(p.command, &v(&["vim", "-u", "NONE"])[..]);
 
         // --create parses as a flag on either side of the name (FDR 0015).
         let a = v(&["--create", "dev"]);
-        let (d, cr, _k, n, _c) = parse_attach_args(&a).unwrap();
-        assert!(!d && cr && n == "dev");
+        let p = parse_attach_args(&a).unwrap();
+        assert!(!p.detach && p.create && p.name == "dev");
         let a = v(&["dev", "--create", "--detach"]);
-        let (d, cr, _k, n, _c) = parse_attach_args(&a).unwrap();
-        assert!(d && cr && n == "dev");
+        let p = parse_attach_args(&a).unwrap();
+        assert!(p.detach && p.create && p.name == "dev");
 
         // Missing name is an error (with or without a leading flag).
         assert!(parse_attach_args(&v(&[])).is_err());
@@ -2396,17 +2421,17 @@ mod tests {
     fn parse_attach_args_reads_kind() {
         let v = |xs: &[&str]| -> Vec<String> { xs.iter().map(|s| s.to_string()).collect() };
         let a = v(&["--create", "--kind", "anonymous", "s-1"]);
-        let (d, cr, kind, n, _c) = parse_attach_args(&a).unwrap();
-        assert!(!d && cr && n == "s-1");
-        assert_eq!(kind, Some(SessionKind::Anonymous));
+        let p = parse_attach_args(&a).unwrap();
+        assert!(!p.detach && p.create && p.name == "s-1");
+        assert_eq!(p.kind, Some(SessionKind::Anonymous));
         // Absent: None (the caller decides the default).
         let a = v(&["dev"]);
-        assert_eq!(parse_attach_args(&a).unwrap().2, None);
+        assert_eq!(parse_attach_args(&a).unwrap().kind, None);
         // `--kind` after the name parses too, like --detach.
         let a = v(&["dev", "--kind", "named", "--", "htop"]);
-        let (_, _, kind, n, c) = parse_attach_args(&a).unwrap();
-        assert_eq!((kind, n), (Some(SessionKind::Named), "dev"));
-        assert_eq!(c, &v(&["htop"])[..]);
+        let p = parse_attach_args(&a).unwrap();
+        assert_eq!((p.kind, p.name), (Some(SessionKind::Named), "dev"));
+        assert_eq!(p.command, &v(&["htop"])[..]);
         assert!(parse_attach_args(&v(&["--kind", "system", "x"])).is_err());
         assert!(parse_attach_args(&v(&["--kind", "bogus", "x"])).is_err());
         assert!(parse_attach_args(&v(&["--kind"])).is_err());
@@ -2417,48 +2442,48 @@ mod tests {
         let v = |xs: &[&str]| -> Vec<String> { xs.iter().map(|s| s.to_string()).collect() };
         // No args -> auto-id (no target), no detach, no command.
         let a = v(&[]);
-        let (d, _k, t, c) = parse_start_args(&a).unwrap();
-        assert!(!d && t.is_none() && c.is_empty());
+        let p = parse_start_args(&a).unwrap();
+        assert!(!p.detach && p.target.is_none() && p.command.is_empty());
         // Leading --detach, still no target.
         let a = v(&["--detach"]);
-        let (d, _k, t, c) = parse_start_args(&a).unwrap();
-        assert!(d && t.is_none() && c.is_empty());
+        let p = parse_start_args(&a).unwrap();
+        assert!(p.detach && p.target.is_none() && p.command.is_empty());
         // A leading `--` means "no target"; the rest is an opaque command.
         let a = v(&["--", "vim"]);
-        let (d, _k, t, c) = parse_start_args(&a).unwrap();
-        assert!(!d && t.is_none() && c == ["vim"]);
+        let p = parse_start_args(&a).unwrap();
+        assert!(!p.detach && p.target.is_none() && p.command == ["vim"]);
         // Named target, then a command after `--`.
         let a = v(&["dev", "--", "htop"]);
-        let (d, _k, t, c) = parse_start_args(&a).unwrap();
-        assert!(!d && t == Some("dev") && c == ["htop"]);
+        let p = parse_start_args(&a).unwrap();
+        assert!(!p.detach && p.target == Some("dev") && p.command == ["htop"]);
         // --detach around the target.
         let a = v(&["--detach", "dev"]);
-        let (d, _k, t, c) = parse_start_args(&a).unwrap();
-        assert!(d && t == Some("dev") && c.is_empty());
+        let p = parse_start_args(&a).unwrap();
+        assert!(p.detach && p.target == Some("dev") && p.command.is_empty());
     }
 
     #[test]
     fn parse_start_args_reads_kind() {
         let v = |xs: &[&str]| -> Vec<String> { xs.iter().map(|s| s.to_string()).collect() };
         let a = v(&["--kind", "anonymous", ":+"]);
-        let (d, kind, t, c) = parse_start_args(&a).unwrap();
-        assert!(!d);
-        assert_eq!(kind, Some(SessionKind::Anonymous));
-        assert_eq!(t, Some(":+"));
-        assert!(c.is_empty());
+        let p = parse_start_args(&a).unwrap();
+        assert!(!p.detach);
+        assert_eq!(p.kind, Some(SessionKind::Anonymous));
+        assert_eq!(p.target, Some(":+"));
+        assert!(p.command.is_empty());
         // Absent: None (the caller derives it from the target class).
         let a = v(&["dev"]);
-        assert_eq!(parse_start_args(&a).unwrap().1, None);
+        assert_eq!(parse_start_args(&a).unwrap().kind, None);
         // `--kind` after the target parses too, like --detach.
         let a = v(&["dev", "--kind", "named", "--", "htop"]);
-        let (_, kind, t, c) = parse_start_args(&a).unwrap();
-        assert_eq!((kind, t), (Some(SessionKind::Named), Some("dev")));
-        assert_eq!(c, &v(&["htop"])[..]);
+        let p = parse_start_args(&a).unwrap();
+        assert_eq!((p.kind, p.target), (Some(SessionKind::Named), Some("dev")));
+        assert_eq!(p.command, &v(&["htop"])[..]);
         // A leading `--kind` with no target still means auto-id.
         let a = v(&["--detach", "--kind", "anonymous"]);
-        let (d, kind, t, c) = parse_start_args(&a).unwrap();
-        assert!(d && t.is_none() && c.is_empty());
-        assert_eq!(kind, Some(SessionKind::Anonymous));
+        let p = parse_start_args(&a).unwrap();
+        assert!(p.detach && p.target.is_none() && p.command.is_empty());
+        assert_eq!(p.kind, Some(SessionKind::Anonymous));
         // A bad or missing value is an error, not a silent Named.
         assert!(parse_start_args(&v(&["--kind", "system", "x"])).is_err());
         assert!(parse_start_args(&v(&["--kind"])).is_err());
