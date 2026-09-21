@@ -773,10 +773,10 @@ fn start_remote_auto(
                 .ok_or_else(|| Error::from("posh start: too many remote sessions"))?
         }
     };
-    // The attach that follows is to a session this front door created: the
-    // FDR 0016 stack reads it as anonymous even when the remote daemon
-    // predates CAP_SESSION_KIND (cmd_ssh_session records the target).
-    picker::next_attach_is_created();
+    // The attach that follows is to an anonymous session this front door
+    // created: the FDR 0016 stack reads it as anonymous even when the remote
+    // daemon predates CAP_SESSION_KIND (cmd_ssh_session records the target).
+    picker::next_attach_is_anonymous_create();
     cmd_ssh_session(user, host, target_group, global_group, id, extra, forward_flag)
 }
 

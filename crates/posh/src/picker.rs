@@ -291,20 +291,23 @@ pub fn request_pop(previous: Previous) -> Option<String> {
 static SWITCH: Mutex<Option<Switch>> = Mutex::new(None);
 /// The attach in progress — the session a switch would be LEAVING: its
 /// target, the kind its daemon reported on a frame (`CAP_SESSION_KIND`;
-/// `Unknown` until it does), and whether this front door CREATED it (`:+` /
-/// create-new) — the design §2 fallback: a created session whose daemon
-/// predates the kind reads Anonymous. Set by the attach entry points; read
-/// by the front door when a switch asks to kill it.
+/// `Unknown` until it does), and whether this front door created it as an
+/// ANONYMOUS session (a `:+` / create-new dispatch) — the design §2 fallback
+/// when the daemon reports Unknown: such a session is anonymous by
+/// construction. A named `posh start <name>` never sets it. Set by the
+/// attach entry points; read by the front door when a switch asks to kill
+/// it.
 struct Current {
     target: String,
     kind: SessionKind,
-    created: bool,
+    anonymous_create: bool,
 }
 static CURRENT: Mutex<Option<Current>> = Mutex::new(None);
-/// One-shot: the next `set_current` is a session this front door created
-/// (`posh start :+` / `ph host:+`). Set by the two creators right before the
-/// attach entry point they call records the target; consumed by it.
-static NEXT_ATTACH_CREATED: Mutex<bool> = Mutex::new(false);
+/// One-shot: the next `set_current` is an anonymous session this front door
+/// created (`posh start :+` / `ph host:+`). Set by the two creators right
+/// before the attach entry point they call records the target; consumed by
+/// it.
+static NEXT_ATTACH_ANONYMOUS_CREATE: Mutex<bool> = Mutex::new(false);
 /// A kill the front door armed for the NEW attach to carry out once it is
 /// established (`(target, force)`): kill-after-attach, so a failed switch
 /// never destroys the session it was leaving.
@@ -407,22 +410,31 @@ fn display_target(target: &str) -> String {
     }
 }
 
-/// A new attach: the kind is `Unknown` until its daemon says; created iff a
-/// creator flagged this attach (`next_attach_is_created`, consumed here).
+/// A new attach: the kind is `Unknown` until its daemon says; an anonymous
+/// create iff a creator flagged this attach (`next_attach_is_anonymous_create`,
+/// consumed here).
 pub fn set_current(target: &str) {
-    let created = std::mem::take(&mut *NEXT_ATTACH_CREATED.lock().unwrap_or_else(|e| e.into_inner()));
+    let anonymous_create =
+        std::mem::take(&mut *NEXT_ATTACH_ANONYMOUS_CREATE.lock().unwrap_or_else(|e| e.into_inner()));
     *CURRENT.lock().unwrap_or_else(|e| e.into_inner()) = Some(Current {
         target: target.to_string(),
         kind: SessionKind::Unknown,
-        created,
+        anonymous_create,
     });
 }
 
-/// Flag the next attach as a session this front door is creating (the `:+`
-/// / create-new dispatch): `cmd_start_local` and `start_remote_auto`, right
-/// before the entry point that calls `set_current`.
-pub fn next_attach_is_created() {
-    *NEXT_ATTACH_CREATED.lock().unwrap_or_else(|e| e.into_inner()) = true;
+/// Flag the next attach as an anonymous session this front door is creating
+/// (the `:+` / create-new dispatch): `cmd_start_local` (only for an
+/// anonymous kind) and `start_remote_auto` (always anonymous), right before
+/// the entry point that calls `set_current`.
+pub fn next_attach_is_anonymous_create() {
+    *NEXT_ATTACH_ANONYMOUS_CREATE.lock().unwrap_or_else(|e| e.into_inner()) = true;
+}
+
+/// Whether an anonymous create is armed for the next attach (test seam).
+#[cfg(test)]
+pub(crate) fn anonymous_create_armed() -> bool {
+    *NEXT_ATTACH_ANONYMOUS_CREATE.lock().unwrap_or_else(|e| e.into_inner())
 }
 
 /// The daemon reported the current session's kind (a frame's id 20 entry).
@@ -442,16 +454,17 @@ pub fn current() -> Option<String> {
 }
 
 /// The current session's kind: what its daemon reported if it did; else
-/// Anonymous for a session this front door created (a daemon that predates
-/// the kind cannot say, but a `:+` create is anonymous by construction);
-/// else `Unknown` (a plain attach to a silent daemon, or no attach at all).
+/// Anonymous for a session this front door created by `:+` (a daemon that
+/// predates the kind cannot say, but such a create is anonymous by
+/// construction); else `Unknown` (a plain attach or a named start against a
+/// silent daemon, or no attach at all).
 pub fn current_kind() -> SessionKind {
     CURRENT
         .lock()
         .unwrap_or_else(|e| e.into_inner())
         .as_ref()
         .map_or(SessionKind::Unknown, |c| match c.kind {
-            SessionKind::Unknown if c.created => SessionKind::Anonymous,
+            SessionKind::Unknown if c.anonymous_create => SessionKind::Anonymous,
             kind => kind,
         })
 }
@@ -828,16 +841,19 @@ mod tests {
         assert_eq!(current_entry(), None);
     }
 
-    /// The design §2 fallback: a created (`:+`) dispatch against a daemon
+    /// The design §2 fallback: an anonymous create (`:+`) against a daemon
     /// that never says (Unknown) reads Anonymous; a plain attach to the same
     /// daemon reads Unknown; a daemon that DOES say wins over the fallback,
-    /// and a known kind is never downgraded to Unknown. The created flag is
+    /// and a known kind is never downgraded to Unknown. The flag is
     /// one-shot: consumed by the `set_current` it precedes.
     #[test]
-    fn current_kind_falls_back_to_anonymous_only_for_a_created_dispatch() {
+    fn current_kind_falls_back_to_anonymous_only_for_an_anonymous_create() {
         let _g = switch_test_guard();
-        next_attach_is_created();
+        assert!(!anonymous_create_armed());
+        next_attach_is_anonymous_create();
+        assert!(anonymous_create_armed());
         set_current(":s-9");
+        assert!(!anonymous_create_armed(), "consumed by set_current");
         assert_eq!(current_kind(), SessionKind::Anonymous);
         assert_eq!(
             current_entry(),

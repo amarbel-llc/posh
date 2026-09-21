@@ -338,11 +338,19 @@ pub fn cmd_start_local(
     let path = cfg.socket_path(name)?;
     let stream = UnixStream::connect(&path)
         .map_err(|e| Error::Msg(format!("connect {}: {e}", path.display())))?;
-    // A session this front door created (the FDR 0016 stack's anonymous
-    // fallback for a daemon that never reports its kind).
-    crate::picker::next_attach_is_created();
+    // An anonymous session this front door created (`:+`): the FDR 0016
+    // stack's fallback for a daemon that never reports its kind. A named
+    // start arms nothing.
+    arm_anonymous_create(kind);
     crate::picker::set_current(&crate::picker::target_for(None, Some(&cfg.group), name));
     run_interactive(stream)
+}
+
+/// Arm the picker's anonymous-create fallback only for an anonymous create.
+fn arm_anonymous_create(kind: SessionKind) {
+    if kind == SessionKind::Anonymous {
+        crate::picker::next_attach_is_anonymous_create();
+    }
 }
 
 /// The detach key Ctrl-\ in raw C0 and its kitty keyboard CSI-u forms (base key
@@ -2790,6 +2798,22 @@ mod tests {
         let text = serde_json::to_string(&palette_commands(true, false, false, Some(":prev"))).unwrap();
         assert!(text.contains("Back to :prev"), "{text}");
         crate::picker::stack_pop();
+    }
+
+    /// A named `posh start <name>` never arms the anonymous-create fallback;
+    /// only an anonymous (`:+`) create does.
+    #[test]
+    fn named_local_start_does_not_arm_the_anonymous_create_fallback() {
+        let _g = crate::picker::switch_test_guard();
+        crate::picker::set_current(":reset"); // consume any armed flag
+        arm_anonymous_create(SessionKind::Named);
+        assert!(!crate::picker::anonymous_create_armed());
+        arm_anonymous_create(SessionKind::Unknown);
+        assert!(!crate::picker::anonymous_create_armed());
+        arm_anonymous_create(SessionKind::Anonymous);
+        assert!(crate::picker::anonymous_create_armed());
+        crate::picker::set_current(":s-1");
+        assert_eq!(crate::picker::current_kind(), SessionKind::Anonymous);
     }
 
     #[test]
