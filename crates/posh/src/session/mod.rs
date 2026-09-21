@@ -377,6 +377,10 @@ struct SessionEntry {
     /// session's status socket (`echo_summary`); `None` from a pre-RFC-0014
     /// daemon (no socket) or an unreachable session.
     echo: Option<String>,
+    /// The session's kind (2026-09-21 session-stack plan §1) as the daemon
+    /// reports it on `Tag::Info`; `None` from a pre-kind daemon (`Unknown`)
+    /// or an unreachable session. Never `Some(Unknown)`.
+    kind: Option<SessionKind>,
 }
 
 /// Summarize a §4.2 status response for the `posh ls` ECHO column: the first
@@ -433,11 +437,16 @@ pub struct PickerEntry {
 
 impl PickerEntry {
     fn from_entry(s: &SessionEntry) -> PickerEntry {
-        let status = match (&s.error, s.clients) {
+        let mut status = match (&s.error, s.clients) {
             (Some(e), _) => format!("stale ({e})"),
             (None, Some(n)) if n > 0 => format!("attached ({n})"),
             (None, _) => "detached".to_string(),
         };
+        // Only an anonymous session is marked: named is the default reading
+        // and system stays unmarked until something creates one.
+        if s.kind == Some(SessionKind::Anonymous) {
+            status.push_str(" \u{b7} anonymous");
+        }
         PickerEntry {
             name: s.name.clone(),
             label: completion_summary(s),
@@ -538,6 +547,7 @@ fn scan_sessions(cfg: &Config) -> Result<Vec<SessionEntry>> {
                     cwd: (!probe.info.cwd.is_empty()).then_some(probe.info.cwd),
                     activity: (!probe.info.activity.is_empty()).then_some(probe.info.activity),
                     echo,
+                    kind: (probe.info.kind != SessionKind::Unknown).then_some(probe.info.kind),
                 })
             }
             Err(e) => {
@@ -550,6 +560,7 @@ fn scan_sessions(cfg: &Config) -> Result<Vec<SessionEntry>> {
                     cwd: None,
                     activity: None,
                     echo: None,
+                    kind: None,
                 });
                 cleanup_stale_socket(&path);
             }
@@ -599,6 +610,12 @@ fn remote_entries(json: &str, prefix: impl Fn(&str) -> String) -> Result<Vec<Ses
             cwd: v["cwd"].as_str().map(str::to_string),
             activity: v["activity"].as_str().map(str::to_string),
             echo: v["echo"].as_str().map(str::to_string),
+            // `parse` accepts only the creatable kinds; a remote may still
+            // legitimately report a `system` session. `unknown` or garbage
+            // reads as no kind.
+            kind: v["kind"].as_str().and_then(|k| {
+                SessionKind::parse(k).or((k == "system").then_some(SessionKind::System))
+            }),
         })
         .collect())
 }
@@ -637,6 +654,11 @@ fn json_list(sessions: &[SessionEntry], current: Option<&str>) -> String {
             if let Some(echo) = &s.echo {
                 out.push_str(",\"echo\":");
                 out.push_str(&json_string(echo));
+            }
+            // Omitted when unknown (a pre-kind daemon), never "unknown".
+            if let Some(kind) = s.kind {
+                out.push_str(",\"kind\":");
+                out.push_str(&json_string(kind.as_str()));
             }
             out.push_str(&format!(",\"current\":{is_current}"));
         }
@@ -1030,6 +1052,7 @@ mod tests {
                 cwd: Some("/home/user".to_string()),
                 activity: Some("vim ~/notes".to_string()),
                 echo: Some("optimistic auto-escalated 412ms".to_string()),
+                kind: Some(SessionKind::Anonymous),
             },
             SessionEntry {
                 name: "broken".to_string(),
@@ -1040,6 +1063,7 @@ mod tests {
                 cwd: None,
                 activity: None,
                 echo: None,
+                kind: None,
             },
             SessionEntry {
                 name: "minimal".to_string(),
@@ -1050,16 +1074,19 @@ mod tests {
                 cwd: None,
                 activity: None,
                 echo: None,
+                kind: None,
             },
         ];
         let json = json_list(&sessions, Some("minimal"));
+        // `kind` is emitted only when known: minimal (an unknown kind) has
+        // no `kind` key at all.
         assert_eq!(
             json,
             concat!(
                 "[",
                 "{\"name\":\"alpha\",\"pid\":1234,\"clients\":2,",
                 "\"cwd\":\"/home/user\",\"cmd\":\"htop -d 10\",\"activity\":\"vim ~/notes\",",
-                "\"echo\":\"optimistic auto-escalated 412ms\",\"current\":false},",
+                "\"echo\":\"optimistic auto-escalated 412ms\",\"kind\":\"anonymous\",\"current\":false},",
                 "{\"name\":\"broken\",\"error\":true,\"status\":\"ConnectionRefused\"},",
                 "{\"name\":\"minimal\",\"pid\":9,\"clients\":0,\"current\":true}",
                 "]"
@@ -1076,7 +1103,7 @@ mod tests {
             "[",
             "{\"name\":\"dev\",\"pid\":42,\"clients\":1,",
             "\"cwd\":\"/home/u/w\",\"cmd\":\"htop\",\"activity\":\"vim x\",",
-            "\"echo\":\"optimistic 12ms\",\"current\":false},",
+            "\"echo\":\"optimistic 12ms\",\"kind\":\"named\",\"current\":false},",
             "{\"name\":\"broken\",\"error\":true,\"status\":\"ConnectionRefused\"},",
             "{\"name\":\"min\",\"pid\":9,\"clients\":0,\"current\":true}",
             "]"
@@ -1087,11 +1114,57 @@ mod tests {
         assert_eq!(entries[0].pid, Some(42));
         assert_eq!(entries[0].cwd.as_deref(), Some("/home/u/w"));
         assert_eq!(entries[0].echo.as_deref(), Some("optimistic 12ms"));
+        assert_eq!(entries[0].kind, Some(SessionKind::Named));
         assert_eq!(entries[1].name, "box:broken");
         assert_eq!(entries[1].error.as_deref(), Some("ConnectionRefused"));
         assert!(entries[2].error.is_none());
         assert!(entries[2].cmd.is_none() && entries[2].activity.is_none());
+        assert_eq!(entries[2].kind, None);
         assert!(remote_entries("nonsense", |n| n.to_string()).is_err());
+    }
+
+    /// The remote may report a `system` session (reserved, never created
+    /// locally yet); `unknown` or garbage reads as no kind.
+    #[test]
+    fn remote_entries_kind_accepts_system_and_drops_unknown() {
+        let json = concat!(
+            "[",
+            "{\"name\":\"sys\",\"pid\":1,\"clients\":0,\"kind\":\"system\"},",
+            "{\"name\":\"old\",\"pid\":2,\"clients\":0,\"kind\":\"unknown\"},",
+            "{\"name\":\"odd\",\"pid\":3,\"clients\":0,\"kind\":\"bogus\"}",
+            "]"
+        );
+        let entries = remote_entries(json, str::to_string).unwrap();
+        assert_eq!(entries[0].kind, Some(SessionKind::System));
+        assert_eq!(entries[1].kind, None);
+        assert_eq!(entries[2].kind, None);
+    }
+
+    fn entry_fixture(name: &str) -> SessionEntry {
+        SessionEntry {
+            name: name.to_string(),
+            pid: Some(1),
+            clients: Some(0),
+            error: None,
+            cmd: None,
+            cwd: None,
+            activity: None,
+            echo: None,
+            kind: None,
+        }
+    }
+
+    /// FDR 0016: an anonymous session's picker status carries the kind;
+    /// named (and unknown) stay the bare state word.
+    #[test]
+    fn picker_entry_status_names_an_anonymous_session() {
+        let mut e = entry_fixture("s-1");
+        e.kind = Some(SessionKind::Anonymous);
+        assert_eq!(PickerEntry::from_entry(&e).status, "detached · anonymous");
+        e.kind = Some(SessionKind::Named);
+        assert_eq!(PickerEntry::from_entry(&e).status, "detached");
+        e.kind = None;
+        assert_eq!(PickerEntry::from_entry(&e).status, "detached");
     }
 
     /// FDR 0016: a picker entry labels a session by its completion summary
@@ -1131,6 +1204,7 @@ mod tests {
             cwd: None,
             activity: activity.map(str::to_string),
             echo: None,
+            kind: None,
         };
         // Activity wins over cmd.
         assert_eq!(
@@ -1161,16 +1235,7 @@ mod tests {
 
     #[test]
     fn json_list_empty_current() {
-        let sessions = vec![SessionEntry {
-            name: "x".to_string(),
-            pid: Some(1),
-            clients: Some(0),
-            error: None,
-            cmd: None,
-            cwd: None,
-            activity: None,
-            echo: None,
-        }];
+        let sessions = vec![entry_fixture("x")];
         let json = json_list(&sessions, None);
         assert!(json.contains("\"current\":false"));
     }

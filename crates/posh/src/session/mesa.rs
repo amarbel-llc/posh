@@ -74,7 +74,7 @@ impl State {
 /// The header record: columns, the STATUS-dot legend, and the empty-table
 /// message (RFC 0003 §2/§6/§7.4). ACTIVITY/ECHO/STARTED IN are `flex` and
 /// shrink in that order (lowest `shrink` first) down to a floor of 8 columns
-/// before mesa ellipsizes; NAME/STATUS/PID/CLIENTS are `pin`, sized to
+/// before mesa ellipsizes; NAME/STATUS/PID/CLIENTS/KIND are `pin`, sized to
 /// content.
 fn header(socket_dir: &Path) -> Value {
     json!({
@@ -83,6 +83,7 @@ fn header(socket_dir: &Path) -> Value {
             {"name": "STATUS", "role": "pin"},
             {"name": "PID", "role": "pin"},
             {"name": "CLIENTS", "role": "pin"},
+            {"name": "KIND", "role": "pin"},
             {"name": "STARTED IN", "role": "flex", "shrink": 2, "min": 8},
             {"name": "ACTIVITY", "role": "flex", "shrink": 0, "min": 8},
             {"name": "ECHO", "role": "flex", "shrink": 1, "min": 8},
@@ -122,6 +123,7 @@ fn row(s: &SessionEntry, current: Option<&str>, home: Option<&str>) -> Value {
             "",
             "",
             "",
+            "",
             {"spans": [{"text": format!("{err} (cleaning up)"), "sev": "muted"}]},
             "",
         ]});
@@ -131,6 +133,7 @@ fn row(s: &SessionEntry, current: Option<&str>, home: Option<&str>) -> Value {
         status_cell(state, current == Some(s.name.as_str())),
         s.pid.map(|p| p.to_string()).unwrap_or_default(),
         s.clients.map(|c| c.to_string()).unwrap_or_default(),
+        s.kind.map(|k| k.as_str().to_string()).unwrap_or_default(),
         abbrev_home(s.cwd.as_deref().unwrap_or(""), home),
         s.activity.clone().or_else(|| s.cmd.clone()).unwrap_or_default(),
         s.echo.clone().unwrap_or_default(),
@@ -205,6 +208,7 @@ pub(super) fn empty_message(socket_dir: &Path) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use posh_proto::caps::SessionKind;
 
     fn entry(name: &str, clients: u64) -> SessionEntry {
         SessionEntry {
@@ -216,6 +220,7 @@ mod tests {
             cwd: Some("/home/u/eng".to_string()),
             activity: Some("nvim".to_string()),
             echo: Some("optimistic auto-escalated 412ms".to_string()),
+            kind: Some(SessionKind::Named),
         }
     }
 
@@ -229,6 +234,7 @@ mod tests {
             cwd: None,
             activity: None,
             echo: None,
+            kind: None,
         }
     }
 
@@ -237,11 +243,11 @@ mod tests {
     }
 
     #[test]
-    fn header_has_seven_columns_legend_and_empty() {
+    fn header_has_eight_columns_legend_and_empty() {
         let records = parse_lines(&build_ndjson(&[], None, None, Path::new("/run/posh/default")));
         assert_eq!(records.len(), 1);
         let header = &records[0];
-        assert_eq!(header["columns"].as_array().unwrap().len(), 7);
+        assert_eq!(header["columns"].as_array().unwrap().len(), 8);
         assert_eq!(header["legend"].as_array().unwrap().len(), 3);
         assert_eq!(header["empty"], "no sessions found in /run/posh/default");
     }
@@ -291,12 +297,32 @@ mod tests {
     fn stale_row_carries_error_in_activity_cell_other_cells_blank() {
         let records = parse_lines(&build_ndjson(&[stale("old")], None, None, Path::new("/x")));
         let cells = records[1]["cells"].as_array().unwrap();
+        assert_eq!(cells.len(), 8);
         assert_eq!(cells[0], "old"); // NAME
         assert_eq!(cells[2], ""); // PID
         assert_eq!(cells[3], ""); // CLIENTS
-        assert_eq!(cells[4], ""); // STARTED IN
-        assert_eq!(cells[5]["spans"][0]["text"], "connection refused (cleaning up)");
-        assert_eq!(cells[6], ""); // ECHO
+        assert_eq!(cells[4], ""); // KIND
+        assert_eq!(cells[5], ""); // STARTED IN
+        assert_eq!(cells[6]["spans"][0]["text"], "connection refused (cleaning up)");
+        assert_eq!(cells[7], ""); // ECHO
+    }
+
+    #[test]
+    fn header_has_a_kind_column_and_rows_fill_it() {
+        let mut s = entry("dev", 1);
+        s.kind = Some(SessionKind::Anonymous);
+        let records = parse_lines(&build_ndjson(&[s], None, None, Path::new("/x")));
+        let cols = records[0]["columns"].as_array().unwrap();
+        let kind_col = cols.iter().position(|c| c["name"] == "KIND").unwrap();
+        assert_eq!(kind_col, 4, "KIND sits after CLIENTS");
+        let cells = records[1]["cells"].as_array().unwrap();
+        assert_eq!(cells.len(), cols.len());
+        assert_eq!(cells[kind_col], "anonymous");
+        // An unknown kind leaves the cell blank.
+        let mut u = entry("old", 0);
+        u.kind = None;
+        let records = parse_lines(&build_ndjson(&[u], None, None, Path::new("/x")));
+        assert_eq!(records[1]["cells"][kind_col], "");
     }
 
     #[test]
