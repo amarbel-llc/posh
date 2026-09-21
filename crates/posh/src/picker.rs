@@ -368,6 +368,54 @@ pub fn auto_pop(end: Option<&AttachEnd>) -> Option<Switch> {
     })
 }
 
+/// `POSH_LEAVE_ANONYMOUS`: what the front door does with the anonymous
+/// sessions this viewport created when it leaves posh (design 2026-09-21
+/// §4). `Ask` (default) prompts; `Keep` never prompts; `Kill` kills without
+/// asking. The env var is the config surface until posh has a config file.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum LeavePolicy {
+    Ask,
+    Keep,
+    Kill,
+}
+
+impl LeavePolicy {
+    /// `keep` | `kill`; anything else (unset, `ask`, a typo) is the safe
+    /// default, `Ask`.
+    pub fn parse(value: Option<&str>) -> LeavePolicy {
+        match value {
+            Some("keep") => LeavePolicy::Keep,
+            Some("kill") => LeavePolicy::Kill,
+            _ => LeavePolicy::Ask,
+        }
+    }
+
+    pub fn from_env() -> LeavePolicy {
+        LeavePolicy::parse(std::env::var("POSH_LEAVE_ANONYMOUS").ok().as_deref())
+    }
+}
+
+/// The sessions the leave prompt is about: every `Anonymous` stack entry,
+/// bottom first, then the current attach when it is `Anonymous` and did
+/// not itself END (an ended session has nothing to kill; a lost one may).
+/// `Unknown` never qualifies — the prompt only names what the daemon (or
+/// the `:+` fallback) called anonymous.
+pub fn leave_candidates(end: Option<&AttachEnd>) -> Vec<StackEntry> {
+    let anonymous = |e: &StackEntry| e.kind == SessionKind::Anonymous;
+    let mut out: Vec<StackEntry> = STACK
+        .lock()
+        .unwrap_or_else(|e| e.into_inner())
+        .iter()
+        .filter(|e| anonymous(e))
+        .cloned()
+        .collect();
+    let ended = matches!(end, Some(AttachEnd::Ended { .. }));
+    if let Some(cur) = current_entry().filter(|e| !ended && anonymous(e)) {
+        out.push(cur);
+    }
+    out
+}
+
 /// A target for a notice: a local `:session` names this machine, like the
 /// picker's rows and the default title do.
 pub(crate) fn display_target(target: &str) -> String {
@@ -1012,5 +1060,53 @@ mod tests {
         // A create target names no session to kill.
         assert!(kill_target(":+", false).is_err());
         assert!(kill_target("box:+", true).is_err());
+    }
+
+    #[test]
+    fn leave_policy_parses_the_env_spellings() {
+        assert_eq!(LeavePolicy::parse(None), LeavePolicy::Ask);
+        assert_eq!(LeavePolicy::parse(Some("ask")), LeavePolicy::Ask);
+        assert_eq!(LeavePolicy::parse(Some("keep")), LeavePolicy::Keep);
+        assert_eq!(LeavePolicy::parse(Some("kill")), LeavePolicy::Kill);
+        assert_eq!(LeavePolicy::parse(Some("bogus")), LeavePolicy::Ask, "unknown ⇒ the safe default");
+    }
+
+    /// The candidates are the anonymous stack entries bottom first, then the
+    /// current attach LAST when it is anonymous and did not end; a named or
+    /// unknown-kind session never qualifies.
+    #[test]
+    fn leave_candidates_are_the_anonymous_entries_plus_a_live_anonymous_current() {
+        let _g = switch_test_guard();
+        while stack_pop().is_some() {}
+        // stack: :s-1 (anon), box:dev (named), box:s-3 (anon); current :s-9 (anon)
+        set_current(":s-1");
+        set_current_kind(SessionKind::Anonymous);
+        stack_push_current();
+        set_current("box:dev");
+        set_current_kind(SessionKind::Named);
+        stack_push_current();
+        set_current("box:s-3");
+        set_current_kind(SessionKind::Anonymous);
+        stack_push_current();
+        set_current(":s-9");
+        set_current_kind(SessionKind::Anonymous);
+        let t = |v: Vec<StackEntry>| v.into_iter().map(|e| e.target).collect::<Vec<_>>();
+        // Quit / detach: stack anon entries in order, then the current LAST.
+        assert_eq!(t(leave_candidates(Some(&AttachEnd::Quit))), [":s-1", "box:s-3", ":s-9"]);
+        assert_eq!(t(leave_candidates(None)), [":s-1", "box:s-3", ":s-9"]);
+        // The current ENDED: it is gone, not a candidate.
+        let ended = AttachEnd::Ended { code: 0, cause: None };
+        assert_eq!(t(leave_candidates(Some(&ended))), [":s-1", "box:s-3"]);
+        // Lost: the daemon may live on; still a candidate.
+        assert_eq!(t(leave_candidates(Some(&AttachEnd::Lost("x".into())))), [":s-1", "box:s-3", ":s-9"]);
+        // A named current adds nothing; an unknown-kind one neither.
+        set_current("box:named");
+        set_current_kind(SessionKind::Named);
+        assert_eq!(t(leave_candidates(Some(&AttachEnd::Quit))), [":s-1", "box:s-3"]);
+        set_current("box:plain");
+        assert_eq!(t(leave_candidates(None)), [":s-1", "box:s-3"]);
+        while stack_pop().is_some() {}
+        *CURRENT.lock().unwrap() = None;
+        assert!(leave_candidates(None).is_empty());
     }
 }

@@ -172,6 +172,45 @@ fn leave_commands_for(method: &str, target: Option<&str>) -> Value {
     ])
 }
 
+/// The leave prompt (design 2026-09-21 §4), shown by the front door on the
+/// way out of posh: the anonymous sessions this viewport created, and what
+/// to do with them.
+pub struct LeavePrompt {
+    /// `Leaving — N anonymous session(s) you created`.
+    pub title: String,
+    /// The candidates, one [`abbreviated`] target per line, stack order with
+    /// the current session last (RFC 0005 §3.2 `description`).
+    pub description: String,
+    /// The three fates as `palette` rows.
+    pub commands: Value,
+}
+
+/// The prompt for `candidates` (never empty — the caller asks nothing with
+/// none). The rows re-issue `session.leave` with a `previous` like the
+/// switch dialogs do; *Keep them running* is FIRST so Enter keeps, and
+/// there is NO Cancel row: Esc is a keep too (the renderer's cancel), so
+/// both ways out of the prompt leave the sessions running.
+pub fn leave_prompt(candidates: &[picker::StackEntry]) -> LeavePrompt {
+    let n = candidates.len();
+    let title = format!(
+        "Leaving \u{2014} {n} anonymous session{} you created",
+        if n == 1 { "" } else { "s" }
+    );
+    let description = candidates.iter().map(|e| abbreviated(&e.target)).collect::<Vec<_>>().join("\n");
+    let cmd = |name: &str, previous: Previous| {
+        json!({
+            "name": name,
+            "action": { "method": "session.leave", "params": { "previous": previous.as_str() } },
+        })
+    };
+    let commands = json!([
+        cmd("Keep them running", Previous::Keep),
+        cmd("Kill them (kept if other viewports are attached)", Previous::Kill),
+        cmd("Kill them even with other viewports attached", Previous::ForceKill),
+    ]);
+    LeavePrompt { title, description, commands }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -349,5 +388,39 @@ mod tests {
         assert!(arr[3]["action"].is_null(), "Cancel is a no-op entry");
         assert_eq!(Previous::parse(None), Some(Previous::Keep));
         assert_eq!(Previous::parse(Some("nuke")), None);
+    }
+
+    /// The leave prompt: the candidates one abbreviated target per line in
+    /// the description (a local `:session` names this machine, a remote's
+    /// host is cut to its first label), *Keep* first, the two kills after,
+    /// no Cancel row; each row a `session.leave` with a `previous`.
+    #[test]
+    fn leave_prompt_lists_candidates_in_the_description_and_offers_keep_first() {
+        let c = vec![
+            entry(":s-1", SessionKind::Anonymous),
+            entry("me@box.example.com:s-3", SessionKind::Anonymous),
+        ];
+        let p = leave_prompt(&c);
+        assert_eq!(p.title, "Leaving \u{2014} 2 anonymous sessions you created");
+        let (first, second) = p.description.split_once('\n').expect("one line per candidate");
+        assert!(first.ends_with(":s-1") && !first.starts_with(':'), "{first}");
+        assert_eq!(second, "box:s-3");
+        let names: Vec<&str> = p.commands.as_array().unwrap().iter().map(|c| c["name"].as_str().unwrap()).collect();
+        assert_eq!(
+            names,
+            [
+                "Keep them running",
+                "Kill them (kept if other viewports are attached)",
+                "Kill them even with other viewports attached"
+            ]
+        );
+        for (i, want) in ["keep", "kill", "force-kill"].iter().enumerate() {
+            assert_eq!(p.commands[i]["action"]["method"], "session.leave");
+            assert_eq!(p.commands[i]["action"]["params"]["previous"], *want);
+        }
+        // One candidate: singular wording, a one-line description.
+        let one = leave_prompt(&c[1..]);
+        assert_eq!(one.title, "Leaving \u{2014} 1 anonymous session you created");
+        assert_eq!(one.description, "box:s-3");
     }
 }
