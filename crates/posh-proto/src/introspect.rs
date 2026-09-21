@@ -1,5 +1,5 @@
 //! RFC 0014: client introspection — the one struct every reporting surface
-//! renders from (§6), its `CAP_CLIENT_STATE` codec (§2), the `CAP_CLIENT_IDENT`
+//! renders from (§7), its `CAP_CLIENT_STATE` codec (§2), the `CAP_CLIENT_IDENT`
 //! codec (§1, the `SERVER_IDENT` layout under the client id), and the status
 //! line a serving side prints per attached client (§4.2).
 //!
@@ -229,7 +229,7 @@ pub struct Outcomes {
 pub const SRTT_UNMEASURED: u32 = u32::MAX;
 
 /// Everything a client reports about itself (RFC 0014 §2) — THE introspection
-/// struct (§6). Add an axis here, and only here; the codec, the §4.2 line, the
+/// struct (§7). Add an axis here, and only here; the codec, the §4.2 line, the
 /// diag dump, and the palette all follow.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
 pub struct ClientIntrospection {
@@ -396,7 +396,7 @@ pub fn render_client_line(r: &ClientRecord) -> String {
     out
 }
 
-/// A fully populated value with every field non-default — the §6 coverage
+/// A fully populated value with every field non-default — the §7 coverage
 /// fixture, shared with the posh crate's renderer tests so every surface is
 /// checked against the same instance.
 pub fn coverage_fixture() -> ClientIntrospection {
@@ -508,7 +508,7 @@ mod tests {
 
     #[test]
     fn client_line_covers_every_field() {
-        // RFC 0014 §6: the coverage test. Every registered key appears in the
+        // RFC 0014 §7: the coverage test. Every registered key appears in the
         // rendered line for a fully populated record.
         let r = ClientRecord {
             ident: Some(Ident {

@@ -38,7 +38,7 @@ pub struct ServerState {
     pub term_gen: u64,
     pub pty_open: bool,
     /// RFC 0014 §3: the peer client's retained introspection record, rendered
-    /// as the same §4.2 line the status socket serves (§6: one struct, every
+    /// as the same §4.2 line the status socket serves (§7: one struct, every
     /// surface). `echo=unknown` until the peer reports.
     pub client: crate::remote::introspect::ClientRecord,
 }
@@ -127,7 +127,7 @@ pub struct ClientState {
     /// otherwise un-SIGUSR2-able on a remote server. `None` until the server
     /// reports (only in a debug posture, when the client advertised CAP_DIAG).
     pub server_diag: Option<crate::remote::caps::ServerDiag>,
-    /// RFC 0014 §6: this client's own introspection record — the echo model
+    /// RFC 0014 §7: this client's own introspection record — the echo model
     /// in effect, who governs it, the gates, thresholds, and outcome counters
     /// — rendered as the same §4.2 line a serving side prints, so the dump and
     /// `posh status` can never disagree about a field.
@@ -447,7 +447,7 @@ mod tests {
     #[test]
     fn server_format_carries_wedge_fields() {
         let line = server_state().format();
-        // RFC 0014 §6 coverage on the server dump: the peer client's line.
+        // RFC 0014 §7 coverage on the server dump: the peer client's line.
         for key in crate::remote::introspect::CLIENT_FIELDS {
             assert!(line.contains(&format!(" {key}=")), "missing {key}= in:\n{line}");
         }
@@ -547,7 +547,7 @@ mod tests {
             },
         }
         .format();
-        // RFC 0014 §6 coverage: the dump renders every registered client
+        // RFC 0014 §7 coverage: the dump renders every registered client
         // field (it was exactly these — model, control, thresholds — the
         // pre-RFC dump omitted).
         for key in crate::remote::introspect::CLIENT_FIELDS {

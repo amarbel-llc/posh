@@ -468,7 +468,7 @@ fn client_ident(st: &ClientState) -> introspect::Ident {
     }
 }
 
-/// THE client introspection value (RFC 0014 §2/§6), built from live state.
+/// THE client introspection value (RFC 0014 §2/§7), built from live state.
 /// Every reporting surface — the wire entry, the SIGUSR2 dump, the palette's
 /// echo stats — renders from this, never from the fields directly.
 fn client_introspection(st: &ClientState) -> ClientIntrospection {
@@ -817,7 +817,7 @@ fn agent_debug_summary(st: &ClientState) -> String {
 /// `$XDG_DATA_HOME` (§8).
 fn predict_debug_summary(st: &ClientState) -> String {
     let ps = st.predict.stats();
-    // RFC 0014 §6: the first line IS the §4.2 client line — what a serving
+    // RFC 0014 §7: the first line IS the §4.2 client line — what a serving
     // side's `posh status` prints for this client — and the human-readable
     // lines below read from the same struct, so the two cannot disagree.
     let ci = client_introspection(st);
@@ -5111,7 +5111,7 @@ mod tests {
         std::fs::remove_file(&sock).ok();
     }
 
-    /// RFC 0014 §6 coverage on the palette surface: "Show echo prediction
+    /// RFC 0014 §7 coverage on the palette surface: "Show echo prediction
     /// stats" renders every registered client field, from the same struct
     /// the wire entry encodes.
     #[test]
