@@ -75,14 +75,41 @@ fn restore_seq(bracket: &Option<(Vec<u8>, Vec<u8>)>) -> Vec<u8> {
 /// return without attaching. Shared by `posh attach --detach` and
 /// `posh start --detach`. The "created" / "already exists" wording is asserted
 /// by the integration suite — keep it byte-for-byte.
-fn ensure_detached(cfg: &Config, name: &str, command: Option<Vec<String>>) -> Result<()> {
-    let created = daemon::ensure_session(cfg, name, command, SessionKind::Named)?;
+fn ensure_detached(
+    cfg: &Config,
+    name: &str,
+    command: Option<Vec<String>>,
+    kind: SessionKind,
+) -> Result<()> {
+    let created = daemon::ensure_session(cfg, name, command, kind)?;
+    if handshake_requested() {
+        println!("{}", start_handshake_line(name, kind));
+    }
     if created {
         println!("session \"{name}\" created");
     } else {
         println!("session \"{name}\" already exists");
     }
     Ok(())
+}
+
+/// The `posh start --detach` handshake line, printed to stdout BEFORE the
+/// pinned prose when the caller asked for it with the `POSH_HANDSHAKE=1`
+/// env (the ssh-crossing env-prefix convention of `sshwrap::remote_command`,
+/// doubling as go-plugin's magic cookie): `POSH START <version> <name>
+/// <kind>`. Version 1; a later version appends fields, never reorders.
+/// Same family as `POSH IP` / `POSH CONNECT` (remote/server.rs) so every
+/// posh-over-ssh exchange reads alike; the pipe-delimited cutover is posh#202.
+pub fn start_handshake_line(name: &str, kind: SessionKind) -> String {
+    format!("POSH START 1 {name} {}", kind.as_str())
+}
+
+/// `POSH_HANDSHAKE=1|on|true|yes` requests the handshake line.
+fn handshake_requested() -> bool {
+    matches!(
+        std::env::var("POSH_HANDSHAKE").as_deref(),
+        Ok("1") | Ok("on") | Ok("true") | Ok("yes")
+    )
 }
 
 /// The interactive attach tail: install signal handlers, take over the
@@ -153,6 +180,7 @@ pub fn cmd_attach(
     command: Option<Vec<String>>,
     detach_flag: bool,
     create_flag: bool,
+    kind: SessionKind,
 ) -> Result<()> {
     // FDR 0012 (RFC 0008 §3.1): an in-session attach is the in-place SWITCH
     // — the issuing viewport re-homes onto the sibling instead of nesting a
@@ -163,7 +191,7 @@ pub fn cmd_attach(
     if !detach_flag {
         if let Ok(current) = std::env::var("POSH_SESSION") {
             let create = if create_flag {
-                SwitchCreate::Ensure(command)
+                SwitchCreate::Ensure { command, kind }
             } else {
                 SwitchCreate::Never
             };
@@ -172,7 +200,7 @@ pub fn cmd_attach(
     }
 
     if detach_flag {
-        return ensure_detached(cfg, name, command);
+        return ensure_detached(cfg, name, command, kind);
     }
 
     // Phase B (FDR 0015): bare `posh attach` is STRICT — attach an existing
@@ -181,7 +209,7 @@ pub fn cmd_attach(
     // (remote::relay) uses connect_or_create directly, so remote host:session
     // stays create-or-attach.
     let stream = if create_flag {
-        crate::session::connect_or_create(cfg, name, command, SessionKind::Named)?
+        crate::session::connect_or_create(cfg, name, command, kind)?
     } else {
         crate::session::attach_existing(cfg, name)?
     };
@@ -196,10 +224,10 @@ enum SwitchCreate {
     /// Bare `posh attach`: strict — the target must already be live.
     Never,
     /// `posh attach --create`: create-or-switch (an idempotent ensure; a
-    /// live target ignores the command, as the non-switch path does).
-    Ensure(Option<Vec<String>>),
+    /// live target ignores the command and kind, as the non-switch path does).
+    Ensure { command: Option<Vec<String>>, kind: SessionKind },
     /// `posh start`: strict create-then-switch — a live target errors.
-    Strict(Option<Vec<String>>),
+    Strict { command: Option<Vec<String>>, kind: SessionKind },
 }
 
 /// FDR 0012 (RFC 0008 §3.1): the in-session switch sender. Resolves the
@@ -240,11 +268,11 @@ fn switch_in_place(
                 )));
             }
         }
-        SwitchCreate::Ensure(command) => {
-            daemon::ensure_session(target_cfg, target, command, SessionKind::Named)?;
+        SwitchCreate::Ensure { command, kind } => {
+            daemon::ensure_session(target_cfg, target, command, kind)?;
         }
-        SwitchCreate::Strict(command) => {
-            if !daemon::ensure_session(target_cfg, target, command, SessionKind::Named)? {
+        SwitchCreate::Strict { command, kind } => {
+            if !daemon::ensure_session(target_cfg, target, command, kind)? {
                 return Err(Error::Msg(format!(
                     "session \"{target}\" already exists (use `posh attach {target}`)"
                 )));
@@ -274,17 +302,18 @@ pub fn cmd_start_local(
     name: &str,
     command: Option<Vec<String>>,
     detach_flag: bool,
+    kind: SessionKind,
 ) -> Result<()> {
     if detach_flag {
-        return ensure_detached(cfg, name, command);
+        return ensure_detached(cfg, name, command, kind);
     }
     if let Ok(current) = std::env::var("POSH_SESSION") {
-        return switch_in_place(cfg, &current, name, SwitchCreate::Strict(command));
+        return switch_in_place(cfg, &current, name, SwitchCreate::Strict { command, kind });
     }
 
     // Strict create: `ensure_session` returns false when the session is already
     // live, which for `start` is an error (unlike attach's create-or-attach).
-    let created = daemon::ensure_session(cfg, name, command, SessionKind::Named)?;
+    let created = daemon::ensure_session(cfg, name, command, kind)?;
     if !created {
         return Err(Error::Msg(format!(
             "session \"{name}\" already exists (use `posh attach {name}`)"
@@ -1817,6 +1846,15 @@ fn client_loop(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn start_handshake_line_is_the_posh_family_with_a_version_first() {
+        assert_eq!(
+            start_handshake_line("s-3", SessionKind::Anonymous),
+            "POSH START 1 s-3 anonymous"
+        );
+        assert_eq!(start_handshake_line("dev", SessionKind::Named), "POSH START 1 dev named");
+    }
 
     #[test]
     fn takeover_sequences_wrap_the_bracket() {

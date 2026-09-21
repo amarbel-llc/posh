@@ -14,6 +14,7 @@ mod target;
 mod terminfo;
 mod util;
 
+use posh_proto::caps::SessionKind;
 use remote::datagram::Family;
 use session::{Config, ListFormat};
 use util::{Error, Result};
@@ -352,8 +353,12 @@ fn cmd_attach(
     args: &[String],
     forward_flag: &remote::agent::ForwardFlag,
 ) -> Result<()> {
-    let (detach_flag, create_flag, name, command) = parse_attach_args(args)?;
+    let (detach_flag, create_flag, kind, name, command) = parse_attach_args(args)?;
     let command = (!command.is_empty()).then(|| command.to_vec());
+    // A `--kind` on attach names the kind a create-or-attach / ensure would
+    // create with; absent, an attach-created session is named (its name was
+    // chosen by the caller). The remote branch below does not carry it yet.
+    let kind = kind.unwrap_or(SessionKind::Named);
     // Remote strict attach (posh#176): a `host:session`-shaped target rides
     // the roaming path, with the strict contract enforced by a probe. ONLY
     // the full RemoteSession form classifies — a bare word that merely
@@ -390,7 +395,14 @@ fn cmd_attach(
             forward_flag,
         );
     }
-    session::client::cmd_attach(&Config::new(group)?, name, command, detach_flag, create_flag)
+    session::client::cmd_attach(
+        &Config::new(group)?,
+        name,
+        command,
+        detach_flag,
+        create_flag,
+        kind,
+    )
 }
 
 /// Classify a `posh attach` target as remote: ONLY the full
@@ -410,54 +422,79 @@ fn attach_remote_target(name: &str) -> Option<(Option<String>, String, Option<St
     }
 }
 
-/// Parse `attach` args as `[--detach|--create]... <name> [--detach|--create]...
-/// [--] [command...]`. `--detach` and `--create` are recognized only as options
-/// around the name (either side); a single `--` ends option parsing so the
-/// create-command is OPAQUE — it may itself contain `--detach`/`--create`/`--`,
-/// matching `posh run` and the remote namespace path. `--create` is FDR 0015's
-/// explicit create-or-attach form (clown's migration target); in Phase A it is
-/// behaviourally identical to the bare form, which stays create-or-attach.
-fn parse_attach_args(args: &[String]) -> Result<(bool, bool, &str, &[String])> {
-    let mut detach = false;
-    let mut create = false;
-    let mut i = 0;
-    while let Some(f @ ("--detach" | "--create")) = args.get(i).map(String::as_str) {
-        if f == "--detach" {
-            detach = true;
-        } else {
-            create = true;
+/// The option flags `posh attach` / `posh start` accept around their target:
+/// `--detach`, `--create` (attach only), and `--kind <anonymous|named>`
+/// (design 2026-09-21 §1). One loop serves both sides of the target.
+#[derive(Default)]
+struct SessionFlags {
+    detach: bool,
+    create: bool,
+    kind: Option<SessionKind>,
+}
+
+impl SessionFlags {
+    /// Consume the run of recognized flags starting at `args[*i]`, advancing
+    /// `*i` past them. `--create` is only a flag when `accept_create`
+    /// (attach); `posh start` has no create-or-attach form. A `--kind` with a
+    /// missing or unparsable value is an error, never a silent default.
+    fn consume(&mut self, args: &[String], i: &mut usize, accept_create: bool) -> Result<()> {
+        loop {
+            match args.get(*i).map(String::as_str) {
+                Some("--detach") => self.detach = true,
+                Some("--create") if accept_create => self.create = true,
+                Some("--kind") => {
+                    let v = args
+                        .get(*i + 1)
+                        .ok_or_else(|| Error::from("--kind requires a value"))?;
+                    self.kind = Some(SessionKind::parse(v).ok_or_else(|| {
+                        Error::Msg(format!("--kind: expected anonymous or named, got {v}"))
+                    })?);
+                    *i += 1;
+                }
+                _ => return Ok(()),
+            }
+            *i += 1;
         }
-        i += 1;
     }
+}
+
+/// Parse `attach` args as `[--detach|--create|--kind K]... <name>
+/// [--detach|--create|--kind K]... [--] [command...]`. The flags are recognized
+/// only as options around the name (either side); a single `--` ends option
+/// parsing so the create-command is OPAQUE — it may itself contain
+/// `--detach`/`--create`/`--`, matching `posh run` and the remote namespace
+/// path. `--create` is FDR 0015's explicit create-or-attach form (clown's
+/// migration target); in Phase A it is behaviourally identical to the bare
+/// form, which stays create-or-attach. `--kind` is the created session's kind
+/// (absent = the caller's default).
+fn parse_attach_args(
+    args: &[String],
+) -> Result<(bool, bool, Option<SessionKind>, &str, &[String])> {
+    let mut flags = SessionFlags::default();
+    let mut i = 0;
+    flags.consume(args, &mut i, true)?;
     let name = args
         .get(i)
         .ok_or_else(|| Error::from("attach requires a session name"))?;
     i += 1;
-    while let Some(f @ ("--detach" | "--create")) = args.get(i).map(String::as_str) {
-        if f == "--detach" {
-            detach = true;
-        } else {
-            create = true;
-        }
-        i += 1;
-    }
+    flags.consume(args, &mut i, true)?;
     if args.get(i).map(String::as_str) == Some("--") {
         i += 1;
     }
-    Ok((detach, create, name, &args[i..]))
+    Ok((flags.detach, flags.create, flags.kind, name, &args[i..]))
 }
 
-/// Parse `start` args as `[--detach]... [target] [--detach]... [--] [command...]`.
-/// Unlike attach, the target is OPTIONAL — absent (or a leading `--`) means an
-/// auto-id session (`posh start` / `posh start -- cmd`). `--` ends option parsing
-/// so the create-command stays opaque.
-fn parse_start_args(args: &[String]) -> (bool, Option<&str>, &[String]) {
-    let mut detach = false;
+/// Parse `start` args as `[--detach|--kind K]... [target] [--detach|--kind K]...
+/// [--] [command...]`. Unlike attach, the target is OPTIONAL — absent (or a
+/// leading `--`) means an auto-id session (`posh start` / `posh start -- cmd`).
+/// `--` ends option parsing so the create-command stays opaque. `--kind` absent
+/// is `None`: the caller derives it from the target class (`start_kind`).
+fn parse_start_args(
+    args: &[String],
+) -> Result<(bool, Option<SessionKind>, Option<&str>, &[String])> {
+    let mut flags = SessionFlags::default();
     let mut i = 0;
-    while args.get(i).map(String::as_str) == Some("--detach") {
-        detach = true;
-        i += 1;
-    }
+    flags.consume(args, &mut i, false)?;
     // A `--` here (or the end of args) means "no target": an auto-id session.
     let target = match args.get(i).map(String::as_str) {
         None | Some("--") => None,
@@ -466,14 +503,11 @@ fn parse_start_args(args: &[String]) -> (bool, Option<&str>, &[String]) {
             Some(t)
         }
     };
-    while args.get(i).map(String::as_str) == Some("--detach") {
-        detach = true;
-        i += 1;
-    }
+    flags.consume(args, &mut i, false)?;
     if args.get(i).map(String::as_str) == Some("--") {
         i += 1;
     }
-    (detach, target, &args[i..])
+    Ok((flags.detach, flags.kind, target, &args[i..]))
 }
 
 /// How a `posh start` target resolves. Local targets create through the strict
@@ -521,6 +555,16 @@ fn classify_start_target(target: Option<&str>) -> StartClass {
     }
 }
 
+/// The kind a `posh start` creates: an explicit `--kind` wins, else the
+/// target class decides — an auto-id target (`:+`, `host:+`, no target) is
+/// anonymous, a named one is named (design 2026-09-21 §1).
+fn start_kind(class: &StartClass, explicit: Option<SessionKind>) -> SessionKind {
+    explicit.unwrap_or(match class {
+        StartClass::LocalAuto { .. } | StartClass::RemoteAuto { .. } => SessionKind::Anonymous,
+        StartClass::LocalNamed { .. } | StartClass::RemoteNamed { .. } => SessionKind::Named,
+    })
+}
+
 /// `posh start`: create a durable session and attach (FDR 0015). Local targets
 /// use the strict create (`cmd_start_local`); an auto-id target picks the next
 /// free `s-N`. Remote targets probe the host's session list over ssh first —
@@ -545,17 +589,19 @@ fn cmd_start(
     if args.first().map(String::as_str) == Some("--ephemeral") {
         return cmd_start_ephemeral(&args[1..], forward_flag);
     }
-    let (detach, target, command_slice) = parse_start_args(args);
+    let (detach, explicit_kind, target, command_slice) = parse_start_args(args)?;
     let command = (!command_slice.is_empty()).then(|| command_slice.to_vec());
-    match classify_start_target(target) {
+    let class = classify_start_target(target);
+    let kind = start_kind(&class, explicit_kind);
+    match class {
         StartClass::LocalAuto { group: g } => {
             let cfg = Config::new(g.as_deref().unwrap_or(group))?;
             let name = session::next_autoid(&cfg)?;
-            session::client::cmd_start_local(&cfg, &name, command, detach)
+            session::client::cmd_start_local(&cfg, &name, command, detach, kind)
         }
         StartClass::LocalNamed { group: g, session } => {
             let cfg = Config::new(g.as_deref().unwrap_or(group))?;
-            session::client::cmd_start_local(&cfg, &session, command, detach)
+            session::client::cmd_start_local(&cfg, &session, command, detach, kind)
         }
         StartClass::RemoteAuto { user, host, group: g } => start_remote_auto(
             user,
@@ -2222,21 +2268,21 @@ mod tests {
 
         // Name only.
         let a = v(&["dev"]);
-        let (d, _create, n, c) = parse_attach_args(&a).unwrap();
+        let (d, _create, _k, n, c) = parse_attach_args(&a).unwrap();
         assert!(!d);
         assert_eq!(n, "dev");
         assert!(c.is_empty());
 
         // Leading --detach (the form the integration tests and clown use).
         let a = v(&["--detach", "dev", "sleep", "300"]);
-        let (d, _create, n, c) = parse_attach_args(&a).unwrap();
+        let (d, _create, _k, n, c) = parse_attach_args(&a).unwrap();
         assert!(d);
         assert_eq!(n, "dev");
         assert_eq!(c, &v(&["sleep", "300"])[..]);
 
         // Post-name --detach (the remote inner-argv form).
         let a = v(&["dev", "--detach", "worker"]);
-        let (d, _create, n, c) = parse_attach_args(&a).unwrap();
+        let (d, _create, _k, n, c) = parse_attach_args(&a).unwrap();
         assert!(d);
         assert_eq!(n, "dev");
         assert_eq!(c, &v(&["worker"])[..]);
@@ -2244,24 +2290,24 @@ mod tests {
         // The #1 fix: a `--` makes the command OPAQUE, so a `--detach` inside
         // it is preserved as a command word, not swallowed as the flag.
         let a = v(&["dev", "--detach", "--", "worker", "--detach"]);
-        let (d, _create, n, c) = parse_attach_args(&a).unwrap();
+        let (d, _create, _k, n, c) = parse_attach_args(&a).unwrap();
         assert!(d);
         assert_eq!(n, "dev");
         assert_eq!(c, &v(&["worker", "--detach"])[..]);
 
         // A `--` separator without `--detach`: opaque command, no detach.
         let a = v(&["dev", "--", "vim", "-u", "NONE"]);
-        let (d, _create, n, c) = parse_attach_args(&a).unwrap();
+        let (d, _create, _k, n, c) = parse_attach_args(&a).unwrap();
         assert!(!d);
         assert_eq!(n, "dev");
         assert_eq!(c, &v(&["vim", "-u", "NONE"])[..]);
 
         // --create parses as a flag on either side of the name (FDR 0015).
         let a = v(&["--create", "dev"]);
-        let (d, cr, n, _c) = parse_attach_args(&a).unwrap();
+        let (d, cr, _k, n, _c) = parse_attach_args(&a).unwrap();
         assert!(!d && cr && n == "dev");
         let a = v(&["dev", "--create", "--detach"]);
-        let (d, cr, n, _c) = parse_attach_args(&a).unwrap();
+        let (d, cr, _k, n, _c) = parse_attach_args(&a).unwrap();
         assert!(d && cr && n == "dev");
 
         // Missing name is an error (with or without a leading flag).
@@ -2270,28 +2316,101 @@ mod tests {
     }
 
     #[test]
+    fn parse_attach_args_reads_kind() {
+        let v = |xs: &[&str]| -> Vec<String> { xs.iter().map(|s| s.to_string()).collect() };
+        let a = v(&["--create", "--kind", "anonymous", "s-1"]);
+        let (d, cr, kind, n, _c) = parse_attach_args(&a).unwrap();
+        assert!(!d && cr && n == "s-1");
+        assert_eq!(kind, Some(SessionKind::Anonymous));
+        // Absent: None (the caller decides the default).
+        let a = v(&["dev"]);
+        assert_eq!(parse_attach_args(&a).unwrap().2, None);
+        // `--kind` after the name parses too, like --detach.
+        let a = v(&["dev", "--kind", "named", "--", "htop"]);
+        let (_, _, kind, n, c) = parse_attach_args(&a).unwrap();
+        assert_eq!((kind, n), (Some(SessionKind::Named), "dev"));
+        assert_eq!(c, &v(&["htop"])[..]);
+        assert!(parse_attach_args(&v(&["--kind", "system", "x"])).is_err());
+        assert!(parse_attach_args(&v(&["--kind", "bogus", "x"])).is_err());
+        assert!(parse_attach_args(&v(&["--kind"])).is_err());
+    }
+
+    #[test]
     fn parse_start_args_grammar() {
         let v = |xs: &[&str]| -> Vec<String> { xs.iter().map(|s| s.to_string()).collect() };
         // No args -> auto-id (no target), no detach, no command.
         let a = v(&[]);
-        let (d, t, c) = parse_start_args(&a);
+        let (d, _k, t, c) = parse_start_args(&a).unwrap();
         assert!(!d && t.is_none() && c.is_empty());
         // Leading --detach, still no target.
         let a = v(&["--detach"]);
-        let (d, t, c) = parse_start_args(&a);
+        let (d, _k, t, c) = parse_start_args(&a).unwrap();
         assert!(d && t.is_none() && c.is_empty());
         // A leading `--` means "no target"; the rest is an opaque command.
         let a = v(&["--", "vim"]);
-        let (d, t, c) = parse_start_args(&a);
+        let (d, _k, t, c) = parse_start_args(&a).unwrap();
         assert!(!d && t.is_none() && c == ["vim"]);
         // Named target, then a command after `--`.
         let a = v(&["dev", "--", "htop"]);
-        let (d, t, c) = parse_start_args(&a);
+        let (d, _k, t, c) = parse_start_args(&a).unwrap();
         assert!(!d && t == Some("dev") && c == ["htop"]);
         // --detach around the target.
         let a = v(&["--detach", "dev"]);
-        let (d, t, c) = parse_start_args(&a);
+        let (d, _k, t, c) = parse_start_args(&a).unwrap();
         assert!(d && t == Some("dev") && c.is_empty());
+    }
+
+    #[test]
+    fn parse_start_args_reads_kind() {
+        let v = |xs: &[&str]| -> Vec<String> { xs.iter().map(|s| s.to_string()).collect() };
+        let a = v(&["--kind", "anonymous", ":+"]);
+        let (d, kind, t, c) = parse_start_args(&a).unwrap();
+        assert!(!d);
+        assert_eq!(kind, Some(SessionKind::Anonymous));
+        assert_eq!(t, Some(":+"));
+        assert!(c.is_empty());
+        // Absent: None (the caller derives it from the target class).
+        let a = v(&["dev"]);
+        assert_eq!(parse_start_args(&a).unwrap().1, None);
+        // `--kind` after the target parses too, like --detach.
+        let a = v(&["dev", "--kind", "named", "--", "htop"]);
+        let (_, kind, t, c) = parse_start_args(&a).unwrap();
+        assert_eq!((kind, t), (Some(SessionKind::Named), Some("dev")));
+        assert_eq!(c, &v(&["htop"])[..]);
+        // A leading `--kind` with no target still means auto-id.
+        let a = v(&["--detach", "--kind", "anonymous"]);
+        let (d, kind, t, c) = parse_start_args(&a).unwrap();
+        assert!(d && t.is_none() && c.is_empty());
+        assert_eq!(kind, Some(SessionKind::Anonymous));
+        // A bad or missing value is an error, not a silent Named.
+        assert!(parse_start_args(&v(&["--kind", "system", "x"])).is_err());
+        assert!(parse_start_args(&v(&["--kind"])).is_err());
+    }
+
+    #[test]
+    fn start_kind_derives_from_the_target_class() {
+        use StartClass::*;
+        assert_eq!(start_kind(&LocalAuto { group: None }, None), SessionKind::Anonymous);
+        assert_eq!(
+            start_kind(&LocalNamed { group: None, session: "dev".into() }, None),
+            SessionKind::Named
+        );
+        assert_eq!(
+            start_kind(&RemoteAuto { user: None, host: "box".into(), group: None }, None),
+            SessionKind::Anonymous
+        );
+        assert_eq!(
+            start_kind(
+                &RemoteNamed { user: None, host: "box".into(), group: None, session: "dev".into() },
+                None
+            ),
+            SessionKind::Named
+        );
+        // An explicit --kind wins over the derivation.
+        assert_eq!(
+            start_kind(&LocalAuto { group: None }, Some(SessionKind::Named)),
+            SessionKind::Named
+        );
     }
 
     #[test]
