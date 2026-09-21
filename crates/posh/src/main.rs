@@ -103,8 +103,10 @@ fn run() -> Result<()> {
 /// the standalone chooser — a tty on both ends and no signal behind the
 /// end (`signaled`: the just-ended attach's verdict, taken by `run()`) —
 /// with *Keep* as Enter and Esc; `Kill` kills unasked; `Keep`, or
-/// nothing anonymous, is silent. The kills run through `kill_target`
-/// (`--unless-attached` protects another viewport unless forced), in
+/// nothing anonymous, is silent. The kills run through `kill_target_as`
+/// with the "session" role — `killed session flac:s-1`, not the switch
+/// flow's "previous session" — (`--unless-attached` protects another
+/// viewport unless forced), in
 /// stack order with the current session last — its attach has already
 /// returned — and every notice prints on stderr AFTER the chooser has
 /// restored the tty. A prompt that could not be shown, or was dismissed,
@@ -115,7 +117,7 @@ fn leave_anonymous_sessions(end: Option<&picker::AttachEnd>, signaled: bool) {
     let tty = util::is_tty(libc::STDIN_FILENO) && util::is_tty(libc::STDOUT_FILENO);
     let policy = picker::LeavePolicy::from_env();
     let kills = |force: bool| {
-        for n in picker::run_leave_kills(&candidates, force, picker::kill_target) {
+        for n in picker::run_leave_kills(&candidates, force, |t, f| picker::kill_target_as(t, f, "session")) {
             eprintln!("posh: {n}");
         }
     };

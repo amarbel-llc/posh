@@ -450,7 +450,10 @@ pub fn leave_action(policy: LeavePolicy, tty: bool, signaled: bool, candidates: 
 
 /// Kill each candidate in order (stack bottom first, the current last —
 /// [`leave_candidates`] already orders them), never stopping on a failure;
-/// one notice per entry. `kill` is [`kill_target`] in production.
+/// one notice per entry. `kill` is [`kill_target_as`] with the `"session"`
+/// role in production (a leave kills *sessions*, not the switch flow's
+/// "previous session"); a failure spells the target like the notices do
+/// ([`display_target`]).
 pub fn run_leave_kills(
     candidates: &[StackEntry],
     force: bool,
@@ -460,7 +463,7 @@ pub fn run_leave_kills(
         .iter()
         .map(|e| match kill(&e.target, force) {
             Ok(notice) => notice,
-            Err(err) => format!("{} not killed: {err}", e.target),
+            Err(err) => format!("{} not killed: {err}", display_target(&e.target)),
         })
         .collect()
 }
@@ -716,18 +719,26 @@ pub fn run_pending_kill() -> Option<String> {
     let (target, force) = PENDING_KILL.lock().unwrap_or_else(|e| e.into_inner()).take()?;
     Some(match kill_target(&target, force) {
         Ok(notice) => notice,
-        Err(e) => format!("previous session {target} not killed: {e}"),
+        Err(e) => format!("previous session {} not killed: {e}", display_target(&target)),
     })
+}
+
+/// The switch flow's kill: [`kill_target_as`] with the "previous session"
+/// role (the session a switch left).
+pub fn kill_target(target: &str, force: bool) -> Result<String> {
+    kill_target_as(target, force, "previous session")
 }
 
 /// Kill the session `target` names — locally through its daemon socket, or
 /// on its host through `posh kill` over ssh — refusing (kept, with a
-/// notice) when other viewports are attached unless `force`.
-pub fn kill_target(target: &str, force: bool) -> Result<String> {
+/// notice) when other viewports are attached unless `force`. `role` is how
+/// the notice names the target: "previous session" for the switch flow,
+/// "session" for the leave flow; a remote kill keeps the remote's own line.
+pub fn kill_target_as(target: &str, force: bool, role: &str) -> Result<String> {
     match crate::ph_parse(Some(target)) {
         crate::PhRoute::LocalResolve { group, session } => {
             let cfg = Config::new(group.as_deref().unwrap_or("default"))?;
-            Ok(kill_notice(target, session::kill_session(&cfg, &session, !force)?))
+            Ok(kill_notice(target, role, session::kill_session(&cfg, &session, !force)?))
         }
         crate::PhRoute::RemoteResolve { user, host, group, session } => {
             let dest = crate::ph_dest(user.as_deref(), &host);
@@ -750,13 +761,16 @@ pub fn kill_target(target: &str, force: bool) -> Result<String> {
     }
 }
 
-fn kill_notice(target: &str, outcome: KillOutcome) -> String {
+/// The local kill's notice: the outcome, the `role` (see [`kill_target_as`]),
+/// and the target spelled with its host ([`display_target`]).
+fn kill_notice(target: &str, role: &str, outcome: KillOutcome) -> String {
+    let target = display_target(target);
     match outcome {
-        KillOutcome::Killed => format!("killed previous session {target}"),
-        KillOutcome::CleanedStale => format!("cleaned up stale previous session {target}"),
-        KillOutcome::Kept { clients } => format!(
-            "kept previous session {target}: {clients} other viewport(s) attached (force-kill to override)"
-        ),
+        KillOutcome::Killed => format!("killed {role} {target}"),
+        KillOutcome::CleanedStale => format!("cleaned up stale {role} {target}"),
+        KillOutcome::Kept { clients } => {
+            format!("kept {role} {target}: {clients} other viewport(s) attached (force-kill to override)")
+        }
     }
 }
 
@@ -1119,6 +1133,33 @@ mod tests {
         // A create target names no session to kill.
         assert!(kill_target(":+", false).is_err());
         assert!(kill_target("box:+", true).is_err());
+        assert!(kill_target_as(":+", false, "session").is_err());
+    }
+
+    /// The local kill notice carries the caller's role — "previous session"
+    /// on a switch, "session" on a leave — and spells a local target with
+    /// this machine's name, as the leave prompt and the picker do.
+    #[test]
+    fn kill_notice_spells_the_role_and_the_host() {
+        let host = crate::remote::mux::hostname();
+        let local = format!("{host}:s-1");
+        assert_eq!(kill_notice(":s-1", "previous session", KillOutcome::Killed), format!("killed previous session {local}"));
+        assert_eq!(kill_notice(":s-1", "session", KillOutcome::Killed), format!("killed session {local}"));
+        assert_eq!(
+            kill_notice(":s-1", "session", KillOutcome::CleanedStale),
+            format!("cleaned up stale session {local}")
+        );
+        assert_eq!(
+            kill_notice(":s-1", "session", KillOutcome::Kept { clients: 2 }),
+            format!("kept session {local}: 2 other viewport(s) attached (force-kill to override)")
+        );
+        assert_eq!(
+            kill_notice(":s-1", "previous session", KillOutcome::Kept { clients: 1 }),
+            format!("kept previous session {local}: 1 other viewport(s) attached (force-kill to override)")
+        );
+        // A target that already names a host is left as it is.
+        assert_eq!(kill_notice("box:s-3", "session", KillOutcome::Killed), "killed session box:s-3");
+        assert!(!local.starts_with(':'), "hostname resolved: {local}");
     }
 
     #[test]
@@ -1211,6 +1252,11 @@ mod tests {
         assert_eq!(*order.borrow(), [":s-1", "box:s-3", ":s-9"]);
         assert_eq!(*forces.borrow(), [false, false, false]);
         assert_eq!(notices, ["killed :s-1", "box:s-3 not killed: box: ssh: no route", "killed :s-9"]);
+        // A LOCAL failure spells the target with this machine's name, like
+        // every other notice.
+        let notices = run_leave_kills(&[entry(":s-1")], false, |_, _| Err(Error::from("gone")));
+        assert_eq!(notices, [format!("{} not killed: gone", display_target(":s-1"))]);
+        assert!(!notices[0].starts_with(':'), "{}", notices[0]);
         // The force flag reaches every kill.
         let notices = run_leave_kills(&[entry("box:s-3")], true, |t, f| Ok(format!("{t} force={f}")));
         assert_eq!(notices, ["box:s-3 force=true"]);
