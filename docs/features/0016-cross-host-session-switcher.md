@@ -103,7 +103,49 @@ daemon's `SESSION_KIND` entry, RFC 0001 id 20, or inferred for a session
 this viewport created with `:+`), and the whole stack — with the current
 session and any open palette or picker — is inspectable from outside via
 `posh status --viewport <pid>`, the viewport's own status socket (RFC 0014
-§6).
+§6). **The kind rule:** an entry carries the kind the *daemon* holds for
+the session (stated at create time, never derived from the name); only
+when the daemon predates the kind does the viewport infer `anonymous` for
+a session it created itself with `:+` (`anonymous_create=1` in the status
+output). So `:+` / `host:+` creates anonymous, a named target creates
+named, and a kind a daemon did not report is `unknown` — never guessed
+from the name.
+
+**The predecessor in the palette.** While the stack has a top, **Back to
+`<top>`** is the palette's *first* row (before *Switch session…*), so
+Enter on a freshly opened palette is the return trip, and the Commands
+heading carries the predecessor — ` · back: <top> [+N]`, N the entries
+under the top — abbreviated (a UUID name to eight hex digits, the host
+half dropped before the session half) to the renderer's content budget.
+Both clients; the design is `docs/plans/2026-09-21-session-stack-ux-design.md`
+§3.
+
+**Leaving posh.** When a viewport leaves posh with no switch to follow — a
+detach, a quit, or the top session ending / being lost with nothing to pop
+— the front door collects the **anonymous sessions this viewport created**
+(every anonymous stack entry, bottom first, then the current session last
+if it is anonymous and did not itself end) and asks what to do with them.
+Under `POSH_LEAVE_ANONYMOUS=ask` (the default) that is a standalone prompt
+on the same renderer, titled `Leaving — N anonymous session(s) you
+created`, the targets one per line as its description, and three rows:
+**Keep them running** (first, so Enter keeps; Esc keeps too — there is no
+Cancel row because both ways out leave the sessions running), **Kill them
+(kept if other viewports are attached)**, **Kill them even with other
+viewports attached**. Each row issues `session.leave {previous}` (RFC
+0005 §7). `keep` never prompts and says nothing; `kill` kills unasked
+(the unless-attached form). The prompt needs a tty on both ends and an
+orderly end: off a tty, or after a terminating signal ended the attach,
+`ask` degrades to one stderr line — `left running: <targets>
+(POSH_LEAVE_ANONYMOUS=kill to kill on exit)` — as does a prompt the
+renderer could not show or the user dismissed. **The kill contract:** the
+kills run in stack order with the current session last (its attach has
+already returned), through the same `posh kill` / `posh kill
+--unless-attached` primitive the switch dialogs use, one notice per entry
+on stderr after the chooser has restored the tty; a host that fails fails
+only its own entry, never the rest. A session the viewport did not create
+(named, system, or one it merely attached to) is never a candidate, and
+an ended session has nothing to kill (a *lost* one may). Design: the same
+plan, §4.
 
 **When the top session goes away.** An attach that ends because the session
 *ended* (its shell exited, or it was killed from elsewhere) or was *lost*
@@ -235,6 +277,7 @@ re-dial. The UX is identical either way; the user never sees which fired.
 | picker host set | local + live mux endpoints (`ph host:` = one host) | the connected set, no per-host ssh fan-out to cold hosts | users routinely want a cold host in the all-hosts picker (add the ssh-config/tailnet union behind a flag) |
 | switch affordance | palette "Switch session…" | one discoverable home, shared with `ph` | a dedicated keybind proves faster than the palette round-trip |
 | session stack scope | per viewport process, in memory; inspectable via `posh status --viewport` (RFC 0014 §6) | matches the re-attach loop that owns switching; no state to reconcile across viewports | users want `ph -` (back) from a fresh shell, or the stack to survive a viewport exit — persist it under the runtime dir |
+| leave policy | `ask` (`POSH_LEAVE_ANONYMOUS`; `keep` / `kill` pin it) | never destroys work unasked: a viewport's own anonymous sessions are the only candidates, Enter and Esc both keep, and a kill respects other viewports unless forced | users always answer the prompt the same way (make that answer the default), or object to the prompt on every detach (the design's tuning lever — a config file, or a per-session choice) |
 
 ## More Information
 
@@ -247,7 +290,8 @@ re-dial. The UX is identical either way; the user never sees which fired.
   the same-host follow-on reuses; its constraints bound the retarget path.
 - **FDR 0009** (`0009-command-palette.md`) — the palette this grows out of.
 - **RFC 0005** (`docs/rfcs/0005-palette-control-protocol.md`) — the palette
-  control channel: §3.5 the `picker` view, §7 `session.switch`.
+  control channel: §3.5 the `picker` view, §3.2 `description`, §7
+  `session.switch` / `session.pop` / `session.leave`.
 - **RFC 0013 §5** (`docs/rfcs/0013-server-introspection-caps.md`) — the activity
   label the picker rows are keyed on.
 - **RFC 0011** (`docs/rfcs/0011-multiplexed-datagram-channels.md`) — the M2 mux

@@ -644,6 +644,90 @@ debug-ph-stack-repro: build-palette
     "${iso[@]}" "$P" kill a 2>/dev/null || true
     "${iso[@]}" "$P" kill b 2>/dev/null || true
 
+# Verify the FDR 0016 leave prompt end to end in an isolated tmux pane: `ph :+`
+# creates an anonymous session through the front door (so run()'s re-attach
+# loop owns the stack), the palette's Switch session… keep-switches onto a
+# named session (pushing the anonymous one), and the palette's Detach then
+# leaves posh with nothing to pop — the front door must show the standalone
+# `Leaving — 1 anonymous session you created` prompt. Phase 1 answers it with
+# Enter (Keep them running) and expects BOTH sessions in `posh list`; phase 2
+# repeats the flow under POSH_LEAVE_ANONYMOUS=kill and expects only `named1`
+# to survive (killed unasked, stderr notice). Isolated like
+# debug-ph-stack-repro (throwaway POSH_DIR under .tmp guarded, a dedicated
+# tmux server, `env -u POSH_SESSION -u POSH_KEY` on every invocation); the
+# pane is captured at each step — read the captures, interactive navigation is
+# timing-sensitive. Best-effort; the hermetic signal is the picker
+# (LeavePolicy / leave_candidates / leave_action / run_leave_kills) and
+# palette_view::leave_prompt unit tests.
+#
+# verify the leave prompt (keep, then POSH_LEAVE_ANONYMOUS=kill) in a tmux pane
+[group("debug")]
+debug-verify-leave-prompt: build-palette
+    #!/usr/bin/env bash
+    set -uo pipefail
+    root="{{ justfile_directory() }}"
+    dir="$root/.tmp/leaveprompt"
+    sock="$dir/posh"
+    case "$sock" in "$root"/.tmp/*/posh) : ;; *) echo "refusing: POSH_DIR '$sock' not under .tmp"; exit 1 ;; esac
+    rm -rf "$dir"; mkdir -p "$sock" "$dir/bin"; chmod 700 "$dir" "$sock"
+    nix develop --command cargo build -p posh
+    P="$root/target/debug/posh"
+    ln -sfn "$P" "$dir/bin/ph"
+    pal="$root/result-posh-palette/bin/posh-palette"
+    iso=(env -u POSH_SESSION -u POSH_KEY "POSH_DIR=$sock" POSH_GROUP=default "POSH_PALETTE=$pal")
+    TM=(tmux -L posh-leaveprompt)
+    # Kill every isolated session but the named ones listed as arguments.
+    kill_except() {
+      for s in $("${iso[@]}" "$P" list --short 2>/dev/null); do
+        case " $* " in *" $s "*) continue ;; esac
+        "${iso[@]}" "$P" kill "$s" >/dev/null 2>&1 || true
+      done
+    }
+    cleanup() { "${TM[@]}" kill-server 2>/dev/null || true; kill_except; }
+    trap cleanup EXIT
+    cap() { echo "== $1 =="; "${TM[@]}" capture-pane -p -t s 2>/dev/null; echo; }
+    key() { "${TM[@]}" send-keys -t s "$@"; }
+    # One phase: ph :+ (anonymous, via the front door) -> palette -> Switch
+    # session… -> named1 -> Keep it running -> palette -> Detach. Leaves the
+    # pane at whatever the leave step produced (the prompt, or a plain exit).
+    phase() {
+      local policy="$1"
+      # Let a previous phase's server go away fully: a new-session on the heels
+      # of kill-server races the dying server ("server exited unexpectedly").
+      "${TM[@]}" kill-server 2>/dev/null || true
+      for _ in 1 2 3 4 5 6 7 8 9 10; do "${TM[@]}" has-session 2>/dev/null || break; sleep 0.5; done
+      sleep 1
+      "${TM[@]}" new-session -d -s s -x 100 -y 30 \
+        "env -u POSH_SESSION -u POSH_KEY POSH_DIR='$sock' POSH_GROUP=default POSH_PALETTE='$pal' \
+          POSH_LEAVE_ANONYMOUS='$policy' POSH_DEBUG_LOG='$dir/posh-$policy.log' \
+          '$dir/bin/ph' :+ 2>'$dir/stderr-$policy.log'; echo PH_EXITED_\$?; sleep 120"
+      sleep 4
+      cap "[$policy] attached to the anonymous session (expect a shell prompt)"
+      key -H 1e; sleep 1; cap "[$policy] palette (expect Switch session… first — no stack yet)"
+      key Enter; sleep 2; cap "[$policy] session picker (expect named1 and the anonymous s-N)"
+      key -l 'named1'; sleep 1; key Enter; sleep 1
+      cap "[$policy] leave question (expect Keep it running first)"
+      key Enter; sleep 3; cap "[$policy] after keep-switch (expect named1's ===NAMED1=== banner)"
+      key -H 1e; sleep 1; cap "[$policy] palette on named1 (expect Back to :s-N first)"
+      # Filter to the Detach row and take it: the viewport leaves posh with
+      # nothing to pop, so the front door reaches leave_anonymous_sessions.
+      key -l 'Detach'; sleep 1; key Enter; sleep 3
+    }
+    "${iso[@]}" "$P" start --detach named1 -- bash --norc -c 'echo ===NAMED1===; cat' || true
+    echo "== sessions before (isolated POSH_DIR=$sock; expect named1 only) =="; "${iso[@]}" "$P" list || true; echo
+    phase ask
+    cap "PHASE 1: leave prompt (expect 'Leaving — 1 anonymous session you created' with Keep them running first)"
+    key Enter; sleep 2
+    cap "PHASE 1: after Enter = keep (expect PH_EXITED_0)"
+    echo "== PHASE 1 stderr =="; cat "$dir/stderr-ask.log" 2>/dev/null || true; echo
+    echo "== PHASE 1 sessions (expect named1 AND the anonymous s-N, both alive) =="; "${iso[@]}" "$P" list || true; echo
+    # Reset for phase 2: only named1 survives, so its listing is unambiguous.
+    kill_except named1
+    phase kill
+    cap "PHASE 2: after Detach under POSH_LEAVE_ANONYMOUS=kill (expect PH_EXITED_0, no prompt)"
+    echo "== PHASE 2 stderr (expect one 'killed' notice for the anonymous session) =="; cat "$dir/stderr-kill.log" 2>/dev/null || true; echo
+    echo "== PHASE 2 sessions (expect named1 only) =="; "${iso[@]}" "$P" list || true; echo
+
 # (Re)bless the mosh terminal characterization goldens (task #4). The driver is
 # the mosh-ffi C++ FFI shim, so a fixed VT script always renders the same grid
 # (no clock, no network). Assert with the normal loop: `just debug-cargo test
