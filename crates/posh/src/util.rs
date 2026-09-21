@@ -382,12 +382,17 @@ extern "C" fn on_sigwinch(_: libc::c_int) {
     SIGWINCH_RECEIVED.store(true, Ordering::Release);
 }
 
-/// Whether a terminating signal (SIGTERM / SIGINT / SIGHUP) has reached this
-/// process — sticky, unlike the `SIGTERM_RECEIVED` flag the loops consume.
-/// The front door reads it on the way out: an attach a signal ended is not
-/// one to ask questions after (the leave prompt degrades to a report).
-pub fn terminating_signal_seen() -> bool {
-    LAST_SIGNAL.load(Ordering::Acquire) != 0
+/// Whether a terminating signal (SIGTERM / SIGINT / SIGHUP) reached this
+/// process since the last call — the CLIENT's per-attach reading of
+/// `LAST_SIGNAL`, consumed here so it never outlives the attach it ended.
+/// The front door takes it once per attach on the way out of the client loop:
+/// an attach a signal ended is not one to ask questions after (the leave
+/// prompt degrades to a report), but `run()` can continue past a signal — a
+/// queued switch re-attaches — and a later, orderly exit must not inherit
+/// the verdict. The daemons read `LAST_SIGNAL` themselves, non-consuming, to
+/// name the signal in their teardown log; that reading is unchanged.
+pub fn take_terminating_signal() -> bool {
+    LAST_SIGNAL.swap(0, Ordering::AcqRel) != 0
 }
 
 /// Terminating-signal handler that also records WHICH signal fired, so the
@@ -474,8 +479,8 @@ pub fn install_sigusr2_handler() {
 /// winds down and restores the tty (raw mode clears ISIG, but kill(1) and
 /// terminal hangup would otherwise terminate with the default disposition
 /// mid-raw) — through the same handler as the daemon's, so `LAST_SIGNAL`
-/// keeps the sticky record `terminating_signal_seen` reads once the
-/// consumed flag is gone; SIGCONT sets SIGCONT_RECEIVED so the screen
+/// keeps the record `take_terminating_signal` consumes per attach once the
+/// loop's flag is gone; SIGCONT sets SIGCONT_RECEIVED so the screen
 /// repaints after SIGSTOP/fg.
 pub fn install_client_signal_handlers() {
     install_handler(
@@ -720,6 +725,17 @@ mod tests {
         assert_eq!(mode, 0o600, "open_private_append must create 0600, got {mode:o}");
 
         let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn take_terminating_signal_consumes_the_record() {
+        // Set `LAST_SIGNAL` directly rather than through `on_terminating_signal`:
+        // the handler also raises `SIGTERM_RECEIVED`, which an in-process test
+        // daemon running concurrently (`session::daemon` tests) would consume
+        // as its own shutdown.
+        LAST_SIGNAL.store(libc::SIGTERM, Ordering::Release);
+        assert!(take_terminating_signal(), "the signal that fired is reported once");
+        assert!(!take_terminating_signal(), "consumed: a later attach's exit does not inherit it");
     }
 
     #[test]

@@ -57,8 +57,11 @@ fn run() -> Result<()> {
     once?;
     loop {
         let end = picker::take_attach_end();
+        // Consumed per attach: a signal that ended an attach with a switch
+        // already queued belongs to THAT attach, not to every later exit.
+        let signaled = util::take_terminating_signal();
         let Some(sw) = picker::take_switch().or_else(|| picker::auto_pop(end.as_ref())) else {
-            leave_anonymous_sessions(end.as_ref());
+            leave_anonymous_sessions(end.as_ref(), signaled);
             // Unbind before the `process::exit` inside, which skips `main`'s.
             viewport_status::shutdown();
             return exit_with_attach_end(end);
@@ -98,14 +101,15 @@ fn run() -> Result<()> {
 /// anonymous sessions this viewport created (design 2026-09-21 §4,
 /// `POSH_LEAVE_ANONYMOUS`). `Ask` (the default) shows the leave prompt on
 /// the standalone chooser — a tty on both ends and no signal behind the
-/// end — with *Keep* as Enter and Esc; `Kill` kills unasked; `Keep`, or
+/// end (`signaled`: the just-ended attach's verdict, taken by `run()`) —
+/// with *Keep* as Enter and Esc; `Kill` kills unasked; `Keep`, or
 /// nothing anonymous, is silent. The kills run through `kill_target`
 /// (`--unless-attached` protects another viewport unless forced), in
 /// stack order with the current session last — its attach has already
 /// returned — and every notice prints on stderr AFTER the chooser has
 /// restored the tty. A prompt that could not be shown, or was dismissed,
 /// keeps the sessions and says which were left.
-fn leave_anonymous_sessions(end: Option<&picker::AttachEnd>) {
+fn leave_anonymous_sessions(end: Option<&picker::AttachEnd>, signaled: bool) {
     use picker::{LeaveAction, Previous};
     let candidates = picker::leave_candidates(end);
     let tty = util::is_tty(libc::STDIN_FILENO) && util::is_tty(libc::STDOUT_FILENO);
@@ -115,7 +119,7 @@ fn leave_anonymous_sessions(end: Option<&picker::AttachEnd>) {
             eprintln!("posh: {n}");
         }
     };
-    match picker::leave_action(policy, tty, util::terminating_signal_seen(), &candidates) {
+    match picker::leave_action(policy, tty, signaled, &candidates) {
         LeaveAction::Nothing => {}
         LeaveAction::Report => eprintln!("posh: {}", picker::left_running_notice(&candidates)),
         LeaveAction::Kill { force } => kills(force),

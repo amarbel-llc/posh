@@ -432,8 +432,10 @@ pub enum LeaveAction {
 }
 
 /// Pure: the decision from the policy, whether stdin + stdout are a tty,
-/// whether a terminating signal reached the viewport
-/// (`util::terminating_signal_seen`), and the candidates.
+/// whether a terminating signal ended the JUST-ENDED attach (`signaled`:
+/// `util::take_terminating_signal`, consumed per attach by `run()` — an
+/// earlier attach's signal never downgrades a later, orderly exit), and the
+/// candidates.
 pub fn leave_action(policy: LeavePolicy, tty: bool, signaled: bool, candidates: &[StackEntry]) -> LeaveAction {
     if candidates.is_empty() {
         return LeaveAction::Nothing;
@@ -567,8 +569,10 @@ pub fn current_entry() -> Option<StackEntry> {
 /// `overlay` line): `kind` is `palette` (the Commands palette, a dialog, or
 /// the leave question it asks today), `picker` (the session picker —
 /// in-session `session.list`, or the standalone `ph` chooser), or `leave`
-/// (reserved for the Section 4 leave prompt); `over` is the attach the view
-/// was opened over (`None` for the standalone chooser).
+/// (the standalone anonymous-session leave prompt the front door shows on
+/// the way out — `main::leave_anonymous_sessions`; distinct from the
+/// in-session leave question, which is a `palette` view); `over` is the
+/// attach the view was opened over (`None` for the standalone chooser).
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Overlay {
     pub kind: &'static str,
