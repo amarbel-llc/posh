@@ -12,7 +12,7 @@
 
 **Design:** `docs/plans/2026-09-21-session-stack-ux-design.md` (approved 2026-09-21).
 
-**Sequencing note:** Sections 2 through 4 depend on Section 1's types and on the exact shape Section 2's socket takes. Their tasks below are scoped (files, tests, behavior) but NOT yet broken into 2-to-5-minute steps. Expand each into steps of the Section 1 shape when its predecessor has merged; do not start a later section from this outline alone.
+**Sequencing note:** every section was expanded into steps once its predecessor had merged (Sections 1–3 merged 2026-09-21; Section 4 landed the same day). Where the shipped code deviates from a task's sketch, the section's own text says so (the `CAP_SESSION_KIND` cap instead of an activity-format bump, RFC 0014 §6 instead of §5, the lazy viewport bind, the one-shot anonymous-create flag, the `run_standalone(first_show)` shape, the per-attach `take_terminating_signal`).
 
 **Dev loop:** `just debug-cargo test -p posh <test_name>` for a single test, `just debug-cargo test -p posh-proto` for the proto crate. `merge-this-session` runs the full `just` gate; do not run `just` by hand before merging. Commit after every green step; the pre-commit hook formats (conformist).
 
