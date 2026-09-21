@@ -1130,17 +1130,243 @@ Then the Section 3 merge (attestation + `merge-this-session-async`); run clippy 
 
 ---
 
-## Section 4: leave prompt (outline)
+## Section 4: leave prompt
 
-### Task 15: `leave_candidates` and the lever
+**State of the code this section starts from (verified 2026-09-21):** RFC 0005
+§3.2 `ui.show` has `view` / `commands` / `title` / `prompt` / `body` / `rows` /
+`empty` and no description text; posh-palette (`posh-palette/main.go`,
+`showParams` ~125, `Update` ~231, `paletteView` ~526) renders title → filter
+input → rows. `remote::palette::choose_standalone(title, rows, empty)` hosts
+ONLY the `picker` view on a blank frame; there is no standalone COMMAND-list
+chooser. `run()` (`main.rs:54-94`) exits through `exit_with_attach_end` when
+no switch / auto-pop follows; `picker::kill_target(target, force)` (~475)
+kills locally or over ssh with `--unless-attached` unless forced and returns
+a notice string. `picker::AttachEnd { Ended{code,cause} | Lost | Quit }`.
+`picker::overlay_open("leave")` is reserved and unused.
 
-- `picker.rs`: `pub fn leave_candidates(end: Option<&AttachEnd>) -> Vec<StackEntry>` (every `Anonymous` stack entry + the current when `Anonymous` and `end` is not `Ended`); `pub enum LeavePolicy { Ask, Keep, Kill }` parsed from `POSH_LEAVE_ANONYMOUS` (default `Ask`). Six-combination test table.
+### Task 14: RFC 0005 `description` + the standalone command chooser
 
-### Task 16: the prompt in `run()`
+**Promotion criteria:** N/A (additive protocol field; an old renderer ignores
+an unknown `ui.show` param per §9).
 
-- `main.rs`: after `take_switch().or_else(auto_pop)` yields `None`, compute candidates; on `Ask` with a tty and a non-signal end, call `palette::choose_standalone` with `palette_view::leave_prompt(&candidates)` (description block + the three rows, *Keep* first); on `Kill` or a kill choice run `kill_target` per entry in stack order, current last, collecting notices printed after the tty is restored; off-tty / signal ends print `posh: left running: <targets>`.
-- Tests: the decision function `leave_action(policy, has_tty, end, candidates) -> LeaveAction` unit-tested; the kill ordering tested with a stub killer.
+**Files:**
+- Modify: `docs/rfcs/0005-palette-control-protocol.md` §3.2 table (+ a §9
+  compatibility sentence): `description` (string, optional, `palette` and
+  `picker`): free text the renderer shows between the heading and the
+  filter input, word-wrapped to the panel, never filtered on.
+- Modify: `posh-palette/main.go` — `showParams.Description string
+  \`json:"description,omitempty"\``; `model.description`; set in the `palette`
+  and `picker` arms of `Update` (cleared when absent); `paletteView` and
+  `pickerView` write it (dim style, one blank line after) between the title
+  and the input. Test in `posh-palette/main_test.go`: a `showMsg{View:
+  "palette", Description: "a\nb"}` yields a `View()` containing both lines
+  between the title and the prompt.
+- Modify: `crates/posh/src/remote/palette.rs` — `Palette::open_described(title,
+  description, commands)` (`show` with the extra field; `open` stays as is);
+  `pub fn choose_standalone_commands(title, description, commands) ->
+  Result<Choice>` sharing `choose_standalone`'s loop (factor the loop into a
+  private `run_standalone(palette, first_show: impl FnOnce(&mut Palette))`)
+  — a `Choice::Action` for a command's action, `Cancelled` on Esc / renderer
+  gone, `Unsupported` if the renderer rejects the view. Tests: `open_described`
+  sends the field (socketpair test like `show_dialog_sends_…`); the
+  `real_binary_*` round-trip gains a described-palette case (skips without a
+  fresh renderer; `just debug-palette-e2e` runs it).
+- Commit: `posh: RFC 0005 ui.show description; a standalone command chooser`.
+
+### Task 15: `LeavePolicy`, `leave_candidates`, and the prompt's JSON
+
+**Files:**
+- Modify: `crates/posh/src/picker.rs` (beside `auto_pop`), `crates/posh/src/remote/palette_view.rs`.
+
+**Step 1: failing tests**
+
+picker.rs:
+```rust
+#[test]
+fn leave_policy_parses_the_env_spellings() {
+    assert_eq!(LeavePolicy::parse(None), LeavePolicy::Ask);
+    assert_eq!(LeavePolicy::parse(Some("ask")), LeavePolicy::Ask);
+    assert_eq!(LeavePolicy::parse(Some("keep")), LeavePolicy::Keep);
+    assert_eq!(LeavePolicy::parse(Some("kill")), LeavePolicy::Kill);
+    assert_eq!(LeavePolicy::parse(Some("bogus")), LeavePolicy::Ask); // unknown ⇒ the safe default
+}
+
+#[test]
+fn leave_candidates_are_the_anonymous_entries_plus_a_live_anonymous_current() {
+    let _g = switch_test_guard();
+    while stack_pop().is_some() {}
+    // stack: :s-1 (anon), box:dev (named), box:s-3 (anon); current :s-9 (anon)
+    set_current(":s-1"); set_current_kind(SessionKind::Anonymous); stack_push_current();
+    set_current("box:dev"); set_current_kind(SessionKind::Named); stack_push_current();
+    set_current("box:s-3"); set_current_kind(SessionKind::Anonymous); stack_push_current();
+    set_current(":s-9"); set_current_kind(SessionKind::Anonymous);
+    let t = |v: Vec<StackEntry>| v.into_iter().map(|e| e.target).collect::<Vec<_>>();
+    // Quit / detach: stack anon entries in order, then the current LAST.
+    assert_eq!(t(leave_candidates(Some(&AttachEnd::Quit))), [":s-1", "box:s-3", ":s-9"]);
+    assert_eq!(t(leave_candidates(None)), [":s-1", "box:s-3", ":s-9"]);
+    // The current ENDED: it is gone, not a candidate.
+    let ended = AttachEnd::Ended { code: 0, cause: None };
+    assert_eq!(t(leave_candidates(Some(&ended))), [":s-1", "box:s-3"]);
+    // Lost: the daemon may live on; still a candidate.
+    assert_eq!(t(leave_candidates(Some(&AttachEnd::Lost("x".into())))), [":s-1", "box:s-3", ":s-9"]);
+    // A named current adds nothing; an unknown-kind entry is never a candidate.
+    set_current_kind(SessionKind::Named); // no downgrade — use a fresh current instead
+    set_current("box:named"); set_current_kind(SessionKind::Named);
+    assert_eq!(t(leave_candidates(Some(&AttachEnd::Quit))), [":s-1", "box:s-3"]);
+    while stack_pop().is_some() {}
+}
+```
+
+palette_view.rs:
+```rust
+#[test]
+fn leave_prompt_lists_candidates_in_the_description_and_offers_keep_first() {
+    let c = vec![entry(":s-1", SessionKind::Anonymous), entry("box:s-3", SessionKind::Anonymous)];
+    let p = leave_prompt(&c);
+    assert_eq!(p.title, "Leaving — 2 anonymous sessions you created");
+    assert_eq!(p.description, "flac:s-1\nbox:s-3"); // display_target / short_target form; hostname-dependent for ":" — assert with starts/ends like commands_title
+    let names: Vec<&str> = p.commands.as_array().unwrap().iter().map(|c| c["name"].as_str().unwrap()).collect();
+    assert_eq!(names, ["Keep them running", "Kill them (kept if other viewports are attached)", "Kill them even with other viewports attached"]);
+    assert_eq!(p.commands[0]["action"]["method"], "session.leave");
+    assert_eq!(p.commands[0]["action"]["params"]["previous"], "keep");
+    assert_eq!(p.commands[1]["action"]["params"]["previous"], "kill");
+    assert_eq!(p.commands[2]["action"]["params"]["previous"], "force-kill");
+    // One candidate: singular wording.
+    assert!(leave_prompt(&c[..1]).title.starts_with("Leaving — 1 anonymous session "));
+}
+```
+
+**Step 3: implementation**
+
+picker.rs:
+```rust
+/// `POSH_LEAVE_ANONYMOUS`: what the front door does with the anonymous
+/// sessions this viewport created when it leaves posh (design 2026-09-21
+/// §4). `Ask` (default) prompts; `Keep` never prompts; `Kill` kills without
+/// asking. The env var is the config surface until posh has a config file.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum LeavePolicy { Ask, Keep, Kill }
+impl LeavePolicy {
+    pub fn parse(v: Option<&str>) -> LeavePolicy   // "keep" | "kill" | anything else ⇒ Ask
+    pub fn from_env() -> LeavePolicy               // std::env::var("POSH_LEAVE_ANONYMOUS")
+}
+
+/// The sessions the leave prompt is about: every `Anonymous` stack entry,
+/// bottom first, then the current attach when it is `Anonymous` and did
+/// not itself END (an ended session has nothing to kill; a lost one may).
+/// `Unknown` never qualifies — the prompt only names what the daemon (or
+/// the `:+` fallback) called anonymous.
+pub fn leave_candidates(end: Option<&AttachEnd>) -> Vec<StackEntry>
+```
+
+palette_view.rs:
+```rust
+/// The leave prompt (design 2026-09-21 §4): the candidates in the
+/// `description` block, the three fates as rows, *Keep* first so Enter
+/// keeps. Rows re-issue `session.leave` with a `previous` like the switch
+/// dialogs; the front door reads the selection back.
+pub struct LeavePrompt { pub title: String, pub description: String, pub commands: Value }
+pub fn leave_prompt(candidates: &[StackEntry]) -> LeavePrompt
+```
+(the rows reuse `leave_commands_for("session.leave", None)` minus the Cancel
+row — or keep Cancel as a fourth row meaning keep; choose Keep-first + no
+Cancel so Esc and Enter both keep. Note in the doc.)
+
+Commit: `posh: LeavePolicy, leave_candidates, and the leave prompt view`.
+
+### Task 16: the prompt in `run()` and the kills
+
+**Files:** `crates/posh/src/main.rs` (`run`, `exit_with_attach_end`), `crates/posh/src/picker.rs` (a pure decision fn + a kill runner with a seam).
+
+**Step 1: failing tests** (picker.rs, pure):
+```rust
+#[test]
+fn leave_action_decision_table() {
+    use LeaveAction::*;
+    let c = vec![entry(":s-1", SessionKind::Anonymous)];
+    // no candidates ⇒ nothing, whatever the policy
+    assert_eq!(leave_action(LeavePolicy::Ask, true, false, &[]), Nothing);
+    // keep ⇒ nothing, silently
+    assert_eq!(leave_action(LeavePolicy::Keep, true, false, &c), Nothing);
+    // kill ⇒ kill (unless-attached), no prompt
+    assert_eq!(leave_action(LeavePolicy::Kill, true, false, &c), Kill { force: false });
+    // ask on a tty, not a signal ⇒ prompt
+    assert_eq!(leave_action(LeavePolicy::Ask, true, false, &c), Prompt);
+    // ask off-tty or after a signal ⇒ report, keep
+    assert_eq!(leave_action(LeavePolicy::Ask, false, false, &c), Report);
+    assert_eq!(leave_action(LeavePolicy::Ask, true, true, &c), Report);
+}
+
+#[test]
+fn run_leave_kills_in_stack_order_current_last_and_collects_every_notice() {
+    // a stub killer records the order and fails one host; the runner never stops early
+    let order = std::cell::RefCell::new(vec![]);
+    let notices = run_leave_kills(&[entry(":s-1", ..), entry("box:s-3", ..), entry(":s-9", ..)], false, |t, f| {
+        order.borrow_mut().push(t.to_string());
+        if t == "box:s-3" { Err(Error::from("box: ssh: no route")) } else { Ok(format!("killed {t}")) }
+    });
+    assert_eq!(*order.borrow(), [":s-1", "box:s-3", ":s-9"]);
+    assert_eq!(notices, ["killed :s-1", "box:s-3 not killed: box: ssh: no route", "killed :s-9"]);
+}
+```
+
+**Step 3: implementation**
+
+picker.rs:
+```rust
+#[derive(Debug, PartialEq, Eq)]
+pub enum LeaveAction { Nothing, Prompt, Kill { force: bool }, Report }
+/// Pure: what to do on leaving, from the policy, whether stdin+stdout are a
+/// tty, whether the attach ended by a signal (`util::signal_received()` or
+/// the AttachEnd's Quit-by-signal marker — read how the clients note it),
+/// and the candidates.
+pub fn leave_action(policy: LeavePolicy, tty: bool, signaled: bool, candidates: &[StackEntry]) -> LeaveAction
+/// Kill each candidate in order (stack bottom first, the current last —
+/// `leave_candidates` already orders them), never stopping on a failure;
+/// one notice per entry. `kill` is `kill_target` in production.
+pub fn run_leave_kills(candidates: &[StackEntry], force: bool, kill: impl FnMut(&str, bool) -> Result<String>) -> Vec<String>
+pub fn left_running_notice(candidates: &[StackEntry]) -> String   // "left running: flac:s-1, box:s-3 (POSH_LEAVE_ANONYMOUS=kill to kill on exit)"
+```
+
+main.rs `run()`: in the `else` arm before `viewport_status::shutdown()`:
+```rust
+            let candidates = picker::leave_candidates(end.as_ref());
+            let tty = util::is_tty(libc::STDIN_FILENO) && util::is_tty(libc::STDOUT_FILENO);
+            match picker::leave_action(picker::LeavePolicy::from_env(), tty, signaled(&end), &candidates) {
+                picker::LeaveAction::Nothing => {}
+                picker::LeaveAction::Report => eprintln!("posh: {}", picker::left_running_notice(&candidates)),
+                picker::LeaveAction::Kill { force } => {
+                    for n in picker::run_leave_kills(&candidates, force, picker::kill_target) { eprintln!("posh: {n}"); }
+                }
+                picker::LeaveAction::Prompt => {
+                    let p = remote::palette_view::leave_prompt(&candidates);
+                    picker::overlay_open("leave");
+                    let choice = remote::palette::choose_standalone_commands(&p.title, &p.description, p.commands);
+                    picker::overlay_close("leave");
+                    match choice {
+                        Ok(remote::palette::Choice::Action { params, .. }) => match picker::Previous::parse(params["previous"].as_str()) {
+                            Some(picker::Previous::Kill) => { for n in picker::run_leave_kills(&candidates, false, picker::kill_target) { eprintln!("posh: {n}"); } }
+                            Some(picker::Previous::ForceKill) => { for n in picker::run_leave_kills(&candidates, true, picker::kill_target) { eprintln!("posh: {n}"); } }
+                            _ => {}
+                        },
+                        // Cancelled / Unsupported / a renderer error: keep, and say what was left.
+                        _ => eprintln!("posh: {}", picker::left_running_notice(&candidates)),
+                    }
+                }
+            }
+```
+The current session, when a candidate, is last in the list and its attach has
+already returned, so its kill goes through the same `kill_target`
+(`--unless-attached` protects another viewport). Print notices AFTER
+`choose_standalone_commands` restored the tty (it does before returning).
+
+Commit: `posh: ask what to do with the anonymous sessions a viewport created when it leaves (POSH_LEAVE_ANONYMOUS)`.
 
 ### Task 17: docs and manual verification
 
-- FDR 0016 amendment (stacked switching gains the kind rule and the leave prompt); `doc/posh.1.scd` ENVIRONMENT gains `POSH_LEAVE_ANONYMOUS`; a `debug-verify-leave-prompt` justfile recipe (`debug` group) driving `ph :+` → keep-switch → detach in a tmux pane and printing the prompt capture and `posh list`.
+- `docs/features/0016-cross-host-session-switcher.md`: "Stacked switching" gains the kind rule, the predecessor heading, and a "Leaving posh" paragraph (the prompt, the lever, the off-tty report); the trade-off table gains a `leave policy` row (ask / keep / kill; signal: the tuning lever from the design §6).
+- `doc/posh.1.scd`: ENVIRONMENT gains `POSH_LEAVE_ANONYMOUS`; the `ph`/palette section describes the prompt in two sentences.
+- `docs/rfcs/0005-palette-control-protocol.md` §7 (client methods the renderer issues): `session.leave {previous}` beside `session.switch` / `session.pop`.
+- `justfile`: `debug-verify-leave-prompt` (`debug` group, depends on `build-palette`): in a detached tmux pane with an isolated `POSH_DIR` under `.tmp/`, run the worktree `ph :+`, type `exit`-safe filler, keep-switch to a named session created in the same dir, then detach with the palette; capture the pane (the prompt must be visible), send Enter (keep), then print `posh list` showing both sessions alive; a second run with `POSH_LEAVE_ANONYMOUS=kill` prints a list with the anonymous one gone. Model it on `debug-verify-establish-modal` (`justfile:519`).
+- `just lint-doc` clean; commit `docs: the leave prompt (FDR 0016), POSH_LEAVE_ANONYMOUS, session.leave in RFC 0005; a debug-verify-leave-prompt recipe`.
+- Then the Section 4 merge (attestation + `merge-this-session-async`), and the memory note in `posh-devshell-gotchas` if the recipe taught anything new.
