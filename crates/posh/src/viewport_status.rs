@@ -366,13 +366,26 @@ mod tests {
             bind_listener(&dir, pid).err()
         );
         assert_eq!(BINDS.load(Ordering::Relaxed), binds + 1);
-        picker::set_current(":vs-test");
-        assert_eq!(BINDS.load(Ordering::Relaxed), binds + 1, "a second attach does not rebind");
         let sock = sock_path(&dir, pid);
         let pidfile = pid_path(&dir, pid);
         assert_eq!(std::fs::read_to_string(&pidfile).unwrap(), pid.to_string());
         let served = session::read_status_socket(&sock).unwrap();
-        assert!(served.starts_with(&format!("viewport pid={pid} ")), "{served}");
+        assert!(
+            served.starts_with(&format!("viewport pid={pid} current=:vs-test kind=unknown anonymous_create=0\n")),
+            "{served}"
+        );
+        // A second attach (an in-place re-home) does not rebind but the
+        // `current=` line follows it; the kind arriving on a frame updates
+        // `kind=` without the front door's loop.
+        picker::set_current(":vs-rehomed");
+        assert_eq!(BINDS.load(Ordering::Relaxed), binds + 1, "a second attach does not rebind");
+        let served = session::read_status_socket(&sock).unwrap();
+        assert!(served.contains(" current=:vs-rehomed kind=unknown "), "{served}");
+        picker::set_current_kind(SessionKind::Named);
+        let served = session::read_status_socket(&sock).unwrap();
+        assert!(served.contains(" current=:vs-rehomed kind=named "), "{served}");
+        picker::set_current(":vs-test");
+        assert!(session::read_status_socket(&sock).unwrap().contains(" current=:vs-test kind=unknown "));
         // The overlay helpers refresh on their own. The `leave` kind is the
         // one no concurrent renderer test opens (they record palette / picker
         // over whatever `current` is), so its line is this test's alone.

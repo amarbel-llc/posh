@@ -424,6 +424,9 @@ pub fn set_current(target: &str) {
         anonymous_create,
     });
     crate::viewport_status::ensure_bound();
+    // An FDR 0012 in-place switch re-homes without returning through
+    // `run()`, so the socket's `current=` line is refreshed here.
+    crate::viewport_status::refresh_now();
 }
 
 /// Flag the next attach as an anonymous session this front door is creating
@@ -447,8 +450,17 @@ pub fn set_current_kind(kind: SessionKind) {
     if kind == SessionKind::Unknown {
         return;
     }
-    if let Some(cur) = CURRENT.lock().unwrap_or_else(|e| e.into_inner()).as_mut() {
-        cur.kind = kind;
+    let changed = match CURRENT.lock().unwrap_or_else(|e| e.into_inner()).as_mut() {
+        Some(cur) if cur.kind != kind => {
+            cur.kind = kind;
+            true
+        }
+        _ => false,
+    };
+    if changed {
+        // The kind arrives on a frame mid-attach: the socket's `kind=` line
+        // is refreshed here, not by the front door's loop.
+        crate::viewport_status::refresh_now();
     }
 }
 
