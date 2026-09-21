@@ -64,8 +64,8 @@ fn run() -> Result<()> {
         }
         if sw.pop {
             picker::stack_pop();
-        } else if let (None, Some(leaving)) = (force, picker::current()) {
-            picker::stack_push(&leaving);
+        } else if force.is_none() {
+            picker::stack_push_current();
         }
         if let Err(e) = dispatch_ph(ph_parse(Some(&sw.target)), &picker::default_group()) {
             picker::disarm_kill();
@@ -773,6 +773,10 @@ fn start_remote_auto(
                 .ok_or_else(|| Error::from("posh start: too many remote sessions"))?
         }
     };
+    // The attach that follows is to a session this front door created: the
+    // FDR 0016 stack reads it as anonymous even when the remote daemon
+    // predates CAP_SESSION_KIND (cmd_ssh_session records the target).
+    picker::next_attach_is_created();
     cmd_ssh_session(user, host, target_group, global_group, id, extra, forward_flag)
 }
 

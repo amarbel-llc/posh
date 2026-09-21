@@ -222,14 +222,23 @@ pub struct Switch {
     pub pop: bool,
 }
 
-/// The session stack (FDR 0016, stacked switching): the targets a viewport
+/// A session the viewport switched away from: its target and the kind it
+/// was known to be when left (`current_kind` at push time — the daemon's
+/// report, or the created-dispatch fallback; `Unknown` otherwise).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct StackEntry {
+    pub target: String,
+    pub kind: SessionKind,
+}
+
+/// The session stack (FDR 0016, stacked switching): the sessions a viewport
 /// switched AWAY from in this front-door process, most recent last. A switch
 /// pushes the session it leaves; *Back* pops. Lives as long as the process
 /// — the `run()` re-attach loop — and no longer: leaving posh empties it.
-static STACK: Mutex<Vec<String>> = Mutex::new(Vec::new());
+static STACK: Mutex<Vec<StackEntry>> = Mutex::new(Vec::new());
 
 /// The session *Back* would return to, if any.
-pub fn stack_top() -> Option<String> {
+pub fn stack_top() -> Option<StackEntry> {
     STACK.lock().unwrap_or_else(|e| e.into_inner()).last().cloned()
 }
 
@@ -247,20 +256,24 @@ pub fn title() -> String {
     }
 }
 
-/// Push the session a switch is leaving (the front door, before the re-dial).
-pub fn stack_push(target: &str) {
-    STACK.lock().unwrap_or_else(|e| e.into_inner()).push(target.to_string());
+/// Push the session a switch is leaving — the attach in progress, with the
+/// kind it is known to be (the front door, before the re-dial). A no-op with
+/// no attach in progress.
+pub fn stack_push_current() {
+    if let Some(entry) = current_entry() {
+        STACK.lock().unwrap_or_else(|e| e.into_inner()).push(entry);
+    }
 }
 
 /// Pop the stack (the front door, when dispatching a *Back*).
-pub fn stack_pop() -> Option<String> {
+pub fn stack_pop() -> Option<StackEntry> {
     STACK.lock().unwrap_or_else(|e| e.into_inner()).pop()
 }
 
 /// Record a *Back*: the switch target is the stack's top. `None` (nothing
 /// recorded) when the stack is empty.
 pub fn request_pop(previous: Previous) -> Option<String> {
-    let target = stack_top()?;
+    let target = stack_top()?.target;
     *SWITCH.lock().unwrap_or_else(|e| e.into_inner()) = Some(Switch {
         target: target.clone(),
         previous,
@@ -277,14 +290,21 @@ pub fn request_pop(previous: Previous) -> Option<String> {
 /// all pass through.
 static SWITCH: Mutex<Option<Switch>> = Mutex::new(None);
 /// The attach in progress — the session a switch would be LEAVING: its
-/// target and the kind its daemon reported on a frame (`CAP_SESSION_KIND`;
-/// `Unknown` until it does). Set by the attach entry points; read by the
-/// front door when a switch asks to kill it.
+/// target, the kind its daemon reported on a frame (`CAP_SESSION_KIND`;
+/// `Unknown` until it does), and whether this front door CREATED it (`:+` /
+/// create-new) — the design §2 fallback: a created session whose daemon
+/// predates the kind reads Anonymous. Set by the attach entry points; read
+/// by the front door when a switch asks to kill it.
 struct Current {
     target: String,
     kind: SessionKind,
+    created: bool,
 }
 static CURRENT: Mutex<Option<Current>> = Mutex::new(None);
+/// One-shot: the next `set_current` is a session this front door created
+/// (`posh start :+` / `ph host:+`). Set by the two creators right before the
+/// attach entry point they call records the target; consumed by it.
+static NEXT_ATTACH_CREATED: Mutex<bool> = Mutex::new(false);
 /// A kill the front door armed for the NEW attach to carry out once it is
 /// established (`(target, force)`): kill-after-attach, so a failed switch
 /// never destroys the session it was leaving.
@@ -364,7 +384,7 @@ pub fn auto_pop(end: Option<&AttachEnd>) -> Option<Switch> {
         AttachEnd::Ended { .. } | AttachEnd::Lost(_) => end?.label()?,
         AttachEnd::Quit => return None,
     };
-    let top = stack_top()?;
+    let top = stack_top()?.target;
     let left = current().unwrap_or_else(|| "session".to_string());
     *PENDING_NOTICE.lock().unwrap_or_else(|e| e.into_inner()) = Some(format!(
         "session {} {why} \u{2014} back to {}",
@@ -387,12 +407,22 @@ fn display_target(target: &str) -> String {
     }
 }
 
-/// A new attach: the kind is `Unknown` until its daemon says.
+/// A new attach: the kind is `Unknown` until its daemon says; created iff a
+/// creator flagged this attach (`next_attach_is_created`, consumed here).
 pub fn set_current(target: &str) {
+    let created = std::mem::take(&mut *NEXT_ATTACH_CREATED.lock().unwrap_or_else(|e| e.into_inner()));
     *CURRENT.lock().unwrap_or_else(|e| e.into_inner()) = Some(Current {
         target: target.to_string(),
         kind: SessionKind::Unknown,
+        created,
     });
+}
+
+/// Flag the next attach as a session this front door is creating (the `:+`
+/// / create-new dispatch): `cmd_start_local` and `start_remote_auto`, right
+/// before the entry point that calls `set_current`.
+pub fn next_attach_is_created() {
+    *NEXT_ATTACH_CREATED.lock().unwrap_or_else(|e| e.into_inner()) = true;
 }
 
 /// The daemon reported the current session's kind (a frame's id 20 entry).
@@ -411,10 +441,28 @@ pub fn current() -> Option<String> {
     CURRENT.lock().unwrap_or_else(|e| e.into_inner()).as_ref().map(|c| c.target.clone())
 }
 
-/// The current session's kind as its daemon reported it; `Unknown` with no
-/// attach in progress or before the daemon said.
+/// The current session's kind: what its daemon reported if it did; else
+/// Anonymous for a session this front door created (a daemon that predates
+/// the kind cannot say, but a `:+` create is anonymous by construction);
+/// else `Unknown` (a plain attach to a silent daemon, or no attach at all).
 pub fn current_kind() -> SessionKind {
-    CURRENT.lock().unwrap_or_else(|e| e.into_inner()).as_ref().map_or(SessionKind::Unknown, |c| c.kind)
+    CURRENT
+        .lock()
+        .unwrap_or_else(|e| e.into_inner())
+        .as_ref()
+        .map_or(SessionKind::Unknown, |c| match c.kind {
+            SessionKind::Unknown if c.created => SessionKind::Anonymous,
+            kind => kind,
+        })
+}
+
+/// The attach in progress as a stack entry (what a switch away from it
+/// would push).
+pub fn current_entry() -> Option<StackEntry> {
+    Some(StackEntry {
+        target: current()?,
+        kind: current_kind(),
+    })
 }
 
 /// The title a viewport shows for a session that has set none of its own:
@@ -674,11 +722,13 @@ mod tests {
         assert_eq!(title(), TITLE);
         assert_eq!(request_pop(Previous::Keep), None, "nothing to go back to");
         assert_eq!(take_switch(), None);
-        stack_push(":s-1");
-        stack_push("box:dev");
+        set_current(":s-1");
+        stack_push_current();
+        set_current("box:dev");
+        stack_push_current();
         assert_eq!(stack_depth(), 2);
         assert_eq!(title(), "sessions \u{b7} 2 to go back");
-        assert_eq!(stack_top().as_deref(), Some("box:dev"));
+        assert_eq!(stack_top().map(|e| e.target).as_deref(), Some("box:dev"));
         assert_eq!(request_pop(Previous::Kill).as_deref(), Some("box:dev"));
         assert_eq!(
             take_switch(),
@@ -686,8 +736,8 @@ mod tests {
         );
         // Recording a pop does not pop: the front door does, when it re-dials.
         assert_eq!(stack_depth(), 2);
-        assert_eq!(stack_pop().as_deref(), Some("box:dev"));
-        assert_eq!(stack_top().as_deref(), Some(":s-1"));
+        assert_eq!(stack_pop().map(|e| e.target).as_deref(), Some("box:dev"));
+        assert_eq!(stack_top().map(|e| e.target).as_deref(), Some(":s-1"));
         stack_pop();
         // The back question re-issues session.pop with a previous, no target.
         // The session being left is named in the dialog title (the caller), NOT
@@ -718,7 +768,9 @@ mod tests {
         // No stack: nothing to pop, whatever the end.
         assert_eq!(auto_pop(Some(&ended(0))), None);
         assert_eq!(take_pending_notice(), None);
-        stack_push(":s-2");
+        set_current(":s-2");
+        stack_push_current();
+        set_current("box:dev");
         // A quit never pops.
         assert_eq!(auto_pop(Some(&AttachEnd::Quit)), None);
         assert_eq!(auto_pop(None), None);
@@ -746,6 +798,62 @@ mod tests {
         );
         assert!(take_pending_notice().unwrap().contains("lost (mux channel closed)"));
         stack_pop();
+    }
+
+    /// Each stack entry carries the kind the session was known to be when
+    /// left: the daemon's report on the current attach travels with the
+    /// target onto the stack.
+    #[test]
+    fn stack_entries_carry_the_kind_of_the_session_left() {
+        let _g = switch_test_guard();
+        while stack_pop().is_some() {}
+        set_current(":s-1");
+        set_current_kind(SessionKind::Anonymous);
+        stack_push_current();
+        set_current("box:dev");
+        set_current_kind(SessionKind::Named);
+        stack_push_current();
+        assert_eq!(
+            stack_top().map(|e| (e.target, e.kind)),
+            Some(("box:dev".into(), SessionKind::Named))
+        );
+        stack_pop();
+        assert_eq!(stack_top().map(|e| e.kind), Some(SessionKind::Anonymous));
+        assert_eq!(stack_pop().map(|e| e.target).as_deref(), Some(":s-1"));
+        assert_eq!(stack_top(), None);
+        // With no attach in progress there is nothing to push.
+        *CURRENT.lock().unwrap() = None;
+        stack_push_current();
+        assert_eq!(stack_depth(), 0);
+        assert_eq!(current_entry(), None);
+    }
+
+    /// The design §2 fallback: a created (`:+`) dispatch against a daemon
+    /// that never says (Unknown) reads Anonymous; a plain attach to the same
+    /// daemon reads Unknown; a daemon that DOES say wins over the fallback,
+    /// and a known kind is never downgraded to Unknown. The created flag is
+    /// one-shot: consumed by the `set_current` it precedes.
+    #[test]
+    fn current_kind_falls_back_to_anonymous_only_for_a_created_dispatch() {
+        let _g = switch_test_guard();
+        next_attach_is_created();
+        set_current(":s-9");
+        assert_eq!(current_kind(), SessionKind::Anonymous);
+        assert_eq!(
+            current_entry(),
+            Some(StackEntry { target: ":s-9".into(), kind: SessionKind::Anonymous })
+        );
+        set_current_kind(SessionKind::Named);
+        assert_eq!(current_kind(), SessionKind::Named, "the daemon's report wins");
+        set_current_kind(SessionKind::Unknown);
+        assert_eq!(current_kind(), SessionKind::Named, "never downgraded");
+        set_current(":dev"); // a plain attach clears both
+        assert_eq!(current_kind(), SessionKind::Unknown);
+        set_current_kind(SessionKind::Unknown);
+        assert_eq!(current_kind(), SessionKind::Unknown);
+        *CURRENT.lock().unwrap() = None;
+        set_current_kind(SessionKind::Named);
+        assert_eq!(current_kind(), SessionKind::Unknown, "no attach: a no-op");
     }
 
     /// The leave step: three `session.switch` re-issues carrying the chosen

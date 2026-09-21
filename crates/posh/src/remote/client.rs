@@ -414,8 +414,13 @@ fn open_palette(st: &mut ClientState) -> bool {
         st.palette = Palette::spawn(st.rows, st.cols);
     }
     let back_to = crate::picker::stack_top();
-    let commands =
-        palette_commands(st.server_log_on, st.scroll_opt, st.debug_banner, st.record.is_some(), back_to.as_deref());
+    let commands = palette_commands(
+        st.server_log_on,
+        st.scroll_opt,
+        st.debug_banner,
+        st.record.is_some(),
+        back_to.as_ref().map(|e| e.target.as_str()),
+    );
     let title = palette_title(st.wire.srtt(), st.predict_model, st.echo_escalation.escalated());
     if let Some(p) = st.palette.as_mut() {
         // A persisted (spawned-then-closed) palette is not resized while closed,
@@ -1152,7 +1157,7 @@ fn dispatch_palette_action(
             // never names it); with the answer, record the pop and end this
             // attach like a switch. An empty stack just says so.
             let previous = params.get("previous").and_then(Value::as_str);
-            let Some(top) = crate::picker::stack_top() else {
+            let Some(top) = crate::picker::stack_top().map(|e| e.target) else {
                 st.notify.set_message("nothing to go back to", false, now);
                 return false;
             };

@@ -338,6 +338,9 @@ pub fn cmd_start_local(
     let path = cfg.socket_path(name)?;
     let stream = UnixStream::connect(&path)
         .map_err(|e| Error::Msg(format!("connect {}: {e}", path.display())))?;
+    // A session this front door created (the FDR 0016 stack's anonymous
+    // fallback for a daemon that never reports its kind).
+    crate::picker::next_attach_is_created();
     crate::picker::set_current(&crate::picker::target_for(None, Some(&cfg.group), name));
     run_interactive(stream)
 }
@@ -1061,7 +1064,12 @@ fn open_local_palette(
     let back_to = crate::picker::stack_top();
     p.open(
         "Commands",
-        palette_commands(fr.scroll_opt, coalesce_on, coalesce_available, back_to.as_deref()),
+        palette_commands(
+            fr.scroll_opt,
+            coalesce_on,
+            coalesce_available,
+            back_to.as_ref().map(|e| e.target.as_str()),
+        ),
     );
     fr.set_scroll(0);
     fr.invalidate();
@@ -1144,7 +1152,7 @@ fn dispatch_local_action(method: &str, params: &Value, sock_write_buf: &mut Vec<
             // leave question first when `previous` is absent; then record
             // the pop and detach like a switch. Nothing to pop: nothing.
             let previous = params.get("previous").and_then(Value::as_str);
-            let Some(top) = crate::picker::stack_top() else {
+            let Some(top) = crate::picker::stack_top().map(|e| e.target) else {
                 return LocalAction::None;
             };
             if previous.is_none() && crate::picker::current().is_some() {
@@ -2759,7 +2767,9 @@ mod tests {
             LocalAction::None
         ));
         assert!(buf.is_empty(), "nothing to go back to: no detach");
-        crate::picker::stack_push(":prev");
+        crate::picker::set_current(":prev");
+        crate::picker::stack_push_current();
+        crate::picker::set_current(":here");
         assert!(matches!(
             dispatch_local_action("session.pop", &json!({}), &mut buf),
             LocalAction::AskBack(t) if t == ":prev"
