@@ -111,8 +111,9 @@ overlay kind=palette over=box:dev
 ```
 
 `posh status --viewport <pid>` reads it. `posh list` grows nothing yet.
-Reaped like the `remote/` sockets. This gives RFC 0014 §5 UPSTREAM a
-body; the RFC is amended in the same change.
+Reaped like the `remote/` sockets. Specified as a new RFC 0014 §6 (the
+§5 UPSTREAM entry is the nested-session case and stays as it is), amended
+in the same change.
 
 **System overlays.** The palette, the picker, and the leave prompt
 register as overlays in the viewport while open and unregister on close.
