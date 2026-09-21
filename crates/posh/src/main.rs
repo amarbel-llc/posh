@@ -567,14 +567,15 @@ fn start_kind(class: &StartClass, explicit: Option<SessionKind>) -> SessionKind 
 
 /// `posh start`: create a durable session and attach (FDR 0015). Local targets
 /// use the strict create (`cmd_start_local`); an auto-id target picks the next
-/// free `s-N`. Remote targets probe the host's session list over ssh first —
-/// a named target that already exists errors (the strict-create contract), an
-/// auto-id target picks the first free remote `s-N` — then create through the
-/// existing roaming path (`cmd_ssh_session`, whose create-or-attach is safe
-/// because the probe just showed the name absent). The probe-then-create pair
-/// is not atomic: a session created between the two degrades to an attach
-/// (the daemon's `connect_or_create` is idempotent), never an error or a
-/// clobber — the strictness is a UX guard, same as `ph`'s resolve.
+/// free `s-N`. A remote named target probes the host's session list over ssh
+/// first — one that already exists errors (the strict-create contract) — then
+/// creates through the existing roaming path (`cmd_ssh_session`, whose
+/// create-or-attach is safe because the probe just showed the name absent).
+/// The probe-then-create pair is not atomic: a session created between the
+/// two degrades to an attach (the daemon's `connect_or_create` is idempotent),
+/// never an error or a clobber — the strictness is a UX guard, same as `ph`'s
+/// resolve. A remote auto-id target is created remote-atomically instead
+/// (`start_remote_auto`: the host picks the free `s-N` itself).
 ///
 /// `--ephemeral` (FDR 0011's explicit non-durable opt-out, leading position
 /// only) short-circuits all of that: the rest of the argv is the retired
@@ -698,8 +699,14 @@ fn bare_host_guidance(user: Option<String>, host: String, group: &str) -> Error 
 }
 
 /// Remote auto-id create (`posh start host:` / `host:+`, and `ph host:+`):
-/// query the host's sessions, pick the first free `s-N`, and create it
-/// (`cmd_ssh_session` create-or-attaches; the id is free, so it creates).
+/// ask the host to create the next free `s-N` itself — a remote-atomic
+/// anonymous `posh start --detach --kind anonymous` answered by the
+/// `POSH START` handshake line (design 2026-09-21 §1) — then attach to it
+/// (`cmd_ssh_session` create-or-attaches; the session is live, so it
+/// attaches). A remote too old for `--kind` fails the exec, and one too old
+/// for the handshake answers prose only; both fall back to the old
+/// probe-then-attach path (query the names, pick the first free `s-N`; the
+/// created kind is then whatever that remote defaults to).
 fn start_remote_auto(
     user: Option<String>,
     host: String,
@@ -709,10 +716,74 @@ fn start_remote_auto(
     forward_flag: &remote::agent::ForwardFlag,
 ) -> Result<()> {
     let grp = target_group.clone().unwrap_or_else(|| global_group.to_string());
-    let names = remote_session_names(user.as_deref(), &host, &grp)?;
-    let id = first_free_autoid(&names)
-        .ok_or_else(|| Error::from("posh start: too many remote sessions"))?;
+    // posh#182: the same dial decision every other ssh spawn makes, so the
+    // create reaches exactly the host the subsequent bootstrap will.
+    let dest = remote::sshwrap::SshDest::resolve(&ph_dest(user.as_deref(), &host));
+    if dest.substituted() {
+        util::log_write("info", &dest.describe());
+    }
+    let batch = !util::is_tty(0);
+    let argv = remote_start_argv(&dest, &grp, batch);
+    let created = std::process::Command::new(&argv[0])
+        .args(&argv[1..])
+        .output()
+        .ok()
+        .filter(|o| o.status.success())
+        .and_then(|o| parse_start_handshake(&String::from_utf8_lossy(&o.stdout)));
+    let id = match created {
+        Some((id, _kind)) => id,
+        None => {
+            util::log_write(
+                "info",
+                "remote start --kind unavailable; falling back to the session-list probe",
+            );
+            let names = remote_session_names(user.as_deref(), &host, &grp)?;
+            first_free_autoid(&names)
+                .ok_or_else(|| Error::from("posh start: too many remote sessions"))?
+        }
+    };
     cmd_ssh_session(user, host, target_group, global_group, id, extra, forward_flag)
+}
+
+/// `ssh [-o BatchMode=yes] … <dest> POSH_HANDSHAKE=1 posh [-g G] start --detach
+/// --kind anonymous`: the remote-atomic auto-id create (design 2026-09-21
+/// §1). The env prefix is the ssh-crossing cookie (`sshwrap::remote_command`
+/// precedent) that asks the remote for the `POSH START` handshake line; the
+/// remote picks the free `s-N` itself, and the attach that follows finds it
+/// live. Batch mode follows `remote_list_argv`'s rule (non-TTY callers only).
+fn remote_start_argv(dest: &remote::sshwrap::SshDest, group: &str, batch: bool) -> Vec<String> {
+    let mut argv: Vec<String> = vec!["ssh".to_string()];
+    if batch {
+        argv.push("-o".into());
+        argv.push("BatchMode=yes".into());
+    }
+    argv.extend(dest.ssh_args());
+    argv.push(dest.target());
+    argv.push("POSH_HANDSHAKE=1".into());
+    argv.push("posh".into());
+    if group != "default" {
+        argv.push("-g".into());
+        argv.push(group.into());
+    }
+    argv.extend(["start", "--detach", "--kind", "anonymous"].map(String::from));
+    argv
+}
+
+/// The `POSH START <version> <name> <kind>` handshake line
+/// (`session::client::start_handshake_line`), scanned line by line past any
+/// motd noise the way `LineScraper` scans for `POSH CONNECT`. `None` when no
+/// such line is present — the prose-only answer of a remote that predates
+/// the handshake, the caller's cue to fall back. A version we cannot parse
+/// is `None` too; extra trailing fields from a newer version are ignored.
+fn parse_start_handshake(stdout: &str) -> Option<(String, SessionKind)> {
+    stdout.lines().find_map(|l| {
+        let rest = l.strip_prefix("POSH START ")?;
+        let mut f = rest.split_whitespace();
+        let _version: u32 = f.next()?.parse().ok()?;
+        let name = f.next()?.to_string();
+        let kind = SessionKind::parse(f.next()?)?;
+        Some((name, kind))
+    })
 }
 
 /// How a `ph` target token resolves (FDR 0015). The colon is the sole
@@ -2385,6 +2456,52 @@ mod tests {
         // A bad or missing value is an error, not a silent Named.
         assert!(parse_start_args(&v(&["--kind", "system", "x"])).is_err());
         assert!(parse_start_args(&v(&["--kind"])).is_err());
+    }
+
+    #[test]
+    fn remote_start_argv_creates_detached_anonymous_with_the_handshake_cookie() {
+        let dest = remote::sshwrap::SshDest::verbatim("box");
+        assert_eq!(
+            remote_start_argv(&dest, "default", true),
+            [
+                "ssh", "-o", "BatchMode=yes", "box", "POSH_HANDSHAKE=1", "posh", "start",
+                "--detach", "--kind", "anonymous"
+            ]
+            .map(String::from)
+        );
+        assert_eq!(
+            remote_start_argv(&dest, "grp", false),
+            [
+                "ssh", "box", "POSH_HANDSHAKE=1", "posh", "-g", "grp", "start", "--detach",
+                "--kind", "anonymous"
+            ]
+            .map(String::from)
+        );
+    }
+
+    #[test]
+    fn start_handshake_is_parsed_and_prose_is_not() {
+        assert_eq!(
+            parse_start_handshake("POSH START 1 s-3 anonymous\nsession \"s-3\" created\n"),
+            Some(("s-3".to_string(), SessionKind::Anonymous))
+        );
+        // Noise before the line (a motd, a warning) is skipped, like LineScraper.
+        assert_eq!(
+            parse_start_handshake("warning: x\nPOSH START 1 s-12 named\n"),
+            Some(("s-12".to_string(), SessionKind::Named))
+        );
+        // A newer version with extra fields still yields the first three.
+        assert_eq!(
+            parse_start_handshake("POSH START 2 s-3 anonymous extra=1\n"),
+            Some(("s-3".to_string(), SessionKind::Anonymous))
+        );
+        // Prose alone is an OLD remote (no handshake) — None, so the caller
+        // falls back.
+        assert_eq!(parse_start_handshake("session \"s-3\" created\n"), None);
+        assert_eq!(parse_start_handshake("session \"s-3\" already exists\n"), None);
+        assert_eq!(parse_start_handshake(""), None);
+        // A version we cannot read is rejected, not guessed.
+        assert_eq!(parse_start_handshake("POSH START x s-3 anonymous\n"), None);
     }
 
     #[test]
