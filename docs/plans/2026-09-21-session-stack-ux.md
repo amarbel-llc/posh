@@ -976,20 +976,157 @@ removes a pair whose pidfile names a dead pid and keeps a live one.
 
 ---
 
-## Section 3: StackView + palette_view (outline)
+## Section 3: StackView + palette_view
 
-### Task 12: `StackView` schema
+**State of the code this section starts from (verified 2026-09-21):** both
+palettes already put *Back to X* as the SECOND row after *Switch session…*
+(`remote/client.rs:353-357`, `session/client.rs:1018-1021`) and the stack
+question dialogs (`back_commands`, `leave_commands`) live in `picker.rs`. The
+remote heading is `rtt 12ms · echo: always[ (auto)]` (`palette_title`,
+`remote/client.rs:404-407`, ~23-30 columns); the local palette opens with the
+literal title `Commands`; the picker heading is `picker::title()` (`sessions ·
+N to go back`). The renderer's panel is 46 columns with 2 of padding and
+word-wraps a longer heading, so the budget is ~42.
 
-- `picker.rs`: `pub struct StackView { top: Option<StackEntry>, depth: usize, current: Option<StackEntry> }` and `pub fn stack_view() -> StackView`. Tests pin the values for empty / one / many.
+### Task 12: `StackView` schema and the `palette_view` module
 
-### Task 13: `remote/palette_view.rs`
+**Promotion criteria:** N/A.
 
-- New module holding every function from `StackView` (+ existing inputs) to RFC 0005 JSON: `commands_title(view, rtt_suffix)`, `back_row(view)`, `leave_prompt(candidates)` (used in Section 4), `picker_title(view)`. Both clients' `palette_commands` and `palette_title` call these; no string literal about the stack remains in `session/client.rs` or `remote/client.rs`.
-- Tests: golden JSON per `StackView` shape; a test asserting the title stays under 42 columns for a long host.
+**Files:**
+- Modify: `crates/posh/src/picker.rs` — add `StackView` + `stack_view()` beside `stack_top` (~line 470); move `leave_commands` / `back_commands` / `leave_commands_for` (~174-211) and `title()` (~239-247) OUT to the new module (keep thin `pub use` re-exports in picker for one release so nothing else moves).
+- Create: `crates/posh/src/remote/palette_view.rs` (registered in `remote/mod.rs`), the ONLY place a stack fact becomes RFC 0005 JSON or a heading string.
+- Test: both files.
 
-### Task 14: presentation for this iteration
+**Step 1: failing tests**
 
-- `Commands · back: flac:s-1 [+N]`; *Back to X* as the first row when `top.is_some()`. Update the two `palette_commands_*` tests in each client to go through `palette_view`.
+picker.rs:
+```rust
+#[test]
+fn stack_view_reports_top_depth_and_current() {
+    let _g = switch_test_guard();
+    while stack_pop().is_some() {}
+    assert_eq!(stack_view(), StackView { top: None, depth: 0, current: None });
+    set_current(":s-1"); set_current_kind(SessionKind::Anonymous); stack_push_current();
+    set_current("box:dev"); set_current_kind(SessionKind::Named);
+    let v = stack_view();
+    assert_eq!(v.depth, 1);
+    assert_eq!(v.top.as_ref().map(|e| e.target.as_str()), Some(":s-1"));
+    assert_eq!(v.current.as_ref().map(|e| (e.target.as_str(), e.kind)), Some(("box:dev", SessionKind::Named)));
+    while stack_pop().is_some() {}
+}
+```
+
+palette_view.rs (golden, pure — no statics touched):
+```rust
+fn entry(t: &str, k: SessionKind) -> StackEntry { StackEntry { target: t.into(), kind: k } }
+
+#[test]
+fn commands_title_names_the_top_and_counts_the_rest() {
+    let none = StackView { top: None, depth: 0, current: None };
+    assert_eq!(commands_title(&none, Some("rtt 12ms · echo: always")), "rtt 12ms · echo: always");
+    assert_eq!(commands_title(&none, None), "Commands");
+    let one = StackView { top: Some(entry(":s-1", SessionKind::Anonymous)), depth: 1, current: None };
+    assert_eq!(commands_title(&one, None), "Commands · back: flac:s-1");       // ":" = this host, via display_target
+    let many = StackView { top: Some(entry("me@box.example.com:grp/ff9fe216-9652-4e23-805c-6f4dd5ce7eca", SessionKind::Named)), depth: 3, current: None };
+    assert_eq!(commands_title(&many, Some("rtt 12ms · echo: always")), "rtt 12ms · echo: always · back: box:grp/ff9fe216 +2");
+}
+
+#[test]
+fn commands_title_stays_inside_the_renderer_budget() {
+    // 46-column panel, 2 padding: a long host + a UUID name + the rtt/echo prefix
+    // must abbreviate to ≤ 42 columns (chars; the strings are ASCII-ish plus '·').
+    let v = StackView { top: Some(entry("someone@very-long-hostname.internal.example.com:grp/ff9fe216-9652-4e23-805c-6f4dd5ce7eca", SessionKind::Named)), depth: 12, current: None };
+    let t = commands_title(&v, Some("rtt 1234ms · echo: optimistic (auto)"));
+    assert!(t.chars().count() <= 42, "{t} is {} cols", t.chars().count());
+}
+
+#[test]
+fn back_row_is_present_only_with_a_top() {
+    let none = StackView { top: None, depth: 0, current: None };
+    assert_eq!(back_row(&none), None);
+    let one = StackView { top: Some(entry("box:dev", SessionKind::Named)), depth: 1, current: None };
+    assert_eq!(back_row(&one), Some(json!({ "name": "Back to box:dev", "action": { "method": "session.pop" } })));
+}
+
+#[test]
+fn picker_title_counts_the_stack() {
+    let none = StackView { top: None, depth: 0, current: None };
+    assert_eq!(picker_title(&none), "sessions");
+    let two = StackView { top: Some(entry(":a", SessionKind::Named)), depth: 2, current: None };
+    assert_eq!(picker_title(&two), "sessions · 2 to go back");
+}
+```
+plus the existing `leave_commands_carry_target_and_previous` and the
+`back_commands` test moved over unchanged.
+
+**Step 2:** run `just debug-cargo test -p posh -- palette_view picker`; compile failures.
+
+**Step 3: implementation**
+
+picker.rs:
+```rust
+/// The stack as a VIEW MODEL (design 2026-09-21 §3): the session *Back*
+/// returns to, how many are stacked, and the attach in progress. The only
+/// producer; `remote::palette_view` is the only consumer that turns it into
+/// RFC 0005 JSON or a heading — so the palette redesign changes that module
+/// and nothing here.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct StackView {
+    pub top: Option<StackEntry>,
+    pub depth: usize,
+    pub current: Option<StackEntry>,
+}
+pub fn stack_view() -> StackView {
+    StackView { top: stack_top(), depth: stack_depth(), current: current_entry() }
+}
+```
+`display_target` (picker.rs ~377) becomes `pub(crate)`; `short_session` /
+`short_host` too (they abbreviate the UUID and the host).
+
+palette_view.rs:
+```rust
+//! Presentation of the FDR 0016 session stack for the RFC 0005 renderer —
+//! the ONLY module that turns a `picker::StackView` into a heading string or
+//! a palette row. Schema (`picker`) and presentation (here) are split on
+//! purpose (design 2026-09-21 §3): the palette redesign edits this file.
+
+/// Budget for a heading: posh-palette's panel is 46 columns with 2 of
+/// padding and word-wraps beyond it.
+const TITLE_BUDGET: usize = 42;
+
+/// The Commands palette heading: the client's own prefix (the remote's
+/// `rtt … · echo: …`, or `Commands` when the client has none) plus, with a
+/// stack, ` · back: <top> [+N]`. The top is abbreviated like the default
+/// title (`short_host`:`short_session`); if the whole line still exceeds
+/// the budget the host is dropped from the back target, then the prefix is
+/// truncated with `…` — the stack part is the reason the user opened it.
+pub fn commands_title(view: &StackView, prefix: Option<&str>) -> String
+/// `Back to <top>` → `session.pop`, or None without a stack.
+pub fn back_row(view: &StackView) -> Option<Value>
+/// The picker heading: `sessions` plus ` · N to go back` with a stack.
+pub fn picker_title(view: &StackView) -> String
+/// The leave question for a switch / a Back (moved from picker.rs, unchanged).
+pub fn leave_commands(target: &str) -> Value
+pub fn back_commands() -> Value
+```
+`picker::title()` becomes `palette_view::picker_title(&stack_view())` at its
+call sites (`session/client.rs:1752`, `remote/client.rs:1119`, `main.rs`
+`cmd_ph_picker`); `picker::leave_commands` / `back_commands` callers move to
+`palette_view::` (or keep the re-export and delete it in Task 13).
+
+**Step 5:** commit `posh: StackView schema + palette_view presentation split for the session stack`.
+
+### Task 13: the presentation for this iteration
+
+**Files:** `remote/client.rs:305-437` (`palette_commands`, `palette_title`, `open_palette`), `session/client.rs:1000-1065` (`palette_commands`, `open_local_palette`), their tests (`palette_commands_*` in both; `remote/client.rs:4677-4678` asserts the Back row position).
+
+**Step 1: failing tests** — in each client, a test that with a stack top the FIRST row is `Back to <top>` and *Switch session…* is second; without a top the first row is *Switch session…* and no row starts with `Back to`; and (remote) that the title passed to `p.open` is `commands_title(&view, Some(palette_title(..)))`. Update `remote/client.rs:4677` (`off[1]` → `off[0]`).
+
+**Step 3:** both `palette_commands` take `view: &StackView` instead of `back_to: Option<&str>`; the row list starts with `back_row(view)` (when Some) then *Switch session…*; `open_palette` passes `commands_title(&view, Some(&palette_title(..)))`, `open_local_palette` passes `commands_title(&view, None)`. No `format!("Back to …")` or `"to go back"` literal remains outside `palette_view.rs` (add a test in palette_view.rs that greps? no — a `rg` in the self-review is enough).
+
+**Step 5:** commit `posh: Back to <top> is the first palette row; the heading names the predecessor`.
+
+Then the Section 3 merge (attestation + `merge-this-session-async`); run clippy and `--test session_integration` first.
 
 ---
 
