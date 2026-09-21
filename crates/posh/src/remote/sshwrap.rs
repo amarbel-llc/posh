@@ -499,6 +499,34 @@ impl SshDest {
     }
 }
 
+/// The one shape every remote `posh` control invocation takes:
+/// `ssh <ssh_opts> <dest.ssh_args()> <dest.target()> <env_prefix> posh [-g G]
+/// <tail>`. Owns the `posh` literal and the `-g` rule (omitted for the
+/// `default` group, so the default-group wire is unchanged from before
+/// groups existed, #66). `env_prefix` is the ssh-crossing `NAME=value` words
+/// (`remote_command`'s convention). Behind `posh list host:` / the name
+/// probes, the `ph host:+` remote create, and the picker's remote kill.
+pub fn remote_posh_argv(
+    dest: &SshDest,
+    ssh_opts: &[&str],
+    env_prefix: &[&str],
+    group: &str,
+    tail: &[String],
+) -> Vec<String> {
+    let mut argv: Vec<String> = vec!["ssh".to_string()];
+    argv.extend(ssh_opts.iter().map(|s| s.to_string()));
+    argv.extend(dest.ssh_args());
+    argv.push(dest.target());
+    argv.extend(env_prefix.iter().map(|s| s.to_string()));
+    argv.push("posh".into());
+    if group != "default" {
+        argv.push("-g".into());
+        argv.push(group.into());
+    }
+    argv.extend_from_slice(tail);
+    argv
+}
+
 /// `[user@]host` split at the LAST `@` (ssh's rule). An empty user counts as
 /// absent.
 fn split_user(dest: &str) -> (Option<&str>, &str) {

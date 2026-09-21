@@ -348,6 +348,12 @@ fn run_once() -> Result<()> {
     }
 }
 
+/// `posh attach`: strict attach to an existing session, `--create` /
+/// `--detach` for the create-or-attach / create-or-ensure forms, local or
+/// (for a `host:session` target) remote. A `--kind` is honored by the local
+/// creates only: on the remote branch it is parsed and then DISCARDED — the
+/// remote inner argv does not carry it yet, so a remote create stays that
+/// remote's default (named). Intentional for now.
 fn cmd_attach(
     group: &str,
     args: &[String],
@@ -752,21 +758,25 @@ fn start_remote_auto(
 /// remote picks the free `s-N` itself, and the attach that follows finds it
 /// live. Batch mode follows `remote_list_argv`'s rule (non-TTY callers only).
 fn remote_start_argv(dest: &remote::sshwrap::SshDest, group: &str, batch: bool) -> Vec<String> {
-    let mut argv: Vec<String> = vec!["ssh".to_string()];
+    remote::sshwrap::remote_posh_argv(
+        dest,
+        batch_ssh_opts(batch),
+        &["POSH_HANDSHAKE=1"],
+        group,
+        &["start", "--detach", "--kind", "anonymous"].map(String::from),
+    )
+}
+
+/// The ssh options a remote control invocation adds for a non-TTY caller:
+/// `BatchMode=yes`, so a script or completion never hangs on a prompt. An
+/// interactive caller runs without it so a first contact can accept the host
+/// key (posh#182).
+fn batch_ssh_opts(batch: bool) -> &'static [&'static str] {
     if batch {
-        argv.push("-o".into());
-        argv.push("BatchMode=yes".into());
+        &["-o", "BatchMode=yes"]
+    } else {
+        &[]
     }
-    argv.extend(dest.ssh_args());
-    argv.push(dest.target());
-    argv.push("POSH_HANDSHAKE=1".into());
-    argv.push("posh".into());
-    if group != "default" {
-        argv.push("-g".into());
-        argv.push(group.into());
-    }
-    argv.extend(["start", "--detach", "--kind", "anonymous"].map(String::from));
-    argv
 }
 
 /// The `POSH START <version> <name> <kind>` handshake line
@@ -1464,21 +1474,13 @@ fn remote_list_argv(
     format_flag: &str,
     batch: bool,
 ) -> Vec<String> {
-    let mut argv: Vec<String> = vec!["ssh".to_string()];
-    if batch {
-        argv.push("-o".into());
-        argv.push("BatchMode=yes".into());
-    }
-    argv.extend(dest.ssh_args());
-    argv.push(dest.target());
-    argv.push("posh".into());
-    if group != "default" {
-        argv.push("-g".into());
-        argv.push(group.into());
-    }
-    argv.push("list".into());
-    argv.push(format_flag.into());
-    argv
+    remote::sshwrap::remote_posh_argv(
+        dest,
+        batch_ssh_opts(batch),
+        &[],
+        group,
+        &["list".to_string(), format_flag.to_string()],
+    )
 }
 
 /// Run a remote `posh list` over ssh and return its stdout, forwarding the
@@ -1920,11 +1922,13 @@ GLOBAL OPTIONS
         `poshterity replay FILE` / `posh rec replay FILE`.
 
 SESSION COMMANDS (local persistence)
-    attach [--detach] [--create] <name> [--] [command...]  (alias: a)
+    attach [--detach] [--create] [--kind K] <name> [--] [command...]  (alias: a)
         Attach to an EXISTING session; errors if it is absent (use `start`,
         or --create). With --create, create-or-attach (running command,
         default $SHELL, when created). With --detach, ensure the session
-        exists, print status, and exit without attaching. A `--` ends option
+        exists, print status, and exit without attaching. --kind
+        anonymous|named sets the kind a create makes (default named; a
+        live session keeps its own). A `--` ends option
         parsing so the command is taken literally. Detach key: Ctrl-\\.
         Inside a session (POSH_SESSION set) this is the in-place SWITCH
         (FDR 0012): the viewport you typed it in re-homes onto <name>
@@ -1935,13 +1939,15 @@ SESSION COMMANDS (local persistence)
         --create/--detach skip the probe. Any other name — dotted words
         included — is a literal local session name.
 
-    start [--detach] [target] [--] [command...]  (alias: s)
+    start [--detach] [--kind K] [target] [--] [command...]  (alias: s)
         Create a durable session and attach. Errors if a named session
         already exists (use `attach`). With no target (or `:+`), create a
         new auto-id session (s-1, s-2, ...), picked later by its activity
         label. Remote targets work the same way: `host:name` creates a
         named session on the host (strict — errors if it exists there),
-        `host:` or `host:+` a remote auto-id. With --detach,
+        `host:` or `host:+` a remote auto-id. --kind anonymous|named
+        overrides the kind derived from the target (auto-id targets are
+        anonymous, named ones named). With --detach,
         ensure-and-return (idempotent, like `attach --detach`). Inside a
         session, a local start creates the session and then SWITCHES the
         viewport you typed it in onto it (FDR 0012; no nesting). With

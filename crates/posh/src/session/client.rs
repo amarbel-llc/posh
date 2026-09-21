@@ -75,6 +75,12 @@ fn restore_seq(bracket: &Option<(Vec<u8>, Vec<u8>)>) -> Vec<u8> {
 /// return without attaching. Shared by `posh attach --detach` and
 /// `posh start --detach`. The "created" / "already exists" wording is asserted
 /// by the integration suite — keep it byte-for-byte.
+///
+/// The `POSH START` handshake line (when requested) must never report a kind
+/// the daemon does not hold: a session this call created reports the
+/// requested kind; one that already existed reports the kind probed off the
+/// live daemon (`unknown` from a pre-kind build); a failed probe prints no
+/// line rather than a guess.
 fn ensure_detached(
     cfg: &Config,
     name: &str,
@@ -83,10 +89,6 @@ fn ensure_detached(
 ) -> Result<()> {
     let created = daemon::ensure_session(cfg, name, command, kind)?;
     if handshake_requested() {
-        // The line must never report a kind the daemon does not hold: a
-        // session that already existed keeps ITS kind, read off the live
-        // daemon (`unknown` from a pre-kind build). A failed probe prints
-        // nothing rather than a guess.
         let live = if created {
             Some(kind)
         } else {
@@ -96,7 +98,7 @@ fn ensure_detached(
                 .map(|probe| probe.info.kind)
         };
         if let Some(live) = live {
-            println!("{}", start_handshake_line(name, handshake_kind_for(created, kind, live)));
+            println!("{}", start_handshake_line(name, live));
         }
     }
     if created {
@@ -116,17 +118,6 @@ fn ensure_detached(
 /// posh-over-ssh exchange reads alike; the pipe-delimited cutover is posh#202.
 pub fn start_handshake_line(name: &str, kind: SessionKind) -> String {
     format!("POSH START 1 {name} {}", kind.as_str())
-}
-
-/// The kind the handshake line reports: a session this call created holds the
-/// requested kind; one that already existed holds whatever the live daemon
-/// says (the requested kind was never applied to it).
-fn handshake_kind_for(created: bool, requested: SessionKind, live: SessionKind) -> SessionKind {
-    if created {
-        requested
-    } else {
-        live
-    }
 }
 
 /// `POSH_HANDSHAKE=1|on|true|yes` requests the handshake line.
@@ -1884,14 +1875,6 @@ mod tests {
             start_handshake_line("dev", SessionKind::Unknown),
             "POSH START 1 dev unknown"
         );
-    }
-
-    #[test]
-    fn handshake_kind_is_the_requested_one_only_for_a_session_this_call_created() {
-        use SessionKind::*;
-        assert_eq!(handshake_kind_for(true, Anonymous, Named), Anonymous);
-        assert_eq!(handshake_kind_for(false, Anonymous, Named), Named);
-        assert_eq!(handshake_kind_for(false, Anonymous, Unknown), Unknown);
     }
 
     #[test]

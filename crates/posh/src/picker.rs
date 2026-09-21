@@ -518,26 +518,18 @@ pub fn remote_kill_argv(
     session: &str,
     force: bool,
 ) -> Vec<String> {
-    let mut argv = vec![
-        "ssh".to_string(),
-        "-o".to_string(),
-        "BatchMode=yes".to_string(),
-        "-o".to_string(),
-        "ConnectTimeout=5".to_string(),
-    ];
-    argv.extend(dest.ssh_args());
-    argv.push(dest.target());
-    argv.push("posh".to_string());
-    if let Some(g) = group.filter(|g| *g != "default") {
-        argv.push("-g".to_string());
-        argv.push(g.to_string());
-    }
-    argv.push("kill".to_string());
+    let mut tail = vec!["kill".to_string()];
     if !force {
-        argv.push("--unless-attached".to_string());
+        tail.push("--unless-attached".to_string());
     }
-    argv.push(session.to_string());
-    argv
+    tail.push(session.to_string());
+    crate::remote::sshwrap::remote_posh_argv(
+        dest,
+        &["-o", "BatchMode=yes", "-o", "ConnectTimeout=5"],
+        &[],
+        group.unwrap_or("default"),
+        &tail,
+    )
 }
 
 #[cfg(test)]
