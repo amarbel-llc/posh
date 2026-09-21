@@ -726,33 +726,253 @@ git commit -m "docs: --kind on start/attach, KIND in posh list; FDR 0015 notes a
 
 ---
 
-## Section 2: viewport registry (outline, expand after Section 1 merges)
+## Section 2: viewport registry
 
-### Task 8: typed stack entries
+**Two corrections to the earlier outline (2026-09-21, after Section 1 merged):**
+(a) the kind does NOT ride the activity entry with a format bump — an old
+roaming client's `decode_session_activity` rejects an unknown format byte and
+would lose the whole label against a new daemon. It rides a NEW capability id,
+`CAP_SESSION_KIND` (20), which an old client ignores (RFC 0001 table rule). (b)
+RFC 0014 §5 UPSTREAM is the nested-session entry (id 18), not a viewport
+registry; the viewport socket gets its own new §6.
 
-- Modify `crates/posh/src/picker.rs:213-297` — `StackEntry { target: String, kind: SessionKind }`, `STACK: Mutex<Vec<StackEntry>>`, `CURRENT: Mutex<Option<StackEntry>>`; `set_current(target)` keeps its signature and records `Unknown`, and a new `set_current_kind(kind)` is called by the entry points once the daemon answered. `stack_push` takes the current entry whole. `stack_top` returns `Option<StackEntry>`.
-- Modify `crates/posh/src/main.rs:46-79` — `run()` pushes `picker::current_entry()`; on a `LocalNew` / `RemoteNew` dispatch it calls `picker::set_current_origin_created()` so a daemon answering `Unknown` reads as `Anonymous` (the fallback in design §2).
-- Local client (`session/client.rs:187,295`): after `probe_session` / the first `Tag::Info`, call `set_current_kind(info.kind)`. Roaming client: needs Task 9's frame extension.
-- Tests: `picker.rs` stack tests updated for the struct; a `current_kind_falls_back_to_anonymous_only_for_a_created_dispatch` test.
+**Dev loop for this section (lesson from Section 1's two gate failures):** before
+merging, run `just debug-cargo clippy --all-targets -- -D warnings` AND
+`just debug-cargo test -p posh --test session_integration`, not only the unit
+binary.
 
-### Task 9: kind on the activity frame (relay / bridge → roaming client)
+### Task 8: `CAP_SESSION_KIND` on the frame
 
-- Modify `crates/posh-proto/src/caps.rs:299-365` — `SessionActivity` gains `kind: SessionKind`; `encode_session_activity` appends the byte AFTER the two strings (a pre-kind decoder rejects trailing bytes today, so bump `SESSION_ACTIVITY_FMT` to 2 and have `decode_session_activity` accept fmt 1 without the byte and fmt 2 with it). Update RFC 0013 §5.1 in place.
-- Modify `session/daemon.rs` (`activity_now` / the label attach) to fill `kind`; the relay and M2 bridge forward the entry unchanged.
-- Modify `remote/client.rs` — where `CAP_SESSION_ACTIVITY` is decoded for `default_title_with`, also `set_current_kind`.
-- Tests: proto round-trips for fmt 1 and 2; the daemon test from Task 3 extended to read the kind off the first frame.
+**Promotion criteria:** N/A (additive cap id).
+
+**Files:**
+- Modify: `crates/posh-proto/src/caps.rs:159` (after `CAP_EXIT_CAUSE`), plus encode/decode helpers beside `encode_session_activity` (~387-428); tests.
+- Modify: `docs/rfcs/0001-target-grammar-and-capability-table.md:252-253` — a `| 20 | SESSION_KIND | server | 1 byte | … |` row in the style of id 19, and the unassigned range becomes `21–223`.
+- Modify: `crates/posh/src/session/daemon.rs:209-216` (`ClientConn` activity fields), `:383-391` (`queue_frame`'s activity cap), `daemon_loop`'s per-iteration activity block (~1257-1276); the kind reaches `daemon_loop` already (Task 3).
+- Modify: `crates/posh/src/remote/client.rs:3013-3019` (decode beside `CAP_SESSION_ACTIVITY`; `ClientState` gains `session_kind: SessionKind`) and `crates/posh/src/session/client.rs:671-676` (same, a `kind` field beside `activity`).
+- Relay and bridge: nothing — they forward server cap entries unchanged (verify with a test, not an edit).
+
+**Step 1: failing tests**
+
+posh-proto:
+```rust
+#[test]
+fn session_kind_cap_roundtrip_and_rejections() {
+    for k in [SessionKind::Anonymous, SessionKind::Named, SessionKind::System] {
+        let cap = encode_session_kind(k);
+        assert_eq!(cap.id, CAP_SESSION_KIND);
+        assert_eq!(cap.payload, vec![k.to_byte()]);
+        assert_eq!(decode_session_kind(&cap.payload), Some(k));
+    }
+    assert_eq!(decode_session_kind(&[]), None);
+    assert_eq!(decode_session_kind(&[1, 2]), None, "exactly one byte");
+    assert_eq!(decode_session_kind(&[0]), Some(SessionKind::Unknown));
+    assert_eq!(decode_session_kind(&[77]), Some(SessionKind::Unknown));
+}
+```
+
+daemon.rs tests (extend `spawn_test_daemon`'s in-process daemon; look at how the existing activity-on-frame test at ~3242-3285 drives `queue_frame` with `wants_activity`):
+```rust
+#[test]
+fn kind_rides_the_first_activity_bearing_frame_once() {
+    // A client that requested CAP_SESSION_ACTIVITY gets CAP_SESSION_KIND on
+    // the same frame as its first activity entry, and never again (the kind
+    // never changes). A client that did not request activity gets neither.
+}
+```
+
+remote/client.rs tests (beside the existing test at ~5689 that feeds a frame with an activity cap and asserts `st.session_activity`):
+```rust
+#[test]
+fn session_kind_cap_is_held_and_feeds_the_current_target() {
+    // feed a frame carrying encode_session_kind(Anonymous); assert
+    // st.session_kind == Anonymous and picker::current_kind() == Anonymous.
+}
+```
+
+**Step 2:** run them; compile failures.
+
+**Step 3: implementation**
+
+caps.rs:
+```rust
+/// The session's kind (design 2026-09-21 §1): server entry, one byte
+/// (`SessionKind::to_byte`), attached to the same visible frame as the
+/// client's FIRST `SESSION_ACTIVITY` entry and never again — a session's
+/// kind is fixed at create time. A relay / M2 bridge forwards it unchanged;
+/// a standalone Arch-A server (an ephemeral shell, no daemon) never sends
+/// it. Display / policy on the viewport side only (the FDR 0016 stack and
+/// the leave prompt); an old client ignores the id.
+pub const CAP_SESSION_KIND: u8 = 20;
+
+pub fn encode_session_kind(kind: SessionKind) -> Cap {
+    Cap { id: CAP_SESSION_KIND, payload: vec![kind.to_byte()] }
+}
+
+/// `None` for anything but exactly one byte (malformed); an unknown byte
+/// value reads `Unknown`, per `SessionKind::from_byte`.
+pub fn decode_session_kind(payload: &[u8]) -> Option<SessionKind> {
+    match payload {
+        [b] => Some(SessionKind::from_byte(*b)),
+        _ => None,
+    }
+}
+```
+
+daemon.rs: `ClientConn` gains `kind_sent: bool`. In `queue_frame`, when the
+activity cap is being attached (the existing branch) and `!self.kind_sent`,
+push `caps::encode_session_kind(kind)` too and set `kind_sent = true`. That
+needs the kind at `queue_frame`: store it on `ClientConn` at accept
+(`kind: SessionKind`, set from `daemon_loop`'s parameter where new conns are
+built ~1339), so no signature churn.
+
+remote/client.rs: in the frame-cap block, after the activity decode:
+```rust
+    if let Some(cap) = caps::find(&frame.caps, caps::CAP_SESSION_KIND) {
+        if let Some(kind) = caps::decode_session_kind(&cap.payload) {
+            st.session_kind = kind;
+            crate::picker::set_current_kind(kind);
+        }
+    }
+```
+session/client.rs: the same in `render_frame_acking` (a `kind` field on the
+renderer struct beside `activity`). `picker::set_current_kind` is Task 9's;
+for this task add it as a minimal `pub fn set_current_kind(_: SessionKind) {}`
+stub ONLY if Task 9 is not being done in the same dispatch — otherwise land
+them together.
+
+**Step 4:** `just debug-cargo test -p posh-proto`, `-p posh session::`,
+`-p posh remote::client`, `-p posh --test session_integration`; clippy.
+
+**Step 5:** commit `posh: CAP_SESSION_KIND (20) rides the first activity frame; both clients hold it`.
+
+### Task 9: typed stack entries and the current kind
+
+**Files:**
+- Modify: `crates/posh/src/picker.rs:213-297` (the `STACK` / `CURRENT` statics and their accessors), `:350-373` (`auto_pop`), `:384-390` (`set_current` / `current`), tests `:640-730`.
+- Modify: `crates/posh/src/main.rs:46-79` (`run()`), `dispatch_ph` (`LocalNew` / `RemoteNew` arms ~778-804).
+- Modify: `crates/posh/src/session/client.rs:1003-1006` and `remote/client.rs:415`, `:1154` (the `stack_top` readers: they now get an entry, use `.target`).
+
+**Step 1: failing tests** (picker.rs):
+```rust
+#[test]
+fn stack_entries_carry_the_kind_of_the_session_left() {
+    while stack_pop().is_some() {}
+    set_current(":s-1");
+    set_current_kind(SessionKind::Anonymous);
+    stack_push_current();
+    set_current("box:dev");
+    set_current_kind(SessionKind::Named);
+    stack_push_current();
+    assert_eq!(stack_top().map(|e| (e.target, e.kind)), Some(("box:dev".into(), SessionKind::Named)));
+    stack_pop();
+    assert_eq!(stack_top().map(|e| e.kind), Some(SessionKind::Anonymous));
+    while stack_pop().is_some() {}
+}
+
+#[test]
+fn current_kind_falls_back_to_anonymous_only_for_a_created_dispatch() {
+    // A created (`:+`) dispatch against a daemon that never says (Unknown)
+    // reads Anonymous; the same daemon after a plain attach reads Unknown;
+    // a daemon that DOES say wins over the fallback.
+    set_current(":s-9");
+    mark_current_created();
+    assert_eq!(current_kind(), SessionKind::Anonymous);
+    set_current_kind(SessionKind::Named);
+    assert_eq!(current_kind(), SessionKind::Named);
+    set_current(":dev"); // a new attach clears both
+    assert_eq!(current_kind(), SessionKind::Unknown);
+}
+```
+Update the existing stack tests (`:653-730`) and the two client `stack_top`
+readers for `StackEntry`.
+
+**Step 3: implementation**
+```rust
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct StackEntry {
+    pub target: String,
+    pub kind: SessionKind,
+}
+static STACK: Mutex<Vec<StackEntry>> = Mutex::new(Vec::new());
+/// The attach in progress: its target, the kind its daemon reported
+/// (`Unknown` until it does), and whether this front door CREATED it
+/// (`:+` / create-new) — the design §2 fallback: a created session whose
+/// daemon predates the kind reads Anonymous.
+struct Current { target: String, kind: SessionKind, created: bool }
+static CURRENT: Mutex<Option<Current>> = Mutex::new(None);
+
+pub fn set_current(target: &str)            // resets kind=Unknown, created=false
+pub fn set_current_kind(kind: SessionKind)  // from a frame / probe; no-op with no current
+pub fn mark_current_created()               // by run()/dispatch_ph on a LocalNew/RemoteNew route
+pub fn current() -> Option<String>          // unchanged signature
+pub fn current_kind() -> SessionKind        // kind, else Anonymous if created, else Unknown
+pub fn current_entry() -> Option<StackEntry>
+pub fn stack_push_current()                 // replaces stack_push(&str); pushes current_entry()
+pub fn stack_top() -> Option<StackEntry>
+pub fn stack_pop() -> Option<StackEntry>
+```
+`run()`: `picker::stack_push_current()` in place of `stack_push(&leaving)`;
+`dispatch_ph`'s `LocalNew` / `RemoteNew` arms call `picker::mark_current_created()`
+AFTER the entry point has called `set_current` — simplest: `cmd_start_local`
+and `start_remote_auto` are the two creators, so call it right after their
+`set_current` (client.rs:295 for local; main.rs `start_remote_auto` before
+`cmd_ssh_session`, which calls `set_current` itself — so instead mark from
+`cmd_ssh_session` when its caller says `created`; add a `created: bool`
+parameter there or a `picker::mark_current_created()` call in
+`start_remote_auto` immediately after `cmd_ssh_session` returns is too late —
+choose: `cmd_ssh_session` gains no parameter; `start_remote_auto` sets a
+one-shot `picker::next_attach_is_created()` flag that `set_current` consumes.
+Keep whichever is smaller; test it.)
+
+**Step 5:** commit `posh: the FDR 0016 stack carries each session's kind; a created session defaults to anonymous`.
 
 ### Task 10: the viewport status socket
 
-- New `crates/posh/src/viewport_status.rs` — bind `<base>/viewports/<pid>.status.sock` + `.status.pid` (mirror `remote/server.rs:2634-2660`), gated by `POSH_VIEWPORT_STATUS` (`0`/`off`/`false`/`no` skips), answering the RFC 0014 §4 one-shot with the `viewport` / `stack` / `overlay` lines from design §2; a reaper like the `remote/` one.
-- Modify `main.rs` `run()` — bind before `run_once`, refresh the rendered response whenever the stack or current changes (a `Mutex<String>` the accept thread serves).
-- Modify `session/mod.rs` `cmd_status` — `posh status --viewport <pid>`.
-- Overlay registration: `picker::overlay_open(kind: &str, over: Option<&str>)` / `overlay_close()` called around `palette.open` in both clients and around `choose_standalone`.
-- Tests: bind/answer/reap/skip in the style of `remote/server.rs`'s status-socket tests.
+**Files:**
+- Create: `crates/posh/src/viewport_status.rs` (module registered in `main.rs`).
+- Modify: `crates/posh/src/main.rs:46-79` (`run()` binds before `run_once`, refreshes after every stack/current change), `session/mod.rs:167-191` (`cmd_status` gains `--viewport <pid>`), the `status` arm in `main.rs:~244`.
+- Modify: `picker.rs` — `overlay_open(kind: &'static str, over: Option<&str>)` / `overlay_close()` and an `overlays()` reader; called around `p.open(..)` in `session/client.rs:1050,1737,1747`, `remote/client.rs:425,1132,1160`, and around `choose_standalone` in `main.rs:981`.
 
-### Task 11: RFC 0014 §5 amendment + man page
+**Response grammar** (design §2; RFC 0014 §6 in Task 11):
+```
+viewport pid=<pid> current=<target|-> kind=<kind> created=<0|1>
+stack depth=<n> target=<target> kind=<kind>        (one per entry, bottom first, depth 1..)
+overlay kind=<palette|picker|leave> over=<target|->  (one per live overlay)
+```
 
-- `docs/rfcs/0014-client-introspection-caps.md` §5 UPSTREAM gets the viewport socket's response grammar; `doc/posh.1.scd` `status` gains `--viewport`.
+**Implementation sketch:**
+```rust
+//! RFC 0014 §6: the viewport is the daemon for its own history. One
+//! `<base>/viewports/<pid>.status.sock` (+ `.status.pid`) per front-door
+//! process, answering connect → response → EOF like a session daemon's
+//! socket (§4.1). The response is rebuilt by `refresh()` whenever the
+//! stack, the current attach, or an overlay changes; the accept thread
+//! serves the latest snapshot. `POSH_VIEWPORT_STATUS=0|off|false|no`
+//! skips the bind (diagnostic only; nothing depends on it).
+pub fn bind() -> Option<ViewportStatus>          // mirrors server.rs bind_remote_status_socket
+impl ViewportStatus { pub fn refresh(&self) }    // renders picker state into the shared String
+impl Drop for ViewportStatus                     // removes sock + pidfile
+pub fn dir() -> PathBuf                          // <base>/viewports
+pub fn reap_dead()                               // unlink pairs whose .status.pid is not alive (kill -0); called by bind() and by `posh status --viewport`
+pub(crate) fn render(current: Option<&Current-ish view>, stack: &[StackEntry], overlays: &[Overlay]) -> String  // pure; the tests pin it
+```
+`picker` exposes a `pub fn snapshot() -> (Option<(String, SessionKind, bool)>, Vec<StackEntry>, Vec<Overlay>)` so `render` stays pure and `refresh` is one call. `run()` calls `refresh()` after `stack_push_current` / `stack_pop` / each `dispatch_ph` return; the overlay helpers call it themselves.
+
+**Tests:** `render` golden for empty / one entry / entries + overlay; bind →
+`read_status_socket` → the same text; `POSH_VIEWPORT_STATUS=0` skips (test via
+a `bind_with(enabled: bool, base: &Path)` seam, not the env); `reap_dead`
+removes a pair whose pidfile names a dead pid and keeps a live one.
+
+**Step 5:** commit `posh: per-viewport status socket serving the session stack and live overlays (RFC 0014 §6)`.
+
+### Task 11: RFC 0014 §6 and the man page
+
+- `docs/rfcs/0014-client-introspection-caps.md`: new `### 6. Viewport status socket` (path, liveness pidfile, the three line grammars above, reaping, the env gate), and a one-line cross-reference from §4.1. Status stays `proposed`.
+- `docs/rfcs/0001-target-grammar-and-capability-table.md`: the id 20 row (if Task 8 did not already add it).
+- `doc/posh.1.scd`: `status [--viewport pid] [session]`; ENVIRONMENT gains `POSH_VIEWPORT_STATUS`.
+- `just lint-doc` clean; commit `docs: RFC 0014 §6 viewport status socket; posh status --viewport; CAP_SESSION_KIND in RFC 0001`.
+- Then the Section 2 merge (attestation + `merge-this-session-async`).
 
 ---
 
