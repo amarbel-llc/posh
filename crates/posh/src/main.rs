@@ -13,6 +13,7 @@ mod tailnet;
 mod target;
 mod terminfo;
 mod util;
+mod viewport_status;
 
 use posh_proto::caps::SessionKind;
 use remote::datagram::Family;
@@ -43,12 +44,26 @@ fn main() {
 /// detach the user asked for — pops on its own (`picker::auto_pop`): the
 /// viewport returns to the session under it, with a banner saying why. With
 /// nothing to pop, the ended session's exit status becomes the process's,
-/// and a lost one is reported on stderr.
+/// and a lost one is reported on stderr. The viewport status socket (RFC
+/// 0014 §6) is bound for the whole loop and refreshed at every stack /
+/// current change; the overlay helpers refresh it themselves.
 fn run() -> Result<()> {
-    run_once()?;
+    // A `posh-server` process is a remote's server, never a viewport.
+    let status = if invoked_as("posh-server") { None } else { viewport_status::ViewportStatus::bind() };
+    let refresh = || {
+        if let Some(s) = &status {
+            s.refresh();
+        }
+    };
+    let once = run_once();
+    refresh();
+    once?;
     loop {
         let end = picker::take_attach_end();
         let Some(sw) = picker::take_switch().or_else(|| picker::auto_pop(end.as_ref())) else {
+            // Unbind before a `process::exit` inside: that skips Drop, and
+            // the socket + pidfile would outlive the viewport until reaped.
+            drop(status);
             return exit_with_attach_end(end);
         };
         // Kill-after-attach: arm the kill of the session being LEFT for the
@@ -67,7 +82,10 @@ fn run() -> Result<()> {
         } else if force.is_none() {
             picker::stack_push_current();
         }
-        if let Err(e) = dispatch_ph(ph_parse(Some(&sw.target)), &picker::default_group()) {
+        refresh();
+        let dispatched = dispatch_ph(ph_parse(Some(&sw.target)), &picker::default_group());
+        refresh();
+        if let Err(e) = dispatched {
             picker::disarm_kill();
             // An automatic pop whose re-dial failed: say what happened to the
             // session that ended before saying why the fallback failed.
@@ -106,6 +124,17 @@ fn exit_with_attach_end(end: Option<picker::AttachEnd>) -> Result<()> {
     }
 }
 
+/// Whether argv[0]'s basename is `name` (the `bin/posh-server` / `bin/ph`
+/// symlinks route on it).
+fn invoked_as(name: &str) -> bool {
+    std::env::args()
+        .next()
+        .as_deref()
+        .map(std::path::Path::new)
+        .and_then(|p| p.file_name())
+        .is_some_and(|n| n == name)
+}
+
 fn run_once() -> Result<()> {
     let argv: Vec<String> = std::env::args().skip(1).collect();
 
@@ -113,26 +142,14 @@ fn run_once() -> Result<()> {
     // invoked under that name every argument belongs to the server
     // subcommand (`posh-server new -p ...` == `posh server new -p ...`),
     // which is what the ssh bootstrap runs on the remote host.
-    let invoked_as_server = std::env::args()
-        .next()
-        .as_deref()
-        .map(std::path::Path::new)
-        .and_then(|p| p.file_name())
-        .is_some_and(|n| n == "posh-server");
-    if invoked_as_server {
+    if invoked_as("posh-server") {
         return cmd_server(&argv);
     }
 
     // FDR 0015: the package also installs `bin/ph -> posh`; invoked as `ph`, the
     // front-door router owns the whole argv (its own `-g` plus the terse
     // colon-discriminator grammar), so it returns before posh's global flag loop.
-    let invoked_as_ph = std::env::args()
-        .next()
-        .as_deref()
-        .map(std::path::Path::new)
-        .and_then(|p| p.file_name())
-        .is_some_and(|n| n == "ph");
-    if invoked_as_ph {
+    if invoked_as("ph") {
         return cmd_ph(&argv);
     }
 
@@ -239,6 +256,17 @@ fn run_once() -> Result<()> {
         // ENCLOSING session via $POSH_SESSION/$POSH_GROUP, the in-session
         // "what echo mode am I being viewed through" answer.
         "status" | "st" => {
+            // `--viewport [pid]` (RFC 0014 §6): a front-door process's own
+            // session stack and live overlays, or the live viewport pids.
+            if args.iter().any(|a| a == "--viewport") {
+                let pid = match args.iter().find(|a| !a.starts_with('-')) {
+                    Some(p) => Some(p.parse::<u32>().map_err(|_| {
+                        Error::Msg(format!("status --viewport: {p} is not a pid"))
+                    })?),
+                    None => None,
+                };
+                return viewport_status::cmd_status(pid);
+            }
             let name = args.iter().find(|a| !a.starts_with('-')).map(String::as_str);
             let group = match name {
                 Some(_) => group,
@@ -2019,6 +2047,9 @@ SESSION COMMANDS (local persistence)
         client's echo model, control (auto/pinned), rtt, and build. With no
         name, the enclosing session ($POSH_SESSION) — the in-session answer
         to: which echo mode am I being viewed through? (RFC 0014)
+        --viewport [pid]: a front-door process's own session stack and
+        live overlays (RFC 0014 §6); without a pid, the live viewport pids.
+        $POSH_VIEWPORT_STATUS=0 keeps a viewport from binding its socket.
 
     kill [--unless-attached] <name>...         (alias: k)
         Kill a session, its shell, and all attached clients. Accepts

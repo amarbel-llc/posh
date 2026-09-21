@@ -478,6 +478,71 @@ pub fn current_entry() -> Option<StackEntry> {
     })
 }
 
+/// A renderer view the viewport is showing OVER its session (RFC 0014 §6
+/// `overlay` line): `kind` is `palette` (the Commands palette, a dialog, or
+/// the leave question it asks today), `picker` (the session picker —
+/// in-session `session.list`, or the standalone `ph` chooser), or `leave`
+/// (reserved for the Section 4 leave prompt); `over` is the attach the view
+/// was opened over (`None` for the standalone chooser).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Overlay {
+    pub kind: &'static str,
+    pub over: Option<String>,
+}
+
+/// The live overlays, oldest first. VISIBLE state: a renderer that is
+/// spawned but hidden has no entry.
+static OVERLAYS: Mutex<Vec<Overlay>> = Mutex::new(Vec::new());
+
+/// A view of `kind` became visible over the current attach.
+pub fn overlay_open(kind: &'static str) {
+    OVERLAYS
+        .lock()
+        .unwrap_or_else(|e| e.into_inner())
+        .push(Overlay { kind, over: current() });
+    crate::viewport_status::refresh_now();
+}
+
+/// The most recent view of `kind` was dismissed. A no-op when none is live.
+pub fn overlay_close(kind: &'static str) {
+    {
+        let mut overlays = OVERLAYS.lock().unwrap_or_else(|e| e.into_inner());
+        if let Some(i) = overlays.iter().rposition(|o| o.kind == kind) {
+            overlays.remove(i);
+        }
+    }
+    crate::viewport_status::refresh_now();
+}
+
+/// Everything the viewport status socket reports (RFC 0014 §6), read in one
+/// go so its renderer stays pure: the attach in progress (target, its
+/// EFFECTIVE kind — what [`current_kind`] answers and a push would carry —
+/// and the anonymous-create flag that explains an `anonymous` reading
+/// against a silent daemon), the stack bottom first, and the live overlays.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Snapshot {
+    pub current: Option<(String, SessionKind, bool)>,
+    pub stack: Vec<StackEntry>,
+    pub overlays: Vec<Overlay>,
+}
+
+pub fn snapshot() -> Snapshot {
+    let current = CURRENT
+        .lock()
+        .unwrap_or_else(|e| e.into_inner())
+        .as_ref()
+        .map(|c| (c.target.clone(), c.kind, c.anonymous_create))
+        .map(|(target, kind, anon)| match kind {
+            SessionKind::Unknown if anon => (target, SessionKind::Anonymous, anon),
+            kind => (target, kind, anon),
+        });
+    Snapshot {
+        current,
+        stack: STACK.lock().unwrap_or_else(|e| e.into_inner()).clone(),
+        overlays: OVERLAYS.lock().unwrap_or_else(|e| e.into_inner()).clone(),
+    }
+}
+
 /// The title a viewport shows for a session that has set none of its own:
 /// `host:session` for the attach in progress — the host as typed minus any
 /// `user@` and trailing domain labels (`box` for `me@box.example`), this
@@ -870,6 +935,44 @@ mod tests {
         *CURRENT.lock().unwrap() = None;
         set_current_kind(SessionKind::Named);
         assert_eq!(current_kind(), SessionKind::Unknown, "no attach: a no-op");
+    }
+
+    /// Overlays record VISIBLE views over the attach they opened on; a close
+    /// removes the most recent of its kind and a stray close is a no-op. The
+    /// snapshot carries the current attach with its EFFECTIVE kind (the
+    /// anonymous-create fallback applied), the stack bottom first, and the
+    /// overlays. Renderer tests elsewhere may open overlays of their own
+    /// concurrently, so the assertions are scoped to this test's target.
+    #[test]
+    fn overlays_track_visible_views_and_the_snapshot_reads_everything() {
+        let _g = switch_test_guard();
+        while stack_pop().is_some() {}
+        let mine = |s: &Snapshot| -> Vec<&'static str> {
+            s.overlays.iter().filter(|o| o.over.as_deref() == Some(":ovl-test")).map(|o| o.kind).collect()
+        };
+        set_current(":s-1");
+        set_current_kind(SessionKind::Named);
+        stack_push_current();
+        next_attach_is_anonymous_create();
+        set_current(":ovl-test");
+        overlay_close("palette"); // nothing live: a no-op
+        overlay_open("palette");
+        overlay_open("picker");
+        let snap = snapshot();
+        assert_eq!(snap.current, Some((":ovl-test".into(), SessionKind::Anonymous, true)));
+        assert_eq!(snap.stack, vec![StackEntry { target: ":s-1".into(), kind: SessionKind::Named }]);
+        assert_eq!(mine(&snap), ["palette", "picker"]);
+        overlay_close("palette");
+        assert_eq!(mine(&snapshot()), ["picker"], "the palette went, the picker stays");
+        overlay_close("picker");
+        assert_eq!(mine(&snapshot()), Vec::<&str>::new());
+        set_current_kind(SessionKind::Named);
+        assert_eq!(snapshot().current, Some((":ovl-test".into(), SessionKind::Named, true)));
+        stack_pop();
+        *CURRENT.lock().unwrap() = None;
+        let snap = snapshot();
+        assert_eq!(snap.current, None);
+        assert!(snap.stack.is_empty());
     }
 
     /// The leave step: three `session.switch` re-issues carrying the chosen

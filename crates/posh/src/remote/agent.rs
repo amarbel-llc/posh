@@ -2019,7 +2019,7 @@ fn own_pid() -> i32 {
 
 /// True if a process with `pid` still exists. `kill(pid, 0)` performs the
 /// permission/existence check without sending a signal; ESRCH means gone.
-fn pid_alive(pid: i32) -> bool {
+pub(crate) fn pid_alive(pid: i32) -> bool {
     // SAFETY: kill(2) with signal 0 only probes; it touches no memory.
     let rc = unsafe { libc::kill(pid, 0) };
     if rc == 0 {

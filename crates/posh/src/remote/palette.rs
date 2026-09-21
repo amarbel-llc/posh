@@ -72,6 +72,11 @@ pub struct Palette {
     /// Observational guard: catches a query answer posh wrote to this PTY echoing
     /// back into `rterm` (posh#195). Silent unless the slave's ECHO was left on.
     echo_watch: EchoWatch,
+    /// The `picker::Overlay` kind recorded for the view on screen (RFC 0014
+    /// §6), `None` while hidden. Kept here — the one place `open` toggles —
+    /// so the record follows VISIBLE state in every host (both clients, the
+    /// standalone chooser), never a persisted-but-hidden renderer.
+    overlay: Option<&'static str>,
 }
 
 /// Locate the `posh-palette` binary: `$POSH_PALETTE` override, else next to the
@@ -136,6 +141,7 @@ impl Palette {
             dialog_body: String::new(),
             pending_show: None,
             echo_watch: EchoWatch::default(),
+            overlay: None,
         };
         if p.handshake() {
             Some(p)
@@ -168,11 +174,28 @@ impl Palette {
         self.show(json!({ "view": "palette", "title": title, "commands": commands }));
     }
 
-    /// Send a `ui.show` and remember its id (see `pending_show`).
+    /// Send a `ui.show` and remember its id (see `pending_show`). The view
+    /// is on screen from here: recorded as a `picker` overlay for the
+    /// session picker, `palette` for everything else (the command list, a
+    /// dialog, the leave question).
     fn show(&mut self, params: Value) {
+        let kind = if params.get("view").and_then(Value::as_str) == Some("picker") { "picker" } else { "palette" };
         let id = self.send_request("ui.show", params);
         self.pending_show = Some(id);
-        self.open = true;
+        self.set_visible(Some(kind));
+    }
+
+    /// Toggle `open`, keeping the RFC 0014 §6 overlay record in step: a
+    /// re-show while up swaps the kind, a hide removes it.
+    fn set_visible(&mut self, kind: Option<&'static str>) {
+        if let Some(prev) = self.overlay.take() {
+            crate::picker::overlay_close(prev);
+        }
+        if let Some(kind) = kind {
+            crate::picker::overlay_open(kind);
+        }
+        self.overlay = kind;
+        self.open = kind.is_some();
     }
 
     /// Summon an info dialog (RFC 0005 §3.2 `ui.show` view="dialog"): `body` is
@@ -235,7 +258,7 @@ impl Palette {
             };
             match v.get("method").and_then(Value::as_str) {
                 Some("ui.cancelled") => {
-                    self.open = false;
+                    self.set_visible(None);
                     return PaletteEvent::Cancelled;
                 }
                 Some("ui.copy") => {
@@ -247,7 +270,7 @@ impl Palette {
                     self.send_response(v.get("id").cloned().unwrap_or(Value::Null), json!({}));
                     let method = method.to_string();
                     let params = v.get("params").cloned().unwrap_or_else(|| json!({}));
-                    self.open = false;
+                    self.set_visible(None);
                     return PaletteEvent::Action { method, params };
                 }
                 None if self.pending_show.is_some()
@@ -257,7 +280,7 @@ impl Palette {
                     // renderer does not draw that view (RFC 0005 §3.5).
                     self.pending_show = None;
                     if v.get("error").is_some() {
-                        self.open = false;
+                        self.set_visible(None);
                         return PaletteEvent::ViewRejected;
                     }
                 }
@@ -275,6 +298,7 @@ impl Palette {
     /// Coordinated teardown: ask the renderer to exit, give it a grace period,
     /// then `SIGKILL` if it has not (its event loop may be wedged).
     pub fn shutdown(mut self) {
+        self.set_visible(None); // a renderer torn down mid-view shows nothing
         self.send_notification("ui.shutdown", json!({}));
         unsafe { libc::close(self.ctrl) };
         unsafe { libc::close(self.master) };
@@ -633,6 +657,7 @@ mod tests {
             dialog_body: String::new(),
             pending_show: None,
             echo_watch: EchoWatch::default(),
+            overlay: None,
         };
         (p, sp[1])
     }
