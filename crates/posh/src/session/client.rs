@@ -513,6 +513,10 @@ struct FrameRenderer {
     /// RFC 0013 §5.2: the daemon's activity label as last carried on a frame
     /// (requested on Init); the default title's process half (#193).
     activity: Option<caps::SessionActivity>,
+    /// The session's kind as the daemon reported it (`CAP_SESSION_KIND`, id
+    /// 20, once beside the first activity entry); `Unknown` until then.
+    /// Mirrored into `picker::set_current_kind` for the FDR 0016 stack.
+    kind: SessionKind,
     rows: u16,
     cols: u16,
 }
@@ -562,6 +566,7 @@ impl FrameRenderer {
             last_wheel: false,
             scroll_opt: true,
             activity: None,
+            kind: SessionKind::Unknown,
             rows,
             cols,
             stats: Stats::new(),
@@ -672,6 +677,13 @@ impl FrameRenderer {
         if let Some(cap) = caps::find(&frame.caps, caps::CAP_SESSION_ACTIVITY) {
             if let Ok(a) = caps::decode_session_activity(&cap.payload) {
                 self.activity = Some(a);
+            }
+        }
+        // The session's kind (id 20), once beside the first activity entry.
+        if let Some(cap) = caps::find(&frame.caps, caps::CAP_SESSION_KIND) {
+            if let Some(kind) = caps::decode_session_kind(&cap.payload) {
+                self.kind = kind;
+                crate::picker::set_current_kind(kind);
             }
         }
         // `[stats]` (posh#171): the frame's kind + arrival, then the apply

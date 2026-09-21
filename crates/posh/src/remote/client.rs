@@ -7,6 +7,7 @@ use std::collections::VecDeque;
 use std::net::{SocketAddr, ToSocketAddrs};
 use std::time::Instant;
 
+use posh_proto::caps::SessionKind;
 use posh_term::Terminal;
 use poshterity::castx;
 use serde_json::{json, Value};
@@ -1622,6 +1623,11 @@ struct ClientState {
     /// attaches it on the first request and on change). Feeds the default
     /// title (#193) and the About view. `None` against a pre-#193 daemon.
     session_activity: Option<caps::SessionActivity>,
+    /// The session's kind as its daemon reported it on a frame
+    /// (`CAP_SESSION_KIND`, id 20, once beside the first activity entry);
+    /// `Unknown` against a daemon that predates it or a standalone server.
+    /// Mirrored into `picker::set_current_kind` for the FDR 0016 stack.
+    session_kind: SessionKind,
     /// The live debug banner (FDR 0007): on via the palette or
     /// `POSH_DEBUG_BANNER=1`; its text is rebuilt every
     /// [`DEBUG_BANNER_REFRESH_MS`] and composited under the connection banner.
@@ -1797,6 +1803,7 @@ fn client_loop(
         stats,
         paint_pending: None,
         session_activity: None,
+        session_kind: SessionKind::Unknown,
         debug_banner: debug_banner_env(),
         banner: DebugBanner::default(),
         palette: None,
@@ -3015,6 +3022,14 @@ fn process_frame(st: &mut ClientState, frame: &ServerFrame) -> bool {
     if let Some(cap) = caps::find(&frame.caps, caps::CAP_SESSION_ACTIVITY) {
         if let Ok(activity) = caps::decode_session_activity(&cap.payload) {
             st.session_activity = Some(activity);
+        }
+    }
+    // The session's kind (id 20), sent once beside the first activity entry;
+    // the FDR 0016 stack reads it through the picker's current target.
+    if let Some(cap) = caps::find(&frame.caps, caps::CAP_SESSION_KIND) {
+        if let Some(kind) = caps::decode_session_kind(&cap.payload) {
+            st.session_kind = kind;
+            crate::picker::set_current_kind(kind);
         }
     }
     // Scrollback stream v2 (RFC 0009 §1): adopt the server's epoch from its
@@ -5226,6 +5241,7 @@ mod tests {
             stats: Stats::new(),
             paint_pending: None,
             session_activity: None,
+            session_kind: SessionKind::Unknown,
             debug_banner: false,
             banner: DebugBanner::default(),
             palette: None,
@@ -5703,6 +5719,29 @@ mod tests {
             "{:?}",
             String::from_utf8_lossy(&bytes)
         );
+    }
+
+    /// `CAP_SESSION_KIND` (id 20): the kind a frame carries is held on the
+    /// client and mirrored onto the picker's current target, so the FDR 0016
+    /// stack records what kind of session a switch leaves.
+    #[test]
+    fn session_kind_cap_is_held_and_feeds_the_current_target() {
+        let _g = crate::picker::switch_test_guard();
+        crate::picker::set_current(&crate::picker::target_for(Some("box"), None, "dev"));
+        assert_eq!(crate::picker::current_kind(), SessionKind::Unknown);
+        let mut st = test_state(5, 40);
+        assert_eq!(st.session_kind, SessionKind::Unknown);
+        let frame = ServerFrame {
+            flags: 0,
+            caps: vec![caps::encode_session_kind(SessionKind::Anonymous)],
+            frame_num: 1,
+            input_ack: 0,
+            echo_ack: 0,
+            body: FrameBody::Full(Terminal::with_scrollback(5, 40, 0).dump_vt()),
+        };
+        assert!(process_frame(&mut st, &frame));
+        assert_eq!(st.session_kind, SessionKind::Anonymous);
+        assert_eq!(crate::picker::current_kind(), SessionKind::Anonymous);
     }
 
     /// A paint destination that accepts everything, for the gauge tests.

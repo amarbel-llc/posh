@@ -12,6 +12,7 @@
 
 use std::sync::Mutex;
 
+use posh_proto::caps::SessionKind;
 use serde_json::{json, Value};
 
 use crate::session::{self, Config, KillOutcome};
@@ -275,10 +276,15 @@ pub fn request_pop(previous: Previous) -> Option<String> {
 /// local socket) each return their own shape — this is the one seam they
 /// all pass through.
 static SWITCH: Mutex<Option<Switch>> = Mutex::new(None);
-/// The target of the attach in progress — the session a switch would be
-/// LEAVING. Set by the attach entry points; read by the front door when a
-/// switch asks to kill it.
-static CURRENT: Mutex<Option<String>> = Mutex::new(None);
+/// The attach in progress — the session a switch would be LEAVING: its
+/// target and the kind its daemon reported on a frame (`CAP_SESSION_KIND`;
+/// `Unknown` until it does). Set by the attach entry points; read by the
+/// front door when a switch asks to kill it.
+struct Current {
+    target: String,
+    kind: SessionKind,
+}
+static CURRENT: Mutex<Option<Current>> = Mutex::new(None);
 /// A kill the front door armed for the NEW attach to carry out once it is
 /// established (`(target, force)`): kill-after-attach, so a failed switch
 /// never destroys the session it was leaving.
@@ -381,12 +387,34 @@ fn display_target(target: &str) -> String {
     }
 }
 
+/// A new attach: the kind is `Unknown` until its daemon says.
 pub fn set_current(target: &str) {
-    *CURRENT.lock().unwrap_or_else(|e| e.into_inner()) = Some(target.to_string());
+    *CURRENT.lock().unwrap_or_else(|e| e.into_inner()) = Some(Current {
+        target: target.to_string(),
+        kind: SessionKind::Unknown,
+    });
+}
+
+/// The daemon reported the current session's kind (a frame's id 20 entry).
+/// A no-op with no attach in progress; a known kind is never downgraded to
+/// `Unknown` (an origin that stopped saying does not unsay).
+pub fn set_current_kind(kind: SessionKind) {
+    if kind == SessionKind::Unknown {
+        return;
+    }
+    if let Some(cur) = CURRENT.lock().unwrap_or_else(|e| e.into_inner()).as_mut() {
+        cur.kind = kind;
+    }
 }
 
 pub fn current() -> Option<String> {
-    CURRENT.lock().unwrap_or_else(|e| e.into_inner()).clone()
+    CURRENT.lock().unwrap_or_else(|e| e.into_inner()).as_ref().map(|c| c.target.clone())
+}
+
+/// The current session's kind as its daemon reported it; `Unknown` with no
+/// attach in progress or before the daemon said.
+pub fn current_kind() -> SessionKind {
+    CURRENT.lock().unwrap_or_else(|e| e.into_inner()).as_ref().map_or(SessionKind::Unknown, |c| c.kind)
 }
 
 /// The title a viewport shows for a session that has set none of its own:

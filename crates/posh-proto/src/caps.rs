@@ -157,6 +157,14 @@ pub const CAP_CLIENT_UPSTREAM: u8 = 18;
 /// only when the origin knew (a daemon end reaches the roaming client
 /// through the relay / bridge unchanged). Display only.
 pub const CAP_EXIT_CAUSE: u8 = 19;
+/// The session's kind (design 2026-09-21 §1): server entry, one byte
+/// (`SessionKind::to_byte`), attached to the same visible frame as the
+/// client's FIRST `SESSION_ACTIVITY` entry and never again — a session's
+/// kind is fixed at create time. A relay / M2 bridge forwards it unchanged;
+/// a standalone Arch-A server (an ephemeral shell, no daemon) never sends
+/// it. Display / policy on the viewport side only (the FDR 0016 stack and
+/// the leave prompt); an old client ignores the id.
+pub const CAP_SESSION_KIND: u8 = 20;
 
 /// Why a session ended, as its daemon (or a standalone server) knew it.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -334,9 +342,8 @@ pub enum SessionKind {
 
 impl SessionKind {
     /// The one-byte wire form (`0` unknown, `1` anonymous, `2` named,
-    /// `3` system): the IPC `SessionInfo` tail carries it and, once Task 9
-    /// of the 2026-09-21 plan threads it onto the activity frame, that
-    /// entry too.
+    /// `3` system): the IPC `SessionInfo` tail carries it and so does the
+    /// [`CAP_SESSION_KIND`] frame entry.
     pub fn to_byte(self) -> u8 {
         match self {
             SessionKind::Unknown => 0,
@@ -425,6 +432,24 @@ pub fn decode_session_activity(payload: &[u8]) -> Result<SessionActivity> {
         return Err(err());
     }
     Ok(SessionActivity { process, title })
+}
+
+/// Encode a session's kind as its [`CAP_SESSION_KIND`] entry: one byte.
+pub fn encode_session_kind(kind: SessionKind) -> Cap {
+    Cap {
+        id: CAP_SESSION_KIND,
+        payload: vec![kind.to_byte()],
+    }
+}
+
+/// Decode a [`CAP_SESSION_KIND`] payload: `None` for anything but exactly
+/// one byte (malformed); an unknown byte value reads `Unknown`, per
+/// [`SessionKind::from_byte`].
+pub fn decode_session_kind(payload: &[u8]) -> Option<SessionKind> {
+    match payload {
+        [b] => Some(SessionKind::from_byte(*b)),
+        _ => None,
+    }
 }
 
 /// Mask a received [`CAP_KITTY_KEYBOARD`] payload to the valid low-5-bit flag
@@ -1309,5 +1334,19 @@ mod tests {
         assert_eq!(SessionKind::parse("named"), Some(SessionKind::Named));
         assert_eq!(SessionKind::parse("system"), None, "system is reserved, not creatable");
         assert_eq!(SessionKind::parse("bogus"), None);
+    }
+
+    #[test]
+    fn session_kind_cap_roundtrip_and_rejections() {
+        for k in [SessionKind::Anonymous, SessionKind::Named, SessionKind::System] {
+            let cap = encode_session_kind(k);
+            assert_eq!(cap.id, CAP_SESSION_KIND);
+            assert_eq!(cap.payload, vec![k.to_byte()]);
+            assert_eq!(decode_session_kind(&cap.payload), Some(k));
+        }
+        assert_eq!(decode_session_kind(&[]), None);
+        assert_eq!(decode_session_kind(&[1, 2]), None, "exactly one byte");
+        assert_eq!(decode_session_kind(&[0]), Some(SessionKind::Unknown));
+        assert_eq!(decode_session_kind(&[77]), Some(SessionKind::Unknown));
     }
 }

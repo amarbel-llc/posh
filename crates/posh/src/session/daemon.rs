@@ -214,6 +214,12 @@ struct ClientConn {
     wants_activity: bool,
     activity_now: Option<caps::SessionActivity>,
     activity_sent: Option<caps::SessionActivity>,
+    /// The session's kind (`CAP_SESSION_KIND`, id 20): fixed at create time,
+    /// so it rides the SAME visible frame as this client's first activity
+    /// entry and never again (`kind_sent`). Stored per connection at accept
+    /// so `queue_frame` needs no new parameter.
+    kind: SessionKind,
+    kind_sent: bool,
 }
 
 impl ClientConn {
@@ -385,7 +391,15 @@ impl ClientConn {
             && self.activity_now != self.activity_sent
         {
             self.activity_sent = self.activity_now.clone();
-            self.activity_now.iter().map(caps::encode_session_activity).collect()
+            let mut entries: Vec<caps::Cap> =
+                self.activity_now.iter().map(caps::encode_session_activity).collect();
+            // The kind (id 20) rides the first activity-bearing frame once:
+            // a session never changes kind, so there is nothing to refresh.
+            if !self.kind_sent {
+                self.kind_sent = true;
+                entries.push(caps::encode_session_kind(self.kind));
+            }
+            entries
         } else {
             Vec::new()
         };
@@ -1337,6 +1351,8 @@ fn daemon_loop(
                     wants_activity: false,
                     activity_now: None,
                     activity_sent: None,
+                    kind,
+                    kind_sent: false,
                 });
             }
         }
@@ -2194,6 +2210,8 @@ mod tests {
             wants_activity: false,
             activity_now: None,
             activity_sent: None,
+            kind: SessionKind::Unknown,
+            kind_sent: false,
         }
     }
 
@@ -2309,6 +2327,8 @@ mod tests {
             wants_activity: false,
             activity_now: None,
             activity_sent: None,
+            kind: SessionKind::Unknown,
+            kind_sent: false,
         };
         let mut init = ipc::encode_resize(rows, cols).to_vec();
         init.extend_from_slice(&caps::encode_table(&caps::own_table(&[])));
@@ -2346,6 +2366,8 @@ mod tests {
             wants_activity: false,
             activity_now: None,
             activity_sent: None,
+            kind: SessionKind::Unknown,
+            kind_sent: false,
         };
         let mut init = ipc::encode_resize(rows, cols).to_vec();
         init.extend_from_slice(&caps::encode_table(&caps::own_table(&[caps::Cap {
@@ -2939,6 +2961,8 @@ mod tests {
             wants_activity: false,
             activity_now: None,
             activity_sent: None,
+            kind: SessionKind::Unknown,
+            kind_sent: false,
         };
         let mut init = ipc::encode_resize(rows, cols).to_vec();
         init.extend_from_slice(&caps::encode_table(&caps::own_table(&[caps::Cap {
@@ -3218,6 +3242,8 @@ mod tests {
             wants_activity: false,
             activity_now: None,
             activity_sent: None,
+            kind: SessionKind::Unknown,
+            kind_sent: false,
         };
         let mut table = vec![caps::Cap {
             id: caps::CAP_LOSSY,
@@ -3282,6 +3308,56 @@ mod tests {
             caps::decode_session_activity(&got.payload).unwrap().label(),
             "~/notes \u{b7} vim"
         );
+    }
+
+    /// `CAP_SESSION_KIND` (id 20): a client that requested id 15 gets the
+    /// kind on the SAME frame as its first activity entry, and never again
+    /// (the kind never changes); a client that did not request activity
+    /// never gets it.
+    #[test]
+    fn kind_rides_the_first_activity_bearing_frame_once() {
+        let label = |process: &str| caps::SessionActivity {
+            process: process.into(),
+            title: String::new(),
+        };
+        let mut term = Terminal::with_scrollback(24, 80, 0);
+        term.process(b"hello");
+
+        // No activity request: the kind is known but never attached.
+        let (mut quiet, _peer) = frame_capable_conn(24, 80);
+        quiet.kind = SessionKind::Anonymous;
+        quiet.activity_now = Some(label("fish"));
+        assert!(quiet.queue_frame_from(&term));
+        let frames = decode_server_frames(&quiet.write_buf);
+        assert!(caps::find(&frames[0].caps, caps::CAP_SESSION_KIND).is_none());
+        assert!(!quiet.kind_sent);
+
+        // Requested: the first activity-bearing frame carries both entries.
+        let (mut c, _peer) = frame_capable_conn(24, 80);
+        c.kind = SessionKind::Anonymous;
+        c.absorb_client_caps(
+            &[caps::Cap {
+                id: caps::CAP_SESSION_ACTIVITY,
+                payload: vec![],
+            }],
+            0,
+            false,
+        );
+        c.activity_now = Some(label("fish"));
+        assert!(c.queue_frame_from(&term));
+        let frames = decode_server_frames(&c.write_buf);
+        assert!(caps::find(&frames[0].caps, caps::CAP_SESSION_ACTIVITY).is_some());
+        let got = caps::find(&frames[0].caps, caps::CAP_SESSION_KIND).expect("kind rides the first activity frame");
+        assert_eq!(caps::decode_session_kind(&got.payload), Some(SessionKind::Anonymous));
+        c.write_buf.clear();
+
+        // A later activity change: the label again, the kind not.
+        c.activity_now = Some(label("vim"));
+        term.process(b" more");
+        assert!(c.queue_frame_from(&term));
+        let frames = decode_server_frames(&c.write_buf);
+        assert!(caps::find(&frames[0].caps, caps::CAP_SESSION_ACTIVITY).is_some());
+        assert!(caps::find(&frames[0].caps, caps::CAP_SESSION_KIND).is_none(), "sent once");
     }
 
     /// Decode the queued `Tag::Frame` records into whole `ServerFrame`s (header +
@@ -3730,6 +3806,8 @@ mod tests {
             wants_activity: false,
             activity_now: None,
             activity_sent: None,
+            kind: SessionKind::Unknown,
+            kind_sent: false,
         };
         let mut init = ipc::encode_resize(rows, cols).to_vec();
         init.extend_from_slice(&caps::encode_table(&caps::own_table(&[caps::Cap {
@@ -3933,6 +4011,8 @@ mod tests {
             wants_activity: false,
             activity_now: None,
             activity_sent: None,
+            kind: SessionKind::Unknown,
+            kind_sent: false,
         };
         let mut init = ipc::encode_resize(rows, cols).to_vec();
         init.extend_from_slice(&caps::encode_table(&caps::own_table(&[
