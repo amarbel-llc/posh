@@ -416,6 +416,61 @@ pub fn leave_candidates(end: Option<&AttachEnd>) -> Vec<StackEntry> {
     out
 }
 
+/// What the front door does on the way out about the [`leave_candidates`]
+/// (design 2026-09-21 §4).
+#[derive(Debug, PartialEq, Eq)]
+pub enum LeaveAction {
+    /// Nothing to do, silently: no candidates, or the policy is `Keep`.
+    Nothing,
+    /// Ask through the standalone chooser (`palette_view::leave_prompt`).
+    Prompt,
+    /// Kill them without asking (the `Kill` policy).
+    Kill { force: bool },
+    /// Keep them and say so on stderr: `Ask` cannot prompt — no tty on
+    /// both ends, or a signal ended the attach.
+    Report,
+}
+
+/// Pure: the decision from the policy, whether stdin + stdout are a tty,
+/// whether a terminating signal reached the viewport
+/// (`util::terminating_signal_seen`), and the candidates.
+pub fn leave_action(policy: LeavePolicy, tty: bool, signaled: bool, candidates: &[StackEntry]) -> LeaveAction {
+    if candidates.is_empty() {
+        return LeaveAction::Nothing;
+    }
+    match policy {
+        LeavePolicy::Keep => LeaveAction::Nothing,
+        LeavePolicy::Kill => LeaveAction::Kill { force: false },
+        LeavePolicy::Ask if tty && !signaled => LeaveAction::Prompt,
+        LeavePolicy::Ask => LeaveAction::Report,
+    }
+}
+
+/// Kill each candidate in order (stack bottom first, the current last —
+/// [`leave_candidates`] already orders them), never stopping on a failure;
+/// one notice per entry. `kill` is [`kill_target`] in production.
+pub fn run_leave_kills(
+    candidates: &[StackEntry],
+    force: bool,
+    mut kill: impl FnMut(&str, bool) -> Result<String>,
+) -> Vec<String> {
+    candidates
+        .iter()
+        .map(|e| match kill(&e.target, force) {
+            Ok(notice) => notice,
+            Err(err) => format!("{} not killed: {err}", e.target),
+        })
+        .collect()
+}
+
+/// The stderr line for candidates left running unasked (`LeaveAction::Report`,
+/// or a dismissed prompt): the targets as the notices spell them
+/// ([`display_target`]) and the lever that would have killed them.
+pub fn left_running_notice(candidates: &[StackEntry]) -> String {
+    let targets = candidates.iter().map(|e| display_target(&e.target)).collect::<Vec<_>>().join(", ");
+    format!("left running: {targets} (POSH_LEAVE_ANONYMOUS=kill to kill on exit)")
+}
+
 /// A target for a notice: a local `:session` names this machine, like the
 /// picker's rows and the default title do.
 pub(crate) fn display_target(target: &str) -> String {
@@ -1108,5 +1163,60 @@ mod tests {
         while stack_pop().is_some() {}
         *CURRENT.lock().unwrap() = None;
         assert!(leave_candidates(None).is_empty());
+    }
+
+    fn entry(t: &str) -> StackEntry {
+        StackEntry { target: t.into(), kind: SessionKind::Anonymous }
+    }
+
+    #[test]
+    fn leave_action_decision_table() {
+        use LeaveAction::*;
+        let c = vec![entry(":s-1")];
+        // no candidates ⇒ nothing, whatever the policy
+        assert_eq!(leave_action(LeavePolicy::Ask, true, false, &[]), Nothing);
+        assert_eq!(leave_action(LeavePolicy::Kill, true, false, &[]), Nothing);
+        // keep ⇒ nothing, silently
+        assert_eq!(leave_action(LeavePolicy::Keep, true, false, &c), Nothing);
+        // kill ⇒ kill (unless-attached), no prompt, tty or not
+        assert_eq!(leave_action(LeavePolicy::Kill, true, false, &c), Kill { force: false });
+        assert_eq!(leave_action(LeavePolicy::Kill, false, true, &c), Kill { force: false });
+        // ask on a tty, not a signal ⇒ prompt
+        assert_eq!(leave_action(LeavePolicy::Ask, true, false, &c), Prompt);
+        // ask off-tty or after a signal ⇒ report, keep
+        assert_eq!(leave_action(LeavePolicy::Ask, false, false, &c), Report);
+        assert_eq!(leave_action(LeavePolicy::Ask, true, true, &c), Report);
+    }
+
+    /// The runner kills in the given order (stack bottom first, current
+    /// last), a failed host fails only its own entry, and every entry gets
+    /// a notice.
+    #[test]
+    fn run_leave_kills_in_stack_order_current_last_and_collects_every_notice() {
+        let order = std::cell::RefCell::new(vec![]);
+        let forces = std::cell::RefCell::new(vec![]);
+        let notices = run_leave_kills(&[entry(":s-1"), entry("box:s-3"), entry(":s-9")], false, |t, f| {
+            order.borrow_mut().push(t.to_string());
+            forces.borrow_mut().push(f);
+            if t == "box:s-3" {
+                Err(Error::from("box: ssh: no route"))
+            } else {
+                Ok(format!("killed {t}"))
+            }
+        });
+        assert_eq!(*order.borrow(), [":s-1", "box:s-3", ":s-9"]);
+        assert_eq!(*forces.borrow(), [false, false, false]);
+        assert_eq!(notices, ["killed :s-1", "box:s-3 not killed: box: ssh: no route", "killed :s-9"]);
+        // The force flag reaches every kill.
+        let notices = run_leave_kills(&[entry("box:s-3")], true, |t, f| Ok(format!("{t} force={f}")));
+        assert_eq!(notices, ["box:s-3 force=true"]);
+    }
+
+    #[test]
+    fn left_running_notice_names_every_candidate_and_the_lever() {
+        let n = left_running_notice(&[entry(":s-1"), entry("box:s-3")]);
+        assert!(n.starts_with("left running: "), "{n}");
+        assert!(n.contains(":s-1, box:s-3 (POSH_LEAVE_ANONYMOUS=kill to kill on exit)"), "{n}");
+        assert!(!n.contains(" :s-1"), "a local target names this machine: {n}");
     }
 }

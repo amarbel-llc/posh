@@ -382,8 +382,12 @@ extern "C" fn on_sigwinch(_: libc::c_int) {
     SIGWINCH_RECEIVED.store(true, Ordering::Release);
 }
 
-extern "C" fn on_sigterm(_: libc::c_int) {
-    SIGTERM_RECEIVED.store(true, Ordering::Release);
+/// Whether a terminating signal (SIGTERM / SIGINT / SIGHUP) has reached this
+/// process — sticky, unlike the `SIGTERM_RECEIVED` flag the loops consume.
+/// The front door reads it on the way out: an attach a signal ended is not
+/// one to ask questions after (the leave prompt degrades to a report).
+pub fn terminating_signal_seen() -> bool {
+    LAST_SIGNAL.load(Ordering::Acquire) != 0
 }
 
 /// Terminating-signal handler that also records WHICH signal fired, so the
@@ -469,14 +473,16 @@ pub fn install_sigusr2_handler() {
 /// SIGTERM, SIGINT, and SIGHUP all route to SIGTERM_RECEIVED so the loop
 /// winds down and restores the tty (raw mode clears ISIG, but kill(1) and
 /// terminal hangup would otherwise terminate with the default disposition
-/// mid-raw); SIGCONT sets SIGCONT_RECEIVED so the screen repaints after
-/// SIGSTOP/fg.
+/// mid-raw) — through the same handler as the daemon's, so `LAST_SIGNAL`
+/// keeps the sticky record `terminating_signal_seen` reads once the
+/// consumed flag is gone; SIGCONT sets SIGCONT_RECEIVED so the screen
+/// repaints after SIGSTOP/fg.
 pub fn install_client_signal_handlers() {
     install_handler(
         libc::SIGWINCH,
         on_sigwinch as extern "C" fn(libc::c_int) as usize,
     );
-    let on_term = on_sigterm as extern "C" fn(libc::c_int) as usize;
+    let on_term = on_terminating_signal as extern "C" fn(libc::c_int) as usize;
     for signo in [libc::SIGTERM, libc::SIGINT, libc::SIGHUP] {
         install_handler(signo, on_term);
     }

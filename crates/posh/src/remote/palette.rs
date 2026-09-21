@@ -176,7 +176,6 @@ impl Palette {
     /// renderer draws between the heading and the filter input (the leave
     /// prompt's candidate list). A renderer that predates the field ignores
     /// it (§9) and shows the plain command list.
-    #[allow(dead_code)] // wired by the leave prompt (session-stack plan Task 16)
     pub fn open_described(&mut self, title: &str, description: &str, commands: Value) {
         self.show(json!({
             "view": "palette",
@@ -567,7 +566,6 @@ pub fn choose_standalone(title: &str, rows: Value, empty: &str) -> util::Result<
 /// keep / kill choices as the commands). Same outcomes: the chosen
 /// command's action, `Cancelled` on Esc / renderer gone, `Unsupported`
 /// when the renderer rejects the view.
-#[allow(dead_code)] // wired by the leave prompt (session-stack plan Task 16)
 pub fn choose_standalone_commands(title: &str, description: &str, commands: Value) -> util::Result<Choice> {
     run_standalone(|palette| palette.open_described(title, description, commands))
 }

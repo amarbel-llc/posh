@@ -58,6 +58,7 @@ fn run() -> Result<()> {
     loop {
         let end = picker::take_attach_end();
         let Some(sw) = picker::take_switch().or_else(|| picker::auto_pop(end.as_ref())) else {
+            leave_anonymous_sessions(end.as_ref());
             // Unbind before the `process::exit` inside, which skips `main`'s.
             viewport_status::shutdown();
             return exit_with_attach_end(end);
@@ -89,6 +90,51 @@ fn run() -> Result<()> {
                 eprintln!("posh: {n}");
             }
             return Err(e);
+        }
+    }
+}
+
+/// On the way out of posh (an attach nothing followed): what becomes of the
+/// anonymous sessions this viewport created (design 2026-09-21 §4,
+/// `POSH_LEAVE_ANONYMOUS`). `Ask` (the default) shows the leave prompt on
+/// the standalone chooser — a tty on both ends and no signal behind the
+/// end — with *Keep* as Enter and Esc; `Kill` kills unasked; `Keep`, or
+/// nothing anonymous, is silent. The kills run through `kill_target`
+/// (`--unless-attached` protects another viewport unless forced), in
+/// stack order with the current session last — its attach has already
+/// returned — and every notice prints on stderr AFTER the chooser has
+/// restored the tty. A prompt that could not be shown, or was dismissed,
+/// keeps the sessions and says which were left.
+fn leave_anonymous_sessions(end: Option<&picker::AttachEnd>) {
+    use picker::{LeaveAction, Previous};
+    let candidates = picker::leave_candidates(end);
+    let tty = util::is_tty(libc::STDIN_FILENO) && util::is_tty(libc::STDOUT_FILENO);
+    let policy = picker::LeavePolicy::from_env();
+    let kills = |force: bool| {
+        for n in picker::run_leave_kills(&candidates, force, picker::kill_target) {
+            eprintln!("posh: {n}");
+        }
+    };
+    match picker::leave_action(policy, tty, util::terminating_signal_seen(), &candidates) {
+        LeaveAction::Nothing => {}
+        LeaveAction::Report => eprintln!("posh: {}", picker::left_running_notice(&candidates)),
+        LeaveAction::Kill { force } => kills(force),
+        LeaveAction::Prompt => {
+            let p = remote::palette_view::leave_prompt(&candidates);
+            picker::overlay_open("leave");
+            let choice = remote::palette::choose_standalone_commands(&p.title, &p.description, p.commands);
+            picker::overlay_close("leave");
+            match choice {
+                Ok(remote::palette::Choice::Action { params, .. }) => {
+                    match Previous::parse(params["previous"].as_str()) {
+                        Some(Previous::Kill) => kills(false),
+                        Some(Previous::ForceKill) => kills(true),
+                        Some(Previous::Keep) | None => {}
+                    }
+                }
+                // Cancelled / Unsupported / a renderer error: keep, and say what was left.
+                _ => eprintln!("posh: {}", picker::left_running_notice(&candidates)),
+            }
         }
     }
 }
