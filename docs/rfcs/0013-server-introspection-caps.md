@@ -173,6 +173,20 @@ the session or choosing among sessions:
   activity label, not its id. A pre-RFC-0013 daemon omits the field; readers
   render `unknown`.
 
+**The session's kind rides the first activity frame** (added 2026-09-21). A
+session daemon attaches one `SESSION_KIND` entry (RFC 0001 id 20, a single
+byte) to the same visible frame as a client's FIRST activity entry — so only
+a client that requested id 15 receives it — and never again: a session's kind
+is fixed at create time, so there is nothing to refresh, and a client keeps
+the value it was given. A relay or mux bridge forwards it unchanged with the
+activity answer; a standalone server that owns its PTY (no daemon) never
+sends it. The entry's layout and the kind values are RFC 0001's id 20 row;
+what the kinds mean (`anonymous`, `named`, `system`) and what a client does
+with one (the FDR 0016 stack entry, the viewport status socket of RFC 0014
+§6) is the session-stack UX design (`docs/plans/2026-09-21-session-stack-ux-design.md`
+§1). Like the label, the kind is display and viewport-side policy data, never
+trusted by a serving side for behavior.
+
 ## Security Considerations
 
 The identity block reveals build provenance and process facts, and the activity

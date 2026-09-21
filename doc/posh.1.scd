@@ -266,7 +266,7 @@ Local persistence over Unix sockets.
 *detach-all* (alias: *da*)
 	Detach all clients from all sessions in the group.
 
-*status* [_name_] (alias: *st*)
+*status* [_name_] [*--viewport* [_pid_]] (alias: *st*)
 	Print the session's status response (RFC 0014 §4.2): a session
 	line — daemon build, pid, frames gate, the PTY's ECHO flag, alt-screen,
 	client count, activity label — then one line per attached client with
@@ -283,6 +283,23 @@ Local persistence over Unix sockets.
 	that predates RFC 0014 has no status socket and reports _stale_; a
 	client that reported nothing renders _echo=unknown_, distinct from
 	_echo=none_ (a client that reported it has no predictor).
+
+	*--viewport* _pid_ reads a *viewport* instead of a session — a
+	front-door *posh* process's own history, which no daemon holds
+	(RFC 0014 §6): a _viewport_ line with the session it is attached to,
+	that session's kind (_anonymous_, _named_, _system_, or _unknown_;
+	_anonymous_create=1_ marks a kind the viewport inferred from having
+	created the session itself, against a daemon that predates the kind),
+	one _stack_ line per session it switched away from and can go *Back*
+	to (FDR 0016; bottom first, _depth=1_ the oldest), and one _overlay_
+	line per renderer view showing over the session (_palette_, _picker_,
+	or _leave_). A viewport binds
+	_<base>/viewports/<pid>.status.sock_ on its first attach — never a
+	listing command — and removes it at exit. Fields are _key=value_ by
+	prefix; a target may contain spaces (a line break in a session name
+	is flattened to a space), so read a value up to the next known key,
+	not the next space. Without a _pid_, *--viewport* reaps the sockets
+	of dead viewports and prints the live viewport pids, one per line.
 
 *kill* [*--unless-attached*] _name_... (alias: *k*)
 	Kill a session, its shell, and all attached clients. Accepts several
@@ -408,6 +425,11 @@ _POSH_HANDSHAKE_
 	*attach --detach* print the *POSH START 1* _name_ _kind_ handshake
 	line on stdout ahead of their status prose (see *start*). Off by
 	default; *ph* _host_*:+* sets it on the ssh command it runs.
+
+_POSH_VIEWPORT_STATUS_
+	When set to _0_, _off_, _false_, or _no_, a viewport skips binding its
+	_<base>/viewports/<pid>.status.sock_ (see *status --viewport*).
+	Diagnostic only; nothing depends on the socket. On by default.
 
 _POSH_PREDICTION_MODEL_
 	Local-echo prediction model: _always_, _never_, _adaptive_

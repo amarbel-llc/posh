@@ -97,7 +97,13 @@ keep / kill / force-kill question about the session being left, so a
 one-off session can be discarded on the way back. The stack lives in the
 viewport process — the `run()` re-attach loop — and no longer: quitting posh
 empties it, and each viewport has its own. Depth is unbounded in practice
-(a target string per level).
+(a target string per level). Since 2026-09-21 each entry also records the
+session's kind (`anonymous` / `named` / `system` / `unknown`, from the
+daemon's `SESSION_KIND` entry, RFC 0001 id 20, or inferred for a session
+this viewport created with `:+`), and the whole stack — with the current
+session and any open palette or picker — is inspectable from outside via
+`posh status --viewport <pid>`, the viewport's own status socket (RFC 0014
+§6).
 
 **When the top session goes away.** An attach that ends because the session
 *ended* (its shell exited, or it was killed from elsewhere) or was *lost*
@@ -228,7 +234,7 @@ re-dial. The UX is identical either way; the user never sees which fired.
 | same-host switch mechanism (follow-on) | FDR 0012 retarget | reuses one transport, no blip, matches the collapse story | the two-path split (retarget + re-dial) costs more than re-dial-everywhere saves |
 | picker host set | local + live mux endpoints (`ph host:` = one host) | the connected set, no per-host ssh fan-out to cold hosts | users routinely want a cold host in the all-hosts picker (add the ssh-config/tailnet union behind a flag) |
 | switch affordance | palette "Switch session…" | one discoverable home, shared with `ph` | a dedicated keybind proves faster than the palette round-trip |
-| session stack scope | per viewport process, in memory | matches the re-attach loop that owns switching; no state to reconcile across viewports | users want `ph -` (back) from a fresh shell, or the stack to survive a viewport exit — persist it under the runtime dir |
+| session stack scope | per viewport process, in memory; inspectable via `posh status --viewport` (RFC 0014 §6) | matches the re-attach loop that owns switching; no state to reconcile across viewports | users want `ph -` (back) from a fresh shell, or the stack to survive a viewport exit — persist it under the runtime dir |
 
 ## More Information
 

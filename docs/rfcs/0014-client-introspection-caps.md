@@ -40,8 +40,9 @@ document are sent unconditionally.
 
 Scope: the two capability entries and their payloads, the retention and
 exposure rules on the server and daemon, the session status socket and its line
-format, upstream propagation across nested sessions, and the shared-struct
-conformance rule. Out of scope: any change to frame bodies; the session-layer
+format, upstream propagation across nested sessions, the per-viewport status
+socket serving a front-door process's session stack and overlays (§6, added
+2026-09-21), and the shared-struct conformance rule. Out of scope: any change to frame bodies; the session-layer
 collapse (FDR 0012), which is expected to subsume §5 by removing the nesting it
 propagates through.
 
@@ -111,7 +112,7 @@ decoder MUST accept and ignore trailing bytes: a later format version MAY
 append fields while keeping this prefix, and a peer that knows only `0x01`
 reads the prefix. (This is the `CAP_METRICS` v1→v2 convention, RFC 0007 §3,
 chosen over RFC 0013's strict-length rule precisely because this payload is
-expected to grow with every new axis, §6.) A format version whose prefix is
+expected to grow with every new axis, §7.) A format version whose prefix is
 *not* this layout MUST use a new version byte.
 
 Counters are cumulative for the life of the client's current predictor and
@@ -217,6 +218,10 @@ GC rules, and MUST additionally emit the response in its `SIGUSR2` diag dump
 alongside the session dirs. The two roles differ only in the path; a reader
 MUST NOT be able to tell from the response which role answered.
 
+A viewport process binds a socket of the same shape under
+`<base>/viewports/<pid>.status.sock` for its own session stack and overlays
+(§6), with a different response grammar.
+
 #### 4.2 Response format
 
 The response is one or more lines. Line 1 is the session line; each further
@@ -259,7 +264,7 @@ fail with a one-line error naming the missing variable when not inside a
 session. `posh ls` SHOULD append, per session, the `echo`, `control`, `srtt`
 and `build` fields of each attached client. The palette's *About / transport
 info* and *Show echo prediction stats* MUST render the same fields from the same
-source struct (§6); the client's own `SIGUSR2` dump MUST include `echo_model`,
+source struct (§7); the client's own `SIGUSR2` dump MUST include `echo_model`,
 `echo_control`, the thresholds, and its build — the fields the FDR 0007 dump
 omitted.
 
@@ -301,7 +306,141 @@ and no `UPSTREAM` entry is needed. When FDR 0012 reaches `experimental`, this
 section SHOULD be revisited; id 18 MUST remain valid for the intentional-nesting
 escape hatch FDR 0012 preserves.
 
-### 6. The double-end visibility rule
+### 6. Viewport status socket
+
+A *viewport* is a front-door `posh` process that attaches to sessions on
+behalf of one terminal — the `run()` re-attach loop that owns the FDR 0016
+session stack and the renderer overlays (the Commands palette, the session
+picker). That history exists nowhere but in the viewport process: no daemon
+holds it, and §4's session socket cannot answer "which sessions has this
+terminal been through, and what is it showing right now?" This section makes
+the viewport the daemon for its own history (session-stack UX design
+2026-09-21 §2). The socket is diagnostic: nothing in posh reads it for
+behavior.
+
+#### 6.1 Path, liveness record, and the first-attach rule
+
+A viewport MUST bind `<base>/viewports/<pid>.status.sock`, where `<base>` is
+the socket base directory (`$POSH_DIR`, else the defaults `posh`(1) lists)
+and `<pid>` is its own pid, and MUST write the liveness record
+`<base>/viewports/<pid>.status.pid` (the pid in decimal) BEFORE the bind, so
+a reaper can judge the socket by the record alone. The pair follows §4.1's
+contract: one UTF-8 response per accepted connection, then close; the socket
+is never read; a bind failure is non-fatal (one warning line, the attach
+proceeds).
+
+The bind happens on the process's **first attach** — the first time it
+records a current session (posh: `picker::set_current`, which every attach
+entry point passes through) — and never again for the life of the process:
+a later attach, re-dial, or FDR 0012 in-place re-home refreshes the response
+but does not rebind. A process that only lists or queries (`posh list`,
+`posh status`, `ph` completion) MUST NOT bind: it has no history, and a
+listing process therefore never lists itself. The pair is removed when the
+process exits.
+
+The `viewports` directory MUST be validated like every socket directory
+(github #7): the base a real, self-owned directory; the leaf created 0700,
+private and self-owned, never followed through a symlink. A validation
+failure is a bind failure.
+
+#### 6.2 Response
+
+The response is one or more lines, each a record whose first word is its
+kind, followed by space-separated `key=value` fields in the order given.
+Unknown keys and unknown record kinds MUST be ignored.
+
+    viewport pid=<pid> current=<target|-> kind=<kind> anonymous_create=<0|1>
+    stack depth=<n> target=<target> kind=<kind>
+    overlay kind=<palette|picker|leave> over=<target|->
+
+Exactly one `viewport` line, first; then one `stack` line per FDR 0016 stack
+entry, bottom first, `depth` counting from 1 (the entry *Back* would return
+to is the last one); then one `overlay` line per visible system overlay,
+oldest first.
+
+`viewport`:
+
+| field | value |
+|---|---|
+| `pid` | the viewport's pid, decimal — the same as the socket name |
+| `current` | the target of the session the viewport is attached to, as it was dialed (`box:dev`, `:s-1`); `-` when no attach is in progress |
+| `kind` | the current session's **effective kind**, §6.3: `anonymous`, `named`, `system`, or `unknown` |
+| `anonymous_create` | `1` when the anonymous-create fallback (§6.3) is armed for the current attach, `0` otherwise |
+
+`stack`:
+
+| field | value |
+|---|---|
+| `depth` | the entry's position, 1 = the bottom of the stack |
+| `target` | the session the viewport switched away from, as it was dialed |
+| `kind` | the effective kind that session had when it was pushed (§6.3) |
+
+`overlay`:
+
+| field | value |
+|---|---|
+| `kind` | `palette` (the Commands palette, or a dialog it hosts), `picker` (the session picker, in-session or the standalone `ph` chooser), or `leave` (reserved for the leave prompt) |
+| `over` | the target the view was opened over; `-` for a view with no attach beneath it (the standalone chooser) |
+
+The kind values are the `SESSION_KIND` names of RFC 0001 id 20: `unknown`,
+`anonymous`, `named`, `system`.
+
+**Flattening.** A target is a session name a user chose, and a session name
+may legally contain a space, a tab, or a line break. A writer MUST replace
+every tab, newline, and carriage return in a value with a single space; it
+MUST NOT quote or escape values (this is deliberately not §4.2's quoting
+rule: a viewport target never contains `=`, and only a line break could
+break the one-record-per-line grammar). A consumer MUST therefore parse a
+line by locating each ` <key>=` prefix and MUST NOT assume a value has no
+spaces; a value runs to the next ` <known-key>=` or the end of the line.
+
+**Refresh.** The response MUST reflect the viewport's state at the time of
+the connection: it is rebuilt on every stack push and pop, on every change
+to the current session or its effective kind (an attach, a re-dial, a
+re-home, a `SESSION_KIND` entry arriving on a frame), and on every overlay
+open and close.
+
+#### 6.3 The effective kind
+
+The `kind` on the `viewport` line, and the `kind` a stack entry records when
+it is pushed, is the **effective** kind:
+
+1. the kind the session's daemon reported (RFC 0001 id 20, riding the first
+   activity-bearing frame — RFC 0013 §5; or the `Tag::Info` tail on a local
+   attach), if it reported one; else
+2. `anonymous` when this viewport itself created the session as an anonymous
+   session (a `:+` / picker create-new dispatch) and the daemon predates the
+   kind — the one case where the viewport's knowledge overrides the daemon's,
+   since such a create is anonymous by construction; else
+3. `unknown`.
+
+`anonymous_create` shows whether rule 2 is armed for the current attach, so
+a reader can tell an `anonymous` the daemon said from one the viewport
+inferred. A reported kind is never downgraded: an origin that later stops
+saying does not unsay.
+
+#### 6.4 Reaping and `posh status --viewport`
+
+A viewport that crashes leaves its pair behind. Both the bind (§6.1) and
+`posh status --viewport` MUST first reap: every `<pid>.status.pid` under the
+directory whose pid is not a live process (`kill(pid, 0)` → `ESRCH`) has
+its record and socket unlinked. A live pid's files are never touched, so a
+socket that answers nothing while its pid lives reads as `stale` per §4.1,
+not as absent.
+
+`posh status --viewport <pid>` reads and prints that viewport's response;
+it MUST fail with a one-line error when the socket is absent (no such
+viewport, or one that predates this section). `posh status --viewport` with
+no pid reaps and then prints the live viewport pids, one per line, ascending.
+
+#### 6.5 Environment gate
+
+`POSH_VIEWPORT_STATUS` set to `0`, `off`, `false`, or `no` (case-insensitive)
+makes a viewport skip the bind entirely — no directory is created, no record
+written. The stack and the overlays are unaffected: the socket is the only
+thing the gate removes.
+
+### 7. The double-end visibility rule
 
 Every introspectable axis MUST be declared exactly once, as a field on one of
 two structs in `posh-proto`: `ClientIntrospection` (the decoded form of
@@ -330,7 +469,7 @@ axis SHOULD state, in its Interface section, which field carries it.
 
 The 2026-08-25 sweep of local (session daemon + local-attach client) versus
 remote (roaming server/client, relay, mux) behavior found these introspection
-gaps; §4 and §6 are their consolidation. Feature-parity gaps outside
+gaps; §4 and §7 are their consolidation. Feature-parity gaps outside
 introspection (echo prediction, resync, scrollback v2, agent forwarding on
 local-origin sessions, sizing arbitration — the #87/#53/#137 class) are tracked
 separately and are out of this document's scope; the remaining untracked
@@ -338,7 +477,7 @@ local/remote divergences the same sweep found are posh#171.
 
 | Axis | Local today | Remote today | Consolidated by |
 |---|---|---|---|
-| `SIGUSR2` transport dump | none under `session/` | `remote/diag.rs` client, server, mux daemon (FDR 0007) | §4.1 (daemon answers on the socket), §6 (all dumps render one struct) |
+| `SIGUSR2` transport dump | none under `session/` | `remote/diag.rs` client, server, mux daemon (FDR 0007) | §4.1 (daemon answers on the socket), §7 (all dumps render one struct) |
 | Status socket | daemon answers only the `posh list` IPC reply | mux `agent/mux-<id>.status.sock` (RFC 0013 §4); Arch-A server none | §4.1 (`<session>.status.sock` and `remote/<pid>.status.sock`, one response) |
 | Client-state visibility | client has no predictor, sends nothing | client holds everything, sends nothing | §1–§3 (`echo_model` = 0 for a predictor-less client is still a report) |
 | Periodic `[stats]` log records | local client honors `POSH_DEBUG_LOG` but emits no transport records | full periodic records + `#wedge` breadcrumbs | not consolidated here — posh#171 |
@@ -352,7 +491,11 @@ ride the AEAD-sealed connection (RFC 0001) or the owner-only session socket.
 host under the same uid. The status socket inherits the session directory's
 owner-only permissions; it exposes nothing a `SIGUSR2` dump does not already
 write to a per-pid log, but it does so without a signal, so it MUST NOT be
-bound world-readable.
+bound world-readable. The viewport status socket (§6) lives under the same
+owner-only directory rules as the session and `remote/` directories
+(validated, 0700, never through a symlink), and exposes only the viewport's
+own history — the targets it dialed and the views it is showing — never
+another process's state or a session's content.
 
 No field is trusted for behavior (§3): a malformed or adversarial payload from
 an authenticated peer affects only what a status reader sees. Decoders are
@@ -387,7 +530,8 @@ tests for the same rows are normative. The bats lane uses binary injection via
 | §4.1, socket contract | `introspect-status-sock.bats` | connect → lines → EOF; a dropped-listener socket reads `stale`; bind failure is non-fatal |
 | §4.3, `posh status` inside a session | `introspect-status-sock.bats` | run with `POSH_SESSION` set, no target; run without, expect the one-line error |
 | §5, upstream propagation | `introspect-upstream.bats` | attach inside an attach; the inner status shows the outer client's line indented; a stale outer socket renders `upstream=stale` |
-| §6, coverage test | `cargo test -p posh-proto` | every struct field round-trips and appears in every renderer |
+| §6, viewport status socket | `cargo test -p posh viewport_status` | the response golden (three record kinds, bottom-first stack, flattened line breaks); the first attach binds once and a second does not rebind; overlay open/close and a kind arriving mid-attach refresh the response; shutdown removes the pair; dead pairs are reaped and live ones kept; the env gate creates nothing; a symlinked `viewports` dir is refused (github #7) |
+| §7, coverage test | `cargo test -p posh-proto` | every struct field round-trips and appears in every renderer |
 
 ## Compatibility
 
@@ -417,7 +561,11 @@ Informative:
 
 - [FDR 0006] Optimistic local echo — the echo models, escalation machine, and
   gates §2 reports.
-- [FDR 0007] Transport state dump — the `SIGUSR2` surface §4.3 and §6 bring
+- [FDR 0007] Transport state dump — the `SIGUSR2` surface §4.3 and §7 bring
   under the shared struct.
+- [FDR 0016] Cross-host session switcher — the session stack and the
+  overlays §6 exposes.
+- Session-stack UX design (`docs/plans/2026-09-21-session-stack-ux-design.md`)
+  — §1 the session kind §6.3 reports, §2 the viewport registry §6 specifies.
 - [FDR 0012] Session layer collapse — the feature that subsumes §5.
 - [RFC 0007] §3 — the append-only payload-versioning convention §2.1 adopts.
