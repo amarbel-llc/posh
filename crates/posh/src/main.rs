@@ -1422,7 +1422,15 @@ fn cmd_ssh_session(
                 None => Ok(None),
             };
             match seeded
-                .and_then(|seed| remote::mux::ensure_mux(&dest, Family::Auto, None, &source, seed))
+                .and_then(|seed| {
+                    remote::mux::ensure_mux(remote::mux::EndpointRequest {
+                        dest: dest.clone(),
+                        family: Family::Auto,
+                        port_range: None,
+                        agent_source: source.clone(),
+                        seed,
+                    })
+                })
                 .and_then(|handle| handle.open_session(&target))
             {
                 Ok(transport) => {
@@ -1464,7 +1472,15 @@ fn cmd_ssh_session(
     let (agent_source, mux_ref) = remote::mux::apply_mux_gate(
         remote::mux::mux_selected(),
         resolve_agent_source(forward_flag),
-        |source| remote::mux::ensure_mux(&dest, Family::Auto, None, source, None),
+        |source| {
+            remote::mux::ensure_mux(remote::mux::EndpointRequest {
+                dest: dest.clone(),
+                family: Family::Auto,
+                port_range: None,
+                agent_source: source.to_path_buf(),
+                seed: None,
+            })
+        },
     );
     let opts = remote::sshwrap::SshOptions {
         family: Family::Auto,
@@ -1832,7 +1848,15 @@ fn cmd_ssh(args: &[String], forward: &remote::agent::ForwardFlag) -> Result<()> 
     let (agent_source, mux_ref) = remote::mux::apply_mux_gate(
         remote::mux::mux_selected(),
         resolve_agent_source(forward),
-        |source| remote::mux::ensure_mux(target, family, port_range.as_deref(), source, None),
+        |source| {
+            remote::mux::ensure_mux(remote::mux::EndpointRequest {
+                dest: target.to_string(),
+                family,
+                port_range: port_range.clone(),
+                agent_source: source.to_path_buf(),
+                seed: None,
+            })
+        },
     );
     // posh#161: the endpoint owning forwarding ⇒ the session still gets
     // agent/sock and the bootstrap ssh runs -a (see `SshOptions::agent_export`).

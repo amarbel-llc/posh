@@ -1240,15 +1240,35 @@ pub fn seed_cold_endpoint(
     Ok(Some(SeededEndpoint { host, port, key }))
 }
 
+/// What an endpoint is ensured FOR: the per-invocation facts a daemon
+/// inherits from its spawner. [`ensure_mux`] takes one and hands it to
+/// [`run_daemon`] when it spawns, so the destination, the address shape and
+/// the inherited agent source travel together instead of as a positional
+/// run of five.
+pub struct EndpointRequest {
+    /// The ssh destination (`[user@]host`) — what
+    /// [`sshwrap::run`](crate::remote::sshwrap::run) takes, and what
+    /// [`dest_key`] slugs.
+    pub dest: String,
+    pub family: Family,
+    pub port_range: Option<String>,
+    /// The spawner's FDR 0004-resolved local agent socket, inherited by a
+    /// daemon this request spawns (design doc "Security").
+    pub agent_source: PathBuf,
+    /// posh#198: a bootstrap the foreground attach already ran, consumed by
+    /// the first daemon this request spawns.
+    pub seed: Option<SeededEndpoint>,
+}
+
 /// Returns in the SPAWNER only; the daemon grandchild exits the process.
-pub fn run_daemon(
-    key: &str,
-    dest: &str,
-    family: Family,
-    port_range: Option<String>,
-    agent_source: PathBuf,
-    seed: Option<SeededEndpoint>,
-) -> Result<MuxSpawn> {
+pub fn run_daemon(key: &str, req: EndpointRequest) -> Result<MuxSpawn> {
+    let EndpointRequest {
+        dest,
+        family,
+        port_range,
+        agent_source,
+        seed,
+    } = req;
     let sock = mux_socket_path(key)?;
     let listener = match bind_or_probe(&sock)? {
         MuxBind::ExistingDaemon => return Ok(MuxSpawn::AlreadyRunning),
@@ -1258,7 +1278,7 @@ pub fn run_daemon(
     // picker can enumerate the connected hosts (`live_endpoint_dests`) — the
     // slug key is not reversible. Best-effort: a missing file only drops the
     // host from the all-hosts picker.
-    let _ = std::fs::write(dest_sidecar(&sock), dest);
+    let _ = std::fs::write(dest_sidecar(&sock), &dest);
     if util::double_fork()? {
         drop(listener);
         // Give the grandchild a beat to exist before the spawner connects
@@ -1292,7 +1312,7 @@ pub fn run_daemon(
         // foreground modal already bootstrapped; reconnects bootstrap here.
         let conn = match seed {
             Some(s) => wire_from_report(&s.host, s.port, &s.key, family)?,
-            None => establish_wire(dest, family, port_range.clone())?,
+            None => establish_wire(&dest, family, port_range.clone())?,
         };
         let peer = conn
             .remote()
@@ -1301,7 +1321,7 @@ pub fn run_daemon(
             "info",
             &format!("mux daemon started key={key} dest={dest} peer={peer}"),
         );
-        let mut reestablish = || establish_wire(dest, family, port_range.clone());
+        let mut reestablish = || establish_wire(&dest, family, port_range.clone());
         mux_loop(
             listener,
             conn,
@@ -2341,33 +2361,37 @@ fn variant_key(key: &str) -> String {
 /// socket — and sends `MuxSessionRef`. The returned [`MuxHandle`] must be
 /// held for the invocation's lifetime; dropping it is the unref.
 ///
-/// `agent_source` is the invocation's FDR 0004-resolved local agent socket,
-/// inherited by a daemon this call spawns (design doc "Security"). `seed`
-/// (posh#198, from [`seed_cold_endpoint`]) is consumed by the first daemon
-/// this call spawns, if any; a spawn that loses the bind race leaves the
-/// seeded remote to time out on its own.
-pub fn ensure_mux(
-    dest: &str,
-    family: Family,
-    port_range: Option<&str>,
-    agent_source: &Path,
-    seed: Option<SeededEndpoint>,
-) -> Result<MuxHandle> {
-    let (user, host) = split_dest(dest);
-    let key = dest_key(user, host, family, port_range);
+/// The [`EndpointRequest`]'s `agent_source` is the invocation's FDR
+/// 0004-resolved local agent socket, inherited by a daemon this call spawns
+/// (design doc "Security"). Its `seed` (posh#198, from
+/// [`seed_cold_endpoint`]) is consumed by the first daemon this call spawns,
+/// if any; a spawn that loses the bind race leaves the seeded remote to time
+/// out on its own.
+pub fn ensure_mux(req: EndpointRequest) -> Result<MuxHandle> {
+    let EndpointRequest {
+        dest,
+        family,
+        port_range,
+        agent_source,
+        seed,
+    } = req;
+    let (user, host) = split_dest(&dest);
+    let key = dest_key(user, host, family, port_range.as_deref());
     let dir = mux_dir()?;
     let mut seed = seed;
     let mut spawn = |k: &str| {
         run_daemon(
             k,
-            dest,
-            family,
-            port_range.map(str::to_string),
-            agent_source.to_path_buf(),
-            seed.take(),
+            EndpointRequest {
+                dest: dest.clone(),
+                family,
+                port_range: port_range.clone(),
+                agent_source: agent_source.clone(),
+                seed: seed.take(),
+            },
         )
     };
-    let handle = ensure_mux_conn(&dir, &key, &mut spawn, HELLO_TIMEOUT, agent_source)?;
+    let handle = ensure_mux_conn(&dir, &key, &mut spawn, HELLO_TIMEOUT, &agent_source)?;
     if let Some(theirs) = handle.source_mismatch() {
         eprintln!(
             "posh: mux endpoint {} forwards {}; restart it to change (this \
