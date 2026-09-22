@@ -173,11 +173,16 @@ impl Palette {
     }
 
     /// Send a `ui.show` and remember its id (see `pending_show`). The view
-    /// is on screen from here: recorded as a `picker` overlay for the
-    /// session picker, `palette` for everything else (the command list, a
-    /// dialog, the leave question).
+    /// is on screen from here, recorded as an overlay of its own kind (the
+    /// design's "system session", RFC 0014 §6): `picker` for the session
+    /// picker, `notice` for a pop notice, `palette` for everything else (the
+    /// command list, a dialog).
     fn show(&mut self, params: Value) {
-        let kind = if params.get("view").and_then(Value::as_str) == Some("picker") { "picker" } else { "palette" };
+        let kind = match params.get("view").and_then(Value::as_str) {
+            Some("picker") => "picker",
+            Some("notice") => "notice",
+            _ => "palette",
+        };
         let id = self.send_request("ui.show", params);
         self.pending_show = Some(id);
         self.set_visible(Some(kind));
@@ -214,6 +219,15 @@ impl Palette {
     /// and `empty` the text shown when there are no rows.
     pub fn show_picker(&mut self, title: &str, rows: Value, empty: &str) {
         self.show(json!({ "view": "picker", "title": title, "rows": rows, "empty": empty }));
+    }
+
+    /// Raise the must-dismiss pop notice (RFC 0005 §3.6 `ui.show`
+    /// view="notice", FDR 0016): `stack` is the `[{target, state, detail}]`
+    /// entry list `palette_view::notice_stack` builds. Its only outcome is
+    /// `ui.cancelled`; a renderer that predates it answers with an error,
+    /// surfaced as [`PaletteEvent::ViewRejected`] for the caller's banner.
+    pub fn show_notice(&mut self, title: &str, stack: Value) {
+        self.show(json!({ "view": "notice", "title": title, "stack": stack }));
     }
 
     /// Drain the renderer PTY into the emulated screen. Returns whether the
@@ -778,6 +792,37 @@ mod tests {
         unsafe { libc::close(peer) };
     }
 
+    // show_notice summons a `notice` view carrying the stack entries (RFC 0005
+    // §3.6), recorded as a `notice` overlay — its own kind on the viewport
+    // status socket, not a `palette` (the design's "system session").
+    #[test]
+    fn show_notice_sends_notice_view_as_its_own_overlay() {
+        let (mut p, peer) = palette_with_ctrl();
+        p.show_notice(
+            "Session ended",
+            json!([
+                { "target": "box:top", "state": "popped", "detail": "ended (exit 1)" },
+                { "target": "box:dev", "state": "current" },
+            ]),
+        );
+        assert!(p.is_open());
+        assert_eq!(p.overlay, Some("notice"));
+        let mut buf = [0u8; 512];
+        let n = unsafe { libc::read(peer, buf.as_mut_ptr() as *mut libc::c_void, buf.len()) };
+        let line = std::str::from_utf8(&buf[..n.max(0) as usize]).unwrap();
+        let v: Value = serde_json::from_str(line.trim()).unwrap();
+        assert_eq!(v["method"], "ui.show");
+        assert_eq!(v["params"]["view"], "notice");
+        assert_eq!(v["params"]["title"], "Session ended");
+        assert_eq!(v["params"]["stack"][0]["state"], "popped");
+        assert_eq!(v["params"]["stack"][1]["target"], "box:dev");
+        // Dismissal is the only outcome, and it takes the overlay down.
+        write_line(peer, r#"{"jsonrpc":"2.0","method":"ui.cancelled"}"#);
+        assert!(matches!(p.poll_events(), PaletteEvent::Cancelled));
+        assert!(!p.is_open());
+        unsafe { libc::close(peer) };
+    }
+
     // The REAL renderer draws a picker as an aligned table and answers a
     // selection with the row's action (RFC 0005 §3.5). Skipped without the
     // binary, like the other real_binary tests.
@@ -826,6 +871,73 @@ mod tests {
         let (method, params) = got.expect("an action came back");
         assert_eq!(method, "session.switch");
         assert_eq!(params["target"], "dev:s-2");
+        p.shutdown();
+    }
+
+    // The REAL renderer draws the pop notice `palette_view` builds (RFC 0005
+    // §3.6) — the one test where the Rust producer and the Go renderer meet —
+    // one entry per line in the given order, ignores a key it does not bind
+    // (the notice appears unprompted, so a keystroke meant for the session
+    // must not dismiss it), and reports dismissal as `ui.cancelled`.
+    #[test]
+    fn real_binary_notice_round_trip() {
+        use crate::picker::{AttachEnd, PopNotice, StackEntry, StackView};
+        use crate::remote::palette_view::{notice_stack, notice_title};
+        use posh_proto::caps::SessionKind;
+        if palette_binary().is_none() {
+            eprintln!("skip: posh-palette not found (set POSH_PALETTE to run)");
+            return;
+        }
+        let named = |t: &str| StackEntry { target: t.into(), kind: SessionKind::Named };
+        let notice = PopNotice {
+            ended: AttachEnd::Ended { code: 3, cause: None },
+            gone: vec![named("box:top"), named("box:mid")],
+            view: StackView { below: vec![named("box:low")], current: Some(named("box:dev")) },
+        };
+        let mut p = Palette::spawn(24, 100).expect("spawn + handshake");
+        p.show_notice(&notice_title(&notice), notice_stack(&notice));
+        let deadline = Instant::now() + Duration::from_secs(3);
+        while Instant::now() < deadline && !p.rterm.dump_text().contains("box:low") {
+            poll_readable(p.master, Duration::from_millis(50));
+            p.pump();
+            // The deployed binary may predate the view (RFC 0005 §3.6): skip
+            // on skew. Run against a fresh build with `just debug-palette-e2e`.
+            poll_readable(p.ctrl, Duration::from_millis(50));
+            if matches!(p.poll_events(), PaletteEvent::ViewRejected) {
+                eprintln!("skip: this posh-palette predates the notice view");
+                p.shutdown();
+                return;
+            }
+        }
+        let text = p.rterm.dump_text();
+        let at = |needle: &str| text.find(needle).unwrap_or_else(|| panic!("{needle} missing:\n{text}"));
+        assert!(text.contains("2 sessions gone"), "the heading counts the chain:\n{text}");
+        assert!(at("box:top") < at("box:mid"), "most recently entered first:\n{text}");
+        assert!(at("box:mid") < at("box:dev") && at("box:dev") < at("box:low"), "{text}");
+        assert!(text.contains("ended (exit 3)") && text.contains("gone"), "details:\n{text}");
+
+        // An unbound key is NOT an acknowledgement.
+        p.forward_input(b"x");
+        let settle = Instant::now() + Duration::from_millis(400);
+        while Instant::now() < settle {
+            poll_readable(p.ctrl, Duration::from_millis(50));
+            assert!(
+                matches!(p.poll_events(), PaletteEvent::None),
+                "an unbound key must not dismiss the notice"
+            );
+        }
+        assert!(p.is_open());
+
+        // A dismiss key is, and it is the notice's only outcome.
+        p.forward_input(b"q");
+        let mut cancelled = false;
+        let deadline = Instant::now() + Duration::from_secs(3);
+        while Instant::now() < deadline && !cancelled {
+            poll_readable(p.ctrl, Duration::from_millis(100));
+            cancelled = matches!(p.poll_events(), PaletteEvent::Cancelled);
+        }
+        assert!(cancelled, "dismissal is reported as ui.cancelled");
+        assert!(!p.is_open());
         p.shutdown();
     }
 

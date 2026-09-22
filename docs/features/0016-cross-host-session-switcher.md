@@ -141,7 +141,12 @@ RFC 0005 §3.6) drawing the stack: what left it struck through, an arrow on
 where the viewport now sits, the rest dim. It is dismissed with esc / q /
 enter and by nothing else — it appears at a moment the user did not choose,
 so a keystroke meant for the shell underneath is ignored rather than
-swallowed as an acknowledgement.
+swallowed as an acknowledgement. It registers on the viewport status socket
+as a `notice` overlay (RFC 0014 §6) while it is up, like the palette and the
+picker. Where it cannot be drawn — no `posh-palette`, one that predates the
+view, or a local session that never framed — it degrades to its one-line
+form: the roaming client's banner, or a stderr line from the local client
+once the terminal is restored.
 
 If the pop's own target turns out to be gone, the front door **keeps
 popping**, and the whole chain is reported in that ONE notice with each
@@ -154,9 +159,10 @@ lost one is named on one stderr line — no more silent drop to the prompt.
 cause — the shell exited, `posh kill`, a signal to the daemon, a daemon
 failure — as an IPC record ahead of the exit status, and the relay / M2
 bridge carry it to the roaming client as `EXIT_CAUSE` (RFC 0001 id 19) on
-the shutdown frame, so the notice reads `session box:dev killed (posh kill)
-— back to flac:s-2` or `… ended (daemon got SIGTERM) …`; a session killed
-from outside with no stack to pop prints that same phrase on stderr. A
+the shutdown frame, so the struck entry in the notice reads `killed (posh
+kill)` or `ended (daemon got SIGTERM)` (the one-line form: `session box:dev
+killed (posh kill) — back to flac:s-2`); a session killed from outside with
+no stack to pop prints that same phrase on stderr. A
 daemon that predates the record leaves the cause unknown and the notice
 falls back to the exit status. Still a follow-on: the picker's handling of a
 session vanishing while it is open, and a next step with an empty stack

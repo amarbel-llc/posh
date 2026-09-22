@@ -1,13 +1,13 @@
 //! Presentation of the FDR 0016 session stack for the RFC 0005 renderer —
-//! the ONLY module that turns a [`picker::StackView`] into a heading string
-//! or a palette row. Schema (`picker`) and presentation (here) are split on
-//! purpose (design 2026-09-21 §3): the palette redesign edits this file, and
-//! no stack mutation, wire, or client-loop code refers to a row label or a
-//! title string.
+//! the ONLY module that turns a [`picker::StackView`] into a heading string,
+//! a palette row, or a `notice` entry list. Schema (`picker`) and
+//! presentation (here) are split on purpose (design 2026-09-21 §3): the
+//! palette redesign edits this file, and no stack mutation, wire, or
+//! client-loop code refers to a row label or a title string.
 
 use serde_json::{json, Value};
 
-use crate::picker::{self, StackView};
+use crate::picker::{self, PopNotice, StackView};
 
 /// Budget for a heading: posh-palette's panel is 46 columns with 2 of
 /// padding and word-wraps beyond it.
@@ -66,10 +66,10 @@ fn clamp_tail(s: &str, max: usize) -> String {
 /// opened it.
 pub fn commands_title(view: &StackView, prefix: Option<&str>) -> String {
     let prefix = prefix.unwrap_or(COMMANDS);
-    let Some(top) = view.top.as_ref() else {
+    let Some(top) = view.top() else {
         return prefix.to_string();
     };
-    let rest = match view.depth.saturating_sub(1) {
+    let rest = match view.depth().saturating_sub(1) {
         0 => String::new(),
         n => format!(" +{n}"),
     };
@@ -100,7 +100,7 @@ pub fn commands_title(view: &StackView, prefix: Option<&str>) -> String {
 /// Enter is "go back". The top is spelled as the heading spells it
 /// ([`abbreviated`]; rows wrap, so no width clamp).
 pub fn back_row(view: &StackView) -> Option<Value> {
-    let top = view.top.as_ref()?;
+    let top = view.top()?;
     Some(json!({ "name": format!("Back to {}", abbreviated(&top.target)), "action": { "method": "session.pop" } }))
 }
 
@@ -112,11 +112,44 @@ pub fn no_back_notice() -> &'static str {
 /// The picker heading: [`picker::TITLE`], plus how deep the session stack
 /// is when a *Back* would return somewhere (`sessions · 2 to go back`).
 pub fn picker_title(view: &StackView) -> String {
-    match view.depth {
+    match view.depth() {
         0 => picker::TITLE.to_string(),
         1 => format!("{} \u{b7} 1 to go back", picker::TITLE),
         n => format!("{} \u{b7} {n} to go back", picker::TITLE),
     }
+}
+
+/// The `notice` heading: what happened to the one session — `ended`, or
+/// `lost` for an attach that dropped while the session may still be running
+/// — or, for a cascade, how many are `gone` (a chain can mix the two).
+pub fn notice_title(notice: &PopNotice) -> String {
+    match notice.gone.len() {
+        0 | 1 if matches!(notice.ended, picker::AttachEnd::Lost(_)) => "Session lost".to_string(),
+        0 | 1 => "Session ended".to_string(),
+        n => format!("{n} sessions gone"),
+    }
+}
+
+/// The RFC 0005 §3.6 `stack` for an automatic pop, most recently entered
+/// first: each session that left (`popped` — the one that ended says how,
+/// every later one was found already `gone`), where the viewport now sits
+/// (`current`), then everything still under it (`below`). Targets use the
+/// heading's one spelling ([`abbreviated`]).
+pub fn notice_stack(notice: &PopNotice) -> Value {
+    let entry = |target: &str, state: &str, detail: Option<String>| {
+        let mut e = json!({ "target": abbreviated(target), "state": state });
+        if let Some(detail) = detail {
+            e["detail"] = json!(detail);
+        }
+        e
+    };
+    let popped = notice.gone.iter().enumerate().map(|(i, e)| {
+        let detail = if i == 0 { notice.ended.label() } else { Some("gone".to_string()) };
+        entry(&e.target, "popped", detail)
+    });
+    let current = notice.view.current.iter().map(|e| entry(&e.target, "current", None));
+    let below = notice.view.below.iter().map(|e| entry(&e.target, "below", None));
+    Value::Array(popped.chain(current).chain(below).collect())
 }
 
 #[cfg(test)]
@@ -129,8 +162,11 @@ mod tests {
         StackEntry { target: t.into(), kind: k }
     }
 
+    /// A stack `depth` deep whose top is `top`; the entries under it are
+    /// placeholders, since the headings only name the top.
     fn view(top: Option<StackEntry>, depth: usize) -> StackView {
-        StackView { top, depth, current: None }
+        let under = (1..depth).map(|n| entry(&format!(":under-{n}"), SessionKind::Named));
+        StackView { below: top.into_iter().chain(under).collect(), current: None }
     }
 
     const RTT: &str = "rtt 12ms \u{b7} echo: always";
@@ -254,5 +290,81 @@ mod tests {
         let row = back_row(&view(Some(entry(":prev", SessionKind::Named)), 1)).unwrap();
         assert_eq!(row["action"]["method"], "session.pop");
         assert!(row["action"].get("params").is_none(), "{row}");
+    }
+
+    fn pop_notice(gone: &[&str], current: &str, below: &[&str]) -> PopNotice {
+        let named = |t: &&str| entry(t, SessionKind::Named);
+        PopNotice {
+            ended: picker::AttachEnd::Ended { code: 1, cause: None },
+            gone: gone.iter().map(named).collect(),
+            view: StackView {
+                below: below.iter().map(named).collect(),
+                current: Some(named(&current)),
+            },
+        }
+    }
+
+    /// The §3.6 `stack`, most recently entered first: the session that ended
+    /// (saying how), where the viewport now is, then what is still under it.
+    #[test]
+    fn a_pop_notice_lists_the_whole_stack_in_order() {
+        let n = pop_notice(&["box:top"], "box:mid", &["box:low", "box:bottom"]);
+        assert_eq!(
+            notice_stack(&n),
+            json!([
+                { "target": "box:top", "state": "popped", "detail": "ended (exit 1)" },
+                { "target": "box:mid", "state": "current" },
+                { "target": "box:low", "state": "below" },
+                { "target": "box:bottom", "state": "below" },
+            ])
+        );
+        assert_eq!(notice_title(&n), "Session ended");
+    }
+
+    /// A cascade is ONE notice: the session that ended says how, and every
+    /// stack entry found dead on the way down says `gone`.
+    #[test]
+    fn a_cascade_notice_marks_each_dead_entry_gone() {
+        let n = pop_notice(&["box:top", "box:mid"], "box:bottom", &[]);
+        let stack = notice_stack(&n);
+        let states: Vec<_> = stack
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|e| (e["target"].as_str().unwrap(), e["state"].as_str().unwrap(), e.get("detail").and_then(Value::as_str)))
+            .collect();
+        assert_eq!(
+            states,
+            [
+                ("box:top", "popped", Some("ended (exit 1)")),
+                ("box:mid", "popped", Some("gone")),
+                ("box:bottom", "current", None),
+            ]
+        );
+        assert_eq!(notice_title(&n), "2 sessions gone");
+    }
+
+    /// A LOST session may still be running — only the attach to it dropped —
+    /// so its heading must not say it ended.
+    #[test]
+    fn a_lost_session_is_not_announced_as_ended() {
+        let mut n = pop_notice(&["box:top"], "box:dev", &[]);
+        n.ended = picker::AttachEnd::Lost("mux channel closed".into());
+        assert_eq!(notice_title(&n), "Session lost");
+        assert_eq!(notice_stack(&n)[0]["detail"], "lost (mux channel closed)");
+    }
+
+    /// Targets take the heading's one spelling: a UUID name by its first 8
+    /// digits, the host by its first label.
+    #[test]
+    fn a_pop_notice_abbreviates_targets_like_the_heading() {
+        let n = pop_notice(
+            &["me@box.example.com:ff9fe216-9652-4e23-805c-6f4dd5ce7eca"],
+            "me@box.example.com:dev",
+            &[],
+        );
+        let stack = notice_stack(&n);
+        assert_eq!(stack[0]["target"], "box:ff9fe216");
+        assert_eq!(stack[1]["target"], "box:dev");
     }
 }

@@ -83,10 +83,6 @@ fn run() -> Result<()> {
                     }
                 }
             }
-            // The RFC 0005 §3.6 notice is `palette_view`'s to draw; the
-            // one-line banner the clients print is already stored for the
-            // next attach to take.
-            picker::Effect::ShowPopNotice(_) => {}
             picker::Effect::RefreshStatus => viewport_status::refresh_now(),
             picker::Effect::Exit { end, skipped } => {
                 if !skipped.is_empty() {
@@ -113,7 +109,7 @@ fn run() -> Result<()> {
 /// that ended before the caller says why the fallback failed.
 fn report_pop_notice() {
     if let Some(n) = picker::take_pending_notice() {
-        eprintln!("posh: {n}");
+        eprintln!("posh: {}", n.banner());
     }
 }
 

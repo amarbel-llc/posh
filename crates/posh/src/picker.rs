@@ -147,16 +147,32 @@ pub struct StackEntry {
     pub kind: SessionKind,
 }
 
-/// The stack as a VIEW MODEL (design 2026-09-21 §3): the session *Back*
-/// returns to, how many are stacked, and the attach in progress. The only
-/// producer; `crate::remote::palette_view` is the only consumer that turns
-/// it into RFC 0005 JSON or a heading — so the palette redesign changes that
-/// module and nothing here.
+/// The stack as a VIEW MODEL (design 2026-09-21 §3): the attach in progress
+/// and every session beneath it. The only producer;
+/// `crate::remote::palette_view` is the only consumer that turns it into
+/// RFC 0005 JSON or a heading — so the palette redesign changes that module
+/// and nothing here.
+///
+/// The whole stack rather than a top and a count: the §3.6 notice names
+/// every entry, and a separate `top`/`depth` could disagree with it.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct StackView {
-    pub top: Option<StackEntry>,
-    pub depth: usize,
+    /// Sessions *Back* returns through, MOST RECENT FIRST — the order the
+    /// notice lists them and the reverse of the internal push order.
+    pub below: Vec<StackEntry>,
     pub current: Option<StackEntry>,
+}
+
+impl StackView {
+    /// The session *Back* returns to.
+    pub fn top(&self) -> Option<&StackEntry> {
+        self.below.first()
+    }
+
+    /// How many sessions *Back* can return through.
+    pub fn depth(&self) -> usize {
+        self.below.len()
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -213,7 +229,8 @@ struct Cascade {
     /// entry turns out to be dead.
     original: AttachEnd,
     /// The session that ended, then each stack entry whose re-dial failed,
-    /// oldest first.
+    /// in the order they were found — which is most recently entered first,
+    /// the order [`PopNotice::gone`] hands on.
     gone: Vec<StackEntry>,
 }
 
@@ -235,8 +252,12 @@ pub struct ViewportState {
     /// Live overlays, oldest first. VISIBLE state: a renderer that is
     /// spawned but hidden has no entry.
     overlays: Vec<Overlay>,
-    /// One-line banner for the NEXT attach to print, set when a pop landed.
-    notice: Option<String>,
+    /// Why the viewport is here, for the NEXT attach to show once it is
+    /// established — set when an automatic pop landed, taken by
+    /// [`take_pending_notice`]. State rather than an effect: the attach that
+    /// shows it has not begun when the pop lands, so something has to hold
+    /// it across the re-dial, and this is the one place both clients read.
+    notice: Option<PopNotice>,
 }
 
 impl ViewportState {
@@ -288,9 +309,6 @@ pub enum Event {
 pub enum Effect {
     /// Attach to this target (the front door's re-dial loop).
     Dial { target: String },
-    /// The viewport was returned here automatically: show the RFC 0005 §3.6
-    /// `notice` view. `palette_view` owns turning it into `ui.show` JSON.
-    ShowPopNotice(PopNotice),
     /// Leave posh with this verdict. `skipped` is non-empty only when a
     /// cascade exhausted the stack: those sessions died unobserved and this
     /// is the only record the user gets of them.
@@ -302,20 +320,28 @@ pub enum Effect {
     RefreshStatus,
 }
 
-/// What an automatic pop has to say for itself: the whole chain that died,
-/// and where the viewport landed. Several `gone` entries is the CASCADE case
-/// — reported in ONE notice rather than one per step, because that list is
-/// the only record of sessions that ended unobserved.
+/// What an automatic pop has to say for itself: why it started, the whole
+/// chain that died, and where the viewport landed. Several `gone` entries is
+/// the CASCADE case — reported in ONE notice rather than one per step,
+/// because that list is the only record of sessions that ended unobserved.
+/// `palette_view` turns it into the RFC 0005 §3.6 `notice` view.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct PopNotice {
+    /// How the session the viewport was in ended — `gone[0]`'s story. Every
+    /// later `gone` entry was found already dead while popping.
+    pub ended: AttachEnd,
+    /// The session that ended, then each stack entry whose re-dial failed:
+    /// most recently entered first, the order the notice lists them.
     pub gone: Vec<StackEntry>,
     pub view: StackView,
 }
 
 impl PopNotice {
-    /// The one-line banner the clients print until the §3.6 notice view
-    /// carries it: `session flac:s-1 ended (exit 1) — back to flac:dev`.
-    fn banner(&self, why: &str) -> String {
+    /// The one-line form, for a client with no renderer (or one that
+    /// predates the §3.6 view): `session flac:s-1 ended (exit 1) — back to
+    /// flac:dev`.
+    pub fn banner(&self) -> String {
+        let why = self.ended.label().unwrap_or_else(|| "ended".to_string());
         let left = self
             .gone
             .iter()
@@ -376,17 +402,14 @@ pub(crate) fn apply(state: &mut ViewportState, event: Event) -> Vec<Effect> {
                 kind: SessionKind::Unknown,
                 anonymous_create: std::mem::take(&mut state.anonymous_create),
             });
-            let mut effects = Vec::new();
             if let Some(cascade) = state.cascade.take() {
-                let notice = PopNotice {
+                state.notice = Some(PopNotice {
+                    ended: cascade.original,
                     gone: cascade.gone,
                     view: view_of(state),
-                };
-                state.notice = cascade.original.label().map(|why| notice.banner(&why));
-                effects.push(Effect::ShowPopNotice(notice));
+                });
             }
-            effects.push(Effect::RefreshStatus);
-            effects
+            vec![Effect::RefreshStatus]
         }
         Event::KindReported(kind) => {
             // A known kind is never downgraded to `Unknown`: an origin that
@@ -530,8 +553,7 @@ fn effective_kind(cur: &Current) -> SessionKind {
 
 fn view_of(state: &ViewportState) -> StackView {
     StackView {
-        top: state.stack.last().cloned(),
-        depth: state.stack.len(),
+        below: state.stack.iter().rev().cloned().collect(),
         current: current_entry_of(state),
     }
 }
@@ -573,7 +595,9 @@ pub fn stack_view() -> StackView {
     with_state(view_of)
 }
 
-pub fn take_pending_notice() -> Option<String> {
+/// The notice an automatic pop left for this attach, if any — taken once,
+/// by whichever client establishes first ([`ViewportState::notice`]).
+pub fn take_pending_notice() -> Option<PopNotice> {
     VIEWPORT.lock().unwrap_or_else(|e| e.into_inner()).notice.take()
 }
 
@@ -693,11 +717,10 @@ pub(crate) fn current_kind() -> SessionKind {
 
 /// A renderer view the viewport is showing OVER its session (RFC 0014 §6
 /// `overlay` line). `kind` is `palette` (the Commands palette, or a dialog
-/// it hosts) or `picker` (the session picker — in-session `session.list`,
-/// or the standalone `ph` chooser); `notice` is reserved for the
-/// must-dismiss pop modal (RFC 0005 §3.6), which nothing drives yet.
-/// `over` is the attach the view was opened over (`None` for the
-/// standalone chooser).
+/// it hosts), `picker` (the session picker — in-session `session.list`,
+/// or the standalone `ph` chooser), or `notice` (the must-dismiss pop
+/// modal, RFC 0005 §3.6). `over` is the attach the view was opened over
+/// (`None` for the standalone chooser).
 ///
 /// The vocabulary is a `&'static str`, not an enum, so nothing here
 /// constrains it — RFC 0014 §6's table is where the values are agreed, and
@@ -837,15 +860,19 @@ pub(crate) fn switch_test_guard() -> std::sync::MutexGuard<'static, ()> {
 /// clients and `palette_view` — pure, no statics touched.
 #[cfg(test)]
 pub(crate) fn no_stack() -> StackView {
-    StackView { top: None, depth: 0, current: None }
+    StackView { below: Vec::new(), current: None }
 }
 
-/// A stack view whose top is `target` (a named session), `depth` deep.
+/// A stack view whose top is `target` (a named session), `depth` deep; the
+/// entries under it are placeholders named `:under-N`.
 #[cfg(test)]
 pub(crate) fn stacked(target: &str, depth: usize) -> StackView {
+    let entry = |t: String| StackEntry { target: t, kind: SessionKind::Named };
     StackView {
-        top: Some(StackEntry { target: target.into(), kind: SessionKind::Named }),
-        depth,
+        below: std::iter::once(entry(target.into()))
+            .chain((1..depth).map(|n| entry(format!(":under-{n}"))))
+            .take(depth)
+            .collect(),
         current: None,
     }
 }
@@ -1058,14 +1085,16 @@ mod tests {
             apply(&mut s, Event::AttachReturned),
             [Effect::Dial { target: ":below".into() }]
         );
-        let effects = apply(&mut s, Event::Entered { target: ":below".into() });
-        let notice = match &effects[0] {
-            Effect::ShowPopNotice(n) => n.clone(),
-            other => panic!("expected a pop notice, got {other:?}"),
-        };
+        assert_eq!(
+            apply(&mut s, Event::Entered { target: ":below".into() }),
+            [Effect::RefreshStatus],
+            "the notice is held for the next attach, not an effect of arriving"
+        );
+        let notice = s.notice.take().expect("a notice for the next attach");
+        assert_eq!(notice.ended, ended(1));
         assert_eq!(targets(&notice.gone), [":top"]);
         assert_eq!(notice.view.current.as_ref().map(|e| e.target.as_str()), Some(":below"));
-        let banner = s.notice.clone().expect("a banner for the next attach");
+        let banner = notice.banner();
         assert!(banner.contains("ended (exit 1)"), "{banner}");
         assert!(banner.contains("back to"), "{banner}");
 
@@ -1133,11 +1162,9 @@ mod tests {
         );
         assert_eq!(targets(&s.stack), [":bottom"], "the dead entry came off");
         // `:bottom` answers: ONE notice naming the whole chain.
-        let effects = apply(&mut s, Event::Entered { target: ":bottom".into() });
-        let notice = match &effects[0] {
-            Effect::ShowPopNotice(n) => n.clone(),
-            other => panic!("expected a pop notice, got {other:?}"),
-        };
+        apply(&mut s, Event::Entered { target: ":bottom".into() });
+        let notice = s.notice.take().expect("a notice for the next attach");
+        assert_eq!(notice.ended, ended(1), "the chain's story is the first end");
         assert_eq!(
             targets(&notice.gone),
             [":top", ":middle"],
@@ -1261,20 +1288,19 @@ mod tests {
         assert_eq!(snapshot_of(&ViewportState::new()).current, None);
     }
 
-    /// The view model reads the three stack facts in one go.
+    /// The view model carries the WHOLE stack, most recent first — `top` and
+    /// `depth` are read off it, so they cannot disagree with the entries.
     #[test]
-    fn the_stack_view_reports_top_depth_and_current() {
-        assert_eq!(
-            view_of(&ViewportState::new()),
-            StackView { top: None, depth: 0, current: None }
-        );
+    fn the_stack_view_lists_every_entry_most_recent_first() {
+        assert_eq!(view_of(&ViewportState::new()), no_stack());
         let s = st(
             &[(":a", SessionKind::Anonymous), (":b", SessionKind::Named)],
             Some(":here"),
         );
         let v = view_of(&s);
-        assert_eq!(v.depth, 2);
-        assert_eq!(v.top.as_ref().map(|e| e.target.as_str()), Some(":b"));
+        assert_eq!(targets(&v.below), [":b", ":a"], "pushed :a then :b, so :b is on top");
+        assert_eq!(v.depth(), 2);
+        assert_eq!(v.top().map(|e| e.target.as_str()), Some(":b"));
         assert_eq!(v.current.as_ref().map(|e| e.target.as_str()), Some(":here"));
     }
 
@@ -1307,14 +1333,15 @@ mod tests {
     #[test]
     fn the_pop_banner_names_the_host() {
         let notice = PopNotice {
+            ended: ended(1),
             gone: vec![StackEntry { target: ":s-1".into(), kind: SessionKind::Anonymous }],
             view: StackView {
-                top: None,
-                depth: 0,
+                below: Vec::new(),
                 current: Some(StackEntry { target: ":s-2".into(), kind: SessionKind::Named }),
             },
         };
-        let banner = notice.banner("ended (exit 1)");
+        let banner = notice.banner();
+        assert!(banner.contains(" ended (exit 1) "), "the end phrases itself: {banner}");
         assert!(banner.starts_with("session "), "{banner}");
         assert!(!banner.contains(" :s-1"), "a local target names this machine: {banner}");
         assert!(banner.ends_with(&display_target(":s-2")), "{banner}");

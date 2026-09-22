@@ -1617,6 +1617,10 @@ struct ClientState {
     /// The command-palette overlay renderer (Ctrl-^ p), spawned lazily on first
     /// summon and kept resident; `None` until then or if it can't be launched.
     palette: Option<Palette>,
+    /// The pop notice's one-line banner while its RFC 0005 §3.6 view is up —
+    /// shown instead if the renderer turns out to predate the view, dropped
+    /// once the user dismisses it.
+    pop_notice_banner: Option<String>,
     /// The connect-establishing modal (posh#195): a captured `crap-present`
     /// process whose rendered progress is composited (like the palette) onto the
     /// viewport until the first frame. `Some` from the immediate takeover until
@@ -1788,6 +1792,7 @@ fn client_loop(
         debug_banner: debug_banner_env(),
         banner: DebugBanner::default(),
         palette: None,
+        pop_notice_banner: None,
         establish: None,
         record: None,
         last_reack: None,
@@ -2281,12 +2286,23 @@ fn drive_client(
             if fds[base + 1].revents & libc::POLLIN != 0 {
                 match st.palette.as_mut().map(Palette::poll_events) {
                     Some(PaletteEvent::Action { method, params }) => {
+                        st.pop_notice_banner = None;
                         if dispatch_palette_action(st, raw, &method, &params, now_ms()) {
                             send_now = true;
                         }
                         st.initialized = false; // palette closed -> repaint session
                     }
-                    Some(PaletteEvent::Cancelled) | Some(PaletteEvent::ViewRejected) => {
+                    Some(PaletteEvent::Cancelled) => {
+                        st.pop_notice_banner = None; // acknowledged
+                        st.initialized = false; // palette closed -> repaint session
+                    }
+                    // A renderer that predates the view refused it (RFC 0005
+                    // §3.5/§3.6): if that was the pop notice, degrade to its
+                    // one-line banner.
+                    Some(PaletteEvent::ViewRejected) => {
+                        if let Some(banner) = st.pop_notice_banner.take() {
+                            st.notify.set_message(&banner, false, now_ms());
+                        }
                         st.initialized = false; // palette closed -> repaint session
                     }
                     Some(PaletteEvent::Copy) => {
@@ -2483,15 +2499,40 @@ fn suspend(st: &mut ClientState, raw: &RawMode) {
 }
 
 /// The first authentic frame: the attach is established. Drop the
-/// pre-connect banner and say why an automatic pop brought the viewport here.
+/// pre-connect banner and say why an automatic pop brought the viewport here
+/// — the RFC 0005 §3.6 notice over the restored session, or its one-line
+/// banner when no renderer can draw it.
 fn first_frame(st: &mut ClientState, now: u64) {
     if st.notify.message().starts_with("Nothing received") {
         st.notify.set_message("", false, now);
     }
     if let Some(notice) = crate::picker::take_pending_notice() {
-        util::log_write("switch", &notice);
-        st.notify.set_message(&notice, false, now);
+        let banner = notice.banner();
+        util::log_write("switch", &banner);
+        if show_pop_notice(st, &notice) {
+            st.pop_notice_banner = Some(banner);
+        } else {
+            st.notify.set_message(&banner, false, now);
+        }
     }
+}
+
+/// Raise the must-dismiss pop notice, spawning the renderer if it is not
+/// resident yet. False when no renderer can be launched.
+fn show_pop_notice(st: &mut ClientState, notice: &crate::picker::PopNotice) -> bool {
+    if st.palette.is_none() {
+        st.palette = Palette::spawn(st.rows, st.cols);
+    }
+    let Some(p) = st.palette.as_mut() else {
+        return false;
+    };
+    p.resize(st.rows, st.cols);
+    p.show_notice(
+        &super::palette_view::notice_title(notice),
+        super::palette_view::notice_stack(notice),
+    );
+    st.initialized = false; // repaint to show the overlay
+    true
 }
 
 fn request_shutdown(st: &mut ClientState) {
@@ -5270,6 +5311,7 @@ mod tests {
             debug_banner: false,
             banner: DebugBanner::default(),
             palette: None,
+            pop_notice_banner: None,
             establish: None,
             record: None,
             last_reack: None,

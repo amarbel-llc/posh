@@ -143,16 +143,18 @@ fn run_interactive(stream: UnixStream) -> Result<()> {
     let bracket = crate::terminfo::ca_mode_bracket();
     let enter = enter_seq(&bracket);
     let _ = util::write_fd(STDOUT, &enter);
-    // The local client has no banner, so an automatic pop's "session …
-    // ended — back to …" is logged and printed once the tty is restored.
-    let pop_notice = crate::picker::take_pending_notice();
-    if let Some(n) = pop_notice.as_deref() {
-        util::log_write("switch", n);
+    // An automatic pop's notice: the loop raises it over the first frame
+    // (RFC 0005 §3.6) and takes it. Whatever is left here — no renderer, a
+    // session that never framed, or a renderer that predates the view — is
+    // printed once the tty is restored, since the local client has no banner.
+    let mut pop_notice = crate::picker::take_pending_notice();
+    if let Some(n) = pop_notice.as_ref() {
+        util::log_write("switch", &n.banner());
     }
     let mut stream = stream;
     let result = loop {
         let mut switch_to: Option<(String, String)> = None;
-        let result = client_loop(stream, &enter, &raw, &mut switch_to);
+        let result = client_loop(stream, &enter, &raw, &mut switch_to, &mut pop_notice);
         // FDR 0012 (RFC 0008 §3.1): the daemon routed a switch to this
         // viewport. Re-dial the target in place — raw mode and the alternate
         // screen stay up, and the new daemon's Init replay repaints over the
@@ -180,7 +182,7 @@ fn run_interactive(stream: UnixStream) -> Result<()> {
     let _ = util::write_fd(STDOUT, &restore_seq(&bracket));
     drop(raw);
     if let Some(n) = pop_notice {
-        eprintln!("posh: {n}");
+        eprintln!("posh: {}", n.banner());
     }
     // When the session ended (rather than detached), the shell's exit status
     // becomes our own (github #18) — `run()` exits with the noted end, after
@@ -1241,11 +1243,36 @@ fn parse_coalesce_gate(value: Option<&str>) -> bool {
     )
 }
 
+/// Raise an automatic pop's notice (RFC 0005 §3.6) over the session,
+/// spawning the renderer if it is not resident. Returns the notice while it
+/// is on screen; with no renderer it stays in `pop_notice` for the caller.
+fn raise_pop_notice(
+    palette: &mut Option<Palette>,
+    (rows, cols): (u16, u16),
+    pop_notice: &mut Option<crate::picker::PopNotice>,
+) -> Option<crate::picker::PopNotice> {
+    let notice = pop_notice.take()?;
+    if palette.is_none() {
+        *palette = Palette::spawn(rows, cols);
+    }
+    let Some(p) = palette.as_mut() else {
+        *pop_notice = Some(notice);
+        return None;
+    };
+    p.resize(rows, cols);
+    p.show_notice(
+        &crate::remote::palette_view::notice_title(&notice),
+        crate::remote::palette_view::notice_stack(&notice),
+    );
+    Some(notice)
+}
+
 fn client_loop(
     stream: UnixStream,
     enter: &[u8],
     raw: &RawMode,
     switch_to: &mut Option<(String, String)>,
+    pop_notice: &mut Option<crate::picker::PopNotice>,
 ) -> Result<i32> {
     stream.set_nonblocking(true)?;
     let sock_fd = stream.as_raw_fd();
@@ -1360,6 +1387,13 @@ fn client_loop(
     // session never builds a FrameRenderer, so Ctrl-^ is never intercepted and
     // this stays None — the palette is a frames-on feature.
     let mut palette: Option<Palette> = None;
+    // The pop notice while its view is up: handed BACK to the caller if the
+    // renderer refuses the view, so it is printed after restore instead.
+    // Raised ONCE per loop — a notice handed back (no renderer, or a refused
+    // view) must not be retried on the next frame, since each try may block
+    // on a renderer spawn.
+    let mut notice_up: Option<crate::picker::PopNotice> = None;
+    let mut notice_raised = false;
 
     // Whether we ack applied frames to drive the daemon's coalescing (posh#137).
     // Mirrors whether we advertised CAP_COALESCE (`POSH_COALESCE`, default off):
@@ -1613,6 +1647,12 @@ fn client_loop(
                                         );
                                     }
                                 }
+                                // FDR 0016: the session is on screen, so an
+                                // automatic pop's notice goes over it now.
+                                if !notice_raised {
+                                    notice_raised = true;
+                                    notice_up = raise_pop_notice(&mut palette, frame_size, pop_notice);
+                                }
                             }
                             Tag::Exit => {
                                 // Session over: flush the final output and
@@ -1685,6 +1725,7 @@ fn client_loop(
             if fds[base + 1].revents & libc::POLLIN != 0 {
                 match palette.as_mut().map(Palette::poll_events) {
                     Some(PaletteEvent::Action { method, params }) => {
+                        notice_up = None;
                         let queued = sock_write_buf.len();
                         let action = dispatch_local_action(&method, &params, &mut sock_write_buf);
                         // A detach queued by the palette (Detach, a switch,
@@ -1742,7 +1783,14 @@ fn client_loop(
                     }
                     // Dismissed without a selection — or the renderer refused
                     // the view (an older binary): repaint the plain session.
-                    Some(PaletteEvent::Cancelled) | Some(PaletteEvent::ViewRejected) => {
+                    // A dismissed pop notice is done with; a refused one goes
+                    // back to the caller, to be printed after restore.
+                    Some(event @ (PaletteEvent::Cancelled | PaletteEvent::ViewRejected)) => {
+                        if let Some(n) = notice_up.take() {
+                            if matches!(event, PaletteEvent::ViewRejected) {
+                                *pop_notice = Some(n);
+                            }
+                        }
                         if let Some(fr) = frame_renderer.as_mut() {
                             fr.invalidate();
                             stdout_buf.extend_from_slice(&fr.recompose(None));
