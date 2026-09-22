@@ -1407,57 +1407,56 @@ fn cmd_ssh_session(
     // Any failure (endpoint unreachable, open refused, transport error)
     // falls THROUGH to the unchanged per-invocation path below, which
     // re-ensures the endpoint for M1 agent ownership on its own — so a
-    // failed session open never strands forwarding. Forwarding-off
-    // invocations skip (the endpoint spawn is keyed to an agent source);
-    // they keep per-invocation connections until a later increment.
+    // failed session open never strands forwarding. A forwarding-off
+    // invocation rides M2 too: it ensures a SESSION-ONLY endpoint
+    // (`agent_source: None`) rather than skipping, since carrying the
+    // session channel is worth an endpoint even with no agent to forward.
     if remote::mux::mux_selected() && remote::mux::mux_sessions_selected() {
-        if let Some(source) = resolve_agent_source(forward_flag) {
-            let target =
-                group.map_or_else(|| session.clone(), |g| format!("{g}/{session}"));
-            // posh#198: a cold endpoint's bootstrap ssh runs in the takeover's
-            // modal (its prompt answered there, once) and seeds the daemon;
-            // a warm endpoint — or no takeover — seeds nothing.
-            let seeded = match takeover.as_mut() {
-                Some(t) => remote::mux::seed_cold_endpoint(&dest, Family::Auto, None, t),
-                None => Ok(None),
-            };
-            match seeded
-                .and_then(|seed| {
-                    remote::mux::ensure_mux(remote::mux::EndpointRequest {
-                        dest: dest.clone(),
-                        family: Family::Auto,
-                        port_range: None,
-                        agent_source: source.clone(),
-                        seed,
-                    })
+        let agent_source = resolve_agent_source(forward_flag);
+        let target = group.map_or_else(|| session.clone(), |g| format!("{g}/{session}"));
+        // posh#198: a cold endpoint's bootstrap ssh runs in the takeover's
+        // modal (its prompt answered there, once) and seeds the daemon;
+        // a warm endpoint — or no takeover — seeds nothing.
+        let seeded = match takeover.as_mut() {
+            Some(t) => remote::mux::seed_cold_endpoint(&dest, Family::Auto, None, t),
+            None => Ok(None),
+        };
+        match seeded
+            .and_then(|seed| {
+                remote::mux::ensure_mux(remote::mux::EndpointRequest {
+                    dest: dest.clone(),
+                    family: Family::Auto,
+                    port_range: None,
+                    agent_source,
+                    seed,
                 })
-                .and_then(|handle| handle.open_session(&target))
-            {
-                Ok(transport) => {
-                    let handoff = takeover
-                        .as_mut()
-                        .map(remote::connect_progress::Takeover::handoff);
-                    match remote::client::run_over_mux(transport, &dest, handoff) {
-                        // The exit status was noted for `run()` to exit with.
-                        Ok(_) => return Ok(()),
-                        // A close BEFORE any frame arrived (the remote
-                        // refused/failed the channel after the local grant)
-                        // or no frame within the connect timeout (the daemon
-                        // mid-reconnect) — fall through to the per-invocation
-                        // path, like every other establishment failure. The
-                        // takeover stays; its modal is re-raised for the
-                        // next attempt.
-                        Err(e) if mux_establish_failed(&e) => {
-                            warn_mux_fallback(&e);
-                            if let Some(t) = takeover.as_mut() {
-                                t.ensure_modal();
-                            }
+            })
+            .and_then(|handle| handle.open_session(&target))
+        {
+            Ok(transport) => {
+                let handoff = takeover
+                    .as_mut()
+                    .map(remote::connect_progress::Takeover::handoff);
+                match remote::client::run_over_mux(transport, &dest, handoff) {
+                    // The exit status was noted for `run()` to exit with.
+                    Ok(_) => return Ok(()),
+                    // A close BEFORE any frame arrived (the remote
+                    // refused/failed the channel after the local grant)
+                    // or no frame within the connect timeout (the daemon
+                    // mid-reconnect) — fall through to the per-invocation
+                    // path, like every other establishment failure. The
+                    // takeover stays; its modal is re-raised for the
+                    // next attempt.
+                    Err(e) if mux_establish_failed(&e) => {
+                        warn_mux_fallback(&e);
+                        if let Some(t) = takeover.as_mut() {
+                            t.ensure_modal();
                         }
-                        Err(e) => return Err(e),
                     }
+                    Err(e) => return Err(e),
                 }
-                Err(e) => warn_mux_fallback(&e),
             }
+            Err(e) => warn_mux_fallback(&e),
         }
     }
     // Foreground roaming attach. Resolve agent forwarding (flag > env >
@@ -1477,7 +1476,7 @@ fn cmd_ssh_session(
                 dest: dest.clone(),
                 family: Family::Auto,
                 port_range: None,
-                agent_source: source.to_path_buf(),
+                agent_source: Some(source.to_path_buf()),
                 seed: None,
             })
         },
@@ -1491,7 +1490,9 @@ fn cmd_ssh_session(
         connect_timeout_secs: None,
         // posh#161: the endpoint owns forwarding ⇒ the session still gets
         // agent/sock, and the bootstrap ssh runs -a (see the field's doc).
-        agent_export: mux_ref.is_some(),
+        // Keyed on the endpoint FORWARDING an agent, not merely existing: a
+        // session-only endpoint's agent/sock answers every request FAIL.
+        agent_export: remote::mux::session_agent_export(mux_ref.as_ref()),
     };
     // Bootstrap selection (RFC 0008 §3): the single-model relay by default;
     // `POSH_RELAY=0` forces the legacy Architecture-A inner-`posh attach`
@@ -1853,14 +1854,16 @@ fn cmd_ssh(args: &[String], forward: &remote::agent::ForwardFlag) -> Result<()> 
                 dest: target.to_string(),
                 family,
                 port_range: port_range.clone(),
-                agent_source: source.to_path_buf(),
+                agent_source: Some(source.to_path_buf()),
                 seed: None,
             })
         },
     );
     // posh#161: the endpoint owning forwarding ⇒ the session still gets
     // agent/sock and the bootstrap ssh runs -a (see `SshOptions::agent_export`).
-    let mux_owned = mux_ref.is_some();
+    // "Owns forwarding" means it HAS an agent source, not merely that an
+    // endpoint exists — a session-only one forwards nothing.
+    let mux_owned = remote::mux::session_agent_export(mux_ref.as_ref());
     let opts = remote::sshwrap::SshOptions {
         family,
         port_range,

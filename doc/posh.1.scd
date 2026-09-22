@@ -364,7 +364,12 @@ Local persistence over Unix sockets.
 	under the table (dim on a terminal; plain trailing lines on a
 	pipe) restates what SELF, REMOTE, and CHANNELS mean.
 	*--raw* prints each daemon's verbatim status one-liner instead
-	(every field, including the congestion summary: cwnd, cuts,
+	(every field, including _agent=_ — the local agent socket the
+	endpoint forwards, or _none_ for a session-only endpoint, which
+	carries M2 session channels and answers every agent request with
+	a refusal; the table has no column for it, and _channels=0_
+	alone cannot tell it from an idle agent endpoint — and the
+	congestion summary: cwnd, cuts,
 	deepest backoff streak) — the daily health check for the
 	_$POSH_MUX_SESSIONS_ default-on rollout and the grep target for
 	a soak. Probing rides the observer path — no

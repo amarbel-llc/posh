@@ -257,11 +257,21 @@ impl MuxState {
 // security rules); same-uid IPC under the hardened mux/ dir.
 
 /// The compile-time protocol/version stamp the RFC 0011 §6 endpoint rule
-/// keys on: `"mux1/"` (the mux IPC protocol generation) + the §2 channel
+/// keys on: `"mux2/"` (the mux IPC protocol generation) + the §2 channel
 /// envelope version this build speaks ([`channel::VER_1`], pinned by test).
 /// A client seeing a different stamp in the `MuxHelloAck` MUST start a fresh
 /// socket-name variant and let this endpoint drain — never negotiate down.
-pub const MUX_PROTO_STAMP: &str = "mux1/1";
+///
+/// Generation 2: [`MuxHelloAck::source`] became optional, because an
+/// endpoint may now carry ONLY M2 session channels (a forwarding-off
+/// attach). The generation, not the envelope version, moved — the §2 wire
+/// is untouched. The bump matters in BOTH directions and §6 handles each
+/// with the variant socket rather than negotiation: a gen-1 invocation
+/// reaching a session-only endpoint would claim a ref and expect agent
+/// forwarding that every OPEN answers FAIL, and a gen-2 invocation reaching
+/// a gen-1 daemon cannot tell "agentless" from "empty path". Each starts its
+/// own `<key>.<stamp>` endpoint instead.
+pub const MUX_PROTO_STAMP: &str = "mux2/1";
 
 /// Upper bound on one mux IPC frame's payload. Legitimate payloads are a
 /// stamp + a few scalars (well under 1 KiB); the bound stops a hostile or
@@ -465,12 +475,18 @@ impl MuxConnState {
 /// source lets a joining invocation SEE which agent the endpoint actually
 /// forwards — the daemon inherited its spawner's resolution, and a later
 /// invocation resolving differently would otherwise diverge silently.
+///
+/// An EMPTY tail is `source: None` — a session-only endpoint, spawned by a
+/// forwarding-off attach, which carries M2 session channels and answers
+/// every agent OPEN with FAIL. An empty path is never a legitimate agent
+/// source, so the tail stays unambiguous; [`MUX_PROTO_STAMP`] generation 2
+/// keeps an older peer from reading the absence as one.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct MuxHelloAck {
     pub state: MuxConnState,
     pub stamp: String,
     pub key: String,
-    pub source: PathBuf,
+    pub source: Option<PathBuf>,
 }
 
 impl MuxHelloAck {
@@ -478,7 +494,10 @@ impl MuxHelloAck {
         use std::os::unix::ffi::OsStrExt;
         let stamp = self.stamp.as_bytes();
         let key = self.key.as_bytes();
-        let source = self.source.as_os_str().as_bytes();
+        let source = self
+            .source
+            .as_ref()
+            .map_or(&[][..], |s| s.as_os_str().as_bytes());
         let mut out = Vec::with_capacity(5 + stamp.len() + key.len() + source.len());
         out.push(self.state as u8);
         out.extend_from_slice(&(stamp.len() as u16).to_le_bytes());
@@ -507,11 +526,14 @@ impl MuxHelloAck {
         if key_len > rest.len() {
             return None;
         }
+        let source = &rest[key_len..];
         Some(MuxHelloAck {
             state,
             stamp: String::from_utf8_lossy(stamp).into_owned(),
             key: String::from_utf8_lossy(&rest[..key_len]).into_owned(),
-            source: PathBuf::from(std::ffi::OsStr::from_bytes(&rest[key_len..])),
+            // Empty tail = a session-only endpoint (no agent source).
+            source: (!source.is_empty())
+                .then(|| PathBuf::from(std::ffi::OsStr::from_bytes(source))),
         })
     }
 }
@@ -734,7 +756,9 @@ struct MuxStatusCtx<'a> {
     peer: Option<std::net::SocketAddr>,
     heard_age_ms: u64,
     channels: usize,
-    agent_source: &'a Path,
+    /// `None` on a session-only endpoint — it forwards no agent, so
+    /// `channels` is 0 for a reason no count can express.
+    agent_source: Option<&'a Path>,
     /// The §9.2 congestion summary (`AgentChannelMux::congestion_summary`):
     /// live cwnd bytes, cumulative MD cuts, deepest backoff streak.
     congestion: (usize, u64, u32),
@@ -752,11 +776,17 @@ struct MuxStatusCtx<'a> {
 /// The `MuxStatus` one-liner (FDR 0007 dump surface): the daemon's OWN
 /// build (`self=` — a long-lived daemon keeps running the code it was
 /// spawned with, so "what's on disk" answers nothing about it), peer addr,
-/// remote build, last-heard age, channel counts (agent + M2 session), refs,
+/// remote build, last-heard age, channel counts (agent + M2 session), the
+/// agent source it forwards (`none` on a session-only endpoint), refs,
 /// linger state, §9.2 congestion summary.
+///
+/// `agent=` is what separates a session-only endpoint from an agent
+/// endpoint that merely has no live channels right now — `channels=0` reads
+/// identically for both, so without it `mux ls --raw` cannot answer "is
+/// agent forwarding even possible here".
 fn status_line(ctx: &MuxStatusCtx, state: &MuxState) -> String {
     format!(
-        "mux {key}: self={slf} state={cs} peer={peer} remote={remote} heard={heard}ms channels={ch} session_channels={sess} refs={refs} linger={linger} cwnd={cwnd} cuts={cuts} streak_hwm={hwm}",
+        "mux {key}: self={slf} state={cs} peer={peer} remote={remote} heard={heard}ms channels={ch} session_channels={sess} agent={agent} refs={refs} linger={linger} cwnd={cwnd} cuts={cuts} streak_hwm={hwm}",
         key = ctx.key,
         slf = env!("POSH_BUILD"),
         cs = ctx.conn_state.label(),
@@ -769,6 +799,9 @@ fn status_line(ctx: &MuxStatusCtx, state: &MuxState) -> String {
         heard = ctx.heard_age_ms,
         ch = ctx.channels,
         sess = ctx.session_channels,
+        agent = ctx
+            .agent_source
+            .map_or_else(|| "none".to_string(), |p| p.display().to_string()),
         refs = state.refs(),
         linger = if state.lingering() { "armed" } else { "off" },
         cwnd = ctx.congestion.0,
@@ -834,7 +867,7 @@ fn process_ipc_conn(
                     state: ctx.conn_state,
                     stamp: MUX_PROTO_STAMP.to_string(),
                     key: ctx.key.to_string(),
-                    source: ctx.agent_source.to_path_buf(),
+                    source: ctx.agent_source.map(Path::to_path_buf),
                 };
                 if !send_mux_frame(conn, MuxTag::HelloAck, &ack.encode()) {
                     return false;
@@ -1253,8 +1286,11 @@ pub struct EndpointRequest {
     pub family: Family,
     pub port_range: Option<String>,
     /// The spawner's FDR 0004-resolved local agent socket, inherited by a
-    /// daemon this request spawns (design doc "Security").
-    pub agent_source: PathBuf,
+    /// daemon this request spawns (design doc "Security"). `None` asks for a
+    /// SESSION-ONLY endpoint: a forwarding-off attach still wants the M2
+    /// session channel, and the endpoint it gets forwards no agent and
+    /// answers every agent OPEN with FAIL.
+    pub agent_source: Option<PathBuf>,
     /// posh#198: a bootstrap the foreground attach already ran, consumed by
     /// the first daemon this request spawns.
     pub seed: Option<SeededEndpoint>,
@@ -1325,7 +1361,7 @@ pub fn run_daemon(key: &str, req: EndpointRequest) -> Result<MuxSpawn> {
         mux_loop(
             listener,
             conn,
-            &agent_source,
+            agent_source.as_deref(),
             linger_ms_from_env(),
             key,
             &mut reestablish,
@@ -1381,17 +1417,28 @@ fn heartbeat_message(request_ident: bool) -> Vec<u8> {
 /// connection, and the local-agent proxy's channel fds. Server-initiated
 /// agent OPENs dial the local `agent_source` while a session ref is held;
 /// with `refs == 0` every OPEN is answered FAIL and open channels are closed
-/// on the unref-to-zero edge (the FDR 0014 M1 policy, client-enforced).
+/// on the unref-to-zero edge (the FDR 0014 M1 policy, client-enforced). An
+/// `agent_source` of `None` is a SESSION-ONLY endpoint: no local proxy is
+/// built at all, and every OPEN takes that same FAIL path for the whole
+/// life of the daemon rather than a second refusal of its own.
 /// Outbound traffic drains through `iteration_sends(None, ..)` with RTO
 /// pacing; a heartbeat session instruction rides at least every
 /// [`HEARTBEAT_INTERVAL`]. Exits on the linger expiry or a terminating
 /// signal; the remote side's Drop follows from the ensuing silence (its
 /// peer timeout). Factored from [`run_daemon`] so tests drive it in-process
 /// over loopback UDP against a real Task 2 `agent_only_loop` peer.
+///
+/// Closes every live proxied channel, or nothing at all on a session-only
+/// endpoint. The unref-to-zero sweep runs on every endpoint, so it reads
+/// better as one helper than as an `if let` at each of its five edges.
+fn close_agent_channels(proxy: &mut Option<AgentClient>) -> Vec<AgentRecord> {
+    proxy.as_mut().map_or_else(Vec::new, AgentClient::close_all)
+}
+
 fn mux_loop(
     listener: UnixListener,
     mut conn: Connection,
-    agent_source: &Path,
+    agent_source: Option<&Path>,
     linger_ms: u64,
     key: &str,
     reestablish: &mut dyn FnMut() -> Result<Connection>,
@@ -1401,7 +1448,7 @@ fn mux_loop(
     let mut fragmenter = sync::Fragmenter::new();
     let mut assembly = sync::FragmentAssembly::new();
     let mut agent_mux = AgentChannelMux::new_client();
-    let mut proxy = AgentClient::new(agent_source.to_path_buf());
+    let mut proxy = agent_source.map(|s| AgentClient::new(s.to_path_buf()));
     let mut state = MuxState::new(linger_ms, now_ms());
     let mut conns: Vec<IpcConn> = Vec::new();
     // M2 session channels: the wire allocator (ordinal 1 = SESSION_CHANNEL,
@@ -1518,7 +1565,9 @@ fn mux_loop(
             fds.push(util::pollfd(c.stream.as_raw_fd(), libc::POLLIN));
         }
         let agent_base = fds.len();
-        fds.extend_from_slice(&proxy.pollfds());
+        if let Some(p) = proxy.as_ref() {
+            fds.extend_from_slice(&p.pollfds());
+        }
 
         match util::poll(&mut fds, timeout) {
             Ok(_) => {}
@@ -1694,8 +1743,9 @@ fn mux_loop(
                                                 &state,
                                             );
                                             if was && !state.serviceable() {
-                                                agent_mux
-                                                    .queue_records(&proxy.close_all());
+                                                agent_mux.queue_records(
+                                                    &close_agent_channels(&mut proxy),
+                                                );
                                             }
                                         }
                                     }
@@ -1706,13 +1756,17 @@ fn mux_loop(
                             continue;
                         }
                         let recs = agent_mux.on_instruction(chan, message);
-                        if state.serviceable() {
-                            let replies = proxy.apply_records(&recs);
+                        // Agent service needs BOTH a held ref and an agent to
+                        // serve; a session-only endpoint fails every OPEN for
+                        // its whole life, down this same path.
+                        if let Some(p) = proxy.as_mut().filter(|_| state.serviceable()) {
+                            let replies = p.apply_records(&recs);
                             agent_mux.queue_records(&replies);
                         } else {
-                            // FDR 0014 M1 policy: refs == 0 ⇒ agent service
-                            // off — answer every OPEN with FAIL and hand
-                            // nothing to the local agent.
+                            // FDR 0014 M1 policy: refs == 0 (or no agent
+                            // source at all) ⇒ agent service off — answer
+                            // every OPEN with FAIL and hand nothing to the
+                            // local agent.
                             let fails: Vec<AgentRecord> = recs
                                 .iter()
                                 .filter(|r| r.kind == RecordKind::Open)
@@ -1748,7 +1802,9 @@ fn mux_loop(
         if (agent_base..fds.len())
             .any(|i| fds[i].revents & (libc::POLLIN | libc::POLLHUP | libc::POLLERR) != 0)
         {
-            agent_mux.queue_records(&proxy.read_channels());
+            if let Some(p) = proxy.as_mut() {
+                agent_mux.queue_records(&p.read_channels());
+            }
         }
 
         // IPC traffic on the polled prefix; walk backwards so removal is
@@ -1760,7 +1816,9 @@ fn mux_loop(
             conn_state,
             peer: conn.remote(),
             heard_age_ms: now.saturating_sub(last_heard),
-            channels: proxy.live_channel_count(),
+            channels: proxy
+                .as_ref()
+                .map_or(0, AgentClient::live_channel_count),
             agent_source,
             congestion: agent_mux.congestion_summary(),
             remote_ident: remote_ident.as_ref(),
@@ -1796,7 +1854,7 @@ fn mux_loop(
                 let was_serviceable = state.serviceable();
                 drop_ipc_conn(&dead, &mut state, now);
                 if was_serviceable && !state.serviceable() {
-                    agent_mux.queue_records(&proxy.close_all());
+                    agent_mux.queue_records(&close_agent_channels(&mut proxy));
                 }
                 continue;
             }
@@ -1884,7 +1942,8 @@ fn mux_loop(
                                 state.unref(now);
                                 log_ref_change("-ipc-close", conns[i].peer_pid, &state);
                                 if was && !state.serviceable() {
-                                    agent_mux.queue_records(&proxy.close_all());
+                                    agent_mux
+                                        .queue_records(&close_agent_channels(&mut proxy));
                                 }
                             }
                         }
@@ -1922,7 +1981,7 @@ fn mux_loop(
                     now.saturating_sub(last_heard)
                 ),
             );
-            let _ = proxy.close_all();
+            let _ = close_agent_channels(&mut proxy);
             agent_mux = AgentChannelMux::new_client();
             fragmenter = sync::Fragmenter::new();
             assembly = sync::FragmentAssembly::new();
@@ -2061,7 +2120,7 @@ fn mux_loop(
                 state.unref(now);
                 log_ref_change("-open-timeout", c.peer_pid, &state);
                 if was && !state.serviceable() {
-                    agent_mux.queue_records(&proxy.close_all());
+                    agent_mux.queue_records(&close_agent_channels(&mut proxy));
                 }
             }
         }
@@ -2163,11 +2222,13 @@ pub struct MuxHandle {
     buf: MuxFrameBuffer,
     state: MuxConnState,
     key: String,
-    /// `Some(daemon's source)` when the endpoint forwards a DIFFERENT local
-    /// agent than this invocation resolved — the daemon keeps its own (it
-    /// inherited its spawner's resolution; restarting it is the only way to
-    /// change), and the caller warns instead of silently diverging.
-    source_mismatch: Option<PathBuf>,
+    /// The agent source the endpoint reported in its hello ack, whatever
+    /// this invocation resolved: the daemon keeps its own (it inherited its
+    /// spawner's resolution; restarting it is the only way to change).
+    /// `None` is a session-only endpoint. This is the ONE route the fact
+    /// travels — [`source_warning`] derives the divergence report from it,
+    /// and [`forwards_agent`](Self::forwards_agent) the export decision.
+    endpoint_source: Option<PathBuf>,
 }
 
 impl MuxHandle {
@@ -2182,11 +2243,18 @@ impl MuxHandle {
         &self.key
     }
 
-    /// The daemon's agent-source path when it differs from the source this
-    /// invocation resolved; `None` when they agree. The endpoint keeps
-    /// forwarding ITS source either way — the caller's job is to warn.
-    pub fn source_mismatch(&self) -> Option<&Path> {
-        self.source_mismatch.as_deref()
+    /// The agent source this endpoint forwards, as it reported it; `None` on
+    /// a session-only endpoint.
+    pub fn endpoint_source(&self) -> Option<&Path> {
+        self.endpoint_source.as_deref()
+    }
+
+    /// Whether this endpoint can forward an agent at all. A session-only
+    /// endpoint answers every agent OPEN with FAIL, so a session born
+    /// alongside one must NOT be pointed at `<base>/agent/sock` — see
+    /// [`session_agent_export`].
+    pub fn forwards_agent(&self) -> bool {
+        self.endpoint_source.is_some()
     }
 
     /// M2: opens this invocation's session channel to `target` over the
@@ -2391,34 +2459,31 @@ pub fn ensure_mux(req: EndpointRequest) -> Result<MuxHandle> {
             },
         )
     };
-    let handle = ensure_mux_conn(&dir, &key, &mut spawn, HELLO_TIMEOUT, &agent_source)?;
-    if let Some(theirs) = handle.source_mismatch() {
-        eprintln!(
-            "posh: mux endpoint {} forwards {}; restart it to change (this \
-             invocation resolved {})",
-            handle.key(),
-            theirs.display(),
-            agent_source.display()
-        );
+    let handle = ensure_mux_conn(&dir, &key, &mut spawn, HELLO_TIMEOUT)?;
+    if let Some(warning) = source_warning(
+        handle.key(),
+        handle.endpoint_source(),
+        agent_source.as_deref(),
+    ) {
+        eprintln!("{warning}");
     }
     Ok(handle)
 }
 
-/// The seam behind [`ensure_mux`]: explicit mux dir, spawn action, and the
-/// invocation's resolved local agent source (compared against the ack's for
-/// [`MuxHandle::source_mismatch`]), so the whole
-/// connect/spawn/hello/variant/ref ladder is tested in-process against a
-/// [`mux_loop`] thread instead of a forked daemon.
+/// The seam behind [`ensure_mux`]: explicit mux dir and spawn action, so the
+/// whole connect/spawn/hello/variant/ref ladder is tested in-process against
+/// a [`mux_loop`] thread instead of a forked daemon. The endpoint's own
+/// agent source rides back on the handle; comparing it against what the
+/// invocation resolved is [`ensure_mux`]'s job, not this ladder's.
 fn ensure_mux_conn(
     dir: &Path,
     key: &str,
     spawn: &mut dyn FnMut(&str) -> Result<MuxSpawn>,
     hello_timeout: std::time::Duration,
-    local_source: &Path,
 ) -> Result<MuxHandle> {
     let (stream, buf, ack) = connect_and_hello(dir, key, spawn, hello_timeout)?;
     if ack.stamp == MUX_PROTO_STAMP {
-        return claim_ref(stream, buf, ack, hello_timeout, local_source);
+        return claim_ref(stream, buf, ack, hello_timeout);
     }
     // RFC 0011 §6: never negotiate down. The endpoint told us ITS stamp; we
     // start a fresh daemon on the variant socket and let the old one drain.
@@ -2437,7 +2502,7 @@ fn ensure_mux_conn(
             ack.stamp
         )));
     }
-    claim_ref(stream, buf, ack, hello_timeout, local_source)
+    claim_ref(stream, buf, ack, hello_timeout)
 }
 
 /// One connect-or-spawn + hello round for a single socket name. A failed
@@ -2718,8 +2783,17 @@ pub fn apply_mux_gate(
         return (agent_source, None);
     }
     let Some(source) = agent_source else {
-        // Forwarding resolved off: nothing for the endpoint to own — the
-        // mux exists to carry agent forwarding, so no spawn at all.
+        // Forwarding resolved off: nothing for the endpoint to OWN, so no
+        // spawn at all. An endpoint can now be session-only (see
+        // [`EndpointRequest::agent_source`]) — but this gate is reached only
+        // on the per-invocation fallback, where the attach is NOT riding the
+        // endpoint. An endpoint ensured here would carry no session and have
+        // no agent to serve: an ssh bootstrap, a double fork and an idle UDP
+        // connection bought for nothing. The M2 path is where a
+        // forwarding-off attach gets its endpoint, and it ensures one
+        // directly. Keeping this early return also keeps the POSH_MUX=0
+        // rollback's bootstrap bytes identical for forwarding-off
+        // invocations.
         return (None, None);
     };
     match ensure(&source) {
@@ -2754,19 +2828,59 @@ fn claim_ref(
     mut buf: MuxFrameBuffer,
     ack: MuxHelloAck,
     timeout: std::time::Duration,
-    local_source: &Path,
 ) -> Result<MuxHandle> {
     use std::io::Write;
     stream.write_all(&encode_mux_frame(MuxTag::SessionRef, b""))?;
     await_frame(&mut stream, &mut buf, timeout, MuxTag::RefAck)?;
-    let source_mismatch = (ack.source != local_source).then_some(ack.source);
     Ok(MuxHandle {
         conn: stream,
         buf,
         state: ack.state,
         key: ack.key,
-        source_mismatch,
+        endpoint_source: ack.source,
     })
+}
+
+/// The one-line warning an invocation gets when the endpoint it just joined
+/// does not forward the agent it resolved. The endpoint keeps ITS source
+/// either way — a daemon inherited its spawner's resolution and only a
+/// restart changes it — so this reports divergence rather than repairing it.
+///
+/// Two shapes diverge, and only two. A DIFFERENT source is the FDR 0014
+/// Finding-3 case. A session-only endpoint (`None`) where this invocation
+/// resolved an agent is the newer one, reachable whenever a forwarding-off
+/// attach spawned the endpoint first: agent forwarding is simply absent
+/// here, and saying so beats letting the user discover it at the first
+/// `git push`. The reverse — an agent endpoint joined by an invocation that
+/// wants no forwarding — is NOT a warning: that invocation asked for
+/// nothing and loses nothing, and warning would fire on the ordinary mix of
+/// forwarding and `--no-forward-agent` attaches to one host.
+fn source_warning(key: &str, endpoint: Option<&Path>, local: Option<&Path>) -> Option<String> {
+    match (endpoint, local) {
+        (Some(theirs), Some(ours)) if theirs != ours => Some(format!(
+            "posh: mux endpoint {key} forwards {}; restart it to change (this \
+             invocation resolved {})",
+            theirs.display(),
+            ours.display()
+        )),
+        (None, Some(ours)) => Some(format!(
+            "posh: mux endpoint {key} carries sessions only and forwards no \
+             agent; restart it to forward {}",
+            ours.display()
+        )),
+        _ => None,
+    }
+}
+
+/// Whether a session bootstrapped alongside `handle` should be asked to
+/// export `<base>/agent/sock` into its shell (posh#161,
+/// `SshOptions::agent_export`). True only when an endpoint exists AND it
+/// forwards an agent: pointing a session at a session-only endpoint's
+/// socket would hand its shell an `SSH_AUTH_SOCK` whose every request is
+/// answered FAIL — a silent agent breakage that looks like a hung agent,
+/// not like forwarding being off.
+pub fn session_agent_export(handle: Option<&MuxHandle>) -> bool {
+    handle.is_some_and(MuxHandle::forwards_agent)
 }
 
 /// The local hostname via gethostname(2); `"unknown"` when the call fails or
@@ -2886,12 +3000,15 @@ mod tests {
 
     #[test]
     fn mux_stamp_pins_rfc0011_envelope_ver() {
-        // The compile-time stamp is "mux1/" + the RFC 0011 §2 envelope version
-        // this build speaks; bumping VER_1 without bumping the stamp (or vice
-        // versa) must fail here, since §6 keys endpoint compatibility on it.
+        // The compile-time stamp is "<mux IPC generation>/" + the RFC 0011 §2
+        // envelope version this build speaks; bumping VER_1 without bumping
+        // the stamp (or vice versa) must fail here, since §6 keys endpoint
+        // compatibility on it. The generation is "mux2" since the hello ack's
+        // source became optional (a session-only endpoint); the envelope
+        // version it pins is unchanged.
         assert_eq!(
             MUX_PROTO_STAMP,
-            format!("mux1/{}", crate::remote::channel::VER_1)
+            format!("mux2/{}", crate::remote::channel::VER_1)
         );
     }
 
@@ -2924,19 +3041,26 @@ mod tests {
                 state,
                 stamp: MUX_PROTO_STAMP.to_string(),
                 key: "example.com-4".to_string(),
-                source: PathBuf::from("/run/user/1000/agent.sock"),
+                source: Some(PathBuf::from("/run/user/1000/agent.sock")),
             };
             assert_eq!(MuxHelloAck::decode(&ack.encode()), Some(ack));
         }
-        // An empty source path survives the roundtrip (source is the
-        // trailing field, so empty is representable).
+        // A session-only endpoint reports no source at all: the trailing
+        // field goes empty on the wire and decodes back to None, never to an
+        // empty path (an empty path is not a legitimate agent socket).
         let bare = MuxHelloAck {
             state: MuxConnState::Connected,
             stamp: "s".into(),
             key: "k".into(),
-            source: PathBuf::new(),
+            source: None,
         };
-        assert_eq!(MuxHelloAck::decode(&bare.encode()), Some(bare));
+        let wire = bare.encode();
+        assert_eq!(MuxHelloAck::decode(&wire), Some(bare));
+        assert_eq!(
+            MuxHelloAck::decode(&wire).unwrap().source,
+            None,
+            "an empty tail is the session-only endpoint, not PathBuf::new()"
+        );
         assert_eq!(MuxHelloAck::decode(b""), None);
         assert_eq!(MuxHelloAck::decode(&[1u8, 9, 0]), None, "stamp_len past end");
         // key_len reaching past the payload end is rejected too.
@@ -2944,7 +3068,7 @@ mod tests {
             state: MuxConnState::Connected,
             stamp: "s".into(),
             key: "key".into(),
-            source: PathBuf::new(),
+            source: None,
         }
         .encode();
         truncated.truncate(truncated.len() - 2); // cut into the key
@@ -2954,7 +3078,7 @@ mod tests {
             state: MuxConnState::Connected,
             stamp: "s".into(),
             key: "k".into(),
-            source: PathBuf::from("/a"),
+            source: Some(PathBuf::from("/a")),
         }
         .encode();
         wire[0] = 9;
@@ -3072,7 +3196,7 @@ mod tests {
             peer: None,
             heard_age_ms: 12,
             channels: 0,
-            agent_source: Path::new(TEST_CTX_SOURCE),
+            agent_source: Some(Path::new(TEST_CTX_SOURCE)),
             congestion: (262_144, 0, 0),
             remote_ident: None,
             session_channels: 0,
@@ -3117,8 +3241,8 @@ mod tests {
         assert_eq!(ack.state, MuxConnState::Connected);
         assert_eq!(ack.key, "example.com-4");
         assert_eq!(
-            ack.source,
-            Path::new(TEST_CTX_SOURCE),
+            ack.source.as_deref(),
+            Some(Path::new(TEST_CTX_SOURCE)),
             "the ack reports the daemon's resolved agent source"
         );
         assert!(!state.serviceable(), "hello alone holds no ref");
@@ -3322,7 +3446,7 @@ mod tests {
                 mux_loop(
                     listener,
                     conn,
-                    &agent_sock,
+                    Some(&agent_sock),
                     3_000,
                     "test-dest",
                     &mut || panic!("this test never reconnects"),
@@ -3345,7 +3469,11 @@ mod tests {
         assert_eq!(ack.state, MuxConnState::Connected);
         assert_eq!(ack.stamp, MUX_PROTO_STAMP);
         assert_eq!(ack.key, "test-dest");
-        assert_eq!(ack.source, agent_sock, "the loop reports its agent source");
+        assert_eq!(
+            ack.source.as_deref(),
+            Some(agent_sock.as_path()),
+            "the loop reports its agent source"
+        );
 
         // Phase 1 — refs == 0 (the FDR 0014 M1 policy): a consumer on the
         // remote's agent/sock is answered with FAIL, never the local agent.
@@ -3674,18 +3802,39 @@ mod tests {
         linger_ms: u64,
         ports: (u16, u16),
     ) -> (std::thread::JoinHandle<()>, Connection) {
+        let agent = dir.join("no-agent.sock");
+        start_inprocess_daemon_with(dir, key, linger_ms, ports, Some(agent))
+    }
+
+    /// [`start_inprocess_daemon`] with `None` for `agent`: a SESSION-ONLY
+    /// endpoint, what a forwarding-off attach ensures.
+    fn start_inprocess_session_only_daemon(
+        dir: &Path,
+        key: &str,
+        linger_ms: u64,
+        ports: (u16, u16),
+    ) -> (std::thread::JoinHandle<()>, Connection) {
+        start_inprocess_daemon_with(dir, key, linger_ms, ports, None)
+    }
+
+    fn start_inprocess_daemon_with(
+        dir: &Path,
+        key: &str,
+        linger_ms: u64,
+        ports: (u16, u16),
+        agent: Option<PathBuf>,
+    ) -> (std::thread::JoinHandle<()>, Connection) {
         let ukey = crate::remote::crypto::Key::random();
         let (server_conn, port) = Connection::server(ports, &ukey, Family::Inet).unwrap();
         let listener = UnixListener::bind(mux_socket_path_in(dir, key)).unwrap();
         let addr = format!("127.0.0.1:{port}").parse().unwrap();
         let conn = Connection::client(addr, &ukey).unwrap();
-        let agent = dir.join("no-agent.sock");
         let key = key.to_string();
         let handle = std::thread::spawn(move || {
             mux_loop(
                 listener,
                 conn,
-                &agent,
+                agent.as_deref(),
                 linger_ms,
                 &key,
                 &mut || panic!("this test never reconnects"),
@@ -3890,7 +4039,7 @@ mod tests {
                 mux_loop(
                     listener,
                     conn,
-                    &agent,
+                    Some(&agent),
                     0, // linger 0: the IPC ref below is what pins the daemon
                     "reconn",
                     &mut || {
@@ -4182,13 +4331,7 @@ mod tests {
         let dir = temp_base();
         let (daemon, mut server) = start_inprocess_daemon(&dir, "m2t", 1_000, (63630, 63639));
         let mut spawn = |_: &str| -> Result<MuxSpawn> { panic!("daemon is live") };
-        let handle = ensure_mux_conn(
-            &dir,
-            "m2t",
-            &mut spawn,
-            std::time::Duration::from_secs(8),
-            &dir.join("no-agent.sock"),
-        )
+        let handle = ensure_mux_conn(&dir, "m2t", &mut spawn, std::time::Duration::from_secs(8))
         .unwrap();
         let mut t = handle.open_session("box:t").unwrap();
         // The wire OPEN reaches the remote; a frame comes back through the
@@ -4240,13 +4383,7 @@ mod tests {
         // …then the 17th, through the real client half, must Err — the
         // fallback cue.
         let mut spawn = |_: &str| -> Result<MuxSpawn> { panic!("daemon is live") };
-        let handle = ensure_mux_conn(
-            &dir,
-            "m2full",
-            &mut spawn,
-            std::time::Duration::from_secs(8),
-            &dir.join("no-agent.sock"),
-        )
+        let handle = ensure_mux_conn(&dir, "m2full", &mut spawn, std::time::Duration::from_secs(8))
         .unwrap();
         let err = match handle.open_session("box:overflow") {
             Ok(_) => panic!("a full table must refuse"),
@@ -4368,7 +4505,7 @@ mod tests {
             mux_loop(
                 listener,
                 daemon_conn,
-                &agent_path,
+                Some(&agent_path),
                 1_000,
                 "m2e2e",
                 &mut || panic!("this test never reconnects"),
@@ -4379,9 +4516,9 @@ mod tests {
         // Two invocations through the real client half.
         let mut spawn = |_: &str| -> Result<MuxSpawn> { panic!("daemon is live") };
         let timeout = std::time::Duration::from_secs(10);
-        let h_a = ensure_mux_conn(&dir, "m2e2e", &mut spawn, timeout, &agent_sock).unwrap();
+        let h_a = ensure_mux_conn(&dir, "m2e2e", &mut spawn, timeout).unwrap();
         let mut t_a = h_a.open_session("default/a").unwrap();
-        let h_b = ensure_mux_conn(&dir, "m2e2e", &mut spawn, timeout, &agent_sock).unwrap();
+        let h_b = ensure_mux_conn(&dir, "m2e2e", &mut spawn, timeout).unwrap();
         let mut t_b = h_b.open_session("default/b").unwrap();
 
         let msg = |input: &[u8], acked: u64| {
@@ -4563,7 +4700,7 @@ mod tests {
                 mux_loop(
                     listener,
                     daemon_conn,
-                    &agent_sock,
+                    Some(&agent_sock),
                     2_000,
                     "reattach",
                     &mut || {
@@ -4583,7 +4720,7 @@ mod tests {
         // `established()` is false until a frame lands.
         let mut spawn = |_: &str| -> Result<MuxSpawn> { panic!("daemon is live") };
         let timeout = std::time::Duration::from_secs(8);
-        let h = ensure_mux_conn(&dir, "reattach", &mut spawn, timeout, &agent_sock).unwrap();
+        let h = ensure_mux_conn(&dir, "reattach", &mut spawn, timeout).unwrap();
         let mut t = h.open_session("default/x").unwrap();
         assert!(!t.established(), "no frame yet: peer 1 never served the open");
         let input = sync::ClientMessage {
@@ -4779,7 +4916,7 @@ mod tests {
                 mux_loop(
                     listener,
                     daemon_conn,
-                    &agent_sock,
+                    Some(&agent_sock),
                     2_000,
                     "ag196",
                     &mut || {
@@ -4796,7 +4933,7 @@ mod tests {
         // Open a session (holds the ref, drives the reconnect) + a keystroke.
         let mut spawn = |_: &str| -> Result<MuxSpawn> { panic!("daemon is live") };
         let timeout = std::time::Duration::from_secs(8);
-        let h = ensure_mux_conn(&dir, "ag196", &mut spawn, timeout, &agent_sock).unwrap();
+        let h = ensure_mux_conn(&dir, "ag196", &mut spawn, timeout).unwrap();
         let mut t = h.open_session("default/x").unwrap();
         let input = sync::ClientMessage {
             flags: 0,
@@ -4881,7 +5018,10 @@ mod tests {
     fn variant_key_appends_the_sanitized_stamp() {
         // The §6 mismatch path lands on `<key>.<ver>.sock`; the stamp's `/`
         // renders slug-safe so the variant stays a single path component.
-        assert_eq!(variant_key("example.com-4"), "example.com-4.mux1-1");
+        // Spelled out rather than derived from MUX_PROTO_STAMP on purpose:
+        // this name lands in `mux/` and in `posh mux ls`, so a stamp bump
+        // SHOULD fail here and make its socket-name consequence deliberate.
+        assert_eq!(variant_key("example.com-4"), "example.com-4.mux2-1");
     }
 
     #[test]
@@ -4901,13 +5041,13 @@ mod tests {
         let local_source = dir.join("no-agent.sock");
 
         // Absent socket: exactly one spawn, then connect + hello + ref.
-        let handle = ensure_mux_conn(&dir, "dest", &mut spawn, timeout, &local_source).unwrap();
+        let handle = ensure_mux_conn(&dir, "dest", &mut spawn, timeout).unwrap();
         assert_eq!(handle.key(), "dest");
         assert_eq!(handle.state(), MuxConnState::Connected);
         assert_eq!(
-            handle.source_mismatch(),
-            None,
-            "a matching agent source is not a mismatch"
+            handle.endpoint_source(),
+            Some(local_source.as_path()),
+            "the handle carries the endpoint's own agent source"
         );
         assert_eq!(spawned.get(), 1, "absent socket: exactly one spawn");
 
@@ -4915,7 +5055,7 @@ mod tests {
         wait_status_contains(&mut obs, "refs=1 ");
 
         // A second invocation reuses the live daemon: no new spawn, 2nd ref.
-        let handle2 = ensure_mux_conn(&dir, "dest", &mut spawn, timeout, &local_source).unwrap();
+        let handle2 = ensure_mux_conn(&dir, "dest", &mut spawn, timeout).unwrap();
         assert_eq!(spawned.get(), 1, "a live daemon is reused, never respawned");
         wait_status_contains(&mut obs, "refs=2 ");
 
@@ -4948,13 +5088,7 @@ mod tests {
             }));
             Ok(MuxSpawn::AlreadyRunning)
         };
-        let handle = ensure_mux_conn(
-            &dir,
-            "raced",
-            &mut spawn,
-            std::time::Duration::from_secs(8),
-            &dir.join("no-agent.sock"),
-        )
+        let handle = ensure_mux_conn(&dir, "raced", &mut spawn, std::time::Duration::from_secs(8))
         .unwrap();
         assert_eq!(handle.key(), "raced");
         assert_eq!(handle.state(), MuxConnState::Connected);
@@ -4991,13 +5125,7 @@ mod tests {
             }));
             Ok(MuxSpawn::Spawned)
         };
-        let err = match ensure_mux_conn(
-            &dir,
-            "oldremote",
-            &mut spawn,
-            std::time::Duration::from_secs(8),
-            &dir.join("no-agent.sock"),
-        ) {
+        let err = match ensure_mux_conn(&dir, "oldremote", &mut spawn, std::time::Duration::from_secs(8)) {
             Ok(_) => panic!("a daemon that died before hello must be an error"),
             Err(e) => e,
         };
@@ -5020,13 +5148,7 @@ mod tests {
             hold = Some(start_inprocess_daemon(&dir, k, 1_000, (63480, 63489)));
             Ok(MuxSpawn::Spawned)
         };
-        let handle = ensure_mux_conn(
-            &dir,
-            "oldremote",
-            &mut respawn,
-            std::time::Duration::from_secs(8),
-            &dir.join("no-agent.sock"),
-        )
+        let handle = ensure_mux_conn(&dir, "oldremote", &mut respawn, std::time::Duration::from_secs(8))
         .unwrap();
         assert_eq!(handle.state(), MuxConnState::Connected);
         drop(handle);
@@ -5052,7 +5174,7 @@ mod tests {
                 state: MuxConnState::Draining,
                 stamp: "mux0/9".to_string(),
                 key: "dest".to_string(),
-                source: PathBuf::from("/old/agent.sock"),
+                source: Some(PathBuf::from("/old/agent.sock")),
             };
             s.write_all(&encode_mux_frame(MuxTag::HelloAck, &ack.encode())).unwrap();
         });
@@ -5063,13 +5185,7 @@ mod tests {
             hold = Some(start_inprocess_daemon(&dir, k, 1_000, (63470, 63479)));
             Ok(MuxSpawn::Spawned)
         };
-        let handle = ensure_mux_conn(
-            &dir,
-            "dest",
-            &mut spawn,
-            std::time::Duration::from_secs(8),
-            &dir.join("no-agent.sock"),
-        )
+        let handle = ensure_mux_conn(&dir, "dest", &mut spawn, std::time::Duration::from_secs(8))
         .unwrap();
         // §6: never negotiate down — the fresh endpoint lives on the variant
         // socket; the old one is left to drain.
@@ -5087,12 +5203,13 @@ mod tests {
     }
 
     #[test]
-    fn differing_agent_source_is_noted_on_the_handle() {
-        // Finding-3 seam: the daemon reports ITS resolved agent source in
-        // the hello ack; an invocation that resolved a DIFFERENT source gets
-        // a handle noting the daemon's path (the caller warns and proceeds —
-        // keep = the daemon's, restart to change), while a matching source
-        // notes nothing.
+    fn the_handle_carries_the_endpoints_own_agent_source() {
+        // Finding-3 seam: the daemon reports ITS resolved agent source in the
+        // hello ack, and the handle carries that back verbatim — it is the
+        // ONE route the fact travels now, feeding both the divergence warning
+        // and the agent-export decision. Comparing it against what an
+        // invocation resolved belongs to `source_warning`, tested purely
+        // below; the ladder itself no longer takes a local source.
         let dir = temp_base();
         let daemon_source = dir.join("no-agent.sock"); // start_inprocess_daemon's
         let mut hold = None;
@@ -5101,28 +5218,145 @@ mod tests {
             Ok(MuxSpawn::Spawned)
         };
         let timeout = std::time::Duration::from_secs(8);
-        let mismatched = ensure_mux_conn(
-            &dir,
-            "src",
-            &mut spawn,
-            timeout,
-            &dir.join("other-agent.sock"),
-        )
-        .unwrap();
+        let handle = ensure_mux_conn(&dir, "src", &mut spawn, timeout).unwrap();
         assert_eq!(
-            mismatched.source_mismatch(),
+            handle.endpoint_source(),
             Some(daemon_source.as_path()),
-            "the handle notes the DAEMON's source on a mismatch"
+            "the handle carries the DAEMON's source, not the invocation's"
         );
-        // The same endpoint, hello'd with the daemon's own source: no note.
-        let mut spawn2 = |_: &str| -> Result<MuxSpawn> { panic!("daemon is live") };
-        let matching = ensure_mux_conn(&dir, "src", &mut spawn2, timeout, &daemon_source).unwrap();
-        assert_eq!(matching.source_mismatch(), None);
-        drop(matching);
-        drop(mismatched);
+        assert!(handle.forwards_agent());
+        // An invocation that resolved a DIFFERENT source is warned; one that
+        // resolved the daemon's own is not.
+        assert!(source_warning("src", handle.endpoint_source(), Some(Path::new("/other.sock")))
+            .is_some());
+        assert_eq!(
+            source_warning("src", handle.endpoint_source(), Some(&daemon_source)),
+            None
+        );
+        drop(handle);
         let (daemon, _server) = hold.take().unwrap();
         daemon.join().unwrap();
         std::fs::remove_dir_all(&dir).ok();
+    }
+
+    #[test]
+    fn a_session_only_endpoint_reports_no_agent_through_the_real_ladder() {
+        // The M2-with-forwarding-off shape, end to end through the real
+        // client half: a daemon spawned with no agent source acks `None`,
+        // the handle says it forwards nothing, and its status one-liner
+        // reads `agent=none` — which is what separates it from an agent
+        // endpoint that merely has no live channel right now (both say
+        // `channels=0`).
+        // Zero linger: the daemon exits the instant the ref drops, so this
+        // test adds no lingering poll thread to the suite's parallel load.
+        // Not incidental — with a 1 s linger here, the timing-fragile
+        // `remote::server::tests::escape_flag_spawns_and_tears_down_a_shell_overlay`
+        // failed deterministically (posh#203, whose poll loop has no
+        // wall-clock deadline). This keeps the suite green; the fix is #203's.
+        let dir = temp_base();
+        let mut hold = None;
+        let mut spawn = |k: &str| {
+            hold = Some(start_inprocess_session_only_daemon(
+                &dir,
+                k,
+                0,
+                (63450, 63459),
+            ));
+            Ok(MuxSpawn::Spawned)
+        };
+        let handle = ensure_mux_conn(
+            &dir,
+            "sessonly",
+            &mut spawn,
+            std::time::Duration::from_secs(8),
+        )
+        .unwrap();
+        assert_eq!(
+            handle.endpoint_source(),
+            None,
+            "a session-only endpoint reports no agent source"
+        );
+        assert!(!handle.forwards_agent());
+        assert!(
+            !session_agent_export(Some(&handle)),
+            "a session born beside it must not be pointed at agent/sock"
+        );
+        // One status round-trip while the ref is held — no polling needed,
+        // the field is on every line.
+        let mut obs = ipc_observer(&mux_socket_path_in(&dir, "sessonly"));
+        let line = ipc_status(&mut obs);
+        assert!(
+            line.contains("agent=none "),
+            "a session-only endpoint must say so on its status line: {line:?}"
+        );
+        assert!(
+            line.contains("channels=0 "),
+            "and `channels=0` alone cannot say it: {line:?}"
+        );
+        // A LATER forwarding invocation joining this same endpoint is told
+        // its agent will not forward here, rather than discovering it at the
+        // first signing request.
+        assert!(source_warning(
+            "sessonly",
+            handle.endpoint_source(),
+            Some(Path::new("/run/user/1000/agent.sock"))
+        )
+        .is_some());
+        drop(handle);
+        drop(obs);
+        let (daemon, _server) = hold.take().unwrap();
+        daemon.join().unwrap();
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    #[test]
+    fn source_warning_fires_only_where_the_invocation_loses_an_agent() {
+        let ours = Path::new("/run/user/1000/agent.sock");
+        let theirs = Path::new("/run/user/1000/other.sock");
+        // A DIFFERENT source: the endpoint keeps its own, so say so.
+        let differs = source_warning("box", Some(theirs), Some(ours)).expect("a warning");
+        assert!(differs.contains("forwards /run/user/1000/other.sock"), "{differs}");
+        assert!(differs.contains("resolved /run/user/1000/agent.sock"), "{differs}");
+        // A session-only endpoint joined by a forwarding invocation: no agent
+        // here at all, which is the newer silent-breakage shape.
+        let none = source_warning("box", None, Some(ours)).expect("a warning");
+        assert!(none.contains("sessions only"), "{none}");
+        assert!(none.contains("/run/user/1000/agent.sock"), "{none}");
+        // Agreement is silent, and so is an agent endpoint joined by an
+        // invocation that wants no forwarding — it asked for nothing and
+        // loses nothing, and warning would fire on every ordinary mix of
+        // forwarding and --no-forward-agent attaches to one host.
+        assert_eq!(source_warning("box", Some(ours), Some(ours)), None);
+        assert_eq!(source_warning("box", Some(ours), None), None);
+        assert_eq!(source_warning("box", None, None), None);
+    }
+
+    #[test]
+    fn a_session_only_endpoint_never_exports_agent_sock_into_a_session() {
+        // posh#161's export tells the session shell to use
+        // <base>/agent/sock. A session-only endpoint answers every agent
+        // OPEN with FAIL, so exporting its path would hand the shell a
+        // socket that can never serve — an agent that looks hung rather
+        // than absent. The decision keys on the endpoint FORWARDING an
+        // agent, never on one merely existing.
+        let forwarding = fake_handle();
+        let session_only = fake_session_only_handle();
+        assert!(forwarding.forwards_agent());
+        assert!(!session_only.forwards_agent());
+        assert!(session_agent_export(Some(&forwarding)));
+        assert!(
+            !session_agent_export(Some(&session_only)),
+            "an endpoint that forwards nothing must not be exported into a session"
+        );
+        assert!(!session_agent_export(None), "no endpoint, no export");
+        // And the bootstrap bytes follow: no AGENT_EXPORT env prefix.
+        let mut opts = opts_with(None);
+        opts.agent_export = session_agent_export(Some(&session_only));
+        assert_eq!(
+            crate::remote::sshwrap::remote_command(&opts, &[], &[]),
+            "posh-server new",
+            "a session-only endpoint leaves the bootstrap byte-identical to forwarding-off"
+        );
     }
 
     #[test]
@@ -5138,13 +5372,7 @@ mod tests {
             hold = Some(start_inprocess_daemon(&dir, k, 0, (63490, 63499)));
             Ok(MuxSpawn::Spawned)
         };
-        let handle = ensure_mux_conn(
-            &dir,
-            "zero",
-            &mut spawn,
-            std::time::Duration::from_secs(8),
-            &dir.join("no-agent.sock"),
-        )
+        let handle = ensure_mux_conn(&dir, "zero", &mut spawn, std::time::Duration::from_secs(8))
         .expect("a zero-linger daemon must accept its first ref");
         assert_eq!(handle.key(), "zero");
         assert_eq!(handle.state(), MuxConnState::Connected);
@@ -5171,7 +5399,7 @@ mod tests {
                 state: MuxConnState::Connected,
                 stamp: MUX_PROTO_STAMP.to_string(),
                 key,
-                source: PathBuf::from("/run/user/1000/agent.sock"),
+                source: Some(PathBuf::from("/run/user/1000/agent.sock")),
             };
             s.write_all(&encode_mux_frame(MuxTag::HelloAck, &ack.encode())).unwrap();
             // Consume the SessionRef so the client's write SUCCEEDS (the
@@ -5192,13 +5420,7 @@ mod tests {
         let fake = fake_endpoint_closing_before_ref_ack(&dir, "dying");
         let mut spawn =
             |_: &str| -> Result<MuxSpawn> { panic!("socket exists; no spawn expected") };
-        let got = ensure_mux_conn(
-            &dir,
-            "dying",
-            &mut spawn,
-            std::time::Duration::from_secs(2),
-            Path::new("/run/user/1000/agent.sock"),
-        );
+        let got = ensure_mux_conn(&dir, "dying", &mut spawn, std::time::Duration::from_secs(2));
         assert!(
             got.is_err(),
             "an unconfirmed session ref must be an Err, not a silent handle"
@@ -5215,10 +5437,10 @@ mod tests {
         let dir = temp_base();
         let fake = fake_endpoint_closing_before_ref_ack(&dir, "gated");
         let source = PathBuf::from("/run/user/1000/agent.sock");
-        let (agent_source, handle) = apply_mux_gate(true, Some(source.clone()), |s| {
+        let (agent_source, handle) = apply_mux_gate(true, Some(source.clone()), |_| {
             let mut spawn =
                 |_: &str| -> Result<MuxSpawn> { panic!("socket exists; no spawn expected") };
-            ensure_mux_conn(&dir, "gated", &mut spawn, std::time::Duration::from_secs(2), s)
+            ensure_mux_conn(&dir, "gated", &mut spawn, std::time::Duration::from_secs(2))
         });
         assert_eq!(
             agent_source,
@@ -5270,7 +5492,7 @@ mod tests {
                                 mux_loop(
                                     listener,
                                     conn,
-                                    &agent,
+                                    Some(&agent),
                                     1_000,
                                     &k,
                                     &mut || panic!("this test never reconnects"),
@@ -5283,13 +5505,7 @@ mod tests {
                     }
                 };
                 barrier.wait();
-                ensure_mux_conn(
-                    &dir,
-                    "cold",
-                    &mut spawn,
-                    std::time::Duration::from_secs(8),
-                    &dir.join("no-agent.sock"),
-                )
+                ensure_mux_conn(&dir, "cold", &mut spawn, std::time::Duration::from_secs(8))
             }));
         }
         let handles: Vec<MuxHandle> = racers
@@ -5322,7 +5538,17 @@ mod tests {
             buf: MuxFrameBuffer::default(),
             state: MuxConnState::Connected,
             key: "k".to_string(),
-            source_mismatch: None,
+            endpoint_source: Some(PathBuf::from("/run/user/1000/agent.sock")),
+        }
+    }
+
+    /// A handle on a SESSION-ONLY endpoint: it carries the M2 channel but
+    /// forwards no agent, so nothing born beside it may be pointed at
+    /// `agent/sock`.
+    fn fake_session_only_handle() -> MuxHandle {
+        MuxHandle {
+            endpoint_source: None,
+            ..fake_handle()
         }
     }
 
@@ -5415,9 +5641,18 @@ mod tests {
     #[test]
     fn mux_gate_with_forwarding_off_skips_the_endpoint_entirely() {
         // mux on but forwarding resolved off: nothing for the endpoint to
-        // own — no spawn, no handle, bootstrap unchanged.
+        // OWN — no spawn, no handle, bootstrap unchanged.
+        //
+        // An endpoint CAN now be session-only, so this is no longer "the mux
+        // exists to carry agent forwarding". It stays because of WHERE this
+        // gate sits: the per-invocation fallback, where the attach makes its
+        // own ssh connection and is NOT riding the endpoint. One ensured
+        // here would carry no session and have no agent to serve — an ssh
+        // bootstrap, a double fork and an idle UDP connection for nothing.
+        // A forwarding-off attach gets its session-only endpoint on the M2
+        // path instead, which ensures one directly.
         let (agent_source, handle) = apply_mux_gate(true, None, |_| {
-            panic!("no forwarding ⇒ no mux spawn at all")
+            panic!("no forwarding and not riding the endpoint ⇒ no spawn")
         });
         assert_eq!(agent_source, None);
         assert!(handle.is_none());
@@ -5619,7 +5854,7 @@ mod tests {
                 mux_loop(
                     listener,
                     conn,
-                    &agent_sock,
+                    Some(&agent_sock),
                     1_000,
                     &k,
                     &mut || panic!("this test never reconnects"),
@@ -5636,10 +5871,10 @@ mod tests {
         // `ensure_mux_conn_concurrent_cold_start_races_to_one_daemon`.)
         let timeout = std::time::Duration::from_secs(20);
         let invocation1 =
-            ensure_mux_conn(&local_base, "m1dest", &mut spawn, timeout, &real_agent_sock)
+            ensure_mux_conn(&local_base, "m1dest", &mut spawn, timeout)
                 .unwrap();
         let invocation2 =
-            ensure_mux_conn(&local_base, "m1dest", &mut spawn, timeout, &real_agent_sock)
+            ensure_mux_conn(&local_base, "m1dest", &mut spawn, timeout)
                 .unwrap();
         assert_eq!(spawned, 1, "both invocations share the one endpoint");
 
