@@ -326,6 +326,18 @@ pub enum MuxTag {
     /// carries the exit-status path's bytes). Dropping the IPC conn implies
     /// close.
     SessionClose = 10,
+    /// Mux → client (FDR 0012 §3.1): the remote bridge re-homed this
+    /// channel to another session, and the payload is that wire target
+    /// (`[group/]session`, UTF-8). The daemon learns this from
+    /// [`SESSION_WIRE_SWITCH`] and forwards it because the CLIENT process is
+    /// the one that owns the FDR 0016 viewport bookkeeping — without this
+    /// hop a roaming viewport's `current` stays frozen at whatever it
+    /// attached to, and the session it was moved out of is never stacked.
+    ///
+    /// Additive: the frame buffer skips tags it does not know, so a client
+    /// that predates this simply keeps today's behaviour and no
+    /// [`MUX_PROTO_STAMP`] generation changes.
+    SessionSwitched = 11,
 }
 
 impl MuxTag {
@@ -342,6 +354,7 @@ impl MuxTag {
             8 => MuxTag::SessionMsg,
             9 => MuxTag::SessionFrame,
             10 => MuxTag::SessionClose,
+            11 => MuxTag::SessionSwitched,
             _ => return None,
         })
     }
@@ -938,7 +951,8 @@ fn process_ipc_conn(
             }
             // Mux → client verbs arriving FROM a peer: ignore, keep the conn.
             MuxTag::HelloAck | MuxTag::StatusReply | MuxTag::RefAck
-            | MuxTag::SessionOpenAck | MuxTag::SessionFrame => {}
+            | MuxTag::SessionOpenAck | MuxTag::SessionFrame
+            | MuxTag::SessionSwitched => {}
         }
     }
     open
@@ -1705,13 +1719,30 @@ fn mux_loop(
                                     Some(&SESSION_WIRE_SWITCH) => {
                                         // FDR 0012 §3.1: the remote bridge
                                         // re-homed this channel to a new
-                                        // session. Update the stored target so
-                                        // a later reconnect re-drives the OPEN
-                                        // with the switched session, not the
-                                        // original (the client does not
-                                        // re-OPEN — the bridge already
-                                        // re-homed and its frames are flowing).
+                                        // session. TWO things happen, and
+                                        // neither replaces the other.
+                                        //
+                                        // Update the stored target, so a
+                                        // later wire reconnect re-drives the
+                                        // OPEN with the SWITCHED session and
+                                        // not the original (posh#162). The
+                                        // client does not re-OPEN — the
+                                        // bridge already re-homed and its
+                                        // frames are flowing.
                                         sess.target = message[1..].to_vec();
+                                        // And forward it, because the CLIENT
+                                        // process owns the FDR 0016 viewport
+                                        // bookkeeping and cannot see this
+                                        // wire. Without the hop a roaming
+                                        // viewport's `current` stays frozen
+                                        // at whatever it attached to and the
+                                        // session it was moved out of is
+                                        // never stacked.
+                                        let _ = send_mux_frame(
+                                            ci,
+                                            MuxTag::SessionSwitched,
+                                            &message[1..],
+                                        );
                                         util::log_write(
                                             "info",
                                             &format!(
@@ -2300,6 +2331,11 @@ pub enum MuxSessionEvent {
     /// The channel closed (remote daemon exit / endpoint teardown); the
     /// payload is the exit-status path's bytes, possibly empty.
     Closed(Vec<u8>),
+    /// FDR 0012 §3.1: the remote bridge re-homed this viewport onto another
+    /// session, whose wire target (`[group/]session`) this carries. The
+    /// client does NOT re-open — the bridge already re-homed and its frames
+    /// are flowing — it records where it now is.
+    Switched(String),
 }
 
 /// The M2 client-side transport: whole assembled messages over the mux IPC
@@ -2352,6 +2388,11 @@ impl MuxSessionTransport {
                             .map(|c| c.payload)
                             .unwrap_or_default();
                         return Some(MuxSessionEvent::Closed(payload));
+                    }
+                    MuxTag::SessionSwitched => {
+                        return Some(MuxSessionEvent::Switched(
+                            String::from_utf8_lossy(&frame.payload).into_owned(),
+                        ));
                     }
                     _ => {}
                 },
@@ -4550,6 +4591,7 @@ mod tests {
                     Some(MuxSessionEvent::Closed(p)) => {
                         panic!("channel closed unexpectedly: {p:?}")
                     }
+                    Some(MuxSessionEvent::Switched(t)) => panic!("unexpected re-home to {t}"),
                     None => std::thread::sleep(std::time::Duration::from_millis(5)),
                 }
             }
@@ -4590,6 +4632,145 @@ mod tests {
         peer.join().unwrap();
         std::fs::remove_dir_all(&local_base).ok();
         std::fs::remove_dir_all(&remote_base).ok();
+    }
+
+    /// The forward-compat contract behind "the hop needs no
+    /// `MUX_PROTO_STAMP` bump": a build that does not know a tag SKIPS it
+    /// and keeps parsing. Tag 11 is `SessionSwitched` in THIS build; a build
+    /// that predates it saw `from_u8(11) == None` and took exactly the skip
+    /// path tag 12 takes here, so adding the verb is additive rather than a
+    /// generation change. Pinned for the tag itself rather than inherited
+    /// from the generic unknown-tag test.
+    #[test]
+    fn the_switched_tag_is_additive_and_an_unknown_one_is_still_skipped() {
+        assert_eq!(MuxTag::from_u8(11), Some(MuxTag::SessionSwitched));
+        assert_eq!(MuxTag::from_u8(12), None, "the next tag is still unassigned");
+        let mut buf = MuxFrameBuffer::default();
+        buf.feed(&encode_mux_frame(
+            MuxTag::SessionFrame,
+            &encode_session_frame(7, b"before"),
+        ));
+        // A SessionSwitched frame between two frames a predating build DOES
+        // know: it skips the middle one and parses both neighbours.
+        buf.feed(&encode_mux_frame(MuxTag::SessionSwitched, b"default/y"));
+        buf.feed(&[12, 2, 0, 0, 0, 1, 2]); // an unassigned tag
+        buf.feed(&encode_mux_frame(
+            MuxTag::SessionFrame,
+            &encode_session_frame(7, b"after"),
+        ));
+        let first = buf.next().unwrap().unwrap();
+        assert_eq!(first.tag, MuxTag::SessionFrame);
+        let switched = buf.next().unwrap().unwrap();
+        assert_eq!(switched.tag, MuxTag::SessionSwitched);
+        assert_eq!(switched.payload, b"default/y");
+        let last = buf.next().unwrap().unwrap();
+        assert_eq!(last.tag, MuxTag::SessionFrame, "the unassigned tag was skipped");
+        assert_eq!(decode_session_frame(&last.payload).unwrap().1, b"after");
+        assert_eq!(buf.next().unwrap(), None);
+    }
+
+    /// The FDR 0012 re-home does TWO things at the daemon, and this pins
+    /// both — the second is the one that is easy to tidy away.
+    ///
+    /// 1. It FORWARDS the new target to the client, which is what lets a
+    ///    roaming viewport record where it now is (defect B: without this
+    ///    the client's `current` froze at whatever it attached to, because
+    ///    `SESSION_WIRE_SWITCH` never crossed the IPC boundary).
+    /// 2. It keeps updating `sess.target`, so a LATER wire reconnect
+    ///    re-drives the OPEN with the SWITCHED session rather than the
+    ///    original (posh#162). Dropping that in favour of the forward would
+    ///    be silent until someone's link actually dropped, which is why the
+    ///    reconnect half is asserted here and not left to inspection.
+    #[test]
+    fn a_switch_reaches_the_client_and_survives_a_wire_reconnect() {
+        use std::sync::atomic::{AtomicU32, Ordering};
+        use std::sync::Arc;
+
+        let dir = temp_base();
+        // Peer 1 serves the open, then the switch, then goes silent so the
+        // compressed-liveness probe condemns the wire. Peer 2 receives the
+        // re-driven OPEN.
+        let ukey1 = crate::remote::crypto::Key::random();
+        let (mut server1, port1) = Connection::server((63660, 63669), &ukey1, Family::Inet).unwrap();
+        let ukey2 = crate::remote::crypto::Key::random();
+        let (mut server2, port2) = Connection::server((63660, 63669), &ukey2, Family::Inet).unwrap();
+
+        let listener = UnixListener::bind(mux_socket_path_in(&dir, "switched")).unwrap();
+        let agent_sock = dir.join("no-agent.sock");
+        let addr1 = format!("127.0.0.1:{port1}").parse().unwrap();
+        let daemon_conn = Connection::client(addr1, &ukey1).unwrap();
+        let attempts = Arc::new(AtomicU32::new(0));
+        let daemon = {
+            let attempts = Arc::clone(&attempts);
+            let agent_sock = agent_sock.clone();
+            std::thread::spawn(move || {
+                let addr2 = format!("127.0.0.1:{port2}").parse().unwrap();
+                mux_loop(
+                    listener,
+                    daemon_conn,
+                    Some(&agent_sock),
+                    2_000,
+                    "switched",
+                    &mut || {
+                        attempts.fetch_add(1, Ordering::Relaxed);
+                        Connection::client(addr2, &ukey2)
+                    },
+                    WireLiveness::with_thresholds(1_000, 1_000),
+                )
+            })
+        };
+
+        let mut spawn = |_: &str| -> Result<MuxSpawn> { panic!("daemon is live") };
+        let timeout = std::time::Duration::from_secs(8);
+        let h = ensure_mux_conn(&dir, "switched", &mut spawn, timeout).unwrap();
+        let mut t = h.open_session("default/x").unwrap();
+
+        let mut assembly = sync::FragmentAssembly::new();
+        let mut frag = sync::Fragmenter::new();
+        let (chan, m) = recv_wire_until(&mut server1, &mut assembly, |c, m| {
+            c.kind() == channel::KIND_SESSION
+                && c != channel::SESSION_CHANNEL
+                && m.first() == Some(&SESSION_WIRE_OPEN)
+        });
+        assert!(
+            String::from_utf8_lossy(&m[1..]).starts_with("default/x"),
+            "the first open names the original target"
+        );
+        // Establish, then re-home the channel onto `default/y`.
+        send_wire(&mut server1, &mut frag, chan, SESSION_WIRE_DATA, b"frame-bytes");
+        send_wire(&mut server1, &mut frag, chan, SESSION_WIRE_SWITCH, b"default/y");
+
+        // (1) The CLIENT learns the new target — the hop defect B needed.
+        let deadline = util::now_ms() + 8_000;
+        let switched = loop {
+            assert!(util::now_ms() < deadline, "the switch never reached the client");
+            match t.next_event() {
+                Some(MuxSessionEvent::Switched(target)) => break target,
+                Some(MuxSessionEvent::Closed(p)) => panic!("channel closed: {p:?}"),
+                _ => std::thread::sleep(std::time::Duration::from_millis(5)),
+            }
+        };
+        assert_eq!(switched, "default/y", "the client is told where it now is");
+
+        // (2) Peer 1 is silent from here; the verdict fires and the daemon
+        // re-drives the OPEN on the fresh wire — with the SWITCHED target.
+        let (_, reopen) = recv_wire_until(&mut server2, &mut assembly, |c, m| {
+            c.kind() == channel::KIND_SESSION
+                && c != channel::SESSION_CHANNEL
+                && m.first() == Some(&SESSION_WIRE_OPEN)
+        });
+        assert!(
+            String::from_utf8_lossy(&reopen[1..]).starts_with("default/y"),
+            "the reconnect must re-open the SWITCHED session, not the original: {:?}",
+            String::from_utf8_lossy(&reopen[1..])
+        );
+        assert!(attempts.load(Ordering::Relaxed) >= 1, "the wire was re-established");
+
+        // Dropping the transport releases the session ref; the linger then
+        // expires and the loop exits.
+        drop(t);
+        daemon.join().unwrap();
+        std::fs::remove_dir_all(&dir).ok();
     }
 
     /// A riding M2 session channel SURVIVES a mux-wire death+reconnect: on
@@ -4754,6 +4935,7 @@ mod tests {
                     Some(MuxSessionEvent::Closed(p)) => {
                         panic!("the client was sent a close across the wire reconnect: {p:?}")
                     }
+                    Some(MuxSessionEvent::Switched(t)) => panic!("unexpected re-home to {t}"),
                     None => std::thread::sleep(std::time::Duration::from_millis(5)),
                 }
             }
@@ -4958,6 +5140,7 @@ mod tests {
                     }
                 }
                 Some(MuxSessionEvent::Closed(p)) => panic!("session closed across reconnect: {p:?}"),
+                Some(MuxSessionEvent::Switched(t)) => panic!("unexpected re-home to {t}"),
                 None => std::thread::sleep(std::time::Duration::from_millis(5)),
             }
         }

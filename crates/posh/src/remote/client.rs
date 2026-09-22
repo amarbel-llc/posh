@@ -2087,6 +2087,10 @@ fn drive_client(
                 Datagram(Vec<u8>),
                 Frame(Vec<u8>),
                 Closed(Vec<u8>),
+                /// FDR 0012 §3.1: the bridge re-homed this viewport onto
+                /// another session (M2 only — the relay deliberately sends
+                /// no such notice and is being retired, ADR 0007).
+                Switched(String),
                 Skip,
                 Dry,
                 Dead,
@@ -2102,10 +2106,33 @@ fn drive_client(
                     Wire::Mux(t) => match t.next_event() {
                         Some(crate::remote::mux::MuxSessionEvent::Frame(b)) => Rx::Frame(b),
                         Some(crate::remote::mux::MuxSessionEvent::Closed(p)) => Rx::Closed(p),
+                        Some(crate::remote::mux::MuxSessionEvent::Switched(t)) => Rx::Switched(t),
                         None => Rx::Dry,
                     },
                 };
                 match rx {
+                    Rx::Switched(wire_target) => {
+                        // DEFECT B: a roaming viewport's `current` used to
+                        // freeze at whatever it attached to, because nothing
+                        // on this path ever recorded a re-home. `entered`
+                        // records it AND pushes the session left behind, so
+                        // *Back* returns there.
+                        //
+                        // The wire target is `[group/]session` on the host
+                        // this connection already names, so it is spelled
+                        // back into an RFC 0001 target the same way the
+                        // attach entry points spell theirs.
+                        let (group, name) = match wire_target.split_once('/') {
+                            Some((g, n)) => (Some(g), n),
+                            None => (None, wire_target.as_str()),
+                        };
+                        crate::picker::entered(&crate::picker::target_for(
+                            Some(source),
+                            group,
+                            name,
+                        ));
+                        continue;
+                    }
                     Rx::Skip => continue,
                     Rx::Dry => break,
                     Rx::Dead => break,
