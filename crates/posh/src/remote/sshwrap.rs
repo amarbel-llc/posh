@@ -378,7 +378,7 @@ fn is_shell_safe_name(name: &str) -> bool {
 /// truecolor (TERM degrades gracefully via resolve_term; COLORTERM has no
 /// fallback). Keep the two sides in sync. POSH_KEY is deliberately excluded —
 /// the session key never travels in the cleartext remote command string.
-fn forwarded_env_vars() -> Vec<(String, String)> {
+pub(crate) fn forwarded_env_vars() -> Vec<(String, String)> {
     std::env::vars()
         .filter(|(k, _)| {
             (k == "LANG"
@@ -518,7 +518,16 @@ pub fn remote_posh_argv(
     argv.extend(dest.ssh_args());
     argv.push(dest.target());
     argv.extend(env_prefix.iter().map(|s| s.to_string()));
-    argv.push("posh".into());
+    argv.extend(posh_tokens(group, tail));
+    argv
+}
+
+/// The remote `posh [-g GROUP] <tail>` token list — the `posh` literal and the
+/// `-g` rule (omitted for the `default` group, #66) that [`remote_posh_argv`]
+/// splices into a loose ssh argv, factored out so the `ph host:+` create can
+/// shell-quote the same tokens into an env-prefixed command string instead.
+pub(crate) fn posh_tokens(group: &str, tail: &[String]) -> Vec<String> {
+    let mut argv = vec!["posh".to_string()];
     if group != "default" {
         argv.push("-g".into());
         argv.push(group.into());
@@ -884,7 +893,7 @@ pub fn run(
 /// through a fresh, disposable transport pair. Agent forwarding (FDR 0004)
 /// rides that later foreground connection, not the spawn — so no `-A` here.
 pub fn run_detached(target: &str, inner: &[String], opts: &SshOptions) -> Result<()> {
-    let remote_cmd = detached_command(inner, &forwarded_env_vars());
+    let remote_cmd = env_prefixed_command(&forwarded_env_vars(), inner);
 
     let dest = SshDest::resolve(target);
     if let Some(notice) = dest.notice() {
@@ -919,11 +928,15 @@ pub fn run_detached(target: &str, inner: &[String], opts: &SshOptions) -> Result
     Ok(())
 }
 
-/// Builds the remote command for a detached spawn (#67): locale/TERM env
-/// prefixes (the same forwarding the foreground bootstrap applies), then the
-/// inner `posh ... attach ... --detach ...` argv, each element shell-quoted so
-/// a command with spaces survives the remote shell intact.
-fn detached_command(inner: &[String], env_vars: &[(String, String)]) -> String {
+/// Builds a remote command string for a plain `posh ...` spawn over ssh:
+/// [`forwarded_env_vars`]-shaped locale/TERM env prefixes (the same forwarding
+/// the foreground bootstrap applies), then the `argv` tokens, each element
+/// shell-quoted so a command with spaces survives the remote shell intact.
+///
+/// Shared by the detached spawn (#67) and the `ph host:+` remote-atomic create
+/// — every posh-over-ssh spawn forwards the client's environment, so a session
+/// it creates is never born TERM-less (no colors, visible re-echo).
+pub(crate) fn env_prefixed_command(env_vars: &[(String, String)], argv: &[String]) -> String {
     let mut cmd = String::new();
     for (name, value) in env_vars {
         cmd.push_str(name);
@@ -931,7 +944,7 @@ fn detached_command(inner: &[String], env_vars: &[(String, String)]) -> String {
         cmd.push_str(&shell_quote(value));
         cmd.push(' ');
     }
-    for (i, arg) in inner.iter().enumerate() {
+    for (i, arg) in argv.iter().enumerate() {
         if i > 0 {
             cmd.push(' ');
         }
@@ -1270,7 +1283,7 @@ mod tests {
     }
 
     #[test]
-    fn detached_command_quotes_inner_and_prefixes_env() {
+    fn env_prefixed_command_quotes_argv_and_prefixes_env() {
         // #67: a detached remote spawn execs `posh ... attach ... --detach
         // ...` directly (no `posh-server new`), every argv element shell-
         // quoted, with locale/TERM env prefixes like the foreground bootstrap.
@@ -1282,7 +1295,7 @@ mod tests {
         .collect();
         let env = vec![("LANG".to_string(), "en_US.UTF-8".to_string())];
         assert_eq!(
-            detached_command(&inner, &env),
+            env_prefixed_command(&env, &inner),
             "LANG='en_US.UTF-8' 'posh' '-g' 'spinclass' 'attach' 'id 7' '--detach' 'my worker'"
         );
 
@@ -1291,7 +1304,7 @@ mod tests {
             .iter()
             .map(|s| s.to_string())
             .collect();
-        assert_eq!(detached_command(&bare, &[]), "'posh' 'attach' 'w' '--detach'");
+        assert_eq!(env_prefixed_command(&[], &bare), "'posh' 'attach' 'w' '--detach'");
     }
 
     #[test]

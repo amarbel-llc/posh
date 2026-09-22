@@ -830,7 +830,7 @@ fn start_remote_auto(
         util::log_write("info", &dest.describe());
     }
     let batch = !util::is_tty(0);
-    let argv = remote_start_argv(&dest, &grp, batch);
+    let argv = remote_start_argv(&dest, &grp, batch, &remote::sshwrap::forwarded_env_vars());
     let created = std::process::Command::new(&argv[0])
         .args(&argv[1..])
         .output()
@@ -856,20 +856,41 @@ fn start_remote_auto(
     cmd_ssh_session(user, host, target_group, global_group, id, extra, forward_flag)
 }
 
-/// `ssh [-o BatchMode=yes] … <dest> POSH_HANDSHAKE=1 posh [-g G] start --detach
-/// --kind anonymous`: the remote-atomic auto-id create (design 2026-09-21
-/// §1). The env prefix is the ssh-crossing cookie (`sshwrap::remote_command`
-/// precedent) that asks the remote for the `POSH START` handshake line; the
+/// `ssh [-o BatchMode=yes] … <dest> "<env prefixes> POSH_HANDSHAKE='1' 'posh'
+/// [-g G] 'start' '--detach' '--kind' 'anonymous'"`: the remote-atomic auto-id
+/// create (design 2026-09-21 §1). The remote side is ONE shell-quoted command
+/// string, not loose argv tokens, because it carries `env_vars` as shell
+/// assignment prefixes — `forwarded_env_vars()` in production, injected here
+/// so the shape test never reads the process environment. That forwarding is
+/// what every other posh-over-ssh spawn does (`sshwrap::remote_command`, the
+/// `--detach` spawn): without it the remote `posh start` runs TERM-less and
+/// the session shell it daemonizes is born with no TERM at all — no colors,
+/// visible character re-echo. `POSH_HANDSHAKE` is the ssh-crossing cookie
+/// asking the remote for the `POSH START` handshake line, ordered after the
+/// forwarded vars exactly as `remote_command` orders `POSH_AGENT_EXPORT`; the
 /// remote picks the free `s-N` itself, and the attach that follows finds it
 /// live. Batch mode follows `remote_list_argv`'s rule (non-TTY callers only).
-fn remote_start_argv(dest: &remote::sshwrap::SshDest, group: &str, batch: bool) -> Vec<String> {
-    remote::sshwrap::remote_posh_argv(
-        dest,
-        batch_ssh_opts(batch),
-        &["POSH_HANDSHAKE=1"],
-        group,
-        &["start", "--detach", "--kind", "anonymous"].map(String::from),
-    )
+fn remote_start_argv(
+    dest: &remote::sshwrap::SshDest,
+    group: &str,
+    batch: bool,
+    env_vars: &[(String, String)],
+) -> Vec<String> {
+    let mut env = env_vars.to_vec();
+    env.push(("POSH_HANDSHAKE".to_string(), "1".to_string()));
+    let command = remote::sshwrap::env_prefixed_command(
+        &env,
+        &remote::sshwrap::posh_tokens(
+            group,
+            &["start", "--detach", "--kind", "anonymous"].map(String::from),
+        ),
+    );
+    let mut argv: Vec<String> = vec!["ssh".to_string()];
+    argv.extend(batch_ssh_opts(batch).iter().map(|s| s.to_string()));
+    argv.extend(dest.ssh_args());
+    argv.push(dest.target());
+    argv.push(command);
+    argv
 }
 
 /// The ssh options a remote control invocation adds for a non-TTY caller:
@@ -2574,20 +2595,35 @@ mod tests {
 
     #[test]
     fn remote_start_argv_creates_detached_anonymous_with_the_handshake_cookie() {
+        // The remote side is ONE command string: the client's environment as
+        // shell-assignment prefixes (the parity every other posh-over-ssh
+        // spawn has — a create that forgets TERM strands the session shell
+        // without one), then the handshake cookie, then the quoted posh argv.
+        // The env list is injected, never read from the process environment.
         let dest = remote::sshwrap::SshDest::verbatim("box");
+        let env = [("TERM", "xterm-kitty"), ("COLORTERM", "truecolor")]
+            .map(|(k, v)| (k.to_string(), v.to_string()))
+            .to_vec();
         assert_eq!(
-            remote_start_argv(&dest, "default", true),
+            remote_start_argv(&dest, "default", true, &env),
             [
-                "ssh", "-o", "BatchMode=yes", "box", "POSH_HANDSHAKE=1", "posh", "start",
-                "--detach", "--kind", "anonymous"
+                "ssh",
+                "-o",
+                "BatchMode=yes",
+                "box",
+                "TERM='xterm-kitty' COLORTERM='truecolor' POSH_HANDSHAKE='1' \
+                 'posh' 'start' '--detach' '--kind' 'anonymous'",
             ]
             .map(String::from)
         );
+        // Non-default group splices `-g GRP`; no batch flag for a TTY caller.
+        // With no forwarded vars the cookie still leads the command string.
         assert_eq!(
-            remote_start_argv(&dest, "grp", false),
+            remote_start_argv(&dest, "grp", false, &[]),
             [
-                "ssh", "box", "POSH_HANDSHAKE=1", "posh", "-g", "grp", "start", "--detach",
-                "--kind", "anonymous"
+                "ssh",
+                "box",
+                "POSH_HANDSHAKE='1' 'posh' '-g' 'grp' 'start' '--detach' '--kind' 'anonymous'",
             ]
             .map(String::from)
         );

@@ -935,6 +935,36 @@ fn apply_client_size(clients: &[ClientConn], pty_fd: RawFd, term: &mut Terminal)
     }
 }
 
+/// The environment a session daemon adds on top of its own when it spawns the
+/// session shell: the session's identity, and always a non-empty TERM —
+/// `term` (the daemon's own `TERM` reading) when it has one, a resolved one
+/// when it does not.
+///
+/// The TERM floor exists because a session's shell inherits the environment
+/// that created the session, and a create path that forgets to forward TERM
+/// strands an interactive shell without one: no colors, visible character
+/// re-echo. The `ph host:+` remote-atomic create did exactly that (its ssh
+/// exec carried no environment), and while that path now forwards TERM like
+/// every other posh-over-ssh spawn, no future one should be able to strand a
+/// shell this way. A TERM the daemon already has is passed through untouched
+/// — the client's own forwarded value always wins over a resolved guess.
+pub(crate) fn session_spawn_env(
+    name: &str,
+    group: &str,
+    term: Option<&str>,
+) -> Vec<(String, String)> {
+    // resolve_term never yields an empty string, even with no terminfo DB.
+    let term = match term.filter(|t| !t.is_empty()) {
+        Some(t) => t.to_string(),
+        None => crate::terminfo::resolve_term(),
+    };
+    vec![
+        ("POSH_SESSION".to_string(), name.to_string()),
+        ("POSH_GROUP".to_string(), group.to_string()),
+        ("TERM".to_string(), term),
+    ]
+}
+
 fn daemon_main(
     cfg: &Config,
     name: &str,
@@ -964,10 +994,7 @@ fn daemon_main(
     // stdio is detached, so the PTY starts at the 24x80 default; the first
     // client Init resizes it.
     let (rows, cols) = (24u16, 80u16);
-    let envs = vec![
-        ("POSH_SESSION".to_string(), name.to_string()),
-        ("POSH_GROUP".to_string(), cfg.group.clone()),
-    ];
+    let envs = session_spawn_env(name, &cfg.group, std::env::var("TERM").ok().as_deref());
     let child = match pty::spawn_shell(command.as_deref(), rows, cols, &envs, None) {
         Ok(c) => c,
         Err(e) => {
@@ -1818,6 +1845,35 @@ fn daemon_loop(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// The session shell's spawn env always names the session and its group,
+    /// and never leaves TERM unset: a create path that forwarded none (the
+    /// `ph host:+` regression) must not strand an interactive shell without
+    /// one. A TERM the daemon already has is passed through untouched.
+    #[test]
+    fn session_spawn_env_floors_term_without_overriding_a_forwarded_one() {
+        let term_of = |env: &[(String, String)]| -> Option<String> {
+            env.iter().find(|(k, _)| k == "TERM").map(|(_, v)| v.clone())
+        };
+        let identity = |env: &[(String, String)]| -> Vec<(String, String)> {
+            env.iter().filter(|(k, _)| k != "TERM").cloned().collect()
+        };
+        let expected_identity = [("POSH_SESSION", "s-1"), ("POSH_GROUP", "grp")]
+            .map(|(k, v)| (k.to_string(), v.to_string()))
+            .to_vec();
+
+        let forwarded = session_spawn_env("s-1", "grp", Some("xterm-kitty"));
+        assert_eq!(term_of(&forwarded).as_deref(), Some("xterm-kitty"));
+        assert_eq!(identity(&forwarded), expected_identity);
+
+        // Absent or empty: a resolved TERM, never nothing and never "".
+        for missing in [None, Some("")] {
+            let env = session_spawn_env("s-1", "grp", missing);
+            let term = term_of(&env).expect("a TERM is set when the daemon has none");
+            assert!(!term.is_empty(), "resolved TERM must not be empty");
+            assert_eq!(identity(&env), expected_identity);
+        }
+    }
 
     /// RFC 0014 §3: an Init table's identity is the ATTACHMENT's own; a later
     /// `ClientCaps` identity with another pid is the origin behind a relay

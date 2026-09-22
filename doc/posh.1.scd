@@ -193,7 +193,11 @@ Local persistence over Unix sockets.
 	_host_*:+* creates a remote auto-id session (first free _s-N_ — the
 	host picks it itself, answered by the *POSH START* handshake below;
 	a host too old for *--kind* or the handshake falls back to the
-	list-then-attach probe).
+	list-then-attach probe). Like every posh-over-ssh spawn, the remote
+	create forwards the client's _$TERM_ and _$COLORTERM_ (with
+	_$LANG_/_$LC_\*_) so the session shell is born with the terminal
+	the client is on; a session created without one gets a TERM
+	resolved against the host's terminfo database rather than none.
 	Every session has a *kind* — _anonymous_, _named_, or the reserved
 	_system_ — stated at create time and held by the daemon for the
 	session's life; it is never derived from the name, and a daemon
