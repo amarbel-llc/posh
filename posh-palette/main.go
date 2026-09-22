@@ -122,6 +122,16 @@ type row struct {
 	Action *action  `json:"action,omitempty"`
 }
 
+// entry is one line of the "notice" view (RFC 0005 §3.6): a session on the
+// viewport's stack. State carries MEANING, not presentation — `popped`,
+// `current`, `below` — and the renderer alone decides the treatment, so the
+// look can change without a protocol change.
+type entry struct {
+	Target string `json:"target"`
+	State  string `json:"state"`
+	Detail string `json:"detail,omitempty"`
+}
+
 type showParams struct {
 	View     string    `json:"view"`
 	Commands []command `json:"commands,omitempty"`
@@ -136,11 +146,14 @@ type showParams struct {
 	// rows, and the text shown when there are none.
 	Rows  []row  `json:"rows,omitempty"`
 	Empty string `json:"empty,omitempty"`
+	// Stack belongs to the "notice" view (RFC 0005 §3.6): the viewport's
+	// session stack, most recently entered first.
+	Stack []entry `json:"stack,omitempty"`
 }
 
 // knownView reports whether a ui.show view name is one this renderer draws.
 func knownView(v string) bool {
-	return v == "palette" || v == "dialog" || v == "picker"
+	return v == "palette" || v == "dialog" || v == "picker" || v == "notice"
 }
 
 // bubbletea messages produced from control input.
@@ -172,6 +185,13 @@ var (
 			Background(lipgloss.Color("63"))
 	dimStyle  = lipgloss.NewStyle().Faint(true)
 	helpStyle = lipgloss.NewStyle().Faint(true)
+	// A notice's `popped` entry: visibly REMOVED (RFC 0005 §3.6). Faint as
+	// well as struck so the "gone" reading survives a terminal that drops
+	// strikethrough.
+	goneStyle = lipgloss.NewStyle().Strikethrough(true).Faint(true)
+	// A notice's `current` entry: emphasized, but deliberately NOT selStyle
+	// — that is the selection highlight, and a notice has nothing to select.
+	hereStyle = lipgloss.NewStyle().Bold(true)
 )
 
 // --- model ---
@@ -183,6 +203,7 @@ const (
 	viewPalette
 	viewDialog
 	viewPicker
+	viewNotice
 )
 
 type keymap struct {
@@ -211,6 +232,9 @@ type model struct {
 	body   string
 	copied bool
 	width  int
+	// Notice view (RFC 0005 §3.6): the session stack to draw, in the order
+	// given — never filtered, never sorted.
+	stack []entry
 }
 
 func newModel(c *conn) model {
@@ -280,6 +304,18 @@ func (m model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 			m.input.Focus()
 			m.selected = 0
 			m.recompute()
+		case "notice":
+			m.view = viewNotice
+			m.stack = msg.Stack
+			m.title = msg.Title
+			if m.title == "" {
+				m.title = "Session ended"
+			}
+			// §3.6: a notice has no filter input — `prompt`, `description`
+			// and `commands` are ignored. Blur so a stray keystroke cannot
+			// land in a textinput this view never draws.
+			m.description = ""
+			m.input.Blur()
 		default:
 			m.view = viewNone
 		}
@@ -298,6 +334,16 @@ func (m model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 				m.sendCopy()
 				m.copied = true
 			case key.Matches(msg, m.keys.dismiss):
+				m.conn.notify("ui.cancelled", nil)
+				m.view = viewNone
+			}
+			return m, nil
+		case viewNotice:
+			// §3.6: dismiss-only, and ONLY on a bound key. The view appears
+			// unprompted, at a moment the user did not choose, so a
+			// keystroke meant for the session must never be swallowed as an
+			// acknowledgement — anything unbound is ignored, not consumed.
+			if key.Matches(msg, m.keys.dismiss) {
 				m.conn.notify("ui.cancelled", nil)
 				m.view = viewNone
 			}
@@ -419,6 +465,8 @@ func (m model) View() tea.View {
 		return tea.NewView(m.dialogView())
 	case viewPicker:
 		return tea.NewView(m.pickerView())
+	case viewNotice:
+		return tea.NewView(m.noticeView())
 	}
 	return tea.NewView("")
 }
@@ -460,6 +508,59 @@ func (m model) pickerView() string {
 	b.WriteByte('\n')
 	b.WriteString(helpStyle.Render("↑/↓ choose · enter select · esc cancel"))
 	return dialogStyle.Width(panelWidth).Render(b.String())
+}
+
+// noticeView draws the must-dismiss session-stack notice (RFC 0005 §3.6):
+// one entry per line, in the order given, never filtered and never sorted.
+// `state` alone decides the treatment — `popped` is struck through as
+// removed, `current` carries the marker, and ANY other value is drawn as
+// `below`, so a state this renderer predates degrades instead of breaking
+// the view. There is no filter input and nothing to select.
+func (m model) noticeView() string {
+	var b strings.Builder
+	b.WriteString(titleStyle.Render(m.title))
+	b.WriteString("\n\n")
+	panelWidth := 80
+	if m.width > 0 {
+		panelWidth = m.width - 4
+	}
+	panelWidth = max(min(panelWidth, 120), 30)
+	// dialogStyle's Padding(1, 2) + the double border: 6 columns of chrome;
+	// the "→ " marker takes two more, as the picker's "› " does.
+	lineWidth := panelWidth - 8
+	for _, e := range m.stack {
+		st, marker := entryStyle(e.State)
+		b.WriteString(marker + st.Render(truncate(entryLine(e), lineWidth)))
+		b.WriteByte('\n')
+	}
+	b.WriteByte('\n')
+	b.WriteString(helpStyle.Render("enter dismiss"))
+	return dialogStyle.Width(panelWidth).Render(b.String())
+}
+
+// entryStyle maps a notice entry's state to its treatment and line marker —
+// the ONE place RFC 0005 §3.6's three states become a look, so changing the
+// look never touches the protocol. An unrecognized state degrades to
+// `below`, so a state this renderer predates is drawn plainly rather than
+// breaking the view.
+func entryStyle(state string) (lipgloss.Style, string) {
+	switch state {
+	case "popped":
+		return goneStyle, "  "
+	case "current":
+		return hereStyle, "→ "
+	default:
+		return dimStyle, "  "
+	}
+}
+
+// entryLine renders one notice entry as `target  (detail)`, or just the
+// target when it carries no detail.
+func entryLine(e entry) string {
+	if e.Detail == "" {
+		return e.Target
+	}
+	return e.Target + "  (" + e.Detail + ")"
 }
 
 // columnWidths is the widest cell per column across rows (rune-counted so a

@@ -6,7 +6,30 @@ import (
 	"os"
 	"strings"
 	"testing"
+
+	tea "charm.land/bubbletea/v2"
 )
+
+// plain strips SGR escape sequences so a CONTENT assertion does not depend on
+// where lipgloss chooses to place them — it styles per span, so a styled line
+// carries escapes inside the text. Handles `ESC [ ... m`, which is all the
+// renderer emits.
+func plain(s string) string {
+	var b strings.Builder
+	for i := 0; i < len(s); {
+		if s[i] == 0x1b && i+1 < len(s) && s[i+1] == '[' {
+			j := i + 2
+			for j < len(s) && s[j] != 'm' {
+				j++
+			}
+			i = min(j+1, len(s))
+			continue
+		}
+		b.WriteByte(s[i])
+		i++
+	}
+	return b.String()
+}
 
 // captureConn returns a conn whose writes are collected; calling the returned
 // func closes the write end and parses every line back into an rpcMessage.
@@ -280,9 +303,114 @@ func TestNoDescriptionKeepsInputUnderTitle(t *testing.T) {
 	}
 }
 
-// ui.show accepts exactly the three RFC 0005 views.
+// The "notice" view (RFC 0005 §3.6) draws the stack in the order given, with
+// `state` alone deciding the treatment: `popped` struck through as removed,
+// `current` marked, and anything else — including a state this renderer
+// predates — degraded to `below` rather than breaking the view. Several
+// `popped` entries in one notice is the cascade: a pop whose target was
+// itself gone, reported once rather than as a queue of modals.
+func TestNoticeRendersStackInOrderWithStates(t *testing.T) {
+	updated, _ := newModel(&conn{}).Update(showMsg{View: "notice", Stack: []entry{
+		{Target: "flac:clown-0dfe", State: "popped", Detail: "exited 0"},
+		{Target: "flac:s-1", State: "popped", Detail: "gone"},
+		{Target: "box:dev", State: "current"},
+		{Target: "box:old", State: "from-the-future"},
+	}})
+	m := updated.(model)
+	if m.view != viewNotice {
+		t.Fatalf("view = %d, want viewNotice", m.view)
+	}
+	if m.title != "Session ended" {
+		t.Errorf("default title = %q, want Session ended", m.title)
+	}
+	out := plain(m.noticeView())
+	for _, want := range []string{
+		"flac:clown-0dfe  (exited 0)", "flac:s-1  (gone)", "box:dev", "box:old",
+	} {
+		if !strings.Contains(out, want) {
+			t.Errorf("noticeView() missing %q in:\n%s", want, out)
+		}
+	}
+	// The order given, never sorted.
+	if i, j := strings.Index(out, "flac:clown-0dfe"), strings.Index(out, "box:dev"); i < 0 || j < 0 || i > j {
+		t.Errorf("entries must render in the order given:\n%s", out)
+	}
+	// The marker belongs to `current` and to nothing else.
+	if !strings.Contains(out, "→ box:dev") {
+		t.Errorf("the current entry must be marked:\n%s", out)
+	}
+	for _, other := range []string{"→ flac:s-1", "→ box:old"} {
+		if strings.Contains(out, other) {
+			t.Errorf("only the current entry may carry the marker, found %q in:\n%s", other, out)
+		}
+	}
+	if !strings.Contains(out, "dismiss") {
+		t.Errorf("a must-dismiss view needs its hint:\n%s", out)
+	}
+}
+
+// The state -> treatment mapping itself (RFC 0005 §3.6), pinned directly so
+// the assertion does not depend on where lipgloss places escape sequences:
+// `popped` is drawn as removed, `current` takes the marker, and an
+// unrecognized state is indistinguishable from `below`.
+func TestNoticeEntryStyleMapsStateToTreatment(t *testing.T) {
+	if _, marker := entryStyle("current"); marker != "→ " {
+		t.Errorf("current marker = %q, want the arrow", marker)
+	}
+	gone, marker := entryStyle("popped")
+	if !gone.GetStrikethrough() {
+		t.Error("a popped entry must be drawn as visibly removed")
+	}
+	if marker != "  " {
+		t.Errorf("popped marker = %q, want blank — only current is marked", marker)
+	}
+	future, fm := entryStyle("from-the-future")
+	below, bm := entryStyle("below")
+	if future.GetStrikethrough() != below.GetStrikethrough() || fm != bm {
+		t.Error("an unrecognized state must degrade to `below`, never error")
+	}
+}
+
+// §3.6: an unbound keystroke must be IGNORED, not swallowed. The notice
+// appears unprompted, at a moment the user did not choose, so a character
+// meant for the shell underneath must neither dismiss it nor be consumed.
+func TestNoticeIgnoresAnUnboundKey(t *testing.T) {
+	c, collect := captureConn(t)
+	shown, _ := newModel(c).Update(showMsg{View: "notice", Stack: []entry{
+		{Target: "box:dev", State: "current"},
+	}})
+	after, _ := shown.(model).Update(tea.KeyPressMsg{Code: 'x', Text: "x"})
+	if after.(model).view != viewNotice {
+		t.Error("an unbound key must leave the notice up")
+	}
+	if msgs := collect(); len(msgs) != 0 {
+		t.Errorf("an unbound key must send nothing, got %+v", msgs)
+	}
+}
+
+// Dismissing reports ui.cancelled (RFC 0005 §4.2) and takes the view down.
+// `q` is one of the renderer's existing dismiss keys, shared with the dialog.
+func TestNoticeDismissNotifiesCancelled(t *testing.T) {
+	c, collect := captureConn(t)
+	shown, _ := newModel(c).Update(showMsg{View: "notice", Stack: []entry{
+		{Target: "box:dev", State: "current"},
+	}})
+	after, _ := shown.(model).Update(tea.KeyPressMsg{Code: 'q', Text: "q"})
+	if after.(model).view != viewNone {
+		t.Error("a bound dismiss key must take the notice down")
+	}
+	msgs := collect()
+	if len(msgs) != 1 || msgs[0].Method != "ui.cancelled" {
+		t.Fatalf("want a single ui.cancelled, got %+v", msgs)
+	}
+	if msgs[0].ID != nil {
+		t.Error("a notification must not carry an id")
+	}
+}
+
+// ui.show accepts exactly the four RFC 0005 views.
 func TestKnownViews(t *testing.T) {
-	for _, v := range []string{"palette", "dialog", "picker"} {
+	for _, v := range []string{"palette", "dialog", "picker", "notice"} {
 		if !knownView(v) {
 			t.Errorf("%q must be a known view", v)
 		}
