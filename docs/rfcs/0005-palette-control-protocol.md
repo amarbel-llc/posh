@@ -134,14 +134,15 @@ Show a view. `result` is an empty object `{}` acknowledging the view is up
 
 | field      | type      | required | meaning                                  |
 |------------|-----------|----------|------------------------------------------|
-| `view`     | string    | yes      | View to display. Defines `"palette"`, `"dialog"`, and `"picker"` (§3.5). |
+| `view`     | string    | yes      | View to display. Defines `"palette"`, `"dialog"`, `"picker"` (§3.5), and `"notice"` (§3.6). |
 | `commands` | command[] | for `palette` | The command list (§5).             |
-| `title`    | string    | no       | Heading; default `"Commands"` (palette) / `"Info"` (dialog) / `"Sessions"` (picker). |
+| `title`    | string    | no       | Heading; default `"Commands"` (palette) / `"Info"` (dialog) / `"Sessions"` (picker) / `"Session ended"` (notice). |
 | `prompt`   | string    | no       | Filter-input prompt; default `"/ "` (palette and picker). |
 | `description` | string | no       | Free text a `palette` or `picker` shows between the heading and the filter input, word-wrapped to the panel; never matched by the filter. Absent or empty: nothing is shown and the layout is unchanged. |
 | `body`     | string    | for `dialog` | The text the `dialog` view displays.   |
 | `rows`     | row[]     | for `picker` | The table rows (§3.5).                 |
 | `empty`    | string    | no       | Text shown by a `picker` with no rows; default `"(no sessions)"`. |
+| `stack`    | entry[]   | for `notice` | The session-stack entries (§3.6).      |
 
 An unknown `view` MUST yield error `-32602` (invalid params). A second `ui.show`
 while a view is up REPLACES it (re-configures in place).
@@ -192,6 +193,59 @@ client still learns of a cancel the usual way). The view is additive (§9):
 a version-1 renderer that predates it answers `-32602`, which a client MUST
 treat as "picker unavailable" (fall back to its non-TUI listing), never as a
 protocol failure.
+
+#### 3.6 The `notice` view (FDR 0016)
+
+The `"notice"` view is a **must-dismiss** message. Unlike every other view it
+is shown UNPROMPTED — the client raises it after an automatic pop, when the
+session the viewport was in has ended and the viewport has returned to the one
+beneath — and it stays up until the user acknowledges it. It carries no
+`commands` and nothing selectable; its only outcome is `ui.cancelled` (§4.2).
+
+`params.stack` is the viewport's session stack, **most recently entered
+first**. An **entry**:
+
+| field    | type   | required | meaning                                           |
+|----------|--------|----------|---------------------------------------------------|
+| `target` | string | yes      | The session, in the client's display spelling (`host:session`). |
+| `state`  | string | yes      | One of `"popped"`, `"current"`, `"below"`.        |
+| `detail` | string | no       | Short parenthetical, e.g. `exited 0`, `gone`.     |
+
+`state` carries MEANING, not presentation — the renderer chooses how each is
+drawn, so the visual treatment can change without a protocol change:
+
+* `popped` — a session that has just left the stack, whether because it ended
+  or because it was found already gone while popping. The renderer MUST draw
+  these as visibly removed (strikeout where the terminal supports it).
+* `current` — the session the viewport now sits in. The renderer MUST mark it
+  distinctly from the others (an arrow or equivalent leading indicator).
+* `below` — a session still on the stack beneath `current`, rendered
+  unobtrusively (dim).
+
+A `notice` has no filter input: `prompt`, `description` and `commands`
+present with `view="notice"` MUST be ignored.
+
+The renderer MUST render one entry per line in the given order, MUST NOT
+filter or sort them, and MUST truncate a long `target` rather than wrapping.
+An unrecognized `state` MUST be rendered as `below` rather than rejected, so a
+future state is degraded, not fatal. Ordinarily exactly one entry is
+`current`; a renderer MUST tolerate zero or several without erroring.
+
+Several `popped` entries in one notice is the CASCADE case: a pop whose target
+was itself gone pops again, and the whole chain is reported in a single notice
+rather than one per step. That list is the only record the user gets of
+sessions that died unobserved, which is why the view exists rather than a
+one-line banner.
+
+Dismissal uses the renderer's existing dismiss affordance (the `dialog` view's
+keys) and sends `ui.cancelled` (§4.2). The renderer SHOULD show a hint line in
+its help style. The renderer MUST NOT dismiss on an unbound key: the view
+appears at a moment the user did not choose, so a keystroke meant for the
+session must not be silently consumed as an acknowledgement.
+
+The view is additive (§9): a version-1 renderer that predates it answers
+`-32602`, which a client MUST treat as "notice unavailable" and degrade to its
+one-line pop banner, never as a protocol failure.
 
 ### 4. Methods the client implements (renderer → client)
 
