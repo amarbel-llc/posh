@@ -385,7 +385,7 @@ oldest first.
 
 | field | value |
 |---|---|
-| `kind` | `palette` (the Commands palette, or a dialog it hosts), `picker` (the session picker, in-session or the standalone `ph` chooser), or `leave` (reserved for the leave prompt) |
+| `kind` | `palette` (the Commands palette, or a dialog it hosts), `picker` (the session picker, in-session or the standalone `ph` chooser), or `notice` (reserved for the must-dismiss pop modal, RFC 0005 §3.6) |
 | `over` | the target the view was opened over; `-` for a view with no attach beneath it (the standalone chooser) |
 
 The kind values are the `SESSION_KIND` names of RFC 0001 id 20: `unknown`,

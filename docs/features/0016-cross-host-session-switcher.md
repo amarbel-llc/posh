@@ -73,28 +73,24 @@ switch outcome** instead of an exit status; the front door then attaches to the
 named target exactly as `ph <target>` would — a local socket, a mux session
 channel, or a fresh bootstrap — and loops until an attach ends without a switch.
 
-**Leaving a session.** FDR 0011 reaps nothing, so a switch is where a session
-would otherwise pile up. Choosing a row from *inside* a session therefore asks
-a second question, in the same renderer as a three-command palette:
+**Leaving a session.** FDR 0011 reaps nothing, so sessions accumulate. A
+transition deliberately does **nothing** about that: it never kills the
+session it leaves, and asks no question on the way out. What it does is
+push, so the session you left is one *Back* away rather than gone. Real
+cleanup is v2 session management; until then the implicit cleanup is
+returning to a session and exiting it normally.
 
-- **Switch, keep it running** (the default, and what Enter on the first
-  entry does) — the previous session stays detached.
-- **Switch, kill it** — killed once the new attach is *established*, so a
-  switch that fails to attach never destroys the session it was leaving.
-  If other viewports are still attached to it, it is kept and the new
-  session's banner says so.
-- **Switch, kill it even with other viewports attached** — the forced
-  form; those viewports are thrown out exactly as `posh kill` does.
-
-**Stacked switching (push / pop).** A switch that *keeps* the session it
-leaves is a **push**: the front door records that session on a stack, and
-the palette gains **Back to `<session>`** (`session.pop`, RFC 0005 §7),
-offered only while the stack has a top, which re-dials the top and pops it.
-So a detour — check on a build, answer a prompt elsewhere — is two palette
-choices: switch (keep), then Back. A switch that kills the session it leaves
-pushes nothing (there is nothing to return to). *Back* asks the same
-keep / kill / force-kill question about the session being left, so a
-one-off session can be discarded on the way back. The stack lives in the
+**Stacked switching (push / pop).** Every transition is a **push** —
+whether it came from the picker, from `posh attach <name>` typed inside a
+session, or from `posh start <name>` (the FDR 0012 in-place re-home). There
+is no longer a "switch" that replaces without recording. The front door
+pushes the session it leaves, and the palette gains **Back to `<session>`**
+(`session.pop`, RFC 0005 §7), offered while the stack has a top, which
+re-dials the top and pops it. So a detour — check on a build, answer a
+prompt elsewhere — is two palette choices: switch, then Back. Unconditional
+on purpose: while the push was conditional, the typed and picked paths
+disagreed about whether a move was navigation at all, and the typed one
+silently dropped the session it left. The stack lives in the
 viewport process — the `run()` re-attach loop — and no longer: quitting posh
 empties it, and each viewport has its own. Depth is unbounded in practice
 (a target string per level). Since 2026-09-21 each entry also records the
@@ -120,46 +116,41 @@ half dropped before the session half) to the renderer's content budget.
 Both clients; the design is `docs/plans/2026-09-21-session-stack-ux-design.md`
 §3.
 
-**Leaving posh.** When a viewport leaves posh with no switch to follow — a
-detach, a quit, or the top session ending / being lost with nothing to pop
-— the front door collects the **anonymous sessions this viewport created**
-(every anonymous stack entry, bottom first, then the current session last
-if it is anonymous and did not itself end) and asks what to do with them.
-Under `POSH_LEAVE_ANONYMOUS=ask` (the default) that is a standalone prompt
-on the same renderer, titled `Leaving — N anonymous session(s) you
-created`, the targets one per line as its description, and three rows:
-**Keep them running** (first, so Enter keeps; Esc keeps too — there is no
-Cancel row because both ways out leave the sessions running), **Kill them
-(kept if other viewports are attached)**, **Kill them even with other
-viewports attached**. Each row issues `session.leave {previous}` (RFC
-0005 §7). `keep` never prompts and says nothing; `kill` kills unasked
-(the unless-attached form). The prompt needs a tty on both ends and an
-orderly end: off a tty, or after a terminating signal ended the attach,
-`ask` degrades to one stderr line — `left running: <targets>
-(POSH_LEAVE_ANONYMOUS=kill to kill on exit)` — as does a prompt the
-renderer could not show or the user dismissed. **The kill contract:** the
-kills run in stack order with the current session last (its attach has
-already returned), through the same `posh kill` / `posh kill
---unless-attached` primitive the switch dialogs use, one notice per entry
-on stderr after the chooser has restored the tty; a host that fails fails
-only its own entry, never the rest. A session the viewport did not create
-(named, system, or one it merely attached to) is never a candidate, and
-an ended session has nothing to kill (a *lost* one may). Design: the same
-plan, §4.
+**Leaving posh.** Nothing is killed. A viewport that leaves posh — a
+detach, a quit, or the last session ending with nothing to pop — leaves
+every session it visited running, and says nothing about them. Anonymous
+sessions therefore accumulate until something reaps them, which is
+deliberate for now: a leave-time kill prompt was specified and built, then
+removed, because it asked the question at the wrong moment — on the way out
+of a session the viewport was usually about to return to — and because
+"which of these did I mean to keep" is a session-management problem rather
+than a switcher one. `posh kill` is the manual answer and v2 session
+management the planned one.
 
-**When the top session goes away.** An attach that ends because the session
-*ended* (its shell exited, or it was killed from elsewhere) or was *lost*
-(an established mux channel closed, the local daemon's socket dropped) pops
-on its own: the front door re-dials the stack's top exactly as a *Back,
-keep* would, and the new attach's first frame carries a banner saying why —
-`session box:dev ended (exit 0) — back to flac:s-2`, or `… lost (mux
-channel closed) — back to …`. A quit or detach the user asked for (the
-palette, `Ctrl-^ .`, `Ctrl-\`, a signal) never pops: quitting posh still
-quits, and the stack goes with the viewport. A re-dial that fails during an
-automatic pop drops to the shell with both the notice and the failure. With
-no stack to pop, an ended session's exit status is the viewport's own (as
-before) and a lost one is named on one stderr line — no more silent drop to
-the prompt. **The daemon says why** (posh#194): its teardown reports the
+**When the top session goes away — the default pop.** An attach that ends
+because the session *ended* (its shell exited, or it was killed from
+elsewhere) or was *lost* (an established mux channel closed, the local
+daemon's socket dropped) pops on its own: the front door re-dials the
+stack's top exactly as a *Back* would. A quit or detach the user asked for
+(the palette, `Ctrl-^ .`, `Ctrl-\`, a signal) never pops: quitting posh
+still quits, and the stack goes with the viewport.
+
+The pop is **announced, and must be acknowledged.** Once the re-dial is
+established, the restored session gets a modal (`ui.show view="notice"`,
+RFC 0005 §3.6) drawing the stack: what left it struck through, an arrow on
+where the viewport now sits, the rest dim. It is dismissed with esc / q /
+enter and by nothing else — it appears at a moment the user did not choose,
+so a keystroke meant for the shell underneath is ignored rather than
+swallowed as an acknowledgement.
+
+If the pop's own target turns out to be gone, the front door **keeps
+popping**, and the whole chain is reported in that ONE notice with each
+skipped entry struck and marked `gone`. That list is the only record the
+user gets of sessions that died unobserved. With nothing left to pop, an
+ended session's exit status becomes the viewport's own (as before) and a
+lost one is named on one stderr line — no more silent drop to the prompt.
+
+**The daemon says why** (posh#194): its teardown reports the
 cause — the shell exited, `posh kill`, a signal to the daemon, a daemon
 failure — as an IPC record ahead of the exit status, and the relay / M2
 bridge carry it to the roaming client as `EXIT_CAUSE` (RFC 0001 id 19) on
@@ -277,7 +268,8 @@ re-dial. The UX is identical either way; the user never sees which fired.
 | picker host set | local + live mux endpoints (`ph host:` = one host) | the connected set, no per-host ssh fan-out to cold hosts | users routinely want a cold host in the all-hosts picker (add the ssh-config/tailnet union behind a flag) |
 | switch affordance | palette "Switch session…" | one discoverable home, shared with `ph` | a dedicated keybind proves faster than the palette round-trip |
 | session stack scope | per viewport process, in memory; inspectable via `posh status --viewport` (RFC 0014 §6) | matches the re-attach loop that owns switching; no state to reconcile across viewports | users want `ph -` (back) from a fresh shell, or the stack to survive a viewport exit — persist it under the runtime dir |
-| leave policy | `ask` (`POSH_LEAVE_ANONYMOUS`; `keep` / `kill` pin it) | never destroys work unasked: a viewport's own anonymous sessions are the only candidates, Enter and Esc both keep, and a kill respects other viewports unless forced | users always answer the prompt the same way (make that answer the default), or object to the prompt on every detach (the design's tuning lever — a config file, or a per-session choice) |
+| cleanup on leave | none — every session the viewport visited is left running | a transition is navigation, not disposal; a leave-time kill prompt shipped and was removed, because it asked at the wrong moment and because deciding which sessions to keep is session management, not switching | anonymous sessions accumulate faster than `posh kill` absorbs — which is the signal to build v2 session management, not to re-add the prompt |
+| pop announcement | must-dismiss `notice` modal over the restored session | an unasked-for move needs acknowledging, and the struck list is the only record of sessions that died unobserved | the modal wears out its welcome on routine clean exits — then show it only for a non-zero exit or a `gone` cascade, and a one-line banner otherwise |
 
 ## More Information
 
@@ -290,8 +282,8 @@ re-dial. The UX is identical either way; the user never sees which fired.
   the same-host follow-on reuses; its constraints bound the retarget path.
 - **FDR 0009** (`0009-command-palette.md`) — the palette this grows out of.
 - **RFC 0005** (`docs/rfcs/0005-palette-control-protocol.md`) — the palette
-  control channel: §3.5 the `picker` view, §3.2 `description`, §7
-  `session.switch` / `session.pop` / `session.leave`.
+  control channel: §3.5 the `picker` view, §3.6 the must-dismiss `notice`
+  view, §3.2 `description`, §7 `session.switch` / `session.pop`.
 - **RFC 0013 §5** (`docs/rfcs/0013-server-introspection-caps.md`) — the activity
   label the picker rows are keyed on.
 - **RFC 0011** (`docs/rfcs/0011-multiplexed-datagram-channels.md`) — the M2 mux

@@ -692,13 +692,16 @@ pub(crate) fn current_kind() -> SessionKind {
 }
 
 /// A renderer view the viewport is showing OVER its session (RFC 0014 §6
-/// `overlay` line): `kind` is `palette` (the Commands palette, a dialog, or
-/// the leave question it asks today), `picker` (the session picker —
-/// in-session `session.list`, or the standalone `ph` chooser), or `leave`
-/// (the standalone anonymous-session leave prompt the front door shows on
-/// the way out — `main::leave_anonymous_sessions`; distinct from the
-/// in-session leave question, which is a `palette` view); `over` is the
-/// attach the view was opened over (`None` for the standalone chooser).
+/// `overlay` line). `kind` is `palette` (the Commands palette, or a dialog
+/// it hosts) or `picker` (the session picker — in-session `session.list`,
+/// or the standalone `ph` chooser); `notice` is reserved for the
+/// must-dismiss pop modal (RFC 0005 §3.6), which nothing drives yet.
+/// `over` is the attach the view was opened over (`None` for the
+/// standalone chooser).
+///
+/// The vocabulary is a `&'static str`, not an enum, so nothing here
+/// constrains it — RFC 0014 §6's table is where the values are agreed, and
+/// a new one belongs there first.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Overlay {
     pub kind: &'static str,
