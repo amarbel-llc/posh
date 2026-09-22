@@ -3,6 +3,19 @@
 //! stream to a remote roaming client over the AEAD-UDP transport, bridging the
 //! UDP client's input back to the daemon as `Tag::Input`.
 //!
+//! # DNR — superseded by M2 (ADR 0007)
+//!
+//! This path is scheduled for removal: M2 (the mux session channel,
+//! `remote::mux`) is the surviving ingress. **No new features here — bug
+//! fixes only**; anything new lands on M2, and a feature that cannot be
+//! expressed over M2 is a signal to fix M2, not to extend this module. The
+//! known gap that motivated the decision: an FDR 0012 re-home performed here
+//! is never reported to the roaming client (see the `switch_to` block in
+//! `relay_loop`), so viewport-side bookkeeping — the FDR 0016 session stack —
+//! cannot work over a relay. M2 reports it (`SESSION_WIRE_SWITCH`). See
+//! `docs/decisions/0007-converge-on-m2-retire-relay-and-architecture-a.md`
+//! for the removal sequence.
+//!
 //! # Single-model invariant
 //!
 //! Unlike the legacy `remote::server` (FDR 0001 Architecture A, which owns a

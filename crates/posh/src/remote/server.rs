@@ -1,6 +1,25 @@
 //! Roaming remote server (mosh-server port, simplified SSP): owns the PTY
 //! and a posh_term::Terminal, and syncs screen state to the client as
 //! dump_vt frames (full or diffed against the last client-acked frame).
+//!
+//! # DNR — the Architecture-A half is superseded by M2 (ADR 0007)
+//!
+//! This module is SPLIT, and only one half is on death row:
+//!
+//! - **Architecture A — DNR.** [`server_loop`] and the PTY/terminal-owning
+//!   path it anchors (this module's second `posh_term::Terminal` +
+//!   `FrameProducer`, the `<base>/remote/<pid>.status.sock` surface, and the
+//!   `POSH_RELAY=0` rollback that reaches it) are scheduled for removal. **No
+//!   new features there — bug fixes only.** Its sessions have no daemon, so
+//!   they are neither shareable with a local attach nor visible to
+//!   `posh list`; one host was found running twelve of them on a stale build
+//!   (`just debug-posh-builds`).
+//! - **The mux peer half — STAYS.** [`agent_only_loop`], `mux_peer_loop`, and
+//!   `connect_named_daemon` are the REMOTE end of M2 and are the surviving
+//!   path. Work on those freely.
+//!
+//! See `docs/decisions/0007-converge-on-m2-retire-relay-and-architecture-a.md`
+//! for the removal sequence and the working rule.
 
 use std::time::Instant;
 
