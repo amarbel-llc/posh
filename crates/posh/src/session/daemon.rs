@@ -1106,12 +1106,11 @@ pub(crate) struct SessionStatus<'a> {
 /// per attached client (`records` carry their `age=` already).
 pub(crate) fn status_response(s: &SessionStatus<'_>, records: &[introspect::ClientRecord]) -> String {
     let mut out = format!(
-        "session={} group={} daemon={}({}) pid={} frames={} echo_flag={} \
+        "session={} group={} daemon={} pid={} frames={} echo_flag={} \
          alt_screen={} clients={} activity={:?}\n",
         s.name,
         s.group,
-        env!("POSH_VERSION"),
-        env!("POSH_GIT_SHA"),
+        env!("POSH_BUILD"),
         s.daemon_pid,
         if s.frames { "on" } else { "off" },
         s.echo_flag as u8,
@@ -1908,7 +1907,7 @@ mod tests {
         assert_eq!(c.record.ident.as_ref().map(|i| i.pid), Some(200));
         assert_eq!(c.record.state, Some(state));
         let line = introspect::render_client_line(&c.record_now(1_250));
-        assert!(line.contains("client pid=200 build=1(a) via=relay pid=100 echo=optimistic"), "{line}");
+        assert!(line.contains("client pid=200 build=1+a via=relay pid=100 echo=optimistic"), "{line}");
         assert!(line.ends_with(" age=250"), "{line}");
         // A malformed state entry keeps the held record.
         c.absorb_client_caps(

@@ -530,9 +530,8 @@ pub(crate) fn mux_peer_loop(
                         Ok((stream, _)) => {
                             let d = endpoint.diag(0, 0);
                             let line = format!(
-                                "posh {} ({}) pid={} peer={} heard={}ms agent_channels={} opened_total={} owns_agent_sock={} session_channels={}\n",
-                                env!("POSH_VERSION"),
-                                env!("POSH_GIT_SHA"),
+                                "posh {} pid={} peer={} heard={}ms agent_channels={} opened_total={} owns_agent_sock={} session_channels={}\n",
+                                env!("POSH_BUILD"),
                                 std::process::id(),
                                 conn.remote()
                                     .map_or_else(|| "none".to_string(), |a| a.to_string()),
@@ -5079,7 +5078,10 @@ mod tests {
             s.set_read_timeout(Some(std::time::Duration::from_secs(8))).unwrap();
             let mut line = String::new();
             s.read_to_string(&mut line).unwrap();
-            assert!(line.contains(env!("POSH_GIT_SHA")), "status line: {line:?}");
+            assert!(
+                line.contains(concat!("posh ", env!("POSH_BUILD"))),
+                "status line: {line:?}"
+            );
             assert!(line.contains("owns_agent_sock="), "status line: {line:?}");
         }
         h.join().unwrap();

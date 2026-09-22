@@ -7,6 +7,12 @@
 //! consuming crate as compile-time env vars; runtime code reads
 //! `env!("POSH_VERSION")` / `env!("POSH_GIT_SHA")`. See eng-versioning(7).
 //!
+//! It also flows `POSH_BUILD` — the two joined as `<version>+<sha>`. That
+//! join happens HERE and nowhere else: a version alone does not identify a
+//! build (one host routinely runs several daemons reporting the same
+//! `POSH_VERSION`), so every human-facing build surface prints the one
+//! composed string and `posh_build` is the single place it is composed.
+//!
 //! Cargo's `package.version` stays an inert "0.0.0" placeholder (see the root
 //! `Cargo.toml`) that nothing reads for the actual version — so there is
 //! nothing to keep in sync and no drift to guard against.
@@ -15,26 +21,31 @@ use std::env;
 use std::fs;
 use std::path::PathBuf;
 
-/// Flow `POSH_VERSION` and `POSH_GIT_SHA` into the consuming crate. Call from
-/// each crate's `build.rs` `main`.
+/// Flow `POSH_VERSION`, `POSH_GIT_SHA`, and the composed `POSH_BUILD`
+/// (`<version>+<sha>`) into the consuming crate. Call from each crate's
+/// `build.rs` `main`.
 ///
 /// Runs in the *consuming* crate's build-script process, so
 /// `CARGO_MANIFEST_DIR` is that crate's directory — every posh crate lives at
 /// `crates/<name>/`, so `../../version.env` resolves to the repo root for all
 /// of them.
 pub fn flow() {
-    flow_version();
-    flow_git_sha();
+    let version = flow_version();
+    let git_sha = flow_git_sha();
+    // The build IDENTITY (eng-versioning(7) "version subcommand output"):
+    // `<version>+<sha>`, one greppable token. Runtime: env!("POSH_BUILD").
+    println!("cargo:rustc-env=POSH_BUILD={version}+{git_sha}");
 }
 
-/// Resolve and flow the authoritative version, in order:
+/// Resolve and flow the authoritative version, returning it for [`flow`] to
+/// compose into `POSH_BUILD`. Resolution order:
 ///   1. `$POSH_VERSION` in the build environment (set by the nix derivation).
 ///   2. `../../version.env` relative to the crate (dev builds from the
 ///      workspace checkout).
 ///   3. `CARGO_PKG_VERSION` as a never-hit fallback (only when neither source
 ///      exists, e.g. a published crate tarball), so `env!("POSH_VERSION")`
 ///      always resolves.
-fn flow_version() {
+fn flow_version() -> String {
     println!("cargo:rerun-if-env-changed=POSH_VERSION");
 
     let manifest_dir = PathBuf::from(env::var("CARGO_MANIFEST_DIR").expect("CARGO_MANIFEST_DIR"));
@@ -54,14 +65,16 @@ fn flow_version() {
 
     // Flow the authoritative version into the crate. Runtime: env!("POSH_VERSION").
     println!("cargo:rustc-env=POSH_VERSION={version}");
+    version
 }
 
-/// Resolve and flow the git revision (github #63). Resolves like the version:
+/// Resolve and flow the git revision (github #63), returning it for [`flow`]
+/// to compose into `POSH_BUILD`. Resolves like the version:
 ///   1. `$POSH_GIT_SHA` in the build env (set by the nix derivation from the
 ///      flake's git rev — already carries a "-dirty" suffix when unclean).
 ///   2. `git` in a dev checkout — short sha plus "-dirty" for a modified tree.
 ///   3. "unknown" (no env, no git — e.g. a source tarball).
-fn flow_git_sha() {
+fn flow_git_sha() -> String {
     println!("cargo:rerun-if-env-changed=POSH_GIT_SHA");
     let git_sha = env::var("POSH_GIT_SHA")
         .ok()
@@ -69,6 +82,7 @@ fn flow_git_sha() {
         .or_else(git_describe)
         .unwrap_or_else(|| "unknown".to_string());
     println!("cargo:rustc-env=POSH_GIT_SHA={git_sha}");
+    git_sha
 }
 
 /// Dev-checkout git revision: `<short-sha>` plus `-dirty` when the working tree

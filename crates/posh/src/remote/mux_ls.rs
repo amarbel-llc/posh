@@ -6,7 +6,7 @@
 //!
 //! The rows are parsed from the daemons' own status one-liners — the
 //! `mux <key>: self=… state=… …` line a daemon answers `Status` with, and
-//! the `posh <ver> (<sha>) pid=… …` line a served endpoint writes to its
+//! the `posh <ver>+<sha> pid=… …` line a served endpoint writes to its
 //! status socket — rather than from a second wire shape, so an older daemon
 //! that reports fewer fields degrades to blank cells, and `mux ls --raw`
 //! (the verbatim lines) stays the single source of truth for a soak grep.
@@ -73,8 +73,8 @@ pub struct Entry {
     pub role: Role,
     pub health: Health,
     pub note: String,
-    /// A served peer's build, reported as the line's prefix (`posh 1.2.3
-    /// (sha)`) rather than a `self=` field.
+    /// A served peer's build, reported as the line's prefix
+    /// (`posh 1.2.3+sha`) rather than a `self=` field.
     pub build: String,
     pub fields: Vec<(String, String)>,
 }
@@ -89,9 +89,9 @@ impl Entry {
 }
 
 /// Splits a status line's body into its leading free text and its `k=v`
-/// pairs. A whitespace token without `=` extends the previous value (so
-/// `self=1.2.3 (abc)` keeps its parenthesized sha) or, before any pair,
-/// the prefix.
+/// pairs. A whitespace token without `=` extends the previous value (so a
+/// pre-composed-build daemon's `self=1.2.3 (abc)` keeps its parenthesized
+/// sha) or, before any pair, the prefix.
 fn parse_kv(body: &str) -> (String, Vec<(String, String)>) {
     let mut prefix = String::new();
     let mut fields: Vec<(String, String)> = Vec::new();
@@ -300,8 +300,11 @@ pub fn render() -> Result<()> {
 mod tests {
     use super::*;
 
-    const LIVE: &str = "mux box: self=0.9.1 (abc1234) state=connected peer=100.64.0.2:60001 remote=0.9.0 (def5678) heard=1234ms channels=2 session_channels=1 refs=3 linger=off cwnd=8192 cuts=0 streak_hwm=0\n";
+    const LIVE: &str = "mux box: self=0.9.1+abc1234 state=connected peer=100.64.0.2:60001 remote=0.9.0+def5678 heard=1234ms channels=2 session_channels=1 refs=3 linger=off cwnd=8192 cuts=0 streak_hwm=0\n";
 
+    /// A daemon predating the composed `<ver>+<sha>` build string renders its
+    /// build as `<ver> (<sha>)`, and `mux ls` reads whatever the daemons on
+    /// this host actually run — so the whitespace-extending parse stays.
     #[test]
     fn kv_parse_keeps_parenthesized_values_and_the_prefix() {
         let (prefix, fields) = parse_kv("posh 9.9.9 (cafef00) pid=7 peer=none heard=5ms");
@@ -341,15 +344,15 @@ mod tests {
         assert_eq!(entries[2].health, Health::OldGeneration);
         let live = &entries[1];
         assert_eq!(live.role, Role::Client);
-        assert_eq!(live.field("self"), "0.9.1 (abc1234)");
+        assert_eq!(live.field("self"), "0.9.1+abc1234");
         let r = row(live);
         let cells = r["cells"].as_array().unwrap();
         assert_eq!(cells[0], "box");
         assert_eq!(cells[1], "client");
         assert_eq!(cells[2]["spans"][0]["sev"], "ok");
         assert_eq!(cells[3], "connected");
-        assert_eq!(cells[4], "0.9.1 (abc1234)");
-        assert_eq!(cells[5], "0.9.0 (def5678)");
+        assert_eq!(cells[4], "0.9.1+abc1234");
+        assert_eq!(cells[5], "0.9.0+def5678");
         assert_eq!(cells[6], "100.64.0.2:60001");
         assert_eq!(cells[7], "1.2s");
         assert_eq!(cells[8], "2/1");
@@ -365,7 +368,7 @@ mod tests {
 
     #[test]
     fn served_rows_take_the_build_from_the_prefix() {
-        let raw = "endpoint mux-alpha: posh 9.9.9 (cafef00) pid=7 peer=100.64.0.9:5000 heard=90000ms agent_channels=1 opened_total=4 owns_agent_sock=true session_channels=0\n\
+        let raw = "endpoint mux-alpha: posh 9.9.9+cafef00 pid=7 peer=100.64.0.9:5000 heard=90000ms agent_channels=1 opened_total=4 owns_agent_sock=true session_channels=0\n\
                    endpoint mux-beta: stale (connection refused)\n";
         let entries = entries_from_raw(mux::MUX_LS_EMPTY, raw);
         assert_eq!(entries.len(), 2);
@@ -374,7 +377,7 @@ mod tests {
         assert_eq!(cells[0], "mux-alpha");
         assert_eq!(cells[1], "served");
         assert_eq!(cells[3], "serving");
-        assert_eq!(cells[4], "9.9.9 (cafef00)");
+        assert_eq!(cells[4], "9.9.9+cafef00");
         assert_eq!(cells[5], "");
         assert_eq!(cells[7], "1m30s");
         assert_eq!(cells[8], "1/0");

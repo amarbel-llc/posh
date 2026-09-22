@@ -20,11 +20,13 @@ use remote::datagram::Family;
 use session::{Config, ListFormat};
 use util::{Error, Result};
 
-// Flowed from version.env (POSH_VERSION) by build.rs; see eng-versioning(7).
-const VERSION: &str = env!("POSH_VERSION");
-// Git revision (short sha, "-dirty" when the tree was unclean at build), also
-// flowed by build.rs — from the nix flake's rev, or `git` in a dev checkout.
-const GIT_SHA: &str = env!("POSH_GIT_SHA");
+// The build IDENTITY, `<version>+<sha>`, composed once in posh_build from
+// version.env (POSH_VERSION) plus the git rev (POSH_GIT_SHA); see
+// eng-versioning(7). What `posh version` prints and what every build surface
+// renders: a version alone does not identify a build — one host routinely runs
+// several daemons all reporting the same POSH_VERSION. The two parts stay
+// separate on the wire (`caps::ServerIdent`), which joins them with `build()`.
+const BUILD: &str = env!("POSH_BUILD");
 
 fn main() {
     let result = run();
@@ -266,7 +268,7 @@ fn run_once() -> Result<()> {
             Ok(())
         }
         "version" | "v" | "-V" | "--version" => {
-            println!("posh {VERSION} ({GIT_SHA})");
+            println!("posh {BUILD}");
             Ok(())
         }
         "list" | "ls" | "l" => {
@@ -2261,6 +2263,20 @@ OTHER
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// The build identity is composed exactly once (in `posh_build`), so the
+    /// composed `POSH_BUILD` every surface renders and the two parts the wire
+    /// carries (`caps::ServerIdent`) can never disagree. A second composition
+    /// point creeping back in trips this.
+    #[test]
+    fn build_is_the_version_and_sha_joined() {
+        assert_eq!(
+            BUILD,
+            format!("{}+{}", env!("POSH_VERSION"), env!("POSH_GIT_SHA"))
+        );
+        assert!(!env!("POSH_VERSION").is_empty(), "POSH_VERSION not flowed");
+        assert!(!env!("POSH_GIT_SHA").is_empty(), "POSH_GIT_SHA not flowed");
+    }
 
     #[test]
     fn port_range_parsing() {

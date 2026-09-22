@@ -2123,6 +2123,108 @@ debug-posh-mux-table:
 debug-posh-ls:
     script -qec "posh list" /dev/null
 
+# Census the posh builds actually RUNNING on this host, not just the one on
+# PATH: the binaries on disk, every session daemon (`posh status <name>` ->
+# `daemon=`), every client attached to one (the same response's `build=`, which
+# is how a viewport's own build surfaces), every mux daemon (`posh mux ls --raw`
+# -> `self=`), and every Architecture-A roaming server (`<base>/remote/*.status.pid`).
+# Ends with the DISTINCT builds seen and a verdict line.
+#
+# Why this exists: a long-lived daemon keeps running the code it was started
+# with, so one host routinely runs several builds at once while every one of
+# them reports the same POSH_VERSION — which is what makes "reproduces in this
+# viewport, not that one" hard to pin, and what posh#206's stale-daemon banner
+# is built on. Read-only; pair with debug-posh-procs.
+#
+# list every distinct posh build running on this host
+[group("debug")]
+debug-posh-builds:
+    #!/usr/bin/env bash
+    # Deliberately no `-e`: every probe below talks to a live daemon over a
+    # socket, and one unreachable session must not abort the census.
+    set -uo pipefail
+    seen="$(mktemp)"
+    trap 'rm -f "$seen"' EXIT
+    # $1 = where the build was observed, $2 = the build string. Everything is
+    # normalised to the one spelling `<ver>+<sha>` here, so the distinct-set at
+    # the end counts BUILDS and not renderings of the same build. A daemon
+    # still running a pre-composed-build build renders `<ver>(<sha>)` (with or
+    # without a space) — fold that legacy spelling in rather than counting it
+    # as a build of its own. A parenthesised non-build note ("(unreachable…)")
+    # starts with `(`, so it survives unfolded and is skipped below.
+    norm() { sed 's/^\([^ (][^ (]*\) *(\([^)]*\))$/\1+\2/'; }
+    note() {
+      b="$(printf '%s' "$2" | norm)"
+      printf '  %-34s %s\n' "$1" "$b"
+      case "$b" in *+*) printf '%s\n' "$b" >>"$seen" ;; esac
+    }
+    # A session daemon and an Architecture-A roaming server answer the SAME
+    # status shape (RFC 0014 §4.1), so one probe serves both.
+    daemon_build() { sed -n 's/.*daemon=\([^ ]*\).*/\1/p' | head -n1; }
+
+    echo "== binaries on disk =="
+    for b in "$(command -v posh 2>/dev/null)" \
+      '{{ justfile_directory() }}/result/bin/posh' \
+      '{{ justfile_directory() }}/target/debug/posh'; do
+      [ -n "$b" ] && [ -x "$b" ] || continue
+      # `posh <ver>+<sha>` -> `<ver>+<sha>`; an older binary's
+      # `posh <ver> (<sha>)` reaches note() intact and is folded by norm().
+      v="$("$b" version 2>/dev/null | sed -n 's/^posh //p')"
+      note "${b/#$HOME/\~}" "${v:-(no version output)}"
+    done
+
+    echo "== session daemons (and their attached clients) =="
+    names="$(posh list --json 2>/dev/null | grep -o '"name":"[^"]*"' | cut -d'"' -f4)"
+    [ -n "$names" ] || echo "  (no sessions in this group)"
+    for n in $names; do
+      st="$(posh status "$n" 2>&1)"
+      note "daemon $n" "$(printf '%s\n' "$st" | daemon_build)"
+      # Each attached client reports its own Ident as `build=<ver>+<sha>`; a
+      # roaming client's entry arrives via the relay, so a viewport on another
+      # machine shows up here too.
+      printf '%s\n' "$st" | sed -n 's/.*build=\([^ ]*\).*/\1/p' | sort -u \
+        | while read -r b; do note "  client of $n" "$b"; done
+    done
+
+    echo "== mux daemons =="
+    raw="$(posh mux ls --raw 2>/dev/null)"
+    if [ -n "$raw" ]; then
+      # `self=<ver>+<sha>` is one token; a pre-composed-build daemon renders
+      # `self=<ver> (<sha>)`, whose space the first expression folds away (it
+      # rewrites the whole line, so the catch-all below cannot double-print).
+      printf '%s\n' "$raw" \
+        | sed -n -e 's/.*\bself=\([^ ]*\) (\([^)]*\)).*/\1+\2/p' \
+                 -e 's/.*\bself=\([^ ]*\).*/\1/p' | sort -u \
+        | while read -r b; do note "mux daemon" "$b"; done
+    else
+      echo "  (no mux daemons)"
+    fi
+
+    echo "== roaming servers (Architecture A) =="
+    uid="$(id -u)"
+    base="${POSH_DIR:-${XDG_RUNTIME_DIR:-/tmp/posh-$uid}/posh}"
+    found=
+    for f in "$base"/remote/*.status.pid; do
+      [ -e "$f" ] || continue
+      found=1
+      p="$(basename "$f" .status.pid)"
+      # A leftover pidfile whose server is gone answers nothing; say so rather
+      # than emitting a blank build.
+      b="$(posh status "remote-$p" 2>&1 | daemon_build)"
+      note "remote-$p" "${b:-(unreachable — stale pidfile?)}"
+    done
+    [ -n "$found" ] || echo "  (none under $base/remote)"
+
+    echo "== distinct builds seen =="
+    sort -u "$seen" | sed 's/^/  /'
+    count="$(sort -u "$seen" | grep -c .)"
+    if [ "$count" -le 1 ]; then
+      echo "verdict: one build in play"
+    else
+      echo "verdict: $count DISTINCT builds in play — a fix deployed to one of"
+      echo "         them does not reach the others until their processes restart"
+    fi
+
 # Spin up ONE fresh roaming server for hand-testing the command palette, with NO
 # ambient paths. Kills any lingering posh servers, builds the hermetic toolset
 # (absolute /nix/store paths; posh + posh-palette co-installed so Ctrl-^ finds the

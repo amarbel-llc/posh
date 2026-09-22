@@ -686,9 +686,8 @@ fn about_summary(st: &ClientState) -> String {
                 .map(|d| d.as_millis() as u64)
                 .unwrap_or(0);
             format!(
-                "remote: posh {} ({}) pid={} up={}s",
-                id.version,
-                id.git_sha,
+                "remote: posh {} pid={} up={}s",
+                id.build(),
                 id.pid,
                 now_wall.saturating_sub(id.start_unix_ms) / 1000,
             )
@@ -714,9 +713,8 @@ fn about_summary(st: &ClientState) -> String {
         None => "activity: (not reported; pre-#193 daemon, or not yet delivered)".to_string(),
     };
     format!(
-        "posh {} ({})\n{remote}\n{remote_state}\n{activity}\nmode: {mode}\n{}\n{}\n{}\n{}\n{}",
-        env!("POSH_VERSION"),
-        env!("POSH_GIT_SHA"),
+        "posh {}\n{remote}\n{remote_state}\n{activity}\nmode: {mode}\n{}\n{}\n{}\n{}\n{}",
+        env!("POSH_BUILD"),
         gate("POSH_MUX", crate::remote::mux::mux_selected()),
         gate("POSH_MUX_SESSIONS", crate::remote::mux::mux_sessions_selected()),
         gate("POSH_CHANNELS", crate::remote::sshwrap::channels_selected()),
@@ -4796,7 +4794,7 @@ mod tests {
     fn about_summary_reports_gates_mode_and_version() {
         let st = test_state(24, 80);
         let s = about_summary(&st);
-        assert!(s.contains(&format!("posh {}", env!("POSH_VERSION"))), "{s}");
+        assert!(s.contains(concat!("posh ", env!("POSH_BUILD"))), "{s}");
         assert!(s.contains("mode: per-invocation connection (baseline)"), "{s}");
         for gate in [
             "POSH_MUX=",

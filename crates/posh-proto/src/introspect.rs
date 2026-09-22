@@ -357,7 +357,7 @@ pub struct ClientRecord {
 pub fn render_client_line(r: &ClientRecord) -> String {
     let mut out = String::from("client");
     match &r.ident {
-        Some(id) => out.push_str(&format!(" pid={} build={}({})", id.pid, id.version, id.git_sha)),
+        Some(id) => out.push_str(&format!(" pid={} build={}", id.pid, id.build())),
         None => out.push_str(" build=unknown"),
     }
     if let Some(pid) = r.via_relay_pid {
@@ -527,7 +527,7 @@ mod tests {
         }
         assert_eq!(
             line,
-            "client pid=7 build=9.9.9(cafef00) via=relay pid=8 echo=optimistic \
+            "client pid=7 build=9.9.9+cafef00 via=relay pid=8 echo=optimistic \
              control=auto-escalated srtt=412 rto=900 codec=morph gates=echo:1,alt:1,active:1 \
              thresholds=150/3000/80/15000 predict=11/22/33 resets=44 age=1234"
         );

@@ -102,9 +102,10 @@ pub fn git_rev() -> &'static str {
 /// `version+sha`. poshterity stamps this into the `.castx` `emu_rev` header so a
 /// recorded golden frame can be audited against the exact emulator build that
 /// produced it (github #71). The single composition point — recorders call
-/// `emu_rev()` rather than assembling the string themselves.
+/// `emu_rev()` rather than assembling the string themselves. The join itself
+/// happens once, in `posh_build` (`POSH_BUILD`); this reads it back.
 pub fn emu_rev() -> String {
-    format!("{}+{}", version(), git_rev())
+    env!("POSH_BUILD").to_string()
 }
 
 #[cfg(test)]
@@ -113,7 +114,9 @@ mod provenance_tests {
 
     /// Provenance guard (github #71): the build must flow both a version and a
     /// git sha, and `emu_rev()` must compose them as `version+sha`. A build
-    /// product shipping without provenance trips this.
+    /// product shipping without provenance trips this. Since `emu_rev()` reads
+    /// the pre-composed `POSH_BUILD`, this is also the guard that the composed
+    /// string and its two parts agree.
     #[test]
     fn emu_rev_composes_version_and_git_rev() {
         assert!(!version().is_empty(), "POSH_VERSION not flowed");

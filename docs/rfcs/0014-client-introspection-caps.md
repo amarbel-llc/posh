@@ -232,19 +232,25 @@ writer MAY omit a key whose value is unknown.
 
 Session line:
 
-    session=<name> group=<group> daemon=<version>(<sha>) pid=<u32> \
+    session=<name> group=<group> daemon=<version>+<sha> pid=<u32> \
       frames=<on|off> echo_flag=<0|1> alt_screen=<0|1> clients=<n> \
       activity="<label>"
 
 Client line (one per retained client, `via=` present only for a relayed origin):
 
-    client pid=<u32> build=<version>(<sha>) [via=relay pid=<u32>] \
+    client pid=<u32> build=<version>+<sha> [via=relay pid=<u32>] \
       echo=<model> control=<auto|auto-escalated|pinned-env|pinned-palette|gate-off> \
       srtt=<ms|none> rto=<ms> codec=<dumpdiff|morph|unknown> \
       gates=echo:<0|1>,alt:<0|1>,active:<0|1> \
       thresholds=<esc_srtt>/<esc_hold>/<deesc_srtt>/<deesc_hold> \
       predict=<correct>/<nocredit>/<incorrect> resets=<n> age=<ms> \
       [upstream=<n>]
+
+`daemon=` and `build=` render the build IDENTITY `<version>+<sha>` — the same
+string `posh version` prints. The wire keeps the two as the separate
+`SERVER_IDENT`/`CLIENT_IDENT` fields of §1.1, so a mixed-version peer reads
+each on its own; joining them is a rendering choice, and the joined string is
+comparable for equality only (SemVer build metadata carries no ordering).
 
 `age` is milliseconds since the `CLIENT_STATE` entry was decoded. `echo` renders
 the §2.2 model name, with value 0 rendered as `none` (a client that reported it

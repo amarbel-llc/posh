@@ -74,7 +74,12 @@ the `eng-*(7)` manpages — read them with `man eng-versioning`,
   repo root is the single source of truth. The crate manifests carry an inert
   `0.0.0` placeholder (`version.workspace = true`); each crate's `build.rs`
   flows `POSH_VERSION` in at compile time, so there is no `Cargo.toml` version
-  to keep in lockstep. `just bump-version <sem>` rewrites only `version.env`;
+  to keep in lockstep. `flow()` also composes `POSH_BUILD` = `<version>+<sha>`
+  — the build identity every surface renders, joined there and nowhere else
+  (a version alone does not identify a build; `just debug-posh-builds`
+  censuses the several one host runs). The wire keeps the parts separate;
+  `ServerIdent::build()` joins. `+` is SemVer metadata: equality, NO ordering.
+  `just bump-version <sem>` rewrites only `version.env`;
   `just tag` / `just release` cut signed `vX.Y.Z` releases. NOTE: `mosh`
   (vendored upstream, `1.4.0`) and `posht` (Go) keep their own independent
   version lineages — do not fold them into `POSH_VERSION`. `posh-rec` also

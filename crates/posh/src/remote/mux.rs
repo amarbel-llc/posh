@@ -758,15 +758,14 @@ fn status_line(ctx: &MuxStatusCtx, state: &MuxState) -> String {
     format!(
         "mux {key}: self={slf} state={cs} peer={peer} remote={remote} heard={heard}ms channels={ch} session_channels={sess} refs={refs} linger={linger} cwnd={cwnd} cuts={cuts} streak_hwm={hwm}",
         key = ctx.key,
-        slf = format_args!("{} ({})", env!("POSH_VERSION"), env!("POSH_GIT_SHA")),
+        slf = env!("POSH_BUILD"),
         cs = ctx.conn_state.label(),
         peer = ctx
             .peer
             .map_or_else(|| "none".to_string(), |a| a.to_string()),
-        remote = ctx.remote_ident.map_or_else(
-            || "unknown".to_string(),
-            |id| format!("{} ({})", id.version, id.git_sha)
-        ),
+        remote = ctx
+            .remote_ident
+            .map_or_else(|| "unknown".to_string(), |id| id.build()),
         heard = ctx.heard_age_ms,
         ch = ctx.channels,
         sess = ctx.session_channels,
@@ -1564,8 +1563,8 @@ fn mux_loop(
                                             util::log_write(
                                                 "info",
                                                 &format!(
-                                                    "remote endpoint: posh {} ({})",
-                                                    id.version, id.git_sha
+                                                    "remote endpoint: posh {}",
+                                                    id.build()
                                                 ),
                                             );
                                             remote_ident = Some(id);
@@ -3137,7 +3136,7 @@ mod tests {
             // The daemon's OWN build: a long-lived daemon answers with the
             // code it runs, not what's on disk — the "is this daemon stale"
             // introspection question.
-            concat!("self=", env!("POSH_VERSION"), " (", env!("POSH_GIT_SHA"), ")"),
+            concat!("self=", env!("POSH_BUILD")),
             "refs=1",
             "channels=0",
             "session_channels=0",
@@ -3543,7 +3542,7 @@ mod tests {
         let live = UnixListener::bind(dir.join("mux-alpha.status.sock")).unwrap();
         let answer = std::thread::spawn(move || {
             if let Ok((mut s, _)) = live.accept() {
-                let _ = s.write_all(b"posh 9.9.9 (cafef00) owns_agent_sock=true\n");
+                let _ = s.write_all(b"posh 9.9.9+cafef00 owns_agent_sock=true\n");
             }
         });
         // Stale: bound then dropped — connect refused. And a non-status
@@ -3826,7 +3825,7 @@ mod tests {
         send_ident_frame(&mut server, "9.9.9", "cafef00");
         // The status line reports the remote build (mux ls's new column).
         let mut obs = ipc_observer(&mux_socket_path_in(&dir, "ident"));
-        wait_status_contains(&mut obs, "remote=9.9.9 (cafef00)");
+        wait_status_contains(&mut obs, "remote=9.9.9+cafef00");
         drop(obs);
         daemon.join().unwrap();
         std::fs::remove_dir_all(&dir).ok();
@@ -3896,7 +3895,7 @@ mod tests {
         let mut assembly1 = sync::FragmentAssembly::new();
         recv_ident_request(&mut server1, &mut assembly1);
         send_ident_frame(&mut server1, "9.9.9", "cafef00");
-        wait_status_contains(&mut ipc, "remote=9.9.9 (cafef00)");
+        wait_status_contains(&mut ipc, "remote=9.9.9+cafef00");
 
         // Phase 2: peer 1 never speaks again. The probe arms, the verdict
         // lands, attempt 0 fails, attempt 1 (post-backoff) swaps the wire —
@@ -3905,7 +3904,7 @@ mod tests {
         let mut assembly2 = sync::FragmentAssembly::new();
         recv_ident_request(&mut server2, &mut assembly2);
         send_ident_frame(&mut server2, "8.8.8", "beefbee");
-        wait_status_contains(&mut ipc, "remote=8.8.8 (beefbee)");
+        wait_status_contains(&mut ipc, "remote=8.8.8+beefbee");
         wait_status_contains(&mut ipc, "state=connected");
         assert_eq!(
             attempts.load(Ordering::Relaxed),

@@ -240,6 +240,21 @@ pub struct ServerIdent {
     pub start_unix_ms: u64,
 }
 
+impl ServerIdent {
+    /// The build IDENTITY: `<version>+<sha>`, the same string the far end's
+    /// `posh version` prints. Two peers are running the SAME build iff this
+    /// matches — the version alone does not identify a build (one host
+    /// routinely runs several daemons reporting one `POSH_VERSION`), which is
+    /// why the two fields stay separate on the wire and are joined only here.
+    ///
+    /// SemVer treats everything after `+` as build metadata, so this string is
+    /// comparable for EQUALITY and carries NO ordering: to ask which peer is
+    /// newer, compare `version` — never this.
+    pub fn build(&self) -> String {
+        format!("{}+{}", self.version, self.git_sha)
+    }
+}
+
 /// Format version of the [`ServerIdent`] payload; bumped on layout change,
 /// and an unknown value is REJECTED by [`decode_server_ident`] (the requester
 /// keeps its "unknown" display rather than misparsing a future layout).
