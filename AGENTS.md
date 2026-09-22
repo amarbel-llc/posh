@@ -6,9 +6,41 @@ POSH is **the portable shell**: terminal sessions that roam across networks
 namespace. This file orients an agent working in the repo; the README is the
 human-facing introduction.
 
+**This file is deliberately a router, not a manual.** posh documents itself in
+four places — man pages, design records, justfile recipe comments, and the
+session prompt — each of which is fuller and closer to the code than a summary
+here could stay. A summary of any of them is a standing drift generator: it
+goes stale the commit after it is written, and it is stale silently, because
+nothing checks a prose paragraph against the thing it describes. So the rule
+for editing this file is: **before adding a paragraph, find which of the four
+homes it belongs in, and put it there instead.** Add here only what has no
+home — and then say where it is implemented, so the next reader can leave.
+
+conformist's `agents-md` linter caps this file (40000 characters by default,
+a merge-gate check). The cap is the symptom, not the constraint: an
+orientation doc that grows unbounded stops being one.
+
+## Where the answers live
+
+| question | go to |
+|---|---|
+| what does `$POSH_*` do? | `man posh` / `man posh-client` / `man posh-server` — **ENVIRONMENT** documents every variable, **SIGNALS** every dump |
+| what does a subcommand do? | the same pages — `posh(1)` has the target grammar, the `ph` front door, and every session/remote command |
+| the shape of the whole system | `posh(7)` — namespace, roaming, persistence, takeover, prediction |
+| why does a user-facing feature behave like this? | `docs/features/` (FDRs) — the levers, the rollback, the decisions and their dates |
+| what is on the wire or in a file? | `docs/rfcs/` — RFC 0001 holds the target grammar and the capability registry, maintained **in place** (a new or retired id edits its table, citing the RFC that changed it) |
+| why was it built this way at all? | `docs/decisions/` (ADRs) |
+| can I rely on a record today? | `docs/README.md` — the `status` vocabulary, and the rule that status moves in the commit that moves the code |
+| what does a `just` recipe do, and why? | `just --list` for the catalogue; the **comment block above the recipe** is its documentation, and it is fuller than any summary of it |
+| eng-wide conventions | `man eng-versioning`, `man eng-manpages`, `man eng-design_patterns-justfile`, `man conformist` |
+
+Design records are deliberately not enumerated here — an inline index of a
+growing directory drifts on every new record, and agent sessions are handed
+the current set with statuses automatically.
+
 ## Layout
 
-This is a Cargo workspace plus a vendored C++ reference tree and a Go helper.
+A Cargo workspace plus a vendored C++ reference tree and two Go helpers.
 
 ```
 crates/
@@ -16,22 +48,23 @@ crates/
                (#![forbid(unsafe_code)]; frozen public API in src/lib.rs)
   posh/        the posh binary — session daemon, remote transport, CLI.
                All libc/PTY FFI lives here, never in posh-term.
-  posh-proto/  shared frame/display protocol: the Snapshot + new_frame renderer,
-               the swappable frame codecs (DumpDiff/MorphDelta), the
-               ServerFrame/FrameBody wire types, and the RFC 0001 capability
-               table. Extracted from posh's remote module so poshterity can
-               drive the same codecs without a posh→poshterity→posh cycle (#75).
+  posh-proto/  shared frame/display protocol: the Snapshot + new_frame
+               renderer, the swappable frame codecs (DumpDiff/MorphDelta),
+               the ServerFrame/FrameBody wire types, and the RFC 0001
+               capability table. Extracted so poshterity can drive the same
+               codecs without a posh→poshterity→posh cycle (#75).
   poshterity/  deterministic step-ratcheted terminal recorder/replayer built
                on posh-term (#56 epic); also hosts the deterministic
                server-frame harness (framereplay, #75)
-doc/           scdoc man-page SOURCES — posh(1), posh-server(1),
-               posh-client(1), posh(7). Compiled by the flake; see below.
-docs/          ADRs (docs/decisions/), RFCs (docs/rfcs/), feature records
-               (docs/features/, the FDRs), plans (docs/plans/), manual tests
+  posh-build/  the shared build.rs logic every crate's build.rs calls
+  mosh-ffi/    C++ FFI characterization tests against zz-mosh (not a default
+               workspace member; `just test-mosh-ffi`)
+doc/           scdoc man-page SOURCES, compiled by the flake
+docs/          ADRs, RFCs, FDRs, plans, manual tests — see docs/README.md
 posht/         standalone interactive terminal-capability test (Go/Bubble Tea)
 posh-palette/  the command-palette renderer (Go/Bubble Tea v2): a subprocess
-               the client drives over a JSON-RPC control channel (RFC 0005) and
-               composites onto the session view. Its own Go module, like posht.
+               the client drives over a JSON-RPC control channel (RFC 0005)
+               and composites onto the session view. Its own Go module.
 zz-mosh/       the vendored C++ mosh reference tree (the porting reference);
                has its OWN justfile for host-lane recipes: `just zz-mosh/<r>`
 ```
@@ -54,521 +87,147 @@ nix build .#mosh            # the C++ reference (.#mosh); just build-nix
 nix build .#posht           # the Go capability test; just build-go
 ```
 
-`merge-this-session`'s pre-merge hook runs `just` (= validate+lint+build+
-test) — that IS the CI lane. Do not redundantly run `just` before merging;
-a cheap `go build`/per-crate `cargo build` to check compilation is fine.
+`merge-this-session`'s pre-merge hook runs `just` — that IS the CI lane. Do
+not redundantly run `just` before merging; a cheap `go build` / per-crate
+`cargo build` to check compilation is fine.
 
 The `.#posh` checkPhase runs `cargo test --workspace`, so every workspace
-crate's tests (posh-term, posh, posh-rec) gate merges. The C++ `.#mosh`
-check runs only the sandbox-safe subset; the tmux-driven emulation tests
-SKIP in the sandbox (tracked: wiring them in is #62; the macOS host failure
-is #2).
+crate's tests gate merges. The C++ `.#mosh` check runs only the sandbox-safe
+subset; the tmux-driven emulation tests SKIP in the sandbox (wiring them in
+is #62; the macOS host failure is #2).
 
-## Conventions (eng + repo-specific)
+## Key design facts
 
-This repo follows the eng workspace conventions. The authoritative source is
-the `eng-*(7)` manpages — read them with `man eng-versioning`,
-`man eng-manpages`, `man eng-design_patterns-justfile`, etc. Repo specifics:
+These are **traps** — places where reading the code naively gets it wrong, or
+where two things that look interchangeable are not. Each ends with where the
+full story lives; this list is not a tour of the system.
 
-- **Versioning (eng-versioning(7)):** `version.env` (`POSH_VERSION`) at the
-  repo root is the single source of truth. The crate manifests carry an inert
-  `0.0.0` placeholder (`version.workspace = true`); each crate's `build.rs`
-  flows `POSH_VERSION` in at compile time, so there is no `Cargo.toml` version
-  to keep in lockstep. `flow()` also composes `POSH_BUILD` = `<version>+<sha>`
-  — the build identity every surface renders, joined there and nowhere else
-  (a version alone does not identify a build; `just debug-posh-builds`
-  censuses the several one host runs). The wire keeps the parts separate;
-  `ServerIdent::build()` joins. `+` is SemVer metadata: equality, NO ordering.
-  `just bump-version <sem>` rewrites only `version.env`;
-  `just tag` / `just release` cut signed `vX.Y.Z` releases. NOTE: `mosh`
-  (vendored upstream, `1.4.0`) and `posht` (Go) keep their own independent
-  version lineages — do not fold them into `POSH_VERSION`. `posh-rec` also
-  carries its own lineage (it's meant to be a separable tool). `version.env`
-  conflicts on rebase resolve to the **higher semver** via a custom git merge
-  driver (`scripts/version-merge`, declared in `.gitattributes`); register it
-  per-clone with `just install-merge-driver` (the sweatfile `[hooks].create`
-  does this for fresh spinclass worktrees).
-- **Man pages (eng-manpages(7)):** hand-written scdoc under `doc/*.scd`,
-  compiled into the posh package by the flake's `postInstall` (a generic
-  section-deriving loop). `man posh` etc. resolve via a consumer's
-  home-manager `programs.man`. Lint locally with `just lint-doc`. scdoc
-  pitfall: a line starting with `[` collides with table syntax (escape as
-  `\[`), and a literal `*` inside `_italic_` is a parse error.
-- **Formatting + linting (conformist(7)):** conformist (the treefmt
-  successor) is the formatter+linter gate. `conformist.nix` (eng preset +
-  clang-format/nixfmt/shfmt) is the source of truth; the flake's `formatter`
-  (`nix fmt` / `just codemod-fmt`, repair mode) and `checks.formatting`
-  (`just lint-fmt`, read-only) drive it. `conformist.nix` is the single config
-  source — there is **no** committed `conformist.toml`; the git hooks are
-  store-pinned wrappers (`conformist-pre-commit` / `conformist-repair`,
-  conformist#47/#51/#54) that the flake exposes from
-  `conformistEval.config.build.{preCommit,repair}` (the module derives both from
-  one `mkHookWrapper` body), each baking its own `/nix/store` config — so they
-  format with the same pinned toolchain as `nix fmt`, never silent-skipping a
-  file type the ambient PATH lacks. The impure git-state lane (agents-md, git-remotes, sweatfile, clippy, …) runs
-  via `just lint-worktree`; the clippy linter (conformist#69, opt-in, enabled in
-  `conformistImpureEval`) is posh's workspace `cargo clippy --all-targets -- -D warnings`
-  gate. The sweatfile wires the spinclass hooks: `pre-commit`
-  (`conformist-pre-commit`, format at authoring time) and `repair`
-  (`conformist-repair`, fold fixes in before the pre-merge verify gate); both
-  live on the devShell PATH, and a fresh `sc start`/`sc resume` installs the
-  pre-commit hook.
-- **Justfile (eng-design_patterns-justfile(7)):** verb-noun leaf recipes
-  under bare aggregates; `[group(...)]` attributes; `default` is the first
-  recipe. Add release/maintenance recipes to the `maintenance` group.
-- **Docs:** significant designs get a record under `docs/` — ADR for
-  architecture decisions, RFC for wire/file-format contracts, FDR for
-  user-facing features. The records are deliberately NOT enumerated here: an
-  inline list goes stale on every new record, and the current set with statuses
-  is supplied to agent sessions automatically. Browse `docs/rfcs/`,
-  `docs/features/`, and `docs/decisions/` for the live set. The target grammar
-  + capability registry is RFC 0001, and that registry is maintained IN PLACE —
-  a new or retired capability id updates its table, citing the RFC that changed
-  it.
-
-## Key design facts (load-bearing, verified)
-
-- **Session lifecycle:** a session is owned by a double-forked daemon, not
-  any client. Detach/disconnect/roam leave it running; the daemon exits
-  (killing its process group, propagating the shell's exit code) only when
-  the shell itself exits. `crates/posh/src/session/daemon.rs`.
-- **A remote attach takes over the terminal FIRST and hosts its whole
-  establishment — the bootstrap ssh included — in a palette-style modal (#1
-  → posh#195 → FDR 0019):** `cmd_ssh_session` / `cmd_ssh` begin a
-  `connect_progress::Takeover` before the mux endpoint ensure (raw mode,
-  smcup, a stderr CAPTURE replayed after rmcup; dropped at return).
-  `CrapModal` (progress: `crap-present` captured off a PTY) shows before/after
-  the ssh phase; `SshModal` DURING it — `sshwrap::bootstrap_in_modal` runs ssh
-  on a cooked+echo PTY that is its controlling tty (prompts land in the modal,
-  keystrokes forward to it), the `POSH …` handshake scraped off by the
-  byte-fed `LineScraper` so the key never renders. `Takeover::handoff` gives
-  the client loop the modal + painter state (`drive_client(inherited)` neither
-  smcups nor rmcups). Off-tty there is no takeover. A `run_daemon` spawned
-  under the takeover `close_inherited_fds`. A COLD endpoint's bootstrap runs
-  in the modal too (`mux::seed_cold_endpoint` → `SeededEndpoint` for the
-  daemon's first establish, posh#198); only its reconnects stay tty-less.
-- **Multi-client sizing is smallest-wins, and the DAEMON owns it:** the
-  session daemon sizes the pty to the elementwise MINIMUM across all attached
-  clients (`min_client_size`/`apply_client_size`, `session/daemon.rs`; tmux
-  `window-size smallest`). So every client but the smallest permanently
-  renders a session smaller than its own terminal — a steady state, not a
-  transient. The roaming server (`remote/server.rs`) is by contrast
-  **single-peer**: its `client_size` is one peer's size, not an arbitration.
+- **Two serializers, two contracts** (`posh-term/src/dump.rs`): `dump_vt()`
+  targets a freshly built `Terminal` that MAY BE LARGER than the source, so
+  it must never derive a position from an assumed height; `dump_vt_flat()`
+  targets a REAL tty that may carry mode leftovers, so it emits
+  `DRAWABLE_STATE_RESET` first. Swapping one for the other at a call site is
+  a bug, not a refactor.
 - **Geometry travels UP only:** a client reports its size (`Tag::Init` /
   `Tag::Resize`); nothing ever tells a client the resulting session size.
-  `ServerFrame` carries no dimensions, and `Snapshot` has `rows`/`cols` but is
-  encode-side only, never serialized. So a client sizes its mirror `Terminal`
-  to its own tty — which, with smallest-wins above, is the wrong size. This is
-  the root of the mismatched-size cursor bugs; ADR 0006 + RFC 0012 propose
-  carrying the geometry on the frame.
-- **Two serializers, two contracts** (`posh-term/src/dump.rs`): `dump_vt()`
-  targets a freshly built `Terminal` that MAY BE LARGER than the source, so it
-  must never derive a position from an assumed height; `dump_vt_flat()`
-  targets a REAL tty that may carry mode leftovers, so it emits
-  `DRAWABLE_STATE_RESET` first. Swapping one for the other at a call site is a
-  bug, not a refactor.
+  `ServerFrame` carries no dimensions, and `Snapshot`'s `rows`/`cols` are
+  encode-side only, never serialized — so a client sizes its mirror
+  `Terminal` to its own tty, which is the wrong size whenever it is not the
+  smallest client. Root of the mismatched-size cursor bugs. ADR 0006 +
+  RFC 0012.
+- **Multi-client sizing is smallest-wins, and the DAEMON owns it**
+  (`min_client_size` / `apply_client_size`, `session/daemon.rs`; tmux
+  `window-size smallest`). Every client but the smallest permanently renders
+  a session smaller than its own terminal — a steady state, not a transient.
+  The roaming server (`remote/server.rs`) is by contrast **single-peer**: its
+  `client_size` is one peer's size, not an arbitration.
 - **Frames are unconditional daemon-side but NOT universal:** a client gets
-  frames iff it advertises `CAP_PROTOCOL_VERSION` in its `Tag::Init` capability
-  table — `is_frame_capable` tests for that specific id, not merely for a table
-  being present. A client without it stays on raw `Tag::Output` (the old-client
-  skew case). The daemon-side `POSH_SESSION_FRAMES` opt-out was RETIRED
-  2026-08-25 (posh#171; the roaming server never had one) — the env var is
-  ignored, and the only rollback to Architecture A is `POSH_RELAY=0`. `daemon.rs`'s
-  version-skew tests pin the client-caps axis.
-- **The RFC 0011 channel envelope is opt-in and default-off:** setting
-  `POSH_CHANNELS=1` client-side makes the ssh bootstrap append `--channels`,
-  and only then does the datagram connection speak the 9-byte envelope — the
-  session stream on one channel, each forwarded agent connection on its own
-  `agent` channel (`AgentChannelMux`, `remote/agent.rs`), retired cap ids
-  6/7/8 never on the wire. Without the selector the wire is byte-identical
-  baseline; `remote/channel.rs` (`seal_instruction`/`open_any_instruction`)
-  is the single mode gate. The per-destination mux endpoint (M1,
-  `remote/mux.rs` + `posh-server agent`) is DEFAULT ON (`POSH_MUX=0` opts
-  out — FDR 0014 promotion): one enveloped connection per destination owns
-  agent forwarding (or carries sessions only, when nothing forwards),
-  sessions bootstrap with forwarding off,
-  and remote `agent/sock` ownership is structural from a single client host.
-  **Sessions still get `SSH_AUTH_SOCK=<base>/agent/sock` at birth**: with no
-  `-A` riding to `posh-server` the client sends the `POSH_AGENT_EXPORT=1`
-  env prefix instead (posh#161; `agent::session_auth_env`, honored by
-  `server::run` + the relay; an older server ignores it), and every posh
-  bootstrap ssh under endpoint ownership runs with the real `-a` (derived in
-  `sshwrap::ssh_args` from the export, unless the flag was explicit) — an
-  sshd-forwarded socket in the session env is a connection-bound competitor
-  the host's login rendezvous latches onto.
-  Any endpoint failure (old remote without the `agent` verb included) falls
-  back to per-connection forwarding with a one-line warning. The FDR 0004
-  symlink election code PERSISTS for the opt-out, mixed versions, and the
-  two-client-host election (RFC 0011 §7 conditional rule — direct
-  `agent/sock` bind stays a future decision; design:
-  `docs/plans/2026-07-28-connection-mux-endpoint-design.md`). M2 session
-  sharing is DEFAULT ON (`POSH_MUX_SESSIONS=0` opts out; promoted from
-  opt-in 2026-09-03): a `host:session`
-  attach rides the mux connection as a session channel (`mux_loop`
-  routes whole messages; the remote `posh-server mux` channel table applies
-  the §3 relay contract per channel; `remote/client.rs`'s `Wire` seam keeps
-  prediction/rendering in the foreground process), falling back
-  per-invocation on any failure. **A riding session SURVIVES a mux-wire
-  death+reconnect** (posh#162 seam): on the dead-wire verdict the daemon
-  RETAINS each session channel (does not tear it down, sends the client no
-  close) with its ref held, and the open-until-confirmed pass re-drives the
-  OPEN with the stored target on the fresh wire — reattaching to the surviving
-  remote session daemon (`connect_or_create` is idempotent). **The re-driven
-  OPEN carries a `SessionResume` cursor** (`remote/resume.rs`) — every offset
-  that must stay continuous when the transport is rebuilt, tracked by the mux
-  daemon off the acks on relayed frames: the FRAME ceiling (the surviving
-  daemon's fresh producer restarts `frame_num` low, so it is rewrapped ABOVE the
-  client's `applied_num` or the reattach `Full` lands `frame_num < applied_num`
-  and the client drops it as stale and wedges — posh#162), the daemon-applied
-  INPUT offset (the fresh bridge seeds its `InputInbox` here so the viewport's
-  re-sent reliable-input tail is accepted, not dropped as a gap — which silently
-  lost every keystroke typed across a reconnect), and the ECHO-ack offset (the
-  `always` predictor's confirm boundary, so local echo of durable pending input
-  stays consistent). The fresh bridge is CONSTRUCTED from the cursor
-  (`InputInbox::resume` / `EchoAck::resume` / frame offset), and because
-  `SessionResume` has no blanket `Default`, a new durable stream is a field the
-  compiler forces every reattach site and the wire codec to carry — the
-  invariant is structural, not per-stream discipline. posh#186 already preserved
-  input/echo across an FDR 0012 re-home (same bridge); this extends the same
-  continuity to a reconnect (fresh bridge). The cursor's fields, its
-  versioned skew-safe OPEN encoding, and the "durable stream ⇒ a
-  `SessionResume` field" invariant are specified in RFC 0015 (extending
-  RFC 0008 §3.1). The client is
-  sent nothing: frames stall, the transport-agnostic "Last contact N ago"
-  banner counts up, and the reattach repaint clears it — mosh-parity, a wire
-  blip is invisible exactly as on the baseline per-invocation UDP path
-  (`mux.rs` wire-dead verdict block; a remote that never answers the re-OPEN
-  is caught by the open-timeout give-up, a real close the client exits on).
-  The palette's *About / transport info* command shows the mode and every
-  gate's resolved value.
-- **posh-term is pure state:** feed PTY bytes via `Terminal::process`, read
-  the screen via `screen()`/`dump_vt()`/`dump_text()`, drain query replies
-  via `take_responses()`. `generation()` bumps on every visible change;
-  `mid_escape()` marks escape-sequence boundaries. The public API (lib.rs)
-  is frozen: callers may ADD items, never remove/change signatures.
+  frames iff it advertises `CAP_PROTOCOL_VERSION` in its `Tag::Init`
+  capability table — `is_frame_capable` tests for that specific id, not
+  merely for a table being present. Without it a client stays on raw
+  `Tag::Output` (the old-client skew case, pinned by `daemon.rs`'s
+  version-skew tests). `POSH_SESSION_FRAMES` was retired 2026-08-25
+  (posh#171) and is ignored; the only rollback to Architecture A is
+  `POSH_RELAY=0`.
+- **posh-term is pure state, and its API is frozen:** feed PTY bytes via
+  `Terminal::process`, read via `screen()` / `dump_vt()` / `dump_text()`,
+  drain query replies via `take_responses()`. `generation()` bumps on every
+  visible change; `mid_escape()` marks escape-sequence boundaries. Callers
+  may ADD to `lib.rs`, never remove or change a signature.
 - **Stream parsing (ADR-0003):** multi-byte structures (escape sequences,
   framed records) MUST be reassembled across read boundaries via a byte-fed
   state machine — never assume a `read()` delivers a whole sequence.
-- **Escape-to-shell overlay (FDR 0008):** the palette's *Shell out* command
-  (FDR 0009; originally `Ctrl-^ s`) makes the *server* spawn a transient second
-  PTY + `posh_term::Terminal` in the session cwd; while it is up the broadcast
-  source and input sink swap to that overlay (the live session keeps running
-  underneath, just unbroadcast) and frames carry `FLAG_OVERLAY`.
-  `remote/server.rs:server_loop`. Server-side because the worktree lives on the
-  server for cross-host roaming.
-- **Command palette (FDR 0009):** `Ctrl-^` opens the `posh-palette` renderer
-  subprocess (its own Go module) driven over the RFC 0005 JSON-RPC channel on
-  fd 3, composited onto the session `Snapshot`. It is the escape menu (echo,
-  logging, shell-out, suspend, quit); `Ctrl-^ .` survives only as the
-  renderer-unavailable emergency quit. `remote/client.rs` + `remote/palette.rs`.
-  **The same renderer is the FDR 0016 session picker:** RFC 0005 §3.5 adds a
-  generic `picker` view (aligned rows + a per-row action). `picker.rs` owns
-  the rows (`session::picker_entries_*`: the local scan, or a host's
-  `posh list --json`, over this machine plus the live mux endpoints —
-  `mux::live_endpoint_dests`, the `<key>.dest` sidecar) and the switch
-  hand-off. Two hosts: `ph` / `ph host:` run it standalone
-  (`palette::choose_standalone`, composited onto a blank frame); in-session,
-  both palettes' *Switch session…* (`session.list`) re-shows the renderer as
-  the picker. A `session.switch {target}` selection is a RE-DIAL: the client
-  records the target (`picker::request_switch`) and ends its attach (quit /
-  detach), and `main.rs`'s `run()` loop re-attaches through `ph_parse` —
-  the same routing as typing the target. A transition never KILLS the
-  session it leaves (killing is deferred to v2 session management; popping
-  back is the cleanup), so the selection is the whole answer — no leave
-  question, no `previous`. **One state machine:** `picker.rs` holds ONE
-  `VIEWPORT` and a pure `apply(state, event) -> Vec<Effect>`; the CALLER
-  performs the effects. **Stacked switching:** `Event::Entered` is the only
-  thing that moves `current`, and it PUSHES what it leaves — so no caller
-  can record arriving without the push (there is no public `set_current`;
-  the FDR 0012 in-place re-home did exactly that and lost the session).
-  Only a pop pops. The palettes offer *Back to X* (`session.pop`,
-  `picker::request_pop` / `back_row`) while `picker::stack_top` is Some.
-  **Auto-pop:** every client loop notes WHY its attach ended
-  (`picker::note_attach_end`: `Ended(status)` on the shutdown / `Tag::Exit`
-  frame, `Lost(reason)` when an established mux channel or the daemon socket
-  closes unasked, `Quit` for a user quit / detach / switch / signal — the
-  local loop's `detaching` flag tells a detach's socket close from a loss);
-  `Event::AttachReturned` consumes it and, for `Ended` / `Lost` with a stack
-  top, dials the top and leaves a `session X ended (exit N) — back to Y`
-  notice that `first_frame` / `run_interactive` show. A pop target itself
-  gone (`Event::DialFailed`) pops AGAIN, and the whole chain is reported in
-  ONE `ShowPopNotice` (RFC 0005 §3.6). `Quit` never pops. With no
-  stack, `Ended` becomes the process exit status (the entry points no longer
-  `process::exit` themselves) and `Lost` prints one stderr line. **The
-  cause travels (posh#194):** `daemon_loop` returns a
-  `posh_proto::caps::SessionEnd` (exited / killed / signaled / failed) that
-  teardown sends as `Tag::ExitCause` (ipc 18) ahead of `Tag::Exit`; the
-  relay forwards it as `CAP_EXIT_CAUSE` (id 19, `relay::shutdown_caps`) on
-  its shutdown frame, and the M2 bridge now sends a `FLAG_SHUTDOWN` frame
-  (status + cause) BEFORE the channel close — before this the bridge closed
-  with the raw `Tag::Exit` bytes as the close payload and the roaming
-  client's `exit_status` stayed 0 over mux; the client still decodes such a
-  4-byte close from an older bridge as `Ended`. `AttachEnd::label` /
-  `SessionEnd::label` phrase it (`killed (posh kill)`), and
-  `exit_with_attach_end` prints a killed / signaled / failed / lost end on
-  stderr when nothing pops.
-  The attach entry points record the session they sit in with
-  `picker::entered`, which also feeds `picker::default_title`: a
-  session that set no title of its own is shown as `host:session` on the
-  outer terminal by both clients (compose-time, a set title wins; a UUID
-  name is abbreviated; the daemon's foreground process is appended when
-  known — `flac:ff9fe216 · clown`), so a switch into an untitled session
-  never leaves the previous title standing (the posh#108 first-frame rule
-  leaves an EMPTY title alone on purpose). The process comes from RFC 0013
-  §5.2's `CAP_SESSION_ACTIVITY` (id 15, posh#193): both clients request it
-  on every message / on Init, a relay or bridge forwards the request as
-  `Tag::ClientCaps`, and the daemon (`ClientConn::wants_activity` /
-  `activity_now` / `activity_sent`, `queue_frame`) or the Arch-A server
-  attaches the label to a visible frame only on first request and on
-  change, with the foreground-process probe throttled to 250 ms
-  (`session::activity::PROBE_INTERVAL_MS`).
-  An older renderer answers
-  `-32602` → `PaletteEvent::ViewRejected` → the non-TUI candidate list.
-  Its heading carries the live `rtt` and the echo model in effect
-  (`palette_title`, kept under the renderer's ~42 content columns).
-  **Default echo model is `always`** (unset env): paints every keystroke and
-  bypasses the §5.1 gate (below). **Slow-link escalation (FDR 0006 A/B):** an
-  *adaptive* viewport auto-switches to `optimistic` once a MEASURED SRTT holds
-  >150 ms for 3 s and back <80 ms for 15 s (`predict::EchoEscalation`;
-  `POSH_ECHO_ESCALATE=0` opts out); the default `always` never escalates (a
-  downgrade) — only the palette's `Echo: adaptive` re-arms, any explicit pins. **Predictor vs renderer are orthogonal axes
-  (2026-08-25 split):** the model decides WHAT is predicted and hands the
-  renderer a `RenderAdvice` — its recommendation on showing (adaptive's
-  srtt/glitch trigger), holding (the tentative epoch), and marking (the
-  slow-link flag) — which the renderer honors or disregards.
-  `POSH_PREDICTION_SHOW=always` (default) disregards it: every model paints
-  immediately and every cell is marked, so `adaptive` and `always` LOOK
-  identical (they record the same predictions; only their advice differs).
-  `=advised` honors it — mosh's original behavior as a render choice.
-  `POSH_PREDICTION_RENDER=lookalike|replace|dim` is the look — `lookalike`
-  (default since 2026-09-09, `predict/render.rs::LookalikeRenderer` over
-  `posh_proto::lookalike`) draws an unconfirmed cell as a random look-alike
-  glyph re-picked every 150 ms (per-cell memory so it never repeats; the
-  client's 50 ms prediction tick also runs while it is active so the shimmer
-  repaints), `replace` is the original underline. Above both axes sits the
-  RFC 0007 §5.1 safety gate: the client skips rendering while the remote PTY
-  has ECHO off or the alt-screen is up (`render_gate_open` at the render call)
-  for every model EXCEPT the human-selected `always`, which bypasses the gate
-  entirely — paint every keystroke immediately, correct on the next server
-  frame, incl. a transient password glyph the `always` selection accepts by
-  name (§5.1 opt-out; never available to a GP species) — before the split the
-  mosh models' hold happened to mask most password-prompt leaks; now the gate
-  is explicit. `never` is the
-  one model that records nothing. Mechanically the model never touches the
-  screen: `Predictor::offer()` returns a `RenderStep { buf, advice }` and the
-  renderer walks it (`PredictionRenderer::render_step`, default =
-  `OverlayBuffer::render` under the per-step policies; override for per-cell
-  policy), returning a `RenderOutcome` (painted/marked/held/cursor) — the
-  screen-side gauge shown as `last paint:` in the echo stats, distinct from
-  the model's advice-side `PredictorStats`. `set_echo_safe` is a default
-  no-op hint (optimistic drops its overlay eagerly). Further seams: posh#174.
-  **The hot path is measured, always on:** a stdin read that feeds the
-  predictor arms `ClientState::paint_pending`; the same iteration's
-  `render_to` closes it as a `PaintSample` (total / predict / compose /
-  write µs) when a predicted cell reached the tty, else `unpainted`
-  (`Stats::record_paint*`, `PaintLatency`). Read it as `time-to-paint:` in
-  the echo stats dialog, `paint(...)` in the SIGUSR2 dump, `paint_us=` in
-  the `[stats]` line (`never` = the compose+diff floor every model pays).
-- **A lossy client keeps its recent diff bases (posh#189, `POSH_BASE_HISTORY`,
-  default on):** the session daemon anchors every unacked frame for a lossy
-  (relay / mux-bridge) client at the last frame it saw ACKED and emits one
-  frame per PTY read, so any output faster than a round trip (a fish prompt
-  redraw on every keystroke) makes the next Diff's base fall BEHIND the
-  client's `applied_num`. The roaming client retains the dumps of its last 8
-  applied frames (`ClientState::base_history`) and applies such a Diff against
-  the matching one — the diff from an older base still yields the server's
-  current screen — instead of the old `base < applied_num ⇒ RESYNC ⇒ Full`
-  round trip per burst (the "sluggish, jagged echo" over channels). Morph
-  bodies and a base no longer held keep the strict rule; the history clears on
-  resize. `apply(... base_history=N ...)` in the SIGUSR2 dump / `[stats]` line
-  counts absorbed ack-lag Diffs.
+- **Session lifecycle:** a session is owned by a double-forked daemon, not
+  any client. Detach/disconnect/roam leave it running; the daemon exits
+  (killing its process group, propagating the shell's exit code) only when
+  the shell itself exits. `session/daemon.rs`; posh(7) PERSISTENCE.
+- **The mux endpoint is default-on in both increments, and that is load
+  bearing:** M1 (agent forwarding) and M2 (sessions riding the same
+  connection as channels) both ship on, with `POSH_MUX=0` /
+  `POSH_MUX_SESSIONS=0` as the opt-outs, and every failure falls back
+  per-invocation with a warning. So a change that "only affects the mux
+  path" affects the default path. FDR 0014 for the feature and its
+  decisions, RFC 0011 for the envelope, RFC 0015 for the resume cursor a
+  reconnect must carry, `man posh` for every gate's resolved meaning.
+- **Durable stream ⇒ a `SessionResume` field** (`remote/resume.rs`,
+  RFC 0015): any offset that must stay continuous when the transport is
+  rebuilt goes on the cursor. It has no blanket `Default` precisely so the
+  compiler forces every reattach site and the wire codec to carry a new
+  one — the invariant is structural, not per-stream discipline.
+- **A remote attach takes over the terminal FIRST**, before the mux endpoint
+  ensure, and hosts its whole establishment — the bootstrap ssh included —
+  in a palette-style modal. Off-tty there is no takeover. This is why
+  ordering matters around `cmd_ssh_session` / `cmd_ssh`: FDR 0019.
+- **Predictor and renderer are orthogonal axes** (`predict/`): the model
+  decides WHAT is predicted and hands the renderer a `RenderAdvice`; the
+  renderer honors or disregards it. The default `always` model plus
+  `POSH_PREDICTION_SHOW=always` means `adaptive` and `always` LOOK identical
+  while recording different advice — so "it painted" proves nothing about
+  which model is live. `always` also bypasses the RFC 0007 §5.1 safety gate
+  by design (transient password glyphs included). FDR 0006; the levers are
+  in `man posh-client`.
 
-## Debugging a live / wedged roaming session
+## Conventions: posh's deltas from eng
 
-The roaming server (`remote/server.rs`) owns the PTY directly (mosh-server
-style) and syncs frames over encrypted UDP — it has NO local session-daemon
-socket, so a wedged *remote* session is triaged from the process table, the
-kernel UDP table, and `/proc`, not from `posh list`. Paved-path recipes (all
-read-only, `debug` group):
+The eng conventions are authoritative in the `eng-*(7)` man pages. Read them
+there. What follows is only what is specific to this repo.
 
-- `just debug-posh-procs` / `debug-posh-sockets` — find the `posh-server` /
-  `posh` (client) pids, their UDP ports, and state. A wedge is `S` in
-  `do_sys_poll`, not `D` or spinning; both the server and its shell child
-  stay alive (the transport is what's stuck, not the process).
-- `just debug-posh-proc-state <pid>` / `debug-posh-proc-sample <pid>` —
-  per-pid kernel state + a liveness probe (is the event loop still cycling?).
-- `just debug-posh-dump <pid>` — send `SIGUSR2` and print the one-line
-  transport-state snapshot: peer address, last-heard/last-send ages,
-  acked-vs-current frame, RTT. This is the on-demand introspection a wedged
-  session needs — it works on an already-running process, unlike
-  `POSH_DEBUG_LOG` (start-up-gated). The dump lands in `$POSH_DEBUG_LOG` if
-  set, else a per-pid default `$XDG_RUNTIME_DIR/posh/posh-<role>-<pid>.log`.
-  Implementation: `remote/diag.rs`; documented under SIGNALS in
-  `posh-server`(1) / `posh-client`(1) and recorded in FDR 0007.
-- `just debug-posh-forensics <pid>` — print the most recent apply-stall
-  forensic bundle for a CLIENT pid: a verdict (`SHORT_BASE prefix+suffix>applied`
-  = the #90 wedge; `LEN_OK` = the #94 content divergence) plus the raw
-  `.applied` base dump and `.diff` body bytes for an offline `apply_diff`
-  re-run. Written automatically on the first `ReackAndWait` per wedge episode
-  (no pre-arming needed), and on demand via `SIGUSR2` or the "Dump wedge
-  forensics" palette command. Implementation: `remote/diag.rs::capture_forensics`.
-- `just debug-posh-server-smoke` — start a detached loopback server for
-  headless transport debugging (e.g. exercising the dump without a tty).
-- Logging is **opt-in**: `POSH_DEBUG_LOG=<path>` (set before connecting) turns on
-  *continuous* periodic transport summaries plus the `#wedge` breadcrumbs
-  (`pty_read`, the per-second `poll` aggregate, and the client `render`-skip
-  line) to that file — the complement to the on-demand `SIGUSR2` dump. The
-  breadcrumbs are gated on the sink being open, so they stay dormant until then.
-  A connected client's `Ctrl-^` palette / `SIGUSR2` can also open a sink at
-  runtime (default per-pid file under `$XDG_RUNTIME_DIR/posh`).
-- **Live debug banner** (FDR 0007, 2026-09-09): the palette's *Show live
-  debug banner* (`debug.banner`; `POSH_DEBUG_BANNER=1` to start with it) keeps
-  one or two reverse-video rows under the connection banner with the live
-  rtt / rto / send interval / heard age, echo model + render style, prediction
-  gauges, the time-to-paint record, the loop wake rate, and rx / applied /
-  base-history / late-gap counters, rebuilt every 250 ms
-  (`client.rs::apply_debug_banner`, `display::draw_bar_row`). The
-  watch-it-move complement to the dump and the dialogs.
-- `just debug-posh-log-gaps <pid|log>` / `debug-posh-log-loss <pid|log>` —
-  offline scans of a `[stats]` log: `-gaps` finds event-loop STALLS (timestamp
-  jumps between records = a wedge/no-paint freeze); `-loss` finds transport
-  BLACKOUTS (bursts in the cumulative `retransmit` counter + `outstanding`
-  pile-up). Use these to triage a freeze AFTER the fact from the log alone.
-- `just debug-posh-agent <pid|log>` — read forwarded-agent health out of a
-  client log. Two things nothing else surfaces: `channels_opened` is cumulative,
-  so growth on an IDLE connection means something is opening agent channels
-  nobody asked for (posh#147 — which ran unnoticed in shipped telemetry because
-  nothing printed it); and `resent` is agent bytes re-sent because the unacked
-  tail rides every message until acked, i.e. what cumulative-only ack actually
-  costs (posh#142). Needs client dumps taken while forwarding was active
-  (`debug-posh-dump`, or the palette's agent info).
-- **Agent-ownership breadcrumbs (posh#196):** the always-on
-  `agent/mux-<client-id>.log` carries three `pid=`-keyed lines pinning whether a
-  wedged forwarded agent is orphan-ownership vs failed-establishment.
-  `agent endpoint up: pid=… sock=…` maps each pid to its socket (sibling daemons
-  share one per-client-id log). `agent consumer accepted: pid=… channel=N` prints
-  on every consumer connect: a failing `git`/`ssh` request with NO accept on the
-  live daemon means the connect landed on a different daemon holding `agent/sock`
-  (not a fast-fail). The WARN `agent/sock held by a sibling while our peer is
-  live: …` is the direct orphan tell — a peer-active daemon that can't own
-  `agent/sock` because a sibling's socket is merely *bound*
-  (`symlink_needs_takeover` judges socket- not agent-peer-liveness). Diagnostic
-  only; the self-heal fix is pending live capture.
-- `just debug-posh-mux-log` — the LOCAL mux daemons' state (posh#161 triage):
-  `posh mux ls`, each daemon socket's pid, and each always-on `mux/<key>.log`
-  tail, where the ref-lifecycle lines (which invocations pin the daemon,
-  when agent service stopped), wire recv errors, the posh#162 liveness edges
-  (`mux wire dead`, `resume gap`, per-attempt reconnect lines), and the
-  SIGUSR2 status dump land. READ heard= carefully: an idle M1 remote sends
-  nothing unprompted AND heard-age is CLOCK_MONOTONIC (frozen across
-  suspend), so it under-counts and proves nothing by itself. Since the
-  posh#162 reconnect, a silent wire is probed (ident re-request after 15 s,
-  dead verdict 10 s unanswered) and the daemon self-heals — a persistent
-  `state=reconnecting` with climbing attempt numbers means the REMOTE side
-  cannot be re-established (ssh path down, old posh-server without the
-  `agent` verb), not a wedged daemon. Do NOT rely on `mux wire recv error`
-  as the death signal: the 2026-08-20 incident produced none against a
-  closed port (posh#163). The mux daemon handles SIGUSR2 (status dump);
-  before the posh#161 instrumentation the signal KILLED it.
-- **Server introspection (RFC 0013)** — "what build/state is the far end"
-  no longer needs `/proc` spelunking: the palette's *About / transport info*
-  shows the connected server's build + uptime (always) and its live state
-  (fetched on demand while the dialog's 10 s request window is armed);
-  `posh mux ls` is a mesa table (`remote/mux_ls.rs`, rows parsed from the
-  daemons' status one-liners) showing each daemon's own build (SELF — a
-  long-lived daemon keeps running pre-upgrade code; a blank SELF IS the
-  stale-daemon verdict), its remote endpoint's build (REMOTE), and its
-  agent / M2 session channel counts (CHANNELS); on a host SERVING other
-  machines' agents the same table has a `served` row per mux peer, read
-  from `agent/mux-<id>.status.sock` (connect → one line → EOF); the key
-  under the table is an RFC 0003 §6.1 `footer` on the header record (mesa
-  ≥ purse-first 7b0fc8b; an older mesa ignores it, and on a pipe the lines
-  print verbatim after the rows, untabbed). `posh mux
-  ls --raw` prints the verbatim one-liners (`self=` / `remote=` / `agent=`
-  / `session_channels=` / the congestion) — the grep shape the soak
-  recipes use. `posh list` is sessions only (the old appended mux / peer /
-  remote sections are gone). All additive caps (ids 13/14) — an old peer on
-  either side just reads `unknown`.
-- **Client introspection (RFC 0014)** — the reverse direction: every client
-  sends `CAP_CLIENT_IDENT`/`CAP_CLIENT_STATE` (ids 16/17, unsolicited) — its
-  build and its FDR 0006 echo model / control (auto, auto-escalated,
-  pinned-env, pinned-palette, gate-off) / gates / SRTT / outcome counters —
-  and the session daemon retains one record per attached client (a relay
-  forwards its roaming client's entries as `Tag::ClientCaps`, shown as
-  `via=relay`). `posh status [session]` reads the daemon's
-  `<session>.status.sock` (no arg = the enclosing `$POSH_SESSION`), so
-  "which echo mode is the terminal I am viewed through in?" is answerable
-  from INSIDE a session. One struct (`posh_proto::introspect`) drives the
-  wire entry, the client SIGUSR2 dump, the palette's echo stats, and the
-  status line — `client_line_covers_every_field` fails if an axis is added
-  without every renderer. `echo=unknown` = the client reported nothing (old
-  build); `echo=none` = it reported having no predictor (a local attach).
-  An Architecture-A roaming `posh-server` (owns its PTY, no daemon) serves
-  the same response on `<base>/remote/<pid>.status.sock` and in its SIGUSR2
-  dump; the M2 bridge forwards like the relay; `posh ls` condenses each
-  session's first client line into an ECHO column (`optimistic
-  auto-escalated 412ms`, `unknown`, `-`; `echo_summary`);
-  `posh status remote-<pid>` / `posh status <pid>` reads an Arch-A
-  server's `remote/` socket directly (the listing no longer enumerates
-  them). NOT covered: §5 UPSTREAM (dead until
-  FDR 0012 or a nesting-guard change).
-- `just debug-posh-mux-silence-repro <host>` — drive the posh#161 sequence
-  deterministically: SIGSTOP the local mux daemon past the remote's 15 s
-  agent fast-fail and 60 s exit timeout, SIGCONT, then print both sides'
-  evidence (local mux log; the remote agent dir + its persistent
-  `agent/mux-<client-id>.log`, which journals the fast-fail edge, the
-  `agent/sock` disposition ("kept" since the 2026-08-23 rendezvous
-  persistence — the symlink and the dead mux socket now SURVIVE outages so
-  consumers get a fast connect failure, never ENOENT; "unlinked" only from
-  pre-persistence builds), and the exit reason). CAUTION: stalls agent forwarding
-  (and any POSH_MUX_SESSIONS channels on that daemon) for the duration.
-  Since the posh#162 reconnect the daemon is NOT stranded afterward: the
-  probe verdict (or the SIGCONT resume gap) condemns the dead wire and the
-  daemon re-bootstraps a fresh remote endpoint on its own — the repro now
-  demonstrates the self-heal rather than the historical zombie.
-- `just debug-posh-net <peer-100.x>` / `debug-posh-pathloss <peer-100.x>` —
-  explain a high `retransmit` rate by probing the network path: direct vs
-  DERP-relayed Tailscale link, real ICMP loss/latency, socket drop counters,
-  and the host's NAT/firewall posture (`tailscale netcheck`). A steady
-  retransmit climb with ~0% measured loss points at the RTO margin
-  (`RttEstimator::rto`, `remote/datagram.rs`), not the path.
-- `just debug-posh-mtu-probe <peer>` — measure a path's real datagram-size
-  ceiling with sized pings. The signature that matters: small sizes pass,
-  1280+-byte packets lose 100% — a tunnel path (tailscale MTU 1280) dropping
-  IP fragments. posh sizes fragments under the IPv6 minimum MTU
-  (`FRAGMENT_CONTENTS_MAX`, `remote/sync.rs`) precisely so this cannot eat
-  frames; "large frames vanish, small ones pass" means something regressed it.
-- `just debug-posh-remote-triage <host>` / `debug-posh-remote-tail <host>
-  <file>` / `debug-posh-remote-ps <host>` — read-only post-mortem sweep of a
-  REMOTE host's posh state over ssh: process table, socket-dir layout, panic
-  greps, log tails, coredump/journal artifacts. First stop when a remote
-  session "died" — note a session daemon's log prints the SHELL's pid
-  (`child.pid`), and the daemon itself carries its spawner's argv, so pgrep
-  output needs care before declaring a process dead.
-- `just debug-posh-mux-repro-start [host] [session] [posh_bin] [server_cmd]`
-  (+ `-keys`/`-capture`/`-second`/`-capture2`/`-stop [host]`) — drive a fully
-  instrumented `POSH_MUX_SESSIONS=1` attach inside a detached tmux pane:
-  send keystrokes, capture the screen, open a second channel on the same
-  connection, and tear the whole stack down (both ends) between runs.
-  `posh_bin`/`server_cmd` swap in a locally-built binary on both ends — but
-  ONLY after `-stop <host>`: a surviving mux daemon short-circuits the ssh
-  bootstrap and silently keeps the previous stack serving.
+- **Versioning** (`man eng-versioning`): `version.env` (`POSH_VERSION`) is
+  the single source of truth. Crate manifests carry an inert `0.0.0`
+  placeholder (`version.workspace = true`) and each `build.rs` flows the
+  version in at compile time, so there is no `Cargo.toml` version to keep in
+  lockstep. `flow()` also composes `POSH_BUILD` = `<version>+<sha>` — the
+  build identity every surface renders, joined there and nowhere else,
+  because a version alone does not identify a build (`just
+  debug-posh-builds` censuses the several one host runs). `+` is SemVer
+  metadata: equality, NO ordering. The **only** independent lineage is the
+  vendored `zz-mosh/` tree, which keeps upstream's `1.4.0`; everything else
+  flows `POSH_VERSION`, the Go modules included (`posht` via `-ldflags -X`,
+  github #71). `version.env`
+  rebase conflicts resolve to the **higher semver** via `scripts/version-merge`
+  (declared in `.gitattributes`); register it per-clone with `just
+  install-merge-driver` (the sweatfile's `[hooks].create` does this for
+  fresh worktrees).
+- **Man pages** (`man eng-manpages`): hand-written scdoc under `doc/*.scd`,
+  compiled by the flake's `postInstall`. Lint with `just lint-doc`. scdoc
+  pitfalls: a line starting with `[` collides with table syntax (escape as
+  `\[`), and a literal `*` inside `_italic_` is a parse error.
+- **Formatting and linting** (`man conformist`): `conformist.nix` is the
+  single config source — there is **no** committed `conformist.toml`. `nix
+  fmt` / `just codemod-fmt` repair; `just lint-fmt` checks. The impure
+  git-state lane (agents-md, git-remotes, sweatfile, clippy, …) is `just
+  lint-worktree`; posh's clippy gate is the workspace `cargo clippy
+  --all-targets -- -D warnings`. The git hooks are store-pinned wrappers, so
+  they format with the same toolchain as `nix fmt` rather than silently
+  skipping a file type the ambient PATH lacks.
+- **Justfile** (`man eng-design_patterns-justfile`): verb-noun leaf recipes
+  under bare aggregates; `[group(...)]` attributes; `default` is first. A
+  recipe's comment block is its documentation — write it for the agent who
+  will run the recipe without reading its body.
+- **Docs:** significant designs get a record — ADR for a decision, RFC for a
+  wire or file-format contract, FDR for a user-facing feature. `docs/README.md`
+  defines the kinds and the status vocabulary, and the rule that **status
+  moves in the commit that moves the code.**
 
-## Debugging a local session (wheel scrolls vs arrow keys)
+## Debugging
 
-- **The wheel scrolls posh's scroll-view; if it emits arrow keys, the session
-  is not framed.** A current daemon always frames a frame-capable client, so the
-  local wheel-intercept/scroll-view (`remote/scrollview.rs`, FDR 0005) is live
-  and the wheel scrolls posh's scrollback (tmux-like). Not framed (a pre-frames
-  daemon, or a baseline client) ⇒ no `FrameProducer`/`FrameRenderer` ⇒ stdin
-  forwards verbatim, so the wheel reaches the shell and the *outer terminal's*
-  alternate-scroll mode (`DECSET ?1007`) turns it into `↑`/`↓`. posh never
-  translates the wheel to arrows itself (the `POSH_GRAB_MOUSE` wheel→arrow grab
-  is a remote-client-only path, ADR-0002, default-off). The old
-  `POSH_SESSION_FRAMES=0` opt-out is retired and ignored (posh#171). Diagnose an
-  unexpected-arrows case with `cat -v` at a bare prompt: `^[[A`/`^[[B` = not
-  framed, the terminal translated it; `^[[<64;…M` = a different culprit. Full
-  write-up in `docs/wheel-scroll-behavior.md`.
+Every triage path is a `debug`-group recipe, and **each recipe's comment
+block is its documentation** — what it reads, how to read the output, and the
+signature that matters. `just --list` is the catalogue. Do not re-summarize
+them here.
+
+The one framing that is not in any recipe: a roaming `posh-server`
+(`remote/server.rs`) owns its PTY directly, mosh-server style, and has NO
+local session-daemon socket — so a wedged *remote* session is triaged from
+the process table, the kernel UDP table, and `/proc`, not from `posh list`.
+A wedge looks like `S` in `do_sys_poll`, not `D` or a spin, and both the
+server and its shell child stay alive: the transport is stuck, not the
+process. Start at `just debug-posh-procs`, then `just debug-posh-dump <pid>`
+for the on-demand SIGUSR2 transport snapshot (FDR 0007; also `man
+posh-server` SIGNALS).
+
+A live *local* session that emits `↑`/`↓` on the wheel instead of scrolling
+is not framed — full write-up in `docs/wheel-scroll-behavior.md`.
 
 ## When working here
 
@@ -579,4 +238,4 @@ read-only, `debug` group):
   files (new crates, new `doc/*.scd`, `version.env`) before building, or the
   sandbox won't see them.
 - `direnv reload` does not work mid-session; if the devShell needs new
-  packages, ask the user to restart the session.
+  packages, ask for the session to be restarted.

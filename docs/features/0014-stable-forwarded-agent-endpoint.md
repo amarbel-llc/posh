@@ -369,6 +369,29 @@ elects on the #152 marker machinery as a full sibling —
 pins the two-host election at the unit level. The explicit-preference
 override remains unimplemented (MAY).
 
+### Ownership breadcrumbs (2026-09, posh#196)
+
+Election makes ownership *structural*, but it does not make a wrong outcome
+*visible*: a forwarded agent that fails looks the same whether the endpoint
+never established or whether a live endpoint lost `agent/sock` to an orphan
+sibling. Three always-on lines in `agent/mux-<client-id>.log` — keyed by
+`pid=`, since sibling daemons share one per-client-id log — separate them.
+
+- `agent endpoint up: pid=… sock=…` maps each pid to its socket, so the rest
+  of the log can be attributed.
+- `agent consumer accepted: pid=… channel=N` prints on every consumer
+  connect. A failing `git`/`ssh` request with **no** matching accept on the
+  live daemon means the connect landed on a *different* daemon holding
+  `agent/sock` — not a fast-fail, a misrouted one.
+- `WARN agent/sock held by a sibling while our peer is live: …` is the
+  direct orphan tell: a peer-active daemon that cannot own the rendezvous
+  because a sibling's socket is merely *bound*. `symlink_needs_takeover`
+  judges socket liveness, not agent-peer liveness, so a bound-but-dead
+  sibling wins a contest it should lose.
+
+Diagnostic only — these report the condition, they do not repair it. The
+self-heal is pending a live capture of the third line in the wild.
+
 ## Limitations
 
 - **The shipped interim fix (option 1) does not satisfy this record.** It does
