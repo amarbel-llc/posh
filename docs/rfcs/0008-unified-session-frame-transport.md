@@ -1,5 +1,5 @@
 ---
-status: proposed
+status: experimental
 date: 2026-06-30
 ---
 

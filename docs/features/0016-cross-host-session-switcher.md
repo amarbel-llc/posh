@@ -1,5 +1,5 @@
 ---
-status: proposed
+status: experimental
 date: 2026-08-24
 promotion-criteria: >
   exploring -> proposed (MET 2026-09-07): the switch mechanism is decided —

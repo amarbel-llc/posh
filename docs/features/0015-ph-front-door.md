@@ -1,5 +1,5 @@
 ---
-status: proposed
+status: experimental
 date: 2026-08-24
 promotion-criteria: >
   proposed -> experimental: `ph` exists as a front-door binary routing to
