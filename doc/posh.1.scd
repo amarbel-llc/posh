@@ -105,14 +105,11 @@ local session.
 	launches and the command errors with the candidate targets.
 
 	The same renderer is the in-session *Switch session…* palette
-	command, and a switch that keeps the session it leaves stacks it, so
-	the palette's first row becomes *Back to* _session_ (FDR 0016). When
-	the viewport finally leaves posh — a detach, a quit, or its session
-	ending with nothing to go back to — the front door asks what to do
-	with the *anonymous* sessions this viewport created (*:+*, _host_*:+*):
-	the *Leaving* prompt offers *Keep them running* (Enter, or Esc),
-	*Kill them* (kept if other viewports are attached), or a forced kill;
-	see _POSH_LEAVE_ANONYMOUS_ under ENVIRONMENT to skip the question.
+	command, and a switch stacks the session it leaves, so the palette's
+	first row becomes *Back to* _session_ (FDR 0016). A switch never kills
+	the session it leaves: it stays running detached, and *Back* returns
+	to it. Sessions a viewport leaves behind on the way out of posh keep
+	running; kill one with *posh kill* when you are done with it.
 
 # GLOBAL OPTIONS
 
@@ -445,21 +442,6 @@ _POSH_HANDSHAKE_
 	line on stdout ahead of their status prose (see *start*). Off by
 	default; *ph* _host_*:+* sets it on the ssh command it runs.
 
-_POSH_LEAVE_ANONYMOUS_
-	What the front door does with the *anonymous* sessions a viewport
-	created (*:+*, _host_*:+*; the daemon-held kind, see *start*) when it
-	leaves posh with no switch to follow (FDR 0016). *ask* (the default,
-	and any other value): show the *Leaving — N anonymous session(s)
-	you created* prompt, naming them one per line, with *Keep them
-	running* first (Enter and Esc both keep), *Kill them (kept if other
-	viewports are attached)*, and *Kill them even with other viewports
-	attached*; off a terminal, or after a terminating signal ended the
-	attach, the prompt degrades to one stderr line, _left running:_
-	_targets_. *keep*: never ask, say nothing. *kill*: kill them without
-	asking, each unless other viewports are attached to it. Kills run in
-	stack order, the current session last, one notice each; a failed
-	host fails only its own entry. Sessions the viewport did not create
-	are never candidates.
 
 _POSH_VIEWPORT_STATUS_
 	When set to _0_, _off_, _false_, or _no_, a viewport skips binding its

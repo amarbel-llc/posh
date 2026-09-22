@@ -15,8 +15,8 @@ use std::sync::Mutex;
 use posh_proto::caps::SessionKind;
 use serde_json::{json, Value};
 
-use crate::session::{self, Config, KillOutcome};
-use crate::util::{Error, Result};
+use crate::session::{self, Config};
+use crate::util::Result;
 
 /// The picker's heading and its no-rows text (RFC 0005 §3.2 `title` /
 /// §3.5 `empty`).
@@ -138,48 +138,16 @@ pub fn default_group() -> String {
     std::env::var("POSH_GROUP").unwrap_or_else(|_| "default".to_string())
 }
 
-/// What happens to the session a viewport is LEAVING on a switch (RFC 0005
-/// §7 `session.switch.previous`, FDR 0016).
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum Previous {
-    /// Leave it running detached (FDR 0011's default: nothing is reaped).
-    Keep,
-    /// Kill it once the new attach is up — unless other viewports are still
-    /// attached to it, in which case it is kept and the client is told.
-    Kill,
-    /// Kill it once the new attach is up even with other viewports attached
-    /// (they are thrown out, as `posh kill` does).
-    ForceKill,
-}
-
-impl Previous {
-    /// The `previous` parameter's spelling; absent means [`Previous::Keep`].
-    pub fn parse(value: Option<&str>) -> Option<Previous> {
-        match value {
-            None | Some("keep") => Some(Previous::Keep),
-            Some("kill") => Some(Previous::Kill),
-            Some("force-kill") => Some(Previous::ForceKill),
-            Some(_) => None,
-        }
-    }
-
-    pub fn as_str(self) -> &'static str {
-        match self {
-            Previous::Keep => "keep",
-            Previous::Kill => "kill",
-            Previous::ForceKill => "force-kill",
-        }
-    }
-}
-
-/// A recorded switch: the target to re-attach to, what to do with the
-/// session being left, and whether this is a POP (the target came off the
-/// stack; the front door pops it) or a push (the front door pushes the
-/// session being left).
+/// A recorded switch: the target to re-attach to, and whether this is a POP
+/// (the target came off the stack; the front door pops it) or a push (the
+/// front door pushes the session being left).
+///
+/// A transition never kills. What became of the session being left used to
+/// ride here as a `previous` policy; killing is deferred to v2 session
+/// management, and popping back is the cleanup in the meantime.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Switch {
     pub target: String,
-    pub previous: Previous,
     pub pop: bool,
 }
 
@@ -239,11 +207,10 @@ pub fn stack_pop() -> Option<StackEntry> {
 
 /// Record a *Back*: the switch target is the stack's top. `None` (nothing
 /// recorded) when the stack is empty.
-pub fn request_pop(previous: Previous) -> Option<String> {
+pub fn request_pop() -> Option<String> {
     let target = stack_top()?.target;
     *SWITCH.lock().unwrap_or_else(|e| e.into_inner()) = Some(Switch {
         target: target.clone(),
-        previous,
         pop: true,
     });
     Some(target)
@@ -275,15 +242,9 @@ static CURRENT: Mutex<Option<Current>> = Mutex::new(None);
 /// before the attach entry point they call records the target; consumed by
 /// it.
 static NEXT_ATTACH_ANONYMOUS_CREATE: Mutex<bool> = Mutex::new(false);
-/// A kill the front door armed for the NEW attach to carry out once it is
-/// established (`(target, force)`): kill-after-attach, so a failed switch
-/// never destroys the session it was leaving.
-static PENDING_KILL: Mutex<Option<(String, bool)>> = Mutex::new(None);
-
-pub fn request_switch(target: &str, previous: Previous) {
+pub fn request_switch(target: &str) {
     *SWITCH.lock().unwrap_or_else(|e| e.into_inner()) = Some(Switch {
         target: target.to_string(),
-        previous,
         pop: false,
     });
 }
@@ -363,117 +324,8 @@ pub fn auto_pop(end: Option<&AttachEnd>) -> Option<Switch> {
     ));
     Some(Switch {
         target: top,
-        previous: Previous::Keep,
         pop: true,
     })
-}
-
-/// `POSH_LEAVE_ANONYMOUS`: what the front door does with the anonymous
-/// sessions this viewport created when it leaves posh (design 2026-09-21
-/// §4). `Ask` (default) prompts; `Keep` never prompts; `Kill` kills without
-/// asking. The env var is the config surface until posh has a config file.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum LeavePolicy {
-    Ask,
-    Keep,
-    Kill,
-}
-
-impl LeavePolicy {
-    /// `keep` | `kill`; anything else (unset, `ask`, a typo) is the safe
-    /// default, `Ask`.
-    pub fn parse(value: Option<&str>) -> LeavePolicy {
-        match value {
-            Some("keep") => LeavePolicy::Keep,
-            Some("kill") => LeavePolicy::Kill,
-            _ => LeavePolicy::Ask,
-        }
-    }
-
-    pub fn from_env() -> LeavePolicy {
-        LeavePolicy::parse(std::env::var("POSH_LEAVE_ANONYMOUS").ok().as_deref())
-    }
-}
-
-/// The sessions the leave prompt is about: every `Anonymous` stack entry,
-/// bottom first, then the current attach when it is `Anonymous` and did
-/// not itself END (an ended session has nothing to kill; a lost one may).
-/// `Unknown` never qualifies — the prompt only names what the daemon (or
-/// the `:+` fallback) called anonymous.
-pub fn leave_candidates(end: Option<&AttachEnd>) -> Vec<StackEntry> {
-    let anonymous = |e: &StackEntry| e.kind == SessionKind::Anonymous;
-    let mut out: Vec<StackEntry> = STACK
-        .lock()
-        .unwrap_or_else(|e| e.into_inner())
-        .iter()
-        .filter(|e| anonymous(e))
-        .cloned()
-        .collect();
-    let ended = matches!(end, Some(AttachEnd::Ended { .. }));
-    if let Some(cur) = current_entry().filter(|e| !ended && anonymous(e)) {
-        out.push(cur);
-    }
-    out
-}
-
-/// What the front door does on the way out about the [`leave_candidates`]
-/// (design 2026-09-21 §4).
-#[derive(Debug, PartialEq, Eq)]
-pub enum LeaveAction {
-    /// Nothing to do, silently: no candidates, or the policy is `Keep`.
-    Nothing,
-    /// Ask through the standalone chooser (`palette_view::leave_prompt`).
-    Prompt,
-    /// Kill them without asking (the `Kill` policy).
-    Kill { force: bool },
-    /// Keep them and say so on stderr: `Ask` cannot prompt — no tty on
-    /// both ends, or a signal ended the attach.
-    Report,
-}
-
-/// Pure: the decision from the policy, whether stdin + stdout are a tty,
-/// whether a terminating signal ended the JUST-ENDED attach (`signaled`:
-/// `util::take_terminating_signal`, consumed per attach by `run()` — an
-/// earlier attach's signal never downgrades a later, orderly exit), and the
-/// candidates.
-pub fn leave_action(policy: LeavePolicy, tty: bool, signaled: bool, candidates: &[StackEntry]) -> LeaveAction {
-    if candidates.is_empty() {
-        return LeaveAction::Nothing;
-    }
-    match policy {
-        LeavePolicy::Keep => LeaveAction::Nothing,
-        LeavePolicy::Kill => LeaveAction::Kill { force: false },
-        LeavePolicy::Ask if tty && !signaled => LeaveAction::Prompt,
-        LeavePolicy::Ask => LeaveAction::Report,
-    }
-}
-
-/// Kill each candidate in order (stack bottom first, the current last —
-/// [`leave_candidates`] already orders them), never stopping on a failure;
-/// one notice per entry. `kill` is [`kill_target_as`] with the `"session"`
-/// role in production (a leave kills *sessions*, not the switch flow's
-/// "previous session"); a failure spells the target like the notices do
-/// ([`display_target`]).
-pub fn run_leave_kills(
-    candidates: &[StackEntry],
-    force: bool,
-    mut kill: impl FnMut(&str, bool) -> Result<String>,
-) -> Vec<String> {
-    candidates
-        .iter()
-        .map(|e| match kill(&e.target, force) {
-            Ok(notice) => notice,
-            Err(err) => format!("{} not killed: {err}", display_target(&e.target)),
-        })
-        .collect()
-}
-
-/// The stderr line for candidates left running unasked (`LeaveAction::Report`,
-/// or a dismissed prompt): the targets as the notices spell them
-/// ([`display_target`]) and the lever that would have killed them.
-pub fn left_running_notice(candidates: &[StackEntry]) -> String {
-    let targets = candidates.iter().map(|e| display_target(&e.target)).collect::<Vec<_>>().join(", ");
-    format!("left running: {targets} (POSH_LEAVE_ANONYMOUS=kill to kill on exit)")
 }
 
 /// A target for a notice: a local `:session` names this machine, like the
@@ -705,97 +557,11 @@ pub(crate) fn short_host(host: &str) -> String {
     }
 }
 
-pub fn arm_kill(target: &str, force: bool) {
-    *PENDING_KILL.lock().unwrap_or_else(|e| e.into_inner()) = Some((target.to_string(), force));
-}
-
-pub fn disarm_kill() {
-    PENDING_KILL.lock().unwrap_or_else(|e| e.into_inner()).take();
-}
-
-/// Carry out the armed kill, if any — called by a client once its new
-/// attach is established. Returns the one-line notice for the user.
-pub fn run_pending_kill() -> Option<String> {
-    let (target, force) = PENDING_KILL.lock().unwrap_or_else(|e| e.into_inner()).take()?;
-    Some(match kill_target(&target, force) {
-        Ok(notice) => notice,
-        Err(e) => format!("previous session {} not killed: {e}", display_target(&target)),
-    })
-}
-
-/// The switch flow's kill: [`kill_target_as`] with the "previous session"
-/// role (the session a switch left).
-pub fn kill_target(target: &str, force: bool) -> Result<String> {
-    kill_target_as(target, force, "previous session")
-}
-
-/// Kill the session `target` names — locally through its daemon socket, or
-/// on its host through `posh kill` over ssh — refusing (kept, with a
-/// notice) when other viewports are attached unless `force`. `role` is how
-/// the notice names the target: "previous session" for the switch flow,
-/// "session" for the leave flow; a remote kill keeps the remote's own line.
-pub fn kill_target_as(target: &str, force: bool, role: &str) -> Result<String> {
-    match crate::ph_parse(Some(target)) {
-        crate::PhRoute::LocalResolve { group, session } => {
-            let cfg = Config::new(group.as_deref().unwrap_or("default"))?;
-            Ok(kill_notice(target, role, session::kill_session(&cfg, &session, !force)?))
-        }
-        crate::PhRoute::RemoteResolve { user, host, group, session } => {
-            let dest = crate::ph_dest(user.as_deref(), &host);
-            let argv = remote_kill_argv(&crate::remote::sshwrap::SshDest::resolve(&dest), group.as_deref(), &session, force);
-            let out = std::process::Command::new(&argv[0])
-                .args(&argv[1..])
-                .stdin(std::process::Stdio::null())
-                .output()
-                .map_err(|e| Error::Msg(format!("cannot exec ssh: {e}")))?;
-            let stdout = String::from_utf8_lossy(&out.stdout);
-            let line = stdout.lines().last().unwrap_or("").trim().to_string();
-            if !out.status.success() {
-                let stderr = String::from_utf8_lossy(&out.stderr);
-                let why = stderr.lines().last().unwrap_or("").trim();
-                return Err(Error::Msg(format!("{dest}: {}", if why.is_empty() { &line } else { why })));
-            }
-            Ok(format!("{line} on {dest}"))
-        }
-        _ => Err(Error::Msg(format!("{target} names no session"))),
-    }
-}
-
-/// The local kill's notice: the outcome, the `role` (see [`kill_target_as`]),
-/// and the target spelled with its host ([`display_target`]).
-fn kill_notice(target: &str, role: &str, outcome: KillOutcome) -> String {
-    let target = display_target(target);
-    match outcome {
-        KillOutcome::Killed => format!("killed {role} {target}"),
-        KillOutcome::CleanedStale => format!("cleaned up stale {role} {target}"),
-        KillOutcome::Kept { clients } => {
-            format!("kept {role} {target}: {clients} other viewport(s) attached (force-kill to override)")
-        }
-    }
-}
-
-/// `ssh -o BatchMode=yes … <dest> posh [-g G] kill [--unless-attached] <session>`:
-/// the remote kill, non-interactive (an auth prompt cannot be answered from
-/// inside a session), with the same tailnet substitution as the bootstrap.
-pub fn remote_kill_argv(
-    dest: &crate::remote::sshwrap::SshDest,
-    group: Option<&str>,
-    session: &str,
-    force: bool,
-) -> Vec<String> {
-    let mut tail = vec!["kill".to_string()];
-    if !force {
-        tail.push("--unless-attached".to_string());
-    }
-    tail.push(session.to_string());
-    crate::remote::sshwrap::remote_posh_argv(
-        dest,
-        &["-o", "BatchMode=yes", "-o", "ConnectTimeout=5"],
-        &[],
-        group.unwrap_or("default"),
-        &tail,
-    )
-}
+// The viewport's own kill stack — `kill_target` / `kill_notice` /
+// `remote_kill_argv` — went with the leave and switch-kill flows it existed
+// for. Killing a session from a viewport is deferred to v2 session
+// management; `posh kill [--unless-attached]` (`session::cmd_kill`) is the
+// user-facing command meanwhile, and it never went through here.
 
 #[cfg(test)]
 pub(crate) fn switch_test_guard() -> std::sync::MutexGuard<'static, ()> {
@@ -910,10 +676,10 @@ mod tests {
     fn switch_handoff_is_one_shot() {
         let _g = switch_test_guard();
         assert_eq!(take_switch(), None);
-        request_switch("box:dev", Previous::Kill);
+        request_switch("box:dev");
         assert_eq!(
             take_switch(),
-            Some(Switch { target: "box:dev".into(), previous: Previous::Kill, pop: false })
+            Some(Switch { target: "box:dev".into(), pop: false })
         );
         assert_eq!(take_switch(), None);
     }
@@ -926,7 +692,7 @@ mod tests {
         let _g = switch_test_guard();
         while stack_pop().is_some() {}
         assert_eq!(stack_depth(), 0);
-        assert_eq!(request_pop(Previous::Keep), None, "nothing to go back to");
+        assert_eq!(request_pop(), None, "nothing to go back to");
         assert_eq!(take_switch(), None);
         set_current(":s-1");
         stack_push_current();
@@ -934,10 +700,10 @@ mod tests {
         stack_push_current();
         assert_eq!(stack_depth(), 2);
         assert_eq!(stack_top().map(|e| e.target).as_deref(), Some("box:dev"));
-        assert_eq!(request_pop(Previous::Kill).as_deref(), Some("box:dev"));
+        assert_eq!(request_pop().as_deref(), Some("box:dev"));
         assert_eq!(
             take_switch(),
-            Some(Switch { target: "box:dev".into(), previous: Previous::Kill, pop: true })
+            Some(Switch { target: "box:dev".into(), pop: true })
         );
         // Recording a pop does not pop: the front door does, when it re-dials.
         assert_eq!(stack_depth(), 2);
@@ -997,7 +763,7 @@ mod tests {
         // An ended session pops back (the front door pops the entry on re-dial).
         assert_eq!(
             auto_pop(Some(&ended(1))),
-            Some(Switch { target: ":s-2".into(), previous: Previous::Keep, pop: true })
+            Some(Switch { target: ":s-2".into(), pop: true })
         );
         let notice = take_pending_notice().unwrap();
         assert!(notice.starts_with("session box:dev ended (exit 1) \u{2014} back to "), "{notice}");
@@ -1013,7 +779,7 @@ mod tests {
         assert_eq!(AttachEnd::Quit.label(), None);
         assert_eq!(
             auto_pop(Some(&AttachEnd::Lost("mux channel closed".into()))),
-            Some(Switch { target: ":s-2".into(), previous: Previous::Keep, pop: true })
+            Some(Switch { target: ":s-2".into(), pop: true })
         );
         assert!(take_pending_notice().unwrap().contains("lost (mux channel closed)"));
         stack_pop();
@@ -1116,157 +882,4 @@ mod tests {
         assert!(snap.stack.is_empty());
     }
 
-    /// The remote kill runs non-interactively through the resolved
-    /// destination (tailnet alias included), scoped to the group, and asks
-    /// the remote to refuse an attached session unless forced.
-    #[test]
-    fn remote_kill_argv_shape() {
-        let dest = crate::remote::sshwrap::SshDest::verbatim("me@box");
-        assert_eq!(
-            remote_kill_argv(&dest, None, "dev", false),
-            ["ssh", "-o", "BatchMode=yes", "-o", "ConnectTimeout=5", "me@box", "posh", "kill", "--unless-attached", "dev"]
-        );
-        assert_eq!(
-            remote_kill_argv(&dest, Some("work"), "s-1", true),
-            ["ssh", "-o", "BatchMode=yes", "-o", "ConnectTimeout=5", "me@box", "posh", "-g", "work", "kill", "s-1"]
-        );
-        // A create target names no session to kill.
-        assert!(kill_target(":+", false).is_err());
-        assert!(kill_target("box:+", true).is_err());
-        assert!(kill_target_as(":+", false, "session").is_err());
-    }
-
-    /// The local kill notice carries the caller's role — "previous session"
-    /// on a switch, "session" on a leave — and spells a local target with
-    /// this machine's name, as the leave prompt and the picker do.
-    #[test]
-    fn kill_notice_spells_the_role_and_the_host() {
-        let host = crate::remote::mux::hostname();
-        let local = format!("{host}:s-1");
-        assert_eq!(kill_notice(":s-1", "previous session", KillOutcome::Killed), format!("killed previous session {local}"));
-        assert_eq!(kill_notice(":s-1", "session", KillOutcome::Killed), format!("killed session {local}"));
-        assert_eq!(
-            kill_notice(":s-1", "session", KillOutcome::CleanedStale),
-            format!("cleaned up stale session {local}")
-        );
-        assert_eq!(
-            kill_notice(":s-1", "session", KillOutcome::Kept { clients: 2 }),
-            format!("kept session {local}: 2 other viewport(s) attached (force-kill to override)")
-        );
-        assert_eq!(
-            kill_notice(":s-1", "previous session", KillOutcome::Kept { clients: 1 }),
-            format!("kept previous session {local}: 1 other viewport(s) attached (force-kill to override)")
-        );
-        // A target that already names a host is left as it is.
-        assert_eq!(kill_notice("box:s-3", "session", KillOutcome::Killed), "killed session box:s-3");
-        assert!(!local.starts_with(':'), "hostname resolved: {local}");
-    }
-
-    #[test]
-    fn leave_policy_parses_the_env_spellings() {
-        assert_eq!(LeavePolicy::parse(None), LeavePolicy::Ask);
-        assert_eq!(LeavePolicy::parse(Some("ask")), LeavePolicy::Ask);
-        assert_eq!(LeavePolicy::parse(Some("keep")), LeavePolicy::Keep);
-        assert_eq!(LeavePolicy::parse(Some("kill")), LeavePolicy::Kill);
-        assert_eq!(LeavePolicy::parse(Some("bogus")), LeavePolicy::Ask, "unknown ⇒ the safe default");
-    }
-
-    /// The candidates are the anonymous stack entries bottom first, then the
-    /// current attach LAST when it is anonymous and did not end; a named or
-    /// unknown-kind session never qualifies.
-    #[test]
-    fn leave_candidates_are_the_anonymous_entries_plus_a_live_anonymous_current() {
-        let _g = switch_test_guard();
-        while stack_pop().is_some() {}
-        // stack: :s-1 (anon), box:dev (named), box:s-3 (anon); current :s-9 (anon)
-        set_current(":s-1");
-        set_current_kind(SessionKind::Anonymous);
-        stack_push_current();
-        set_current("box:dev");
-        set_current_kind(SessionKind::Named);
-        stack_push_current();
-        set_current("box:s-3");
-        set_current_kind(SessionKind::Anonymous);
-        stack_push_current();
-        set_current(":s-9");
-        set_current_kind(SessionKind::Anonymous);
-        let t = |v: Vec<StackEntry>| v.into_iter().map(|e| e.target).collect::<Vec<_>>();
-        // Quit / detach: stack anon entries in order, then the current LAST.
-        assert_eq!(t(leave_candidates(Some(&AttachEnd::Quit))), [":s-1", "box:s-3", ":s-9"]);
-        assert_eq!(t(leave_candidates(None)), [":s-1", "box:s-3", ":s-9"]);
-        // The current ENDED: it is gone, not a candidate.
-        let ended = AttachEnd::Ended { code: 0, cause: None };
-        assert_eq!(t(leave_candidates(Some(&ended))), [":s-1", "box:s-3"]);
-        // Lost: the daemon may live on; still a candidate.
-        assert_eq!(t(leave_candidates(Some(&AttachEnd::Lost("x".into())))), [":s-1", "box:s-3", ":s-9"]);
-        // A named current adds nothing; an unknown-kind one neither.
-        set_current("box:named");
-        set_current_kind(SessionKind::Named);
-        assert_eq!(t(leave_candidates(Some(&AttachEnd::Quit))), [":s-1", "box:s-3"]);
-        set_current("box:plain");
-        assert_eq!(t(leave_candidates(None)), [":s-1", "box:s-3"]);
-        while stack_pop().is_some() {}
-        *CURRENT.lock().unwrap() = None;
-        assert!(leave_candidates(None).is_empty());
-    }
-
-    fn entry(t: &str) -> StackEntry {
-        StackEntry { target: t.into(), kind: SessionKind::Anonymous }
-    }
-
-    #[test]
-    fn leave_action_decision_table() {
-        use LeaveAction::*;
-        let c = vec![entry(":s-1")];
-        // no candidates ⇒ nothing, whatever the policy
-        assert_eq!(leave_action(LeavePolicy::Ask, true, false, &[]), Nothing);
-        assert_eq!(leave_action(LeavePolicy::Kill, true, false, &[]), Nothing);
-        // keep ⇒ nothing, silently
-        assert_eq!(leave_action(LeavePolicy::Keep, true, false, &c), Nothing);
-        // kill ⇒ kill (unless-attached), no prompt, tty or not
-        assert_eq!(leave_action(LeavePolicy::Kill, true, false, &c), Kill { force: false });
-        assert_eq!(leave_action(LeavePolicy::Kill, false, true, &c), Kill { force: false });
-        // ask on a tty, not a signal ⇒ prompt
-        assert_eq!(leave_action(LeavePolicy::Ask, true, false, &c), Prompt);
-        // ask off-tty or after a signal ⇒ report, keep
-        assert_eq!(leave_action(LeavePolicy::Ask, false, false, &c), Report);
-        assert_eq!(leave_action(LeavePolicy::Ask, true, true, &c), Report);
-    }
-
-    /// The runner kills in the given order (stack bottom first, current
-    /// last), a failed host fails only its own entry, and every entry gets
-    /// a notice.
-    #[test]
-    fn run_leave_kills_in_stack_order_current_last_and_collects_every_notice() {
-        let order = std::cell::RefCell::new(vec![]);
-        let forces = std::cell::RefCell::new(vec![]);
-        let notices = run_leave_kills(&[entry(":s-1"), entry("box:s-3"), entry(":s-9")], false, |t, f| {
-            order.borrow_mut().push(t.to_string());
-            forces.borrow_mut().push(f);
-            if t == "box:s-3" {
-                Err(Error::from("box: ssh: no route"))
-            } else {
-                Ok(format!("killed {t}"))
-            }
-        });
-        assert_eq!(*order.borrow(), [":s-1", "box:s-3", ":s-9"]);
-        assert_eq!(*forces.borrow(), [false, false, false]);
-        assert_eq!(notices, ["killed :s-1", "box:s-3 not killed: box: ssh: no route", "killed :s-9"]);
-        // A LOCAL failure spells the target with this machine's name, like
-        // every other notice.
-        let notices = run_leave_kills(&[entry(":s-1")], false, |_, _| Err(Error::from("gone")));
-        assert_eq!(notices, [format!("{} not killed: gone", display_target(":s-1"))]);
-        assert!(!notices[0].starts_with(':'), "{}", notices[0]);
-        // The force flag reaches every kill.
-        let notices = run_leave_kills(&[entry("box:s-3")], true, |t, f| Ok(format!("{t} force={f}")));
-        assert_eq!(notices, ["box:s-3 force=true"]);
-    }
-
-    #[test]
-    fn left_running_notice_names_every_candidate_and_the_lever() {
-        let n = left_running_notice(&[entry(":s-1"), entry("box:s-3")]);
-        assert!(n.starts_with("left running: "), "{n}");
-        assert!(n.contains(":s-1, box:s-3 (POSH_LEAVE_ANONYMOUS=kill to kill on exit)"), "{n}");
-        assert!(!n.contains(" :s-1"), "a local target names this machine: {n}");
-    }
 }

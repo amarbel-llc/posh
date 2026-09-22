@@ -44,8 +44,9 @@ fn main() {
 /// `picker::request_switch`) or a *Back* (`session.pop`) is followed by an
 /// attach to that target — via the same routing as typing it to `ph` — until
 /// an attach ends without one. The session stack (stacked switching): a
-/// switch that KEEPS the session it leaves pushes it; a *Back* pops its
-/// target. A killed session is never pushed (there is nothing to return to).
+/// switch pushes the session it leaves, unconditionally; a *Back* pops its
+/// target. A transition never kills — that is deferred to v2 session
+/// management, and popping back is the cleanup in the meantime.
 /// An attach that ends because its session ENDED or was LOST — not a quit or
 /// detach the user asked for — pops on its own (`picker::auto_pop`): the
 /// viewport returns to the session under it, with a banner saying why. With
@@ -59,90 +60,26 @@ fn run() -> Result<()> {
     once?;
     loop {
         let end = picker::take_attach_end();
-        // Consumed per attach: a signal that ended an attach with a switch
-        // already queued belongs to THAT attach, not to every later exit.
-        let signaled = util::take_terminating_signal();
         let Some(sw) = picker::take_switch().or_else(|| picker::auto_pop(end.as_ref())) else {
-            leave_anonymous_sessions(end.as_ref(), signaled);
             // Unbind before the `process::exit` inside, which skips `main`'s.
             viewport_status::shutdown();
             return exit_with_attach_end(end);
         };
-        // Kill-after-attach: arm the kill of the session being LEFT for the
-        // new client to carry out once it is established; a failed attach
-        // disarms it, so the old session survives a switch that went nowhere.
-        let force = match sw.previous {
-            picker::Previous::Keep => None,
-            picker::Previous::Kill => Some(false),
-            picker::Previous::ForceKill => Some(true),
-        };
-        if let (Some(force), Some(leaving)) = (force, picker::current()) {
-            picker::arm_kill(&leaving, force);
-        }
         if sw.pop {
             picker::stack_pop();
-        } else if force.is_none() {
+        } else {
             picker::stack_push_current();
         }
         viewport_status::refresh_now();
         let dispatched = dispatch_ph(ph_parse(Some(&sw.target)), &picker::default_group());
         viewport_status::refresh_now();
         if let Err(e) = dispatched {
-            picker::disarm_kill();
             // An automatic pop whose re-dial failed: say what happened to the
             // session that ended before saying why the fallback failed.
             if let Some(n) = picker::take_pending_notice() {
                 eprintln!("posh: {n}");
             }
             return Err(e);
-        }
-    }
-}
-
-/// On the way out of posh (an attach nothing followed): what becomes of the
-/// anonymous sessions this viewport created (design 2026-09-21 §4,
-/// `POSH_LEAVE_ANONYMOUS`). `Ask` (the default) shows the leave prompt on
-/// the standalone chooser — a tty on both ends and no signal behind the
-/// end (`signaled`: the just-ended attach's verdict, taken by `run()`) —
-/// with *Keep* as Enter and Esc; `Kill` kills unasked; `Keep`, or
-/// nothing anonymous, is silent. The kills run through `kill_target_as`
-/// with the "session" role — `killed session flac:s-1`, not the switch
-/// flow's "previous session" — (`--unless-attached` protects another
-/// viewport unless forced), in
-/// stack order with the current session last — its attach has already
-/// returned — and every notice prints on stderr AFTER the chooser has
-/// restored the tty. A prompt that could not be shown, or was dismissed,
-/// keeps the sessions and says which were left.
-fn leave_anonymous_sessions(end: Option<&picker::AttachEnd>, signaled: bool) {
-    use picker::{LeaveAction, Previous};
-    let candidates = picker::leave_candidates(end);
-    let tty = util::is_tty(libc::STDIN_FILENO) && util::is_tty(libc::STDOUT_FILENO);
-    let policy = picker::LeavePolicy::from_env();
-    let kills = |force: bool| {
-        for n in picker::run_leave_kills(&candidates, force, |t, f| picker::kill_target_as(t, f, "session")) {
-            eprintln!("posh: {n}");
-        }
-    };
-    match picker::leave_action(policy, tty, signaled, &candidates) {
-        LeaveAction::Nothing => {}
-        LeaveAction::Report => eprintln!("posh: {}", picker::left_running_notice(&candidates)),
-        LeaveAction::Kill { force } => kills(force),
-        LeaveAction::Prompt => {
-            let p = remote::palette_view::leave_prompt(&candidates);
-            picker::overlay_open("leave");
-            let choice = remote::palette::choose_standalone_commands(&p.title, &p.description, p.commands);
-            picker::overlay_close("leave");
-            match choice {
-                Ok(remote::palette::Choice::Action { params, .. }) => {
-                    match Previous::parse(params["previous"].as_str()) {
-                        Some(Previous::Kill) => kills(false),
-                        Some(Previous::ForceKill) => kills(true),
-                        Some(Previous::Keep) | None => {}
-                    }
-                }
-                // Cancelled / Unsupported / a renderer error: keep, and say what was left.
-                _ => eprintln!("posh: {}", picker::left_running_notice(&candidates)),
-            }
         }
     }
 }

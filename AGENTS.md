@@ -272,20 +272,14 @@ the `eng-*(7)` manpages — read them with `man eng-versioning`,
   the picker. A `session.switch {target}` selection is a RE-DIAL: the client
   records the target (`picker::request_switch`) and ends its attach (quit /
   detach), and `main.rs`'s `run()` loop re-attaches through `ph_parse` —
-  the same routing as typing the target. From INSIDE a session the first
-  selection re-shows the renderer with the leave question
-  (`picker::leave_commands`: keep / kill / force-kill the session being
-  left, `previous` on the re-issued `session.switch`); a kill is ARMED by
-  `run()` (`picker::arm_kill`) and carried out by the NEW client once it is
-  established (`first_frame` / `run_interactive`, `picker::run_pending_kill`)
-  — kill-after-attach, through `session::kill_session` locally or
-  `posh kill --unless-attached` over ssh, so a failed switch never destroys
-  the session it left and other attached viewports are respected unless
-  forced. **Stacked switching:** a keep-switch PUSHES the session it leaves
-  (`picker::stack_push`, done by `run()`), the palettes offer *Back to X*
-  (`session.pop`, `picker::request_pop` / `back_commands`) while
-  `picker::stack_top` is Some, and `run()` pops on a `Switch { pop: true }`;
-  a kill-switch pushes nothing. The stack is process-local to the viewport.
+  the same routing as typing the target. A transition never KILLS the
+  session it leaves (killing is deferred to v2 session management; popping
+  back is the cleanup), so the selection is the whole answer — no leave
+  question, no `previous`. **Stacked switching:** a switch PUSHES the
+  session it leaves (`picker::stack_push`, done by `run()`), the palettes
+  offer *Back to X* (`session.pop`, `picker::request_pop` / `back_row`)
+  while `picker::stack_top` is Some, and `run()` pops on a
+  `Switch { pop: true }`. The stack is process-local to the viewport.
   **Auto-pop:** every client loop notes WHY its attach ended
   (`picker::note_attach_end`: `Ended(status)` on the shutdown / `Tag::Exit`
   frame, `Lost(reason)` when an established mux channel or the daemon socket

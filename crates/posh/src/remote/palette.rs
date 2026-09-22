@@ -172,19 +172,6 @@ impl Palette {
         self.show(json!({ "view": "palette", "title": title, "commands": commands }));
     }
 
-    /// [`Palette::open`] with an RFC 0005 §3.2 `description`: free text the
-    /// renderer draws between the heading and the filter input (the leave
-    /// prompt's candidate list). A renderer that predates the field ignores
-    /// it (§9) and shows the plain command list.
-    pub fn open_described(&mut self, title: &str, description: &str, commands: Value) {
-        self.show(json!({
-            "view": "palette",
-            "title": title,
-            "description": description,
-            "commands": commands,
-        }));
-    }
-
     /// Send a `ui.show` and remember its id (see `pending_show`). The view
     /// is on screen from here: recorded as a `picker` overlay for the
     /// session picker, `palette` for everything else (the command list, a
@@ -538,8 +525,7 @@ pub(crate) fn composite_palette(next: &mut Snapshot, rterm: &Terminal, rows: u16
     }
 }
 
-/// The outcome of a standalone chooser run ([`choose_standalone`],
-/// [`choose_standalone_commands`]).
+/// The outcome of a standalone chooser run ([`choose_standalone`]).
 pub enum Choice {
     /// The user selected a row or command: its action (RFC 0005 §4.1).
     Action { method: String, params: Value },
@@ -560,17 +546,7 @@ pub fn choose_standalone(title: &str, rows: Value, empty: &str) -> util::Result<
     run_standalone(|palette| palette.show_picker(title, rows, empty))
 }
 
-/// [`choose_standalone`] for a COMMAND list: a `palette` view with an RFC
-/// 0005 §3.2 `description` on a blank frame — the leave prompt (design
-/// 2026-09-21 §4: the candidate sessions in the description block, the
-/// keep / kill choices as the commands). Same outcomes: the chosen
-/// command's action, `Cancelled` on Esc / renderer gone, `Unsupported`
-/// when the renderer rejects the view.
-pub fn choose_standalone_commands(title: &str, description: &str, commands: Value) -> util::Result<Choice> {
-    run_standalone(|palette| palette.open_described(title, description, commands))
-}
-
-/// The standalone chooser's host loop, shared by both entry points: spawn
+/// The standalone chooser's host loop: spawn
 /// the renderer at the tty's size, take the alternate screen in raw mode,
 /// let `first_show` summon the view, then forward keystrokes and paint
 /// until a selection, a cancel, or a rejected view. The spawn lives here
@@ -800,83 +776,6 @@ mod tests {
         assert_eq!(v["params"]["rows"][0]["action"]["params"]["target"], "dev:s-2");
         assert_eq!(v["params"]["empty"], "(no sessions)");
         unsafe { libc::close(peer) };
-    }
-
-    // open_described summons a `palette` view carrying the description
-    // beside the commands (RFC 0005 §3.2), as a palette overlay.
-    #[test]
-    fn open_described_sends_the_description() {
-        let (mut p, peer) = palette_with_ctrl();
-        p.open_described(
-            "Leaving",
-            "flac:s-1  anonymous  detached\nbox:s-3  anonymous  attached (1)",
-            json!([{ "name": "Keep them running", "action": { "method": "session.leave", "params": { "previous": "keep" } } }]),
-        );
-        assert!(p.is_open());
-        let mut buf = [0u8; 1024];
-        let n = unsafe { libc::read(peer, buf.as_mut_ptr() as *mut libc::c_void, buf.len()) };
-        let line = std::str::from_utf8(&buf[..n.max(0) as usize]).unwrap();
-        let v: Value = serde_json::from_str(line.trim()).unwrap();
-        assert_eq!(v["method"], "ui.show");
-        assert_eq!(v["params"]["view"], "palette");
-        assert_eq!(v["params"]["title"], "Leaving");
-        assert_eq!(
-            v["params"]["description"],
-            "flac:s-1  anonymous  detached\nbox:s-3  anonymous  attached (1)"
-        );
-        assert_eq!(v["params"]["commands"][0]["action"]["params"]["previous"], "keep");
-        unsafe { libc::close(peer) };
-    }
-
-    // The REAL renderer draws a described palette with the description
-    // between the heading and the input and answers a selection with the
-    // command's action (RFC 0005 §3.2). Unlike the picker case there is no
-    // rejection to skip on: a renderer that predates the field IGNORES it
-    // (§9) and draws the plain list, so a PATH-found profile binary would
-    // fail the description assertion on version skew alone. Hence this one
-    // runs only against an explicit `$POSH_PALETTE` — the fresh build
-    // `just debug-palette-e2e` points it at.
-    #[test]
-    fn real_binary_described_palette_round_trip() {
-        if std::env::var_os("POSH_PALETTE").is_none() || palette_binary().is_none() {
-            eprintln!("skip: needs a fresh posh-palette on POSH_PALETTE (just debug-palette-e2e)");
-            return;
-        }
-        let mut p = Palette::spawn(24, 80).expect("spawn + handshake");
-        p.open_described(
-            "Leaving",
-            "flac:s-1  anonymous\nbox:s-3  anonymous",
-            json!([
-                { "name": "Keep them running", "action": { "method": "session.leave", "params": { "previous": "keep" } } },
-                { "name": "Kill them", "action": { "method": "session.leave", "params": { "previous": "kill" } } },
-            ]),
-        );
-        let deadline = Instant::now() + Duration::from_secs(3);
-        while Instant::now() < deadline && !p.rterm.dump_text().contains("Kill them") {
-            poll_readable(p.master, Duration::from_millis(100));
-            p.pump();
-        }
-        let text = p.rterm.dump_text();
-        assert!(text.contains("Kill them"), "renderer never drew the commands:\n{text}");
-        let at = |s: &str| text.find(s).unwrap_or_else(|| panic!("{s:?} not drawn:\n{text}"));
-        assert!(
-            at("Leaving") < at("flac:s-1") && at("flac:s-1") < at("box:s-3") && at("box:s-3") < at("Keep them"),
-            "description not between the heading and the list:\n{text}"
-        );
-        // Enter on the first (default) command: its action comes back.
-        p.forward_input(b"\r");
-        let mut got = None;
-        let deadline = Instant::now() + Duration::from_secs(3);
-        while Instant::now() < deadline && got.is_none() {
-            poll_readable(p.ctrl, Duration::from_millis(100));
-            if let PaletteEvent::Action { method, params } = p.poll_events() {
-                got = Some((method, params));
-            }
-        }
-        let (method, params) = got.expect("an action came back");
-        assert_eq!(method, "session.leave");
-        assert_eq!(params["previous"], "keep");
-        p.shutdown();
     }
 
     // The REAL renderer draws a picker as an aligned table and answers a

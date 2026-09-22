@@ -1129,56 +1129,27 @@ fn dispatch_palette_action(
             false
         }
         "session.switch" => {
-            // FDR 0016 re-dial. A first selection (no `previous`) from inside
-            // a session re-shows the renderer with the leave question; with
-            // the answer, record the switch for the front door and end this
-            // attach exactly as Quit does; `run()` re-attaches to the target
-            // and the new client carries out any kill once established.
+            // FDR 0016 re-dial: record the switch for the front door and end
+            // this attach exactly as Quit does; `run()` re-attaches to the
+            // target. A transition never kills, so there is no question to
+            // ask first — the selection IS the answer.
             let Some(target) = params.get("target").and_then(Value::as_str) else {
                 return false;
             };
-            let previous = params.get("previous").and_then(Value::as_str);
-            if previous.is_none() {
-                if let (Some(p), Some(leaving)) = (st.palette.as_mut(), crate::picker::current()) {
-                    p.open(
-                        &super::palette_view::leave_dialog_title(target, &leaving),
-                        super::palette_view::leave_commands(target),
-                    );
-                    return false;
-                }
-            }
-            let Some(previous) = crate::picker::Previous::parse(previous) else {
-                return false; // unknown spelling: the renderer closed; ignore
-            };
-            crate::picker::request_switch(target, previous);
+            crate::picker::request_switch(target);
             request_shutdown(st);
             st.notify.set_message(&format!("switching to {target}\u{2026}"), true, now);
             true
         }
         "session.pop" => {
             // Stacked switching (FDR 0016): *Back* to the session this
-            // viewport switched away from. Without `previous`, ask the leave
-            // question first (the stack top is the target, so the renderer
-            // never names it); with the answer, record the pop and end this
-            // attach like a switch. An empty stack just says so.
-            let previous = params.get("previous").and_then(Value::as_str);
+            // viewport switched away from — the stack top, never named by the
+            // renderer. An empty stack just says so.
             let Some(top) = crate::picker::stack_top().map(|e| e.target) else {
                 st.notify.set_message(super::palette_view::no_back_notice(), false, now);
                 return false;
             };
-            if previous.is_none() {
-                if let (Some(p), Some(leaving)) = (st.palette.as_mut(), crate::picker::current()) {
-                    p.open(
-                        &super::palette_view::back_dialog_title(&top, &leaving),
-                        super::palette_view::back_commands(),
-                    );
-                    return false;
-                }
-            }
-            let Some(previous) = crate::picker::Previous::parse(previous) else {
-                return false;
-            };
-            if crate::picker::request_pop(previous).is_none() {
+            if crate::picker::request_pop().is_none() {
                 return false;
             }
             request_shutdown(st);
@@ -2485,19 +2456,12 @@ fn suspend(st: &mut ClientState, raw: &RawMode) {
 }
 
 /// The first authentic frame: the attach is established. Drop the
-/// pre-connect banner and, when a switch armed a kill of the session this
-/// client left (FDR 0016 kill-after-attach), carry it out now and say so;
-/// likewise say why an automatic pop brought the viewport here.
+/// pre-connect banner and say why an automatic pop brought the viewport here.
 fn first_frame(st: &mut ClientState, now: u64) {
     if st.notify.message().starts_with("Nothing received") {
         st.notify.set_message("", false, now);
     }
-    let notices: Vec<String> = crate::picker::take_pending_notice()
-        .into_iter()
-        .chain(crate::picker::run_pending_kill())
-        .collect();
-    if !notices.is_empty() {
-        let notice = notices.join(" \u{b7} ");
+    if let Some(notice) = crate::picker::take_pending_notice() {
         util::log_write("switch", &notice);
         st.notify.set_message(&notice, false, now);
     }
@@ -4188,8 +4152,8 @@ mod tests {
         let _g = crate::picker::switch_test_guard();
         let raw = pty_raw_mode();
         let mut st = test_state(24, 80);
-        // With no renderer to ask through, a selection without `previous`
-        // is a keep-switch; with one, the answer rides along.
+        // The selection IS the whole answer: a transition never kills, so
+        // nothing is asked in between.
         let send = dispatch_palette_action(
             &mut st,
             &raw,
@@ -4203,21 +4167,8 @@ mod tests {
             crate::picker::take_switch(),
             Some(crate::picker::Switch {
                 target: "box:dev".into(),
-                previous: crate::picker::Previous::Keep,
                 pop: false
             })
-        );
-        let mut st = test_state(24, 80);
-        assert!(dispatch_palette_action(
-            &mut st,
-            &raw,
-            "session.switch",
-            &json!({ "target": "box:dev", "previous": "force-kill" }),
-            0,
-        ));
-        assert_eq!(
-            crate::picker::take_switch().map(|s| s.previous),
-            Some(crate::picker::Previous::ForceKill)
         );
         // No target: nothing recorded, nothing ended.
         let mut st = test_state(24, 80);

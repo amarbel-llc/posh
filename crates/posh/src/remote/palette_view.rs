@@ -7,7 +7,7 @@
 
 use serde_json::{json, Value};
 
-use crate::picker::{self, Previous, StackView};
+use crate::picker::{self, StackView};
 
 /// Budget for a heading: posh-palette's panel is 46 columns with 2 of
 /// padding and word-wraps beyond it.
@@ -104,20 +104,6 @@ pub fn back_row(view: &StackView) -> Option<Value> {
     Some(json!({ "name": format!("Back to {}", abbreviated(&top.target)), "action": { "method": "session.pop" } }))
 }
 
-/// The leave question's heading for a switch (RFC 0005 `title`): the target
-/// chosen and the session being left, named ONCE here so the answers
-/// ([`leave_commands`]) stay generic fates of "it". Both spelled as the
-/// heading spells them ([`abbreviated`]).
-pub fn leave_dialog_title(target: &str, leaving: &str) -> String {
-    format!("Switch to {} \u{2014} leave {}:", abbreviated(target), abbreviated(leaving))
-}
-
-/// The leave question's heading for a *Back*: the stack top being returned
-/// to and the session being left ([`back_commands`] never names either).
-pub fn back_dialog_title(top: &str, leaving: &str) -> String {
-    format!("Back to {} \u{2014} leave {}:", abbreviated(top), abbreviated(leaving))
-}
-
 /// The notice for a `session.pop` with nothing stacked.
 pub fn no_back_notice() -> &'static str {
     "nothing to go back to"
@@ -131,84 +117,6 @@ pub fn picker_title(view: &StackView) -> String {
         1 => format!("{} \u{b7} 1 to go back", picker::TITLE),
         n => format!("{} \u{b7} {n} to go back", picker::TITLE),
     }
-}
-
-/// The second step after a picker row is chosen from INSIDE a session: the
-/// palette asking what to do with the session being left. Each command
-/// re-issues `session.switch` with the same `target` and a `previous`.
-/// Keeping it is a PUSH: the session goes on the stack and *Back* returns
-/// to it (FDR 0016, stacked switching).
-pub fn leave_commands(target: &str) -> Value {
-    leave_commands_for("session.switch", Some(target))
-}
-
-/// The leave question for *Back* (`session.pop`): the same three fates for
-/// the session being left, re-issued as `session.pop` with a `previous`
-/// (the target is the stack's top, never named by the renderer).
-pub fn back_commands() -> Value {
-    leave_commands_for("session.pop", None)
-}
-
-/// The three fates (+ cancel) for the session being LEFT, each re-issuing
-/// `method` with a `previous`. The session being left is named ONCE by the
-/// CALLER in the dialog title (RFC 0005 `title`), NOT repeated in every answer,
-/// so the answers read as fates of "it".
-fn leave_commands_for(method: &str, target: Option<&str>) -> Value {
-    let cmd = |name: &str, previous: Previous| {
-        let mut params = json!({ "previous": previous.as_str() });
-        if let Some(t) = target {
-            params["target"] = json!(t);
-        }
-        json!({
-            "name": name,
-            "action": { "method": method, "params": params },
-        })
-    };
-    json!([
-        cmd("Keep it running", Previous::Keep),
-        cmd("Kill it (kept if other viewports are attached)", Previous::Kill),
-        cmd("Kill it even with other viewports attached", Previous::ForceKill),
-        { "name": "Cancel" },
-    ])
-}
-
-/// The leave prompt (design 2026-09-21 §4), shown by the front door on the
-/// way out of posh: the anonymous sessions this viewport created, and what
-/// to do with them.
-pub struct LeavePrompt {
-    /// `Leaving — N anonymous session(s) you created`.
-    pub title: String,
-    /// The candidates, one [`abbreviated`] target per line, stack order with
-    /// the current session last (RFC 0005 §3.2 `description`).
-    pub description: String,
-    /// The three fates as `palette` rows.
-    pub commands: Value,
-}
-
-/// The prompt for `candidates` (never empty — the caller asks nothing with
-/// none). The rows re-issue `session.leave` with a `previous` like the
-/// switch dialogs do; *Keep them running* is FIRST so Enter keeps, and
-/// there is NO Cancel row: Esc is a keep too (the renderer's cancel), so
-/// both ways out of the prompt leave the sessions running.
-pub fn leave_prompt(candidates: &[picker::StackEntry]) -> LeavePrompt {
-    let n = candidates.len();
-    let title = format!(
-        "Leaving \u{2014} {n} anonymous session{} you created",
-        if n == 1 { "" } else { "s" }
-    );
-    let description = candidates.iter().map(|e| abbreviated(&e.target)).collect::<Vec<_>>().join("\n");
-    let cmd = |name: &str, previous: Previous| {
-        json!({
-            "name": name,
-            "action": { "method": "session.leave", "params": { "previous": previous.as_str() } },
-        })
-    };
-    let commands = json!([
-        cmd("Keep them running", Previous::Keep),
-        cmd("Kill them (kept if other viewports are attached)", Previous::Kill),
-        cmd("Kill them even with other viewports attached", Previous::ForceKill),
-    ]);
-    LeavePrompt { title, description, commands }
 }
 
 #[cfg(test)]
@@ -326,20 +234,8 @@ mod tests {
         assert_eq!(back_row(&uuid).unwrap()["name"], "Back to box:ff9fe216");
     }
 
-    /// The dialog headings name the two sessions once each (the answers do
-    /// not repeat them), with the same em-dash shape for a switch and a Back,
-    /// spelled as the heading and the row spell them.
     #[test]
-    fn dialog_titles_name_the_target_and_the_session_left() {
-        assert_eq!(leave_dialog_title("box:dev", "me@far.example.com:s-1"), "Switch to box:dev \u{2014} leave far:s-1:");
-        assert_eq!(
-            back_dialog_title("me@box.example.com:ff9fe216-9652-4e23-805c-6f4dd5ce7eca", "box:dev"),
-            "Back to box:ff9fe216 \u{2014} leave box:dev:"
-        );
-        // A local `:session` names this machine, like the default title.
-        let t = back_dialog_title(":prev", ":here");
-        assert!(t.starts_with("Back to ") && t.contains(":prev \u{2014} leave ") && t.ends_with(":here:"), "{t}");
-        assert!(!t.starts_with("Back to :"), "{t}");
+    fn a_pop_with_nothing_stacked_says_so() {
         assert_eq!(no_back_notice(), "nothing to go back to");
     }
 
@@ -350,77 +246,13 @@ mod tests {
         assert_eq!(picker_title(&view(Some(entry(":a", SessionKind::Named)), 2)), "sessions \u{b7} 2 to go back");
     }
 
-    /// The back question re-issues session.pop with a previous, no target.
-    /// The session being left is named in the dialog title (the caller), NOT
-    /// in every answer — so the answers are generic fates of "it".
+    /// *Back* is a bare `session.pop`: no target (the client resolves it from
+    /// the stack) and no `previous` — a transition never kills, so the row IS
+    /// the whole answer.
     #[test]
-    fn back_commands_reissue_pop_with_a_previous_and_no_target() {
-        let cmds = back_commands();
-        let arr = cmds.as_array().unwrap();
-        assert_eq!(arr.len(), 4);
-        assert_eq!(arr[0]["action"]["method"], "session.pop");
-        assert!(arr[0]["action"]["params"].get("target").is_none());
-        assert_eq!(arr[1]["action"]["params"]["previous"], "kill");
-        assert_eq!(arr[0]["name"], "Keep it running");
-    }
-
-    /// The leave step: three `session.switch` re-issues carrying the chosen
-    /// target and a `previous`, plus a no-op cancel; `previous` parses back,
-    /// and an unknown spelling is rejected (absent = keep). The session being
-    /// left is named in the dialog title (the caller), not in the answers, so
-    /// each answer is a generic fate of "it".
-    #[test]
-    fn leave_commands_carry_target_and_previous() {
-        let cmds = leave_commands("box:dev");
-        let arr = cmds.as_array().unwrap();
-        assert_eq!(arr.len(), 4);
-        let names = ["Keep it running", "Kill it", "Kill it"];
-        for (i, want) in ["keep", "kill", "force-kill"].iter().enumerate() {
-            assert_eq!(arr[i]["action"]["method"], "session.switch");
-            assert_eq!(arr[i]["action"]["params"]["target"], "box:dev");
-            assert_eq!(arr[i]["action"]["params"]["previous"], *want);
-            assert_eq!(Previous::parse(Some(want)).map(Previous::as_str), Some(*want));
-            // The answer names the fate, never the leaving session id.
-            let name = arr[i]["name"].as_str().unwrap();
-            assert!(name.starts_with(names[i]), "{name:?}");
-            assert!(!name.contains(':'), "answer must not repeat a session id: {name:?}");
-        }
-        assert!(arr[3]["action"].is_null(), "Cancel is a no-op entry");
-        assert_eq!(Previous::parse(None), Some(Previous::Keep));
-        assert_eq!(Previous::parse(Some("nuke")), None);
-    }
-
-    /// The leave prompt: the candidates one abbreviated target per line in
-    /// the description (a local `:session` names this machine, a remote's
-    /// host is cut to its first label), *Keep* first, the two kills after,
-    /// no Cancel row; each row a `session.leave` with a `previous`.
-    #[test]
-    fn leave_prompt_lists_candidates_in_the_description_and_offers_keep_first() {
-        let c = vec![
-            entry(":s-1", SessionKind::Anonymous),
-            entry("me@box.example.com:s-3", SessionKind::Anonymous),
-        ];
-        let p = leave_prompt(&c);
-        assert_eq!(p.title, "Leaving \u{2014} 2 anonymous sessions you created");
-        let (first, second) = p.description.split_once('\n').expect("one line per candidate");
-        assert!(first.ends_with(":s-1") && !first.starts_with(':'), "{first}");
-        assert_eq!(second, "box:s-3");
-        let names: Vec<&str> = p.commands.as_array().unwrap().iter().map(|c| c["name"].as_str().unwrap()).collect();
-        assert_eq!(
-            names,
-            [
-                "Keep them running",
-                "Kill them (kept if other viewports are attached)",
-                "Kill them even with other viewports attached"
-            ]
-        );
-        for (i, want) in ["keep", "kill", "force-kill"].iter().enumerate() {
-            assert_eq!(p.commands[i]["action"]["method"], "session.leave");
-            assert_eq!(p.commands[i]["action"]["params"]["previous"], *want);
-        }
-        // One candidate: singular wording, a one-line description.
-        let one = leave_prompt(&c[1..]);
-        assert_eq!(one.title, "Leaving \u{2014} 1 anonymous session you created");
-        assert_eq!(one.description, "box:s-3");
+    fn back_row_is_a_bare_pop_with_no_params() {
+        let row = back_row(&view(Some(entry(":prev", SessionKind::Named)), 1)).unwrap();
+        assert_eq!(row["action"]["method"], "session.pop");
+        assert!(row["action"].get("params").is_none(), "{row}");
     }
 }
