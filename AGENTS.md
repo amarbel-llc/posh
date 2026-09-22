@@ -184,8 +184,9 @@ the `eng-*(7)` manpages — read them with `man eng-versioning`,
   baseline; `remote/channel.rs` (`seal_instruction`/`open_any_instruction`)
   is the single mode gate. The per-destination mux endpoint (M1,
   `remote/mux.rs` + `posh-server agent`) is DEFAULT ON (`POSH_MUX=0` opts
-  out — FDR 0014 promotion): one agent-only enveloped connection per
-  destination owns agent forwarding, sessions bootstrap with forwarding off,
+  out — FDR 0014 promotion): one enveloped connection per destination owns
+  agent forwarding (or carries sessions only, when nothing forwards),
+  sessions bootstrap with forwarding off,
   and remote `agent/sock` ownership is structural from a single client host.
   **Sessions still get `SSH_AUTH_SOCK=<base>/agent/sock` at birth**: with no
   `-A` riding to `posh-server` the client sends the `POSH_AGENT_EXPORT=1`
@@ -485,8 +486,8 @@ read-only, `debug` group):
   under the table is an RFC 0003 §6.1 `footer` on the header record (mesa
   ≥ purse-first 7b0fc8b; an older mesa ignores it, and on a pipe the lines
   print verbatim after the rows, untabbed). `posh mux
-  ls --raw` prints the verbatim one-liners (`self=` / `remote=` /
-  `session_channels=` / the congestion summary) — the grep shape the soak
+  ls --raw` prints the verbatim one-liners (`self=` / `remote=` / `agent=`
+  / `session_channels=` / the congestion) — the grep shape the soak
   recipes use. `posh list` is sessions only (the old appended mux / peer /
   remote sections are gone). All additive caps (ids 13/14) — an old peer on
   either side just reads `unknown`.
