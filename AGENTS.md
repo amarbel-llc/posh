@@ -275,20 +275,24 @@ the `eng-*(7)` manpages — read them with `man eng-versioning`,
   the same routing as typing the target. A transition never KILLS the
   session it leaves (killing is deferred to v2 session management; popping
   back is the cleanup), so the selection is the whole answer — no leave
-  question, no `previous`. **Stacked switching:** a switch PUSHES the
-  session it leaves (`picker::stack_push`, done by `run()`), the palettes
-  offer *Back to X* (`session.pop`, `picker::request_pop` / `back_row`)
-  while `picker::stack_top` is Some, and `run()` pops on a
-  `Switch { pop: true }`. The stack is process-local to the viewport.
+  question, no `previous`. **One state machine:** `picker.rs` holds ONE
+  `VIEWPORT` and a pure `apply(state, event) -> Vec<Effect>`; the CALLER
+  performs the effects. **Stacked switching:** `Event::Entered` is the only
+  thing that moves `current`, and it PUSHES what it leaves — so no caller
+  can record arriving without the push (there is no public `set_current`;
+  the FDR 0012 in-place re-home did exactly that and lost the session).
+  Only a pop pops. The palettes offer *Back to X* (`session.pop`,
+  `picker::request_pop` / `back_row`) while `picker::stack_top` is Some.
   **Auto-pop:** every client loop notes WHY its attach ended
   (`picker::note_attach_end`: `Ended(status)` on the shutdown / `Tag::Exit`
   frame, `Lost(reason)` when an established mux channel or the daemon socket
   closes unasked, `Quit` for a user quit / detach / switch / signal — the
   local loop's `detaching` flag tells a detach's socket close from a loss);
-  `run()` takes it and, for `Ended` / `Lost` with a stack top,
-  `picker::auto_pop` re-dials the top as a *Back, keep* and leaves a
-  `session X ended (exit N) — back to Y` notice that `first_frame` /
-  `run_interactive` show with the kill notice. `Quit` never pops. With no
+  `Event::AttachReturned` consumes it and, for `Ended` / `Lost` with a stack
+  top, dials the top and leaves a `session X ended (exit N) — back to Y`
+  notice that `first_frame` / `run_interactive` show. A pop target itself
+  gone (`Event::DialFailed`) pops AGAIN, and the whole chain is reported in
+  ONE `ShowPopNotice` (RFC 0005 §3.6). `Quit` never pops. With no
   stack, `Ended` becomes the process exit status (the entry points no longer
   `process::exit` themselves) and `Lost` prints one stderr line. **The
   cause travels (posh#194):** `daemon_loop` returns a
@@ -304,7 +308,7 @@ the `eng-*(7)` manpages — read them with `man eng-versioning`,
   `exit_with_attach_end` prints a killed / signaled / failed / lost end on
   stderr when nothing pops.
   The attach entry points record the session they sit in with
-  `picker::set_current`, which also feeds `picker::default_title`: a
+  `picker::entered`, which also feeds `picker::default_title`: a
   session that set no title of its own is shown as `host:session` on the
   outer terminal by both clients (compose-time, a set title wins; a UUID
   name is abbreviated; the daemon's foreground process is appended when

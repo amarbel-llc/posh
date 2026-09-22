@@ -163,8 +163,12 @@ fn run_interactive(stream: UnixStream) -> Result<()> {
                 .and_then(|cfg| crate::session::attach_existing(&cfg, &name))
             {
                 Ok(s) => {
-                    // FDR 0016: the re-homed viewport now sits in `name`.
-                    crate::picker::set_current(&crate::picker::target_for(None, Some(&group), &name));
+                    // FDR 0016: the re-homed viewport now sits in `name`, and
+                    // the session it LEFT goes on the stack — `entered` is
+                    // one operation, so this path can no longer record the
+                    // arrival without the push (it used to, which is how
+                    // anonymous sessions vanished from the bookkeeping).
+                    crate::picker::entered(&crate::picker::target_for(None, Some(&group), &name));
                     stream = s;
                     continue;
                 }
@@ -223,7 +227,7 @@ pub fn cmd_attach(
     } else {
         crate::session::attach_existing(cfg, name)?
     };
-    crate::picker::set_current(&crate::picker::target_for(None, Some(&cfg.group), name));
+    crate::picker::entered(&crate::picker::target_for(None, Some(&cfg.group), name));
     run_interactive(stream)
 }
 
@@ -336,7 +340,7 @@ pub fn cmd_start_local(
     // stack's fallback for a daemon that never reports its kind. A named
     // start arms nothing.
     arm_anonymous_create(kind);
-    crate::picker::set_current(&crate::picker::target_for(None, Some(&cfg.group), name));
+    crate::picker::entered(&crate::picker::target_for(None, Some(&cfg.group), name));
     run_interactive(stream)
 }
 
@@ -2708,34 +2712,31 @@ mod tests {
     #[test]
     fn dispatch_session_pop_records_a_pop() {
         let _g = crate::picker::switch_test_guard();
-        while crate::picker::stack_pop().is_some() {}
-        crate::picker::set_current(":here");
+        crate::picker::reset_for_test();
+        crate::picker::entered(":here");
         let mut buf = Vec::new();
         assert!(matches!(
             dispatch_local_action("session.pop", &json!({}), &mut buf),
             LocalAction::None
         ));
         assert!(buf.is_empty(), "nothing to go back to: no detach");
-        crate::picker::set_current(":prev");
-        crate::picker::stack_push_current();
-        crate::picker::set_current(":here");
+        // Entering `:here` a second time pushes `:prev` — that IS the push.
+        crate::picker::entered(":prev");
+        crate::picker::entered(":here");
         assert!(matches!(
             dispatch_local_action("session.pop", &json!({}), &mut buf),
             LocalAction::None
         ));
         assert_eq!(buf, ipc::encode_frame(Tag::Detach, b""));
         assert_eq!(
-            crate::picker::take_switch(),
-            Some(crate::picker::Switch {
-                target: ":prev".into(),
-                pop: true
-            })
+            crate::picker::dispatch(crate::picker::Event::AttachReturned),
+            [crate::picker::Effect::Dial { target: ":prev".into() }]
         );
         // A local target is spelled as the heading spells it: this machine's name.
         let names = palette_names(&palette_commands(true, false, false, &stacked(":prev", 1)));
         assert!(names[0].starts_with("Back to ") && names[0].ends_with(":prev"), "{names:?}");
         assert!(!names[0].starts_with("Back to :"), "{names:?}");
-        crate::picker::stack_pop();
+        crate::picker::reset_for_test();
     }
 
     use crate::picker::{no_stack, stacked};
@@ -2767,21 +2768,22 @@ mod tests {
     #[test]
     fn named_local_start_does_not_arm_the_anonymous_create_fallback() {
         let _g = crate::picker::switch_test_guard();
-        crate::picker::set_current(":reset"); // consume any armed flag
+        crate::picker::entered(":reset"); // consume any armed flag
         arm_anonymous_create(SessionKind::Named);
         assert!(!crate::picker::anonymous_create_armed());
         arm_anonymous_create(SessionKind::Unknown);
         assert!(!crate::picker::anonymous_create_armed());
         arm_anonymous_create(SessionKind::Anonymous);
         assert!(crate::picker::anonymous_create_armed());
-        crate::picker::set_current(":s-1");
+        crate::picker::entered(":s-1");
         assert_eq!(crate::picker::current_kind(), SessionKind::Anonymous);
     }
 
     #[test]
     fn dispatch_session_switch_records_target_and_detaches() {
         let _g = crate::picker::switch_test_guard();
-        crate::picker::set_current(":here");
+        crate::picker::reset_for_test();
+        crate::picker::entered(":here");
         let mut buf = Vec::new();
         assert!(matches!(
             dispatch_local_action("session.switch", &json!({ "target": ":dev" }), &mut buf),
@@ -2789,11 +2791,8 @@ mod tests {
         ));
         assert_eq!(buf, ipc::encode_frame(Tag::Detach, b""));
         assert_eq!(
-            crate::picker::take_switch(),
-            Some(crate::picker::Switch {
-                target: ":dev".into(),
-                pop: false
-            })
+            crate::picker::dispatch(crate::picker::Event::AttachReturned),
+            [crate::picker::Effect::Dial { target: ":dev".into() }]
         );
         let mut buf = Vec::new();
         assert!(matches!(

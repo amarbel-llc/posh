@@ -398,19 +398,19 @@ mod tests {
     /// second attach does not rebind. The socket answers the rendered text,
     /// an overlay change reaches it on its own, an explicit `refresh_now`
     /// picks up a stack change, and `shutdown` removes both files. Other
-    /// tests may call `set_current` concurrently: with the base set they hit
+    /// tests may call `entered` concurrently: with the base set they hit
     /// the idempotent path, with it cleared they bind nothing.
     #[test]
     fn first_attach_binds_once_and_shutdown_cleans_up() {
         let _g = picker::switch_test_guard();
-        while picker::stack_pop().is_some() {}
+        picker::reset_for_test();
         let base = tmp("bind");
         let dir = base.join("viewports");
         let pid = std::process::id();
         shutdown();
         *TEST_BASE.lock().unwrap() = Some(dir.clone());
         let binds = BINDS.load(Ordering::Relaxed);
-        picker::set_current(":vs-test");
+        picker::entered(":vs-test");
         assert!(
             HANDLE.lock().unwrap().is_some(),
             "bind under {}: {:?}",
@@ -428,15 +428,17 @@ mod tests {
         );
         // A second attach (an in-place re-home) does not rebind but the
         // `current=` line follows it; the kind arriving on a frame updates
-        // `kind=` without the front door's loop.
-        picker::set_current(":vs-rehomed");
+        // `kind=` without the front door's loop. Entering also PUSHES what
+        // it left, so the stack grows as the test walks.
+        picker::entered(":vs-rehomed");
         assert_eq!(BINDS.load(Ordering::Relaxed), binds + 1, "a second attach does not rebind");
         let served = session::read_status_socket(&sock).unwrap();
         assert!(served.contains(" current=:vs-rehomed kind=unknown "), "{served}");
+        assert!(served.contains("stack depth=1 target=:vs-test kind=unknown\n"), "{served}");
         picker::set_current_kind(SessionKind::Named);
         let served = session::read_status_socket(&sock).unwrap();
         assert!(served.contains(" current=:vs-rehomed kind=named "), "{served}");
-        picker::set_current(":vs-test");
+        picker::entered(":vs-test");
         assert!(session::read_status_socket(&sock).unwrap().contains(" current=:vs-test kind=unknown "));
         // The overlay helpers refresh on their own. The `leave` kind is the
         // one no concurrent renderer test opens (they record palette / picker
@@ -446,19 +448,18 @@ mod tests {
         assert!(served.contains("overlay kind=leave over=:vs-test\n"), "{served}");
         picker::overlay_close("leave");
         assert!(!session::read_status_socket(&sock).unwrap().contains("kind=leave"));
-        // An explicit refresh picks up a picker change made without one.
-        picker::stack_push_current();
-        assert!(!session::read_status_socket(&sock).unwrap().contains("stack depth=1 target=:vs-test"));
+        // The stack the walk above built is reported bottom first.
         refresh_now();
         let served = session::read_status_socket(&sock).unwrap();
         assert!(served.contains("stack depth=1 target=:vs-test kind=unknown\n"), "{served}");
-        picker::stack_pop();
+        assert!(served.contains("stack depth=2 target=:vs-rehomed kind=named\n"), "{served}");
+        picker::reset_for_test();
         *TEST_BASE.lock().unwrap() = None;
         shutdown();
         assert!(!sock.exists() && !pidfile.exists());
         assert!(HANDLE.lock().unwrap().is_none());
         refresh_now(); // a no-op once unbound
-        picker::set_current(":vs-after");
+        picker::entered(":vs-after");
         assert!(HANDLE.lock().unwrap().is_none(), "no base under test: no bind");
         let _ = std::fs::remove_dir_all(&base);
     }

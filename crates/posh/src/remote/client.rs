@@ -4164,17 +4164,21 @@ mod tests {
         assert!(send, "a switch asks to send the shutdown promptly");
         assert!(st.shutdown_requested, "a switch ends this attach");
         assert_eq!(
-            crate::picker::take_switch(),
-            Some(crate::picker::Switch {
-                target: "box:dev".into(),
-                pop: false
-            })
+            crate::picker::dispatch(crate::picker::Event::AttachReturned),
+            [crate::picker::Effect::Dial { target: "box:dev".into() }]
         );
-        // No target: nothing recorded, nothing ended.
+        // No target: nothing recorded, nothing ended. (From a clean state:
+        // the transition above is still pending until an attach ENTERS it.)
+        crate::picker::reset_for_test();
         let mut st = test_state(24, 80);
         assert!(!dispatch_palette_action(&mut st, &raw, "session.switch", &json!({}), 0));
         assert!(!st.shutdown_requested);
-        assert_eq!(crate::picker::take_switch(), None);
+        assert_eq!(
+            crate::picker::dispatch(crate::picker::Event::AttachReturned),
+            [crate::picker::Effect::Exit { end: None, skipped: Vec::new() }],
+            "nothing was recorded, so there is nowhere to go"
+        );
+        crate::picker::reset_for_test();
     }
 
     #[test]
@@ -5670,7 +5674,7 @@ mod tests {
     #[test]
     fn untitled_session_paints_the_default_title_until_the_app_sets_one() {
         let _g = crate::picker::switch_test_guard();
-        crate::picker::set_current(&crate::picker::target_for(Some("box"), None, "dev"));
+        crate::picker::entered(&crate::picker::target_for(Some("box"), None, "dev"));
         let mut st = test_state(5, 40);
         let bytes = compose_frame(&mut st, 0);
         assert!(
@@ -5721,7 +5725,7 @@ mod tests {
     #[test]
     fn session_kind_cap_is_held_and_feeds_the_current_target() {
         let _g = crate::picker::switch_test_guard();
-        crate::picker::set_current(&crate::picker::target_for(Some("box"), None, "dev"));
+        crate::picker::entered(&crate::picker::target_for(Some("box"), None, "dev"));
         assert_eq!(crate::picker::current_kind(), SessionKind::Unknown);
         let mut st = test_state(5, 40);
         assert_eq!(st.session_kind, SessionKind::Unknown);

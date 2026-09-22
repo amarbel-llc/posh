@@ -58,29 +58,62 @@ fn run() -> Result<()> {
     let once = run_once();
     viewport_status::refresh_now();
     once?;
-    loop {
-        let end = picker::take_attach_end();
-        let Some(sw) = picker::take_switch().or_else(|| picker::auto_pop(end.as_ref())) else {
-            // Unbind before the `process::exit` inside, which skips `main`'s.
-            viewport_status::shutdown();
-            return exit_with_attach_end(end);
-        };
-        if sw.pop {
-            picker::stack_pop();
-        } else {
-            picker::stack_push_current();
-        }
-        viewport_status::refresh_now();
-        let dispatched = dispatch_ph(ph_parse(Some(&sw.target)), &picker::default_group());
-        viewport_status::refresh_now();
-        if let Err(e) = dispatched {
-            // An automatic pop whose re-dial failed: say what happened to the
-            // session that ended before saying why the fallback failed.
-            if let Some(n) = picker::take_pending_notice() {
-                eprintln!("posh: {n}");
+    let mut effects: std::collections::VecDeque<picker::Effect> =
+        picker::dispatch(picker::Event::AttachReturned).into();
+    while let Some(effect) = effects.pop_front() {
+        match effect {
+            picker::Effect::Dial { target } => {
+                viewport_status::refresh_now();
+                let dispatched = dispatch_ph(ph_parse(Some(&target)), &picker::default_group());
+                viewport_status::refresh_now();
+                match dispatched {
+                    // The attach ran and returned; its client noted why.
+                    Ok(()) => effects.extend(picker::dispatch(picker::Event::AttachReturned)),
+                    Err(e) => {
+                        // The target is gone. An automatic pop keeps popping
+                        // past it (the cascade); an explicit transition that
+                        // went nowhere is just an error, and the reducer
+                        // says which by whether it hands back anything.
+                        let next = picker::dispatch(picker::Event::DialFailed { target });
+                        if next.is_empty() {
+                            report_pop_notice();
+                            return Err(e);
+                        }
+                        effects.extend(next);
+                    }
+                }
             }
-            return Err(e);
+            // The RFC 0005 §3.6 notice is `palette_view`'s to draw; the
+            // one-line banner the clients print is already stored for the
+            // next attach to take.
+            picker::Effect::ShowPopNotice(_) => {}
+            picker::Effect::RefreshStatus => viewport_status::refresh_now(),
+            picker::Effect::Exit { end, skipped } => {
+                if !skipped.is_empty() {
+                    let names = skipped
+                        .iter()
+                        .map(|e| picker::display_target(&e.target))
+                        .collect::<Vec<_>>()
+                        .join(", ");
+                    eprintln!("posh: also gone: {names}");
+                }
+                // Unbind before the `process::exit` inside, which skips
+                // `main`'s.
+                viewport_status::shutdown();
+                return exit_with_attach_end(end);
+            }
         }
+    }
+    // The reducer asked for nothing: the viewport has nowhere left to be.
+    viewport_status::shutdown();
+    Ok(())
+}
+
+/// An automatic pop whose re-dial failed: say what happened to the session
+/// that ended before the caller says why the fallback failed.
+fn report_pop_notice() {
+    if let Some(n) = picker::take_pending_notice() {
+        eprintln!("posh: {n}");
     }
 }
 
@@ -1306,8 +1339,10 @@ fn cmd_ssh_session(
         Some(u) => format!("{u}@{host}"),
         None => host,
     };
-    // FDR 0016: the session a later switch would be leaving.
-    picker::set_current(&picker::target_for(Some(&dest), group, &session));
+    // FDR 0016: the viewport is now here, and whatever it was in goes on the
+    // stack (`entered` is one operation — arriving and leaving cannot be
+    // recorded separately).
+    picker::entered(&picker::target_for(Some(&dest), group, &session));
     if detached {
         // Detached spawn (#67): no transport, so no agent endpoint — execute
         // the inner `posh attach --detach` directly over ssh and return. This
