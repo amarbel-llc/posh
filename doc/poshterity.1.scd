@@ -72,8 +72,10 @@ and lives only in the standalone *poshterity* binary.
 	difference alone.
 
 *version*
-	Print *poshterity* _VERSION_ (_GIT_SHA_) and exit. The version flows
-	from the repo's _version.env_; the git SHA from the build. See
+	Print *poshterity* _VERSION_*+*_GIT_SHA_ and exit — the build
+	identity, joined because a version alone does not identify a build.
+	The version flows from the repo's _version.env_; the git SHA from
+	the build, with a _-dirty_ suffix when the tree was unclean. See
 	*eng-versioning*(7).
 
 *help*

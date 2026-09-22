@@ -80,10 +80,14 @@ pub fn run(args: &[String]) -> Result<(), String> {
             Ok(())
         }
         Some("version" | "-V" | "--version") => {
-            // poshterity's own provenance (version + git sha), flowed by build.rs
-            // (github #71). Distinct from the emulator's emu_rev stamped into
-            // recordings. See eng-versioning(7).
-            println!("poshterity {} ({})", env!("POSH_VERSION"), env!("POSH_GIT_SHA"));
+            // poshterity's own provenance: the build identity `<version>+<sha>`
+            // composed once in posh_build, which is also the shape
+            // eng-versioning(7)'s "version subcommand output" mandates for the
+            // self-identification line. Conceptually this is the BINARY's
+            // provenance, not the emulator's `emu_rev` stamped into recordings
+            // — though in a workspace build the two strings coincide, since
+            // both flow the same version.env and git sha.
+            println!("poshterity {}", env!("POSH_BUILD"));
             Ok(())
         }
         Some(other) => Err(format!("unknown subcommand {other:?}\n\n{USAGE}")),
