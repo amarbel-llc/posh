@@ -976,6 +976,19 @@ fn log_ref_change(action: &str, pid: Option<u32>, state: &MuxState) {
 /// Releases a departing conn's session ref (the auto-unref half of
 /// `MuxSessionRef`): the caller invokes this exactly once per dropped conn.
 fn drop_ipc_conn(conn: &IpcConn, state: &mut MuxState, now: u64) {
+    // posh#211: a client that gives up on an open (its 15 s first-frame
+    // timeout) drops the conn while the session is still unconfirmed — the
+    // remote never answered a single OPEN.
+    if let Some(s) = conn.session.as_ref().filter(|s| !s.confirmed) {
+        util::log_write(
+            "warn",
+            &format!(
+                "session dropped by the client before the remote answered: chan={} after {} OPEN send(s)",
+                s.chan.ordinal(),
+                s.open_sends
+            ),
+        );
+    }
     if conn.holds_ref {
         state.unref(now);
         log_ref_change("-conn-drop", conn.peer_pid, state);
@@ -1678,6 +1691,15 @@ fn mux_loop(
                                 if !sess.confirmed {
                                     sess.confirmed = true;
                                     let chan = sess.chan;
+                                    util::log_write(
+                                        "info",
+                                        &format!(
+                                            "session confirmed by the remote: chan={} after {} OPEN send(s), first reply kind={:?}",
+                                            chan.ordinal(),
+                                            sess.open_sends,
+                                            message.first()
+                                        ),
+                                    );
                                     for m in std::mem::take(&mut sess.queued) {
                                         send_session_wire(
                                             &mut conn,
@@ -1925,6 +1947,19 @@ fn mux_loop(
                             state.add_ref();
                             log_ref_change("+session-open", conns[i].peer_pid, &state);
                         }
+                        // posh#211: the local half of the open's timeline —
+                        // with the wire-send and confirm lines below, the log
+                        // says whether an open that never established ever
+                        // left this host, and whether the remote answered.
+                        util::log_write(
+                            "info",
+                            &format!(
+                                "session open granted: chan={} target={} (pid={})",
+                                chan.ordinal(),
+                                String::from_utf8_lossy(&target),
+                                conns[i].peer_pid.map_or_else(|| "?".to_string(), |p| p.to_string()),
+                            ),
+                        );
                         conns[i].session = Some(IpcSession {
                             chan,
                             target,
@@ -2099,6 +2134,14 @@ fn mux_loop(
                     {
                         s.open_sends += 1;
                         s.last_open_send = Some(now);
+                        // posh#211: the first send only — the retransmit
+                        // count rides the confirm / drop / timeout line.
+                        if s.open_sends == 1 {
+                            util::log_write(
+                                "info",
+                                &format!("session OPEN sent on the wire: chan={}", s.chan.ordinal()),
+                            );
+                        }
                         // The OPEN carries the resume cursor (posh#162 + this
                         // change): INITIAL on the initial open (bare target,
                         // byte-identical), else the frame ceiling + the
@@ -2143,7 +2186,11 @@ fn mux_loop(
             let _ = send_mux_frame(c, MuxTag::SessionClose, &close.encode());
             util::log_write(
                 "warn",
-                "session open timed out (no answer from the remote peer)",
+                &format!(
+                    "session open timed out (no answer from the remote peer): chan={} after {} OPEN send(s)",
+                    s.chan.ordinal(),
+                    s.open_sends
+                ),
             );
             if c.holds_ref {
                 c.holds_ref = false;

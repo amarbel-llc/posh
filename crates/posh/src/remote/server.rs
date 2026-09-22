@@ -918,6 +918,10 @@ fn handle_session_instruction(
         Some(&SESSION_WIRE_OPEN) => {
             if idx.is_none() {
                 if channels.len() >= MAX_SESSION_CHANNELS {
+                    util::log_write(
+                        "warn",
+                        &format!("session OPEN refused, table full: chan={}", chan.ordinal()),
+                    );
                     send_session_wire(
                         conn,
                         fragmenter,
@@ -931,6 +935,18 @@ fn handle_session_instruction(
                 // reconnecting (frame + input + echo continuity).
                 let (target_bytes, resume) =
                     crate::remote::resume::decode_open(&message[1..]);
+                // posh#211: the remote half of the open's timeline (the local
+                // mux daemon logs grant / wire send / confirm). Fresh admits
+                // only — a duplicate is a retransmission and would flood.
+                util::log_write(
+                    "info",
+                    &format!(
+                        "session OPEN received: chan={} target={} resume_frame={}",
+                        chan.ordinal(),
+                        String::from_utf8_lossy(target_bytes),
+                        resume.frame
+                    ),
+                );
                 channels.push(PeerChannel::Awaiting {
                     chan,
                     target: String::from_utf8_lossy(target_bytes).into_owned(),
@@ -993,6 +1009,10 @@ fn handle_session_instruction(
                     )
                 }) {
                     Ok(daemon) => {
+                        util::log_write(
+                            "info",
+                            &format!("session linked: chan={} target={target}", chan.ordinal()),
+                        );
                         channels[i] = PeerChannel::Linked(Box::new(SessionBridge {
                             chan,
                             daemon,
@@ -1013,6 +1033,13 @@ fn handle_session_instruction(
                         }));
                     }
                     Err(e) => {
+                        util::log_write(
+                            "warn",
+                            &format!(
+                                "session open failed: chan={} target={target}: {e}",
+                                chan.ordinal()
+                            ),
+                        );
                         channels.remove(i);
                         send_session_wire(
                             conn,
@@ -1039,6 +1066,14 @@ fn handle_session_instruction(
             }
         }
         Some(&SESSION_WIRE_CLOSE) => {
+            util::log_write(
+                "info",
+                &format!(
+                    "session CLOSE received: chan={} (known={})",
+                    chan.ordinal(),
+                    idx.is_some()
+                ),
+            );
             if let Some(i) = idx {
                 if let PeerChannel::Linked(b) = &mut channels[i] {
                     ipc::append_frame(&mut b.daemon.link.write, Tag::Detach, b"");
