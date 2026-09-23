@@ -256,7 +256,7 @@ install-merge-driver:
 # eval time and flowed into every crate at build time via each crate's
 # build.rs (cargo:rustc-env=POSH_VERSION). `bump-version` is a pure
 # mutation; `tag` reads the current value and pushes a signed tag;
-# `release` orchestrates changelog -> bump -> commit -> tag -> gh release.
+# `release` orchestrates changelog -> bump -> commit -> tag -> forge release.
 # (mosh and posht keep their own version lineages and are untouched by
 # these recipes.)
 
@@ -300,11 +300,18 @@ tag $message:
 # tag) BEFORE bumping so the bump commit isn't in its own changelog; bump
 # version.env (the only versioned file — Pattern B, no Cargo.toml resync),
 # commit, push the branch (so the bump lands on master, not just the tag),
-# sign+push+verify a v<sem> tag, and create the GitHub release with the
-# changelog as the body. The bump+commit is idempotent: skipped when
-# version.env already holds <new>. Usage: just release 0.1.1
+# sign+push+verify a v<sem> tag, and create the release on posh's Forgejo
+# forge with the changelog as the body. The bump+commit is idempotent:
+# skipped when version.env already holds <new>. Usage: just release 0.1.1
 #
-# cut a release from master: changelog, bump, tag, GitHub release
+# `smith` is the forge tool here — not `fj` (despite eng-versioning(7)'s
+# `fj release create`) and not `gh`. `origin` is the canonical
+# code.linenisgreat.com/posh.git, which fronts the forge, and `smith`
+# resolves that owner-less URL to the repo by itself, so no --host/--repo;
+# `gh` cannot, since it is not a GitHub host. `smith` comes from the user
+# profile, not this flake's devShell.
+#
+# cut a release from master: changelog, bump, tag, forge release
 [group("maintenance")]
 release new_version:
     #!/usr/bin/env bash
@@ -350,7 +357,9 @@ release new_version:
 
     # The full changelog rides as the tag annotation (safe via tag's $message).
     just tag "$notes"
-    gh release create "v{{ new_version }}" --title "$header" --notes "$notes"
+    # Publish against the tag `just tag` just signed and pushed (`--tag` is a
+    # PRE-EXISTING tag; smith's `--create-tag` would make an unsigned one).
+    smith release create "$header" --tag "v{{ new_version }}" --body "$notes"
 
 # --- debug -----------------------------------------------------------------
 

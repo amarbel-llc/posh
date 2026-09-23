@@ -601,7 +601,6 @@
               pkgs.clippy # cargo clippy: the conformist #69 gate + dev-loop lint
               pkgs.scdoc # compile/lint doc/*.scd man pages (just lint-doc)
               pkgs.gum # terminal UI for the maintenance recipes (eng-versioning(7))
-              pkgs.gh # `just release` -> gh release create
               pkgs.tcpdump # live-session transport triage (debug-posh-* recipes)
               mesaBin # `posh list`'s renderer (purse-first#185); dev-loop parity
               # with the wrapped nix package for `just debug-cargo`/`debug-posh-*`.
