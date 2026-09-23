@@ -152,9 +152,16 @@ fn run_interactive(stream: UnixStream) -> Result<()> {
         util::log_write("switch", &n.banner());
     }
     let mut stream = stream;
+    // The notice is about the session the pop LANDED on — the first loop's.
+    // After an in-place re-home the viewport is somewhere else, so a later
+    // loop gets none (one handed back stays here, for after restore).
+    let mut rehomed = false;
     let result = loop {
         let mut switch_to: Option<(String, String)> = None;
-        let result = client_loop(stream, &enter, &raw, &mut switch_to, &mut pop_notice);
+        let mut no_notice = None;
+        let notice_slot = if rehomed { &mut no_notice } else { &mut pop_notice };
+        let result = client_loop(stream, &enter, &raw, &mut switch_to, notice_slot);
+        rehomed = true;
         // FDR 0012 (RFC 0008 §3.1): the daemon routed a switch to this
         // viewport. Re-dial the target in place — raw mode and the alternate
         // screen stay up, and the new daemon's Init replay repaints over the
