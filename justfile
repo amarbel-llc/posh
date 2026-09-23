@@ -653,6 +653,74 @@ debug-ph-stack-repro: build-palette
     "${iso[@]}" "$P" kill a 2>/dev/null || true
     "${iso[@]}" "$P" kill b 2>/dev/null || true
 
+# Verify push-cmd (FDR 0020) end to end in a detached tmux pane, with the same
+# isolation as debug-ph-stack-repro (throwaway POSH_DIR under .tmp, no
+# POSH_SESSION/POSH_KEY leakage, a dedicated `tmux -L posh-pushcmd` server).
+# The pane attaches to session `a` (an interactive bash in $dir/work) through
+# the `ph` front door, so the in-process FDR 0016 stack is live.
+#   (a) PALETTE: Ctrl-^, filter "Push", Enter -> the daemon creates an
+#       anonymous s-N running POSH_ESCAPE_CMD (bash) in a's directory and
+#       re-homes the viewport (RFC 0016). The capture should show $dir/work
+#       and s-1 from `pwd; echo $POSH_SESSION`; then `exit` pops back to `a`
+#       under the pop notice "ended (exit 0)".
+#   (b) CLI: inside `a`, `cd /tmp && posh start -- sh -c 'pwd; sleep 2; exit 3'`
+#       -> the child prints /tmp (captured mid-sleep), then pops back with
+#       "ended (exit 3)".
+# Failure signatures: the palette shows "Shell out" instead of "Push shell"
+# (no offer: the daemon or client predates RFC 0016, or the palette renderer is
+# stale — this recipe builds it); no switch after Enter (request lost: read the
+# debug log for "push-cmd:"); a notice without a status (FDR 0020 notice
+# regression). Timing-sensitive; read the captures. Not a hermetic test.
+#
+# verify palette and CLI push-cmd in an isolated tmux pane
+[group("debug")]
+debug-verify-push-cmd: build-palette
+    #!/usr/bin/env bash
+    set -uo pipefail
+    root="{{ justfile_directory() }}"
+    dir="$root/.tmp/pushcmd"
+    sock="$dir/posh"
+    case "$sock" in "$root"/.tmp/*/posh) : ;; *) echo "refusing: POSH_DIR '$sock' not under .tmp"; exit 1 ;; esac
+    rm -rf "$dir"; mkdir -p "$sock" "$dir/work"; chmod 700 "$dir" "$sock"
+    log="$dir/posh.log"
+    nix develop --command cargo build -p posh
+    P="$root/target/debug/posh"
+    ln -sfn "$P" "$dir/ph"
+    pal="$root/result-posh-palette/bin/posh-palette"
+    # The daemon inherits POSH_ESCAPE_CMD and PATH from the creating CLI, so
+    # the pushed shell is a plain bash and `posh` resolves inside `a`.
+    iso=(env -u POSH_SESSION -u POSH_KEY "POSH_DIR=$sock" POSH_GROUP=default "POSH_DEBUG_LOG=$log"
+      "POSH_PALETTE=$pal" "POSH_ESCAPE_CMD=bash --norc" "PATH=$root/target/debug:$PATH")
+    TM=(tmux -L posh-pushcmd)
+    "${TM[@]}" kill-server 2>/dev/null || true
+    (cd "$dir/work" && "${iso[@]}" PS1='a$ ' "$P" attach --detach a -- bash --norc -i) || true
+    "${TM[@]}" new-session -d -s s -x 100 -y 30 \
+      "env -u POSH_SESSION -u POSH_KEY POSH_DIR='$sock' POSH_GROUP=default POSH_PALETTE='$pal' POSH_DEBUG_LOG='$log' \
+        '$dir/ph' a 2>'$dir/stderr.log'; echo PH_EXITED_\$?; sleep 120"
+    sleep 4
+    cap() { echo "== $1 =="; "${TM[@]}" capture-pane -p -t s 2>/dev/null | sed '/^$/d'; echo; }
+    key() { "${TM[@]}" send-keys -t s "$@"; }
+    cap "attached to a"
+    # (a) palette push
+    key -H 1e; sleep 1; cap "palette on a (expect 'Push shell', no 'Shell out')"
+    key -l Push; sleep 1; key Enter; sleep 3
+    key -l 'pwd; echo $POSH_SESSION'; key Enter; sleep 1
+    cap "pushed shell (expect $dir/work and s-1)"
+    key -l exit; key Enter; sleep 3
+    cap "popped back (expect notice 'ended (exit 0)')"
+    key Escape; sleep 1
+    # (b) CLI push
+    key -l "cd /tmp && posh start -- sh -c 'pwd; sleep 2; exit 3'"; key Enter; sleep 1
+    cap "CLI-pushed child (expect /tmp)"
+    sleep 4
+    cap "popped back (expect notice 'ended (exit 3)')"
+    key Escape; sleep 1
+    echo "== sessions =="; "${iso[@]}" "$P" list || true; echo
+    echo "== push-cmd log lines =="; grep -a 'push-cmd' "$dir"/posh/default/*.log "$log" 2>/dev/null || true; echo
+    echo "== stderr =="; cat "$dir/stderr.log" 2>/dev/null || true
+    "${TM[@]}" kill-server 2>/dev/null || true
+    for s in $("${iso[@]}" "$P" list --short 2>/dev/null); do "${iso[@]}" "$P" kill "$s" >/dev/null 2>&1 || true; done
+
 # (Re)bless the mosh terminal characterization goldens (task #4). The driver is
 # the mosh-ffi C++ FFI shim, so a fixed VT script always renders the same grid
 # (no clock, no network). Assert with the normal loop: `just debug-cargo test
