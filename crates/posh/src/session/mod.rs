@@ -364,6 +364,7 @@ pub enum ListFormat {
     Complete,
 }
 
+#[derive(Default)]
 struct SessionEntry {
     name: String,
     pid: Option<i32>,
@@ -386,6 +387,25 @@ struct SessionEntry {
     /// reports it on `Tag::Info`; `None` from a pre-kind daemon (`Unknown`)
     /// or an unreachable session. Never `Some(Unknown)`.
     kind: Option<SessionKind>,
+    /// posh#206: the build the daemon runs (`<version>+<sha>`, the status
+    /// response's `daemon=`); `None` with no status socket (pre-RFC-0014).
+    build: Option<String>,
+    /// posh#206: `build` differs from the build of the posh that listed it —
+    /// a daemon still running pre-upgrade code. Judged by the listing host,
+    /// so a remote listing compares against the remote's own binary.
+    stale: bool,
+}
+
+/// The daemon's build from a §4.2 status response: the session line's
+/// `daemon=` value (`<version>+<sha>`). posh#206.
+pub(crate) fn daemon_build(response: &str) -> Option<String> {
+    response
+        .lines()
+        .next()?
+        .split(' ')
+        .find_map(|kv| kv.strip_prefix("daemon="))
+        .filter(|b| !b.is_empty())
+        .map(str::to_string)
 }
 
 /// Summarize a §4.2 status response for the `posh ls` ECHO column: the first
@@ -542,10 +562,12 @@ fn scan_sessions(cfg: &Config) -> Result<Vec<SessionEntry>> {
                 let cmd = probe.info.cmd_display();
                 // RFC 0014 §4.3: one status-socket read per live session;
                 // a pre-RFC-0014 daemon has no socket and reads `None`.
-                let echo = read_status_socket(&cfg.status_socket_path(&name))
-                    .ok()
-                    .map(|r| echo_summary(&r));
+                let status = read_status_socket(&cfg.status_socket_path(&name)).ok();
+                let echo = status.as_deref().map(echo_summary);
+                let build = status.as_deref().and_then(daemon_build);
                 sessions.push(SessionEntry {
+                    stale: build.as_deref().is_some_and(|b| b != env!("POSH_BUILD")),
+                    build,
                     name,
                     pid: Some(probe.info.pid),
                     clients: Some(probe.info.clients),
@@ -570,6 +592,7 @@ fn scan_sessions(cfg: &Config) -> Result<Vec<SessionEntry>> {
                     activity: None,
                     echo: None,
                     kind: None,
+                    ..Default::default()
                 });
                 cleanup_stale_socket(&path);
             }
@@ -627,6 +650,9 @@ fn remote_entries(json: &str, prefix: impl Fn(&str) -> String) -> Result<Vec<Ses
             kind: v["kind"].as_str().and_then(|k| {
                 SessionKind::parse(k).or((k == "system").then_some(SessionKind::System))
             }),
+            // posh#206: judged by the remote against its OWN binary.
+            build: v["build"].as_str().map(str::to_string),
+            stale: v["stale"].as_bool().unwrap_or(false),
         })
         .collect())
 }
@@ -657,6 +683,12 @@ fn json_list(sessions: &[SessionEntry], current: Option<&str>) -> String {
             if let Some(cwd_now) = &s.cwd_now {
                 out.push_str(",\"cwd_now\":");
                 out.push_str(&json_string(cwd_now));
+            }
+            // posh#206: the daemon's build, and whether it differs from ours.
+            if let Some(build) = &s.build {
+                out.push_str(",\"build\":");
+                out.push_str(&json_string(build));
+                out.push_str(&format!(",\"stale\":{}", s.stale));
             }
             if let Some(cmd) = &s.cmd {
                 out.push_str(",\"cmd\":");
@@ -986,6 +1018,8 @@ mod tests {
                 activity: Some("vim ~/notes".to_string()),
                 echo: Some("optimistic auto-escalated 412ms".to_string()),
                 kind: Some(SessionKind::Anonymous),
+                build: Some("0.4.1+0ld".to_string()),
+                stale: true,
             },
             SessionEntry {
                 name: "broken".to_string(),
@@ -998,6 +1032,7 @@ mod tests {
                 activity: None,
                 echo: None,
                 kind: None,
+                ..Default::default()
             },
             SessionEntry {
                 name: "minimal".to_string(),
@@ -1010,6 +1045,7 @@ mod tests {
                 activity: None,
                 echo: None,
                 kind: None,
+                ..Default::default()
             },
         ];
         let json = json_list(&sessions, Some("minimal"));
@@ -1021,6 +1057,7 @@ mod tests {
                 "[",
                 "{\"name\":\"alpha\",\"pid\":1234,\"clients\":2,",
                 "\"cwd\":\"/home/user\",\"cwd_now\":\"/home/user/src\",",
+                "\"build\":\"0.4.1+0ld\",\"stale\":true,",
                 "\"cmd\":\"htop -d 10\",\"activity\":\"vim ~/notes\",",
                 "\"echo\":\"optimistic auto-escalated 412ms\",\"kind\":\"anonymous\",\"current\":false},",
                 "{\"name\":\"broken\",\"error\":true,\"status\":\"ConnectionRefused\"},",
@@ -1090,6 +1127,7 @@ mod tests {
             activity: None,
             echo: None,
             kind: None,
+            ..Default::default()
         }
     }
 
@@ -1145,6 +1183,7 @@ mod tests {
             activity: activity.map(str::to_string),
             echo: None,
             kind: None,
+            ..Default::default()
         };
         // Activity wins over cmd.
         assert_eq!(
@@ -1188,6 +1227,25 @@ mod tests {
         assert_eq!(remote_pid_from_name("4242"), Some(4242));
         assert_eq!(remote_pid_from_name("dev"), None);
         assert_eq!(remote_pid_from_name("remote-x"), None);
+    }
+
+    /// posh#206: the daemon's build is the session line's `daemon=`.
+    #[test]
+    fn daemon_build_is_read_from_the_status_session_line() {
+        let r = "session=w1 group=default daemon=0.4.2+abc1234 pid=9 frames=on\nclient pid=7 build=0.4.2+zzz\n";
+        assert_eq!(daemon_build(r).as_deref(), Some("0.4.2+abc1234"));
+        assert_eq!(daemon_build("session=w1 pid=9\n"), None, "a key absent");
+        assert_eq!(daemon_build(""), None);
+    }
+
+    /// posh#206: a remote's own staleness verdict rides its JSON.
+    #[test]
+    fn remote_entries_carry_the_remotes_build_verdict() {
+        let json = r#"[{"name":"a","pid":1,"clients":0,"build":"0.4.1+0ld","stale":true},
+                       {"name":"b","pid":2,"clients":0}]"#;
+        let e = remote_entries(json, str::to_string).unwrap();
+        assert_eq!((e[0].build.as_deref(), e[0].stale), (Some("0.4.1+0ld"), true));
+        assert_eq!((e[1].build.as_deref(), e[1].stale), (None, false));
     }
 
     /// RFC 0014 §4.3: the `posh ls` ECHO column condenses the status

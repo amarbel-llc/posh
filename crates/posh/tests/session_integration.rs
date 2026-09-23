@@ -345,8 +345,10 @@ fn daemon_lifecycle_create_list_kill() {
     let lines: Vec<&str> = stdout.lines().collect();
     assert_eq!(lines.len(), 2, "expected header + 1 row: {stdout}");
     let fields: Vec<&str> = lines[1].split('\t').collect();
-    // NAME STATUS PID CLIENTS KIND CWD STARTED-IN ACTIVITY ECHO
-    assert_eq!(fields.len(), 9, "row: {fields:?}");
+    // NAME STATUS PID CLIENTS KIND CWD STARTED-IN ACTIVITY ECHO BUILD
+    assert_eq!(fields.len(), 10, "row: {fields:?}");
+    // posh#206: this binary created the daemon, so the build is ours.
+    assert!(!fields[9].is_empty(), "row: {fields:?}"); // BUILD
     assert_eq!(fields[0], "itest", "row: {fields:?}"); // NAME
     assert_eq!(fields[3], "0", "row: {fields:?}"); // CLIENTS
     // A plain `attach --detach <name>` creates a named session (2026-09-21

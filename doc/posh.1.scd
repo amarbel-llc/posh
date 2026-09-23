@@ -235,8 +235,11 @@ Local persistence over Unix sockets.
 	List sessions in the group. When stdout is a terminal the default
 	output is a four-column table (posh#215): NAME (a dim _(anon)_ after
 	an anonymous session's name); STATUS (a state-colored dot — attached,
-	detached, or stale — then the attached client count, and _(current)_
-	for the session you are in); CWD (where the session is now, resolved
+	detached, or stale — then the attached client count, a dim _stale_
+	_<sha>_ when the session's daemon runs a different posh build than the
+	one listing it (a daemon keeps the code it was started with across
+	upgrades; restart the session to pick up the new build), and
+	_(current)_ for the session you are in); CWD (where the session is now, resolved
 	by the ADR 0008 cascade, followed by a dim _← start dir_ only when it
 	has moved away from where it was started); and ACTIVITY (the RFC 0013
 	§5 activity label, else the launch command, followed by a dim _· echo_
@@ -246,12 +249,15 @@ Local persistence over Unix sockets.
 	the default output is instead one field per column, tab-separated,
 	for scripts: NAME, STATUS, PID, CLIENTS, KIND (_anonymous_, _named_,
 	_system_, or empty for a daemon that predates the kind), CWD, STARTED
-	IN, ACTIVITY, ECHO — system sessions included. The mux endpoints have
+	IN, ACTIVITY, ECHO, BUILD (the daemon's _<version>+<sha>_, empty for
+	a daemon without a status socket) — system sessions included. The mux endpoints have
 	their own table, *mux ls*. *--short* prints names only; *--json*
 	prints a machine-readable array, each row carrying a _kind_ field
 	(_anonymous_, _named_, or _system_; omitted when unknown), _cwd_ (the
 	start directory) and _cwd_now_ (the current one; omitted when
-	unknown); *--complete* prints
+	unknown), and _build_ with _stale_ (whether it differs from the
+	listing posh's build; both omitted when unknown — for *list*
+	_host_*:* the remote judges against its own build); *--complete* prints
 	_name_<TAB>_summary_ lines (the RFC 0013 §5 activity label,
 	else the launch command) for shell completion — the *ph* fish
 	completion renders the summary as each candidate's description.

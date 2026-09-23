@@ -115,7 +115,8 @@ fn styled_row(s: &SessionEntry, current: Option<&str>, home: Option<&str>) -> Va
         return json!({"cells": [name, status_cell(state, None, false), "", {"spans": [muted(format!("{err} (cleaning up)"))]}]});
     }
     let attached = s.clients.filter(|_| state == State::Attached);
-    let status = status_cell(state, attached, current == Some(s.name.as_str()));
+    let stale_build = s.build.as_deref().filter(|_| s.stale);
+    let status = status_cell_with_build(state, attached, current == Some(s.name.as_str()), stale_build);
     let start = s.cwd.as_deref().map(|d| abbrev_home(d, home));
     let now = s.cwd_now.as_deref().map(|d| abbrev_home(d, home));
     let cwd = match (now, start) {
@@ -126,7 +127,8 @@ fn styled_row(s: &SessionEntry, current: Option<&str>, home: Option<&str>) -> Va
         (None, None) => json!(""),
     };
     let label = s.activity.clone().or_else(|| s.cmd.clone()).unwrap_or_default();
-    let activity = match &s.echo {
+    // `-` is echo_summary's "no client attached": nothing to add.
+    let activity = match s.echo.as_ref().filter(|e| *e != "-") {
         Some(echo) if label.is_empty() => json!({"spans": [muted(format!("echo {echo}"))]}),
         Some(echo) => json!({"spans": [{"text": label}, muted(format!(" \u{b7} echo {echo}"))]}),
         None => json!(label),
@@ -159,6 +161,8 @@ fn header(socket_dir: &Path) -> Value {
             {"name": "STARTED IN", "role": "flex", "shrink": 2, "min": 8},
             {"name": "ACTIVITY", "role": "flex", "shrink": 0, "min": 8},
             {"name": "ECHO", "role": "flex", "shrink": 1, "min": 8},
+            // posh#206: appended so the first nine keep their positions.
+            {"name": "BUILD", "role": "pin"},
         ],
         "legend": legend(),
         "empty": empty_message(socket_dir),
@@ -169,9 +173,21 @@ fn header(socket_dir: &Path) -> Value {
 /// given, and a dim `(current)` for the session this client runs inside.
 /// State is carried by the dot's severity alone — the legend is the key.
 fn status_cell(state: State, clients: Option<u64>, current: bool) -> Value {
+    status_cell_with_build(state, clients, current, None)
+}
+
+/// [`status_cell`] plus, for a daemon on another build than this posh
+/// (posh#206), a dim `stale <sha>`: the terminal table shows the anomaly
+/// only, never the build of a current daemon.
+fn status_cell_with_build(state: State, clients: Option<u64>, current: bool, stale_build: Option<&str>) -> Value {
     let mut spans = vec![json!({"text": "\u{25cf}", "sev": state.sev()})];
     if let Some(n) = clients {
         spans.push(json!({"text": format!(" {n}")}));
+    }
+    if let Some(build) = stale_build {
+        // `<version>+<sha>`: the sha is what tells two builds apart.
+        let sha = build.rsplit_once('+').map_or(build, |(_, sha)| sha);
+        spans.push(json!({"text": format!(" stale {sha}"), "sev": "muted"}));
     }
     if current {
         spans.push(json!({"text": " (current)", "sev": "muted"}));
@@ -195,6 +211,7 @@ fn row(s: &SessionEntry, current: Option<&str>, home: Option<&str>) -> Value {
             "",
             {"spans": [{"text": format!("{err} (cleaning up)"), "sev": "muted"}]},
             "",
+            "",
         ]});
     }
     json!({"cells": [
@@ -207,6 +224,7 @@ fn row(s: &SessionEntry, current: Option<&str>, home: Option<&str>) -> Value {
         abbrev_home(s.cwd.as_deref().unwrap_or(""), home),
         s.activity.clone().or_else(|| s.cmd.clone()).unwrap_or_default(),
         s.echo.clone().unwrap_or_default(),
+        s.build.clone().unwrap_or_default(),
     ]})
 }
 
@@ -301,6 +319,7 @@ mod tests {
             activity: Some("nvim".to_string()),
             echo: Some("optimistic auto-escalated 412ms".to_string()),
             kind: Some(SessionKind::Named),
+            ..Default::default()
         }
     }
 
@@ -316,6 +335,7 @@ mod tests {
             activity: None,
             echo: None,
             kind: None,
+            ..Default::default()
         }
     }
 
@@ -324,11 +344,11 @@ mod tests {
     }
 
     #[test]
-    fn header_has_nine_columns_legend_and_empty() {
+    fn the_plain_header_has_ten_columns_legend_and_empty() {
         let records = parse_lines(&build_ndjson(&[], None, None, Path::new("/run/posh/default"), false));
         assert_eq!(records.len(), 1);
         let header = &records[0];
-        assert_eq!(header["columns"].as_array().unwrap().len(), 9);
+        assert_eq!(header["columns"].as_array().unwrap().len(), 10);
         assert_eq!(header["legend"].as_array().unwrap().len(), 3);
         assert_eq!(header["empty"], "no sessions found in /run/posh/default");
     }
@@ -395,7 +415,8 @@ mod tests {
     fn stale_row_carries_error_in_activity_cell_other_cells_blank() {
         let records = parse_lines(&build_ndjson(&[stale("old")], None, None, Path::new("/x"), false));
         let cells = records[1]["cells"].as_array().unwrap();
-        assert_eq!(cells.len(), 9);
+        assert_eq!(cells.len(), 10);
+        assert_eq!(cells[9], ""); // BUILD
         assert_eq!(cells[0], "old"); // NAME
         assert_eq!(cells[2], ""); // PID
         assert_eq!(cells[3], ""); // CLIENTS
@@ -501,6 +522,39 @@ mod tests {
         assert_eq!(names(shown(&all, true, false)), ["dev"]);
         assert_eq!(names(shown(&all, true, true)), ["dev", "svc"]);
         assert_eq!(names(shown(&all, false, false)), ["dev", "svc"], "plumbing keeps every session");
+    }
+
+    /// posh#206: a daemon on another build is marked in STATUS (the anomaly
+    /// only); a current one shows nothing extra.
+    #[test]
+    fn a_stale_daemons_status_names_its_build() {
+        let mut old = entry("old", 0);
+        (old.build, old.stale) = (Some("0.4.1+0ld1234".into()), true);
+        let mut cur = entry("cur", 0);
+        cur.build = Some("0.4.2+new".into());
+        let records = styled(&[old, cur], None);
+        assert_eq!(text(&records[1]["cells"][1]), "\u{25cf} stale 0ld1234");
+        assert_eq!(text(&records[2]["cells"][1]), "\u{25cf}");
+    }
+
+    /// posh#206: the plain table appends BUILD (always, when known) as a
+    /// tenth column, so the first nine keep their positions.
+    #[test]
+    fn the_plain_table_appends_a_build_column() {
+        let mut s = entry("dev", 0);
+        s.build = Some("0.4.2+abc".into());
+        let records = parse_lines(&build_ndjson(&[s], None, None, Path::new("/x"), false));
+        let cols = records[0]["columns"].as_array().unwrap();
+        assert_eq!(cols.last().unwrap()["name"], "BUILD");
+        assert_eq!(records[1]["cells"][cols.len() - 1], "0.4.2+abc");
+    }
+
+    /// An echo summary of `-` means no client is attached: nothing to add.
+    #[test]
+    fn a_detached_sessions_activity_has_no_echo_suffix() {
+        let mut s = entry("d", 0);
+        s.echo = Some("-".into());
+        assert_eq!(styled(&[s], None)[1]["cells"][3], "nvim");
     }
 
     #[test]
