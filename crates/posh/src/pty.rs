@@ -92,6 +92,22 @@ fn read_comm(pid: libc::pid_t) -> Option<String> {
     (!t.is_empty()).then(|| t.to_string())
 }
 
+/// The kernel's working directory of a process (`/proc/<pid>/cwd`) — ADR
+/// 0008's cascade step 2. `None` off Linux or when the process is gone.
+#[cfg(target_os = "linux")]
+pub fn process_cwd(pid: libc::pid_t) -> Option<String> {
+    std::fs::read_link(format!("/proc/{pid}/cwd"))
+        .ok()
+        .map(|p| p.display().to_string())
+}
+
+// macOS gap (posh#214): ADR 0008's cascade step 2 —
+// `proc_pidinfo(PROC_PIDVNODEPATHINFO)` would supply it.
+#[cfg(not(target_os = "linux"))]
+pub fn process_cwd(_pid: libc::pid_t) -> Option<String> {
+    None
+}
+
 // macOS gap (posh#214): the activity label's process half — libproc
 // `proc_name` / `proc_pidpath` would supply it.
 #[cfg(not(target_os = "linux"))]
@@ -605,6 +621,18 @@ mod tests {
     /// can't echo back into posh's model, while OUTPUT processing stays intact so
     /// the child's rendering is unaffected. The openpty default is cooked+echo, so
     /// this asserts the flags actually flip.
+    /// ADR 0008 step 2: the kernel's cwd of a live process — this one — is
+    /// its real working directory; a pid that does not exist has none.
+    // macOS gap (posh#214): `process_cwd` is a stub there, so only Linux asserts.
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn process_cwd_reads_the_kernels_working_directory() {
+        let me = unsafe { libc::getpid() };
+        let here = std::env::current_dir().unwrap().display().to_string();
+        assert_eq!(process_cwd(me).as_deref(), Some(here.as_str()));
+        assert_eq!(process_cwd(i32::MAX), None);
+    }
+
     #[test]
     fn quiet_emulator_slave_clears_echo_and_icanon_keeps_opost() {
         // SAFETY: openpty fills m/s with valid fds; tcgetattr writes a valid

@@ -85,10 +85,13 @@ The step that won is logged when a session is created from it, and shown by
 * Good, because the rule lives in one function; a new consumer cannot
   re-decide it, and a new fact (macOS's kernel cwd) slots in as one step.
 * Good, because provenance makes the fallback steps visible instead of silent.
-* Bad, because `Tag::Info`'s `cwd` changes meaning — from the start directory
-  to the cascade's answer — and gains a provenance field. An older reader must
-  keep working, so the change has to be additive on the wire, and anything
-  that relied on "where it was started" loses that reading.
+* Bad, because `Tag::Info` grows a second directory. As implemented
+  (2026-09-23), `cwd` keeps its start-directory meaning — `posh list`'s
+  STARTED-IN column, `--json` `cwd` and `started_in=` rely on it — and the
+  cascade's answer rides an appended `cwd_now` field (directory + source
+  byte), absent from an older daemon. The status socket (RFC 0014 §4.2)
+  reports it as `cwd=`/`cwd_source=`. Two fields that both say "cwd" invite
+  a reader to pick the wrong one.
 * Bad, because answers differ by platform: the same session can report
   different directories on Linux and macOS until posh#214 lands.
 * Neutral: Architecture A's `server_loop` keeps its own OSC-7 rule; it is

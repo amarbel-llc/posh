@@ -234,7 +234,12 @@ Session line:
 
     session=<name> group=<group> daemon=<version>+<sha> pid=<u32> \
       frames=<on|off> echo_flag=<0|1> alt_screen=<0|1> clients=<n> \
-      activity="<label>"
+      activity="<label>" [cwd="<dir>" cwd_source=<src>]
+
+`cwd`/`cwd_source` (added 2026-09-23, ADR 0008) are where the session is now
+and which cascade step said so: `<src>` is one of `caller`, `kernel`, `osc7`,
+`start`, `home`. A writer that does not run the cascade omits both (the
+Architecture-A roaming server does).
 
 Client line (one per retained client, `via=` present only for a relayed origin):
 

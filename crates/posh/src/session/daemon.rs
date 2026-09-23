@@ -904,6 +904,21 @@ impl ScreenSwitchFilter {
 /// connection IS the issuing viewport, and re-routing to a "more capable"
 /// other viewport would switch the wrong screen — an old client that skips
 /// the unknown tag is the specified visible no-op instead.
+/// Where this session is, by ADR 0008's cascade, from the facts a daemon
+/// holds: its child's kernel cwd, the shell's OSC 7 report, its own start
+/// directory, `$HOME`. No caller cwd — a daemon asks on nobody's behalf.
+fn daemon_cwd(child_pid: libc::pid_t, term: &Terminal, start: &str) -> super::cwd::Resolved {
+    let kernel = crate::pty::process_cwd(child_pid);
+    let home = std::env::var("HOME").ok();
+    super::cwd::session_cwd(super::cwd::Facts {
+        caller: None,
+        kernel: kernel.as_deref(),
+        osc7: Some(term.pwd()).filter(|p| !p.is_empty()),
+        start,
+        home: home.as_deref(),
+    })
+}
+
 fn switch_route_target(clients: &[ClientConn], requester: usize) -> Option<usize> {
     let mut best: Option<(u64, usize)> = None;
     for (j, c) in clients.iter().enumerate() {
@@ -1106,6 +1121,8 @@ pub(crate) struct SessionStatus<'a> {
     pub(crate) echo_flag: bool,
     pub(crate) alt_screen: bool,
     pub(crate) activity: &'a str,
+    /// ADR 0008's answer, omitted when the writer cannot resolve one.
+    pub(crate) cwd: Option<&'a super::cwd::Resolved>,
 }
 
 /// The RFC 0014 §4.2 status response: the session line, then one client line
@@ -1113,7 +1130,7 @@ pub(crate) struct SessionStatus<'a> {
 pub(crate) fn status_response(s: &SessionStatus<'_>, records: &[introspect::ClientRecord]) -> String {
     let mut out = format!(
         "session={} group={} daemon={} pid={} frames={} echo_flag={} \
-         alt_screen={} clients={} activity={:?}\n",
+         alt_screen={} clients={} activity={:?}",
         s.name,
         s.group,
         env!("POSH_BUILD"),
@@ -1124,6 +1141,10 @@ pub(crate) fn status_response(s: &SessionStatus<'_>, records: &[introspect::Clie
         records.len(),
         s.activity,
     );
+    if let Some(c) = s.cwd {
+        out.push_str(&format!(" cwd={:?} cwd_source={}", c.dir, c.source.as_str()));
+    }
+    out.push('\n');
     for r in records {
         out.push_str(&introspect::render_client_line(r));
         out.push('\n');
@@ -1335,6 +1356,7 @@ fn daemon_loop(
                 crate::pty::foreground_command(pty_fd).as_deref(),
                 term.title(),
             );
+            let now_cwd = daemon_cwd(child.pid, term, cwd);
             let response = status_response(
                 &SessionStatus {
                     name,
@@ -1344,6 +1366,7 @@ fn daemon_loop(
                     echo_flag: clients.iter().any(|c| c.echo_flag != 0),
                     alt_screen: term.is_alt_screen(),
                     activity: &activity,
+                    cwd: Some(&now_cwd),
                 },
                 &records,
             );
@@ -1613,6 +1636,7 @@ fn daemon_loop(
                                         cwd: cwd.to_string(),
                                         activity,
                                         kind,
+                                        cwd_now: Some(daemon_cwd(child.pid, term, cwd)),
                                     };
                                     c.queue(Tag::Info, &info.encode());
                                 }
@@ -1807,11 +1831,9 @@ fn daemon_loop(
             // Idempotent via the `overlay.is_none()` guard: a retransmitted
             // request while the overlay is up is a no-op.
             if open_shell && overlay.is_none() {
-                let ov_cwd = if term.pwd().is_empty() {
-                    cwd.to_string()
-                } else {
-                    term.pwd().to_string()
-                };
+                // ADR 0008: the same cascade `Tag::Info` reports, so the
+                // overlay and every other consumer agree on "here".
+                let ov_cwd = daemon_cwd(child.pid, term, cwd).dir;
                 let cmd = escape_command();
                 let (r, w) = (term.rows(), term.cols());
                 match pty::spawn_shell(cmd.as_deref(), r, w, &[], Some(&ov_cwd)) {
@@ -1979,19 +2001,49 @@ mod tests {
                 echo_flag: true,
                 alt_screen: false,
                 activity: "fish · ~/x",
+                cwd: None,
             },
             &[reported, old],
         );
         let mut lines = out.lines();
         let session = lines.next().unwrap();
         assert!(session.starts_with("session=w1 group=default daemon="), "{session}");
-        assert!(session.contains(" pid=42 frames=on echo_flag=1 alt_screen=0 clients=2 activity=\"fish · ~/x\""), "{session}");
+        assert!(session.ends_with(" pid=42 frames=on echo_flag=1 alt_screen=0 clients=2 activity=\"fish · ~/x\""), "{session}");
+        assert!(!session.contains("cwd"), "an unknown cwd is omitted (§4.2 MAY): {session}");
         let first = lines.next().unwrap();
         for key in introspect::CLIENT_FIELDS {
             assert!(first.contains(&format!(" {key}=")), "missing {key}= in {first}");
         }
         assert_eq!(lines.next().unwrap(), "client build=unknown echo=unknown");
         assert!(lines.next().is_none());
+    }
+
+    /// ADR 0008: the session line ends with where the session IS and which
+    /// cascade step said so — the "why did this open in ~?" answer.
+    #[test]
+    fn status_response_reports_the_cwd_and_its_source() {
+        let now = super::super::cwd::Resolved {
+            dir: "/w/my repo".into(),
+            source: super::super::cwd::Source::Osc7,
+        };
+        let out = status_response(
+            &SessionStatus {
+                name: "w1",
+                group: "default",
+                daemon_pid: 42,
+                frames: true,
+                echo_flag: false,
+                alt_screen: false,
+                activity: "",
+                cwd: Some(&now),
+            },
+            &[],
+        );
+        let session = out.lines().next().unwrap();
+        assert!(
+            session.ends_with(" activity=\"\" cwd=\"/w/my repo\" cwd_source=osc7"),
+            "{session}"
+        );
     }
 
     // ---- An in-process session daemon (design 2026-09-21 §1) ----

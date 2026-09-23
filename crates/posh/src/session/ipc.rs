@@ -317,6 +317,11 @@ pub struct SessionInfo {
     /// The session's kind (design 2026-09-21 §1), one byte appended after
     /// the activity label; `Unknown` from a daemon that predates it.
     pub kind: SessionKind,
+    /// Where the session IS (ADR 0008's cascade) and which step said so,
+    /// appended after the kind byte (u16 length, the directory, a source
+    /// byte). `cwd` above keeps meaning where it was STARTED. `None` from a
+    /// daemon that predates the cascade — "not reported", never a guess.
+    pub cwd_now: Option<crate::session::cwd::Resolved>,
 }
 
 impl SessionInfo {
@@ -364,6 +369,15 @@ impl SessionInfo {
         // The session kind rides one byte after the label; a pre-kind client
         // stops reading after the label and never sees it.
         out.push(self.kind.to_byte());
+        // ADR 0008: the cascade's answer after the kind byte; a pre-cascade
+        // client stops at the kind and never sees it.
+        if let Some(now) = &self.cwd_now {
+            let dir = now.dir.as_bytes();
+            let dir_len = dir.len().min(MAX_CWD_LEN);
+            out.extend_from_slice(&(dir_len as u16).to_le_bytes());
+            out.extend_from_slice(&dir[..dir_len]);
+            out.push(now.source.to_byte());
+        }
         out
     }
 
@@ -385,7 +399,7 @@ impl SessionInfo {
         // The session kind (design 2026-09-21 §1) is one byte after the
         // label; absent from a pre-kind daemon and read as `Unknown`.
         let tail = &payload[INFO_LEN..];
-        let (activity, kind) = if tail.len() >= 2 {
+        let (activity, kind, cwd_now) = if tail.len() >= 2 {
             let len = (u16::from_le_bytes([tail[0], tail[1]]) as usize).min(MAX_ACTIVITY_LEN);
             if tail.len() >= 2 + len {
                 let activity = String::from_utf8_lossy(&tail[2..2 + len]).into_owned();
@@ -394,12 +408,14 @@ impl SessionInfo {
                     .copied()
                     .map(SessionKind::from_byte)
                     .unwrap_or_default();
-                (activity, kind)
+                // ADR 0008: after the kind byte, the cascade's answer; a
+                // missing or torn tail reads as not reported.
+                (activity, kind, decode_cwd_now(tail.get(3 + len..).unwrap_or(&[])))
             } else {
-                (String::new(), SessionKind::Unknown)
+                (String::new(), SessionKind::Unknown, None)
             }
         } else {
-            (String::new(), SessionKind::Unknown)
+            (String::new(), SessionKind::Unknown, None)
         };
         Some(SessionInfo {
             clients,
@@ -408,13 +424,27 @@ impl SessionInfo {
             cwd,
             activity,
             kind,
+            cwd_now,
         })
     }
+}
+
+/// The `cwd_now` tail: u16 length, the directory, one source byte. `None`
+/// for an empty or torn tail.
+fn decode_cwd_now(t: &[u8]) -> Option<crate::session::cwd::Resolved> {
+    let len = (u16::from_le_bytes([*t.first()?, *t.get(1)?]) as usize).min(MAX_CWD_LEN);
+    let dir = t.get(2..2 + len)?;
+    let source = crate::session::cwd::Source::from_byte(*t.get(2 + len)?);
+    Some(crate::session::cwd::Resolved {
+        dir: String::from_utf8_lossy(dir).into_owned(),
+        source,
+    })
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::session::cwd::{Resolved, Source};
 
     #[test]
     fn exit_status_roundtrip() {
@@ -595,6 +625,7 @@ mod tests {
             cwd: "/home/user/project".to_string(),
             activity: "htop".to_string(),
             kind: SessionKind::Named,
+            cwd_now: None,
         };
         let bytes = info.encode();
         assert_eq!(bytes.len(), INFO_LEN + 2 + "htop".len() + 1);
@@ -610,6 +641,7 @@ mod tests {
             cwd: String::new(),
             activity: String::new(),
             kind: SessionKind::Anonymous,
+            cwd_now: None,
         };
         let bytes = info.encode();
         // core + (u16 len + 0 activity bytes) + 1 kind byte
@@ -627,6 +659,7 @@ mod tests {
             cwd: String::new(),
             activity: "vim".to_string(),
             kind: SessionKind::Named,
+            cwd_now: None,
         };
         let mut bytes = info.encode();
         bytes.truncate(INFO_LEN + 2 + "vim".len());
@@ -651,6 +684,7 @@ mod tests {
             cwd: String::new(),
             activity: String::new(),
             kind: SessionKind::Unknown,
+            cwd_now: None,
         };
         let decoded = SessionInfo::decode(&info.encode()).unwrap();
         assert_eq!(decoded.cmd_argv(), argv);
@@ -666,6 +700,7 @@ mod tests {
             cwd: "y".repeat(300),
             activity: "z".repeat(400),
             kind: SessionKind::Unknown,
+            cwd_now: None,
         };
         let decoded = SessionInfo::decode(&info.encode()).unwrap();
         assert_eq!(decoded.cmd.len(), MAX_CMD_LEN);
@@ -682,6 +717,7 @@ mod tests {
             cwd: String::new(),
             activity: "~/notes · vim".to_string(),
             kind: SessionKind::Unknown,
+            cwd_now: None,
         };
         assert_eq!(
             SessionInfo::decode(&info.encode()).unwrap().activity,
@@ -700,6 +736,7 @@ mod tests {
             cwd: "/tmp".to_string(),
             activity: "dropped".to_string(),
             kind: SessionKind::Unknown,
+            cwd_now: None,
         };
         let mut core = info.encode();
         core.truncate(INFO_LEN); // drop the appended activity, as an old daemon would
@@ -707,5 +744,66 @@ mod tests {
         assert_eq!(decoded.activity, "");
         assert_eq!(decoded.cmd, "bash");
         assert_eq!(decoded.cwd, "/tmp");
+    }
+
+    /// ADR 0008: the cascade's answer and its source ride after the kind
+    /// byte; `cwd` keeps meaning the START directory, untouched.
+    #[test]
+    fn info_cwd_now_roundtrips_after_the_kind_byte() {
+        let info = SessionInfo {
+            clients: 0,
+            pid: 1,
+            cmd: "bash".to_string(),
+            cwd: "/start".to_string(),
+            activity: "vim".to_string(),
+            kind: SessionKind::Named,
+            cwd_now: Some(Resolved { dir: "/w/repo".into(), source: Source::Osc7 }),
+        };
+        let bytes = info.encode();
+        assert_eq!(bytes.len(), INFO_LEN + 2 + "vim".len() + 1 + 2 + "/w/repo".len() + 1);
+        let decoded = SessionInfo::decode(&bytes).unwrap();
+        assert_eq!(decoded, info);
+        assert_eq!(decoded.cwd, "/start", "cwd still means where it started");
+    }
+
+    /// A daemon that predates the cascade sends no tail after the kind byte;
+    /// its cwd_now is "not reported", never a guess.
+    #[test]
+    fn info_decodes_a_pre_cascade_record_as_not_reported() {
+        let info = SessionInfo {
+            clients: 0,
+            pid: 1,
+            cmd: "bash".to_string(),
+            cwd: "/start".to_string(),
+            activity: String::new(),
+            kind: SessionKind::Named,
+            cwd_now: None,
+        };
+        let bytes = info.encode();
+        assert_eq!(bytes.len(), INFO_LEN + 2 + 1, "None appends nothing");
+        let decoded = SessionInfo::decode(&bytes).unwrap();
+        assert_eq!(decoded.cwd_now, None);
+        assert_eq!(decoded.kind, SessionKind::Named);
+        // A truncated tail (length without its bytes) is also not reported.
+        let mut torn = bytes.clone();
+        torn.extend_from_slice(&9u16.to_le_bytes());
+        torn.extend_from_slice(b"/sho");
+        assert_eq!(SessionInfo::decode(&torn).unwrap().cwd_now, None);
+    }
+
+    /// The directory is capped like `cwd`.
+    #[test]
+    fn info_cwd_now_is_capped() {
+        let info = SessionInfo {
+            clients: 0,
+            pid: 1,
+            cmd: String::new(),
+            cwd: String::new(),
+            activity: String::new(),
+            kind: SessionKind::Unknown,
+            cwd_now: Some(Resolved { dir: "d".repeat(400), source: Source::Kernel }),
+        };
+        let decoded = SessionInfo::decode(&info.encode()).unwrap().cwd_now.unwrap();
+        assert_eq!((decoded.dir.len(), decoded.source), (MAX_CWD_LEN, Source::Kernel));
     }
 }

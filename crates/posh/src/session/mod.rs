@@ -3,6 +3,7 @@
 
 pub(crate) mod activity;
 pub mod client;
+pub mod cwd;
 pub mod daemon;
 pub mod ipc;
 pub(crate) mod mesa;

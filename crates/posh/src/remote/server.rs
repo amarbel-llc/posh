@@ -1511,6 +1511,8 @@ pub(crate) fn server_loop(
                     echo_flag: pty_open && pty::echo_on(child.master),
                     alt_screen: term.is_alt_screen(),
                     activity: &activity,
+                    // Architecture A is bug-fix-only (ADR 0007): no cascade.
+                    cwd: None,
                 },
                 &[client_record.record_now(now_ms())],
             );
