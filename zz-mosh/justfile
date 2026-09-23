@@ -61,7 +61,7 @@ debug-build-remote host:
     ssh -A "$host" bash -l -s <<EOF
     set -euo pipefail
     if [ ! -d ~/eng/repos/posh/.git ]; then
-      mkdir -p ~/eng/repos && git clone git@github.com:amarbel-llc/posh.git ~/eng/repos/posh
+      mkdir -p ~/eng/repos && git clone https://code.linenisgreat.com/posh.git ~/eng/repos/posh
     fi
     cd ~/eng/repos/posh
     git fetch origin

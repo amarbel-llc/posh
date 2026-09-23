@@ -1,4 +1,4 @@
-module github.com/amarbel-llc/posh/posht
+module code.linenisgreat.com/posh/posht
 
 go 1.25.0
 

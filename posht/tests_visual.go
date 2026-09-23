@@ -175,13 +175,13 @@ func boxdrawView(int) string {
 }
 
 func hyperlinkView(int) string {
-	const link = "\x1b]8;;https://github.com/amarbel-llc/posh\x1b\\"
+	const link = "\x1b]8;;https://code.linenisgreat.com/posh\x1b\\"
 	const end = "\x1b]8;;\x1b\\"
 	var b strings.Builder
 	b.WriteString("  The text below is an OSC 8 hyperlink. It must render as the\n" +
 		"  plain words (no escape garbage); in terminals with hyperlink\n" +
 		"  support, hovering/ctrl-clicking it opens the posh repository.\n\n")
-	b.WriteString("      " + link + "posh on GitHub" + end + "\n\n")
+	b.WriteString("      " + link + "posh on code.linenisgreat.com" + end + "\n\n")
 	b.WriteString("  Escape garbage around the words = fail. Plain but\n" +
 		"  unclickable text is a pass if your terminal lacks hyperlinks.\n")
 	return b.String()
