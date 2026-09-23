@@ -479,8 +479,6 @@ func (m model) pickerView() string {
 	b.WriteString(titleStyle.Render(m.title))
 	b.WriteByte('\n')
 	m.writeDescription(&b)
-	b.WriteString(m.input.View())
-	b.WriteString("\n\n")
 	// The panel width tracks the terminal (capped); the rows get what is left
 	// after the marker column and the panel's own border + padding.
 	panelWidth := 80
@@ -488,6 +486,8 @@ func (m model) pickerView() string {
 		panelWidth = m.width - 4
 	}
 	panelWidth = max(min(panelWidth, 120), 30)
+	b.WriteString(m.inputView(panelWidth - paletteChromeWidth))
+	b.WriteString("\n\n")
 	// dialogStyle's Padding(1, 2) + the double border: 6 columns of chrome;
 	// the "› " marker takes two more.
 	lineWidth := panelWidth - 8
@@ -646,12 +646,27 @@ func (m model) writeDescription(b *strings.Builder) {
 	b.WriteString("\n\n")
 }
 
+// inputView renders the filter input sized to `content` columns (the panel's
+// width inside its border and padding). The textinput must be given a width:
+// at 0 it cuts the placeholder to its first rune ("/ T", posh#216). The
+// prompt is the view's own (a show may replace it), and one column is the
+// cursor's.
+func (m model) inputView(content int) string {
+	in := m.input
+	in.SetWidth(max(content-lipgloss.Width(in.Prompt)-1, 1))
+	return in.View()
+}
+
+// paletteChromeWidth is panelStyle's border + horizontal padding: its fixed
+// Width(46) leaves 40 columns of content.
+const paletteChromeWidth = 6
+
 func (m model) paletteView() string {
 	var b strings.Builder
 	b.WriteString(titleStyle.Render(m.title))
 	b.WriteByte('\n')
 	m.writeDescription(&b)
-	b.WriteString(m.input.View())
+	b.WriteString(m.inputView(panelStyle.GetWidth() - paletteChromeWidth))
 	b.WriteString("\n\n")
 	if len(m.filtered) == 0 {
 		b.WriteString(dimStyle.Render("(no matches)"))
