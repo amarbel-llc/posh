@@ -1150,8 +1150,16 @@ fn bridge_client_message(b: &mut SessionBridge, msg: &crate::remote::sync::Clien
         b.echo.record(b.inbox.next_offset(), now_ms());
     }
     // RFC 0014 §3: the riding client's unsolicited introspection entries go
-    // to the daemon verbatim (the M2 hop of the relay rule).
-    let forwarded = crate::remote::relay::forwarded_client_caps(&msg.caps);
+    // to the daemon verbatim (the M2 hop of the relay rule). RFC 0016: push-cmd
+    // rides too — this bridge, unlike the relay, carries the re-home back, so
+    // the addition lives here and never in `forwarded_client_caps`.
+    let mut forwarded = crate::remote::relay::forwarded_client_caps(&msg.caps);
+    forwarded.extend(
+        msg.caps
+            .iter()
+            .filter(|c| matches!(c.id, caps::CAP_PUSH_CMD | caps::CAP_PUSH_CMD_REQUEST))
+            .cloned(),
+    );
     if !forwarded.is_empty() {
         ipc::append_frame(
             &mut b.daemon.link.write,
@@ -3008,6 +3016,45 @@ mod tests {
                 "no shell tag without the escape flag"
             );
         }
+    }
+
+    /// RFC 0016 §2/§3: the M2 bridge carries push-cmd (the offer request and
+    /// the request token) to the daemon in a Tag::ClientCaps table — the
+    /// daemon's Tag::Switch reply already re-homes the channel.
+    #[test]
+    fn the_m2_bridge_forwards_push_cmd_entries_to_the_daemon() {
+        let (mut b, _peer) = test_bridge();
+        let msg = crate::remote::sync::ClientMessage {
+            flags: 0,
+            caps: vec![caps::encode_push_cmd(), caps::encode_push_cmd_request(9)],
+            acked_frame: 0,
+            rows: 24,
+            cols: 80,
+            input_base: 0,
+            input: Vec::new(),
+        };
+        assert!(bridge_client_message(&mut b, &msg));
+        let mut fb = crate::session::ipc::FrameBuffer::new();
+        fb.feed(&b.daemon.link.write);
+        let mut table = None;
+        while let Ok(Some(frame)) = fb.next() {
+            if frame.tag == crate::session::ipc::Tag::ClientCaps {
+                table = Some(caps::decode_table(&frame.payload).unwrap().0);
+            }
+        }
+        let table = table.expect("a ClientCaps table reaches the daemon");
+        assert!(caps::find(&table, caps::CAP_PUSH_CMD).is_some());
+        let req = caps::find(&table, caps::CAP_PUSH_CMD_REQUEST).expect("the request");
+        assert_eq!(caps::decode_push_cmd_request(&req.payload), Some(9));
+    }
+
+    /// RFC 0016 §2/§3, ADR 0007: the relay cannot report a re-home back to
+    /// its viewport, so it never forwards push-cmd — its viewport is never
+    /// offered it and falls back to the overlay.
+    #[test]
+    fn the_relay_never_forwards_push_cmd() {
+        let table = vec![caps::encode_push_cmd(), caps::encode_push_cmd_request(9)];
+        assert!(crate::remote::relay::forwarded_client_caps(&table).is_empty());
     }
 
     #[test]
