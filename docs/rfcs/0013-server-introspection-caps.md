@@ -158,7 +158,12 @@ the session or choosing among sessions:
   title, not a one-shot dialog). The daemon — or the standalone server that
   owns its PTY — attaches the label entry to the first visible frame after the
   request and again only when the title or the foreground process CHANGES,
-  never on every frame; a relay or mux bridge forwards the request to the
+  never on every frame. A session daemon does not wait for output to do so
+  (*amended 2026-09-23*, FDR 0020): an attach's replay frame carries the
+  answer to that attach's requests, and an answer that falls due otherwise (a
+  request forwarded after the replay, a label change on an idle screen) rides
+  a frame the daemon sends for it — so an idle session still answers a fresh
+  viewport, whose push-cmd offer (RFC 0016) rides with the label. A relay or mux bridge forwards the request to the
   daemon (`Tag::ClientCaps`, as for the RFC 0014 entries) and the daemon's
   answer back unchanged. A client keeps the last label delivered. The
   foreground-process probe SHOULD be throttled (posh: 250 ms); the title is

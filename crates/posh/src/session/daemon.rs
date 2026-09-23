@@ -131,6 +131,11 @@ fn ensure_session_in(
     // be long-lived — the relay, `posh-server mux`, or (push-cmd) another
     // daemon holding client sockets and a PTY master — so an inherited fd
     // would pin that resource open and hide its EOF.
+    // A creator that logs (a daemon, the relay, `posh-server mux`) left its
+    // logger in our memory. Drop it while its fd is still ours: shed first and
+    // `log_init`'s replacement would close that fd NUMBER a second time —
+    // by then possibly our own new log, or the PTY master.
+    util::log_disable();
     util::close_inherited_fds(&[listener.as_raw_fd()]);
     // The directory was resolved (and checked to exist) by the caller; if it
     // vanished since, the daemon keeps the creator's and reports that.
@@ -285,6 +290,12 @@ impl ClientConn {
         }
     }
 
+    /// RFC 0013 §5.2: this client asked for the activity label and has not
+    /// been sent the current one (the kind and push-cmd offer ride with it).
+    fn answer_due(&self) -> bool {
+        self.wants_activity && self.activity_now.is_some() && self.activity_now != self.activity_sent
+    }
+
     /// This client's §4.2 record with `age=` filled in from `now`.
     fn record_now(&self, now: u64) -> introspect::ClientRecord {
         let mut r = self.record.clone();
@@ -420,10 +431,7 @@ impl ClientConn {
         let stamp_base_sum = lossy && caps::find(&self.caps, caps::CAP_BASE_SUM).is_some();
         // RFC 0013 §5.2: the activity label rides this visible frame only
         // when it changed since this client last received it (or never did).
-        let activity_cap: Vec<caps::Cap> = if self.wants_activity
-            && self.activity_now.is_some()
-            && self.activity_now != self.activity_sent
-        {
+        let activity_cap: Vec<caps::Cap> = if self.answer_due() {
             self.activity_sent = self.activity_now.clone();
             let mut entries: Vec<caps::Cap> =
                 self.activity_now.iter().map(caps::encode_session_activity).collect();
@@ -815,6 +823,26 @@ fn strip_kitty_reply(responses: &[u8]) -> Vec<u8> {
 /// session underneath (else it renders the session until the next overlay
 /// output — indefinite at an idle prompt — and a baseline client is corrupted by
 /// overlay deltas applied on a session base).
+/// The session's RFC 0013 §5 activity label now: the terminal title each
+/// call, the foreground process re-probed at most every PROBE_INTERVAL_MS
+/// (`process` / `probed_at` are the loop's cache of it).
+fn current_activity(
+    pty_fd: RawFd,
+    term: &Terminal,
+    process: &mut String,
+    probed_at: &mut u64,
+) -> caps::SessionActivity {
+    let t = util::now_ms();
+    if t.saturating_sub(*probed_at) >= super::activity::PROBE_INTERVAL_MS {
+        *probed_at = t;
+        *process = crate::pty::foreground_command(pty_fd).unwrap_or_default();
+    }
+    caps::SessionActivity {
+        process: process.clone(),
+        title: term.title().to_string(),
+    }
+}
+
 fn active_source<'a>(overlay_term: Option<&'a Terminal>, term: &'a Terminal) -> &'a Terminal {
     overlay_term.unwrap_or(term)
 }
@@ -1389,19 +1417,10 @@ fn daemon_loop(
         // (the title from the model each turn, the process on a throttle);
         // `queue_frame` attaches it to a visible frame only when it changed
         // for that client.
-        let activity = if clients.iter().any(|c| c.wants_activity) {
-            let t = util::now_ms();
-            if t.saturating_sub(activity_probe_at) >= super::activity::PROBE_INTERVAL_MS {
-                activity_probe_at = t;
-                activity_process = crate::pty::foreground_command(pty_fd).unwrap_or_default();
-            }
-            Some(caps::SessionActivity {
-                process: activity_process.clone(),
-                title: term.title().to_string(),
-            })
-        } else {
-            None
-        };
+        let activity = clients
+            .iter()
+            .any(|c| c.wants_activity)
+            .then(|| current_activity(pty_fd, term, &mut activity_process, &mut activity_probe_at));
         for c in clients.iter_mut() {
             c.echo_flag = echo_flag;
             c.overlay_flag = overlay_flag;
@@ -1906,6 +1925,12 @@ fn daemon_loop(
                 // up it is what every client sees (FDR 0008), so a client
                 // attaching / resuming mid-overlay must base on the overlay
                 // screen, not the live session underneath (see `active_source`).
+                // RFC 0013 §5.2 / RFC 0016 §2: an Init's requests latched after
+                // this iteration's refresh — answer them on the replay itself.
+                if clients[i].wants_activity && clients[i].activity_now.is_none() {
+                    clients[i].activity_now =
+                        Some(current_activity(pty_fd, term, &mut activity_process, &mut activity_probe_at));
+                }
                 let src = active_source(overlay.as_ref().map(|o| &o.term), term);
                 let c = &mut clients[i];
                 // Derive the dump/snapshot frame inputs ONLY when a producer
@@ -1947,6 +1972,21 @@ fn daemon_loop(
                     }
                 }
             }
+        }
+
+        // RFC 0013 §5.2 / RFC 0016 §2: an answer that is due rides a frame of
+        // its own, even on an idle screen. A request latched this iteration
+        // (an attach's Init, whose replay frame preceded the refresh above,
+        // or a bridge's Tag::ClientCaps) would otherwise wait for output.
+        if clients.iter().any(|c| c.wants_activity && c.activity_now.is_none()) {
+            let now = current_activity(pty_fd, term, &mut activity_process, &mut activity_probe_at);
+            for c in clients.iter_mut().filter(|c| c.wants_activity && c.activity_now.is_none()) {
+                c.activity_now = Some(now.clone());
+            }
+        }
+        let src = active_source(overlay.as_ref().map(|o| &o.term), term);
+        for c in clients.iter_mut().filter(|c| c.producer.is_some() && c.answer_due()) {
+            c.queue_frame_from(src);
         }
     };
 

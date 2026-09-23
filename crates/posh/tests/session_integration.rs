@@ -188,6 +188,11 @@ fn a_push_cmd_request_creates_a_session_here_and_rehomes_the_requester() {
     let mut lines = ran.lines();
     assert_eq!(lines.next(), Some(dir.to_str().unwrap()), "runs in the session's directory");
     assert_eq!(lines.next(), Some("s-1"), "as the new session");
+    // Forked from a daemon, the new daemon must log to ITS OWN file: the
+    // creator's inherited logger is dropped before its fd is shed, else the
+    // fd number is closed twice (under the new log or the PTY master).
+    let log = std::fs::read_to_string(dir.join("default").join("s-1.log")).unwrap_or_default();
+    assert!(log.contains("daemon started session=s-1"), "the pushed daemon logs: {log:?}");
 
     let listed = String::from_utf8_lossy(&posh(&dir, &["list", "--json"]).stdout).into_owned();
     assert!(
@@ -206,6 +211,82 @@ fn a_push_cmd_request_creates_a_session_here_and_rehomes_the_requester() {
     let _ = posh(&dir, &["kill", "s-1"]);
     let _ = posh(&dir, &["kill", "par"]);
     let _ = std::fs::remove_dir_all(&dir);
+}
+
+/// RFC 0013 §5.2 / RFC 0016 §2: the attach replay frame already answers a
+/// client's Init requests — activity label, kind, push-cmd offer — so an idle
+/// session (no later frame) still tells a fresh viewport all three.
+#[test]
+fn an_idle_sessions_replay_frame_answers_the_attach_requests() {
+    use posh_proto::caps;
+    use posh_proto::frame::ServerFrame;
+    use std::io::Write;
+    use std::os::unix::net::UnixStream;
+    const TAG_INIT: u8 = 7;
+    const TAG_FRAME: u8 = 12;
+
+    let dir = test_dir("posh-replay-caps");
+    std::fs::create_dir_all(&dir).unwrap();
+    let out = posh(&dir, &["attach", "--detach", "idle", "sh", "-c", "echo ready; exec sleep 300"]);
+    assert!(out.status.success(), "attach --detach failed: {out:?}");
+    let sock = dir.join("default").join("idle");
+    wait_for(|| UnixStream::connect(&sock).is_ok(), "the session's socket");
+    // Let the shell's output land so the daemon has something to replay.
+    std::thread::sleep(Duration::from_millis(500));
+
+    let mut conn = UnixStream::connect(&sock).unwrap();
+    conn.set_read_timeout(Some(Duration::from_secs(5))).unwrap();
+    let mut init = Vec::new();
+    init.extend_from_slice(&24u16.to_le_bytes());
+    init.extend_from_slice(&80u16.to_le_bytes());
+    init.extend_from_slice(&caps::encode_table(&caps::own_table(&[
+        caps::Cap { id: caps::CAP_SESSION_ACTIVITY, payload: vec![] },
+        caps::encode_push_cmd(),
+    ])));
+    let mut frame = vec![TAG_INIT];
+    frame.extend_from_slice(&(init.len() as u32).to_le_bytes());
+    frame.extend_from_slice(&init);
+    conn.write_all(&frame).unwrap();
+
+    let first = read_until_tag(&mut conn, TAG_FRAME).expect("the replay frame");
+    let first = ServerFrame::decode(&first).unwrap();
+    let has = |id| caps::find(&first.caps, id).is_some();
+    let answered = (
+        has(caps::CAP_SESSION_ACTIVITY),
+        has(caps::CAP_SESSION_KIND),
+        has(caps::CAP_PUSH_CMD),
+    );
+
+
+    // The M2 bridge's shape: a plain Init, then the requests in a later
+    // Tag::ClientCaps. Nothing is printed meanwhile, yet the answer arrives.
+    const TAG_CLIENT_CAPS: u8 = 15;
+    let mut bridged = UnixStream::connect(&sock).unwrap();
+    bridged.set_read_timeout(Some(Duration::from_secs(5))).unwrap();
+    let send = |s: &mut UnixStream, tag: u8, payload: &[u8]| {
+        let mut f = vec![tag];
+        f.extend_from_slice(&(payload.len() as u32).to_le_bytes());
+        f.extend_from_slice(payload);
+        s.write_all(&f).unwrap();
+    };
+    let mut plain = init[..4].to_vec();
+    plain.extend_from_slice(&caps::encode_table(&caps::own_table(&[])));
+    send(&mut bridged, TAG_INIT, &plain);
+    let _replay = read_until_tag(&mut bridged, TAG_FRAME).expect("the plain replay");
+    send(
+        &mut bridged,
+        TAG_CLIENT_CAPS,
+        &caps::encode_table(&[caps::Cap { id: caps::CAP_SESSION_ACTIVITY, payload: vec![] }, caps::encode_push_cmd()]),
+    );
+    let later = read_until_tag(&mut bridged, TAG_FRAME).map(|f| ServerFrame::decode(&f).unwrap());
+    let bridged_offer = later.is_some_and(|f| caps::find(&f.caps, caps::CAP_PUSH_CMD).is_some());
+
+    drop(conn);
+    drop(bridged);
+    let _ = posh(&dir, &["kill", "idle"]);
+    let _ = std::fs::remove_dir_all(&dir);
+    assert_eq!(answered, (true, true, true), "activity, kind, offer on the replay frame");
+    assert!(bridged_offer, "a ClientCaps request on an idle session is answered");
 }
 
 #[test]
