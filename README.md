@@ -212,7 +212,9 @@ glyph until the server confirms the cell — or the original underlined `replace
 is a deprecated alias for `POSH_PREDICTION_MODEL`. A reverse-video
 "Last contact N seconds ago" banner appears after 6.5s of silence. Ctrl-^ opens
 a command palette — the escape menu — listing the predictive-echo models, the
-debug-logging toggle, escape-to-shell on the server, suspend, and quit (rendered
+debug-logging toggle, *Push shell* (a new session in the same directory, FDR
+0020; the escape-to-shell overlay where the daemon does not offer it), suspend,
+and quit (rendered
 by the `posh-palette` helper); Ctrl-^ then `.` is a fallback quit if that helper
 can't launch. Servers
 bind dual-stack IPv6 when possible,

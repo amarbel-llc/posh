@@ -291,8 +291,8 @@ Local persistence over Unix sockets.
 	Print the session's status response (RFC 0014 §4.2): a session
 	line — daemon build, pid, frames gate, the PTY's ECHO flag, alt-screen,
 	client count, activity label, and the current directory with the
-	cascade step that found it (_cwd=_, _cwd_source=_: _caller_, _kernel_,
-	_osc7_, _start_ or _home_) — then one line per attached client with
+	cascade step that found it (_cwd=_, _cwd_source=_: _kernel_, _osc7_,
+	_start_ or _home_) — then one line per attached client with
 	its build, echo model in effect, control (_auto_, _auto-escalated_,
 	_pinned-env_, _pinned-palette_, _gate-off_), rtt, codec, gates,
 	escalation thresholds, and prediction outcome counters. A client

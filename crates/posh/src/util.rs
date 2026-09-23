@@ -537,6 +537,17 @@ pub fn double_fork() -> Result<bool> {
 /// modal's renderer waits on, a pty never released. Linux enumerates
 /// `/proc/self/fd`; elsewhere the descriptor table is swept up to
 /// `sysconf(_SC_OPEN_MAX)`.
+/// The first thing a double-forked daemon does: drop what its creator left
+/// in memory and in the descriptor table, keeping only `keep`. The logger
+/// goes FIRST, while its fd is still ours — shed first and the next
+/// `log_init`'s replacement would close that fd NUMBER a second time, by then
+/// possibly the new log or a PTY master. Creators that log: a session daemon
+/// (push-cmd), the relay, `posh-server mux`, a client under `POSH_DEBUG_LOG`.
+pub fn shed_creator(keep: &[RawFd]) {
+    log_disable();
+    close_inherited_fds(keep);
+}
+
 pub fn close_inherited_fds(keep: &[RawFd]) {
     let mut fds: Vec<RawFd> = Vec::new();
     #[cfg(target_os = "linux")]

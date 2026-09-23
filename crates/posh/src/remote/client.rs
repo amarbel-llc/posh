@@ -906,6 +906,10 @@ fn show_debug_info(st: &mut ClientState, title: &str, body: &str, now: u64) {
 /// RFC 0016 §5: how long a push-cmd request waits for its re-home.
 const PUSH_ANSWER_MS: u64 = 10_000;
 
+/// The notice while a shell request (push or overlay) awaits its answer;
+/// whatever answers it clears the notice only if it still reads this.
+const OPENING_SHELL: &str = "opening shell\u{2026}";
+
 /// The push-cmd request this message carries (RFC 0016 §3), if one is
 /// pending; past its deadline the request is dropped and the user told.
 fn push_request_cap(st: &mut ClientState, now: u64) -> Option<caps::Cap> {
@@ -922,7 +926,7 @@ fn push_request_cap(st: &mut ClientState, now: u64) -> Option<caps::Cap> {
 /// answered, and the offer belongs to the session we left.
 fn note_rehome(st: &mut ClientState, now: u64) {
     st.push_offered = false;
-    if st.pending_push.take().is_some() && st.notify.message() == "opening shell\u{2026}" {
+    if st.pending_push.take().is_some() && st.notify.message() == OPENING_SHELL {
         st.notify.set_message("", false, now);
     }
 }
@@ -1052,14 +1056,14 @@ fn dispatch_palette_action(
             // FDR 0008 escape-to-shell: a one-shot sticky flag the next message
             // carries; the server spawns the overlay shell in the session cwd.
             st.flags |= sync::CLIENT_FLAG_ESCAPE;
-            st.notify.set_message("opening shell\u{2026}", true, now);
+            st.notify.set_message(OPENING_SHELL, true, now);
             true
         }
         "shell.push" => {
             // RFC 0016 §3: a fresh token that rides every message until the
             // re-home lands (`note_rehome`) or PUSH_ANSWER_MS passes.
             st.pending_push = Some((crate::remote::crypto::random_token(), now + PUSH_ANSWER_MS));
-            st.notify.set_message("opening shell\u{2026}", true, now);
+            st.notify.set_message(OPENING_SHELL, true, now);
             true
         }
         "session.resync" => {
@@ -3135,7 +3139,7 @@ fn process_frame(st: &mut ClientState, frame: &ServerFrame) -> bool {
     }
     // The escape-to-shell overlay is up (FDR 0008): the request was honored, so
     // drop the "opening shell…" notice (the request flag is already one-shot).
-    if frame.flags & sync::FLAG_OVERLAY != 0 && st.notify.message() == "opening shell\u{2026}" {
+    if frame.flags & sync::FLAG_OVERLAY != 0 && st.notify.message() == OPENING_SHELL {
         st.notify.set_message("", false, now);
     }
     if frame.flags & sync::FLAG_SHUTDOWN != 0 {
@@ -4157,7 +4161,7 @@ mod tests {
         let raw = pty_raw_mode();
         let mut st = test_state(5, 40);
         assert!(dispatch_palette_action(&mut st, &raw, "shell.push", &json!({}), 1_000), "send promptly");
-        assert_eq!(st.notify.message(), "opening shell\u{2026}");
+        assert_eq!(st.notify.message(), OPENING_SHELL);
         let token = |st: &mut ClientState, now| {
             push_request_cap(st, now).map(|c| caps::decode_push_cmd_request(&c.payload).expect("a valid token"))
         };

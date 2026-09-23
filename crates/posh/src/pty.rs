@@ -616,11 +616,6 @@ mod tests {
         }
     }
 
-    /// `quiet_emulator_slave`: a posh-hosted emulator PTY (palette / crap-present)
-    /// must present a no-echo, non-canonical INPUT discipline so a master write
-    /// can't echo back into posh's model, while OUTPUT processing stays intact so
-    /// the child's rendering is unaffected. The openpty default is cooked+echo, so
-    /// this asserts the flags actually flip.
     /// ADR 0008 step 2: the kernel's cwd of a live process — this one — is
     /// its real working directory; a pid that does not exist has none.
     // macOS gap (posh#214): `process_cwd` is a stub there, so only Linux asserts.
@@ -633,6 +628,11 @@ mod tests {
         assert_eq!(process_cwd(i32::MAX), None);
     }
 
+    /// `quiet_emulator_slave`: a posh-hosted emulator PTY (palette / crap-present)
+    /// must present a no-echo, non-canonical INPUT discipline so a master write
+    /// can't echo back into posh's model, while OUTPUT processing stays intact so
+    /// the child's rendering is unaffected. The openpty default is cooked+echo, so
+    /// this asserts the flags actually flip.
     #[test]
     fn quiet_emulator_slave_clears_echo_and_icanon_keeps_opost() {
         // SAFETY: openpty fills m/s with valid fds; tcgetattr writes a valid

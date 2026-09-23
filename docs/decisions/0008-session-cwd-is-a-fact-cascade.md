@@ -71,9 +71,11 @@ path **and the step that produced it**. Every consumer calls it: push-cmd,
 `posh list`, whatever replaces `posh fork`, and the FDR 0008 overlay for as
 long as it survives. The daemon owns steps 2–4 (it holds the child pid, the
 terminal model, and its start directory), so the implementation lives with it;
-a consumer outside the daemon reads the result through `Tag::Info`. A CLI
-caller supplies step 1 as an input, so its answer carries provenance like any
-other.
+a consumer outside the daemon reads the result through `Tag::Info`. As built
+(2026-09-23), no caller passes step 1 as an input: the only CLI consumer
+(`posh start -- <cmd>` inside a session) satisfies it by inheritance (see
+below), so a daemon never reports `caller` — the source value is reserved for
+a consumer that does.
 
 The step that won is logged when a session is created from it, and shown by
 `posh status`, so "why did this open in `~`?" has an answer.

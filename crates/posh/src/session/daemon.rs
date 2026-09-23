@@ -26,11 +26,11 @@ const SCROLLBACK: usize = 10_000;
 /// raw PTY output so `poshterity replay` can reproduce the screen deterministically.
 type SessionRecorder = poshterity::castx::Recorder<Box<dyn Write>>;
 
-/// Open the recording named by `$POSH_RECORD_FILE` (if any) and write its
+/// Open the recording at `path` (`$POSH_RECORD_FILE`, if set) and write its
 /// header. A failure to open/write only logs and disables recording — it must
 /// never stop the session from starting.
-fn open_recorder(rows: u16, cols: u16) -> Option<SessionRecorder> {
-    let path = std::env::var_os("POSH_RECORD_FILE")?;
+fn open_recorder(path: Option<std::ffi::OsString>, rows: u16, cols: u16) -> Option<SessionRecorder> {
+    let path = path?;
     let file = match std::fs::File::create(&path) {
         Ok(f) => f,
         Err(e) => {
@@ -73,7 +73,15 @@ pub fn ensure_session(
     command: Option<Vec<String>>,
     kind: SessionKind,
 ) -> Result<bool> {
-    ensure_session_in(cfg, name, command, kind, None, None)
+    let created = ensure_session_in(cfg, name, command, kind, None, None)?;
+    if created {
+        // A CLI creator gives the grandchild a beat to exist before it
+        // connects (the socket is already bound, so a fast connect just
+        // queues). Not in `ensure_session_in`: a daemon serving push-cmd
+        // must not stall its own poll loop — and every attached viewport.
+        std::thread::sleep(std::time::Duration::from_millis(10));
+    }
+    Ok(created)
 }
 
 /// [`ensure_session`] for a daemon creating a session on a viewport's behalf
@@ -123,7 +131,6 @@ fn ensure_session_in(
         UnixListener::bind(&path).map_err(|e| Error::Msg(format!("bind {}: {e}", path.display())))?;
     if util::double_fork()? {
         drop(listener);
-        std::thread::sleep(std::time::Duration::from_millis(10));
         return Ok(true);
     }
     // Shed every descriptor the creator held (the mux spawn's rule,
@@ -131,12 +138,7 @@ fn ensure_session_in(
     // be long-lived — the relay, `posh-server mux`, or (push-cmd) another
     // daemon holding client sockets and a PTY master — so an inherited fd
     // would pin that resource open and hide its EOF.
-    // A creator that logs (a daemon, the relay, `posh-server mux`) left its
-    // logger in our memory. Drop it while its fd is still ours: shed first and
-    // `log_init`'s replacement would close that fd NUMBER a second time —
-    // by then possibly our own new log, or the PTY master.
-    util::log_disable();
-    util::close_inherited_fds(&[listener.as_raw_fd()]);
+    util::shed_creator(&[listener.as_raw_fd()]);
     // The directory was resolved (and checked to exist) by the caller; if it
     // vanished since, the daemon keeps the creator's and reports that.
     if let Some(dir) = cwd {
@@ -816,13 +818,6 @@ fn strip_kitty_reply(responses: &[u8]) -> Vec<u8> {
     out
 }
 
-/// The terminal a client should render: the escape overlay's screen while one is
-/// up (FDR 0008), else the live session. The broadcast source AND a
-/// (re)attaching client's replay must agree on this — a client that attaches or
-/// SIGCONT-resumes mid-overlay has to base on the overlay screen, not the live
-/// session underneath (else it renders the session until the next overlay
-/// output — indefinite at an idle prompt — and a baseline client is corrupted by
-/// overlay deltas applied on a session base).
 /// The session's RFC 0013 §5 activity label now: the terminal title each
 /// call, the foreground process re-probed at most every PROBE_INTERVAL_MS
 /// (`process` / `probed_at` are the loop's cache of it).
@@ -843,6 +838,13 @@ fn current_activity(
     }
 }
 
+/// The terminal a client should render: the escape overlay's screen while one is
+/// up (FDR 0008), else the live session. The broadcast source AND a
+/// (re)attaching client's replay must agree on this — a client that attaches or
+/// SIGCONT-resumes mid-overlay has to base on the overlay screen, not the live
+/// session underneath (else it renders the session until the next overlay
+/// output — indefinite at an idle prompt — and a baseline client is corrupted by
+/// overlay deltas applied on a session base).
 fn active_source<'a>(overlay_term: Option<&'a Terminal>, term: &'a Terminal) -> &'a Terminal {
     overlay_term.unwrap_or(term)
 }
@@ -955,16 +957,6 @@ impl ScreenSwitchFilter {
     }
 }
 
-/// FDR 0012 (RFC 0008 §3.1): pick the ONE attached connection a switch
-/// routes to — the most-recent-input client, tmux's current-client
-/// heuristic (per-viewport by construction: every relay/M2 channel serves
-/// exactly one viewport). The requester's own connection is excluded; ties
-/// and the never-typed case fall to the LATEST-attached candidate (highest
-/// index — accept order). `None` when no other connection is attached.
-/// Deliberately unfiltered by frame capability: the most-recent-input
-/// connection IS the issuing viewport, and re-routing to a "more capable"
-/// other viewport would switch the wrong screen — an old client that skips
-/// the unknown tag is the specified visible no-op instead.
 /// Where this session is, by ADR 0008's cascade, from the facts a daemon
 /// holds: its child's kernel cwd, the shell's OSC 7 report, its own start
 /// directory, `$HOME`. No caller cwd — a daemon asks on nobody's behalf.
@@ -1009,6 +1001,17 @@ fn create_pushed_session(group: &str, cwd: &str, token: u64) -> Result<String> {
     Ok(name)
 }
 
+/// FDR 0012 (RFC 0008 §3.1): pick the ONE attached connection a switch
+/// routes to — the most-recent-input client, tmux's current-client
+/// heuristic (per-viewport by construction: every relay/M2 channel serves
+/// exactly one viewport). The requester's own connection is excluded; ties
+/// and the never-typed case fall to the LATEST-attached candidate (highest
+/// index — accept order). `None` when no other connection is attached.
+/// Deliberately unfiltered by frame capability: the most-recent-input
+/// connection IS the issuing viewport, and re-routing to a "more capable"
+/// other viewport would switch the wrong screen — an old client that skips
+/// the unknown tag is the specified visible no-op instead. (A push-cmd
+/// requester, by contrast, IS the viewport: RFC 0016 §4.3.)
 fn switch_route_target(clients: &[ClientConn], requester: usize) -> Option<usize> {
     let mut best: Option<(u64, usize)> = None;
     for (j, c) in clients.iter().enumerate() {
@@ -1086,6 +1089,11 @@ fn daemon_main(
 ) -> ! {
     util::redirect_stdio_devnull();
     let _ = util::log_init(&cfg.log_path(name));
+    // `posh --record FILE` names THIS session's recording. Take it out of the
+    // environment before the shell is spawned, so neither the shell's own
+    // `posh start` nor a push-cmd fork of this daemon records over it.
+    let record_file = std::env::var_os("POSH_RECORD_FILE");
+    std::env::remove_var("POSH_RECORD_FILE");
     // A daemon panic used to abort with no trace in the posh log (only the exit
     // paths that log first are visible), so a panic-death was indistinguishable
     // from a signal-kill. Record it before the default hook unwinds/aborts.
@@ -1135,7 +1143,7 @@ fn daemon_main(
 
     // Optional `.castx` recording (posh --record FILE). Best-effort: a failure
     // to open never blocks the session.
-    let recorder = open_recorder(rows, cols);
+    let recorder = open_recorder(record_file, rows, cols);
 
     // RFC 0014 §4.1: the session status socket (connect → response → EOF)
     // beside the session socket, its `.status.pid` liveness record written
@@ -1823,6 +1831,14 @@ fn daemon_loop(
                     remove = true;
                 }
             }
+            // RFC 0013 §5.2 / RFC 0016 §2: a request this client's messages
+            // latched after the loop-top refresh (Init, Tag::ClientCaps) is
+            // answered this iteration — on the replay below, else by the
+            // end-of-iteration pass — not after the next output.
+            if !remove && clients[i].wants_activity && clients[i].activity_now.is_none() {
+                clients[i].activity_now =
+                    Some(current_activity(pty_fd, term, &mut activity_process, &mut activity_probe_at));
+            }
             // FDR 0012 (RFC 0008 §3.1): route a validated switch request to
             // the most-recent-input attached connection — the issuing
             // viewport — BEFORE any removal shifts indices (the requester
@@ -1847,13 +1863,15 @@ fn daemon_loop(
             // then re-home THIS connection (the requesting viewport) onto it.
             // A requester that is already gone gets nothing created.
             if let Some(token) = push_for.filter(|_| !remove) {
-                let here = daemon_cwd(child.pid, term, cwd).dir;
-                match create_pushed_session(group, &here, token) {
+                let here = daemon_cwd(child.pid, term, cwd);
+                match create_pushed_session(group, &here.dir, token) {
                     Ok(pushed) => {
                         util::log_write(
                             "info",
                             &format!(
-                                "push-cmd: created {pushed} in {here} for client fd={}",
+                                "push-cmd: created {pushed} in {} (cwd_source={}) for client fd={}",
+                                here.dir,
+                                here.source.as_str(),
                                 clients[i].stream.as_raw_fd()
                             ),
                         );
@@ -1925,12 +1943,6 @@ fn daemon_loop(
                 // up it is what every client sees (FDR 0008), so a client
                 // attaching / resuming mid-overlay must base on the overlay
                 // screen, not the live session underneath (see `active_source`).
-                // RFC 0013 §5.2 / RFC 0016 §2: an Init's requests latched after
-                // this iteration's refresh — answer them on the replay itself.
-                if clients[i].wants_activity && clients[i].activity_now.is_none() {
-                    clients[i].activity_now =
-                        Some(current_activity(pty_fd, term, &mut activity_process, &mut activity_probe_at));
-                }
                 let src = active_source(overlay.as_ref().map(|o| &o.term), term);
                 let c = &mut clients[i];
                 // Derive the dump/snapshot frame inputs ONLY when a producer
@@ -1974,16 +1986,9 @@ fn daemon_loop(
             }
         }
 
-        // RFC 0013 §5.2 / RFC 0016 §2: an answer that is due rides a frame of
-        // its own, even on an idle screen. A request latched this iteration
-        // (an attach's Init, whose replay frame preceded the refresh above,
-        // or a bridge's Tag::ClientCaps) would otherwise wait for output.
-        if clients.iter().any(|c| c.wants_activity && c.activity_now.is_none()) {
-            let now = current_activity(pty_fd, term, &mut activity_process, &mut activity_probe_at);
-            for c in clients.iter_mut().filter(|c| c.wants_activity && c.activity_now.is_none()) {
-                c.activity_now = Some(now.clone());
-            }
-        }
+        // RFC 0013 §5.2 / RFC 0016 §2: an answer that is due and was not on a
+        // replay (a bridge's Tag::ClientCaps request, a label change on an
+        // idle screen) rides a frame of its own rather than wait for output.
         let src = active_source(overlay.as_ref().map(|o| &o.term), term);
         for c in clients.iter_mut().filter(|c| c.producer.is_some() && c.answer_due()) {
             c.queue_frame_from(src);

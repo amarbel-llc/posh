@@ -1357,7 +1357,7 @@ pub fn run_daemon(key: &str, req: EndpointRequest) -> Result<MuxSpawn> {
     // PTY and ndjson pipe, the stderr capture — across this spawn, and a
     // daemon pinning that pipe would keep the modal's renderer from ever
     // seeing EOF (a SIGKILL-after-grace stall on every first frame).
-    util::close_inherited_fds(&[listener.as_raw_fd()]);
+    util::shed_creator(&[listener.as_raw_fd()]);
     util::redirect_stdio_devnull();
     let _ = util::log_init(&sock.with_extension("log"));
     std::panic::set_hook(Box::new(|info| {
