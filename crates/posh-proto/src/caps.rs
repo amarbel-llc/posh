@@ -165,6 +165,17 @@ pub const CAP_EXIT_CAUSE: u8 = 19;
 /// it. Display / policy on the viewport side only (the FDR 0016 stack and
 /// the leave prompt); an old client ignores the id.
 pub const CAP_SESSION_KIND: u8 = 20;
+/// RFC 0016 §2: the push-cmd offer, a request/answer pair like
+/// `SESSION_ACTIVITY`'s. Client → server (empty): "I can push". Server →
+/// client (empty), once, beside the first activity answer: "offered". Only a
+/// local attach and the M2 bridge carry the client half — never the relay,
+/// which cannot report a re-home back to its viewport (ADR 0007).
+pub const CAP_PUSH_CMD: u8 = 21;
+/// RFC 0016 §3: client → server, a push-cmd request: a nonzero big-endian
+/// u64 token, then a reserved command field no sender uses yet. Served once
+/// per token; the token is seeded into the created session so a repeat that
+/// lands there after the re-home is ignored too.
+pub const CAP_PUSH_CMD_REQUEST: u8 = 22;
 
 /// Why a session ended, as its daemon (or a standalone server) knew it.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -465,6 +476,30 @@ pub fn decode_session_kind(payload: &[u8]) -> Option<SessionKind> {
         [b] => Some(SessionKind::from_byte(*b)),
         _ => None,
     }
+}
+
+/// The [`CAP_PUSH_CMD`] offer: an empty entry.
+pub fn encode_push_cmd() -> Cap {
+    Cap {
+        id: CAP_PUSH_CMD,
+        payload: Vec::new(),
+    }
+}
+
+/// A [`CAP_PUSH_CMD_REQUEST`] carrying `token` and nothing after it.
+pub fn encode_push_cmd_request(token: u64) -> Cap {
+    Cap {
+        id: CAP_PUSH_CMD_REQUEST,
+        payload: token.to_be_bytes().to_vec(),
+    }
+}
+
+/// The token of a [`CAP_PUSH_CMD_REQUEST`]: `None` when the payload is
+/// shorter than 8 bytes or the token is 0 (reserved). Bytes after the token
+/// are the reserved command field (RFC 0016 §3), ignored here.
+pub fn decode_push_cmd_request(payload: &[u8]) -> Option<u64> {
+    let token = u64::from_be_bytes(payload.get(..8)?.try_into().ok()?);
+    (token != 0).then_some(token)
 }
 
 /// Mask a received [`CAP_KITTY_KEYBOARD`] payload to the valid low-5-bit flag
@@ -1363,5 +1398,37 @@ mod tests {
         assert_eq!(decode_session_kind(&[1, 2]), None, "exactly one byte");
         assert_eq!(decode_session_kind(&[0]), Some(SessionKind::Unknown));
         assert_eq!(decode_session_kind(&[77]), Some(SessionKind::Unknown));
+    }
+
+    /// RFC 0016 takes the next free pair after `SESSION_KIND` (20). Pinned so
+    /// a later allocation cannot silently collide with it.
+    #[test]
+    fn push_cmd_ids_are_the_next_free_pair() {
+        assert_eq!(CAP_PUSH_CMD, 21);
+        assert_eq!(CAP_PUSH_CMD_REQUEST, 22);
+    }
+
+    /// RFC 0016 §3: an 8-byte big-endian token; token 0 and a short payload
+    /// are ignored; bytes after the token are a reserved command field that a
+    /// reader which does not implement it ignores — and a sender never sends.
+    #[test]
+    fn push_cmd_request_token_roundtrips_and_rejects_bad_payloads() {
+        let cap = encode_push_cmd_request(0x0123_4567_89ab_cdef);
+        assert_eq!(cap.id, CAP_PUSH_CMD_REQUEST);
+        assert_eq!(cap.payload.len(), 8, "a sender sends no reserved tail");
+        assert_eq!(decode_push_cmd_request(&cap.payload), Some(0x0123_4567_89ab_cdef));
+        assert_eq!(decode_push_cmd_request(&[]), None, "empty");
+        assert_eq!(decode_push_cmd_request(&[1; 7]), None, "short");
+        assert_eq!(decode_push_cmd_request(&[0; 8]), None, "token 0 is reserved");
+        let mut tail = 9u64.to_be_bytes().to_vec();
+        tail.extend_from_slice(b"future");
+        assert_eq!(decode_push_cmd_request(&tail), Some(9), "the reserved tail is ignored");
+    }
+
+    /// RFC 0016 §2: the offer is an empty entry in both directions.
+    #[test]
+    fn push_cmd_offer_is_an_empty_entry() {
+        let cap = encode_push_cmd();
+        assert_eq!((cap.id, cap.payload.len()), (CAP_PUSH_CMD, 0));
     }
 }
