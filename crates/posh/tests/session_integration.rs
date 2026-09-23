@@ -38,6 +38,75 @@ fn test_dir(prefix: &str) -> PathBuf {
     base.join(format!("{prefix}-{}", std::process::id()))
 }
 
+/// A session daemon is double-forked from whatever created it — a CLI here,
+/// but also long-lived processes (the relay, `posh-server mux`, and for
+/// push-cmd a daemon). It must not keep any of its creator's descriptors
+/// open: a leaked socket or PTY outlives its owner and hides its EOF.
+/// A pipe opened here WITHOUT close-on-exec rides into `posh` through
+/// `exec`, then into the daemon through `fork`; the daemon must not hold it.
+// macOS gap (posh#214): the shedding itself works everywhere
+// (`close_inherited_fds` sweeps to `_SC_OPEN_MAX`); only this check reads
+// `/proc/<pid>/fd` — `lsof -p` would do on macOS.
+#[cfg(target_os = "linux")]
+#[test]
+fn a_new_session_daemon_sheds_its_creators_descriptors() {
+    use std::os::unix::fs::MetadataExt;
+
+    let dir = test_dir("posh-shed");
+    std::fs::create_dir_all(&dir).unwrap();
+    let mut pipe = [0 as libc::c_int; 2];
+    // SAFETY: pipe(2) fills the two-element array we own.
+    assert_eq!(unsafe { libc::pipe(pipe.as_mut_ptr()) }, 0, "pipe");
+    let inode = std::fs::metadata(format!("/proc/self/fd/{}", pipe[0])).unwrap().ino();
+    let leaked = format!("pipe:[{inode}]");
+
+    let out = posh(&dir, &["attach", "--detach", "shed", "sleep", "300"]);
+    assert!(out.status.success(), "attach --detach failed: {out:?}");
+
+    // `posh list`'s PID column is the session SHELL; the daemon is its parent.
+    let mut shell_pid = String::new();
+    wait_for(
+        || {
+            let out = posh(&dir, &["list"]);
+            let stdout = String::from_utf8_lossy(&out.stdout).into_owned();
+            match stdout.lines().nth(1).map(|row| row.split('\t').collect::<Vec<_>>()) {
+                Some(fields) if fields.len() > 2 && fields[0] == "shed" && !fields[2].is_empty() => {
+                    shell_pid = fields[2].to_string();
+                    true
+                }
+                _ => false,
+            }
+        },
+        "the session and its shell pid to appear in list",
+    );
+    let status = std::fs::read_to_string(format!("/proc/{shell_pid}/status")).unwrap();
+    let daemon_pid = status
+        .lines()
+        .find_map(|l| l.strip_prefix("PPid:"))
+        .map(str::trim)
+        .expect("the shell's PPid")
+        .to_string();
+
+    let held: Vec<String> = std::fs::read_dir(format!("/proc/{daemon_pid}/fd"))
+        .unwrap()
+        .flatten()
+        .filter_map(|e| std::fs::read_link(e.path()).ok())
+        .map(|p| p.display().to_string())
+        .collect();
+
+    let _ = posh(&dir, &["kill", "shed"]);
+    // SAFETY: closing the two fds pipe(2) gave us.
+    unsafe {
+        libc::close(pipe[0]);
+        libc::close(pipe[1]);
+    }
+    let _ = std::fs::remove_dir_all(&dir);
+    assert!(
+        !held.contains(&leaked),
+        "daemon {daemon_pid} still holds its creator's {leaked}: {held:?}"
+    );
+}
+
 #[test]
 fn daemon_lifecycle_create_list_kill() {
     let dir = test_dir("posh-itest");

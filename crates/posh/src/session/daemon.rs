@@ -110,6 +110,12 @@ pub fn ensure_session(
         std::thread::sleep(std::time::Duration::from_millis(10));
         return Ok(true);
     }
+    // Shed every descriptor the creator held (the mux spawn's rule,
+    // `remote/mux.rs`). A daemon outlives its creator, and its creator may
+    // be long-lived — the relay, `posh-server mux`, or (push-cmd) another
+    // daemon holding client sockets and a PTY master — so an inherited fd
+    // would pin that resource open and hide its EOF.
+    util::close_inherited_fds(&[listener.as_raw_fd()]);
     daemon_main(cfg, name, listener, command, kind);
 }
 
