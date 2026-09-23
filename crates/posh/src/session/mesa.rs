@@ -127,8 +127,8 @@ fn styled_row(s: &SessionEntry, current: Option<&str>, home: Option<&str>) -> Va
         (None, None) => json!(""),
     };
     let label = s.activity.clone().or_else(|| s.cmd.clone()).unwrap_or_default();
-    // `-` is echo_summary's "no client attached": nothing to add.
-    let activity = match s.echo.as_ref().filter(|e| *e != "-") {
+    // No client attached: nothing to add.
+    let activity = match s.echo.as_deref().filter(|e| *e != super::ECHO_NO_CLIENT) {
         Some(echo) if label.is_empty() => json!({"spans": [muted(format!("echo {echo}"))]}),
         Some(echo) => json!({"spans": [{"text": label}, muted(format!(" \u{b7} echo {echo}"))]}),
         None => json!(label),
@@ -177,7 +177,7 @@ fn status_cell(state: State, clients: Option<u64>, current: bool) -> Value {
 }
 
 /// [`status_cell`] plus, for a daemon on another build than this posh
-/// (posh#206), a dim `stale <sha>`: the terminal table shows the anomaly
+/// (posh#206), a dim `old build <sha>`: the terminal table shows the anomaly
 /// only, never the build of a current daemon.
 fn status_cell_with_build(state: State, clients: Option<u64>, current: bool, stale_build: Option<&str>) -> Value {
     let mut spans = vec![json!({"text": "\u{25cf}", "sev": state.sev()})];
@@ -187,7 +187,8 @@ fn status_cell_with_build(state: State, clients: Option<u64>, current: bool, sta
     if let Some(build) = stale_build {
         // `<version>+<sha>`: the sha is what tells two builds apart.
         let sha = build.rsplit_once('+').map_or(build, |(_, sha)| sha);
-        spans.push(json!({"text": format!(" stale {sha}"), "sev": "muted"}));
+        // Not "stale": the legend already uses that for a dead socket.
+        spans.push(json!({"text": format!(" old build {sha}"), "sev": "muted"}));
     }
     if current {
         spans.push(json!({"text": " (current)", "sev": "muted"}));
@@ -533,7 +534,7 @@ mod tests {
         let mut cur = entry("cur", 0);
         cur.build = Some("0.4.2+new".into());
         let records = styled(&[old, cur], None);
-        assert_eq!(text(&records[1]["cells"][1]), "\u{25cf} stale 0ld1234");
+        assert_eq!(text(&records[1]["cells"][1]), "\u{25cf} old build 0ld1234");
         assert_eq!(text(&records[2]["cells"][1]), "\u{25cf}");
     }
 

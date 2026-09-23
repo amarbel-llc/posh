@@ -235,7 +235,7 @@ Local persistence over Unix sockets.
 	List sessions in the group. When stdout is a terminal the default
 	output is a four-column table (posh#215): NAME (a dim _(anon)_ after
 	an anonymous session's name); STATUS (a state-colored dot — attached,
-	detached, or stale — then the attached client count, a dim _stale_
+	detached, or stale — then the attached client count, a dim _old build_
 	_<sha>_ when the session's daemon runs a different posh build than the
 	one listing it (a daemon keeps the code it was started with across
 	upgrades; restart the session to pick up the new build), and

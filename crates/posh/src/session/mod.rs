@@ -408,6 +408,9 @@ pub(crate) fn daemon_build(response: &str) -> Option<String> {
         .map(str::to_string)
 }
 
+/// [`echo_summary`]'s verdict when no client is attached.
+pub(crate) const ECHO_NO_CLIENT: &str = "-";
+
 /// Summarize a §4.2 status response for the `posh ls` ECHO column: the first
 /// client line's model, control, and rtt (`optimistic auto-escalated 412ms`),
 /// `unknown` for a client that reported nothing, `-` when no client is
@@ -418,7 +421,7 @@ pub(crate) fn echo_summary(response: &str) -> String {
         .filter(|l| l.starts_with("client "))
         .collect();
     let Some(first) = clients.first() else {
-        return "-".to_string();
+        return ECHO_NO_CLIENT.to_string();
     };
     let field = |key: &str| -> Option<&str> {
         first
@@ -583,15 +586,7 @@ fn scan_sessions(cfg: &Config) -> Result<Vec<SessionEntry>> {
             Err(e) => {
                 sessions.push(SessionEntry {
                     name,
-                    pid: None,
-                    clients: None,
                     error: Some(e.to_string()),
-                    cmd: None,
-                    cwd: None,
-                    cwd_now: None,
-                    activity: None,
-                    echo: None,
-                    kind: None,
                     ..Default::default()
                 });
                 cleanup_stale_socket(&path);

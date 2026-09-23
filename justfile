@@ -2152,8 +2152,9 @@ debug-posh-ls:
 # Why this exists: a long-lived daemon keeps running the code it was started
 # with, so one host routinely runs several builds at once while every one of
 # them reports the same POSH_VERSION — which is what makes "reproduces in this
-# viewport, not that one" hard to pin, and what posh#206's stale-daemon banner
-# is built on. Read-only; pair with debug-posh-procs.
+# viewport, not that one" hard to pin. `posh list` marks such a session with
+# "old build <sha>" (posh#206); this census also covers clients, mux daemons
+# and Architecture-A servers. Read-only; pair with debug-posh-procs.
 #
 # list every distinct posh build running on this host
 [group("debug")]
