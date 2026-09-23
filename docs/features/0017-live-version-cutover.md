@@ -38,12 +38,15 @@ from either end — this is the actuator half.
    since the posh#162 reconnect: kill one and the client-side mux daemon
    re-bootstraps it, spawning whatever binary is current on the remote. A
    cutover is one deliberate kill.
-3. **Client mux daemons** — partially covered by the `MUX_PROTO_STAMP`
-   variant-socket machinery: a new-generation invocation spawns the
-   `<key>.<ver>` socket and the old daemon drains (`mux ls` labels it
-   `old-generation`). But that fires only on a *protocol* stamp bump, not a
-   build change, and the old daemon drains only as its refs exit —
-   long-lived sessions pin it indefinitely.
+3. **Client mux daemons** — only the *first half* exists, the
+   `MUX_PROTO_STAMP` variant socket: on a protocol stamp bump a
+   new-generation invocation spawns `<key>.<ver>` and walks away from the
+   old daemon (`mux ls` labels it `old-generation`, a stamp comparison in
+   `probe_endpoint`, not a drain state). **Nothing drains it.**
+   `MuxConnState::Draining` is never assigned in production: the old daemon
+   keeps its refs and channels and exits only when its last ref does, so
+   long-lived sessions pin it indefinitely (posh#212). It fires on a
+   protocol bump only, never a build change.
 4. **Relay processes** (`posh relay`) — per-attach, die with their attach;
    they cut over with the client.
 5. **Roaming servers** (`remote/server.rs`) — own a PTY, a UDP socket, and
@@ -71,6 +74,17 @@ endpoints; the gaps are the *triggers*:
   spawns the variant socket and marks the old daemon draining, and a drain
   deadline (or an explicit `posh upgrade`) migrates pinned refs instead of
   waiting for them to exit.
+  - **Prerequisite: a drain that drains (posh#212).** The stamp case is
+    this mechanism's existing trigger, and it does not work: nothing marks
+    or winds down the superseded daemon. Fix it there first; the
+    build-generation trigger then reuses the same drain.
+  - **Open: the variant lifecycle.** Once the base key holds a
+    current-generation daemon again, nothing moves clients back off
+    `<key>.<ver>` or retires it (the second face of posh#212, observed
+    live as a `mux2-1` variant pinned at `refs=3` against an unknown
+    remote). A build-generation trigger makes variants per build, so this
+    stops being rare: the design must say how a variant becomes canonical
+    or goes away before this trigger ships.
 - The M2 session channels a mux daemon carries already survive a wire
   death+reconnect (posh#162); a deliberate daemon swap rides the same seam —
   the successor re-drives the OPENs and the remote session daemons see a
@@ -202,7 +216,7 @@ before the `posh upgrade` surface that drives it.
 | Phase 2 mechanism | sync-as-client + cutover kernel | reuses attach/frame/dump machinery; rejectable via plain detach | the observer-attach or verify seam proves harder than a bespoke handoff channel |
 | parentage sub-decision | undecided (exec-in-place vs reaper shim) | exec keeps parentage cleanly; the shim avoids exec's no-fallback flip | prototyping either |
 | Phase 2 sequencing | after FDR 0011 accepted | one PTY-owner class, no crypto in the handoff | FDR 0011 stalls while daemon staleness hurts in practice |
-| mux build-generation drain | not implemented | protocol stamp alone misses build-only changes | — |
+| mux build-generation drain | not implemented; blocked on posh#212 (the stamp drain it would reuse does not drain) | protocol stamp alone misses build-only changes | — |
 | auto-cutover | off (explicit verb only) | handoff must soak before it fires unattended | Phase 2 soak time with zero lost sessions |
 
 ## More Information
@@ -210,6 +224,8 @@ before the `posh upgrade` surface that drives it.
 - **posh#164** — the originating design issue this record promotes.
 - **posh#161 / posh#162** — the mux instrumentation and reconnect this
   builds on; #162 is the re-establish seam Phase 1 generalizes.
+- **posh#212** — the superseded mux daemon is never drained, and the
+  variant never retired: Phase 1's mux trigger is blocked on it.
 - **RFC 0013** (`docs/rfcs/0013-server-introspection-caps.md`) and
   **RFC 0014** (`docs/rfcs/0014-client-introspection-caps.md`) — the
   visibility layer: build idents on both ends, the staleness trigger.
