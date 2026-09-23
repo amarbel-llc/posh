@@ -231,26 +231,27 @@ Local persistence over Unix sockets.
 	consumer — it runs *start --detach --kind anonymous* over ssh with
 	the variable set, reads the name, then attaches.
 
-*list* [*--short*] [*-j*|*--json*] [*--complete*] [*-w*|*--watch* [*--interval* _N_]] (aliases: *ls*, *l*)
-	List sessions in the group: name, pid, attached client count.
-	When stdout is a terminal the default output is a styled table
-	with a state-colored status dot (attached, detached, or stale),
-	a KIND column (_anonymous_, _named_, or _system_ — see *start*;
-	empty for a daemon that predates the kind),
-	a CWD column (where the session is now — its shell's working
-	directory, resolved by the ADR 0008 cascade; empty for a daemon that
-	predates it), a STARTED IN column (where it was started), the
-	command of each session, and an ECHO
-	column condensing the first attached client's echo model, control,
-	and rtt from the session's status socket (see *status*; empty for a
-	daemon that predates RFC 0014); when
-	piped it is plain tab-separated lines, unchanged for scripts. The
-	mux endpoints have their own table, *mux ls*. *--short* prints names only; *--json*
+*list* [*--short*] [*-j*|*--json*] [*--complete*] [*-w*|*--watch* [*--interval* _N_]] [*--include-system-sessions*] (aliases: *ls*, *l*)
+	List sessions in the group. When stdout is a terminal the default
+	output is a four-column table (posh#215): NAME (a dim _(anon)_ after
+	an anonymous session's name); STATUS (a state-colored dot — attached,
+	detached, or stale — then the attached client count, and _(current)_
+	for the session you are in); CWD (where the session is now, resolved
+	by the ADR 0008 cascade, followed by a dim _← start dir_ only when it
+	has moved away from where it was started); and ACTIVITY (the RFC 0013
+	§5 activity label, else the launch command, followed by a dim _· echo_
+	summary of the first attached client's echo model, control, and rtt
+	when one reports it — see *status*). System sessions are left out of
+	that table unless *--include-system-sessions* is given. When piped,
+	the default output is instead one field per column, tab-separated,
+	for scripts: NAME, STATUS, PID, CLIENTS, KIND (_anonymous_, _named_,
+	_system_, or empty for a daemon that predates the kind), CWD, STARTED
+	IN, ACTIVITY, ECHO — system sessions included. The mux endpoints have
+	their own table, *mux ls*. *--short* prints names only; *--json*
 	prints a machine-readable array, each row carrying a _kind_ field
 	(_anonymous_, _named_, or _system_; omitted when unknown), _cwd_ (the
 	start directory) and _cwd_now_ (the current one; omitted when
-	unknown) — the piped lines carry the same pair as _started_in=_ and
-	_cwd_now=_; *--complete* prints
+	unknown); *--complete* prints
 	_name_<TAB>_summary_ lines (the RFC 0013 §5 activity label,
 	else the launch command) for shell completion — the *ph* fish
 	completion renders the summary as each candidate's description.

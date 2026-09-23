@@ -475,7 +475,9 @@ pub fn picker_entries_from_json(json: &str) -> Result<Vec<PickerEntry>> {
         .collect())
 }
 
-pub fn cmd_list(cfg: &Config, format: ListFormat) -> Result<()> {
+/// `posh list`. `include_system` re-admits system sessions to the terminal
+/// table (`--include-system-sessions`); every other format lists them anyway.
+pub fn cmd_list(cfg: &Config, format: ListFormat, include_system: bool) -> Result<()> {
     let current = std::env::var("POSH_SESSION").ok();
     let sessions = scan_sessions(cfg)?;
     match format {
@@ -486,8 +488,8 @@ pub fn cmd_list(cfg: &Config, format: ListFormat) -> Result<()> {
             Ok(())
         }
         ListFormat::Short => {
-            for s in &sessions {
-                print_session_line(s, format, current.as_deref());
+            for s in sessions.iter().filter(|s| s.error.is_none()) {
+                println!("{}", s.name);
             }
             Ok(())
         }
@@ -500,16 +502,16 @@ pub fn cmd_list(cfg: &Config, format: ListFormat) -> Result<()> {
             }
             Ok(())
         }
-        // The `mesa` renderer (purse-first, RFC 0003) auto-detects whether
-        // ITS (inherited) stdout is a terminal, so posh needs no tty branch
-        // of its own here — styled table or plain TAB-separated lines, both
-        // driven by the same NDJSON stream. --short/--json stay untouched
-        // (scripts and the completion probe parse those).
+        // The `mesa` renderer (purse-first, RFC 0003): a four-column table on
+        // a terminal, one field per column on a pipe (posh#215, mesa.rs).
+        // --short/--json stay untouched (scripts and the completion probe
+        // parse those).
         ListFormat::Default => mesa::render(
             &sessions,
             current.as_deref(),
             std::env::var("HOME").ok().as_deref(),
             &cfg.socket_dir,
+            include_system,
         ),
     }
 }
@@ -589,9 +591,10 @@ pub fn render_remote_list(
     dest: &str,
     json: &str,
     prefix: impl Fn(&str) -> String,
+    include_system: bool,
 ) -> Result<()> {
     let sessions = remote_entries(json, prefix)?;
-    mesa::render(&sessions, None, None, Path::new(dest))
+    mesa::render(&sessions, None, None, Path::new(dest), include_system)
 }
 
 /// Parse a remote `posh list --json` array into table entries — the pure,
@@ -712,46 +715,6 @@ fn completion_summary(s: &SessionEntry) -> String {
         .or(s.cmd.as_deref())
         .unwrap_or("")
         .replace(['\t', '\n', '\r'], " ")
-}
-
-fn print_session_line(s: &SessionEntry, format: ListFormat, current: Option<&str>) {
-    let prefix = match current {
-        Some(cur) if cur == s.name => "\u{2192} ",
-        Some(_) => "  ",
-        None => "",
-    };
-    if format == ListFormat::Short {
-        if s.error.is_none() {
-            println!("{}", s.name);
-        }
-        return;
-    }
-    if let Some(err) = &s.error {
-        println!(
-            "{prefix}session_name={}\tstatus={err}\t(cleaning up)",
-            s.name
-        );
-        return;
-    }
-    let mut line = format!(
-        "{prefix}session_name={}\tpid={}\tclients={}",
-        s.name,
-        s.pid.unwrap_or(0),
-        s.clients.unwrap_or(0)
-    );
-    if let Some(cwd) = &s.cwd {
-        line.push_str(&format!("\tstarted_in={cwd}"));
-    }
-    if let Some(cwd_now) = &s.cwd_now {
-        line.push_str(&format!("\tcwd_now={cwd_now}"));
-    }
-    if let Some(cmd) = &s.cmd {
-        line.push_str(&format!("\tcmd={cmd}"));
-    }
-    if let Some(echo) = &s.echo {
-        line.push_str(&format!("\techo={echo}"));
-    }
-    println!("{line}");
 }
 
 // ---------------------------------------------------------------------------

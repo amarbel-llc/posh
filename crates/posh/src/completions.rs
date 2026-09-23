@@ -107,7 +107,7 @@ _posh_completions() {
     case "$subcmd" in
       attach|a) flags="$flags --detach" ;;
       start|s) flags="$flags --detach --ephemeral" ;;
-      list|ls|l) flags="--short --json -j" ;;
+      list|ls|l) flags="--short --json -j --include-system-sessions" ;;
       history|hi) flags="--vt" ;;
       server) flags="-p -4 -6" ;;
       client) flags="-4 -6" ;;
@@ -163,7 +163,7 @@ _posh_completions() {
       COMPREPLY=($(compgen -W "bash zsh fish" -- "$cur"))
       ;;
     list|ls|l)
-      COMPREPLY=($(compgen -W "--short --json -j" -- "$cur"))
+      COMPREPLY=($(compgen -W "--short --json -j --include-system-sessions" -- "$cur"))
       ;;
     server)
       # Server verbs: new (default, mosh-server parity), relay (RFC 0008
@@ -243,7 +243,7 @@ const ZSH_COMPLETIONS: &str = r#"_posh() {
           _values 'shell' 'bash' 'zsh' 'fish'
           ;;
         list|ls|l)
-          _values 'options' '--short' '--json' '-j'
+          _values 'options' '--short' '--json' '-j' '--include-system-sessions'
           ;;
         server)
           # Server verbs: new (default), relay (RFC 0008), agent (FDR 0014

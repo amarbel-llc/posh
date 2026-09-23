@@ -224,7 +224,7 @@ fn run_once() -> Result<()> {
     let rest = &argv[i..];
 
     let Some(command) = rest.first() else {
-        return session::cmd_list(&Config::new(&group)?, ListFormat::Default);
+        return session::cmd_list(&Config::new(&group)?, ListFormat::Default, false);
     };
     let args = &rest[1..];
 
@@ -239,6 +239,8 @@ fn run_once() -> Result<()> {
         }
         "list" | "ls" | "l" => {
             let (format, watch, interval) = parse_list_args(args)?;
+            // posh#215: the terminal table hides system sessions unless asked.
+            let include_system = args.iter().any(|a| a == "--include-system-sessions");
             // `posh list box:` — remote listing through the namespace
             // (RFC 0001 §1): a trailing-colon host queries the host over
             // ssh and renders through the SAME mesa table as the local
@@ -254,17 +256,16 @@ fn run_once() -> Result<()> {
                                 "--watch is local-only (drop the host: target)",
                             ));
                         }
-                        return cmd_list_remote(user, host, &group, format);
+                        return cmd_list_remote(user, host, &group, format, include_system);
                     }
                 }
             }
             if watch {
-                return cmd_list_watch(&group, interval);
+                return cmd_list_watch(&group, interval, include_system);
             }
             // Sessions only: the mux endpoints have their own table
-            // (`posh mux ls`), so the listing is the same shape on a
-            // terminal and on a pipe.
-            session::cmd_list(&Config::new(&group)?, format)
+            // (`posh mux ls`).
+            session::cmd_list(&Config::new(&group)?, format, include_system)
         }
         // `posh status [session]` (RFC 0014 §4.3): the session's status
         // socket — daemon build, gates, and every attached client's echo
@@ -1677,6 +1678,7 @@ fn cmd_list_remote(
     host: String,
     group: &str,
     format: ListFormat,
+    include_system: bool,
 ) -> Result<()> {
     let prefix = ph_dest(user.as_deref(), &host);
     match format {
@@ -1705,9 +1707,12 @@ fn cmd_list_remote(
         }
         ListFormat::Default => {
             let json = remote_list_output(user.as_deref(), &host, group, "--json")?;
-            session::render_remote_list(&format!("{prefix}:"), &json, |name| {
-                remote_list_line(&prefix, group, name)
-            })
+            session::render_remote_list(
+                &format!("{prefix}:"),
+                &json,
+                |name| remote_list_line(&prefix, group, name),
+                include_system,
+            )
         }
     }
 }
@@ -1896,26 +1901,26 @@ fn parse_list_args(args: &[String]) -> Result<(ListFormat, bool, u64)> {
 /// Ctrl-C quits, `r` refreshes immediately; a resize is picked up on the
 /// next render (the table reads the width each pass). Cbreak, not raw:
 /// per-key input while the renderers' plain `\n` output stays intact.
-fn cmd_list_watch(group: &str, interval_secs: u64) -> Result<()> {
+fn cmd_list_watch(group: &str, interval_secs: u64, include_system: bool) -> Result<()> {
     if !util::is_tty(libc::STDOUT_FILENO) || !util::is_tty(libc::STDIN_FILENO) {
         return Err(Error::from("--watch needs a terminal"));
     }
     let cfg = Config::new(group)?;
     let cbreak = pty::CbreakMode::enable(libc::STDIN_FILENO)?;
     let _ = util::write_all_retry(libc::STDOUT_FILENO, &remote::display::open(), 1000);
-    let result = list_watch_loop(&cfg, interval_secs);
+    let result = list_watch_loop(&cfg, interval_secs, include_system);
     let _ = util::write_all_retry(libc::STDOUT_FILENO, &remote::display::close(), 1000);
     drop(cbreak);
     result
 }
 
-fn list_watch_loop(cfg: &Config, interval_secs: u64) -> Result<()> {
+fn list_watch_loop(cfg: &Config, interval_secs: u64, include_system: bool) -> Result<()> {
     use std::io::{Read as _, Write as _};
     loop {
         // Clear + home; the one-shot renderers then print into the alt
         // screen exactly as they would to a fresh terminal.
         print!("\x1b[2J\x1b[H");
-        session::cmd_list(cfg, ListFormat::Default)?;
+        session::cmd_list(cfg, ListFormat::Default, include_system)?;
         print!("\n[watch: q quit, r refresh, every {interval_secs}s]");
         std::io::stdout().flush().ok();
 
@@ -2081,10 +2086,12 @@ SESSION COMMANDS (local persistence)
         --ephemeral (first arg), a non-durable throwaway roaming shell
         instead — see REMOTE COMMANDS below.
 
-    list [--short] [-j|--json] [-w|--watch [--interval N]]  (aliases: ls, l)
-        List sessions in the group: name, pid, attached client count.
-        A styled status table on a terminal; plain tab-separated lines
-        when piped (mux endpoints have their own table: mux ls).
+    list [--short] [-j|--json] [-w|--watch [--interval N]] [--include-system-sessions]  (aliases: ls, l)
+        List sessions in the group. On a terminal: NAME, STATUS (dot +
+        attached client count), CWD (← start dir when moved), ACTIVITY
+        (· echo summary); system sessions only with
+        --include-system-sessions. Piped: one field per column, every
+        session (mux endpoints have their own table: mux ls).
         --short prints names only; --json prints a
         machine-readable array; --complete prints `name<TAB>summary`
         lines (the RFC 0013 activity label, else the launch command) for
