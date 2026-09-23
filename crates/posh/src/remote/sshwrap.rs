@@ -1259,7 +1259,7 @@ mod tests {
     #[test]
     fn remote_session_attach_composition_quotes_inner_argv() {
         // RFC 0001 §2: `posh host:grp/my dev` rides as the server's
-        // command, every element shell-quoted (lossless argv, as in fork).
+        // command, every element shell-quoted (lossless argv).
         let opts = SshOptions {
             family: Family::Auto,
             port_range: None,

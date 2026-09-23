@@ -276,8 +276,6 @@ func TestDescriptionRendersBetweenTitleAndInput(t *testing.T) {
 	}
 }
 
-// Without a description the layout is what it was: the filter input sits on
-// the line right after the heading, no block in between.
 // posh#216: the empty filter shows the whole placeholder, not just its first
 // rune — bubbles' textinput cuts the placeholder to Width()+1 runes, so an
 // input left at width 0 rendered "/ T".
@@ -295,6 +293,8 @@ func TestEmptyFilterShowsTheWholePlaceholder(t *testing.T) {
 	}
 }
 
+// Without a description the layout is what it was: the filter input sits on
+// the line right after the heading, no block in between.
 func TestNoDescriptionKeepsInputUnderTitle(t *testing.T) {
 	for _, view := range []string{"palette", "picker"} {
 		updated, _ := newModel(&conn{}).Update(showMsg{View: view, Title: "Leaving"})

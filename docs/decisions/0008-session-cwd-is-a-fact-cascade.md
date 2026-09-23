@@ -68,7 +68,7 @@ available *and names an existing directory* wins:
 
 There is exactly **one implementation** — a `session_cwd` that returns the
 path **and the step that produced it**. Every consumer calls it: push-cmd,
-`posh list`, whatever replaces `posh fork`, and the FDR 0008 overlay for as
+`posh list`, `posh start -- <cmd>` (which replaced `posh fork`, FDR 0020), and the FDR 0008 overlay for as
 long as it survives. The daemon owns steps 2–4 (it holds the child pid, the
 terminal model, and its start directory), so the implementation lives with it;
 a consumer outside the daemon reads the result through `Tag::Info`. As built

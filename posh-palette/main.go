@@ -486,11 +486,11 @@ func (m model) pickerView() string {
 		panelWidth = m.width - 4
 	}
 	panelWidth = max(min(panelWidth, 120), 30)
-	b.WriteString(m.inputView(panelWidth - paletteChromeWidth))
+	content := panelWidth - dialogStyle.GetHorizontalFrameSize()
+	b.WriteString(m.inputView(content))
 	b.WriteString("\n\n")
-	// dialogStyle's Padding(1, 2) + the double border: 6 columns of chrome;
-	// the "› " marker takes two more.
-	lineWidth := panelWidth - 8
+	// The "› " marker takes two columns of the content width.
+	lineWidth := content - 2
 	if len(m.filteredRows) == 0 {
 		b.WriteString(dimStyle.Render(m.empty))
 		b.WriteByte('\n')
@@ -657,16 +657,12 @@ func (m model) inputView(content int) string {
 	return in.View()
 }
 
-// paletteChromeWidth is panelStyle's border + horizontal padding: its fixed
-// Width(46) leaves 40 columns of content.
-const paletteChromeWidth = 6
-
 func (m model) paletteView() string {
 	var b strings.Builder
 	b.WriteString(titleStyle.Render(m.title))
 	b.WriteByte('\n')
 	m.writeDescription(&b)
-	b.WriteString(m.inputView(panelStyle.GetWidth() - paletteChromeWidth))
+	b.WriteString(m.inputView(panelStyle.GetWidth() - panelStyle.GetHorizontalFrameSize()))
 	b.WriteString("\n\n")
 	if len(m.filtered) == 0 {
 		b.WriteString(dimStyle.Render("(no matches)"))
