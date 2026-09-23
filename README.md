@@ -112,7 +112,6 @@ originals.
 posh attach <name> [command...]    # or bare: posh <name>; detach: Ctrl-\
 posh list [--short|--json]
 posh run <name> [--] <command...>
-posh fork [<name>]                 # fork current session (same cmd + cwd)
 posh detach [<name>] | detach-all
 posh kill <name>
 posh groups

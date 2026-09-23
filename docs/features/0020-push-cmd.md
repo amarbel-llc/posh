@@ -63,9 +63,9 @@ Both entry points:
 - **Environment:** an ordinary session — `POSH_SESSION`, `POSH_GROUP`, `TERM`,
   and the forwarded agent socket its creator was born with.
 
-`posh fork` is to be removed (plan Task 10, its own commit after the rest of
-push-cmd lands): `posh start -- <cmd>` covers it, in the directory the user is
-actually in.
+`posh fork` is removed (its own commit, after the rest of push-cmd landed):
+`posh start -- <cmd>` covers it, in the directory the user is actually in, and
+`posh fork` / `posh f` exit with an error naming that replacement.
 
 ## Examples
 
@@ -124,7 +124,7 @@ re-litigated):
   `posh list` like any other.
 - **The parent keeps running** while you are in the pushed session and can end
   meanwhile; the pop then cascades past it and reports it `gone`.
-- **`posh fork`'s removal will be a CLI break.** Its two behaviors that are not
+- **`posh fork`'s removal is a CLI break.** Its two behaviors that are not
   carried over: cloning the source's *command* (name it explicitly) and the
   `<source>-N` Named naming (push-cmd sessions are auto-id anonymous).
 
@@ -138,7 +138,7 @@ CLI entry point is pre-existing behavior.
 ## More Information
 
 - Supersedes FDR 0008 where offered (FDR 0008 remains the fallback until
-  posh#213), and — once Task 10 lands — `posh fork`.
+  posh#213), and `posh fork`.
 - Wire: RFC 0016. Directory: ADR 0008. Re-home: RFC 0008 §3.1 / FDR 0012.
   Stack, pop and notice: FDR 0016, RFC 0005 §3.6. Activity label: RFC 0013 §5.
 - Implementation plan: `docs/plans/2026-09-23-push-cmd.md`.

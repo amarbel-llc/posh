@@ -77,7 +77,7 @@ _posh_completions() {
   cur="${COMP_WORDS[COMP_CWORD]}"
   prev="${COMP_WORDS[COMP_CWORD-1]}"
 
-  local commands="attach start run detach detach-all fork groups tailnet list completions kill history server client mux version help"
+  local commands="attach start run detach detach-all groups tailnet list completions kill history server client mux version help"
 
   # Handle -g/--group flag
   if [[ "$prev" == "-g" || "$prev" == "--group" ]]; then
@@ -213,7 +213,6 @@ const ZSH_COMPLETIONS: &str = r#"_posh() {
         'run:Send command without attaching'
         'detach:Detach all clients from current or named session'
         'detach-all:Detach all clients from all sessions in the group'
-        'fork:Fork current session with same command'
         'groups:List active session groups'
         'tailnet:List reachable Tailscale peer names'
         'list:List active sessions in group'
@@ -470,7 +469,7 @@ end
 
 complete -c posh -f
 
-set -l subcommands attach start run detach detach-all fork groups tailnet list completions kill history server client mux version help
+set -l subcommands attach start run detach detach-all groups tailnet list completions kill history server client mux version help
 set -l no_subcmd "not __fish_seen_subcommand_from $subcommands"
 
 complete -c posh -n $no_subcmd -s g -l group -d 'Session group' -r -a '(posh groups 2>/dev/null)'
@@ -480,7 +479,6 @@ complete -c posh -n $no_subcmd -a start -d 'Create a durable session and attach'
 complete -c posh -n $no_subcmd -a run -d 'Send command without attaching'
 complete -c posh -n $no_subcmd -a detach -d 'Detach all clients from current or named session'
 complete -c posh -n $no_subcmd -a detach-all -d 'Detach all clients from all sessions in the group'
-complete -c posh -n $no_subcmd -a fork -d 'Fork current session with same command'
 complete -c posh -n $no_subcmd -a groups -d 'List active session groups'
 complete -c posh -n $no_subcmd -a tailnet -d 'List reachable Tailscale peer names'
 complete -c posh -n $no_subcmd -a list -d 'List active sessions in group'
@@ -711,7 +709,6 @@ mod tests {
         "run",
         "detach",
         "detach-all",
-        "fork",
         "groups",
         "tailnet",
         "list",

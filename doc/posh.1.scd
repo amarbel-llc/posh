@@ -275,10 +275,10 @@ Local persistence over Unix sockets.
 	attaching. Reads the command from stdin when no arguments are
 	given.
 
-*fork* [_name_] (alias: *f*)
-	Fork the current session (_$POSH_SESSION_) into a new detached
-	session with the same command and working directory. Without a
-	name, the first free _<current>-N_ is used.
+*fork* (alias: *f*)
+	Retired (FDR 0020): exits with an error naming the replacement.
+	Inside a session, *posh start --* _command_ runs _command_ as a new
+	session in your directory and pushes the viewport onto it.
 
 *detach* [_name_] (alias: *d*)
 	Detach all clients from the named session, or from the current
@@ -442,7 +442,8 @@ _POSH_GROUP_
 	Default session group (overridden by *-g*).
 
 _POSH_SESSION_
-	Set inside a session to its name; read by *fork* and *detach*.
+	Set inside a session to its name; read by *detach* and an
+	in-session *start* / *attach*.
 
 _POSH_KEY_
 	Remote session key, read by *posh client* (never passed on the

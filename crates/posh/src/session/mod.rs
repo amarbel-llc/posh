@@ -919,55 +919,10 @@ pub fn cmd_run(cfg: &Config, name: &str, args: &[String]) -> Result<()> {
 }
 
 // ---------------------------------------------------------------------------
-// fork / groups / history (zmx parity)
+// auto-ids / groups / history
 
-/// `posh fork [name]`: clone the current session's command and working
-/// directory into a new detached session. Without a name, the first free
-/// "<current>-N" is used.
-pub fn cmd_fork(cfg: &Config, target: Option<&str>) -> Result<()> {
-    let source = std::env::var("POSH_SESSION").map_err(|_| {
-        Error::from("POSH_SESSION env var not found: are you inside a posh session?")
-    })?;
-
-    // Probe the source session for its command and cwd.
-    let source_path = cfg.socket_path(&source)?;
-    let probe = match probe_session(&source_path) {
-        Ok(p) => p,
-        Err(e) => {
-            cleanup_stale_socket(&source_path);
-            return Err(Error::Msg(format!("source session unresponsive: {e}")));
-        }
-    };
-    let info = probe.info;
-    drop(probe.stream);
-
-    let target_name = match target {
-        Some(name) => name.to_string(),
-        None => next_fork_name(cfg, &source)?,
-    };
-    let target_path = cfg.socket_path(&target_name)?;
-    if session_socket_exists(&target_path) {
-        return Err(Error::Msg(format!("session already exists: {target_name}")));
-    }
-
-    let args = info.cmd_argv();
-    let command = (!args.is_empty()).then_some(args);
-
-    // chdir so the new daemon inherits the source session's cwd.
-    if !info.cwd.is_empty() {
-        if let Err(e) = std::env::set_current_dir(&info.cwd) {
-            util::log_write("warn", &format!("could not chdir to {}: {e}", info.cwd));
-        }
-    }
-
-    let created = daemon::ensure_session(cfg, &target_name, command, SessionKind::Named)?;
-    if created {
-        println!("forked session \"{source}\" into \"{target_name}\"");
-    }
-    Ok(())
-}
-
-fn next_fork_name(cfg: &Config, base: &str) -> Result<String> {
+/// The first free `<base>-N` session name in `cfg`'s group.
+fn next_free_name(cfg: &Config, base: &str) -> Result<String> {
     for i in 1..1000u32 {
         let candidate = format!("{base}-{i}");
         let Ok(path) = cfg.socket_path(&candidate) else {
@@ -985,10 +940,9 @@ fn next_fork_name(cfg: &Config, base: &str) -> Result<String> {
 /// label, not this key (FDR 0015).
 pub(crate) const AUTOID_BASE: &str = "s";
 
-/// The next free auto-id session name (first unoccupied `s-N` slot), reusing the
-/// same free-slot search as [`next_fork_name`].
+/// The next free auto-id session name (first unoccupied `s-N` slot).
 pub(crate) fn next_autoid(cfg: &Config) -> Result<String> {
-    next_fork_name(cfg, AUTOID_BASE)
+    next_free_name(cfg, AUTOID_BASE)
 }
 
 /// `posh groups`: list groups (socket-base subdirectories with at least one

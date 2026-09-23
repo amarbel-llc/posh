@@ -1137,8 +1137,8 @@ fn daemon_main(
 
     let mut term = Terminal::with_scrollback(rows, cols, SCROLLBACK);
     let mut clients: Vec<ClientConn> = Vec::new();
-    // Join argv with NUL (not spaces) so `posh fork` can recover arguments
-    // that contain spaces losslessly. github #18.
+    // Join argv with NUL (not spaces): the Tag::Info wire form, lossless for
+    // arguments that contain spaces. github #18.
     let info_cmd = command.as_ref().map(|c| c.join("\0")).unwrap_or_default();
 
     // Optional `.castx` recording (posh --record FILE). Best-effort: a failure

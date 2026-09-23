@@ -289,6 +289,24 @@ fn an_idle_sessions_replay_frame_answers_the_attach_requests() {
     assert!(bridged_offer, "a ClientCaps request on an idle session is answered");
 }
 
+/// FDR 0020: `posh fork` is retired in favor of push-cmd. Muscle memory gets
+/// the replacement, not an unknown-command error.
+#[test]
+fn fork_is_retired_and_names_its_replacement() {
+    let dir = test_dir("posh-fork-retired");
+    std::fs::create_dir_all(&dir).unwrap();
+    for spelling in ["fork", "f"] {
+        let out = posh(&dir, &[spelling]);
+        assert!(!out.status.success(), "`posh {spelling}` must fail: {out:?}");
+        let stderr = String::from_utf8_lossy(&out.stderr);
+        assert!(
+            stderr.contains("fork was removed; use 'posh start -- <cmd>' inside the session (FDR 0020)"),
+            "`posh {spelling}` stderr: {stderr}"
+        );
+    }
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
 #[test]
 fn daemon_lifecycle_create_list_kill() {
     let dir = test_dir("posh-itest");

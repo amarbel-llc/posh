@@ -317,7 +317,11 @@ fn run_once() -> Result<()> {
             }
             session::cmd_run(&Config::new(&group)?, name, cmd_args)
         }
-        "fork" | "f" => session::cmd_fork(&Config::new(&group)?, args.first().map(|s| s.as_str())),
+        // FDR 0020: retired — name the replacement rather than fall through
+        // to an unknown-command error, so muscle memory gets an answer.
+        "fork" | "f" => Err(Error::from(
+            "fork was removed; use 'posh start -- <cmd>' inside the session (FDR 0020)",
+        )),
         "groups" | "gs" => session::cmd_groups(),
         // Tailnet peer names (MagicDNS), one per line — the completion source
         // for tab-completing tailscale hosts; empty/silent without tailscale.
@@ -2096,11 +2100,6 @@ SESSION COMMANDS (local persistence)
         Send a command to a session (created if needed) without attaching.
         Reads the command from stdin when no arguments are given.
 
-    fork [<name>]                              (alias: f)
-        Fork the current session ($POSH_SESSION) into a new detached
-        session with the same command and working directory. Without a
-        name, the first free \"<current>-N\" is used.
-
     detach [<name>]                            (alias: d)
         Detach all clients from the named session, or from the current
         session ($POSH_SESSION) when no name is given.
@@ -2989,7 +2988,6 @@ mod tests {
             "start",
             "list",
             "run",
-            "fork",
             "detach",
             "detach-all",
             "status",
