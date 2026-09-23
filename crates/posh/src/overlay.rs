@@ -23,10 +23,20 @@ pub(crate) struct Overlay {
 /// `$POSH_ESCAPE_CMD` parsed into argv (whitespace-split; `sc exec` and most
 /// commands need nothing fancier). `None` (unset/blank) means spawn `$SHELL` as
 /// a login shell — the same default as the session shell.
+///
+/// Unit tests get a plain `sh` instead: a test must not run whatever the
+/// developer configured. posh#203 was exactly that — an ambient
+/// `POSH_ESCAPE_CMD='sc exec'` made the overlay a wrapper whose inner shell,
+/// under load, missed the test's `exit` and never ended.
 pub(crate) fn escape_command() -> Option<Vec<String>> {
-    std::env::var("POSH_ESCAPE_CMD")
-        .ok()
-        .filter(|s| !s.trim().is_empty())
+    #[cfg(test)]
+    return Some(vec!["sh".to_string()]);
+    #[cfg(not(test))]
+    parse_escape_command(std::env::var("POSH_ESCAPE_CMD").ok().as_deref())
+}
+
+fn parse_escape_command(raw: Option<&str>) -> Option<Vec<String>> {
+    raw.filter(|s| !s.trim().is_empty())
         .map(|s| s.split_whitespace().map(str::to_string).collect())
 }
 
@@ -37,5 +47,25 @@ pub(crate) fn close_overlay(overlay: &mut Option<Overlay>) {
         util::kill_pgroup(o.child.pid, libc::SIGHUP);
         let _ = util::try_reap(o.child.pid);
         util::close_fd(o.child.master);
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn escape_command_is_whitespace_split_and_blank_means_the_login_shell() {
+        let argv = |v: &[&str]| Some(v.iter().map(|s| s.to_string()).collect::<Vec<_>>());
+        assert_eq!(parse_escape_command(Some("sc exec")), argv(&["sc", "exec"]));
+        assert_eq!(parse_escape_command(Some("  nvim   -R  ")), argv(&["nvim", "-R"]));
+        assert_eq!(parse_escape_command(Some("   ")), None);
+        assert_eq!(parse_escape_command(None), None);
+    }
+
+    /// posh#203: tests never run the developer's configured command.
+    #[test]
+    fn unit_tests_ignore_the_ambient_escape_command() {
+        assert_eq!(escape_command(), Some(vec!["sh".to_string()]));
     }
 }

@@ -3423,6 +3423,61 @@ mod tests {
         server.join().unwrap();
     }
 
+    /// posh#203 diagnostics: every descendant of this test process, with its
+    /// state, command, and the terminals it holds — so a failure says whether
+    /// the overlay shell is still alive or something else pins its PTY.
+    // macOS gap (posh#214): reads /proc; elsewhere it reports nothing.
+    fn descendant_ptys() -> String {
+        #[cfg(target_os = "linux")]
+        {
+            let me = std::process::id().to_string();
+            let mut out = String::new();
+            let Ok(procs) = std::fs::read_dir("/proc") else { return out };
+            let ppid_of = |pid: &str| -> Option<String> {
+                let s = std::fs::read_to_string(format!("/proc/{pid}/stat")).ok()?;
+                s.rsplit(')').next()?.split_whitespace().nth(1).map(str::to_string)
+            };
+            for p in procs.flatten() {
+                let pid = p.file_name().to_string_lossy().into_owned();
+                if !pid.bytes().all(|b| b.is_ascii_digit()) {
+                    continue;
+                }
+                // Walk up to see whether this process descends from us.
+                let (mut cur, mut hops) = (pid.clone(), 0);
+                while cur != me && cur != "0" && cur != "1" && hops < 16 {
+                    match ppid_of(&cur) {
+                        Some(pp) => cur = pp,
+                        None => break,
+                    }
+                    hops += 1;
+                }
+                if cur != me || pid == me {
+                    continue;
+                }
+                let stat = std::fs::read_to_string(format!("/proc/{pid}/stat")).unwrap_or_default();
+                let cmd = std::fs::read(format!("/proc/{pid}/cmdline"))
+                    .map(|b| String::from_utf8_lossy(&b).replace('\0', " "))
+                    .unwrap_or_default();
+                let ttys: Vec<String> = std::fs::read_dir(format!("/proc/{pid}/fd"))
+                    .map(|fds| {
+                        fds.flatten()
+                            .filter_map(|e| {
+                                let t = std::fs::read_link(e.path()).ok()?.display().to_string();
+                                (t.starts_with("/dev/pts") || t.contains("ptmx"))
+                                    .then(|| format!("{}->{t}", e.file_name().to_string_lossy()))
+                            })
+                            .collect()
+                    })
+                    .unwrap_or_default();
+                let state = stat.rsplit(')').next().and_then(|s| s.split_whitespace().next()).unwrap_or("?");
+                out.push_str(&format!("  pid={pid} state={state} cmd={cmd:?} ttys={ttys:?}\n"));
+            }
+            out
+        }
+        #[cfg(not(target_os = "linux"))]
+        String::new()
+    }
+
     #[test]
     fn escape_flag_spawns_and_tears_down_a_shell_overlay() {
         // FDR 0008: CLIENT_FLAG_ESCAPE makes the server spawn a shell overlay
@@ -3514,7 +3569,12 @@ mod tests {
         }
 
         assert!(saw_overlay, "never saw FLAG_OVERLAY after CLIENT_FLAG_ESCAPE");
-        assert!(overlay_cleared, "overlay never closed after `exit`");
+        assert!(
+            overlay_cleared,
+            "overlay never closed after `exit` (posh#203); SHELL={:?}, descendants:\n{}",
+            std::env::var("SHELL"),
+            descendant_ptys()
+        );
         assert!(saw_shutdown, "server never wound down");
         server.join().unwrap();
     }

@@ -120,6 +120,17 @@ pub struct PtyChild {
     pub pid: libc::pid_t,
 }
 
+/// Mark `fds` close-on-exec. Every descriptor a spawner creates gets this, so
+/// none rides into a child some OTHER thread execs meanwhile (posh#203: a
+/// leaked slave keeps its master from ever seeing EOF). Our own child is
+/// unaffected: `dup2` onto its stdio clears the flag on the copy.
+fn set_cloexec(fds: &[libc::c_int]) {
+    for &fd in fds {
+        // SAFETY: fcntl on integer fds; a bad fd is a harmless EBADF.
+        unsafe { libc::fcntl(fd, libc::F_SETFD, libc::FD_CLOEXEC) };
+    }
+}
+
 /// Opens a PTY and forks; the child becomes session leader on the slave side
 /// and execs `command` (or, when None, `$SHELL` as a login shell with a
 /// "-"-prefixed argv[0], the traditional signal). `extra_env` entries are
@@ -178,6 +189,7 @@ pub fn spawn_shell(
         {
             return Err(std::io::Error::last_os_error().into());
         }
+        set_cloexec(&[master, slave]);
         // Exec-failure report (posh#200): a close-on-exec pipe the child writes
         // its errno to if execvp returns. A successful exec closes it, so the
         // parent's read yields nothing on success and the errno on failure —
@@ -305,6 +317,7 @@ pub fn spawn_with_control(bin: &CString, rows: u16, cols: u16) -> Result<PtyCont
             libc::close(child_ctrl);
             return Err(e.into());
         }
+        set_cloexec(&[master, slave, host_ctrl, child_ctrl]);
         // posh drives this PTY as the terminal (palette renderer): present a
         // no-echo, non-canonical INPUT discipline so a master write can't echo
         // back into posh's model or line-buffer. Output processing stays intact.
@@ -332,6 +345,9 @@ pub fn spawn_with_control(bin: &CString, rows: u16, cols: u16) -> Result<PtyCont
             if child_ctrl != 3 {
                 libc::dup2(child_ctrl, 3);
                 libc::close(child_ctrl);
+            } else {
+                // Already at 3, so no dup2 cleared the close-on-exec flag.
+                libc::fcntl(3, libc::F_SETFD, 0);
             }
             // Close the redundant slave ref unless it is now stdio or the
             // control fd (slave == 3 means dup2 above already repurposed it).
@@ -402,6 +418,7 @@ pub fn spawn_capture(bin: &CString, rows: u16, cols: u16) -> Result<PtyCaptureCh
             libc::close(host_stdin);
             return Err(e.into());
         }
+        set_cloexec(&[master, slave, host_stdin, child_stdin]);
         // posh drives this PTY as the terminal (crap-present modal): present a
         // no-echo, non-canonical INPUT discipline so a master write (a query
         // answer) can't echo back into posh's model or line-buffer. crap-present
@@ -614,6 +631,20 @@ mod tests {
             assert_eq!(libc::tcgetattr(s, &mut r), 0);
             assert_ne!(r.c_lflag & libc::ICANON, 0, "drop restores the termios");
         }
+    }
+
+    /// posh#203: the host keeps a spawned PTY's master for the child's life;
+    /// it must not ride into every OTHER child this process execs (a test run
+    /// found `sleep 600` children holding dozens of sibling PTYs), where a
+    /// leaked slave would keep that PTY's master from ever seeing EOF.
+    #[test]
+    fn spawn_shell_keeps_its_master_out_of_other_execs() {
+        let cmd: Vec<String> = vec!["sh".into(), "-c".into(), "exit 0".into()];
+        let child = spawn_shell(Some(&cmd), 24, 80, &[], None).unwrap();
+        let flags = unsafe { libc::fcntl(child.master, libc::F_GETFD) };
+        let _ = crate::util::try_reap(child.pid);
+        crate::util::close_fd(child.master);
+        assert_ne!(flags & libc::FD_CLOEXEC, 0, "master is close-on-exec");
     }
 
     /// ADR 0008 step 2: the kernel's cwd of a live process — this one — is
