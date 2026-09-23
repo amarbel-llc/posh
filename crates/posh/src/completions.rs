@@ -525,6 +525,7 @@ complete -c posh -n "__fish_seen_subcommand_from list" -l short -d 'Short output
 complete -c posh -n "__fish_seen_subcommand_from list" -l json -s j -d 'JSON output'
 complete -c posh -n "__fish_seen_subcommand_from list" -l watch -s w -d 'Live-refresh the session table'
 complete -c posh -n "__fish_seen_subcommand_from list" -l interval -d 'Watch refresh seconds' -r
+complete -c posh -n "__fish_seen_subcommand_from list" -l include-system-sessions -d 'Show system sessions in the table'
 complete -c posh -n "__fish_seen_subcommand_from history" -l vt -d 'VT escape stream output'
 "#;
 

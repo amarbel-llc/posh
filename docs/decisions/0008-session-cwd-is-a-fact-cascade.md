@@ -89,7 +89,8 @@ The step that won is logged when a session is created from it, and shown by
 * Good, because provenance makes the fallback steps visible instead of silent.
 * Bad, because `Tag::Info` grows a second directory. As implemented
   (2026-09-23), `cwd` keeps its start-directory meaning — `posh list`'s
-  STARTED-IN column, `--json` `cwd` and `started_in=` rely on it — and the
+  piped STARTED IN column, its terminal table's `← start` marker, and
+  `--json` `cwd` rely on it — and the
   cascade's answer rides an appended `cwd_now` field (directory + source
   byte), absent from an older daemon. The status socket (RFC 0014 §4.2)
   reports it as `cwd=`/`cwd_source=`. Two fields that both say "cwd" invite

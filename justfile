@@ -2098,7 +2098,7 @@ debug-posh-backlog-cleanup:
 # Render the styled `posh list` table (the sc-list-style TTY default) against
 # throwaway sessions in an isolated POSH_DIR, under a fake TTY (util-linux
 # `script`) so the pretty path triggers headlessly. Visual dev-loop check for
-# the table renderer; the geometry is unit-tested in session/list_table.rs.
+# the table renderer; both table shapes are unit-tested in session/mesa.rs.
 #
 # render the styled posh list table under a fake TTY
 [group("debug")]

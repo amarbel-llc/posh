@@ -11,6 +11,7 @@ use std::io::Write;
 use std::path::Path;
 use std::process::{Command, Stdio};
 
+use posh_proto::caps::SessionKind;
 use serde_json::{json, Value};
 
 use super::SessionEntry;
@@ -104,7 +105,7 @@ fn styled_header(socket_dir: &Path) -> Value {
 /// A stale session's error takes the ACTIVITY cell, as in the plain table.
 fn styled_row(s: &SessionEntry, current: Option<&str>, home: Option<&str>) -> Value {
     let muted = |t: String| json!({"text": t, "sev": "muted"});
-    let name = if s.kind == Some(posh_proto::caps::SessionKind::Anonymous) {
+    let name = if s.kind == Some(SessionKind::Anonymous) {
         json!({"spans": [{"text": s.name}, muted(" (anon)".into())]})
     } else {
         json!(s.name)
@@ -113,7 +114,7 @@ fn styled_row(s: &SessionEntry, current: Option<&str>, home: Option<&str>) -> Va
     if let Some(err) = &s.error {
         return json!({"cells": [name, status_cell(state, None, false), "", {"spans": [muted(format!("{err} (cleaning up)"))]}]});
     }
-    let attached = s.clients.filter(|&n| n > 0 && state == State::Attached);
+    let attached = s.clients.filter(|_| state == State::Attached);
     let status = status_cell(state, attached, current == Some(s.name.as_str()));
     let start = s.cwd.as_deref().map(|d| abbrev_home(d, home));
     let now = s.cwd_now.as_deref().map(|d| abbrev_home(d, home));
@@ -138,7 +139,7 @@ fn styled_row(s: &SessionEntry, current: Option<&str>, home: Option<&str>) -> Va
 fn shown(sessions: &[SessionEntry], styled: bool, include_system: bool) -> Vec<&SessionEntry> {
     sessions
         .iter()
-        .filter(|s| !styled || include_system || s.kind != Some(posh_proto::caps::SessionKind::System))
+        .filter(|s| !styled || include_system || s.kind != Some(SessionKind::System))
         .collect()
 }
 
@@ -287,7 +288,6 @@ pub(super) fn empty_message(socket_dir: &Path) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use posh_proto::caps::SessionKind;
 
     fn entry(name: &str, clients: u64) -> SessionEntry {
         SessionEntry {
