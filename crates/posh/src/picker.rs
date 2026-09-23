@@ -145,6 +145,9 @@ pub fn default_group() -> String {
 pub struct StackEntry {
     pub target: String,
     pub kind: SessionKind,
+    /// The RFC 0013 §5 activity label the session last reported while it
+    /// was the attach in progress; empty when it never reported one.
+    pub activity: String,
 }
 
 /// The stack as a VIEW MODEL (design 2026-09-21 §3): the attach in progress
@@ -204,6 +207,9 @@ struct Current {
     target: String,
     kind: SessionKind,
     anonymous_create: bool,
+    /// The RFC 0013 §5 activity label its daemon last reported; empty until
+    /// it does. A push carries it into the [`StackEntry`].
+    activity: String,
 }
 
 /// The transition a client asked for, waiting for the front door to carry it
@@ -291,6 +297,9 @@ pub enum Event {
     Entered { target: String },
     /// The daemon reported the current session's kind (a frame's id 20).
     KindReported(SessionKind),
+    /// The daemon reported the current session's RFC 0013 §5 activity label
+    /// (a frame's id 15).
+    ActivityReported(String),
     /// The client's verdict on the attach that just ended.
     AttachEnded(AttachEnd),
     /// The front door: the attach call returned — decide what happens next.
@@ -401,6 +410,7 @@ pub(crate) fn apply(state: &mut ViewportState, event: Event) -> Vec<Effect> {
                 target,
                 kind: SessionKind::Unknown,
                 anonymous_create: std::mem::take(&mut state.anonymous_create),
+                activity: String::new(),
             });
             if let Some(cascade) = state.cascade.take() {
                 state.notice = Some(PopNotice {
@@ -424,6 +434,14 @@ pub(crate) fn apply(state: &mut ViewportState, event: Event) -> Vec<Effect> {
                 }
                 _ => Vec::new(),
             }
+        }
+        Event::ActivityReported(label) => {
+            // Like the kind, a known label is never unsaid by an empty
+            // report. No status refresh: the socket does not show it.
+            if let Some(cur) = state.current.as_mut().filter(|_| !label.is_empty()) {
+                cur.activity = label;
+            }
+            Vec::new()
         }
         Event::AttachEnded(end) => {
             state.end = Some(end);
@@ -480,6 +498,7 @@ pub(crate) fn apply(state: &mut ViewportState, event: Event) -> Vec<Effect> {
                 _ => Some(StackEntry {
                     target,
                     kind: SessionKind::Unknown,
+                    activity: String::new(),
                 }),
             };
             cascade.gone.extend(dead);
@@ -537,6 +556,7 @@ fn current_entry_of(state: &ViewportState) -> Option<StackEntry> {
     Some(StackEntry {
         target: cur.target.clone(),
         kind: effective_kind(cur),
+        activity: cur.activity.clone(),
     })
 }
 
@@ -620,8 +640,9 @@ pub enum AttachEnd {
 }
 
 impl AttachEnd {
-    /// The notice phrase: `ended (exit 1)`, `killed (posh kill)`, `ended
-    /// (daemon got SIGTERM)`, `lost (mux channel closed)`; `None` for a quit.
+    /// The notice phrase: `ended (exit 1)`, `killed (posh kill, status 129)`,
+    /// `ended (daemon got SIGTERM, status 143)`, `lost (mux channel closed)`;
+    /// `None` for a quit.
     pub fn label(&self) -> Option<String> {
         Some(match self {
             AttachEnd::Ended { code, cause } => cause
@@ -697,6 +718,14 @@ pub fn set_current_kind(kind: SessionKind) {
     perform_status_effects(&effects);
 }
 
+/// The daemon reported the current session's RFC 0013 §5 activity label (a
+/// frame's id 15 entry). Held so that a push records it and a later pop
+/// notice can say what the session was doing (FDR 0020). A no-op with no
+/// attach in progress, and an empty label never overwrites a known one.
+pub fn set_current_activity(label: &str) {
+    dispatch(Event::ActivityReported(label.to_string()));
+}
+
 pub fn current() -> Option<String> {
     with_state(|s| s.current.as_ref().map(|c| c.target.clone()))
 }
@@ -713,6 +742,13 @@ pub fn current() -> Option<String> {
 #[cfg(test)]
 pub(crate) fn current_kind() -> SessionKind {
     with_state(|s| s.current.as_ref().map_or(SessionKind::Unknown, effective_kind))
+}
+
+/// The current attach's activity label — the client tests' mirroring seam,
+/// like [`current_kind`].
+#[cfg(test)]
+pub(crate) fn current_activity() -> String {
+    with_state(|s| s.current.as_ref().map(|c| c.activity.clone()).unwrap_or_default())
 }
 
 /// A renderer view the viewport is showing OVER its session (RFC 0014 §6
@@ -867,7 +903,7 @@ pub(crate) fn no_stack() -> StackView {
 /// entries under it are placeholders named `:under-N`.
 #[cfg(test)]
 pub(crate) fn stacked(target: &str, depth: usize) -> StackView {
-    let entry = |t: String| StackEntry { target: t, kind: SessionKind::Named };
+    let entry = |t: String| StackEntry { target: t, kind: SessionKind::Named, activity: String::new() };
     StackView {
         below: std::iter::once(entry(target.into()))
             .chain((1..depth).map(|n| entry(format!(":under-{n}"))))
@@ -992,12 +1028,13 @@ mod tests {
         ViewportState {
             stack: stack
                 .iter()
-                .map(|(t, k)| StackEntry { target: (*t).into(), kind: *k })
+                .map(|(t, k)| StackEntry { target: (*t).into(), kind: *k, activity: String::new() })
                 .collect(),
             current: current.map(|t| Current {
                 target: t.into(),
                 kind: SessionKind::Unknown,
                 anonymous_create: false,
+                activity: String::new(),
             }),
             ..ViewportState::new()
         }
@@ -1069,7 +1106,7 @@ mod tests {
         apply(&mut s, Event::Entered { target: ":dev".into() });
         assert_eq!(
             s.stack,
-            [StackEntry { target: ":anon".into(), kind: SessionKind::Anonymous }],
+            [StackEntry { target: ":anon".into(), kind: SessionKind::Anonymous, activity: String::new() }],
             "the re-homed viewport left a session behind; it belongs on the stack"
         );
     }
@@ -1243,7 +1280,7 @@ mod tests {
         apply(&mut s, Event::Entered { target: ":next".into() });
         assert_eq!(
             s.stack,
-            [StackEntry { target: ":anon".into(), kind: SessionKind::Anonymous }]
+            [StackEntry { target: ":anon".into(), kind: SessionKind::Anonymous, activity: String::new() }]
         );
         apply(&mut s, Event::KindReported(SessionKind::Named));
         apply(&mut s, Event::Entered { target: ":third".into() });
@@ -1282,7 +1319,7 @@ mod tests {
         assert_eq!(snap.current, Some((":ovl".into(), SessionKind::Anonymous, true)));
         assert_eq!(
             snap.stack,
-            [StackEntry { target: ":s-1".into(), kind: SessionKind::Named }]
+            [StackEntry { target: ":s-1".into(), kind: SessionKind::Named, activity: String::new() }]
         );
         assert_eq!(snap.overlays.iter().map(|o| o.kind).collect::<Vec<_>>(), ["picker"]);
         assert_eq!(snapshot_of(&ViewportState::new()).current, None);
@@ -1313,13 +1350,13 @@ mod tests {
             AttachEnd::Ended { code: 129, cause: Some(SessionEnd::Killed) }
                 .label()
                 .as_deref(),
-            Some("killed (posh kill)")
+            Some("killed (posh kill, status 129)")
         );
         assert_eq!(
             AttachEnd::Ended { code: 143, cause: Some(SessionEnd::Signaled(15)) }
                 .label()
                 .as_deref(),
-            Some("ended (daemon got SIGTERM)")
+            Some("ended (daemon got SIGTERM, status 143)")
         );
         assert_eq!(
             AttachEnd::Lost("mux channel closed".into()).label().as_deref(),
@@ -1334,10 +1371,10 @@ mod tests {
     fn the_pop_banner_names_the_host() {
         let notice = PopNotice {
             ended: ended(1),
-            gone: vec![StackEntry { target: ":s-1".into(), kind: SessionKind::Anonymous }],
+            gone: vec![StackEntry { target: ":s-1".into(), kind: SessionKind::Anonymous, activity: String::new() }],
             view: StackView {
                 below: Vec::new(),
-                current: Some(StackEntry { target: ":s-2".into(), kind: SessionKind::Named }),
+                current: Some(StackEntry { target: ":s-2".into(), kind: SessionKind::Named, activity: String::new() }),
             },
         };
         let banner = notice.banner();
@@ -1347,4 +1384,48 @@ mod tests {
         assert!(banner.ends_with(&display_target(":s-2")), "{banner}");
     }
 
+    /// FDR 0020: a pushed entry keeps the activity label (RFC 0013 §5) its
+    /// session last reported, so a later notice can say what it was doing.
+    #[test]
+    fn a_pushed_entry_carries_the_activity_label_it_was_left_with() {
+        let mut s = ViewportState::new();
+        apply(&mut s, Event::Entered { target: ":a".into() });
+        assert_eq!(apply(&mut s, Event::ActivityReported("notes.md · nvim".into())), []);
+        apply(&mut s, Event::Entered { target: ":b".into() });
+        assert_eq!(s.stack[0].activity, "notes.md · nvim");
+        assert_eq!(
+            current_entry_of(&s).map(|e| e.activity),
+            Some(String::new()),
+            "a new attach starts with no label of its own"
+        );
+    }
+
+    /// Like the kind, a known label is never unsaid by an empty report.
+    #[test]
+    fn an_empty_activity_label_never_overwrites_a_known_one() {
+        let mut s = ViewportState::new();
+        apply(&mut s, Event::Entered { target: ":a".into() });
+        apply(&mut s, Event::ActivityReported("vim".into()));
+        apply(&mut s, Event::ActivityReported(String::new()));
+        apply(&mut s, Event::Entered { target: ":b".into() });
+        assert_eq!(s.stack[0].activity, "vim");
+        // With no attach at all, a report is a no-op.
+        let mut none = ViewportState::new();
+        assert_eq!(apply(&mut none, Event::ActivityReported("x".into())), []);
+        assert_eq!(current_entry_of(&none), None);
+    }
+
+    /// Every pop is announced, a clean exit included, and the notice names
+    /// what the ended session was doing.
+    #[test]
+    fn the_notice_carries_the_ended_sessions_activity_label() {
+        let mut s = st(&[(":below", SessionKind::Named)], Some(":top"));
+        apply(&mut s, Event::ActivityReported("cargo build".into()));
+        apply(&mut s, Event::AttachEnded(ended(0)));
+        apply(&mut s, Event::AttachReturned);
+        apply(&mut s, Event::Entered { target: ":below".into() });
+        let n = s.notice.take().expect("every pop is announced, a clean exit too");
+        assert_eq!(n.ended, ended(0));
+        assert_eq!(n.gone[0].activity, "cargo build");
+    }
 }

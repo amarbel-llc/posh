@@ -191,17 +191,17 @@ pub enum SessionEnd {
 }
 
 impl SessionEnd {
-    /// The short human phrase a notice uses: `killed (posh kill)`,
-    /// `ended (daemon got SIGTERM)`, … — `exit_code` completes the shell
-    /// case (`ended (exit 1)`).
+    /// The short human phrase a notice uses — the cause and, always, the
+    /// numeric status (FDR 0020): `ended (exit 1)`, `killed (posh kill,
+    /// status 129)`, `ended (daemon got SIGTERM, status 143)`.
     pub fn label(self, exit_code: i32) -> String {
         match self {
             SessionEnd::Exited => format!("ended (exit {exit_code})"),
-            SessionEnd::Killed => "killed (posh kill)".to_string(),
+            SessionEnd::Killed => format!("killed (posh kill, status {exit_code})"),
             SessionEnd::Signaled(signo) => {
-                format!("ended (daemon got {})", signal_name(signo))
+                format!("ended (daemon got {}, status {exit_code})", signal_name(signo))
             }
-            SessionEnd::Failed => "ended (daemon failed)".to_string(),
+            SessionEnd::Failed => format!("ended (daemon failed, status {exit_code})"),
         }
     }
 }
@@ -1115,11 +1115,13 @@ mod tests {
         assert_eq!(decode_exit_cause(&[]), None);
         assert_eq!(decode_exit_cause(&[9]), None);
         assert_eq!(decode_exit_cause(&[3]), None, "a signaled kind needs its number");
+        // FDR 0020: every end states its numeric status, not only a shell exit.
         assert_eq!(SessionEnd::Exited.label(1), "ended (exit 1)");
-        assert_eq!(SessionEnd::Killed.label(129), "killed (posh kill)");
-        assert_eq!(SessionEnd::Signaled(15).label(143), "ended (daemon got SIGTERM)");
-        assert_eq!(SessionEnd::Signaled(31).label(0), "ended (daemon got signal 31)");
-        assert_eq!(SessionEnd::Failed.label(0), "ended (daemon failed)");
+        assert_eq!(SessionEnd::Exited.label(0), "ended (exit 0)");
+        assert_eq!(SessionEnd::Killed.label(129), "killed (posh kill, status 129)");
+        assert_eq!(SessionEnd::Signaled(15).label(143), "ended (daemon got SIGTERM, status 143)");
+        assert_eq!(SessionEnd::Signaled(31).label(0), "ended (daemon got signal 31, status 0)");
+        assert_eq!(SessionEnd::Failed.label(1), "ended (daemon failed, status 1)");
     }
 
     #[test]

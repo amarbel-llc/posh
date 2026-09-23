@@ -902,7 +902,7 @@ mod tests {
             eprintln!("skip: posh-palette not found (set POSH_PALETTE to run)");
             return;
         }
-        let named = |t: &str| StackEntry { target: t.into(), kind: SessionKind::Named };
+        let named = |t: &str| StackEntry { target: t.into(), kind: SessionKind::Named, activity: String::new() };
         let notice = PopNotice {
             ended: AttachEnd::Ended { code: 3, cause: None },
             gone: vec![named("box:top"), named("box:mid")],

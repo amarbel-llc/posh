@@ -694,6 +694,7 @@ impl FrameRenderer {
         // RFC 0013 §5.2: the activity label rides a frame when it changes.
         if let Some(cap) = caps::find(&frame.caps, caps::CAP_SESSION_ACTIVITY) {
             if let Ok(a) = caps::decode_session_activity(&cap.payload) {
+                crate::picker::set_current_activity(&a.label());
                 self.activity = Some(a);
             }
         }
@@ -2266,6 +2267,31 @@ mod tests {
         assert_eq!(a.last_rx_body, FrameKind::Diff);
         let l = fr.stats.link_snapshot();
         assert_eq!((l.frames_total, l.frames_full, l.frames_diff), (5, 4, 1));
+    }
+
+    /// RFC 0013 §5.2: the local client mirrors a frame's activity label onto
+    /// the picker's current target, the same seam the roaming client uses,
+    /// so a pop notice can say what the session was doing (FDR 0020).
+    #[test]
+    fn a_frames_activity_label_feeds_the_current_target() {
+        let _g = crate::picker::switch_test_guard();
+        crate::picker::entered(&crate::picker::target_for(None, None, "dev"));
+        assert_eq!(crate::picker::current_activity(), "");
+        let mut fr = FrameRenderer::new(5, 40);
+        let frame = ServerFrame {
+            flags: 0,
+            caps: vec![caps::encode_session_activity(&caps::SessionActivity {
+                process: "cargo".into(),
+                title: String::new(),
+            })],
+            frame_num: 1,
+            input_ack: 0,
+            echo_ack: 0,
+            body: FrameBody::Full(Terminal::with_scrollback(5, 40, 0).dump_vt()),
+        }
+        .encode();
+        assert!(fr.render_frame(&frame, None).is_ok());
+        assert_eq!(crate::picker::current_activity(), "cargo");
     }
 
     #[test]

@@ -132,7 +132,8 @@ pub fn notice_title(notice: &PopNotice) -> String {
 
 /// The RFC 0005 §3.6 `stack` for an automatic pop, most recently entered
 /// first: each session that left (`popped` — the one that ended says how,
-/// every later one was found already `gone`), where the viewport now sits
+/// every later one was found already `gone`; each followed by its activity
+/// label when one was known), where the viewport now sits
 /// (`current`), then everything still under it (`below`). Targets use the
 /// heading's one spelling ([`abbreviated`]).
 pub fn notice_stack(notice: &PopNotice) -> Value {
@@ -144,8 +145,9 @@ pub fn notice_stack(notice: &PopNotice) -> Value {
         e
     };
     let popped = notice.gone.iter().enumerate().map(|(i, e)| {
-        let detail = if i == 0 { notice.ended.label() } else { Some("gone".to_string()) };
-        entry(&e.target, "popped", detail)
+        let story = if i == 0 { notice.ended.label() } else { Some("gone".to_string()) };
+        let parts: Vec<String> = story.into_iter().chain((!e.activity.is_empty()).then(|| e.activity.clone())).collect();
+        entry(&e.target, "popped", (!parts.is_empty()).then(|| parts.join(" \u{b7} ")))
     });
     let current = notice.view.current.iter().map(|e| entry(&e.target, "current", None));
     let below = notice.view.below.iter().map(|e| entry(&e.target, "below", None));
@@ -159,7 +161,7 @@ mod tests {
     use posh_proto::caps::SessionKind;
 
     fn entry(t: &str, k: SessionKind) -> StackEntry {
-        StackEntry { target: t.into(), kind: k }
+        StackEntry { target: t.into(), kind: k, activity: String::new() }
     }
 
     /// A stack `depth` deep whose top is `top`; the entries under it are
@@ -352,6 +354,21 @@ mod tests {
         n.ended = picker::AttachEnd::Lost("mux channel closed".into());
         assert_eq!(notice_title(&n), "Session lost");
         assert_eq!(notice_stack(&n)[0]["detail"], "lost (mux channel closed)");
+    }
+
+    /// Each popped entry's detail is its story, then its activity label
+    /// (RFC 0013 §5) when one was known: how the ended session ended, and
+    /// `gone` for an entry found dead while popping.
+    #[test]
+    fn a_notice_entry_joins_its_story_and_activity_label() {
+        let mut n = pop_notice(&["box:top", "box:mid"], "box:dev", &[]);
+        n.gone[0].activity = "cargo build".into();
+        n.gone[1].activity = "vim".into();
+        let stack = notice_stack(&n);
+        assert_eq!(stack[0]["detail"], "ended (exit 1) \u{b7} cargo build");
+        assert_eq!(stack[1]["detail"], "gone \u{b7} vim");
+        // Current and below entries carry no detail.
+        assert!(stack[2].get("detail").is_none(), "{stack}");
     }
 
     /// Targets take the heading's one spelling: a UUID name by its first 8

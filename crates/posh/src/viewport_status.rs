@@ -328,7 +328,7 @@ mod tests {
 
         let one = Snapshot {
             current: Some((":ff9fe216-9652-4e23-805c-6f4dd5ce7eca".into(), SessionKind::Anonymous, true)),
-            stack: vec![StackEntry { target: "box:dev".into(), kind: SessionKind::Named }],
+            stack: vec![StackEntry { target: "box:dev".into(), kind: SessionKind::Named, activity: String::new() }],
             overlays: vec![],
         };
         assert_eq!(
@@ -340,8 +340,8 @@ mod tests {
         let two = Snapshot {
             current: Some(("box:work/s-3".into(), SessionKind::Named, false)),
             stack: vec![
-                StackEntry { target: ":s-1".into(), kind: SessionKind::Unknown },
-                StackEntry { target: "box:dev".into(), kind: SessionKind::Anonymous },
+                StackEntry { target: ":s-1".into(), kind: SessionKind::Unknown, activity: String::new() },
+                StackEntry { target: "box:dev".into(), kind: SessionKind::Anonymous, activity: String::new() },
             ],
             overlays: vec![
                 Overlay { kind: "palette", over: Some("box:work/s-3".into()) },
@@ -361,7 +361,7 @@ mod tests {
         // is kept as is.
         let odd = Snapshot {
             current: Some((":two\nlines".into(), SessionKind::Named, false)),
-            stack: vec![StackEntry { target: "box:a b\r\nc\td".into(), kind: SessionKind::Named }],
+            stack: vec![StackEntry { target: "box:a b\r\nc\td".into(), kind: SessionKind::Named, activity: String::new() }],
             overlays: vec![Overlay { kind: "palette", over: Some(":two\nlines".into()) }],
         };
         assert_eq!(

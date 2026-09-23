@@ -3050,6 +3050,7 @@ fn process_frame(st: &mut ClientState, frame: &ServerFrame) -> bool {
     // (refreshed only when the far end sees it change).
     if let Some(cap) = caps::find(&frame.caps, caps::CAP_SESSION_ACTIVITY) {
         if let Ok(activity) = caps::decode_session_activity(&cap.payload) {
+            crate::picker::set_current_activity(&activity.label());
             st.session_activity = Some(activity);
         }
     }
@@ -5796,6 +5797,30 @@ mod tests {
         assert!(process_frame(&mut st, &frame));
         assert_eq!(st.session_kind, SessionKind::Anonymous);
         assert_eq!(crate::picker::current_kind(), SessionKind::Anonymous);
+    }
+
+    /// RFC 0013 §5.2: the activity label a frame carries is mirrored onto the
+    /// picker's current target like the kind, so a later pop notice (FDR
+    /// 0020) can say what the session was doing.
+    #[test]
+    fn session_activity_cap_feeds_the_current_target() {
+        let _g = crate::picker::switch_test_guard();
+        crate::picker::entered(&crate::picker::target_for(Some("box"), None, "dev"));
+        assert_eq!(crate::picker::current_activity(), "");
+        let mut st = test_state(5, 40);
+        let frame = ServerFrame {
+            flags: 0,
+            caps: vec![caps::encode_session_activity(&caps::SessionActivity {
+                process: "nvim".into(),
+                title: "notes.md".into(),
+            })],
+            frame_num: 1,
+            input_ack: 0,
+            echo_ack: 0,
+            body: FrameBody::Full(Terminal::with_scrollback(5, 40, 0).dump_vt()),
+        };
+        assert!(process_frame(&mut st, &frame));
+        assert_eq!(crate::picker::current_activity(), "notes.md \u{b7} nvim");
     }
 
     /// A paint destination that accepts everything, for the gauge tests.

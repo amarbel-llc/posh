@@ -160,11 +160,14 @@ cause — the shell exited, `posh kill`, a signal to the daemon, a daemon
 failure — as an IPC record ahead of the exit status, and the relay / M2
 bridge carry it to the roaming client as `EXIT_CAUSE` (RFC 0001 id 19) on
 the shutdown frame, so the struck entry in the notice reads `killed (posh
-kill)` or `ended (daemon got SIGTERM)` (the one-line form: `session box:dev
-killed (posh kill) — back to flac:s-2`); a session killed from outside with
-no stack to pop prints that same phrase on stderr. A
-daemon that predates the record leaves the cause unknown and the notice
-falls back to the exit status. Still a follow-on: the picker's handling of a
+kill, status 129)` or `ended (daemon got SIGTERM, status 143)` — every end
+states its numeric status, a clean `ended (exit 0)` included — followed by
+the session's last activity label (RFC 0013 §5) when it reported one, e.g.
+`ended (exit 0) · cargo build`. A cascade entry reads `gone` plus the label it
+had when it was pushed. (The one-line form: `session box:dev killed (posh
+kill, status 129) — back to flac:s-2`.) A session killed from outside with no
+stack to pop prints that same phrase on stderr. A daemon that predates the
+record leaves the cause unknown and the notice falls back to the exit status. Still a follow-on: the picker's handling of a
 session vanishing while it is open, and a next step with an empty stack
 other than exiting.
 
