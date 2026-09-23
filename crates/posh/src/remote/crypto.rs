@@ -38,6 +38,19 @@ fn fill_random(buf: &mut [u8]) {
     std::io::Read::read_exact(&mut urandom, buf).expect("short read from /dev/urandom");
 }
 
+/// A uniformly random nonzero u64 — an RFC 0016 push-cmd token (a
+/// deduplication id, not a secret).
+pub(crate) fn random_token() -> u64 {
+    loop {
+        let mut b = [0u8; 8];
+        fill_random(&mut b);
+        let t = u64::from_ne_bytes(b);
+        if t != 0 {
+            return t;
+        }
+    }
+}
+
 impl Key {
     pub fn random() -> Key {
         let mut k = [0u8; KEY_LEN];

@@ -535,6 +535,9 @@ struct FrameRenderer {
     /// 20, once beside the first activity entry); `Unknown` until then.
     /// Mirrored into `picker::set_current_kind` for the FDR 0016 stack.
     kind: SessionKind,
+    /// RFC 0016 §2: the daemon offered push-cmd on this attach, so the
+    /// palette shows *Push shell* instead of *Shell out*.
+    push_offered: bool,
     rows: u16,
     cols: u16,
 }
@@ -585,6 +588,7 @@ impl FrameRenderer {
             scroll_opt: true,
             activity: None,
             kind: SessionKind::Unknown,
+            push_offered: false,
             rows,
             cols,
             stats: Stats::new(),
@@ -704,6 +708,9 @@ impl FrameRenderer {
                 self.kind = kind;
                 crate::picker::set_current_kind(kind);
             }
+        }
+        if caps::find(&frame.caps, caps::CAP_PUSH_CMD).is_some() {
+            self.push_offered = true;
         }
         // `[stats]` (posh#171): the frame's kind + arrival, then the apply
         // outcome at each classification below — the roaming client's shape.
@@ -1009,6 +1016,7 @@ fn palette_commands(
     scroll_opt: bool,
     coalesce_on: bool,
     coalesce_available: bool,
+    push_offered: bool,
     view: &crate::picker::StackView,
 ) -> Value {
     // Imperative label (the verb is the action), matching the remote palette:
@@ -1026,7 +1034,13 @@ fn palette_commands(
         // switch this viewport to one (detach, then the front door re-attaches).
         json!({ "name": "Switch session…", "action": { "method": "session.list" } }),
         json!({ "name": "Suspend client", "action": { "method": "client.suspend" } }),
-        json!({ "name": "Shell out", "action": { "method": "shell.open" } }),
+        // RFC 0016 §5: push-cmd when the daemon offered it, else the FDR 0008
+        // overlay — never both.
+        if push_offered {
+            json!({ "name": "Push shell", "action": { "method": "shell.push" } })
+        } else {
+            json!({ "name": "Shell out", "action": { "method": "shell.open" } })
+        },
         json!({ "name": scroll_opt_name, "action": { "method": "render.scroll_opt", "params": { "enabled": scroll_opt_enabled } } }),
     ]);
     // Frame coalescing (posh#137): offer the toggle ONLY when coalescing was
@@ -1069,7 +1083,7 @@ fn open_local_palette(
     let view = crate::picker::stack_view();
     p.open(
         &crate::remote::palette_view::commands_title(&view, None),
-        palette_commands(fr.scroll_opt, coalesce_on, coalesce_available, &view),
+        palette_commands(fr.scroll_opt, coalesce_on, coalesce_available, fr.push_offered, &view),
     );
     fr.set_scroll(0);
     fr.invalidate();
@@ -1118,6 +1132,15 @@ fn dispatch_local_action(method: &str, params: &Value, sock_write_buf: &mut Vec<
             // stays a passive frame consumer; the overlay's screen arrives over
             // the existing Tag::Frame path, and Ctrl-D closes it daemon-side.
             ipc::append_frame(sock_write_buf, Tag::Shell, b"");
+            LocalAction::None
+        }
+        "shell.push" => {
+            // RFC 0016 §3: one request over the reliable socket. The daemon
+            // answers with Tag::Switch, which re-dials — and `entered` pushes.
+            let table = caps::encode_table(&[caps::encode_push_cmd_request(
+                crate::remote::crypto::random_token(),
+            )]);
+            ipc::append_frame(sock_write_buf, Tag::ClientCaps, &table);
             LocalAction::None
         }
         "client.suspend" => LocalAction::Suspend,
@@ -1312,6 +1335,8 @@ fn client_loop(
         id: caps::CAP_SESSION_ACTIVITY,
         payload: vec![],
     });
+    // RFC 0016 §2: this viewport can push-cmd; the daemon offers it back once.
+    extra_caps.push(caps::encode_push_cmd());
     // Advertise CAP_COALESCE only when opted in (posh#137, `POSH_COALESCE=1`):
     // coalescing bounds the daemon's per-client `write_buf` so an output burst
     // can't grow it past MAX_CLIENT_BACKLOG and get us dropped (the
@@ -2802,7 +2827,7 @@ mod tests {
             [crate::picker::Effect::Dial { target: ":prev".into() }]
         );
         // A local target is spelled as the heading spells it: this machine's name.
-        let names = palette_names(&palette_commands(true, false, false, &stacked(":prev", 1)));
+        let names = palette_names(&palette_commands(true, false, false, false, &stacked(":prev", 1)));
         assert!(names[0].starts_with("Back to ") && names[0].ends_with(":prev"), "{names:?}");
         assert!(!names[0].starts_with("Back to :"), "{names:?}");
         crate::picker::reset_for_test();
@@ -2823,10 +2848,10 @@ mod tests {
     /// no row is a Back (design 2026-09-21 §3).
     #[test]
     fn palette_commands_lead_with_back_only_with_a_stack_top() {
-        let with = palette_names(&palette_commands(true, false, false, &stacked("box:dev", 1)));
+        let with = palette_names(&palette_commands(true, false, false, false, &stacked("box:dev", 1)));
         assert_eq!(with[0], "Back to box:dev", "{with:?}");
         assert_eq!(with[1], "Switch session…", "{with:?}");
-        let without = palette_names(&palette_commands(true, false, false, &no_stack()));
+        let without = palette_names(&palette_commands(true, false, false, false, &no_stack()));
         assert_eq!(without[0], "Switch session…", "{without:?}");
         assert!(!without.iter().any(|n| n.starts_with("Back to")), "{without:?}");
         assert_eq!(with.len(), without.len() + 1);
@@ -2870,7 +2895,7 @@ mod tests {
         ));
         assert!(buf.is_empty(), "listing sends nothing to the daemon");
         assert!(
-            serde_json::to_string(&palette_commands(true, false, false, &no_stack()))
+            serde_json::to_string(&palette_commands(true, false, false, false, &no_stack()))
                 .unwrap()
                 .contains("Switch session"),
             "the local palette offers the switcher"
@@ -2888,6 +2913,63 @@ mod tests {
             LocalAction::None
         ));
         assert_eq!(buf, ipc::encode_frame(Tag::Shell, b""));
+    }
+
+    /// RFC 0016 §3: `shell.push` queues exactly one `Tag::ClientCaps` table
+    /// carrying a push-cmd request with a nonzero token (reliable IPC: once).
+    #[test]
+    fn dispatch_shell_push_queues_one_client_caps_request() {
+        let mut buf = Vec::new();
+        assert!(matches!(
+            dispatch_local_action("shell.push", &json!({}), &mut buf),
+            LocalAction::None
+        ));
+        let mut fb = FrameBuffer::new();
+        fb.feed(&buf);
+        let frame = fb.next().unwrap().expect("one frame");
+        assert_eq!(frame.tag, Tag::ClientCaps);
+        let (table, _) = caps::decode_table(&frame.payload).unwrap();
+        let req = caps::find(&table, caps::CAP_PUSH_CMD_REQUEST).expect("the request");
+        assert!(caps::decode_push_cmd_request(&req.payload).is_some(), "a nonzero token");
+        assert!(fb.next().unwrap().is_none(), "exactly one frame");
+    }
+
+    /// RFC 0016 §5: exactly one of *Push shell* / *Shell out* — push when the
+    /// daemon offered it on this attach, the FDR 0008 overlay otherwise.
+    #[test]
+    fn the_palette_offers_push_shell_when_the_daemon_does_and_shell_out_otherwise() {
+        let shells = |push_offered: bool| -> Vec<(String, String)> {
+            palette_commands(true, false, false, push_offered, &no_stack())
+                .as_array()
+                .unwrap()
+                .iter()
+                .filter_map(|c| {
+                    let m = c["action"]["method"].as_str()?;
+                    m.starts_with("shell.").then(|| (c["name"].as_str().unwrap().to_string(), m.to_string()))
+                })
+                .collect()
+        };
+        assert_eq!(shells(true), [("Push shell".to_string(), "shell.push".to_string())]);
+        assert_eq!(shells(false), [("Shell out".to_string(), "shell.open".to_string())]);
+    }
+
+    /// RFC 0016 §2: a frame carrying the daemon's push-cmd offer marks this
+    /// attach as offered.
+    #[test]
+    fn a_frames_push_cmd_offer_is_held() {
+        let mut fr = FrameRenderer::new(5, 40);
+        assert!(!fr.push_offered);
+        let frame = ServerFrame {
+            flags: 0,
+            caps: vec![caps::encode_push_cmd()],
+            frame_num: 1,
+            input_ack: 0,
+            echo_ack: 0,
+            body: FrameBody::Full(Terminal::with_scrollback(5, 40, 0).dump_vt()),
+        }
+        .encode();
+        assert!(fr.render_frame(&frame, None).is_ok());
+        assert!(fr.push_offered);
     }
 
     /// `client.suspend` is routed as a tty-side action (run with the loop's
@@ -2937,13 +3019,13 @@ mod tests {
     #[test]
     fn palette_commands_labels_the_scroll_opt_toggle_by_state() {
         let text = |cmds: &Value| serde_json::to_string(cmds).unwrap();
-        let on = palette_commands(true, true, true, &no_stack());
+        let on = palette_commands(true, true, true, false, &no_stack());
         assert!(
             text(&on).contains("Disable scroll-region optimization"),
             "enabled now => offer Disable: {}",
             text(&on)
         );
-        let off = palette_commands(false, true, true, &no_stack());
+        let off = palette_commands(false, true, true, false, &no_stack());
         assert!(
             text(&off).contains("Enable scroll-region optimization"),
             "disabled now => offer Enable: {}",
@@ -2958,20 +3040,20 @@ mod tests {
     #[test]
     fn palette_commands_labels_the_coalesce_toggle_by_state() {
         let text = |cmds: &Value| serde_json::to_string(cmds).unwrap();
-        let on = palette_commands(true, true, true, &no_stack());
+        let on = palette_commands(true, true, true, false, &no_stack());
         assert!(
             text(&on).contains("Frame coalescing: on (disable)"),
             "coalescing on now => offer disable: {}",
             text(&on)
         );
-        let off = palette_commands(true, false, true, &no_stack());
+        let off = palette_commands(true, false, true, false, &no_stack());
         assert!(
             text(&off).contains("Frame coalescing: off (enable)"),
             "coalescing off now => offer enable: {}",
             text(&off)
         );
         // Unavailable (POSH_COALESCE unset ⇒ cap not advertised): no toggle at all.
-        let unavailable = palette_commands(true, false, false, &no_stack());
+        let unavailable = palette_commands(true, false, false, false, &no_stack());
         assert!(
             !text(&unavailable).contains("Frame coalescing"),
             "no coalescing command when unavailable: {}",

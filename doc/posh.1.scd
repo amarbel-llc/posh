@@ -204,7 +204,11 @@ Local persistence over Unix sockets.
 	With *--detach*, ensure-and-return, idempotent like
 	*attach --detach*. Inside a session, a local *start* creates the
 	session and then *switches* the issuing viewport onto it (FDR
-	0012; no nesting). With *--ephemeral* (first argument), a
+	0012; no nesting). That is *push-cmd* (FDR 0020): *posh start --*
+	_command_ runs _command_ as a new anonymous session in the caller's
+	directory and pushes the viewport onto it; when it exits the viewport
+	pops back with a notice naming its status. *--detach* creates without
+	moving. With *--ephemeral* (first argument), a
 	non-durable throwaway roaming shell instead — see REMOTE
 	COMMANDS below.
 

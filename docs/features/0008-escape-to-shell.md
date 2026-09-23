@@ -1,9 +1,15 @@
 ---
-status: experimental
+status: superseded
 date: 2026-08-25
 ---
 
 # Escape to shell (Ctrl-^ s)
+
+> **Superseded by FDR 0020 (2026-09-23).** *Push shell* runs the same
+> `$POSH_ESCAPE_CMD` as a new anonymous session and pushes the viewport onto
+> it. The overlay below remains the palette's fallback wherever the daemon
+> does not offer push-cmd (an old daemon, the relay, Architecture A) until the
+> posh#213 cutover removes it.
 
 > **Trigger moved (2026-06-22):** the overlay is now summoned by the command
 > palette's *Shell out* command (FDR 0009), not the `Ctrl-^ s` chord. The

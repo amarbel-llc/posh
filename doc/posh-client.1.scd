@@ -65,8 +65,12 @@ standing.
 	the predictive-echo models (_adaptive_, _optimistic_,
 	_always_, _never_, plus the evolved-predictor pilot's _controller_ and
 		_from-scratch_, RFC 0007), the client *and* server debug-logging toggles
-	(_POSH_DEBUG_LOG_; the server toggle rides the transport), shell-out on the
-	server (FDR 0008, the _POSH_ESCAPE_CMD_ command), reset & resync, dump wedge
+	(_POSH_DEBUG_LOG_; the server toggle rides the transport), *Push shell*
+	(FDR 0020: the session's daemon runs the _POSH_ESCAPE_CMD_ command as a new
+	anonymous session in the session's directory and pushes this viewport onto
+	it; offered only when the daemon offers it, over a local attach or an M2
+	session channel) or, where it is not offered, *Shell out* (the FDR 0008
+	overlay on the server, the same command) — never both, reset & resync, dump wedge
 	forensics, show wedge debug info (an on-screen transport-state summary,
 	readable even while the session is frozen, plus a full dump to the
 	diagnostic sink), show connection health (the transport-liveness view behind

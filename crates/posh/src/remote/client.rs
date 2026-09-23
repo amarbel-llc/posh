@@ -307,6 +307,7 @@ fn palette_commands(
     scroll_opt: bool,
     debug_banner: bool,
     recording: bool,
+    push_offered: bool,
     view: &crate::picker::StackView,
 ) -> Value {
     // The live debug banner (FDR 0007): a reverse-video line or two under
@@ -367,7 +368,13 @@ fn palette_commands(
         json!({ "name": scroll_opt_name, "action": { "method": "render.scroll_opt", "params": { "enabled": scroll_opt_enabled } } }),
         json!({ "name": banner_name, "action": { "method": "debug.banner", "params": { "enabled": banner_enabled } } }),
         json!({ "name": record_name, "action": { "method": "record.set", "params": { "enabled": record_enabled } } }),
-        json!({ "name": "Shell out (server)", "action": { "method": "shell.open" } }),
+        // RFC 0016 §5: push-cmd when the daemon offered it (M2 only), else
+        // the FDR 0008 overlay — never both.
+        if push_offered {
+            json!({ "name": "Push shell", "action": { "method": "shell.push" } })
+        } else {
+            json!({ "name": "Shell out (server)", "action": { "method": "shell.open" } })
+        },
         json!({ "name": "Reset & resync (force redraw)", "action": { "method": "session.resync" } }),
         json!({ "name": "Dump wedge forensics", "action": { "method": "session.forensics" } }),
         json!({ "name": "Show wedge debug info", "action": { "method": "session.debuginfo" } }),
@@ -420,7 +427,14 @@ fn palette_heading(
 /// the caller to fall back to the emergency-quit prefix).
 fn open_palette(st: &mut ClientState) -> bool {
     let view = crate::picker::stack_view();
-    let commands = palette_commands(st.server_log_on, st.scroll_opt, st.debug_banner, st.record.is_some(), &view);
+    let commands = palette_commands(
+        st.server_log_on,
+        st.scroll_opt,
+        st.debug_banner,
+        st.record.is_some(),
+        st.push_offered,
+        &view,
+    );
     let title = palette_heading(&view, st.wire.srtt(), st.predict_model, st.echo_escalation.escalated());
     let Some(p) = Palette::summon(&mut st.palette, st.rows, st.cols) else {
         return false;
@@ -889,6 +903,30 @@ fn show_debug_info(st: &mut ClientState, title: &str, body: &str, now: u64) {
     }
 }
 
+/// RFC 0016 §5: how long a push-cmd request waits for its re-home.
+const PUSH_ANSWER_MS: u64 = 10_000;
+
+/// The push-cmd request this message carries (RFC 0016 §3), if one is
+/// pending; past its deadline the request is dropped and the user told.
+fn push_request_cap(st: &mut ClientState, now: u64) -> Option<caps::Cap> {
+    let (token, deadline) = st.pending_push?;
+    if now > deadline {
+        st.pending_push = None;
+        st.notify.set_message("push shell: no answer from the session", false, now);
+        return None;
+    }
+    Some(caps::encode_push_cmd_request(token))
+}
+
+/// A re-home landed (FDR 0012 / RFC 0016 §4.3): any push request is
+/// answered, and the offer belongs to the session we left.
+fn note_rehome(st: &mut ClientState, now: u64) {
+    st.push_offered = false;
+    if st.pending_push.take().is_some() && st.notify.message() == "opening shell\u{2026}" {
+        st.notify.set_message("", false, now);
+    }
+}
+
 /// Dispatch a palette-selected command action (RFC 0005 §7). Returns whether the
 /// client should send to the server promptly (the escape-to-shell flag or quit).
 fn dispatch_palette_action(
@@ -1014,6 +1052,13 @@ fn dispatch_palette_action(
             // FDR 0008 escape-to-shell: a one-shot sticky flag the next message
             // carries; the server spawns the overlay shell in the session cwd.
             st.flags |= sync::CLIENT_FLAG_ESCAPE;
+            st.notify.set_message("opening shell\u{2026}", true, now);
+            true
+        }
+        "shell.push" => {
+            // RFC 0016 §3: a fresh token that rides every message until the
+            // re-home lands (`note_rehome`) or PUSH_ANSWER_MS passes.
+            st.pending_push = Some((crate::remote::crypto::random_token(), now + PUSH_ANSWER_MS));
             st.notify.set_message("opening shell\u{2026}", true, now);
             true
         }
@@ -1600,6 +1645,12 @@ struct ClientState {
     /// `Unknown` against a daemon that predates it or a standalone server.
     /// Mirrored into `picker::set_current_kind` for the FDR 0016 stack.
     session_kind: SessionKind,
+    /// RFC 0016 §2: the daemon offered push-cmd on this attach (reset by a
+    /// re-home; the new daemon offers again).
+    push_offered: bool,
+    /// RFC 0016 §3/§5: an unanswered push-cmd request — its token and the
+    /// deadline (ms) after which it is dropped. Rides every message.
+    pending_push: Option<(u64, u64)>,
     /// The live debug banner (FDR 0007): on via the palette or
     /// `POSH_DEBUG_BANNER=1`; its text is rebuilt every
     /// [`DEBUG_BANNER_REFRESH_MS`] and composited under the connection banner.
@@ -1780,6 +1831,8 @@ fn client_loop(
         paint_pending: None,
         session_activity: None,
         session_kind: SessionKind::Unknown,
+        push_offered: false,
+        pending_push: None,
         debug_banner: debug_banner_env(),
         banner: DebugBanner::default(),
         palette: None,
@@ -2127,6 +2180,7 @@ fn drive_client(
                             group,
                             name,
                         ));
+                        note_rehome(st, now_ms());
                         continue;
                     }
                     Rx::Skip => continue,
@@ -3062,6 +3116,9 @@ fn process_frame(st: &mut ClientState, frame: &ServerFrame) -> bool {
             crate::picker::set_current_kind(kind);
         }
     }
+    if caps::find(&frame.caps, caps::CAP_PUSH_CMD).is_some() {
+        st.push_offered = true;
+    }
     // Scrollback stream v2 (RFC 0009 §1): adopt the server's epoch from its
     // SCROLLBACK2 ack. A change (or a first ack, or the ack after our local
     // resize cleared `sb2_epoch`) opens a fresh epoch: clear the ring and zero
@@ -3811,6 +3868,10 @@ fn outgoing_caps(st: &mut ClientState) -> Vec<caps::Cap> {
         id: caps::CAP_SESSION_ACTIVITY,
         payload: vec![],
     });
+    // RFC 0016 §2/§3: the push-cmd offer request beside it, and a pending
+    // request until its re-home lands. Only the M2 bridge forwards them.
+    extra.push(caps::encode_push_cmd());
+    extra.extend(push_request_cap(st, now_ms()));
     // Evolved predictor (RFC 0007 §3): request the server's remote-host metric
     // terminals only when a GP species is active, so a default session never
     // negotiates CAP_METRICS and pays no per-frame overhead.
@@ -4050,6 +4111,69 @@ mod tests {
         assert_ne!(st.flags & sync::CLIENT_FLAG_ESCAPE, 0, "escape flag set");
     }
 
+    /// RFC 0016 §5: exactly one of *Push shell* / *Shell out* — push when the
+    /// daemon offered it on this attach, the FDR 0008 overlay otherwise.
+    #[test]
+    fn the_palette_offers_push_shell_when_the_daemon_does_and_shell_out_otherwise() {
+        let methods = |push_offered: bool| -> Vec<(String, String)> {
+            palette_commands(false, true, false, false, push_offered, &no_stack())
+                .as_array()
+                .unwrap()
+                .iter()
+                .filter_map(|c| {
+                    let m = c["action"]["method"].as_str()?;
+                    m.starts_with("shell.").then(|| (c["name"].as_str().unwrap().to_string(), m.to_string()))
+                })
+                .collect()
+        };
+        assert_eq!(methods(true), [("Push shell".to_string(), "shell.push".to_string())]);
+        assert_eq!(methods(false), [("Shell out (server)".to_string(), "shell.open".to_string())]);
+    }
+
+    /// RFC 0016 §2: the offer request rides every message, beside the
+    /// activity-label request; a frame carrying the offer marks this attach.
+    #[test]
+    fn push_cmd_is_requested_on_every_message_and_the_offer_is_held() {
+        let mut st = test_state(5, 40);
+        assert!(caps::find(&outgoing_caps(&mut st), caps::CAP_PUSH_CMD).is_some());
+        assert!(!st.push_offered);
+        let frame = ServerFrame {
+            flags: 0,
+            caps: vec![caps::encode_push_cmd()],
+            frame_num: 1,
+            input_ack: 0,
+            echo_ack: 0,
+            body: FrameBody::Full(Terminal::with_scrollback(5, 40, 0).dump_vt()),
+        };
+        assert!(process_frame(&mut st, &frame));
+        assert!(st.push_offered);
+    }
+
+    /// RFC 0016 §3/§5: `shell.push` sets a pending nonzero token that rides
+    /// every message until the re-home lands (which clears it and the
+    /// notice), or until 10 s pass (which drops it and says so).
+    #[test]
+    fn a_push_request_rides_every_message_until_the_rehome_lands_or_times_out() {
+        let raw = pty_raw_mode();
+        let mut st = test_state(5, 40);
+        assert!(dispatch_palette_action(&mut st, &raw, "shell.push", &json!({}), 1_000), "send promptly");
+        assert_eq!(st.notify.message(), "opening shell\u{2026}");
+        let token = |st: &mut ClientState, now| {
+            push_request_cap(st, now).map(|c| caps::decode_push_cmd_request(&c.payload).expect("a valid token"))
+        };
+        let first = token(&mut st, 1_000).expect("the request rides");
+        assert_eq!(token(&mut st, 5_000), Some(first), "the same token each message");
+
+        note_rehome(&mut st, 5_500);
+        assert_eq!(token(&mut st, 5_600), None, "the re-home ends it");
+        assert_eq!(st.notify.message(), "", "and clears the notice");
+
+        dispatch_palette_action(&mut st, &raw, "shell.push", &json!({}), 20_000);
+        assert!(token(&mut st, 29_999).is_some());
+        assert_eq!(token(&mut st, 30_001), None, "10 s without a re-home");
+        assert_eq!(st.notify.message(), "push shell: no answer from the session");
+    }
+
     #[test]
     fn dispatch_quit_requests_shutdown() {
         let raw = pty_raw_mode();
@@ -4064,7 +4188,7 @@ mod tests {
     #[test]
     fn palette_commands_recording_toggle_reflects_state() {
         let names = |recording: bool| -> Vec<String> {
-            palette_commands(false, true, false, recording, &no_stack())
+            palette_commands(false, true, false, recording, false, &no_stack())
                 .as_array()
                 .unwrap()
                 .iter()
@@ -4645,7 +4769,7 @@ mod tests {
     #[test]
     fn palette_commands_lead_with_back_and_the_heading_names_the_predecessor() {
         let names = |v: &crate::picker::StackView| -> Vec<String> {
-            palette_commands(false, true, false, false, v)
+            palette_commands(false, true, false, false, false, v)
                 .as_array()
                 .unwrap()
                 .iter()
@@ -4670,7 +4794,7 @@ mod tests {
 
     #[test]
     fn palette_commands_includes_both_logging_scopes() {
-        let cmds = palette_commands(false, true, false, false, &no_stack());
+        let cmds = palette_commands(false, true, false, false, false, &no_stack());
         let arr = cmds.as_array().expect("commands is an array");
         let names: Vec<&str> = arr.iter().filter_map(|c| c["name"].as_str()).collect();
         assert!(
@@ -4715,7 +4839,7 @@ mod tests {
             names.iter().any(|n| n.contains("Disable scroll-region optimization")),
             "scroll-opt disable command missing: {names:?}"
         );
-        let off: Vec<String> = palette_commands(false, false, true, false, &stacked("box:dev", 1))
+        let off: Vec<String> = palette_commands(false, false, true, false, false, &stacked("box:dev", 1))
             .as_array()
             .unwrap()
             .iter()
@@ -5296,6 +5420,8 @@ mod tests {
             paint_pending: None,
             session_activity: None,
             session_kind: SessionKind::Unknown,
+            push_offered: false,
+            pending_push: None,
             debug_banner: false,
             banner: DebugBanner::default(),
             palette: None,

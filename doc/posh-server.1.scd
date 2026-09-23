@@ -159,9 +159,10 @@ _POSH_AGENT_EXPORT_
 	on it too.
 
 _POSH_ESCAPE_CMD_
-	The command the escape-to-shell overlay runs (FDR 0008), spawned in
-	the session's working directory when the client picks *Shell out* from
-	its *Ctrl-^* command palette. Whitespace-split into argv (so _sc exec_
+	The command a palette *Push shell* runs as a new session (FDR 0020), or
+	the escape-to-shell overlay runs where push is not offered (FDR 0008),
+	in the session's working directory, when the client picks it from its
+	*Ctrl-^* command palette. Whitespace-split into argv (so _sc exec_
 	works); unset or blank runs _$SHELL_ as a login shell, the same default
 	as the session. In an eng/spinclass environment this is set to _sc exec_,
 	which resolves the worktree session from the cwd and loads its devshell.
