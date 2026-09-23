@@ -1161,6 +1161,8 @@ debug-posh-agent-resolve target="" samples="3" bound="10":
       *)
         # An unreadable environ (no /proc on macOS, a foreign-uid or dead
         # pid) must not read as "this shell has no agent".
+        # macOS gap (posh#214): the pid form needs `ps eww -p <pid>` or libproc
+        # `KERN_PROCARGS2`; today it errors there.
         if [ ! -r "/proc/{{ target }}/environ" ]; then
           echo "pid {{ target }}: /proc/{{ target }}/environ is not readable (no /proc, dead pid, or another uid)"
           exit 1

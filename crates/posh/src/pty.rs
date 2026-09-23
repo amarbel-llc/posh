@@ -92,6 +92,8 @@ fn read_comm(pid: libc::pid_t) -> Option<String> {
     (!t.is_empty()).then(|| t.to_string())
 }
 
+// macOS gap (posh#214): the activity label's process half — libproc
+// `proc_name` / `proc_pidpath` would supply it.
 #[cfg(not(target_os = "linux"))]
 fn read_comm(_pid: libc::pid_t) -> Option<String> {
     None

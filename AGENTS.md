@@ -208,6 +208,10 @@ there. What follows is only what is specific to this repo.
   wire or file-format contract, FDR for a user-facing feature. `docs/README.md`
   defines the kinds and the status vocabulary, and the rule that **status
   moves in the commit that moves the code.**
+- **Platform gaps:** a Linux-only feature whose other-platform branch is a stub
+  (or a test that can only assert on Linux) carries a `macOS gap (posh#214):`
+  comment saying what macOS would use, and posh#214 lists every site.
+  `rg 'macOS gap \(posh#214\)'` is the inventory; a new gap adds both.
 
 ## Debugging
 

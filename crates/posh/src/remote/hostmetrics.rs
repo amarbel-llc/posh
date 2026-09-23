@@ -111,6 +111,7 @@ pub fn sample_host_stats() -> RemoteMetrics {
 }
 
 /// Non-Linux: host stats unavailable (no `/proc`); reports all `None`.
+// macOS gap (posh#214): `sysctl vm.loadavg` and `host_statistics64`.
 #[cfg(not(target_os = "linux"))]
 pub fn sample_host_stats() -> RemoteMetrics {
     RemoteMetrics::default()
@@ -138,6 +139,7 @@ fn read_comm(pid: i32) -> Option<String> {
     (!t.is_empty()).then(|| t.to_string())
 }
 
+// macOS gap (posh#214): libproc `proc_name`.
 #[cfg(not(target_os = "linux"))]
 fn read_comm(_pid: i32) -> Option<String> {
     None
@@ -163,6 +165,7 @@ fn session_proc_count(session_id: i32) -> Option<u32> {
     Some(count)
 }
 
+// macOS gap (posh#214): libproc `proc_listpids` plus each pid's session id.
 #[cfg(not(target_os = "linux"))]
 fn session_proc_count(_session_id: i32) -> Option<u32> {
     None
