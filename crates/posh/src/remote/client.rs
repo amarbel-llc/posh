@@ -419,24 +419,15 @@ fn palette_heading(
 /// Returns whether it opened (false if the renderer can't be spawned, leaving
 /// the caller to fall back to the emergency-quit prefix).
 fn open_palette(st: &mut ClientState) -> bool {
-    if st.palette.is_none() {
-        st.palette = Palette::spawn(st.rows, st.cols);
-    }
     let view = crate::picker::stack_view();
     let commands = palette_commands(st.server_log_on, st.scroll_opt, st.debug_banner, st.record.is_some(), &view);
     let title = palette_heading(&view, st.wire.srtt(), st.predict_model, st.echo_escalation.escalated());
-    if let Some(p) = st.palette.as_mut() {
-        // A persisted (spawned-then-closed) palette is not resized while closed,
-        // so re-sync it to the current tty size before summoning — else it
-        // renders at the size it had when last open, misaligned against a
-        // since-resized screen (posh#135).
-        p.resize(st.rows, st.cols);
-        p.open(&title, commands);
-        st.initialized = false; // repaint to show the overlay
-        true
-    } else {
-        false
-    }
+    let Some(p) = Palette::summon(&mut st.palette, st.rows, st.cols) else {
+        return false;
+    };
+    p.open(&title, commands);
+    st.initialized = false; // repaint to show the overlay
+    true
 }
 
 /// Wall-clock milliseconds since the epoch (the `CLIENT_IDENT` start anchor;
@@ -2520,13 +2511,9 @@ fn first_frame(st: &mut ClientState, now: u64) {
 /// Raise the must-dismiss pop notice, spawning the renderer if it is not
 /// resident yet. False when no renderer can be launched.
 fn show_pop_notice(st: &mut ClientState, notice: &crate::picker::PopNotice) -> bool {
-    if st.palette.is_none() {
-        st.palette = Palette::spawn(st.rows, st.cols);
-    }
-    let Some(p) = st.palette.as_mut() else {
+    let Some(p) = Palette::summon(&mut st.palette, st.rows, st.cols) else {
         return false;
     };
-    p.resize(st.rows, st.cols);
     p.show_notice(
         &super::palette_view::notice_title(notice),
         super::palette_view::notice_stack(notice),

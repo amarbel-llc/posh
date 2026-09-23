@@ -149,6 +149,20 @@ impl Palette {
         }
     }
 
+    /// The resident renderer in `slot`, spawned on first use and re-synced to
+    /// the current tty size — a persisted (spawned-then-closed) palette is not
+    /// resized while closed, so a summon after a resize would otherwise render
+    /// at its old size, misaligned against the screen (posh#135). `None` when
+    /// no renderer can be launched. Every client summon goes through here.
+    pub fn summon(slot: &mut Option<Palette>, rows: u16, cols: u16) -> Option<&mut Palette> {
+        if slot.is_none() {
+            *slot = Palette::spawn(rows, cols);
+        }
+        let p = slot.as_mut()?;
+        p.resize(rows, cols);
+        Some(p)
+    }
+
     /// The renderer's screen to composite, or `None` while the palette is hidden.
     pub fn screen(&self) -> Option<&Terminal> {
         self.is_open().then_some(&self.rterm)

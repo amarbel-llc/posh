@@ -1062,17 +1062,9 @@ fn open_local_palette(
     coalesce_on: bool,
     coalesce_available: bool,
 ) -> bool {
-    if palette.is_none() {
-        *palette = Palette::spawn(rows, cols);
-    }
-    let Some(p) = palette.as_mut() else {
+    let Some(p) = Palette::summon(palette, rows, cols) else {
         return false;
     };
-    // A persisted (spawned-then-closed) palette is not resized while closed
-    // (the SIGWINCH handler skips a closed palette), so re-sync it to the
-    // current tty size before summoning — else it renders at the size it had
-    // when last open, misaligned against a since-resized screen (posh#135).
-    p.resize(rows, cols);
     let view = crate::picker::stack_view();
     p.open(
         &crate::remote::palette_view::commands_title(&view, None),
@@ -1259,14 +1251,10 @@ fn raise_pop_notice(
     pop_notice: &mut Option<crate::picker::PopNotice>,
 ) -> Option<crate::picker::PopNotice> {
     let notice = pop_notice.take()?;
-    if palette.is_none() {
-        *palette = Palette::spawn(rows, cols);
-    }
-    let Some(p) = palette.as_mut() else {
+    let Some(p) = Palette::summon(palette, rows, cols) else {
         *pop_notice = Some(notice);
         return None;
     };
-    p.resize(rows, cols);
     p.show_notice(
         &crate::remote::palette_view::notice_title(&notice),
         crate::remote::palette_view::notice_stack(&notice),
