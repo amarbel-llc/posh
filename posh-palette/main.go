@@ -520,21 +520,31 @@ func (m model) noticeView() string {
 	var b strings.Builder
 	b.WriteString(titleStyle.Render(m.title))
 	b.WriteString("\n\n")
-	panelWidth := 80
-	if m.width > 0 {
-		panelWidth = m.width - 4
+	// posh#217: size to the content — the widest of the title, the help
+	// line and each "→ " marker + entry — not to the terminal; a notice has
+	// short lines, and every spare column hides the session being restored.
+	// The terminal (and 120) still caps it, and an entry wider than the
+	// room is truncated.
+	const help = "enter dismiss"
+	content := max(lipgloss.Width(m.title), lipgloss.Width(help))
+	for _, e := range m.stack {
+		content = max(content, 2+lipgloss.Width(entryLine(e)))
 	}
-	panelWidth = max(min(panelWidth, 120), 30)
-	// dialogStyle's Padding(1, 2) + the double border: 6 columns of chrome;
-	// the "→ " marker takes two more, as the picker's "› " does.
-	lineWidth := panelWidth - 8
+	frame := dialogStyle.GetHorizontalFrameSize()
+	limit := 120
+	if m.width > 0 {
+		limit = min(limit, m.width-4)
+	}
+	panelWidth := max(min(content+frame, limit), 30)
+	// The "→ " marker takes two columns of the content width.
+	lineWidth := panelWidth - frame - 2
 	for _, e := range m.stack {
 		st, marker := entryStyle(e.State)
 		b.WriteString(marker + st.Render(truncate(entryLine(e), lineWidth)))
 		b.WriteByte('\n')
 	}
 	b.WriteByte('\n')
-	b.WriteString(helpStyle.Render("enter dismiss"))
+	b.WriteString(helpStyle.Render(help))
 	return dialogStyle.Width(panelWidth).Render(b.String())
 }
 

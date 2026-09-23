@@ -366,6 +366,39 @@ func TestNoticeRendersStackInOrderWithStates(t *testing.T) {
 	}
 }
 
+// posh#217: the notice sizes to its content, not the terminal — a short
+// notice on a wide terminal is a small box — yet stays inside a narrow
+// terminal, truncating an entry longer than the room it has.
+func TestNoticeSizesToItsContentWithinTheTerminal(t *testing.T) {
+	show := func(width int, stack []entry) string {
+		updated, _ := newModel(&conn{}).Update(tea.WindowSizeMsg{Width: width, Height: 40})
+		updated, _ = updated.(model).Update(showMsg{View: "notice", Stack: stack})
+		return plain(updated.(model).noticeView())
+	}
+	boxWidth := func(out string) int { return len([]rune(strings.SplitN(out, "\n", 2)[0])) }
+
+	short := []entry{
+		{Target: "flac:s-1", State: "popped", Detail: "ended (exit 0) · bash"},
+		{Target: "flac:a", State: "current"},
+	}
+	out := show(200, short)
+	if w := boxWidth(out); w > 50 {
+		t.Errorf("a short notice on a 200-col terminal is %d wide; want it sized to content:\n%s", w, out)
+	}
+	if !strings.Contains(out, "flac:s-1  (ended (exit 0) · bash)") {
+		t.Errorf("content must fit whole:\n%s", out)
+	}
+
+	long := []entry{{Target: "flac:" + strings.Repeat("x", 90), State: "popped", Detail: "gone"}}
+	out = show(60, long)
+	if w := boxWidth(out); w > 56 {
+		t.Errorf("a long notice must stay inside a 60-col terminal, got %d:\n%s", w, out)
+	}
+	if !strings.Contains(out, "…") {
+		t.Errorf("an entry longer than the room is truncated:\n%s", out)
+	}
+}
+
 // The state -> treatment mapping itself (RFC 0005 §3.6), pinned directly so
 // the assertion does not depend on where lipgloss places escape sequences:
 // `popped` is drawn as removed, `current` takes the marker, and an
