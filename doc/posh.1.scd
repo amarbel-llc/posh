@@ -233,14 +233,20 @@ Local persistence over Unix sockets.
 	with a state-colored status dot (attached, detached, or stale),
 	a KIND column (_anonymous_, _named_, or _system_ — see *start*;
 	empty for a daemon that predates the kind),
-	the working directory and command of each session, and an ECHO
+	a CWD column (where the session is now — its shell's working
+	directory, resolved by the ADR 0008 cascade; empty for a daemon that
+	predates it), a STARTED IN column (where it was started), the
+	command of each session, and an ECHO
 	column condensing the first attached client's echo model, control,
 	and rtt from the session's status socket (see *status*; empty for a
 	daemon that predates RFC 0014); when
 	piped it is plain tab-separated lines, unchanged for scripts. The
 	mux endpoints have their own table, *mux ls*. *--short* prints names only; *--json*
 	prints a machine-readable array, each row carrying a _kind_ field
-	(_anonymous_, _named_, or _system_; omitted when unknown); *--complete* prints
+	(_anonymous_, _named_, or _system_; omitted when unknown), _cwd_ (the
+	start directory) and _cwd_now_ (the current one; omitted when
+	unknown) — the piped lines carry the same pair as _started_in=_ and
+	_cwd_now=_; *--complete* prints
 	_name_<TAB>_summary_ lines (the RFC 0013 §5 activity label,
 	else the launch command) for shell completion — the *ph* fish
 	completion renders the summary as each candidate's description.
@@ -280,7 +286,9 @@ Local persistence over Unix sockets.
 *status* [_name_] [*--viewport* [_pid_]] (alias: *st*)
 	Print the session's status response (RFC 0014 §4.2): a session
 	line — daemon build, pid, frames gate, the PTY's ECHO flag, alt-screen,
-	client count, activity label — then one line per attached client with
+	client count, activity label, and the current directory with the
+	cascade step that found it (_cwd=_, _cwd_source=_: _caller_, _kernel_,
+	_osc7_, _start_ or _home_) — then one line per attached client with
 	its build, echo model in effect, control (_auto_, _auto-escalated_,
 	_pinned-env_, _pinned-palette_, _gate-off_), rtt, codec, gates,
 	escalation thresholds, and prediction outcome counters. A client

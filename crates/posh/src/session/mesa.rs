@@ -72,7 +72,7 @@ impl State {
 }
 
 /// The header record: columns, the STATUS-dot legend, and the empty-table
-/// message (RFC 0003 §2/§6/§7.4). ACTIVITY/ECHO/STARTED IN are `flex` and
+/// message (RFC 0003 §2/§6/§7.4). ACTIVITY/ECHO/STARTED IN/CWD are `flex` and
 /// shrink in that order (lowest `shrink` first) down to a floor of 8 columns
 /// before mesa ellipsizes; NAME/STATUS/PID/CLIENTS/KIND are `pin`, sized to
 /// content.
@@ -84,6 +84,7 @@ fn header(socket_dir: &Path) -> Value {
             {"name": "PID", "role": "pin"},
             {"name": "CLIENTS", "role": "pin"},
             {"name": "KIND", "role": "pin"},
+            {"name": "CWD", "role": "flex", "shrink": 3, "min": 8},
             {"name": "STARTED IN", "role": "flex", "shrink": 2, "min": 8},
             {"name": "ACTIVITY", "role": "flex", "shrink": 0, "min": 8},
             {"name": "ECHO", "role": "flex", "shrink": 1, "min": 8},
@@ -124,6 +125,7 @@ fn row(s: &SessionEntry, current: Option<&str>, home: Option<&str>) -> Value {
             "",
             "",
             "",
+            "",
             {"spans": [{"text": format!("{err} (cleaning up)"), "sev": "muted"}]},
             "",
         ]});
@@ -134,6 +136,7 @@ fn row(s: &SessionEntry, current: Option<&str>, home: Option<&str>) -> Value {
         s.pid.map(|p| p.to_string()).unwrap_or_default(),
         s.clients.map(|c| c.to_string()).unwrap_or_default(),
         s.kind.map(|k| k.as_str().to_string()).unwrap_or_default(),
+        abbrev_home(s.cwd_now.as_deref().unwrap_or(""), home),
         abbrev_home(s.cwd.as_deref().unwrap_or(""), home),
         s.activity.clone().or_else(|| s.cmd.clone()).unwrap_or_default(),
         s.echo.clone().unwrap_or_default(),
@@ -218,6 +221,7 @@ mod tests {
             error: None,
             cmd: Some("fish".to_string()),
             cwd: Some("/home/u/eng".to_string()),
+            cwd_now: Some("/home/u/eng/posh".to_string()),
             activity: Some("nvim".to_string()),
             echo: Some("optimistic auto-escalated 412ms".to_string()),
             kind: Some(SessionKind::Named),
@@ -232,6 +236,7 @@ mod tests {
             error: Some("connection refused".to_string()),
             cmd: None,
             cwd: None,
+            cwd_now: None,
             activity: None,
             echo: None,
             kind: None,
@@ -243,17 +248,17 @@ mod tests {
     }
 
     #[test]
-    fn header_has_eight_columns_legend_and_empty() {
+    fn header_has_nine_columns_legend_and_empty() {
         let records = parse_lines(&build_ndjson(&[], None, None, Path::new("/run/posh/default")));
         assert_eq!(records.len(), 1);
         let header = &records[0];
-        assert_eq!(header["columns"].as_array().unwrap().len(), 8);
+        assert_eq!(header["columns"].as_array().unwrap().len(), 9);
         assert_eq!(header["legend"].as_array().unwrap().len(), 3);
         assert_eq!(header["empty"], "no sessions found in /run/posh/default");
     }
 
     #[test]
-    fn flex_columns_shrink_activity_first_then_echo_then_started_in() {
+    fn flex_columns_shrink_activity_then_echo_then_started_in_then_cwd() {
         let records = parse_lines(&build_ndjson(&[], None, None, Path::new("/x")));
         let cols = records[0]["columns"].as_array().unwrap();
         let shrink_of = |name: &str| {
@@ -263,6 +268,23 @@ mod tests {
         };
         assert!(shrink_of("ACTIVITY") < shrink_of("ECHO"));
         assert!(shrink_of("ECHO") < shrink_of("STARTED IN"));
+        assert!(shrink_of("STARTED IN") < shrink_of("CWD"), "where it is outlasts where it began");
+    }
+
+    /// ADR 0008: CWD (where the session is now) sits before STARTED IN,
+    /// home-abbreviated like it; a pre-cascade daemon leaves it blank.
+    #[test]
+    fn cwd_column_shows_where_the_session_is_now() {
+        let records = parse_lines(&build_ndjson(&[entry("dev", 1)], None, Some("/home/u"), Path::new("/x")));
+        let cols = records[0]["columns"].as_array().unwrap();
+        let at = |name: &str| cols.iter().position(|c| c["name"] == name).unwrap();
+        assert_eq!(at("CWD") + 1, at("STARTED IN"));
+        assert_eq!(records[1]["cells"][at("CWD")], "~/eng/posh");
+        assert_eq!(records[1]["cells"][at("STARTED IN")], "~/eng");
+        let mut old = entry("old", 0);
+        old.cwd_now = None;
+        let records = parse_lines(&build_ndjson(&[old], None, Some("/home/u"), Path::new("/x")));
+        assert_eq!(records[1]["cells"][at("CWD")], "");
     }
 
     #[test]
@@ -297,14 +319,15 @@ mod tests {
     fn stale_row_carries_error_in_activity_cell_other_cells_blank() {
         let records = parse_lines(&build_ndjson(&[stale("old")], None, None, Path::new("/x")));
         let cells = records[1]["cells"].as_array().unwrap();
-        assert_eq!(cells.len(), 8);
+        assert_eq!(cells.len(), 9);
         assert_eq!(cells[0], "old"); // NAME
         assert_eq!(cells[2], ""); // PID
         assert_eq!(cells[3], ""); // CLIENTS
         assert_eq!(cells[4], ""); // KIND
-        assert_eq!(cells[5], ""); // STARTED IN
-        assert_eq!(cells[6]["spans"][0]["text"], "connection refused (cleaning up)");
-        assert_eq!(cells[7], ""); // ECHO
+        assert_eq!(cells[5], ""); // CWD
+        assert_eq!(cells[6], ""); // STARTED IN
+        assert_eq!(cells[7]["spans"][0]["text"], "connection refused (cleaning up)");
+        assert_eq!(cells[8], ""); // ECHO
     }
 
     #[test]

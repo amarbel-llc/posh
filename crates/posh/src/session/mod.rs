@@ -370,7 +370,11 @@ struct SessionEntry {
     clients: Option<u64>,
     error: Option<String>,
     cmd: Option<String>,
+    /// The daemon's START directory (`Tag::Info` `cwd`).
     cwd: Option<String>,
+    /// ADR 0008: where the session is now (`Tag::Info` `cwd_now`); `None`
+    /// from a pre-cascade daemon or an unreachable session.
+    cwd_now: Option<String>,
     /// RFC 0013 §5 activity label (`title · process`); `None` from a
     /// pre-activity daemon or an unreachable session.
     activity: Option<String>,
@@ -546,6 +550,7 @@ fn scan_sessions(cfg: &Config) -> Result<Vec<SessionEntry>> {
                     error: None,
                     cmd: (!cmd.is_empty()).then_some(cmd),
                     cwd: (!probe.info.cwd.is_empty()).then_some(probe.info.cwd),
+                    cwd_now: probe.info.cwd_now.map(|r| r.dir),
                     activity: (!probe.info.activity.is_empty()).then_some(probe.info.activity),
                     echo,
                     kind: (probe.info.kind != SessionKind::Unknown).then_some(probe.info.kind),
@@ -559,6 +564,7 @@ fn scan_sessions(cfg: &Config) -> Result<Vec<SessionEntry>> {
                     error: Some(e.to_string()),
                     cmd: None,
                     cwd: None,
+                    cwd_now: None,
                     activity: None,
                     echo: None,
                     kind: None,
@@ -609,6 +615,7 @@ fn remote_entries(json: &str, prefix: impl Fn(&str) -> String) -> Result<Vec<Ses
                 .then(|| v["status"].as_str().unwrap_or("unreachable").to_string()),
             cmd: v["cmd"].as_str().map(str::to_string),
             cwd: v["cwd"].as_str().map(str::to_string),
+            cwd_now: v["cwd_now"].as_str().map(str::to_string),
             activity: v["activity"].as_str().map(str::to_string),
             echo: v["echo"].as_str().map(str::to_string),
             // `parse` accepts only the creatable kinds; a remote may still
@@ -643,6 +650,10 @@ fn json_list(sessions: &[SessionEntry], current: Option<&str>) -> String {
             if let Some(cwd) = &s.cwd {
                 out.push_str(",\"cwd\":");
                 out.push_str(&json_string(cwd));
+            }
+            if let Some(cwd_now) = &s.cwd_now {
+                out.push_str(",\"cwd_now\":");
+                out.push_str(&json_string(cwd_now));
             }
             if let Some(cmd) = &s.cmd {
                 out.push_str(",\"cmd\":");
@@ -730,6 +741,9 @@ fn print_session_line(s: &SessionEntry, format: ListFormat, current: Option<&str
     );
     if let Some(cwd) = &s.cwd {
         line.push_str(&format!("\tstarted_in={cwd}"));
+    }
+    if let Some(cwd_now) = &s.cwd_now {
+        line.push_str(&format!("\tcwd_now={cwd_now}"));
     }
     if let Some(cmd) = &s.cmd {
         line.push_str(&format!("\tcmd={cmd}"));
@@ -1051,6 +1065,7 @@ mod tests {
                 error: None,
                 cmd: Some("htop -d 10".to_string()),
                 cwd: Some("/home/user".to_string()),
+                cwd_now: Some("/home/user/src".to_string()),
                 activity: Some("vim ~/notes".to_string()),
                 echo: Some("optimistic auto-escalated 412ms".to_string()),
                 kind: Some(SessionKind::Anonymous),
@@ -1062,6 +1077,7 @@ mod tests {
                 error: Some("ConnectionRefused".to_string()),
                 cmd: None,
                 cwd: None,
+                cwd_now: None,
                 activity: None,
                 echo: None,
                 kind: None,
@@ -1073,6 +1089,7 @@ mod tests {
                 error: None,
                 cmd: None,
                 cwd: None,
+                cwd_now: None,
                 activity: None,
                 echo: None,
                 kind: None,
@@ -1086,7 +1103,8 @@ mod tests {
             concat!(
                 "[",
                 "{\"name\":\"alpha\",\"pid\":1234,\"clients\":2,",
-                "\"cwd\":\"/home/user\",\"cmd\":\"htop -d 10\",\"activity\":\"vim ~/notes\",",
+                "\"cwd\":\"/home/user\",\"cwd_now\":\"/home/user/src\",",
+                "\"cmd\":\"htop -d 10\",\"activity\":\"vim ~/notes\",",
                 "\"echo\":\"optimistic auto-escalated 412ms\",\"kind\":\"anonymous\",\"current\":false},",
                 "{\"name\":\"broken\",\"error\":true,\"status\":\"ConnectionRefused\"},",
                 "{\"name\":\"minimal\",\"pid\":9,\"clients\":0,\"current\":true}",
@@ -1103,7 +1121,7 @@ mod tests {
         let json = concat!(
             "[",
             "{\"name\":\"dev\",\"pid\":42,\"clients\":1,",
-            "\"cwd\":\"/home/u/w\",\"cmd\":\"htop\",\"activity\":\"vim x\",",
+            "\"cwd\":\"/home/u/w\",\"cwd_now\":\"/home/u/w/src\",\"cmd\":\"htop\",\"activity\":\"vim x\",",
             "\"echo\":\"optimistic 12ms\",\"kind\":\"named\",\"current\":false},",
             "{\"name\":\"broken\",\"error\":true,\"status\":\"ConnectionRefused\"},",
             "{\"name\":\"min\",\"pid\":9,\"clients\":0,\"current\":true}",
@@ -1114,6 +1132,8 @@ mod tests {
         assert_eq!(entries[0].name, "box:dev");
         assert_eq!(entries[0].pid, Some(42));
         assert_eq!(entries[0].cwd.as_deref(), Some("/home/u/w"));
+        assert_eq!(entries[0].cwd_now.as_deref(), Some("/home/u/w/src"));
+        assert_eq!(entries[2].cwd_now, None, "a pre-cascade remote reads as not reported");
         assert_eq!(entries[0].echo.as_deref(), Some("optimistic 12ms"));
         assert_eq!(entries[0].kind, Some(SessionKind::Named));
         assert_eq!(entries[1].name, "box:broken");
@@ -1149,6 +1169,7 @@ mod tests {
             error: None,
             cmd: None,
             cwd: None,
+            cwd_now: None,
             activity: None,
             echo: None,
             kind: None,
@@ -1203,6 +1224,7 @@ mod tests {
             error: None,
             cmd: cmd.map(str::to_string),
             cwd: None,
+            cwd_now: None,
             activity: activity.map(str::to_string),
             echo: None,
             kind: None,
