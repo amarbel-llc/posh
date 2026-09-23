@@ -505,7 +505,8 @@ pub fn take_flag(flag: &AtomicBool) -> bool {
 /// gets false. The intermediate process never returns.
 pub fn double_fork() -> Result<bool> {
     // SAFETY: the process is single-threaded at every call site (daemon and
-    // server startup, before any event loop), so fork(2) is not racing
+    // server startup, before any event loop; a session daemon's own
+    // single-threaded poll loop serving push-cmd), so fork(2) is not racing
     // allocator or lock state; the intermediate child only calls
     // async-signal-safe functions before _exit.
     unsafe {

@@ -73,6 +73,22 @@ pub fn ensure_session(
     command: Option<Vec<String>>,
     kind: SessionKind,
 ) -> Result<bool> {
+    ensure_session_in(cfg, name, command, kind, None, None)
+}
+
+/// [`ensure_session`] for a daemon creating a session on a viewport's behalf
+/// (RFC 0016 §4): the new daemon starts in `cwd` rather than the creator's
+/// own directory, and `seed` pre-marks a push-cmd token as served so a late
+/// repeat that reaches the new session is ignored. A CLI creator passes
+/// `None` for both — its cwd is the one the new daemon should inherit.
+fn ensure_session_in(
+    cfg: &Config,
+    name: &str,
+    command: Option<Vec<String>>,
+    kind: SessionKind,
+    cwd: Option<&str>,
+    seed: Option<u64>,
+) -> Result<bool> {
     let path = cfg.socket_path(name)?;
     if session::session_socket_exists(&path) {
         match session::probe_session(&path) {
@@ -116,7 +132,12 @@ pub fn ensure_session(
     // daemon holding client sockets and a PTY master — so an inherited fd
     // would pin that resource open and hide its EOF.
     util::close_inherited_fds(&[listener.as_raw_fd()]);
-    daemon_main(cfg, name, listener, command, kind);
+    // The directory was resolved (and checked to exist) by the caller; if it
+    // vanished since, the daemon keeps the creator's and reports that.
+    if let Some(dir) = cwd {
+        let _ = std::env::set_current_dir(dir);
+    }
+    daemon_main(cfg, name, listener, command, kind, seed);
 }
 
 struct ClientConn {
@@ -226,6 +247,10 @@ struct ClientConn {
     /// so `queue_frame` needs no new parameter.
     kind: SessionKind,
     kind_sent: bool,
+    /// RFC 0016 §2: this connection asked for push-cmd (`CAP_PUSH_CMD`);
+    /// the offer rides its first activity-bearing frame once (`push_offered`).
+    wants_push_cmd: bool,
+    push_offered: bool,
 }
 
 impl ClientConn {
@@ -238,6 +263,9 @@ impl ClientConn {
         // connection (the client re-sends it on every message anyway).
         if caps::find(table, caps::CAP_SESSION_ACTIVITY).is_some() {
             self.wants_activity = true;
+        }
+        if caps::find(table, caps::CAP_PUSH_CMD).is_some_and(|c| c.payload.is_empty()) {
+            self.wants_push_cmd = true;
         }
         if let Some(cap) = caps::find(table, caps::CAP_CLIENT_IDENT) {
             if let Ok(ident) = introspect::decode_client_ident(&cap.payload) {
@@ -404,6 +432,11 @@ impl ClientConn {
             if !self.kind_sent {
                 self.kind_sent = true;
                 entries.push(caps::encode_session_kind(self.kind));
+            }
+            // RFC 0016 §2: the push-cmd offer, the same placement, once.
+            if self.wants_push_cmd && !self.push_offered {
+                self.push_offered = true;
+                entries.push(caps::encode_push_cmd());
             }
             entries
         } else {
@@ -919,6 +952,35 @@ fn daemon_cwd(child_pid: libc::pid_t, term: &Terminal, start: &str) -> super::cw
     })
 }
 
+/// RFC 0016 §4.1: the token of a push-cmd request in `table` that this daemon
+/// has not served yet, recording it in `served` (which keeps the 64 most
+/// recent). `None` for no request, a malformed one, or a repeat.
+fn take_push_request(table: &[caps::Cap], served: &mut Vec<u64>) -> Option<u64> {
+    const SERVED_KEPT: usize = 64;
+    let token = caps::decode_push_cmd_request(&caps::find(table, caps::CAP_PUSH_CMD_REQUEST)?.payload)?;
+    if served.contains(&token) {
+        return None;
+    }
+    served.push(token);
+    if served.len() > SERVED_KEPT {
+        served.drain(..served.len() - SERVED_KEPT);
+    }
+    Some(token)
+}
+
+/// RFC 0016 §4.2: create the pushed session — anonymous, the next auto-id in
+/// `group`, running `$POSH_ESCAPE_CMD` (or the login shell) in `cwd`, with
+/// `token` already served. Returns its name.
+fn create_pushed_session(group: &str, cwd: &str, token: u64) -> Result<String> {
+    let cfg = Config::new(group)?;
+    let name = session::next_autoid(&cfg)?;
+    if !ensure_session_in(&cfg, &name, escape_command(), SessionKind::Anonymous, Some(cwd), Some(token))? {
+        // Another creator took the slot between the scan and the bind.
+        return Err(Error::Msg(format!("{name} already exists")));
+    }
+    Ok(name)
+}
+
 fn switch_route_target(clients: &[ClientConn], requester: usize) -> Option<usize> {
     let mut best: Option<(u64, usize)> = None;
     for (j, c) in clients.iter().enumerate() {
@@ -992,6 +1054,7 @@ fn daemon_main(
     listener: UnixListener,
     command: Option<Vec<String>>,
     kind: SessionKind,
+    seed: Option<u64>,
 ) -> ! {
     util::redirect_stdio_devnull();
     let _ = util::log_init(&cfg.log_path(name));
@@ -1077,6 +1140,7 @@ fn daemon_main(
         &cwd,
         kind,
         recorder,
+        seed,
     );
     // The status socket is introspection, not a rendezvous: always removed.
     drop(status_listener);
@@ -1174,6 +1238,7 @@ fn daemon_loop(
     cwd: &str,
     kind: SessionKind,
     mut recorder: Option<SessionRecorder>,
+    seed: Option<u64>,
 ) -> caps::SessionEnd {
     let listener_fd = listener.as_raw_fd();
     let pty_fd = child.master;
@@ -1192,6 +1257,9 @@ fn daemon_loop(
     // half, probed at most every PROBE_INTERVAL_MS while any client wants it.
     let mut activity_probe_at: u64 = 0;
     let mut activity_process = String::new();
+    // RFC 0016 §4.1: push-cmd tokens already served, seeded with the one
+    // that created this session (if one did).
+    let mut served_pushes: Vec<u64> = seed.into_iter().collect();
 
     // Why the loop ended (posh#194): reported to attached clients as the
     // `Tag::ExitCause` record ahead of `Tag::Exit`.
@@ -1408,6 +1476,8 @@ fn daemon_loop(
                     activity_sent: None,
                     kind,
                     kind_sent: false,
+                    wants_push_cmd: false,
+                    push_offered: false,
                 });
             }
         }
@@ -1537,6 +1607,7 @@ fn daemon_loop(
             let mut detach_all = false;
             let mut open_shell = false;
             let mut switch_req: Option<Vec<u8>> = None;
+            let mut push_for: Option<u64> = None;
             let total_clients = clients.len();
             {
                 let c = &mut clients[i];
@@ -1575,6 +1646,7 @@ fn daemon_loop(
                                     if c.apply_init(&frame.payload) {
                                         resized = true;
                                     }
+                                    push_for = push_for.or(take_push_request(&c.caps, &mut served_pushes));
                                     // Enable per-client frame production for a
                                     // frame-capable client; a no-op for a
                                     // baseline client (the replay/broadcast
@@ -1610,6 +1682,7 @@ fn daemon_loop(
                                     // held record kept.
                                     if let Ok((table, _)) = caps::decode_table(&frame.payload) {
                                         c.absorb_client_caps(&table, util::now_ms(), false);
+                                        push_for = push_for.or(take_push_request(&table, &mut served_pushes));
                                     }
                                 }
                                 Tag::Detach => {
@@ -1749,6 +1822,25 @@ fn daemon_loop(
                     clients[j].queue(Tag::Switch, &payload);
                 } else {
                     util::log_write("info", "switch: no attached viewport to route to");
+                }
+            }
+            // RFC 0016 §4: serve a push-cmd — a new anonymous session here,
+            // then re-home THIS connection (the requesting viewport) onto it.
+            // A requester that is already gone gets nothing created.
+            if let Some(token) = push_for.filter(|_| !remove) {
+                let here = daemon_cwd(child.pid, term, cwd).dir;
+                match create_pushed_session(group, &here, token) {
+                    Ok(pushed) => {
+                        util::log_write(
+                            "info",
+                            &format!(
+                                "push-cmd: created {pushed} in {here} for client fd={}",
+                                clients[i].stream.as_raw_fd()
+                            ),
+                        );
+                        clients[i].queue(Tag::Switch, &ipc::encode_switch_target(group, &pushed));
+                    }
+                    Err(e) => util::log_write("error", &format!("push-cmd: create failed: {e}")),
                 }
             }
             if detach_all {
@@ -2146,6 +2238,7 @@ mod tests {
                 "",
                 kind,
                 None,
+                None,
             )
         });
         TestDaemon {
@@ -2325,6 +2418,8 @@ mod tests {
             activity_sent: None,
             kind: SessionKind::Unknown,
             kind_sent: false,
+            wants_push_cmd: false,
+            push_offered: false,
         }
     }
 
@@ -2442,6 +2537,8 @@ mod tests {
             activity_sent: None,
             kind: SessionKind::Unknown,
             kind_sent: false,
+            wants_push_cmd: false,
+            push_offered: false,
         };
         let mut init = ipc::encode_resize(rows, cols).to_vec();
         init.extend_from_slice(&caps::encode_table(&caps::own_table(&[])));
@@ -2481,6 +2578,8 @@ mod tests {
             activity_sent: None,
             kind: SessionKind::Unknown,
             kind_sent: false,
+            wants_push_cmd: false,
+            push_offered: false,
         };
         let mut init = ipc::encode_resize(rows, cols).to_vec();
         init.extend_from_slice(&caps::encode_table(&caps::own_table(&[caps::Cap {
@@ -3076,6 +3175,8 @@ mod tests {
             activity_sent: None,
             kind: SessionKind::Unknown,
             kind_sent: false,
+            wants_push_cmd: false,
+            push_offered: false,
         };
         let mut init = ipc::encode_resize(rows, cols).to_vec();
         init.extend_from_slice(&caps::encode_table(&caps::own_table(&[caps::Cap {
@@ -3357,6 +3458,8 @@ mod tests {
             activity_sent: None,
             kind: SessionKind::Unknown,
             kind_sent: false,
+            wants_push_cmd: false,
+            push_offered: false,
         };
         let mut table = vec![caps::Cap {
             id: caps::CAP_LOSSY,
@@ -3471,6 +3574,74 @@ mod tests {
         let frames = decode_server_frames(&c.write_buf);
         assert!(caps::find(&frames[0].caps, caps::CAP_SESSION_ACTIVITY).is_some());
         assert!(caps::find(&frames[0].caps, caps::CAP_SESSION_KIND).is_none(), "sent once");
+    }
+
+    /// RFC 0016 §2: the push-cmd offer rides the first activity-bearing frame
+    /// once, and only to a connection that asked with `CAP_PUSH_CMD`.
+    #[test]
+    fn push_cmd_is_offered_once_beside_the_first_activity_answer_to_a_client_that_asks() {
+        let label = |process: &str| caps::SessionActivity {
+            process: process.into(),
+            title: String::new(),
+        };
+        let wants = |c: &mut ClientConn, ids: &[u8]| {
+            let table: Vec<caps::Cap> = ids.iter().map(|&id| caps::Cap { id, payload: vec![] }).collect();
+            c.absorb_client_caps(&table, 0, false);
+        };
+        let mut term = Terminal::with_scrollback(24, 80, 0);
+        term.process(b"hello");
+
+        // Asked for activity only: never offered.
+        let (mut quiet, _peer) = frame_capable_conn(24, 80);
+        wants(&mut quiet, &[caps::CAP_SESSION_ACTIVITY]);
+        quiet.activity_now = Some(label("fish"));
+        assert!(quiet.queue_frame_from(&term));
+        let frames = decode_server_frames(&quiet.write_buf);
+        assert!(caps::find(&frames[0].caps, caps::CAP_SESSION_ACTIVITY).is_some());
+        assert!(caps::find(&frames[0].caps, caps::CAP_PUSH_CMD).is_none());
+
+        // Asked for both: offered (empty payload) beside the first answer.
+        let (mut c, _peer) = frame_capable_conn(24, 80);
+        wants(&mut c, &[caps::CAP_SESSION_ACTIVITY, caps::CAP_PUSH_CMD]);
+        c.activity_now = Some(label("fish"));
+        assert!(c.queue_frame_from(&term));
+        let frames = decode_server_frames(&c.write_buf);
+        let offer = caps::find(&frames[0].caps, caps::CAP_PUSH_CMD).expect("offered on the first activity frame");
+        assert!(offer.payload.is_empty());
+        c.write_buf.clear();
+
+        // A later activity change: not offered again.
+        c.activity_now = Some(label("vim"));
+        term.process(b" more");
+        assert!(c.queue_frame_from(&term));
+        let frames = decode_server_frames(&c.write_buf);
+        assert!(caps::find(&frames[0].caps, caps::CAP_SESSION_ACTIVITY).is_some());
+        assert!(caps::find(&frames[0].caps, caps::CAP_PUSH_CMD).is_none(), "offered once");
+    }
+
+    /// RFC 0016 §4.1: each token is served once; a seed makes it served from
+    /// the start; the set keeps at least the 64 most recent.
+    #[test]
+    fn a_push_request_is_served_once_per_token() {
+        let req = |t: u64| vec![caps::encode_push_cmd_request(t)];
+        let mut served = Vec::new();
+        assert_eq!(take_push_request(&req(7), &mut served), Some(7));
+        assert_eq!(take_push_request(&req(7), &mut served), None, "a repeat");
+        assert_eq!(take_push_request(&req(8), &mut served), Some(8));
+        assert_eq!(take_push_request(&[], &mut served), None, "no request");
+        let malformed = caps::Cap { id: caps::CAP_PUSH_CMD_REQUEST, payload: vec![0; 8] };
+        assert_eq!(take_push_request(&[malformed], &mut served), None, "token 0");
+
+        let mut seeded = vec![7];
+        assert_eq!(take_push_request(&req(7), &mut seeded), None, "the seed is served");
+
+        let mut many = Vec::new();
+        for t in 1..=200u64 {
+            assert_eq!(take_push_request(&req(t), &mut many), Some(t));
+        }
+        for t in 137..=200u64 {
+            assert_eq!(take_push_request(&req(t), &mut many), None, "token {t} forgotten");
+        }
     }
 
     /// Decode the queued `Tag::Frame` records into whole `ServerFrame`s (header +
@@ -3921,6 +4092,8 @@ mod tests {
             activity_sent: None,
             kind: SessionKind::Unknown,
             kind_sent: false,
+            wants_push_cmd: false,
+            push_offered: false,
         };
         let mut init = ipc::encode_resize(rows, cols).to_vec();
         init.extend_from_slice(&caps::encode_table(&caps::own_table(&[caps::Cap {
@@ -4126,6 +4299,8 @@ mod tests {
             activity_sent: None,
             kind: SessionKind::Unknown,
             kind_sent: false,
+            wants_push_cmd: false,
+            push_offered: false,
         };
         let mut init = ipc::encode_resize(rows, cols).to_vec();
         init.extend_from_slice(&caps::encode_table(&caps::own_table(&[

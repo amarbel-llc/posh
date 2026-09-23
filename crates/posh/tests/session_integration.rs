@@ -107,6 +107,107 @@ fn a_new_session_daemon_sheds_its_creators_descriptors() {
     );
 }
 
+/// Read `Tag` frames (tag byte, u32 LE length, payload) off `stream` until one
+/// tagged `want` arrives; `None` when the read times out first.
+fn read_until_tag(stream: &mut std::os::unix::net::UnixStream, want: u8) -> Option<Vec<u8>> {
+    use std::io::Read;
+    loop {
+        let mut header = [0u8; 5];
+        stream.read_exact(&mut header).ok()?;
+        let len = u32::from_le_bytes(header[1..5].try_into().unwrap()) as usize;
+        let mut payload = vec![0u8; len];
+        stream.read_exact(&mut payload).ok()?;
+        if header[0] == want {
+            return Some(payload);
+        }
+    }
+}
+
+/// RFC 0016 §4: a push-cmd request makes the daemon create an anonymous
+/// session running `$POSH_ESCAPE_CMD` in the session's directory (ADR 0008),
+/// then re-home THE REQUESTING connection onto it with `Tag::Switch`. A
+/// repeat of the same token creates nothing.
+#[test]
+fn a_push_cmd_request_creates_a_session_here_and_rehomes_the_requester() {
+    use posh_proto::caps;
+    use std::io::Write;
+    use std::os::unix::net::UnixStream;
+    const TAG_CLIENT_CAPS: u8 = 15;
+    const TAG_SWITCH: u8 = 17;
+
+    let dir = test_dir("posh-push");
+    std::fs::create_dir_all(&dir).unwrap();
+    let dir = dir.canonicalize().unwrap();
+    let out_file = dir.join("pushed.out");
+    let probe = dir.join("probe.sh");
+    std::fs::write(
+        &probe,
+        format!(
+            "pwd > {out}.tmp; echo \"$POSH_SESSION\" >> {out}.tmp; mv {out}.tmp {out}; exec sleep 300\n",
+            out = out_file.display()
+        ),
+    )
+    .unwrap();
+
+    // The parent runs in `dir`; its daemon (and so the push) inherits the
+    // escape command. Kernel cwd on Linux, start dir elsewhere: both `dir`.
+    let out = Command::new(env!("CARGO_BIN_EXE_posh"))
+        .args(["attach", "--detach", "par", "sleep", "300"])
+        .current_dir(&dir)
+        .env("POSH_DIR", &dir)
+        .env("POSH_ESCAPE_CMD", format!("sh {}", probe.display()))
+        .env_remove("POSH_SESSION")
+        .env_remove("POSH_GROUP")
+        .output()
+        .expect("run posh");
+    assert!(out.status.success(), "attach --detach failed: {out:?}");
+
+    let sock = dir.join("default").join("par");
+    wait_for(|| UnixStream::connect(&sock).is_ok(), "the parent's socket");
+    let mut conn = UnixStream::connect(&sock).unwrap();
+    conn.set_read_timeout(Some(Duration::from_secs(5))).unwrap();
+    let request = |conn: &mut UnixStream, token: u64| {
+        let table = caps::encode_table(&[caps::encode_push_cmd_request(token)]);
+        let mut frame = vec![TAG_CLIENT_CAPS];
+        frame.extend_from_slice(&(table.len() as u32).to_le_bytes());
+        frame.extend_from_slice(&table);
+        conn.write_all(&frame).unwrap();
+    };
+
+    request(&mut conn, 7);
+    let target = read_until_tag(&mut conn, TAG_SWITCH).expect("the requester is re-homed");
+    let nul = target.iter().position(|b| *b == 0).expect("group\\0session");
+    let (group, pushed) = (
+        String::from_utf8_lossy(&target[..nul]).into_owned(),
+        String::from_utf8_lossy(&target[nul + 1..]).into_owned(),
+    );
+    assert_eq!((group.as_str(), pushed.as_str()), ("default", "s-1"));
+
+    wait_for(|| out_file.exists(), "the pushed command to run");
+    let ran = std::fs::read_to_string(&out_file).unwrap();
+    let mut lines = ran.lines();
+    assert_eq!(lines.next(), Some(dir.to_str().unwrap()), "runs in the session's directory");
+    assert_eq!(lines.next(), Some("s-1"), "as the new session");
+
+    let listed = String::from_utf8_lossy(&posh(&dir, &["list", "--json"]).stdout).into_owned();
+    assert!(
+        listed.contains("\"name\":\"s-1\"") && listed.contains("\"kind\":\"anonymous\""),
+        "the pushed session is anonymous: {listed}"
+    );
+
+    // The same token again: served already, so no second switch or session.
+    request(&mut conn, 7);
+    conn.set_read_timeout(Some(Duration::from_millis(500))).unwrap();
+    assert!(read_until_tag(&mut conn, TAG_SWITCH).is_none(), "a repeat is ignored");
+    let names = String::from_utf8_lossy(&posh(&dir, &["list", "--short"]).stdout).into_owned();
+    assert!(!names.lines().any(|l| l == "s-2"), "no second session: {names}");
+
+    drop(conn);
+    let _ = posh(&dir, &["kill", "s-1"]);
+    let _ = posh(&dir, &["kill", "par"]);
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
 #[test]
 fn daemon_lifecycle_create_list_kill() {
     let dir = test_dir("posh-itest");
@@ -145,8 +246,8 @@ fn daemon_lifecycle_create_list_kill() {
     let lines: Vec<&str> = stdout.lines().collect();
     assert_eq!(lines.len(), 2, "expected header + 1 row: {stdout}");
     let fields: Vec<&str> = lines[1].split('\t').collect();
-    // NAME STATUS PID CLIENTS KIND STARTED-IN ACTIVITY ECHO
-    assert_eq!(fields.len(), 8, "row: {fields:?}");
+    // NAME STATUS PID CLIENTS KIND CWD STARTED-IN ACTIVITY ECHO
+    assert_eq!(fields.len(), 9, "row: {fields:?}");
     assert_eq!(fields[0], "itest", "row: {fields:?}"); // NAME
     assert_eq!(fields[3], "0", "row: {fields:?}"); // CLIENTS
     // A plain `attach --detach <name>` creates a named session (2026-09-21
@@ -155,7 +256,7 @@ fn daemon_lifecycle_create_list_kill() {
     // ACTIVITY prefers the RFC 0013 activity label over the launch cmd once
     // the daemon has one (here, the foreground process name); either way it
     // names the `sleep` process.
-    assert!(fields[6].contains("sleep"), "row: {fields:?}"); // ACTIVITY
+    assert!(fields[7].contains("sleep"), "row: {fields:?}"); // ACTIVITY
 
     // Creating it again is a no-op.
     let out = posh(&dir, &["attach", "--detach", "itest"]);
