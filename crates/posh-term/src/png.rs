@@ -151,13 +151,12 @@ fn to_rgba(hdr: &Header, samples: &[u8], plte: &[u8], trns: &[u8]) -> Result<Vec
         2 => {
             // Optional tRNS: one 16-bit RGB sample that becomes transparent.
             let key = (trns.len() == 6).then(|| [trns[1], trns[3], trns[5]]);
-            for px in samples.chunks_exact(3) {
-                let a = if key == Some([px[0], px[1], px[2]]) {
-                    0
-                } else {
-                    255
-                };
-                out.extend_from_slice(&[px[0], px[1], px[2], a]);
+            let (pixels, []) = samples.as_chunks::<3>() else {
+                return Err(PngError::BadData);
+            };
+            for &[r, g, b] in pixels {
+                let a = if key == Some([r, g, b]) { 0 } else { 255 };
+                out.extend_from_slice(&[r, g, b, a]);
             }
         }
         3 => {
@@ -173,8 +172,11 @@ fn to_rgba(hdr: &Header, samples: &[u8], plte: &[u8], trns: &[u8]) -> Result<Vec
             }
         }
         4 => {
-            for px in samples.chunks_exact(2) {
-                out.extend_from_slice(&[px[0], px[0], px[0], px[1]]);
+            let (pixels, []) = samples.as_chunks::<2>() else {
+                return Err(PngError::BadData);
+            };
+            for &[g, a] in pixels {
+                out.extend_from_slice(&[g, g, g, a]);
             }
         }
         _ => out.extend_from_slice(samples),

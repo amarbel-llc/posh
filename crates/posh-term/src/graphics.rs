@@ -798,9 +798,13 @@ fn clamp_cell(v: u32) -> u16 {
 fn as_rgba(format: ImageFormat, data: &[u8]) -> Vec<u8> {
     match format {
         ImageFormat::Rgb => {
-            let mut out = Vec::with_capacity(data.len() / 3 * 4);
-            for px in data.chunks_exact(3) {
-                out.extend_from_slice(&[px[0], px[1], px[2], 255]);
+            // `finish_transmission` rejects RGB data (images and frames alike)
+            // whose length isn't `width * height * 3`, so no partial pixel.
+            let (pixels, rest) = data.as_chunks::<3>();
+            debug_assert!(rest.is_empty(), "RGB data with a partial pixel");
+            let mut out = Vec::with_capacity(pixels.len() * 4);
+            for &[r, g, b] in pixels {
+                out.extend_from_slice(&[r, g, b, 255]);
             }
             out
         }

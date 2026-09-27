@@ -925,9 +925,12 @@ pub fn decode_metrics(payload: &[u8]) -> Option<[f64; METRICS_FIELDS]> {
         return None;
     }
     let body = payload.get(1..1 + 8 * METRICS_FIELDS)?;
+    let (fields, []) = body.as_chunks::<8>() else {
+        return None;
+    };
     let mut out = [f64::NAN; METRICS_FIELDS];
-    for (slot, chunk) in out.iter_mut().zip(body.chunks_exact(8)) {
-        *slot = f64::from_le_bytes(chunk.try_into().unwrap());
+    for (slot, field) in out.iter_mut().zip(fields) {
+        *slot = f64::from_le_bytes(*field);
     }
     Some(out)
 }
