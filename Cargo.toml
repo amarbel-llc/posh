@@ -6,6 +6,14 @@ members = ["crates/posh-build", "crates/posh-term", "crates/posh-proto", "crates
 # runs cargo build/test with no --workspace); it is gated separately by the
 # .#checks.<system>.mosh-ffi flake check (just test-mosh-ffi).
 default-members = ["crates/posh-build", "crates/posh-term", "crates/posh-proto", "crates/posh", "crates/poshterity"]
+# crates/posh path-deps vendor/mephisto/v2-rust (RFC 0007), which resolves
+# inside this workspace root's directory tree — so without this exclude, Cargo
+# implicitly treats it as a workspace member, pulling its lib+tests into
+# `--workspace` builds/tests and its own source into our `-D warnings` clippy
+# gate. mephisto is a separate private repo (code.linenisgreat.com/mephisto)
+# vendored read-only via a flake input; its lints are that repo's business,
+# not ours.
+exclude = ["vendor"]
 
 [workspace.package]
 # NOT the source of truth. The real version is version.env (POSH_VERSION),
