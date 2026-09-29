@@ -9,7 +9,7 @@
     igloo.inputs.nixpkgs-master.follows = "nixpkgs-master";
     utils.url = "https://flakehub.com/f/numtide/flake-utils/0.1.102";
     utils.inputs.systems.follows = "igloo/systems";
-    nixpkgs-master.url = "github:NixOS/nixpkgs/e94cb152ed51bd6e24eb4a41f1460252beb52cd2";
+    nixpkgs-master.url = "github:NixOS/nixpkgs/7a0f122f5090cf4c2ade2a13a0e229d4e19ba71f";
 
     # conformist — the linter+formatter multiplexer (treefmt successor, RFC
     # 0001). Supplies the runner binary, its Nix module library
