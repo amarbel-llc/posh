@@ -504,22 +504,7 @@
             # `cargo clippy --fix`. The toolchain (cargo/clippy/rustc/gcc)
             # defaults to `pkgs` (igloo), the same nixpkgs the .#posh build's
             # rustc comes from, so there is no clippy-version findings delta.
-            #
-            # --no-deps: `vendor/mephisto/v2-rust` (the mephisto crate) is a
-            # `path` dependency of crates/posh, not a `[workspace] members`
-            # entry — clippy fully lints path dependencies like first-party
-            # code (unlike the git/registry deps, which it treats as
-            # external and skips), so every nixpkgs-master bump that ships a
-            # new clippy lint can break the gate on vendored code we don't
-            # maintain. --no-deps restricts clippy to the workspace members
-            # themselves; it has no effect on first-party crates, which are
-            # all workspace members already.
-            {
-              linters.clippy = {
-                enable = true;
-                extra-args = [ "--no-deps" ];
-              };
-            }
+            { linters.clippy.enable = true; }
           ];
           package = conformistPkg;
           projectRootFile = "flake.nix";

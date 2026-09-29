@@ -155,7 +155,6 @@ version = "0.1.0"
 dependencies = [
  "hyphence",
  "rust-crap",
- "serde_json",
 ]
 
 [[package]]
