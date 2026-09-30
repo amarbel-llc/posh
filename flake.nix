@@ -101,12 +101,12 @@
         # establishing spinner (crates/posh/src/remote/connect_progress.rs).
         crapPresentBin = crap.packages.${system}.crap-present;
 
-        # RFC 0007: both rust derivations (.#posh and the mosh-ffi check) build
-        # with src = ./. and load the whole workspace manifest — which includes
-        # crates/posh's path-dep on the private `mephisto` crate. vendor/mephisto
-        # is gitignored (absent from src), so populate it from the `mephisto`
-        # flake input's store path before cargo runs (no network/creds in the
-        # sandbox). Shared so the two derivations can't drift. See docs/rfcs/0007.
+        # RFC 0007: the .#posh rust derivation builds with src = ./. and loads
+        # the whole workspace manifest — which includes crates/posh's path-dep
+        # on the private `mephisto` crate. vendor/mephisto is gitignored
+        # (absent from src), so populate it from the `mephisto` flake input's
+        # store path before cargo runs (no network/creds in the sandbox). See
+        # docs/rfcs/0007.
         mephistoVendorPostPatch = ''
           mkdir -p vendor
           cp -r ${mephisto} vendor/mephisto
@@ -132,124 +132,11 @@
         # binary (cargo:rustc-env=POSH_GIT_SHA). See eng-versioning(7).
         poshGitSha = self.shortRev or self.dirtyShortRev or "unknown";
 
-        # Independent lineage: the vendored C++ mosh reference tracks
-        # UPSTREAM mosh (AC_INIT([mosh],[1.4.0]) in configure.ac), not an
-        # eng-released artifact, so it keeps its own literal rather than
-        # POSH_VERSION. The autotools build derives its own VERSION.stamp
-        # from git-describe (absent in the nix sandbox, so it falls back to
-        # "mosh 1.4.0"); this literal is only for the derivation `version`
-        # attr. (posht, by contrast, now flows from POSH_VERSION + git rev via
-        # ldflags — see the posht derivation below.) See eng-versioning(7) on
-        # polyglot lineages.
-        #
-        # Assembled from components rather than written as a bare
-        # `"1.4.0"` literal so it does not trip conformist's
-        # eng-versioning-deprecated-file linter, whose regex flags any
-        # `*Version = "x.y.z"` in flake.nix as a version that should migrate to
-        # version.env. mosh's lineage is a sanctioned exception, not drift —
-        # the components keep the real value (1.4.0) plainly visible.
-        moshVersion = lib.concatStringsSep "." [
-          "1"
-          "4"
-          "0"
-        ];
-
-        # Build-time toolchain: autoreconf stack + protoc + pkg-config, and
-        # perl because scripts/Makefile.am runs `perl -Mdiagnostics -c` on
-        # mosh.pl while generating the `mosh` client script.
-        moshNativeBuildInputs = with pkgs; [
-          autoconf
-          automake
-          pkg-config
-          protobuf
-          perl
-          makeWrapper
-        ];
-
-        # Link/runtime libraries. protobuf appears here AND in
-        # nativeBuildInputs on purpose: configure.ac hard-errors if protoc
-        # and the protobuf headers/libs are different versions, so both must
-        # come from the same package. libutempter is Linux-only (utmp
-        # entries); --with-utempter=check only warns when absent, but we pin
-        # it so utmp recording works.
-        moshBuildInputs =
-          with pkgs;
-          [
-            protobuf
-            ncurses
-            zlib
-            openssl
-          ]
-          ++ lib.optional stdenv.hostPlatform.isLinux libutempter;
-
-        mosh = pkgs.stdenv.mkDerivation {
-          pname = "mosh";
-          version = moshVersion;
-
-          # The C++ reference tree lives under zz-mosh/ (top level is the
-          # posh Rust workspace); sourcing the subtree also keeps Rust-only
-          # changes from rebuilding the C++ derivation.
-          src = ./zz-mosh;
-
-          nativeBuildInputs = moshNativeBuildInputs;
-          buildInputs = moshBuildInputs;
-
-          # autogen.sh is `exec autoreconf -fi`; run it to generate
-          # ./configure from configure.ac + the vendored m4/ macros.
-          preConfigure = ''
-            ./autogen.sh
-          '';
-
-          # openssl is the portable default crypto backend. We pin it
-          # explicitly rather than letting configure auto-detect Apple
-          # CommonCrypto on darwin, so both platforms build the same
-          # cryptography path. README "Advice to distributors".
-          configureFlags = [
-            "--with-crypto-library=openssl"
-          ];
-
-          # `make check` builds and runs the src/tests suite. Some tests
-          # drive a pty / use timing that the stricter nix build sandbox on
-          # darwin can choke on (same reason piggy and ssh-agent-mux set
-          # `doCheck = !isDarwin`). Start with checks ON everywhere; this is
-          # flipped to a darwin opt-out only if a specific test proves
-          # un-sandboxable.
-          doCheck = true;
-
-          # local.test / mouse-alternate-scroll.test exec the generated
-          # scripts/mosh, which inherits mosh.pl's `#!/usr/bin/env perl`
-          # shebang — absent in the sandbox, so inpty's execve fails and
-          # both tests FAIL instead of asserting. Patch the shebang so the
-          # --local round-trip tests really run in this lane. github #4.
-          preCheck = ''
-            patchShebangs scripts/mosh
-          '';
-
-          # The installed `mosh` client is a Perl script (generated from
-          # scripts/mosh.pl). Wrap it so perl is on PATH at runtime
-          # regardless of the user's environment — mirrors piggy's
-          # makeWrapper runtime-dep pinning.
-          postFixup = ''
-            if [ -e "$out/bin/mosh" ]; then
-              wrapProgram "$out/bin/mosh" \
-                --prefix PATH : ${lib.makeBinPath [ pkgs.perl ]}
-            fi
-          '';
-
-          meta = with lib; {
-            description = "Mobile shell: remote terminal over UDP supporting roaming and intermittent connectivity";
-            homepage = "https://mosh.org";
-            license = licenses.gpl3Plus;
-            mainProgram = "mosh";
-            platforms = platforms.linux ++ platforms.darwin;
-          };
-        };
-
         # The Rust workspace: the posh rewrite (crates/posh-term +
         # crates/posh). `cargo test --workspace` runs in the sandboxed
         # checkPhase, making this the hermetic Rust CI gate (github #33).
         # The e2e tests drive ptys and loopback UDP — both available in the
-        # Linux sandbox (the same facilities the C++ --local tests use).
+        # Linux sandbox.
         # Version single source of truth: version.env (POSH_VERSION),
         # read into poshVersion above. crates/posh/build.rs guards
         # Cargo.toml's package.version against it.
@@ -268,7 +155,7 @@
           };
 
           # RFC 0007: vendor the private mephisto crate from the flake input
-          # before cargo runs (shared with the mosh-ffi check). The dev-loop gets
+          # before cargo runs. The dev-loop gets
           # the same path via the devShell shellHook below.
           postPatch = mephistoVendorPostPatch;
 
@@ -431,8 +318,7 @@
         # posh-server / poshterity binaries and the man pages; this adds posht
         # (the Go TUI) and posh-palette (the command-palette renderer).
         # posh-term is a library compiled into posh, not a standalone binary, so
-        # it has no entry here. mosh (the upstream C++ reference) deliberately
-        # stays its own non-default output.
+        # it has no entry here.
         poshToolset = pkgs.symlinkJoin {
           name = "posh-toolset-${poshVersion}";
           paths = [
@@ -471,7 +357,7 @@
             '';
 
         # Tree-wide formatter + eng-convention linters under one runner:
-        # clang-format (C++) + nixfmt + shfmt, plus the eng preset's
+        # nixfmt + shfmt, plus the eng preset's
         # eng-versioning / flake-* / justfile-* checks. The eng preset and
         # posh's own formatters/excludes (./conformist.nix) are merged here.
         # Exposed as `formatter.${system}` (`nix fmt`, repair mode), the
@@ -514,12 +400,10 @@
         packages = {
           # Default is the full toolset (github #73) so a bare `nix build`
           # yields posh + posh-server + poshterity + posht. The individual
-          # products stay addressable; the C++ reference stays buildable as
-          # `nix build .#mosh` but out of the default.
+          # products stay addressable.
           default = poshToolset;
           posh = posh;
           poshterity = poshterity;
-          mosh = mosh;
           posht = posht;
           posh-palette = posh-palette;
 
@@ -550,68 +434,29 @@
           # justfile-*) finds a violation. Driven by `just lint-fmt` and
           # surfaced under `nix flake check`.
           formatting = conformistEval.config.build.check self;
-
-          # The C++ FFI oracle (ADR 0004). mosh-ffi is a dev/test crate kept out
-          # of the shipped .#posh build (workspace default-members), so this
-          # dedicated gate builds and runs its characterization tests
-          # (cargo test -p mosh-ffi) — which compile a slice of the zz-mosh C++
-          # via the cc crate (g++ from stdenv). src = ./. so zz-mosh is in the
-          # sandbox for build.rs's relative read. Driven by `just test-mosh-ffi`
-          # and surfaced under `nix flake check`. Lib-only oracle (no shipped
-          # binary): the value is the checkPhase passing.
-          mosh-ffi = pkgs.rustPlatform.buildRustPackage {
-            pname = "mosh-ffi-check";
-            version = poshVersion;
-            src = ./.;
-            # Same posture as .#posh: mephisto's git-sourced cargo deps resolve
-            # via builtins.fetchGit from the lockfile.
-            cargoLock = {
-              lockFile = ./Cargo.lock;
-              allowBuiltinFetchGit = true;
-            };
-            # RFC 0007: crates/posh (a workspace member this build loads even
-            # though it only compiles -p mosh-ffi) path-deps the private mephisto
-            # crate, so vendor it the same way .#posh does or the workspace
-            # manifest fails to load in the sandbox.
-            postPatch = mephistoVendorPostPatch;
-            cargoBuildFlags = [
-              "-p"
-              "mosh-ffi"
-            ];
-            cargoTestFlags = [
-              "-p"
-              "mosh-ffi"
-            ];
-            doCheck = true;
-            installPhase = "mkdir -p $out";
-          };
         };
 
         formatter = conformistEval.config.build.wrapper;
 
         devShells.default = pkgs.mkShell {
-          packages =
-            moshNativeBuildInputs
-            ++ moshBuildInputs
-            ++ [
-              pkgs.just
-              pkgs.clang-tools # clang-format for the devShell + editor LSP
-              pkgs.cargo # Rust workspace dev-loop (just debug-cargo)
-              pkgs.rustc
-              pkgs.clippy # cargo clippy: the conformist #69 gate + dev-loop lint
-              pkgs.scdoc # compile/lint doc/*.scd man pages (just lint-doc)
-              pkgs.gum # terminal UI for the maintenance recipes (eng-versioning(7))
-              pkgs.tcpdump # live-session transport triage (debug-posh-* recipes)
-              mesaBin # `posh list`'s renderer (purse-first#185); dev-loop parity
-              # with the wrapped nix package for `just debug-cargo`/`debug-posh-*`.
-              crapPresentBin # connect-progress spinner viewport (#1); dev-loop
-              # parity for `just debug-posh-run` and a live attach.
-              conformistPkg # the raw conformist runner: `nix fmt`, lint-worktree
-              # The config-specific, toolchain-hermetic git hooks on PATH under
-              # the names the sweatfile references (conformist#47/#51/#54).
-              conformistEval.config.build.preCommit # `conformist-pre-commit`
-              conformistEval.config.build.repair # `conformist-repair`
-            ];
+          packages = [
+            pkgs.just
+            pkgs.cargo # Rust workspace dev-loop (just debug-cargo)
+            pkgs.rustc
+            pkgs.clippy # cargo clippy: the conformist #69 gate + dev-loop lint
+            pkgs.scdoc # compile/lint doc/*.scd man pages (just lint-doc)
+            pkgs.gum # terminal UI for the maintenance recipes (eng-versioning(7))
+            pkgs.tcpdump # live-session transport triage (debug-posh-* recipes)
+            mesaBin # `posh list`'s renderer (purse-first#185); dev-loop parity
+            # with the wrapped nix package for `just debug-cargo`/`debug-posh-*`.
+            crapPresentBin # connect-progress spinner viewport (#1); dev-loop
+            # parity for `just debug-posh-run` and a live attach.
+            conformistPkg # the raw conformist runner: `nix fmt`, lint-worktree
+            # The config-specific, toolchain-hermetic git hooks on PATH under
+            # the names the sweatfile references (conformist#47/#51/#54).
+            conformistEval.config.build.preCommit # `conformist-pre-commit`
+            conformistEval.config.build.repair # `conformist-repair`
+          ];
           # RFC 0007: the dev-loop's mephisto source. The flake build populates
           # vendor/mephisto from the store (postPatch above); for `just
           # debug-cargo`, symlink it to the same pinned flake-input store path so

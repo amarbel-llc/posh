@@ -40,7 +40,9 @@ the current set with statuses automatically.
 
 ## Layout
 
-A Cargo workspace plus a vendored C++ reference tree and two Go helpers.
+A Cargo workspace plus two Go helpers. The porting reference is upstream
+mosh 1.4.0; the vendored C++ copy (`zz-mosh/`) and its FFI oracle were
+removed by ADR 0009.
 
 ```
 crates/
@@ -57,16 +59,12 @@ crates/
                on posh-term (#56 epic); also hosts the deterministic
                server-frame harness (framereplay, #75)
   posh-build/  the shared build.rs logic every crate's build.rs calls
-  mosh-ffi/    C++ FFI characterization tests against zz-mosh (not a default
-               workspace member; `just test-mosh-ffi`)
 doc/           scdoc man-page SOURCES, compiled by the flake
 docs/          ADRs, RFCs, FDRs, plans, manual tests — see docs/README.md
 posht/         standalone interactive terminal-capability test (Go/Bubble Tea)
 posh-palette/  the command-palette renderer (Go/Bubble Tea v2): a subprocess
                the client drives over a JSON-RPC control channel (RFC 0005)
                and composites onto the session view. Its own Go module.
-zz-mosh/       the vendored C++ mosh reference tree (the porting reference);
-               has its OWN justfile for host-lane recipes: `just zz-mosh/<r>`
 ```
 
 `posh-server` is the same binary as `posh` (a `bin/posh-server -> posh`
@@ -83,7 +81,6 @@ nix build .#posh            # hermetic build + cargo test --workspace
 just build-rust             # the .#posh lane via the justfile
 just debug-cargo test --workspace   # fast in-worktree dev-loop (not hermetic)
 just lint-doc               # compile doc/*.scd, fail on scdoc parse errors
-nix build .#mosh            # the C++ reference (.#mosh); just build-nix
 nix build .#posht           # the Go capability test; just build-go
 ```
 
@@ -92,9 +89,7 @@ not redundantly run `just` before merging; a cheap `go build` / per-crate
 `cargo build` to check compilation is fine.
 
 The `.#posh` checkPhase runs `cargo test --workspace`, so every workspace
-crate's tests gate merges. The C++ `.#mosh` check runs only the sandbox-safe
-subset; the tmux-driven emulation tests SKIP in the sandbox (wiring them in
-is #62; the macOS host failure is #2).
+crate's tests gate merges.
 
 ## Key design facts
 
@@ -180,9 +175,8 @@ there. What follows is only what is specific to this repo.
   build identity every surface renders, joined there and nowhere else,
   because a version alone does not identify a build (`just
   debug-posh-builds` censuses the several one host runs). `+` is SemVer
-  metadata: equality, NO ordering. The **only** independent lineage is the
-  vendored `zz-mosh/` tree, which keeps upstream's `1.4.0`; everything else
-  flows `POSH_VERSION`, the Go modules included (`posht` via `-ldflags -X`,
+  metadata: equality, NO ordering. Everything flows `POSH_VERSION`, the Go
+  modules included (`posht` via `-ldflags -X`,
   github #71). `version.env`
   rebase conflicts resolve to the **higher semver** via `scripts/version-merge`
   (declared in `.gitattributes`); register it per-clone with `just

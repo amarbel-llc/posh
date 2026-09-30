@@ -84,4 +84,6 @@ the README).
 - RFC 0001 (`docs/rfcs/0001-target-grammar-and-capability-table.md`) —
   the namespace and capability table posh layers on top of the mosh
   model.
-- `zz-mosh/` — the vendored mosh reference tree the audit ran against.
+- `zz-mosh/` — the vendored mosh 1.4.0 reference tree the audit ran
+  against; removed by ADR 0009 (upstream: mobile-shell/mosh, tag
+  `mosh-1.4.0`).

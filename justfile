@@ -1,9 +1,7 @@
 # posh justfile — eng conventions: verb-noun leaves under bare aggregates,
 # aggregates-only `default` (first recipe), eng-nix(7) flags on every nix
 # invocation (--show-trace always; -L on builds; --no-link on verify-only).
-# See eng-design_patterns-justfile(7) and eng-nix(7). The C++ reference
-# tree lives in zz-mosh/ with its own justfile for the host-lane recipes
-# (`just zz-mosh/<recipe>`); the hermetic .#mosh lane stays here.
+# See eng-design_patterns-justfile(7) and eng-nix(7).
 
 default: validate lint build test
 
@@ -86,14 +84,7 @@ lint-worktree:
 
 # --- build -----------------------------------------------------------------
 
-build: build-nix build-rust build-go build-palette build-toolset
-
-# hermetic C++ reference build: autogen.sh + configure + make (+ check)
-[group("build")]
-build-nix:
-    # The C++ lane; doCheck runs the sandbox-safe test subset. Sources
-    # zz-mosh/ only, so Rust-only changes don't rebuild it.
-    nix build -L --show-trace ".#mosh" -o result-mosh
+build: build-rust build-go build-palette build-toolset
 
 # hermetic Rust workspace build (cargo test --workspace in checkPhase)
 [group("build")]
@@ -132,19 +123,8 @@ build-toolset:
 
 # --- post-build ------------------------------------------------------------
 
-test: test-nix test-rust test-go test-mosh-ffi
+test: test-rust test-go
 
-# hermetic, CI-safe C++ test signal (the mosh package's doCheck)
-[group("post-build")]
-test-nix:
-    # The sandbox runs the crypto/protocol/--local subset and SKIPs the
-    # tmux emulation tests, so this lane is deterministic. Cheap once
-    # build-nix has realized the derivation.
-    nix build -L --show-trace --no-link ".#mosh"
-
-# Hermetic Rust test signal (posh checkPhase; mosh-ffi is gated separately by
-# test-mosh-ffi via workspace default-members).
-#
 # run the hermetic Rust test signal (the .#posh checkPhase)
 [group("post-build")]
 test-rust:
@@ -155,19 +135,6 @@ test-rust:
 [group("post-build")]
 test-go:
     nix build -L --show-trace --no-link ".#posht"
-
-# Hermetic mosh-ffi gate: the C++ FFI oracle's characterization tests (ADR
-# 0004). mosh-ffi is excluded from .#posh (workspace default-members), so this
-# builds the dedicated .#checks.<system>.mosh-ffi derivation, which runs
-# cargo test -p mosh-ffi (compiling the zz-mosh C++ slice via cc).
-#
-# run the mosh-ffi C++ FFI characterization tests
-[group("post-build")]
-test-mosh-ffi:
-    #!/usr/bin/env bash
-    set -euo pipefail
-    system=$(nix eval --raw --impure --expr 'builtins.currentSystem')
-    nix build -L --show-trace --no-link ".#checks.${system}.mosh-ffi"
 
 
 # --- operational -----------------------------------------------------------
@@ -213,7 +180,7 @@ run-posht-session host session="posht" *ARGS:
 
 codemod-fmt: codemod-fmt-conformist
 
-# rewrite the worktree in place via conformist (clang-format + nixfmt + shfmt)
+# rewrite the worktree in place via conformist (nixfmt + shfmt)
 [group("codemod")]
 codemod-fmt-conformist:
     # Read-only counterpart is `lint-fmt`. They share ./conformist.nix.
@@ -226,7 +193,6 @@ clean: clean-build
 # remove nix build symlinks (result, result-*) from the worktree
 [group("maintenance")]
 clean-build:
-    # The C++ tree's distclean is `just zz-mosh/clean-build`.
     rm -rf result result-*
 
 # update every flake input to its latest revision (rewrites flake.lock)
@@ -744,16 +710,6 @@ debug-cargo-flake runs="8":
       echo ">> run $i ok"
     done
     echo ">> no failure in {{ runs }} runs"
-
-# (Re)bless the mosh terminal characterization goldens (task #4). The driver is
-# the mosh-ffi C++ FFI shim, so a fixed VT script always renders the same grid
-# (no clock, no network). Assert with the normal loop: `just debug-cargo test
-# -p mosh-ffi`. Debug-only; the hermetic gate is build-rust.
-#
-# (re)bless the mosh terminal characterization goldens
-[group("debug")]
-debug-mosh-bless:
-    nix develop --command env MOSH_FFI_BLESS=1 cargo test -p mosh-ffi -- --nocapture
 
 # Prove SSH agent forwarding end-to-end (FDR 0004): run the #[ignore]'d agent
 # E2E tests in remote/server.rs, in three layers — the synthetic byte

@@ -1,8 +1,12 @@
 ---
-status: accepted
+status: superseded
+superseded-by: 0009
 date: 2026-06-16
 decision-makers: sfriedenberg
 ---
+
+> **Superseded by ADR 0009 (2026-09-30):** `zz-mosh/` and `crates/mosh-ffi`
+> were removed; the differential oracle was never built.
 
 # Use mosh's C++ as an FFI oracle for differential testing of posh
 

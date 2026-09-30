@@ -1,5 +1,5 @@
 //! Phase-5 adoption (#61): a real mosh emulation byte stream — the VT100
-//! attributes test (`zz-mosh/src/tests/emulation-attributes-vt100.test`) —
+//! attributes test (mosh 1.4.0 `src/tests/emulation-attributes-vt100.test`) —
 //! replayed deterministically. This is the `tmux capture-pane` + `sleep` race
 //! removed at the root: the screen is a pure function of the recorded bytes,
 //! so there is no live terminal and nothing to time.

@@ -19,7 +19,7 @@ pre-merge = "just"
 # posh's flake.nix exposes from `conformistEval.config.build.preCommit`, placed
 # on the devShell PATH under that name. It wraps `conformist --staged
 # --exit-zero-on-fix` with this repo's generated store-path config, so the
-# staged repair formats *.nix/*.sh/zz-mosh *.cc with the SAME pinned formatters
+# staged repair formats *.nix/*.sh with the SAME pinned formatters
 # as `nix fmt`. Do NOT revert to a bare `conformist --staged`: that resolves
 # formatters from PATH and SILENTLY SKIPS file types the shell lacks
 # (conformist#51). Requires the devShell active (direnv) so the wrapper is on

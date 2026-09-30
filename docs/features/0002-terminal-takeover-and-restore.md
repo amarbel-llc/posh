@@ -126,7 +126,7 @@ posh's alt screen throughout.
 - RFC 0001 (`docs/rfcs/0001-target-grammar-and-capability-table.md`) — the
   attach grammar this applies to.
 - mosh's `Display::open`/`close` (smcup/rmcup) in
-  `zz-mosh/src/terminal/terminaldisplay.cc` — the model for the remote
+  mosh 1.4.0 `src/terminal/terminaldisplay.cc` — the model for the remote
   client behavior.
 - `crates/posh/src/session/daemon.rs` (`ScreenSwitchFilter`) and
   `crates/posh-term/src/dump.rs` (`dump_vt_flat`, `dump_screen_switch`)

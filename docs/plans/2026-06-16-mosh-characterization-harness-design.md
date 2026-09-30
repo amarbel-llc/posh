@@ -1,6 +1,6 @@
 # mosh characterization harness — design
 
-Status: implemented — terminal + predictor slices built, the decouple refactor landed (timing.h), gated in nix/CI via `.#checks.mosh-ffi`.
+Status: removed (2026-09-30, ADR 0009) — was implemented: terminal + predictor slices built, the decouple refactor landed (timing.h), gated in nix/CI via `.#checks.mosh-ffi`. The paths below no longer exist; see git history.
 Date: 2026-06-16
 Related: ADR 0004 (FFI oracle), #75 (poshterity transport reach), #56 (poshterity epic), task #4.
 

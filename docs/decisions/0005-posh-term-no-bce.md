@@ -51,7 +51,7 @@ Good:
 
 Bad / accepted:
 
-* A deliberate behavioral divergence from the mosh reference — the differential mosh-ffi oracle (ADR 0004) will disagree on any blank-under-pen fill; that characterization must encode the intended divergence rather than treat it as a regression.
+* A deliberate behavioral divergence from the mosh reference — any differential comparison against mosh will disagree on blank-under-pen fill; such a characterization must encode the intended divergence rather than treat it as a regression. (The mosh-ffi oracle of ADR 0004 was removed by ADR 0009.)
 * On a client terminal that **is** BCE-capable (the xterm lineage), an app's *deliberate* background fill via erase/scroll-under-pen (e.g. `\x1b[48;5;236m\x1b[2J` to paint a themed background) is now dropped — the inverse-#42 tradeoff, accepted for the common (kitty) case. #115 explores restoring it per the actual client `bce`.
 
 ## Confirmation
@@ -65,6 +65,6 @@ Bad / accepted:
 * Bug + full diagnosis: posh#100 (scroll); posh#110 (the rest).
 * Follow-up: posh#115 (client-cap-aware BCE — support both non-BCE and BCE, chosen per client terminal).
 * Not #42 (backgrounds *dropped*, caused by a missing `TERM`/`COLORTERM`) nor #86 (SGR passthrough).
-* mosh reference: `zz-mosh/src/terminal/terminalframebuffer.{h,cc}` (`newrow()`, `insert_line`/`delete_line`), `terminaldisplay.cc` (`can_use_erase`/`has_bce`). mosh-ffi oracle: ADR 0004.
+* mosh reference (mosh 1.4.0): `src/terminal/terminalframebuffer.{h,cc}` (`newrow()`, `insert_line`/`delete_line`), `terminaldisplay.cc` (`can_use_erase`/`has_bce`). mosh-ffi oracle: ADR 0004, removed by ADR 0009.
 * kitty capability: `infocmp xterm-kitty` (`bce` absent) vs `xterm-256color` (`bce` present); `just debug-term-bce <term>`.
 * Repro + round-trip tooling: `just debug-posh-bleed-scroll` (synthetic), `poshterity render` / `just debug-posh-bleed-render` (server→client bytes).

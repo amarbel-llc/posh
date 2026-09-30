@@ -11,25 +11,10 @@
 # committed conformist.toml to keep in sync.
 { ... }:
 {
-  # C++ reference tree (zz-mosh/src/**/*.cc, *.h). clang-format auto-discovers
-  # zz-mosh/.clang-format (BasedOnStyle: Mozilla) by walking up from each file.
-  programs.clang-format.enable = true;
-
-  # Ship .clang-format into conformist's check sandbox. clang-format has no
-  # native read-only mode, so `conformist check` copies each candidate file
-  # into a sandbox, runs clang-format -i, and diffs — but the sandbox only
-  # carries files the formatter declares via config-files. The upstream
-  # clang-format module omits this (unlike rustfmt — conformist#28), so without
-  # it the sandbox clang-format falls back to its LLVM default and spuriously
-  # flags every Mozilla-styled zz-mosh file. Declaring it makes check mode agree
-  # with repair mode (`nix fmt`) and with native `clang-format --dry-run`.
-  settings.formatter.clang-format.config-files = [ ".clang-format" ];
-
   # nixfmt formats the flake and the nix modules themselves.
   programs.nixfmt.enable = true;
 
-  # Shell glue (zz-mosh/scripts/*.sh, autogen.sh, .envrc). 2-space indent +
-  # -s simplify. NOTE: the treefmt config also passed -ci (case-indent); the
+  # Shell glue (scripts/*, .envrc). 2-space indent + -s simplify. NOTE: the treefmt config also passed -ci (case-indent); the
   # conformist shfmt module does not expose that flag, so it is dropped — a
   # one-time reformat of the case statements in the shell glue.
   programs.shfmt = {
@@ -44,13 +29,6 @@
   linters.eng-versioning.key = "POSH_VERSION";
 
   settings.excludes = [
-    # Vendored autoconf macros — upstream-maintained, not ours to reformat.
-    "zz-mosh/m4/**"
-    # Generated protobuf C++ (built into the tree as *.pb.cc / *.pb.h).
-    "**/*.pb.cc"
-    "**/*.pb.h"
-    # Perl client script — no perl formatter wired up.
-    "zz-mosh/scripts/mosh.pl"
     # Build/CI artifacts and lockfiles.
     "result"
     "result-*"

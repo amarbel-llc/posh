@@ -17,10 +17,10 @@ Portability is the two together: mosh-style roaming carries a session across
 the *network*, zmx-style persistence carries it across *time and machines*,
 and the unified `host:session` namespace addresses both with one grammar.
 
-This repository hosts the rewrite as a Cargo workspace. The original C++
-mosh tree is kept under `zz-mosh/` as the porting reference (with its own
-justfile for the host-lane build: `just zz-mosh/<recipe>`); the original
-zmx (Zig) lives in its own repository.
+This repository hosts the rewrite as a Cargo workspace. The porting
+reference is upstream mosh 1.4.0 (https://github.com/mobile-shell/mosh,
+tag `mosh-1.4.0`); the vendored copy that used to live under `zz-mosh/` was
+removed by ADR 0009. The original zmx (Zig) lives in its own repository.
 
 ## Layout
 
@@ -30,11 +30,9 @@ crates/
   posh/        the posh binary
   posh-proto/  shared frame/display protocol: Snapshot + new_frame renderer, frame codecs (DumpDiff/MorphDelta), ServerFrame/FrameBody wire types, RFC 0001 caps (github #75)
   poshterity/    deterministic terminal recorder/replayer (lib + poshterity bin; posh rec)
-  mosh-ffi/    C++ FFI oracle: drives mosh's terminal + predictor for differential tests (dev/test only; ADR 0004)
 doc/           scdoc man-page sources (man posh, posh-server, posh-client, poshterity, posh(7))
 docs/          ADRs, RFCs, feature records (FDRs), plans, and the manual test plan
 posht/         interactive terminal-capability test (Go; nix build .#posht)
-zz-mosh/       the C++ mosh reference tree (buildable: nix build .#mosh)
 ```
 
 ### crates/posh-term
@@ -280,11 +278,10 @@ epic; adoption + the `.castx` RFC land in the final phase.
 
 ```
 nix build                   # the full toolset: posh, posh-server, poshterity, posht (#73)
-nix build .#posh            # hermetic build + cargo test (posh workspace; mosh-ffi gated separately)
+nix build .#posh            # hermetic build + cargo test (posh workspace)
 just build-rust             # same, via the justfile lane
-just debug-cargo test --workspace   # fast in-worktree dev-loop (includes mosh-ffi)
+just debug-cargo test --workspace   # fast in-worktree dev-loop
 nix run .#poshterity -- ... # the recorder/replayer as a standalone tool
-nix build .#checks.<sys>.mosh-ffi   # the C++ FFI oracle gate (just test-mosh-ffi)
 nix build .#posht           # the interactive capability test (just build-go;
                             # part of `just build`/`test`). See docs/posht.md.
 ```

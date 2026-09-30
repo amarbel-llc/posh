@@ -21,7 +21,7 @@ decision-makers: sfriedenberg
 
 * **Option 1 — Held-partial buffer on a per-read scan.** Keep the original buffer-scan; when a batch ends in a complete `ESC[<` prefix with no terminator, hold that tail and prepend it to the next batch. Bound the held buffer so an unterminated `ESC[<` can't grow forever.
 * **Option 2 — Reuse `posh_term::Parser`.** Drive the existing VT500 parser (already used to decode server output) over the input stream, inspect emitted `Action::Csi { private: b'<', .. }` for mouse events, and re-serialize everything else back to bytes.
-* **Option 3 — Purpose-built byte-fed `MouseFilter` state machine.** A small persistent state machine (`Ground → Esc → Bracket → Body → terminator`) fed one byte at a time, state living in `ClientState`. Only bytes that are part of a live `ESC[<…` match are withheld; the instant a match fails or overflows a cap, every buffered byte is flushed verbatim. Modeled on mosh's `UserInput` (`zz-mosh/src/terminal/terminaluserinput.{h,cc}`), which holds parser state across single-byte calls.
+* **Option 3 — Purpose-built byte-fed `MouseFilter` state machine.** A small persistent state machine (`Ground → Esc → Bracket → Body → terminator`) fed one byte at a time, state living in `ClientState`. Only bytes that are part of a live `ESC[<…` match are withheld; the instant a match fails or overflows a cap, every buffered byte is flushed verbatim. Modeled on mosh's `UserInput` (mosh 1.4.0 `src/terminal/terminaluserinput.{h,cc}`), which holds parser state across single-byte calls.
 
 ## Decision Outcome
 
@@ -123,7 +123,7 @@ here.
 
 * Feature: posh#50 (`POSH_GRAB_MOUSE`), motivated by posh#3/#28 (kitty ignores DECSET 1007). Split-reassembly: posh#52.
 * Implementation: `crates/posh/src/remote/client.rs` — `MouseFilter` / `MouseState`, `grab_active`, the `process_user_input` grab branch; state held in `ClientState.mouse_filter`.
-* Lineage: mosh `zz-mosh/src/terminal/terminaluserinput.{h,cc}` (byte-fed `UserInput` with persistent `state`); posh-term `crates/posh-term/src/parser.rs` (Williams VT500 machine), the same incremental pattern this filter mirrors.
+* Lineage: mosh 1.4.0 `src/terminal/terminaluserinput.{h,cc}` (byte-fed `UserInput` with persistent `state`); posh-term `crates/posh-term/src/parser.rs` (Williams VT500 machine), the same incremental pattern this filter mirrors.
 * Not chosen, revisitable: if a future need makes the lone-Esc delay perceptible in practice, the standard fix is a timeout flush in the client poll loop (the `ttimeoutlen` approach) — add it then, not pre-emptively.
 * Generalized by ADR-0003 (`0003-stream-reassembly-across-reads.md`): `MouseFilter` is one of five instances of the repo-wide "carry partials across reads" convention; 0003 records the pattern and why the instances are kept separate rather than abstracted.
 * Selection coexistence (above): the kitty capability map and the
