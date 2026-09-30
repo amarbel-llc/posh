@@ -22,9 +22,10 @@ AS_IF([test x"$PROTOC" = x],
 # automake 1.12 seems to require this, but automake 1.11 doesn't recognize it
 m4_ifdef([AM_PROG_AR], [AM_PROG_AR])
 
-# Protobuf transitively requires at least C++14, get ahead of the
-# curve and require at least C++17.
-AX_CXX_COMPILE_STDCXX([17])
+# Protobuf transitively requires at least C++14; abseil-cpp 20260817
+# (pulled in via protobuf's headers) uses C++20's <compare> types
+# (std::weak_ordering et al.), so require C++20.
+AX_CXX_COMPILE_STDCXX([20])
 
 WARNING_CXXFLAGS=""
 PICKY_CXXFLAGS=""
