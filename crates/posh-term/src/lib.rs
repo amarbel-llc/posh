@@ -26,6 +26,9 @@
 //! - `Terminal::generation(&self) -> u64` (bumped on every visible change)
 //! - `Terminal::dump_vt(&self) -> Vec<u8>` (escape stream that reconstructs
 //!   the screen, including attributes, cursor, and modes, on a real terminal)
+//! - `Terminal::dump_vt_tail(&self, max_scrollback_rows: usize) -> Vec<u8>`
+//!   (`dump_vt` with the scrollback replay bounded to the newest N rows;
+//!   the frame-transport serializer, posh#225)
 //! - `Terminal::dump_vt_flat(&self) -> Vec<u8>` (single-screen variant: active
 //!   grid only, never switches the target's buffers)
 //! - `Terminal::dump_screen_switch(&self) -> Vec<u8>` (in-place repaint that

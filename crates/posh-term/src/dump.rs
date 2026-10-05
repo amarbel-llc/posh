@@ -250,7 +250,27 @@ impl Terminal {
     /// this serializer, place content and cursor by the same anchor, and assume
     /// nothing about how many rows the target has.
     pub fn dump_vt(&self) -> Vec<u8> {
-        self.dump_vt_impl(false)
+        self.dump_vt_impl(false, usize::MAX)
+    }
+
+    /// [`Terminal::dump_vt`] with the scrollback replay bounded to the
+    /// NEWEST `max_scrollback_rows` rows of the ring.
+    ///
+    /// For frame transport (posh#225). A frame consumer mirrors the dump
+    /// into a ring-less terminal, so replayed scrollback is discarded —
+    /// except by a mirror taller than this terminal, which shows
+    /// `target_rows - self.rows()` of those rows above the grid because the
+    /// flow lands at its bottom. Pass that difference (0 for a same-height
+    /// mirror) and the mirror renders exactly as it would from `dump_vt`,
+    /// from a dump whose size follows the screen instead of the ring.
+    /// `usize::MAX` is `dump_vt`.
+    ///
+    /// The same contract as `dump_vt` otherwise: the target may be larger,
+    /// so nothing here derives a position from an assumed height — a zero
+    /// tail takes the homed `draw_grid` branch that a terminal with no
+    /// scrollback has always taken.
+    pub fn dump_vt_tail(&self, max_scrollback_rows: usize) -> Vec<u8> {
+        self.dump_vt_impl(false, max_scrollback_rows)
     }
 
     /// Like [`Terminal::dump_vt`] but single-screen: draws only the active
@@ -268,11 +288,11 @@ impl Terminal {
     /// overlay source swap all get it, and none of them can forget it.
     pub fn dump_vt_flat(&self) -> Vec<u8> {
         let mut out = Vec::from(DRAWABLE_STATE_RESET);
-        out.extend_from_slice(&self.dump_vt_impl(true));
+        out.extend_from_slice(&self.dump_vt_impl(true, 0));
         out
     }
 
-    fn dump_vt_impl(&self, flat: bool) -> Vec<u8> {
+    fn dump_vt_impl(&self, flat: bool, max_scrollback_rows: usize) -> Vec<u8> {
         let mut out = String::new();
         let mut st = EmitState {
             style: Style::default(),
@@ -329,19 +349,21 @@ impl Terminal {
         // newline because scrolled-in blank lines inherit the pen's
         // background (BCE). github #22.
         let sb_len = self.primary.scrollback_len();
+        let replay = sb_len.min(max_scrollback_rows);
         // The scrollback-flow branch places the grid by a continuous newline
         // flow that lands at the target's BOTTOM (height-dependent), so its
         // cursor must be anchored relative to that flow, not by an absolute CUP
         // (the multi-client taller-target offset bug). The `\x1b[H`-homed
-        // else-branch, and the alt path below (which re-homes + redraws the alt
-        // grid), stay absolute.
-        let cursor_anchor = if sb_len > 0 && !self.alt_active {
+        // else-branch — taken whenever no scrollback rows are replayed — and
+        // the alt path below (which re-homes + redraws the alt grid), stay
+        // absolute.
+        let cursor_anchor = if replay > 0 && !self.alt_active {
             CursorAnchor::Relative
         } else {
             CursorAnchor::Absolute
         };
-        if sb_len > 0 {
-            for i in 0..sb_len {
+        if replay > 0 {
+            for i in (sb_len - replay)..sb_len {
                 let row = self.primary.scrollback_row(i).unwrap();
                 self.emit_terminated_row(&mut out, row, &mut st);
             }
@@ -1193,5 +1215,78 @@ mod cursor_mismatch_tests {
         );
         assert_eq!(replay.cursor().col, s.cursor().col, "and the column");
         assert!(cursor_row_text(&replay).contains("prompt$"));
+    }
+
+    /// Mirror `dump` into a fresh ring-less terminal — what every frame
+    /// consumer does (FDR 0005) — and return its visible state.
+    fn mirror_flat(rows: u16, cols: u16, dump: &[u8]) -> Vec<u8> {
+        let mut t = Terminal::with_scrollback(rows, cols, 0);
+        t.process(dump);
+        t.dump_vt_flat()
+    }
+
+    fn scrolled(rows: u16, cols: u16, ring: usize, lines: usize) -> Terminal {
+        let mut t = Terminal::with_scrollback(rows, cols, ring);
+        for i in 0..lines {
+            t.process(format!("line {i:05} of scrolled output\r\n").as_bytes());
+        }
+        t.process(b"prompt$ ");
+        t
+    }
+
+    /// The whole ring is `usize::MAX` rows of tail: byte-identical to
+    /// `dump_vt`, which `posh history` and the frozen API depend on.
+    #[test]
+    fn tail_dump_with_no_bound_is_dump_vt() {
+        let t = scrolled(24, 80, 1000, 500);
+        assert_eq!(t.dump_vt_tail(usize::MAX), t.dump_vt());
+    }
+
+    /// A same-height mirror needs no scrollback at all: the zero-tail dump
+    /// renders exactly what the full dump renders.
+    #[test]
+    fn zero_tail_dump_renders_like_the_full_dump_at_the_same_height() {
+        let t = scrolled(24, 80, 1000, 500);
+        assert_eq!(
+            mirror_flat(24, 80, &t.dump_vt_tail(0)),
+            mirror_flat(24, 80, &t.dump_vt()),
+        );
+    }
+
+    /// A mirror TALLER than the source shows `extra` scrollback rows above
+    /// the grid (the flow lands at the target's bottom). A tail of exactly
+    /// `extra` rows reproduces that; this is the multi-client case.
+    #[test]
+    fn tail_dump_renders_like_the_full_dump_on_a_taller_mirror() {
+        let t = scrolled(24, 80, 1000, 500);
+        for target_rows in [25u16, 32, 50] {
+            let extra = usize::from(target_rows - 24);
+            assert_eq!(
+                mirror_flat(target_rows, 80, &t.dump_vt_tail(extra)),
+                mirror_flat(target_rows, 80, &t.dump_vt()),
+                "target_rows={target_rows}",
+            );
+        }
+    }
+
+    /// The point of the bound: the dump's size follows the screen, not the
+    /// ring. (posh#225: a 10,000-row ring made every frame ~1 MiB.)
+    #[test]
+    fn tail_dump_size_is_independent_of_ring_depth() {
+        let t = scrolled(50, 200, 10_000, 20_000);
+        assert!(t.dump_vt().len() > 200_000, "premise: the full dump carries the ring");
+        assert!(
+            t.dump_vt_tail(0).len() < 16_384,
+            "zero-tail dump was {} bytes",
+            t.dump_vt_tail(0).len(),
+        );
+    }
+
+    /// Fewer scrollback rows than the requested tail: replay what exists.
+    #[test]
+    fn tail_dump_clamps_to_the_rows_the_ring_holds() {
+        let t = scrolled(24, 80, 1000, 30); // only a handful of rows have scrolled off
+        assert!(t.primary_scrollback_len() > 0 && t.primary_scrollback_len() < 10);
+        assert_eq!(t.dump_vt_tail(10), t.dump_vt());
     }
 }
