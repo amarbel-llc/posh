@@ -38,9 +38,10 @@ struct ProducedFrame {
     num: u64,
     /// The visible-screen frame dump as of this frame — the bytes the caller
     /// built for this client (the session daemon's `dump_vt_mirror` output for
-    /// the client's geometry) — and the diff base for a later `Diff`. A scrollback frame leaves the visible screen unchanged, so
-    /// it records the same visible bytes as the frame before it, keeping the
-    /// diff-base chain intact across interleaved scrollback frames.
+    /// the client's geometry) — and the diff base for a later `Diff`. A
+    /// scrollback frame leaves the visible screen unchanged, so it records the
+    /// same visible bytes as the frame before it, keeping the diff-base chain
+    /// intact across interleaved scrollback frames.
     data: Vec<u8>,
     /// The rendered screen state as of this frame — the morph base for a later
     /// `Morph` (#15), captured alongside `data` so acking this frame gives the
@@ -70,8 +71,9 @@ pub struct FrameProducer {
     current: ProducedFrame,
     /// Last frame the client confirmed.
     acked_num: u64,
-    /// The acked frame's `dump_vt` bytes (the byte-diff base), or `None` when the
-    /// server no longer holds the acked frame's state and must send a `Full`.
+    /// The acked frame's dump (its `ProducedFrame::data`, the byte-diff base),
+    /// or `None` when the server no longer holds the acked frame's state and
+    /// must send a `Full`.
     acked_data: Option<Vec<u8>>,
     /// The acked frame's morph base — rendered snapshot + off-`Snapshot`
     /// alt-screen/dims. `Some` exactly when `acked_data` is.
