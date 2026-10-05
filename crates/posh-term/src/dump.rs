@@ -253,23 +253,49 @@ impl Terminal {
         self.dump_vt_impl(false, usize::MAX)
     }
 
-    /// [`Terminal::dump_vt`] with the scrollback replay bounded to the
-    /// NEWEST `max_scrollback_rows` rows of the ring.
+    /// [`Terminal::dump_vt`] for a consumer that mirrors the dump into a
+    /// RING-LESS terminal of `mirror_rows` x `mirror_cols` (frame transport,
+    /// FDR 0005): the cheapest dump from which that mirror renders what it
+    /// would render from `dump_vt`.
     ///
-    /// For frame transport (posh#225). A frame consumer mirrors the dump
-    /// into a ring-less terminal, so replayed scrollback is discarded —
-    /// except by a mirror taller than this terminal, which shows
-    /// `target_rows - self.rows()` of those rows above the grid because the
-    /// flow lands at its bottom. Pass that difference (0 for a same-height
-    /// mirror) and the mirror renders exactly as it would from `dump_vt`,
-    /// from a dump whose size follows the screen instead of the ring.
-    /// `usize::MAX` is `dump_vt`.
+    /// A ring-less mirror discards replayed scrollback, except that a mirror
+    /// taller than this terminal shows `mirror_rows - self.rows()` of those
+    /// rows above the grid, because the flow lands at its bottom. So for a
+    /// mirror of the SAME WIDTH and at least this height, only that many of
+    /// the newest scrollback rows are replayed (none at the same height, where
+    /// the grid is drawn from home exactly as when the ring is empty), and the
+    /// dump's size follows the screen instead of the ring — posh#225, where a
+    /// 10,000-row ring made every frame ~1 MiB.
     ///
-    /// The same contract as `dump_vt` otherwise: the target may be larger,
-    /// so nothing here derives a position from an assumed height — a zero
-    /// tail takes the homed `draw_grid` branch that a terminal with no
-    /// scrollback has always taken.
-    pub fn dump_vt_tail(&self, max_scrollback_rows: usize) -> Vec<u8> {
+    /// Every other geometry gets `dump_vt`'s bytes, because a row count cannot
+    /// express what the full replay does there. On a wider mirror a
+    /// soft-wrapped row rejoins its continuation, so the replay makes fewer
+    /// lines than rows were counted and `dump_vt` fills the freed lines from
+    /// older ring rows a row tail does not carry: the tail's content lands a
+    /// row high over a blank bottom row. On a shorter mirror `dump_vt` anchors
+    /// the cursor to its bottom-landing flow while the homed grid places it
+    /// absolutely, so the two leave the cursor on different rows. (A narrower
+    /// mirror re-wraps too and falls back the same way; that case is not
+    /// separately demonstrated.) Session geometry on the frame (RFC 0012)
+    /// would make every mirror session-sized and retire the fallback.
+    ///
+    /// Known divergence at the same geometry: `dump_vt`'s replay branch
+    /// misplaces the cursor under a scroll region with a non-default top
+    /// margin (posh#228); the homed branch taken here does not.
+    pub fn dump_vt_mirror(&self, mirror_rows: u16, mirror_cols: u16) -> Vec<u8> {
+        let tail = if mirror_cols == self.cols() && mirror_rows >= self.rows() {
+            usize::from(mirror_rows - self.rows())
+        } else {
+            usize::MAX
+        };
+        self.dump_vt_tail(tail)
+    }
+
+    /// [`Terminal::dump_vt`] with the scrollback replay bounded to the NEWEST
+    /// `max_scrollback_rows` rows of the ring; `usize::MAX` is `dump_vt`. Only
+    /// [`Terminal::dump_vt_mirror`]'s geometry rule makes a bound safe — the
+    /// `a_row_tail_cannot_reproduce_*` tests show where a bare row count fails.
+    fn dump_vt_tail(&self, max_scrollback_rows: usize) -> Vec<u8> {
         self.dump_vt_impl(false, max_scrollback_rows)
     }
 
@@ -918,6 +944,7 @@ fn emit_apc_chunks(out: &mut String, keys: &str, data: &[u8]) {
 
 #[cfg(test)]
 mod cursor_mismatch_tests {
+    use crate::cell::Color;
     use crate::terminal::Terminal;
 
     /// Dump `session` and replay it into a fresh `target_rows x target_cols`
@@ -1234,90 +1261,166 @@ mod cursor_mismatch_tests {
         t
     }
 
-    /// The whole ring is `usize::MAX` rows of tail: byte-identical to
-    /// `dump_vt`, which `posh history` and the frozen API depend on.
-    #[test]
-    fn tail_dump_with_no_bound_is_dump_vt() {
-        let t = scrolled(24, 80, 1000, 500);
-        assert_eq!(t.dump_vt_tail(usize::MAX), t.dump_vt());
+    /// Mirror `dump` into a fresh ring-less terminal and return it.
+    fn mirror(rows: u16, cols: u16, dump: &[u8]) -> Terminal {
+        let mut t = Terminal::with_scrollback(rows, cols, 0);
+        t.process(dump);
+        t
     }
 
-    /// A same-height mirror needs no scrollback at all: the zero-tail dump
-    /// renders exactly what the full dump renders.
-    #[test]
-    fn zero_tail_dump_renders_like_the_full_dump_at_the_same_height() {
-        let t = scrolled(24, 80, 1000, 500);
-        assert_eq!(
-            mirror_flat(24, 80, &t.dump_vt_tail(0)),
-            mirror_flat(24, 80, &t.dump_vt()),
-        );
+    /// Each visible row's text, trailing blanks trimmed.
+    fn rows_text(t: &Terminal) -> Vec<String> {
+        (0..t.rows())
+            .map(|r| t.screen().row(r).unwrap().text(false).trim_end().to_string())
+            .collect()
     }
 
-    /// A mirror TALLER than the source shows `extra` scrollback rows above
-    /// the grid (the flow lands at the target's bottom). A tail of exactly
-    /// `extra` rows reproduces that; this is the multi-client case.
-    #[test]
-    fn tail_dump_renders_like_the_full_dump_on_a_taller_mirror() {
-        let t = scrolled(24, 80, 1000, 500);
-        for target_rows in [25u16, 32, 50] {
-            let extra = usize::from(target_rows - 24);
-            assert_eq!(
-                mirror_flat(target_rows, 80, &t.dump_vt_tail(extra)),
-                mirror_flat(target_rows, 80, &t.dump_vt()),
-                "target_rows={target_rows}",
+    /// The source's heights {same, +1, +8, +26} at its own width — the
+    /// geometries where `dump_vt_mirror` bounds the replay.
+    fn bounded_heights(t: &Terminal) -> [u16; 4] {
+        let r = t.rows();
+        [r, r + 1, r + 8, r + 26]
+    }
+
+    /// At each bounded height, the mirror of `dump_vt_mirror` must show what
+    /// the mirror of `dump_vt` shows, from a dump that really is bounded (so a
+    /// regression to "always the full dump" cannot pass silently).
+    fn assert_mirror_renders_like_full(t: &Terminal, heights: &[u16]) {
+        let full = t.dump_vt();
+        for &rows in heights {
+            let bounded = t.dump_vt_mirror(rows, t.cols());
+            assert!(
+                bounded.len() < full.len(),
+                "rows={rows}: the bounded dump ({} bytes) must be shorter than dump_vt ({} bytes)",
+                bounded.len(),
+                full.len(),
             );
+            assert_eq!(
+                mirror_flat(rows, t.cols(), &bounded),
+                mirror_flat(rows, t.cols(), &full),
+                "rows={rows}",
+            );
+        }
+    }
+
+    #[test]
+    fn mirror_dump_renders_like_the_full_dump_at_bounded_geometries() {
+        let t = scrolled(24, 80, 1000, 500);
+        assert_mirror_renders_like_full(&t, &bounded_heights(&t));
+    }
+
+    /// The cursor mid-screen, so the same-height mirror's homed grid and
+    /// absolute CUP are compared against the full dump's flow and relative
+    /// anchor, not two paths that happen to agree on the bottom row.
+    #[test]
+    fn mirror_dump_renders_a_mid_screen_cursor_like_the_full_dump() {
+        let mut t = scrolled(24, 80, 1000, 500);
+        t.process(b"\x1b[10;20H");
+        assert_mirror_renders_like_full(&t, &bounded_heights(&t));
+    }
+
+    /// Every geometry outside "same width, at least as tall" gets `dump_vt`'s
+    /// exact bytes. (This also covers the unbounded row tail being `dump_vt`,
+    /// which `posh history` and the frozen API depend on.)
+    #[test]
+    fn mirror_dump_falls_back_to_dump_vt_outside_bounded_geometries() {
+        let t = scrolled(24, 80, 1000, 500);
+        let full = t.dump_vt();
+        for (rows, cols) in [(10, 80), (23, 80), (24, 120), (32, 120), (24, 60), (32, 60)] {
+            assert!(t.dump_vt_mirror(rows, cols) == full, "{rows}x{cols} must be dump_vt's bytes");
         }
     }
 
     /// The point of the bound: the dump's size follows the screen, not the
     /// ring. (posh#225: a 10,000-row ring made every frame ~1 MiB.)
     #[test]
-    fn tail_dump_size_is_independent_of_ring_depth() {
+    fn mirror_dump_size_is_independent_of_ring_depth() {
         let t = scrolled(50, 200, 10_000, 20_000);
         assert!(t.dump_vt().len() > 200_000, "premise: the full dump carries the ring");
-        assert!(
-            t.dump_vt_tail(0).len() < 16_384,
-            "zero-tail dump was {} bytes",
-            t.dump_vt_tail(0).len(),
-        );
+        let bounded = t.dump_vt_mirror(50, 200);
+        assert!(bounded.len() < 16_384, "same-geometry dump was {} bytes", bounded.len());
     }
 
-    /// Fewer scrollback rows than the requested tail: replay what exists.
+    /// A taller mirror whose extra rows exceed what the ring holds: replay
+    /// what exists, which is all of it.
     #[test]
-    fn tail_dump_clamps_to_the_rows_the_ring_holds() {
+    fn mirror_dump_clamps_to_the_rows_the_ring_holds() {
         let t = scrolled(24, 80, 1000, 30); // only a handful of rows have scrolled off
         assert!(t.primary_scrollback_len() > 0 && t.primary_scrollback_len() < 10);
-        assert_eq!(t.dump_vt_tail(10), t.dump_vt());
+        assert!(t.dump_vt_mirror(34, 80) == t.dump_vt());
     }
 
-    /// For each target height, mirror the tail dump — with the tail callers
-    /// compute, `target_rows - source_rows` saturating at 0 — and the full
-    /// dump, and require the same visible state.
-    fn assert_tail_renders_like_full(t: &Terminal, target_rows: &[u16]) {
-        for &rows in target_rows {
-            let tail = usize::from(rows).saturating_sub(usize::from(t.rows()));
-            assert_eq!(
-                mirror_flat(rows, t.cols(), &t.dump_vt_tail(tail)),
-                mirror_flat(rows, t.cols(), &t.dump_vt()),
-                "target_rows={rows} tail={tail}",
-            );
+    /// A scrolled 24x80 session whose grid holds a soft-wrapped line.
+    fn wrapped_grid_session() -> Terminal {
+        let mut t = scrolled(24, 80, 1000, 500);
+        t.process(b"\r\n");
+        t.process(format!("WRAPPED{}\r\n", "w".repeat(113)).as_bytes());
+        for i in 0..4 {
+            t.process(format!("after {i}\r\n").as_bytes());
+        }
+        t.process(b"prompt$ ");
+        t
+    }
+
+    /// Why a WIDER mirror falls back (reviewer finding C1): a soft-wrapped
+    /// row rejoins its continuation on the wider mirror, so a row tail of
+    /// `mirror_rows - rows` makes one line too few. `dump_vt` fills that
+    /// line from an older ring row; the row tail leaves the content a row
+    /// high over a blank bottom row. Do not "optimise" the fallback away
+    /// without making this pass the other way.
+    #[test]
+    fn a_row_tail_cannot_reproduce_a_wider_mirror() {
+        let t = wrapped_grid_session();
+        for (rows, tail) in [(32u16, 8usize), (24, 0)] {
+            let row_tail = rows_text(&mirror(rows, 120, &t.dump_vt_tail(tail)));
+            let full = rows_text(&mirror(rows, 120, &t.dump_vt()));
+            let bottom = usize::from(rows) - 1;
+            assert_eq!(full[bottom], "prompt$", "{rows}x120: dump_vt lands the prompt at the bottom");
+            assert_eq!(row_tail[bottom], "", "{rows}x120: the row tail leaves the bottom row blank");
+            assert_eq!(row_tail[bottom - 1], "prompt$", "{rows}x120: one row high");
         }
     }
 
-    /// A mirror SHORTER than the source (a client smaller than the session,
-    /// transiently): the tail is 0, and the homed grid must overflow the
-    /// short target exactly as the bottom-landing flow does.
+    /// Why a SHORTER mirror falls back (reviewer finding C2): a zero tail
+    /// takes the homed grid and an absolute CUP, `dump_vt` the bottom-landing
+    /// flow and a relative anchor, and on a short target they part ways:
+    /// source row 5 of 24 lands on mirror row 5 from the row tail and row 0
+    /// (CUU clamped at the top) from `dump_vt`.
     #[test]
-    fn tail_dump_renders_like_the_full_dump_on_a_shorter_mirror() {
-        let t = scrolled(24, 80, 1000, 500);
-        assert_tail_renders_like_full(&t, &[10, 23]);
+    fn a_row_tail_cannot_reproduce_a_shorter_mirrors_cursor() {
+        let mut t = scrolled(24, 80, 1000, 500);
+        t.process(b"\x1b[6;1H");
+        let row_tail = mirror(10, 80, &t.dump_vt_tail(0));
+        let full = mirror(10, 80, &t.dump_vt());
+        assert_eq!(rows_text(&row_tail), rows_text(&full), "the text agrees");
+        assert_eq!((row_tail.cursor().row, full.cursor().row), (5, 0));
+    }
+
+    /// Reviewer finding C3 claimed a shorter mirror would also differ in
+    /// background colour (`draw_grid`'s `\r\n` without a pen reset). It does
+    /// not reproduce in a posh-term mirror, whose scrolled-in lines never
+    /// take the pen's background; only the C2 cursor difference remains.
+    #[test]
+    fn a_row_tail_on_a_shorter_mirror_differs_only_in_the_cursor() {
+        let mut t = scrolled(24, 80, 1000, 500);
+        t.process(b"\x1b[16;1H\x1b[2K\x1b[41mX\x1b[0m\x1b[17;1H\x1b[2Khi");
+        let row_tail = mirror(10, 80, &t.dump_vt_tail(0));
+        let full = mirror(10, 80, &t.dump_vt());
+        let backgrounds = |m: &Terminal| -> Vec<Vec<Color>> {
+            (0..m.rows())
+                .map(|r| (0..m.cols()).map(|c| m.screen().cell(r, c).unwrap().style.bg).collect())
+                .collect()
+        };
+        assert_eq!(rows_text(&row_tail), rows_text(&full));
+        assert_eq!(backgrounds(&row_tail), backgrounds(&full));
+        assert_ne!(row_tail.cursor(), full.cursor());
     }
 
     /// Soft wraps (one straddling the scrollback/grid seam, one inside the
     /// grid), SGR left active at a row's end, wide characters at the right
     /// margin, and a cursor left mid-line.
     #[test]
-    fn tail_dump_renders_rich_content_like_the_full_dump() {
+    fn mirror_dump_renders_rich_content_like_the_full_dump() {
         let mut t = Terminal::with_scrollback(24, 80, 1000);
         for i in 0..60 {
             t.process(
@@ -1352,28 +1455,35 @@ mod cursor_mismatch_tests {
             t.screen().row(23).unwrap().text(false).starts_with("prompt$"),
             "test setup: the prompt is on the bottom row",
         );
-        assert_tail_renders_like_full(&t, &[24, 25, 32, 50]);
+        assert_mirror_renders_like_full(&t, &bounded_heights(&t));
     }
 
     /// Pending wrap at the last column of the bottom row, with scrollback.
     #[test]
-    fn tail_dump_renders_pending_wrap_like_the_full_dump() {
+    fn mirror_dump_renders_pending_wrap_like_the_full_dump() {
         let mut t = scrolled(24, 80, 1000, 100);
         t.process(b"\r\n");
         t.process(&[b'W'; 80]);
         assert_eq!((t.cursor().row, t.cursor().col), (23, 79));
-        assert_tail_renders_like_full(&t, &[24, 25, 32, 50]);
+        assert_mirror_renders_like_full(&t, &bounded_heights(&t));
     }
 
-    /// The alt screen active over a primary with scrollback: the tail rule
-    /// still replays primary rows behind the alt screen when taller, and the
-    /// visible alt state must match either way.
+    /// The alt screen active over a primary with scrollback. The visible alt
+    /// state must match, and so must the primary the bounded dump replayed
+    /// BEHIND it: leaving the alt screen on both mirrors exposes it.
     #[test]
-    fn tail_dump_renders_the_alt_screen_like_the_full_dump() {
+    fn mirror_dump_renders_the_alt_screen_like_the_full_dump() {
         let mut t = scrolled(24, 80, 1000, 500);
         t.process(b"\x1b[?1049h");
         t.process(b"\x1b[3;10HALT-TOP\x1b[24;1HALT-BOTTOM\x1b[12;5HALT-CURSOR");
-        assert_tail_renders_like_full(&t, &[24, 25, 32, 50]);
+        assert_mirror_renders_like_full(&t, &bounded_heights(&t));
+        for rows in bounded_heights(&t) {
+            let mut bounded = mirror(rows, 80, &t.dump_vt_mirror(rows, 80));
+            let mut full = mirror(rows, 80, &t.dump_vt());
+            bounded.process(b"\x1b[?1049l");
+            full.process(b"\x1b[?1049l");
+            assert_eq!(bounded.dump_vt_flat(), full.dump_vt_flat(), "primary at rows={rows}");
+        }
     }
 
     /// A scrolled session with a non-default scroll region and origin mode,
@@ -1385,35 +1495,29 @@ mod cursor_mismatch_tests {
         t
     }
 
-    /// Mirror `dump` into a fresh ring-less terminal and return it.
-    fn mirror(rows: u16, cols: u16, dump: &[u8]) -> Terminal {
-        let mut t = Terminal::with_scrollback(rows, cols, 0);
-        t.process(dump);
-        t
-    }
-
-    /// Scroll region + origin mode at the source height: the zero-tail dump
+    /// Scroll region + origin mode at the source geometry: the bounded dump
     /// takes the homed `draw_grid` branch with an absolute CUP, so it is
     /// asserted against the SOURCE. Equality with `dump_vt` is deliberately
     /// NOT asserted: `dump_vt`'s scrollback-replay branch moves the cursor
     /// with a CUU that the restored top margin clamps, leaving it on the
     /// margin (posh#228).
     #[test]
-    fn zero_tail_dump_reproduces_a_scroll_region_at_the_same_height() {
+    fn mirror_dump_reproduces_a_scroll_region_at_the_same_geometry() {
         let t = region_session();
-        let m = mirror(24, 80, &t.dump_vt_tail(0));
+        let m = mirror(24, 80, &t.dump_vt_mirror(24, 80));
         assert_eq!(m.cursor(), t.cursor());
         assert_eq!(m.dump_vt_flat(), t.dump_vt_flat());
     }
 
-    /// Scroll region + origin mode on taller mirrors: the tail and the full
+    /// Scroll region + origin mode on taller mirrors: the bounded and the full
     /// dump both take the scrollback-replay branch, so this pins that the
-    /// tail preserves `dump_vt`'s behaviour. Both currently inherit posh#228's
-    /// clamped cursor; fixing posh#228 in the shared branch should keep this
-    /// green.
+    /// bound preserves `dump_vt`'s behaviour. Both currently inherit
+    /// posh#228's clamped cursor; fixing posh#228 in the shared branch should
+    /// keep this green.
     #[test]
-    fn tail_dump_renders_a_scroll_region_like_the_full_dump_on_a_taller_mirror() {
-        assert_tail_renders_like_full(&region_session(), &[25, 32, 50]);
+    fn mirror_dump_renders_a_scroll_region_like_the_full_dump_on_a_taller_mirror() {
+        let t = region_session();
+        assert_mirror_renders_like_full(&t, &bounded_heights(&t)[1..]);
     }
 
     /// The correct behaviour `dump_vt` should have under a scroll region: the
