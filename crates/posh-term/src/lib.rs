@@ -26,14 +26,6 @@
 //! - `Terminal::generation(&self) -> u64` (bumped on every visible change)
 //! - `Terminal::dump_vt(&self) -> Vec<u8>` (escape stream that reconstructs
 //!   the screen, including attributes, cursor, and modes, on a real terminal)
-//! - `Terminal::dump_vt_mirror(&self, mirror_rows: u16, mirror_cols: u16) -> Vec<u8>`
-//!   (`dump_vt` for a ring-less mirror of that size, with the scrollback
-//!   replay bounded where that is proven equivalent; the frame-transport
-//!   serializer, posh#225) — PROVISIONAL until RFC 0012: the geometry rule
-//!   may change or be retired
-//! - `Terminal::dump_vt_mirror_is_bounded(&self, mirror_rows: u16, mirror_cols: u16) -> bool`
-//!   (whether `dump_vt_mirror` bounds the replay for that geometry) —
-//!   PROVISIONAL until RFC 0012: it may change or be retired with the rule
 //! - `Terminal::dump_vt_flat(&self) -> Vec<u8>` (single-screen variant: active
 //!   grid only, never switches the target's buffers)
 //! - `Terminal::dump_screen_switch(&self) -> Vec<u8>` (in-place repaint that
@@ -57,6 +49,19 @@
 //!   into poshterity's `.castx` `emu_rev` header for golden auditing)
 //! - `Color::to_rgb(self) -> Option<(u8,u8,u8)>` (palette/RGB resolution for
 //!   renderers; `None` for the terminal default)
+//!
+//! # Provisional API (not frozen)
+//!
+//! Public and used by the `posh` binary, but NOT part of the frozen
+//! contract: the frame-dump geometry rule is a bridge that session geometry
+//! on the frame (RFC 0012) is expected to change or retire.
+//!
+//! - `Terminal::dump_vt_mirror(&self, mirror_rows: u16, mirror_cols: u16) -> Vec<u8>`
+//!   (`dump_vt` for a ring-less mirror of that size, with the scrollback
+//!   replay bounded where that is proven equivalent; the frame-transport
+//!   serializer, posh#225)
+//! - `Terminal::dump_vt_mirror_is_bounded(&self, mirror_rows: u16, mirror_cols: u16) -> bool`
+//!   (whether `dump_vt_mirror` bounds the replay for that geometry)
 #![forbid(unsafe_code)]
 
 /// Placeholder cell size in pixels, shared by the XTWINOPS reports, kitty

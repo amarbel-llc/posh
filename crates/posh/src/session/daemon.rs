@@ -260,12 +260,18 @@ struct ClientConn {
     push_offered: bool,
     /// The geometry the newest visible dump built for this client was SHAPED
     /// FOR: `Some((rows, cols))` when `dump_vt_mirror` bounded it for that
-    /// mirror size, `None` when it was the full fallback (which renders on a
-    /// mirror of any size) or no visible dump has been built. Recorded where
+    /// mirror size, `None` when it was the full fallback (whose in-flight
+    /// frames still apply at any size) or no visible dump has been built. Recorded where
     /// the dump is built (`note_visible_dump_shape`), so no later moment has
     /// to re-derive it; `owes_regeometry_frame` compares it with the client's
     /// current size (posh#225).
     visible_shaped_for: Option<(u16, u16)>,
+    /// A MorphDelta client's pending regeometry keyframe: the number of the
+    /// first frame produced after `prepare_regeometry_frame` dropped its base
+    /// (the replay, or whichever visible frame comes next). Until the client
+    /// acks that frame or a later one, `apply_frame_ack` keeps dropping any
+    /// base a late ack restores, so every visible frame stays a `Full`.
+    regeometry_keyframe: Option<u64>,
 }
 
 impl ClientConn {
@@ -416,19 +422,21 @@ impl ClientConn {
     /// (`owes_regeometry_frame`), and when it is, makes sure the replay the
     /// loop then queues actually carries that geometry's dump.
     ///
-    /// Frames are shaped for the size a client last reported, and neither the
-    /// local nor the roaming client requests a resync on its own resize; if
+    /// No client re-renders the dump it already holds when it resizes
+    /// itself, and neither the local nor the roaming client requests a resync
+    /// on its own resize; a viewport is repainted by the next frame, which, if
     /// the session size does not change with it (it was not the smallest
-    /// client), no PTY output follows to supersede them. But a frame only goes
-    /// stale across a client's own resize if it was a BOUNDED dump shaped for
-    /// another size — `visible_shaped_for`, recorded when the newest visible
-    /// dump was built, so it is exact whatever the session's size did in
-    /// between. A full fallback dump (the client wider, narrower or shorter
-    /// than the session, or no size reported yet) renders correctly on a
-    /// mirror of ANY size, exactly as before posh#225 when no frame was owed
-    /// on resize; so such a client is owed nothing, which is also what keeps a
-    /// drag-resized wider viewport from being sent a ring-sized frame per
-    /// resize event.
+    /// client), waits for the next PTY output. That was every client's lot
+    /// before posh#225. What posh#225 changed is that a BOUNDED dump is shaped
+    /// for the size it was built for (`visible_shaped_for`, recorded when the
+    /// newest visible dump was built, so it is exact whatever the session's
+    /// size did in between): such a client's in-flight frames are wrong at its
+    /// new size, so it is owed a frame now. A client whose newest dump was
+    /// the full fallback (wider, narrower or shorter than the session, or no
+    /// size reported yet) is owed nothing NEW: its in-flight frames still
+    /// apply at the new size, and, as before posh#225, the next output
+    /// repaints it. Sending it a frame on every resize would be a ring-sized
+    /// frame per resize event for a drag-resized wider viewport.
     ///
     /// A DumpDiff client keeps its acked base — a `Diff` against the
     /// old-geometry dump is byte-level, so it rebuilds the new dump exactly,
@@ -437,11 +445,15 @@ impl ClientConn {
     /// `broadcast_source_swap` does: its encoder judges expressibility on the
     /// SESSION's dims and alt flag, which a client's own resize leaves
     /// unchanged, so it would morph between two identical snapshots — a
-    /// near-empty frame with no dump to rebuild the new geometry from.
-    /// Repeating the drop while the frame is still owed (the replay waits for
-    /// the session's first PTY output) is harmless: it only ever makes the
-    /// next visible frame a `Full`, and building that frame re-records
-    /// `visible_shaped_for`, which ends the debt.
+    /// near-empty frame with no dump to rebuild the new geometry from. The
+    /// keyframe is made DURABLE through `regeometry_keyframe`: a late ack for
+    /// a pre-resize frame would otherwise restore that frame as the base, and
+    /// if the keyframe was lost on the way the client would never receive a
+    /// new-geometry dump (see `apply_frame_ack`). Repeating the drop while the
+    /// frame is still owed (the replay waits for the session's first PTY
+    /// output) is harmless: it only ever makes the next visible frame a
+    /// `Full`, and building that frame re-records `visible_shaped_for`, which
+    /// ends the debt.
     fn prepare_regeometry_frame(&mut self) -> bool {
         if !self.owes_regeometry_frame() {
             return false;
@@ -449,6 +461,10 @@ impl ClientConn {
         if self.uses_morph() {
             if let Some(p) = self.producer.as_mut() {
                 p.drop_acked_base();
+                // Every frame from here on is built without a base, so the
+                // first of them — the replay when it is queued now — is the
+                // new-geometry keyframe the client must ack.
+                self.regeometry_keyframe = Some(p.current_num() + 1);
             }
         }
         true
@@ -656,6 +672,19 @@ impl ClientConn {
         if let Some(sb_total) = producer.ack(acked) {
             self.acked_sb_total = self.acked_sb_total.max(sb_total);
         }
+        // A morph client owed a regeometry keyframe (posh#225): an ack below
+        // it may have restored a PRE-resize frame as the base, which the
+        // client's new-size mirror cannot be morphed from — drop it again, so
+        // the next visible frame is a `Full` (scrollback bookkeeping above
+        // advanced as usual). Once the keyframe or a later frame is acked AND
+        // held as the base, the client holds a new-geometry dump: done.
+        if let Some(keyframe) = self.regeometry_keyframe {
+            if acked < keyframe {
+                producer.drop_acked_base();
+            } else if producer.has_acked_base() {
+                self.regeometry_keyframe = None;
+            }
+        }
         if flags & ipc::FRAME_ACK_RESYNC != 0 {
             producer.drop_acked_base();
             return true;
@@ -797,23 +826,29 @@ fn broadcast_output(clients: &mut [ClientConn], term: &Terminal, bcast: &[u8]) {
     // is shaped for (`note_visible_dump_shape`): `Some(size)` for a bounded
     // geometry, and ONE `None` key for every geometry `dump_vt_mirror` cannot
     // bound (wider, narrower, shorter, not yet reported), since each would
-    // build the same full ring dump. A lone producer client skips the cache,
-    // so its dump is never copied.
+    // build the same full ring dump. A dump is copied only for a LATER client
+    // that shares its key; the last client with a key takes it by move, so an
+    // unshared dump (a lone producer, or a geometry no one else has) is never
+    // copied.
     type DumpKey = Option<(u16, u16)>;
-    let mut dumps: Vec<(DumpKey, Vec<u8>)> = Vec::new();
-    let mut dump_for = |c: &mut ClientConn| -> Vec<u8> {
-        let key = c.note_visible_dump_shape(term);
-        if producers == 1 {
-            return term.dump_vt_mirror(c.rows, c.cols);
+    // Each client's key in client order; `None` for a client without a producer.
+    let keys: Vec<Option<DumpKey>> = clients
+        .iter_mut()
+        .map(|c| c.producer.is_some().then(|| c.note_visible_dump_shape(term)))
+        .collect();
+    let mut held: Vec<(DumpKey, Vec<u8>)> = Vec::new();
+    let mut dump_for = |i: usize, c: &ClientConn| -> Vec<u8> {
+        let key = keys[i].expect("only a producer client takes a dump");
+        let dump = match held.iter().position(|(k, _)| *k == key) {
+            Some(at) => held.swap_remove(at).1,
+            None => term.dump_vt_mirror(c.rows, c.cols),
+        };
+        if keys[i + 1..].contains(&Some(key)) {
+            held.push((key, dump.clone()));
         }
-        if let Some((_, d)) = dumps.iter().find(|(k, _)| *k == key) {
-            return d.clone();
-        }
-        let d = term.dump_vt_mirror(c.rows, c.cols);
-        dumps.push((key, d.clone()));
-        d
+        dump
     };
-    for c in clients.iter_mut() {
+    for (i, c) in clients.iter_mut().enumerate() {
         let produced = match &frame_inputs {
             Some((snap, alt, dims)) => {
                 // A producer-less client never reads the dump (`queue_frame`
@@ -821,7 +856,7 @@ fn broadcast_output(clients: &mut [ClientConn], term: &Terminal, bcast: &[u8]) {
                 // than costing a dump of its geometry. It is still CALLED:
                 // `queue_frame` marks a due activity answer sent before it
                 // looks at the producer, and skipping it would change that.
-                let dump = if c.producer.is_some() { dump_for(c) } else { Vec::new() };
+                let dump = if c.producer.is_some() { dump_for(i, c) } else { Vec::new() };
                 c.queue_frame(dump, snap.clone(), *alt, *dims)
             }
             None => false,
@@ -1633,6 +1668,7 @@ fn daemon_loop(
                     wants_push_cmd: false,
                     push_offered: false,
                     visible_shaped_for: None,
+                    regeometry_keyframe: None,
                 });
             }
         }
@@ -2602,6 +2638,7 @@ mod tests {
             wants_push_cmd: false,
             push_offered: false,
             visible_shaped_for: None,
+            regeometry_keyframe: None,
         }
     }
 
@@ -2722,6 +2759,7 @@ mod tests {
             wants_push_cmd: false,
             push_offered: false,
             visible_shaped_for: None,
+            regeometry_keyframe: None,
         };
         let mut init = ipc::encode_resize(rows, cols).to_vec();
         init.extend_from_slice(&caps::encode_table(&caps::own_table(&[])));
@@ -2764,6 +2802,7 @@ mod tests {
             wants_push_cmd: false,
             push_offered: false,
             visible_shaped_for: None,
+            regeometry_keyframe: None,
         };
         let mut init = ipc::encode_resize(rows, cols).to_vec();
         init.extend_from_slice(&caps::encode_table(&caps::own_table(&[caps::Cap {
@@ -3369,6 +3408,7 @@ mod tests {
             wants_push_cmd: false,
             push_offered: false,
             visible_shaped_for: None,
+            regeometry_keyframe: None,
         };
         let mut init = ipc::encode_resize(rows, cols).to_vec();
         init.extend_from_slice(&caps::encode_table(&caps::own_table(&[caps::Cap {
@@ -3653,6 +3693,7 @@ mod tests {
             wants_push_cmd: false,
             push_offered: false,
             visible_shaped_for: None,
+            regeometry_keyframe: None,
         };
         let mut table = vec![caps::Cap {
             id: caps::CAP_LOSSY,
@@ -4288,6 +4329,7 @@ mod tests {
             wants_push_cmd: false,
             push_offered: false,
             visible_shaped_for: None,
+            regeometry_keyframe: None,
         };
         let mut init = ipc::encode_resize(rows, cols).to_vec();
         init.extend_from_slice(&caps::encode_table(&caps::own_table(&[caps::Cap {
@@ -4496,6 +4538,7 @@ mod tests {
             wants_push_cmd: false,
             push_offered: false,
             visible_shaped_for: None,
+            regeometry_keyframe: None,
         };
         let mut init = ipc::encode_resize(rows, cols).to_vec();
         init.extend_from_slice(&caps::encode_table(&caps::own_table(&[
@@ -4846,6 +4889,51 @@ mod tests {
         assert_eq!(only_full_body(&c.write_buf), term.dump_vt_mirror(rows + 16, cols));
     }
 
+    /// The regeometry keyframe must be DURABLE for a morph client: a late ack
+    /// for a PRE-resize frame still in the producer's outstanding window would
+    /// restore that frame as the acked base (the session dims did not change),
+    /// and the next frame would morph from a dump the client's new-size mirror
+    /// may never have rebuilt — if the keyframe was lost, nothing would re-owe
+    /// it. Until the keyframe (or a later frame) is acked, every visible frame
+    /// stays a `Full`.
+    #[test]
+    fn a_late_pre_resize_ack_does_not_restore_a_morph_clients_base() {
+        let mut term = full_ring_term();
+        let (rows, cols) = (term.rows(), term.cols());
+        let morph = [caps::Cap {
+            id: caps::CAP_MORPH,
+            payload: vec![],
+        }];
+        let (mut c, _pc) = lossy_conn(rows, cols, &morph);
+        let output = |c: &mut ClientConn, term: &mut Terminal, text: &[u8]| -> FrameBody {
+            term.process(text);
+            c.write_buf.clear();
+            broadcast_to(c, term);
+            let mut bodies = decode_frame_bodies(&c.write_buf);
+            assert_eq!(bodies.len(), 1, "one broadcast, one visible frame");
+            bodies.remove(0)
+        };
+        broadcast_to(&mut c, &term); // frame 1, acked: the morph base
+        c.apply_frame_ack(&ipc::encode_frame_ack(1, 0));
+        assert!(matches!(output(&mut c, &mut term, b"a"), FrameBody::Morph { .. })); // frame 2, in flight
+
+        // The client grows taller; the owed keyframe is frame 3.
+        assert!(resize_like_the_loop(&mut c, &term, rows + 16, cols));
+        assert_eq!(c.producer.as_ref().unwrap().current_num(), 3);
+        assert_eq!(c.regeometry_keyframe, Some(3));
+
+        // A late ack for pre-resize frame 2: the next frame must still be a Full.
+        c.apply_frame_ack(&ipc::encode_frame_ack(2, 0));
+        match output(&mut c, &mut term, b"b") {
+            FrameBody::Full(dump) => assert_eq!(dump, term.dump_vt_mirror(rows + 16, cols)),
+            other => panic!("a pre-resize ack restored a morph base: got {other:?}"),
+        }
+        // Once the client acks a new-geometry frame, morphing resumes.
+        c.apply_frame_ack(&ipc::encode_frame_ack(4, 0));
+        assert_eq!(c.regeometry_keyframe, None, "a held new-geometry base ends it");
+        assert!(matches!(output(&mut c, &mut term, b"c"), FrameBody::Morph { .. }));
+    }
+
     /// The loop wiring itself, through the PRODUCTION `daemon_loop`: two frame
     /// clients keep the session at their shared smaller size, so when one of
     /// them grows taller nothing changes session-side and no PTY output
@@ -4911,10 +4999,11 @@ mod tests {
         assert_eq!(handle.shutdown(), caps::SessionEnd::Killed);
     }
 
-    /// Why a client whose OLD geometry got the full dump is owed nothing on
-    /// its own resize: the frame it already holds is `dump_vt`'s full bytes,
-    /// which render on a mirror of any size — so a drag-resized wider viewport
-    /// is never sent a ring-sized frame per resize event.
+    /// Why a client whose OLD geometry got the full dump is owed nothing NEW
+    /// on its own resize: its frames are `dump_vt`'s full bytes, which still
+    /// apply at the new size, and as before posh#225 the next output repaints
+    /// it — so a drag-resized wider viewport is never sent a ring-sized frame
+    /// per resize event.
     #[test]
     fn a_wider_clients_resize_owes_no_frame() {
         let term = full_ring_term();

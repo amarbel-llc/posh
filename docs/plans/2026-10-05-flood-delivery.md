@@ -209,11 +209,14 @@ where it differs** from this section.
   dump per distinct bounded geometry and ONE shared full dump for all
   fallback geometries. `Tag::History` keeps `dump_vt()`.
 - **Regeometry frame.** Because a bounded dump fits one mirror size, when a
-  frame client's own reported size changes and its last visible frame was
-  bounded (`ClientConn::last_visible_bounded`), the daemon queues a fresh
+  frame client's own reported size differs from the size its last visible
+  dump was shaped for (`ClientConn::visible_shaped_for`, `Some(size)` for a
+  bounded dump, `None` for the full fallback), the daemon queues a fresh
   frame for the new geometry, reusing the attach replay: a `Diff` against
-  the old dump for DumpDiff clients, a forced `Full` for MorphDelta clients.
-  A client whose last frame was the full fallback is owed nothing.
+  the old dump for DumpDiff clients, a forced `Full` for MorphDelta clients
+  (kept forced until the client acks it). A client whose last frame was the
+  full fallback is owed nothing new: as before posh#225 it is repainted by
+  the next output, and a frame per resize event would be ring-sized.
 - **Roaming server.** `server_loop` (`remote/server.rs`) builds its visible
   frame with `dump_vt_mirror(client_size)`. It needs no regeometry frame: a
   peer resize resizes its own terminal, which marks it dirty.
@@ -236,6 +239,17 @@ where it differs** from this section.
     resizes the terminal without any viewport resizing
     (`posh-term/src/terminal.rs`, `set_deccolm`), so every viewport is on
     full dumps until it switches back. Correct output, ring-sized frames.
+  - Frames in flight across a viewport's own resize are shaped for its old
+    size. A full `dump_vt` rendered correctly on a mirror of any size; a
+    bounded dump does not, so for about a round trip (plus pacing) after
+    growing, a viewport shows the screen at the top over blank rows before
+    the frame for its new size lands, and after shrinking its cursor can sit
+    on the wrong row. Transient and self-correcting in both producers; it is
+    the price of not replaying the ring, and RFC 0012 removes it.
+  - No client repaints the dump it already holds when it resizes itself, so
+    a viewport on the full dump is still not repainted after its own resize
+    until the next output (unchanged from before posh#225; a same-width
+    viewport now gets a frame at once).
   - History during a flood is still v1: with acks withheld it re-carries
     every un-acked row per chunk, and a remote viewport under a flood is in
     the lost-base regime where history frames are not sent at all. Stages
@@ -1182,8 +1196,18 @@ bugs; none is filed. Promote one to an issue when it is about to be worked:
   producer**, only to have `queue_frame` drop it (the call must stay: it
   records the activity answer before checking for a producer). Matters only
   when baseline and frame clients are attached together.
-- **A shared test constructor for `ClientConn`.** A new field means editing
-  eight hand-written struct literals in `session/daemon.rs`'s tests.
+- **Build `ClientConn` test fixtures from one constructor.** A new field
+  means editing eight hand-written struct literals in
+  `session/daemon.rs`'s tests; the final review says a `test_client_conn()`
+  constructor already exists there, so struct-update syntax over it would
+  do (not checked).
+- **Return a dump's shape with its bytes.** The daemon learns a dump's
+  shape from `dump_vt_mirror_is_bounded` and its bytes from
+  `dump_vt_mirror`, two calls that must be given the same terminal and
+  size. One call returning both would make a mismatch unrepresentable.
+- **Tighten the taller-mirror replay** from `2 * mirror_rows` rows to
+  `2 * mirror_rows - rows`, which the same argument already supports, or to
+  the exact height difference once posh#229 is fixed.
 - **A shared send/receive helper for `remote/server.rs`'s tests.** About a
   dozen tests repeat the same ~25-line client loop.
 - **Bounding the dump at any geometry while the alternate screen is
