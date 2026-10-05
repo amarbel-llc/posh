@@ -4731,4 +4731,49 @@ mod tests {
             }
         }
     }
+
+    /// posh#225 regression: a newline flood into a session whose ring is
+    /// already full must not push a healthy lossy client toward
+    /// `MAX_CLIENT_BACKLOG`. The visible frame must stay screen-sized — it
+    /// may not carry the scrollback ring — whatever the ack cadence.
+    ///
+    /// Scope: this pins the VISIBLE frame. With acks withheld entirely the
+    /// v1 scrollback frame still re-carries every un-acked row (the second
+    /// amplifier); that case is bounded by the v2 send cursor, not here.
+    #[test]
+    #[ignore = "posh#225: fails until visible frames stop replaying the ring (Task 1.3)"]
+    fn posh225_full_ring_flood_keeps_visible_frames_screen_sized() {
+        const KIB: usize = 1024;
+        let flood = newline_flood(256 * KIB);
+        for acks in [FloodAcks::EveryNewest(1), FloodAcks::Lagged(5), FloodAcks::Never] {
+            let case = FloodCase {
+                chunk: 4 * KIB,
+                acks,
+                drain: FloodDrain::OneWritePerChunk,
+                prefill_rows: SCROLLBACK + 200,
+            };
+            let r = measure_flood(&flood, case);
+            assert!(
+                r.largest_visible < 64 * KIB,
+                "acks={}: a visible frame was {} bytes — it is carrying the scrollback ring",
+                acks.label(),
+                r.largest_visible,
+            );
+            if !matches!(acks, FloodAcks::Never) {
+                assert_eq!(
+                    r.crossed_backlog_at,
+                    None,
+                    "acks={}: a draining client crossed MAX_CLIENT_BACKLOG after {} bytes",
+                    acks.label(),
+                    r.fed,
+                );
+                assert!(
+                    r.peak_write_buf < KIB * KIB,
+                    "acks={}: backlog peaked at {} bytes against an ideal reader",
+                    acks.label(),
+                    r.peak_write_buf,
+                );
+            }
+        }
+    }
 }
