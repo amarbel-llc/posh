@@ -208,10 +208,19 @@ pub struct ClientLane {
     to_server: VecDeque<ClientAck>,
     /// Encoded byte length of the largest frame sent on this lane.
     largest_frame_bytes: usize,
+    /// Frames sent on this lane with a `Full` body.
+    full_frames: usize,
+    /// Frames sent on this lane with an incremental (`Diff`/`Morph`) body.
+    incremental_frames: usize,
 }
 
 impl FrameChannel for ClientLane {
     fn send_frame(&mut self, frame: ServerFrame) {
+        match frame.body {
+            FrameBody::Full(_) => self.full_frames += 1,
+            FrameBody::Diff { .. } | FrameBody::Morph { .. } => self.incremental_frames += 1,
+            _ => {}
+        }
         self.largest_frame_bytes = self.largest_frame_bytes.max(frame.encode().len());
         self.to_client.push_back(frame);
     }
@@ -232,6 +241,8 @@ impl ClientLane {
             to_client: VecDeque::new(),
             to_server: VecDeque::new(),
             largest_frame_bytes: 0,
+            full_frames: 0,
+            incremental_frames: 0,
         }
     }
 
@@ -339,6 +350,13 @@ impl FrameHarness {
     /// The largest encoded frame sent to any client so far, in bytes.
     pub fn largest_frame_bytes(&self) -> usize {
         self.lanes.iter().map(|l| l.largest_frame_bytes).max().unwrap_or(0)
+    }
+
+    /// How many `Full` and how many incremental (`Diff`/`Morph`) frames have
+    /// been sent to `id` so far, in that order.
+    pub fn frame_kinds_for(&self, id: ClientId) -> (usize, usize) {
+        let lane = self.lane(id);
+        (lane.full_frames, lane.incremental_frames)
     }
 
     /// The largest encoded frame sent to `id` so far, in bytes.
@@ -488,6 +506,14 @@ impl FrameHarness {
         while history.last().is_some_and(|r| r.is_empty()) {
             history.pop();
         }
+        // `dump_text` joins soft-wrapped rows, so a wrapped line would make
+        // `expected` silently wrong; fail loudly instead.
+        if let Some(wide) = history
+            .iter()
+            .find(|r| r.chars().count() > usize::from(self.server.term.cols()))
+        {
+            panic!("a history line is wider than the server's columns (wrapped): {wide:?}");
+        }
         let tail = &history[history.len().saturating_sub(usize::from(client.rows()))..];
         let skip = tail.iter().take_while(|r| r.is_empty()).count();
         let expected = &tail[skip..];
@@ -619,6 +645,46 @@ mod mismatched_size_tests {
         }
     }
 
+    /// Production's steady state: an acked baseline, then `Diff`s between
+    /// consecutive BOUNDED dumps. Delivering and acking between feeds means
+    /// every lane diffs against its own acked bounded dump rather than sending
+    /// a `Full` each time. The small no-newline feeds change only part of the
+    /// screen, so a `Diff` is the natural body.
+    #[test]
+    fn diffs_between_bounded_dumps_converge_on_a_ring_backed_server() {
+        let mut h = FrameHarness::with_ring(24, 80, FrameSync::DumpDiff, 10_000);
+        let tall = h.add_client(50, 80);
+        let lines: Vec<String> = (0..2_000u16).map(|i| format!("line {i:04}\r\n")).collect();
+        for chunk in lines.chunks(50) {
+            h.feed(chunk.concat().as_bytes());
+            h.deliver_all();
+            h.feed(b"typ");
+            h.deliver_all();
+            h.feed(b"ing");
+            h.deliver_all();
+            h.feed(b"\r\n");
+            h.deliver_all();
+        }
+        h.feed(b"prompt$ ");
+        h.deliver_all();
+
+        h.assert_mirrors_content(ClientId::PRIMARY);
+        h.assert_converged();
+        h.assert_mirrors_session_tail(tall);
+        for id in [ClientId::PRIMARY, tall] {
+            assert!(
+                h.largest_frame_bytes_for(id) < 16_384,
+                "a frame toward {id:?} was {} bytes — it carried the ring",
+                h.largest_frame_bytes_for(id),
+            );
+            let (full, incremental) = h.frame_kinds_for(id);
+            assert!(
+                incremental > 0,
+                "no incremental frame was ever sent toward {id:?} ({full} Full)",
+            );
+        }
+    }
+
     /// A WIDER client of a ring-backed server. `dump_vt_mirror` falls back to
     /// the full dump for any geometry but same-width, so this client's frames
     /// stay ring-sized. This pins a KNOWN LIMITATION of posh#225 Stage 1: a
@@ -639,6 +705,8 @@ mod mismatched_size_tests {
             "the same-size client's frame was {} bytes",
             h.largest_frame_bytes_for(ClientId::PRIMARY),
         );
+        // The bound depends on the feed volume: 2,000 numbered lines is about
+        // 22 KB of ring, so a smaller feed would flip it for the wrong reason.
         assert!(
             h.largest_frame_bytes_for(wide) > 16_384,
             "the wide client's frames are expected to be ring-sized (known limitation) but the largest was {} bytes",
