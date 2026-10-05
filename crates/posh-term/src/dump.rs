@@ -1287,14 +1287,6 @@ mod cursor_mismatch_tests {
         assert!(cursor_row_text(&replay).contains("prompt$"));
     }
 
-    /// Mirror `dump` into a fresh ring-less terminal — what every frame
-    /// consumer does (FDR 0005) — and return its visible state.
-    fn mirror_flat(rows: u16, cols: u16, dump: &[u8]) -> Vec<u8> {
-        let mut t = Terminal::with_scrollback(rows, cols, 0);
-        t.process(dump);
-        t.dump_vt_flat()
-    }
-
     fn scrolled(rows: u16, cols: u16, ring: usize, lines: usize) -> Terminal {
         let mut t = Terminal::with_scrollback(rows, cols, ring);
         for i in 0..lines {
@@ -1309,6 +1301,12 @@ mod cursor_mismatch_tests {
         let mut t = Terminal::with_scrollback(rows, cols, 0);
         t.process(dump);
         t
+    }
+
+    /// Mirror `dump` into a fresh ring-less terminal — what every frame
+    /// consumer does (FDR 0005) — and return its visible state.
+    fn mirror_flat(rows: u16, cols: u16, dump: &[u8]) -> Vec<u8> {
+        mirror(rows, cols, dump).dump_vt_flat()
     }
 
     /// Each visible row's text, trailing blanks trimmed.
@@ -1362,21 +1360,12 @@ mod cursor_mismatch_tests {
         assert_mirror_renders_like_full(&t, &bounded_heights(&t));
     }
 
-    /// Every geometry outside "same width, at least as tall" gets `dump_vt`'s
-    /// exact bytes. (This also covers the unbounded row tail being `dump_vt`,
-    /// which `posh history` and the frozen API depend on.)
-    #[test]
-    fn mirror_dump_falls_back_to_dump_vt_outside_bounded_geometries() {
-        let t = scrolled(24, 80, 1000, 500);
-        let full = t.dump_vt();
-        for (rows, cols) in [(10, 80), (23, 80), (24, 120), (32, 120), (24, 60), (32, 60)] {
-            assert!(t.dump_vt_mirror(rows, cols) == full, "{rows}x{cols} must be dump_vt's bytes");
-        }
-    }
-
     /// `dump_vt_mirror_is_bounded` names the rule `dump_vt_mirror` applies:
     /// over a deep ring, it holds exactly where the dump differs from
-    /// `dump_vt`'s bytes, on the bounded and fallback geometries above.
+    /// `dump_vt`'s bytes. Every geometry outside "same width, at least as
+    /// tall" gets `dump_vt`'s exact bytes. (This also covers the unbounded row
+    /// tail being `dump_vt`, which `posh history` and the frozen API depend
+    /// on.)
     #[test]
     fn mirror_dump_is_bounded_agrees_with_dump_vt_mirror() {
         let t = scrolled(24, 80, 1000, 500);

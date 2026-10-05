@@ -29,8 +29,11 @@
 //! - `Terminal::dump_vt_mirror(&self, mirror_rows: u16, mirror_cols: u16) -> Vec<u8>`
 //!   (`dump_vt` for a ring-less mirror of that size, with the scrollback
 //!   replay bounded where that is proven equivalent; the frame-transport
-//!   serializer, posh#225)
+//!   serializer, posh#225) — PROVISIONAL until RFC 0012: the geometry rule
+//!   may change or be retired
 //! - `Terminal::dump_vt_mirror_is_bounded(&self, mirror_rows: u16, mirror_cols: u16) -> bool`
+//!   (whether `dump_vt_mirror` bounds the replay for that geometry) —
+//!   PROVISIONAL until RFC 0012: it may change or be retired with the rule
 //! - `Terminal::dump_vt_flat(&self) -> Vec<u8>` (single-screen variant: active
 //!   grid only, never switches the target's buffers)
 //! - `Terminal::dump_screen_switch(&self) -> Vec<u8>` (in-place repaint that

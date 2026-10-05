@@ -1169,6 +1169,38 @@ Not yet filed, to be filed when confirmed:
   a host instead of failing (`macOS gap (posh#214)`), so a host like that is
   not measured by the default gate.
 
+Candidates from the Stage 1 cleanup review (2026-10-05) — improvements, not
+bugs; none is filed. Promote one to an issue when it is about to be worked:
+
+- **`FrameProducer::encode_visible` clones its acked dump and snapshot on
+  every encode** (`posh-proto/src/framesync/producer.rs`). Predates
+  posh#225, which shrank the copy from ring-sized to screen-sized for
+  bounded viewports; it is still ring-sized for a viewport on the full
+  dump. A borrowing `Baseline` would remove it, at the cost of a posh-proto
+  API change.
+- **`broadcast_output` clones the `Snapshot` for a client with no
+  producer**, only to have `queue_frame` drop it (the call must stay: it
+  records the activity answer before checking for a producer). Matters only
+  when baseline and frame clients are attached together.
+- **A shared test constructor for `ClientConn`.** A new field means editing
+  eight hand-written struct literals in `session/daemon.rs`'s tests.
+- **A shared send/receive helper for `remote/server.rs`'s tests.** About a
+  dozen tests repeat the same ~25-line client loop.
+- **Bounding the dump at any geometry while the alternate screen is
+  active.** Replayed ring rows then only feed the hidden primary screen, and
+  the alternate grid is homed and absolutely anchored, so wider and shorter
+  mirrors of a full-screen application might be boundable too. Unproven;
+  needs its own equivalence tests.
+- **A reviewer's theoretical gap, unconfirmed:** the taller-mirror replay
+  assumes a soft-wrapped row prints exactly its full width. An orphaned
+  zero-width spacer cell would break that — in `dump_vt` as well. Not
+  established that posh-term can produce one.
+- **When RFC 0012 starts:** a `ClientConn::mirror_geometry()` accessor, so
+  "the size this client's mirror applies frames at" changes in one place
+  (it becomes the session's size for capable clients). Shrinking the
+  taller-mirror replay from `2 * mirror_rows` to the exact height
+  difference belongs to the posh#229 fix.
+
 ## Follow-ups this plan does not do
 - **Pre-attach back-fill** (FDR 0005's deferred extension). Stage 3's
   `HistoryCursor` takes its starting position and fill order as inputs so

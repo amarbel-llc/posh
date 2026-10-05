@@ -347,11 +347,6 @@ impl FrameHarness {
         }
     }
 
-    /// The largest encoded frame sent to any client so far, in bytes.
-    pub fn largest_frame_bytes(&self) -> usize {
-        self.lanes.iter().map(|l| l.largest_frame_bytes).max().unwrap_or(0)
-    }
-
     /// How many `Full` and how many incremental (`Diff`/`Morph`) frames have
     /// been sent to `id` so far, in that order.
     pub fn frame_kinds_for(&self, id: ClientId) -> (usize, usize) {
@@ -567,14 +562,33 @@ impl FrameHarness {
 mod mismatched_size_tests {
     use super::*;
 
-    /// Scroll `count` numbered lines through the server, 50 per `feed`: one
-    /// encode per chunk instead of per line keeps a ring-backed server's
-    /// full-ring dumps (the thing the size tests measure) affordable in debug.
-    fn feed_numbered_lines(h: &mut FrameHarness, count: u16) {
+    /// `count` numbered lines, 50 per chunk: one encode per chunk instead of
+    /// per line keeps a ring-backed server's full-ring dumps (the thing the
+    /// size tests measure) affordable in debug.
+    fn numbered_line_chunks(count: u16) -> Vec<String> {
         let lines: Vec<String> = (0..count).map(|i| format!("line {i:04}\r\n")).collect();
-        for chunk in lines.chunks(50) {
-            h.feed(chunk.concat().as_bytes());
+        lines.chunks(50).map(<[String]>::concat).collect()
+    }
+
+    /// Scroll `count` numbered lines through the server, a chunk per `feed`
+    /// ([`numbered_line_chunks`]).
+    fn feed_numbered_lines(h: &mut FrameHarness, count: u16) {
+        for chunk in numbered_line_chunks(count) {
+            h.feed(chunk.as_bytes());
         }
+    }
+
+    /// No frame toward a same-width client may carry the ring: 2,000 numbered
+    /// lines are about 22 KB of ring, a screen-sized frame well under this.
+    const RING_FREE_FRAME_BYTES: usize = 16_384;
+
+    /// Every frame sent toward `id` stayed under [`RING_FREE_FRAME_BYTES`].
+    fn assert_frames_ring_free(h: &FrameHarness, id: ClientId) {
+        assert!(
+            h.largest_frame_bytes_for(id) < RING_FREE_FRAME_BYTES,
+            "a frame toward {id:?} was {} bytes — it carried the ring",
+            h.largest_frame_bytes_for(id),
+        );
     }
 
     /// The production shape (posh#139): the daemon sizes the pty to the
@@ -637,11 +651,7 @@ mod mismatched_size_tests {
         h.assert_mirrors_session_tail(tall);
         h.assert_converged(); // the same-size client (client 0) still matches exactly
         for id in [ClientId::PRIMARY, tall] {
-            assert!(
-                h.largest_frame_bytes_for(id) < 16_384,
-                "a frame toward {id:?} was {} bytes — it carried the ring",
-                h.largest_frame_bytes_for(id),
-            );
+            assert_frames_ring_free(&h, id);
         }
     }
 
@@ -654,9 +664,8 @@ mod mismatched_size_tests {
     fn diffs_between_bounded_dumps_converge_on_a_ring_backed_server() {
         let mut h = FrameHarness::with_ring(24, 80, FrameSync::DumpDiff, 10_000);
         let tall = h.add_client(50, 80);
-        let lines: Vec<String> = (0..2_000u16).map(|i| format!("line {i:04}\r\n")).collect();
-        for chunk in lines.chunks(50) {
-            h.feed(chunk.concat().as_bytes());
+        for chunk in numbered_line_chunks(2_000) {
+            h.feed(chunk.as_bytes());
             h.deliver_all();
             h.feed(b"typ");
             h.deliver_all();
@@ -672,11 +681,7 @@ mod mismatched_size_tests {
         h.assert_converged();
         h.assert_mirrors_session_tail(tall);
         for id in [ClientId::PRIMARY, tall] {
-            assert!(
-                h.largest_frame_bytes_for(id) < 16_384,
-                "a frame toward {id:?} was {} bytes — it carried the ring",
-                h.largest_frame_bytes_for(id),
-            );
+            assert_frames_ring_free(&h, id);
             let (full, incremental) = h.frame_kinds_for(id);
             assert!(
                 incremental > 0,
@@ -700,15 +705,11 @@ mod mismatched_size_tests {
         h.feed(b"prompt$ ");
         h.deliver_all();
         h.assert_mirrors_content(ClientId::PRIMARY);
-        assert!(
-            h.largest_frame_bytes_for(ClientId::PRIMARY) < 16_384,
-            "the same-size client's frame was {} bytes",
-            h.largest_frame_bytes_for(ClientId::PRIMARY),
-        );
+        assert_frames_ring_free(&h, ClientId::PRIMARY);
         // The bound depends on the feed volume: 2,000 numbered lines is about
         // 22 KB of ring, so a smaller feed would flip it for the wrong reason.
         assert!(
-            h.largest_frame_bytes_for(wide) > 16_384,
+            h.largest_frame_bytes_for(wide) > RING_FREE_FRAME_BYTES,
             "the wide client's frames are expected to be ring-sized (known limitation) but the largest was {} bytes",
             h.largest_frame_bytes_for(wide),
         );
