@@ -97,12 +97,19 @@ These are **traps** — places where reading the code naively gets it wrong, or
 where two things that look interchangeable are not. Each ends with where the
 full story lives; this list is not a tour of the system.
 
-- **Two serializers, two contracts** (`posh-term/src/dump.rs`): `dump_vt()`
-  targets a freshly built `Terminal` that MAY BE LARGER than the source, so
-  it must never derive a position from an assumed height; `dump_vt_flat()`
+- **Three serializers, three contracts** (`posh-term/src/dump.rs`):
+  `dump_vt()` is the full replica, history included (it replays the whole
+  ring; `posh history` uses it), and targets a freshly built `Terminal` that
+  MAY BE LARGER than the source, so it must never derive a position from an
+  assumed height; `dump_vt_mirror(rows, cols)` is the FRAME dump for a
+  ring-less mirror of that geometry — bounded only for a same-width,
+  at-least-as-tall mirror, `dump_vt`'s bytes otherwise — and a bounded dump is
+  shaped for that one mirror size, so a client's own resize owes it a fresh
+  frame (`owes_regeometry_frame`, `session/daemon.rs`); `dump_vt_flat()`
   targets a REAL tty that may carry mode leftovers, so it emits
-  `DRAWABLE_STATE_RESET` first. Swapping one for the other at a call site is
-  a bug, not a refactor.
+  `DRAWABLE_STATE_RESET` first. Swapping one for another at a call site is a
+  bug, not a refactor: a frame built from `dump_vt()` is the posh#225 bug (a
+  full ring made every frame ~1 MiB).
 - **Geometry travels UP only:** a client reports its size (`Tag::Init` /
   `Tag::Resize`); nothing ever tells a client the resulting session size.
   `ServerFrame` carries no dimensions, and `Snapshot`'s `rows`/`cols` are

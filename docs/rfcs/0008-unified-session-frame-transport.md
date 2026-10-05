@@ -102,6 +102,15 @@ for both transports. Over a reliable, ordered transport (the Unix socket):
 No separate "local Full-only" mode is defined; reliability is expressed solely
 as instant acks and a never-lost base.
 
+The dump a visible `Full` or `Diff` body is computed over is the per-client
+frame dump (`Terminal::dump_vt_mirror` for the client's reported geometry),
+not the full `dump_vt`, which replays the whole scrollback ring (posh#225). A
+receiver is unaffected: a `Full` is still bytes a ring-less mirror processes,
+and a `Diff` still applies to the bytes the receiver holds. A sender that
+shapes a dump for a mirror size MUST send a fresh frame when that client's
+reported size changes, because the dump it last sent was shaped for the old
+size.
+
 ### 3. The relay contract
 
 A remote client reaches the daemon through a disposable relay (`posh-server` in

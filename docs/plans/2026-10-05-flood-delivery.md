@@ -81,8 +81,10 @@ guessing at Stage 3's types.
 
 Decision 13 puts the switch on the viewport. Stage 1 has no viewport-
 visible behaviour to switch: it changes how many scrollback rows a frame
-replays, and the rendering is pinned byte-for-byte by tests. This plan
-ships Stage 1 **ungated**, rollback by revert. If a lever is wanted
+replays, and the rendering is unchanged except at the session's own size,
+where two pre-existing `dump_vt` bugs (posh#228, posh#229) no longer show.
+This plan ships Stage 1 **ungated**, rollback by revert; the operator
+accepted that on 2026-10-05. If a lever is wanted
 anyway, the cheapest is a daemon-side `POSH_FRAME_TAIL=full` read at
 session start — but it cannot take effect without a new session, which is
 why it is not proposed.
@@ -90,6 +92,8 @@ why it is not proposed.
 ---
 
 ## Facts the plan relies on (verified 2026-10-05, worktree HEAD `ee87e23`)
+
+These describe the code at `ee87e23`, before Stage 1.
 
 Read in the code unless marked *measured* or *field*.
 
@@ -173,6 +177,77 @@ Read in the code unless marked *measured* or *field*.
 - No ad-hoc scripts; a repeated pipeline becomes a `[group("debug")]`
   recipe with its comment block.
 - Commit after every task. Do not create branches.
+
+---
+
+## Stage 1 as built (2026-10-05)
+
+Stages 0 and 1 are implemented on branch `quiet-willow`. The Stage 0 and
+Stage 1 task text below is kept as the historical plan and is **superseded
+where it differs** from this section.
+
+- **API.** `posh-term` has a third frame-transport entry point,
+  `Terminal::dump_vt_mirror(mirror_rows, mirror_cols)`, plus
+  `Terminal::dump_vt_mirror_is_bounded(mirror_rows, mirror_cols)`. There is
+  no public `dump_vt_tail(max_scrollback_rows)` and no per-client "tail rows"
+  count; review replaced them. `dump_vt()` is unchanged and still serves
+  `posh history`; `dump_vt_flat()` is unchanged.
+- **Geometry rule.** Same width and same height: no scrollback replayed (the
+  grid is drawn from home, as when the ring is empty). Same width and taller:
+  the newest `2 * mirror_rows` scrollback rows, over-provisioned so the
+  replay overfills the mirror and lands at its bottom as the full one does.
+  Any other geometry (wider, narrower, shorter, or 0 rows/cols): exactly
+  `dump_vt`'s bytes. The fallback exists because a row count cannot
+  reproduce the full replay there: on a wider mirror soft-wrapped rows
+  rejoin and free lines the full replay fills from older rows; on a shorter
+  mirror the cursor anchors differ. `dump_vt_mirror_is_bounded` names the
+  rule; a bounded dump is shaped for the mirror size it was built for, the
+  fallback renders on a mirror of any size.
+- **Daemon.** `queue_frame_from` and `broadcast_output`
+  (`session/daemon.rs`) build each client's visible frame with
+  `dump_vt_mirror(client_rows, client_cols)`. `broadcast_output` builds one
+  dump per distinct bounded geometry and ONE shared full dump for all
+  fallback geometries. `Tag::History` keeps `dump_vt()`.
+- **Regeometry frame.** Because a bounded dump fits one mirror size, when a
+  frame client's own reported size changes and its last visible frame was
+  bounded (`ClientConn::last_visible_bounded`), the daemon queues a fresh
+  frame for the new geometry, reusing the attach replay: a `Diff` against
+  the old dump for DumpDiff clients, a forced `Full` for MorphDelta clients.
+  A client whose last frame was the full fallback is owed nothing.
+- **Roaming server.** `server_loop` (`remote/server.rs`) builds its visible
+  frame with `dump_vt_mirror(client_size)`. It needs no regeometry frame: a
+  peer resize resizes its own terminal, which marks it dirty.
+- **Harness.** `poshterity`'s frame harness can run a ring-backed server
+  (`FrameHarness::with_ring`) and builds frames per client geometry.
+- **Measured** (socket-accurate in-process harness, 50x200, full 10,000-row
+  ring, 4 KiB chunks, an ack per chunk): largest visible frame 944,001 bytes
+  to 5,145 bytes. Before, the backlog crossed 16 MiB after 106,496 bytes of
+  output; after, it never crossed across 2 MiB and peaked at 9,369 bytes.
+- **Known limitations.**
+  - A viewport wider, narrower or shorter than the session (for example the
+    larger of two differently-sized viewports on one session) still gets
+    ring-sized frames and can still be dropped under a flood. Stage 2's
+    paced, send-time delivery bounds its backlog regardless of frame size;
+    session geometry on the frame (RFC 0012) would make every mirror
+    session-sized and retire the fallback.
+  - History during a flood is still v1: with acks withheld it re-carries
+    every un-acked row per chunk, and a remote viewport under a flood is in
+    the lost-base regime where history frames are not sent at all. Stages
+    2–3 fix that.
+  - Two pre-existing `dump_vt` bugs were found and filed, not fixed: posh#228
+    (the relative cursor anchor is moved by modes replayed after the flow)
+    and posh#229 (a soft-wrapped row followed by an empty row loses a line;
+    the mirror draws rows one row low). A viewport of exactly the session's
+    size no longer goes through that branch, so it stops seeing both; other
+    geometries and `posh history` (VT form) still do. Ignored tests in
+    `posh-term/src/dump.rs` wait for the fixes.
+- **Rendering** is otherwise unchanged; the exception above is an
+  improvement at the session's own size.
+- **Platform.** One test site depends on the host's unix-socket send buffer
+  and skips its capacity-dependent bounds at runtime where the host grants
+  less than 96 KiB per write (`flood_socket_supports_bounds`, in the
+  posh#225 test block of `session/daemon.rs`); it carries a
+  `macOS gap (posh#214):` comment.
 
 ---
 
@@ -1063,12 +1138,32 @@ collected here as the checklist)
 
 ---
 
-## Follow-ups this plan does not do
+## Queue: issues discovered along the way
 
-- **posh#226** — tell a dropped viewport why. Required by decision 6's
-  backstop; independent of every stage here.
-- **posh#227** — settled by decision 6 (recorded on the issue); close it
-  when Stage 2 lands.
+Operator instruction (2026-10-05): every issue discovered during this work
+is queued and worked **after the main sequence** (the stages above), not
+interleaved with it. Add to this list as issues are filed; work it top to
+bottom once Stage 7 is done, or sooner only if the operator re-orders it.
+
+| # | Issue | Found | Note |
+|---|---|---|---|
+| 1 | **posh#226** — a viewport dropped by the backlog valve is never told why | field triage | Required by decision 6's backstop; independent of every stage. |
+| 2 | **posh#227** — drop policy for a healthy-but-outpaced client | UX grilling | Settled by decision 6 (recorded on the issue); close when Stage 2 lands — no separate work expected. |
+| 3 | **posh#228** — `dump_vt`'s relative cursor anchor is moved by modes replayed after the flow (scroll region, origin mode, tab stops, kitty placements, DECCOLM) | Task 1.1 edge-case tests and review | Pre-existing; the mirror's cursor lands on the wrong row. Pinned by two `#[ignore]`d tests in `posh-term/src/dump.rs` (scroll region, tab stop); un-ignore both in the fix. Same-size viewports stop hitting it after Stage 1; other geometries still do. |
+| 4 | **posh#229** — `dump_vt` loses a line when a soft-wrapped row is followed by an empty row; the mirror draws the screen one row low | Task 1.1 code review | Pre-existing, and an ordinary shell state triggers it (wrap a command by one character, backspace). Pinned by an `#[ignore]`d test; un-ignore it in the fix. Same-size viewports stop hitting it after Stage 1; `posh history` (VT form) and other geometries still do. |
+
+Not yet filed, to be filed when confirmed:
+
+- **One socket write per daemon iteration** (`session/daemon.rs` write
+  section). On a host whose unix-socket send buffer is small (macOS
+  defaults to 8 KiB) the daemon may still out-produce a healthy reader
+  after Stage 1. Unverified; Stage 2 removes the dependence on any
+  platform. File only if a measurement on such a host shows it. The
+  posh#225 regression test now skips its capacity-dependent bounds on such
+  a host instead of failing (`macOS gap (posh#214)`), so a host like that is
+  not measured by the default gate.
+
+## Follow-ups this plan does not do
 - **Pre-attach back-fill** (FDR 0005's deferred extension). Stage 3's
   `HistoryCursor` takes its starting position and fill order as inputs so
   this needs no protocol change (decision 10).
@@ -1076,12 +1171,11 @@ collected here as the checklist)
 
 ## Open questions for the operator
 
-1. **Stage 1 ungated** — accept the rollout exception above?
-2. **Taller viewports.** Stage 1 preserves today's rendering exactly: a
-   viewport taller than the session shows earlier history above the grid
-   once anything has scrolled (and the grid at the top with blank rows
-   below before that). That inconsistency is ADR 0006 / RFC 0012
-   territory and is left alone here. Say if you would rather Stage 1 also
-   made it consistent.
+1. **Stage 1 ungated** — answered: accepted (2026-10-05).
+2. **Mismatched geometries.** Stage 1 preserves a taller viewport's
+   rendering (history above a bottom-anchored grid) and leaves wider,
+   narrower and shorter viewports on the full dump. Whether to make
+   mismatched-geometry rendering consistent is still ADR 0006 / RFC 0012
+   territory and still open.
 3. **Trickle lever** — `POSH_HISTORY_ROWS`, default 256, ack-latency
    signal: confirm or rename before Task 3.4 merges.
