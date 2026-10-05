@@ -370,6 +370,38 @@ impl ClientConn {
         resized
     }
 
+    /// Applies a `Tag::Resize` payload: the client's reported size. Returns
+    /// whether it decoded (a malformed payload is ignored). Extracted, like
+    /// `apply_init`, so the daemon-loop arm and the inline tests drive one path.
+    fn apply_resize(&mut self, payload: &[u8]) -> bool {
+        match ipc::decode_resize(payload) {
+            Some((r, w)) => {
+                self.rows = r;
+                self.cols = w;
+                true
+            }
+            None => false,
+        }
+    }
+
+    /// Whether this client is owed a frame built for its new geometry after
+    /// its own messages changed its reported size from `reported_before`
+    /// (posh#225; the daemon loop queues it through the replay).
+    ///
+    /// A frame only goes stale across a client's own resize if it was a
+    /// BOUNDED dump shaped for the old size. `was_bounded` is whether the dump
+    /// for `reported_before` was (`Terminal::dump_vt_mirror_is_bounded`,
+    /// against the source as it stood before this batch). If it was not — the
+    /// old geometry was wider, narrower or shorter than the session, or no
+    /// size had been reported — the frames in flight are `dump_vt`'s full
+    /// bytes, which render correctly on a mirror of ANY size, exactly as
+    /// before posh#225 when no frame was owed on resize. So such a client is
+    /// owed nothing, which is also what keeps a drag-resized wider viewport
+    /// from being sent a ring-sized frame per resize event.
+    fn owes_regeometry_frame(&self, reported_before: (u16, u16), was_bounded: bool) -> bool {
+        self.producer.is_some() && was_bounded && (self.rows, self.cols) != reported_before
+    }
+
     /// Whether this client advertised the posh-proto frame protocol — i.e. its
     /// `Tag::Init` carried a capability table with `CAP_PROTOCOL_VERSION`. A
     /// baseline (no-table) peer is never frame-capable, so it always receives
@@ -389,6 +421,28 @@ impl ClientConn {
         }
     }
 
+    /// [`queue_frame`] with its inputs derived from one source terminal — the
+    /// per-client shape (mid-overlay attach replay, resync keyframe), kept in
+    /// one place so the frame-input contract cannot drift across call sites.
+    /// `broadcast_output` deliberately keeps its batched form: it derives the
+    /// snapshot, alt flag and dims once per broadcast and builds the dump once
+    /// per distinct client geometry, cloning them per client.
+    ///
+    /// The dump is built for the geometry of THIS client's terminal — what its
+    /// ring-less mirror can show — not replayed from the whole scrollback ring,
+    /// which made every frame ~1 MiB once the ring filled (posh#225). A client
+    /// that has not reported a size yet, or one wider, narrower or shorter than
+    /// `src`, still gets the full dump: a row count cannot reproduce the full
+    /// replay there. The rule itself lives in `Terminal::dump_vt_mirror`.
+    fn queue_frame_from(&mut self, src: &Terminal) -> bool {
+        self.queue_frame(
+            src.dump_vt_mirror(self.rows, self.cols),
+            Snapshot::from_term(src),
+            src.is_alt_screen(),
+            (src.rows(), src.cols()),
+        )
+    }
+
     /// Produce a visible frame from the supplied screen state and queue it as
     /// `Tag::Frame`. Returns `false` (queuing nothing) when this client has no
     /// producer, so the caller falls back to `Tag::Output`.
@@ -406,27 +460,6 @@ impl ClientConn {
     /// codec is selected from the negotiated caps (`CAP_MORPH` ⇒ MorphDelta) and,
     /// with `CAP_BASE_SUM`, the diff base's checksum is stamped so the far client
     /// can verify its base before applying (mirror of `server.rs`).
-    /// [`queue_frame`] with its inputs derived from one source terminal — the
-    /// per-client shape (mid-overlay attach replay, resync keyframe), kept in
-    /// one place so the frame-input contract cannot drift across call sites.
-    /// `broadcast_output` deliberately keeps its batched form: it derives the
-    /// inputs once per geometry and clones them per client.
-    ///
-    /// The dump is built for the geometry of THIS client's terminal — what its
-    /// ring-less mirror can show — not replayed from the whole scrollback ring,
-    /// which made every frame ~1 MiB once the ring filled (posh#225). A client
-    /// that has not reported a size yet, or one wider, narrower or shorter than
-    /// `src`, still gets the full dump: a row count cannot reproduce the full
-    /// replay there. The rule itself lives in `Terminal::dump_vt_mirror`.
-    fn queue_frame_from(&mut self, src: &Terminal) -> bool {
-        self.queue_frame(
-            src.dump_vt_mirror(self.rows, self.cols),
-            Snapshot::from_term(src),
-            src.is_alt_screen(),
-            (src.rows(), src.cols()),
-        )
-    }
-
     fn queue_frame(&mut self, dump: Vec<u8>, snapshot: Snapshot, alt: bool, dims: (u16, u16)) -> bool {
         // Read the lossy-mode inputs before borrowing `producer` mutably. A
         // reliable client leaves all three false ⇒ today's exact behavior.
@@ -689,9 +722,10 @@ impl ClientConn {
 /// `ServerFrame` (`Tag::Frame`) for each frame-capable client, the raw `bcast`
 /// bytes (`Tag::Output`) for the rest. The snapshot frame inputs are derived
 /// once from `term` and cloned per producer — each client diffs against its OWN
-/// acked base — and the dump once per DISTINCT client geometry, since each
-/// client's dump is built for its own terminal (`ClientConn::queue_frame_from`,
-/// posh#225). Both ONLY when at least one client is frame-capable, so a session
+/// acked base — and the dump once per DISTINCT bounded client geometry, plus
+/// at most one shared full dump for every geometry `dump_vt_mirror` cannot
+/// bound, since each client's dump is built for its own terminal
+/// (`ClientConn::queue_frame_from`, posh#225). Both ONLY when at least one client is frame-capable, so a session
 /// with none pays exactly today's cost and emits exactly today's `Tag::Output`
 /// bytes (the gate-off invariant).
 fn broadcast_output(clients: &mut [ClientConn], term: &Terminal, bcast: &[u8]) {
@@ -702,8 +736,15 @@ fn broadcast_output(clients: &mut [ClientConn], term: &Terminal, bcast: &[u8]) {
             (term.rows(), term.cols()),
         )
     });
-    // One dump per distinct client geometry: clients of the same size share it.
-    let mut dumps: Vec<((u16, u16), Vec<u8>)> = Vec::new();
+    // Clients that would get the same dump share it: a bounded geometry keys on
+    // its own size (`None` below never collides with it), and
+    // every geometry `dump_vt_mirror` cannot bound (wider, narrower, shorter,
+    // not yet reported) shares ONE key, since each would build the same full
+    // ring dump — without this, every extra fallback size cost another ring
+    // dump per chunk.
+    // `Some(size)` for a bounded geometry, `None` for the shared fallback.
+    type DumpKey = Option<(u16, u16)>;
+    let mut dumps: Vec<(DumpKey, Vec<u8>)> = Vec::new();
     for c in clients.iter_mut() {
         let produced = match &frame_inputs {
             Some((snap, alt, dims)) => {
@@ -713,7 +754,9 @@ fn broadcast_output(clients: &mut [ClientConn], term: &Terminal, bcast: &[u8]) {
                 // `queue_frame` marks a due activity answer sent before it
                 // looks at the producer, and skipping it would change that.
                 let dump = if c.producer.is_some() {
-                    let geometry = (c.rows, c.cols);
+                    let geometry = term
+                        .dump_vt_mirror_is_bounded(c.rows, c.cols)
+                        .then_some((c.rows, c.cols));
                     match dumps.iter().find(|(g, _)| *g == geometry) {
                         Some((_, d)) => d.clone(),
                         None => {
@@ -1668,6 +1711,11 @@ fn daemon_loop(
             let total_clients = clients.len();
             {
                 let c = &mut clients[i];
+                // Captured BEFORE this batch can resize the session
+                // (`apply_client_size` below): see `owes_regeometry_frame`.
+                let reported_before = (c.rows, c.cols);
+                let was_bounded = active_source(overlay.as_ref().map(|o| &o.term), term)
+                    .dump_vt_mirror_is_bounded(c.rows, c.cols);
                 if revents & libc::POLLIN != 0 {
                     match c.read_buf.read_from(c.stream.as_raw_fd()) {
                         Ok(0) => remove = true,
@@ -1726,9 +1774,7 @@ fn daemon_loop(
                                     needs_replay = has_pty_output;
                                 }
                                 Tag::Resize => {
-                                    if let Some((r, w)) = ipc::decode_resize(&frame.payload) {
-                                        c.rows = r;
-                                        c.cols = w;
+                                    if c.apply_resize(&frame.payload) {
                                         resized = true;
                                     }
                                 }
@@ -1860,6 +1906,23 @@ fn daemon_loop(
                 if revents & err_events != 0 {
                     remove = true;
                 }
+                // A frame client whose reported size changed (a `Tag::Resize`,
+                // or a re-`Init` that already replays) may be owed a frame built
+                // for its NEW geometry (posh#225): a bounded frame is shaped for
+                // the size it last reported (`queue_frame_from`), and neither the
+                // local nor the roaming client requests a resync on its own
+                // resize. If the session size does not change with it (it was
+                // not the smallest client), no PTY output follows to supersede
+                // the frames shaped for the old size, so without this its mirror
+                // keeps them. Owed only when the OLD size's dump was bounded: a
+                // full-dump frame renders at any size, so a client whose previous
+                // geometry got the full dump is owed nothing — which also keeps a
+                // drag-resized wider viewport from being sent a ring-sized frame
+                // per resize event. Reuses the replay below, which runs after
+                // `apply_client_size`.
+                if c.owes_regeometry_frame(reported_before, was_bounded) {
+                    needs_replay |= has_pty_output;
+                }
             }
             // RFC 0013 §5.2 / RFC 0016 §2: a request this client's messages
             // latched after the loop-top refresh (Init, Tag::ClientCaps) is
@@ -1969,6 +2032,15 @@ fn daemon_loop(
                 // the dump replay. A baseline client keeps the flat `dump_vt`
                 // (it pinned the outer terminal to its alt screen, so the replay
                 // must never switch buffers). RFC 0008.
+                // After a frame client's own resize (above) the producer keeps
+                // its acked base, so the replay is a `Diff` against the
+                // old-geometry dump whenever that is the smaller encoding: the
+                // dump codec is byte-level, so the diff rebuilds the new
+                // geometry's dump exactly, and the client re-parses it at its new
+                // size. Forcing a `Full` (dropping the base, as
+                // `broadcast_source_swap` does) would be equally correct but
+                // never smaller: the producer already falls back to a `Full`
+                // when the diff is no win.
                 // Replay the ACTIVE broadcast source: while an escape overlay is
                 // up it is what every client sees (FDR 0008), so a client
                 // attaching / resuming mid-overlay must base on the overlay
@@ -4536,6 +4608,160 @@ mod tests {
         }
     }
 
+    /// The rendering-unchanged requirement itself: `mirror` (a client's
+    /// ring-less mirror with its frames applied) shows exactly what the same
+    /// mirror fed the WHOLE-ring `dump_vt` would — every row and the cursor.
+    fn assert_renders_as_full_replay(mirror: &Terminal, term: &Terminal) {
+        let mut want = Terminal::with_scrollback(mirror.rows(), mirror.cols(), 0);
+        want.process(&term.dump_vt());
+        assert_mirrors(&want, mirror);
+    }
+
+    #[test]
+    fn a_taller_clients_mirror_renders_exactly_what_the_full_dump_would() {
+        let term = full_ring_term();
+        let (mut c, _peer) = frame_capable_conn(term.rows() + 16, term.cols());
+        broadcast_output(std::slice::from_mut(&mut c), &term, b"<raw bytes ignored>");
+        assert_renders_as_full_replay(&mirror_frames(&c.write_buf, c.rows, c.cols, &[]), &term);
+    }
+
+    #[test]
+    fn same_size_clients_share_one_dump_in_a_mixed_broadcast() {
+        let term = full_ring_term();
+        let (rows, cols) = (term.rows(), term.cols());
+        let (a, _pa) = frame_capable_conn(rows, cols);
+        let (taller, _pt) = frame_capable_conn(rows + 16, cols);
+        let (b, _pb) = frame_capable_conn(rows, cols);
+        let mut clients = vec![a, taller, b];
+        broadcast_output(&mut clients, &term, b"<raw bytes ignored>");
+        assert_eq!(clients[0].write_buf, clients[2].write_buf, "same geometry, same frame bytes");
+        assert_ne!(clients[0].write_buf, clients[1].write_buf, "another geometry, another dump");
+    }
+
+    #[test]
+    fn a_resync_keyframe_is_built_for_a_non_session_size_client() {
+        let term = full_ring_term();
+        let (rows, cols) = (term.rows() + 16, term.cols());
+        let (mut c, _peer) = lossy_conn(rows, cols, &[]);
+        broadcast_output(std::slice::from_mut(&mut c), &term, b"<raw bytes ignored>");
+        c.write_buf.clear();
+        handle_frame_ack(&mut c, &ipc::encode_frame_ack(1, ipc::FRAME_ACK_RESYNC), &term);
+        assert_eq!(only_full_body(&c.write_buf), term.dump_vt_mirror(rows, cols));
+        assert_renders_as_full_replay(&mirror_frames(&c.write_buf, rows, cols, &[]), &term);
+    }
+
+    #[test]
+    fn an_overlay_source_swap_builds_each_keyframe_for_the_clients_geometry() {
+        let session = full_ring_term();
+        let (rows, cols) = (session.rows() + 16, session.cols());
+        let (mut c, _peer) = frame_capable_conn(rows, cols);
+        broadcast_output(std::slice::from_mut(&mut c), &session, b"<raw bytes ignored>");
+        let mut overlay = Terminal::new(session.rows(), session.cols());
+        overlay.process(b"overlay$ ");
+        // Open: the overlay screen, as a Full keyframe for this client's size.
+        c.write_buf.clear();
+        broadcast_source_swap(std::slice::from_mut(&mut c), &overlay, &overlay.dump_vt_flat());
+        assert_eq!(only_full_body(&c.write_buf), overlay.dump_vt_mirror(rows, cols));
+        // Close: back to the full-ring session, bounded, rendering unchanged.
+        c.write_buf.clear();
+        broadcast_source_swap(std::slice::from_mut(&mut c), &session, &session.dump_vt_flat());
+        let dump = only_full_body(&c.write_buf);
+        assert!(dump.len() < 64 * 1024, "the swap-back keyframe carried {} bytes of ring", dump.len());
+        assert_renders_as_full_replay(&mirror_frames(&c.write_buf, rows, cols, &[]), &session);
+    }
+
+    /// A frame client resizing ITSELF while the session size stays put (it was
+    /// not the smallest viewport) gets no PTY output to supersede the frames
+    /// shaped for its old size, and neither the local nor the roaming client
+    /// requests a resync on resize — so the daemon owes it a frame for its new
+    /// geometry, which the loop queues through the replay (`queue_frame_from`).
+    /// A client's `Tag::Resize` to `rows` x `cols`, judged the way the daemon
+    /// loop judges it: the old size's boundedness is taken against `src`
+    /// BEFORE the resize applies. Returns whether a regeometry frame is owed.
+    fn resize_owes_frame(c: &mut ClientConn, src: &Terminal, rows: u16, cols: u16) -> bool {
+        let reported_before = (c.rows, c.cols);
+        let was_bounded = src.dump_vt_mirror_is_bounded(c.rows, c.cols);
+        assert!(c.apply_resize(&ipc::encode_resize(rows, cols)));
+        c.owes_regeometry_frame(reported_before, was_bounded)
+    }
+
+    #[test]
+    fn a_frame_clients_own_resize_owes_a_frame_for_its_new_geometry() {
+        let mut term = full_ring_term();
+        let (rows, cols) = (term.rows(), term.cols());
+        let (mut c, _peer) = frame_capable_conn(rows, cols);
+        broadcast_output(std::slice::from_mut(&mut c), &term, b"<raw bytes ignored>");
+
+        assert!(
+            resize_owes_frame(&mut c, &term, rows + 16, cols),
+            "same-size -> taller: the old frame was bounded, so a frame is owed"
+        );
+        assert!(
+            !resize_owes_frame(&mut c, &term, rows + 16, cols),
+            "an unchanged size owes nothing"
+        );
+        // What the client shows without it: the session-sized frame, applied at
+        // the new size, puts the grid at the TOP instead of the bottom.
+        let stale = mirror_frames(&c.write_buf, rows + 16, cols, &[]);
+        assert_ne!(row_text(&stale, rows + 15), row_text(&term, rows - 1));
+
+        // The replay the loop queues, on top of the old-geometry frame.
+        assert!(c.queue_frame_from(&term));
+        assert_renders_as_full_replay(&mirror_frames(&c.write_buf, rows + 16, cols, &[]), &term);
+        // And later output still applies cleanly on that base.
+        term.process(b"\r\nmore output\r\n$ ");
+        broadcast_output(std::slice::from_mut(&mut c), &term, b"<raw bytes ignored>");
+        assert_renders_as_full_replay(&mirror_frames(&c.write_buf, rows + 16, cols, &[]), &term);
+
+        // Taller -> same-size: the taller frame was bounded too.
+        assert!(resize_owes_frame(&mut c, &term, rows, cols), "taller -> same-size owes a frame");
+        // Same-width -> wider: owed ONCE (that replay is the full dump); from
+        // there on the old size falls back, so wider -> wider owes nothing.
+        assert!(resize_owes_frame(&mut c, &term, rows, cols + 20), "same-width -> wider owes one frame");
+        assert!(!resize_owes_frame(&mut c, &term, rows, cols + 30), "wider -> wider owes nothing");
+        // Wider -> same-width: the in-flight frames are full dumps, which
+        // render at the new size, so nothing is owed.
+        assert!(!resize_owes_frame(&mut c, &term, rows, cols), "wider -> same-width owes nothing");
+
+        // A size reported for the first time (0x0 falls back): nothing owed —
+        // the Init replay covers attach.
+        let (mut fresh, _pf) = frame_capable_conn(rows, cols);
+        fresh.rows = 0;
+        fresh.cols = 0;
+        assert!(!resize_owes_frame(&mut fresh, &term, rows, cols), "a first size owes nothing");
+
+        // A baseline client is never owed one (it has no producer).
+        let mut baseline = test_client_conn();
+        baseline.apply_init(&ipc::encode_resize(rows, cols));
+        assert!(!resize_owes_frame(&mut baseline, &term, rows + 16, cols));
+    }
+
+    /// Why a client whose OLD geometry got the full dump is owed nothing on
+    /// its own resize: the frame it already holds is `dump_vt`'s full bytes,
+    /// which render on a mirror of any size — so a drag-resized wider viewport
+    /// is never sent a ring-sized frame per resize event.
+    #[test]
+    fn a_wider_clients_resize_owes_no_frame() {
+        let term = full_ring_term();
+        let (rows, cols) = (term.rows(), term.cols());
+        let (mut c, _peer) = frame_capable_conn(rows, cols + 20);
+        broadcast_output(std::slice::from_mut(&mut c), &term, b"<raw bytes ignored>");
+        assert!(!resize_owes_frame(&mut c, &term, rows + 6, cols + 40));
+        assert_renders_as_full_replay(&mirror_frames(&c.write_buf, c.rows, c.cols, &[]), &term);
+    }
+
+    #[test]
+    fn clients_of_different_fallback_geometries_share_one_full_dump() {
+        let term = full_ring_term();
+        let (rows, cols) = (term.rows(), term.cols());
+        let (wider, _pw) = frame_capable_conn(rows, cols + 20);
+        let (narrower, _pn) = frame_capable_conn(rows + 4, cols - 10);
+        let mut clients = vec![wider, narrower];
+        broadcast_output(&mut clients, &term, b"<raw bytes ignored>");
+        assert_eq!(clients[0].write_buf, clients[1].write_buf, "every fallback geometry gets the one full dump");
+        assert_eq!(only_full_body(&clients[0].write_buf), term.dump_vt());
+    }
+
     // ---- posh#225: write_buf growth under a newline flood (MEASUREMENT) ----
 
     /// How the lossy client's `Tag::FrameAck`s arrive during the flood.
@@ -5044,8 +5270,10 @@ mod tests {
 
     /// posh#225 regression: a newline flood into a session whose ring is
     /// already full must not push a healthy lossy client toward
-    /// `MAX_CLIENT_BACKLOG`. The visible frame must stay screen-sized — it
-    /// may not carry the scrollback ring — whatever the ack cadence.
+    /// `MAX_CLIENT_BACKLOG`. For a viewport of the session's own size, the
+    /// visible frame must stay screen-sized — it may not carry the scrollback
+    /// ring — whatever the ack cadence. (A wider viewport still gets
+    /// ring-sized frames: `a_wider_client_still_gets_the_full_dump`.)
     ///
     /// Scope: this pins the VISIBLE frame. With acks withheld entirely the
     /// v1 scrollback frame still re-carries every un-acked row (the second
@@ -5121,14 +5349,12 @@ mod tests {
         }
     }
 
-    /// posh#225 harness self-check: the delivery assertions
-    /// [`posh225_full_ring_flood_keeps_visible_frames_screen_sized`] makes
-    /// cannot be seen passing until visible frames stop replaying the ring.
-    /// This runs the SAME helpers against the one case where frames are
-    /// already small today — a short flood into an EMPTY ring, where the
-    /// visible body is still a small `Diff` — so the delivery-gated ack model
-    /// and the assertions' slack are guarded now rather than first met by
-    /// the task that un-ignores the regression.
+    /// posh#225 harness self-check: the SAME helpers
+    /// [`posh225_full_ring_flood_keeps_visible_frames_screen_sized`] uses, run
+    /// against a short flood into an EMPTY ring. It guards the empty-ring path
+    /// — a client attached to a young session keeps screen-sized frames and
+    /// its history flows — and the harness's delivery-gated ack model and the
+    /// assertions' slack, independently of the full-ring fixture.
     #[test]
     fn posh225_flood_harness_delivery_assertions_hold_while_frames_are_small() {
         const KIB: usize = 1024;
@@ -5144,20 +5370,20 @@ mod tests {
             let r = measure_flood(&flood, case);
             print_flood_row(case, &r);
             assert!(r.rows_scrolled > 0, "the flood must scroll rows off for this to mean anything");
+            // Every cadence, the lost-base `Full`s included: a client of the
+            // session's own size gets screen-sized frames whatever its acks.
+            assert!(
+                r.largest_visible < 64 * KIB,
+                "acks={}: a visible frame was {} bytes — this scenario no longer keeps frames small",
+                acks.label(),
+                r.largest_visible,
+            );
             if !flood_socket_supports_bounds(case, &r) {
                 continue;
             }
             assert_backlog_bounded(case, &r);
-            // `Lagged(5)` is the lost-base regime: no delivery contract (and,
-            // until visible frames stop replaying the ring, no visible-frame
-            // bound either — its `Full`s carry the whole of this short ring).
+            // `Lagged(5)` is the lost-base regime: no delivery contract.
             if !matches!(acks, FloodAcks::Lagged(5)) {
-                assert!(
-                    r.largest_visible < 64 * KIB,
-                    "acks={}: a visible frame was {} bytes — this scenario no longer keeps frames small",
-                    acks.label(),
-                    r.largest_visible,
-                );
                 assert_history_flowed(case, &r);
             }
         }

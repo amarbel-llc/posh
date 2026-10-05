@@ -482,8 +482,9 @@ struct FrameRenderer {
     /// (Morph/scrollback) would advance, so it is held rather than local.
     server_term: Terminal,
     applier: Box<dyn FrameApplier>,
-    /// The last applied frame's `dump_vt` bytes — the byte-diff base a `Diff`
-    /// reconstructs against.
+    /// The last applied frame's dump — the per-client frame dump the daemon
+    /// built for this client's geometry (`dump_vt_mirror`) — the byte-diff base
+    /// a `Diff` reconstructs against.
     applied_data: Vec<u8>,
     /// The frame number the model currently reflects.
     applied_num: u64,

@@ -36,8 +36,9 @@ use super::{Baseline, CurrentFrame, DumpDiff, FrameEncoder, MorphDelta};
 /// than split.
 struct ProducedFrame {
     num: u64,
-    /// The visible-screen `dump_vt` bytes as of this frame — the diff base for a
-    /// later `Diff`. A scrollback frame leaves the visible screen unchanged, so
+    /// The visible-screen frame dump as of this frame — the bytes the caller
+    /// built for this client (the session daemon's `dump_vt_mirror` output for
+    /// the client's geometry) — and the diff base for a later `Diff`. A scrollback frame leaves the visible screen unchanged, so
     /// it records the same visible bytes as the frame before it, keeping the
     /// diff-base chain intact across interleaved scrollback frames.
     data: Vec<u8>,
