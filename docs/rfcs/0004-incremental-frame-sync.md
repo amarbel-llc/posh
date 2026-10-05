@@ -29,6 +29,12 @@ entire screen model from scratch. That work is O(whole screen) per frame
 regardless of how little changed: measured at ~75 µs for a 24×80 screen and
 ~525 µs for a 50×212 screen on a developer machine.
 
+*Note (2026-10-05, posh#225).* The dump a `Full` carries, and a `Diff` is
+computed over, is the sender's frame dump for that client
+(`Terminal::dump_vt_mirror`; RFC 0008 §2). "A complete `dump_vt`" throughout
+this document means that dump: a complete, self-sufficient serialization of
+what the client's mirror shows, not necessarily the whole scrollback ring.
+
 mosh avoids this. Its server computes a minimal escape-delta between the
 last-acked framebuffer and the current one (`Complete::diff_from` →
 `Display::new_frame`) and the client applies that delta to its existing

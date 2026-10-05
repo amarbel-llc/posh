@@ -41,6 +41,13 @@ scrollback structurally impossible, independent of bandwidth:
    frame — there is no accumulation across frames. Whatever the newest
    `dump_vt` doesn't carry, the client doesn't have.
 
+**Update 2026-10-05 (posh#225).** Since posh#225 a visible frame is computed
+over the per-client frame dump (`Terminal::dump_vt_mirror`), which does not
+replay the ring into a session-sized mirror. The incoming stream described
+above therefore no longer carries the full ring for visible frames at the
+session's size. It is recorded here as the finding that motivated the
+scrollback body.
+
 The core change is to make the client's local model **persistent and
 monotonically accumulating**: a long-lived `Terminal` with a real
 scrollback ring, into which frames are *applied* (advancing it) rather
@@ -145,6 +152,16 @@ near-full on **every scroll event**. So the intuition that "the diff
 should stay compact" does **not** hold for today's top-anchored
 `dump_vt`; compactness requires changing what crosses the wire for
 scrollback.
+
+**Update 2026-10-05 (posh#225).** Since posh#225 a visible frame is computed
+over the per-client frame dump (`Terminal::dump_vt_mirror`), which does not
+replay the ring into a session-sized mirror, so the collapse described above
+no longer applies to visible frames at the session's size; it is recorded
+here as the finding that motivated the scrollback body. This top-anchored
+collapse was exactly posh#225's cause: once the 10,000-row ring was full,
+every visible frame was ring-sized. Viewports wider, narrower or shorter than
+the session still receive the full `dump_vt` (see the posh#225 plan,
+`docs/plans/2026-10-05-flood-delivery.md`).
 
 The protocol that carries scrollback growth is specified normatively in
 **RFC 0002** (`docs/rfcs/0002-scrollback-sync.md`): a capability-gated

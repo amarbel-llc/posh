@@ -47,6 +47,11 @@ normal terminal output — pay a whole-buffer retransmit that grows with
 scrollback depth. This specification defines a body whose cost is bounded
 by the *growth* between frames, not by the depth of accumulated history.
 
+*Update 2026-10-05 (posh#225).* Since posh#225 the visible body is computed
+over the per-client frame dump (RFC 0008 §2), which omits the ring for a
+session-sized mirror. The paragraph above records the constraint as it stood
+when the scrollback body was designed.
+
 This RFC specifies (1) the **`SCROLLBACK` capability** that negotiates
 the extension; (2) the **scrollback frame body** wire format; and (3) the
 **client accumulation model** — how a conforming client maintains a

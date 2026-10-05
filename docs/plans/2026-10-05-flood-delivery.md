@@ -230,6 +230,12 @@ where it differs** from this section.
     paced, send-time delivery bounds its backlog regardless of frame size;
     session geometry on the frame (RFC 0012) would make every mirror
     session-sized and retire the fallback.
+  - The same fallback applies when the SESSION's width differs from the
+    viewport's for a reason other than another viewport: an application
+    that switches column mode (DECCOLM, `CSI ? 3 h` under `CSI ? 40 h`)
+    resizes the terminal without any viewport resizing
+    (`posh-term/src/terminal.rs`, `set_deccolm`), so every viewport is on
+    full dumps until it switches back. Correct output, ring-sized frames.
   - History during a flood is still v1: with acks withheld it re-carries
     every un-acked row per chunk, and a remote viewport under a flood is in
     the lost-base regime where history frames are not sent at all. Stages

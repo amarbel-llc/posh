@@ -64,15 +64,19 @@ relies on fully supported:
   RGB/RGBA/PNG formats, chunked transmission, 320 MB quota, spec ACKs.
 - DCS: DECRQSS, XTGETTCAP; queries: DA1/DA2, DSR, DECRQM, XTVERSION,
   XTWINOPS 14/16/18.
-- Serialization: `dump_text()` (plain text including scrollback) and two
+- Serialization: `dump_text()` (plain text including scrollback) and three
   escape-stream forms that reconstruct contents, attributes, cursor, modes,
   title, scroll region, and kitty graphics — images, placements, animation
   frames — verified by roundtrip tests. They have **different contracts and
   are not interchangeable**:
-  - `dump_vt()` targets a freshly constructed `posh_term::Terminal` — the
-    frame codecs build one per apply. That target may be **larger** than the
-    source (see the sizing note under Sessions), so the replay must not
-    depend on the target's height.
+  - `dump_vt()` is the full replica, scrollback included, and targets a
+    freshly constructed `posh_term::Terminal`. That target may be **larger**
+    than the source (see the sizing note under Sessions), so the replay must
+    not depend on the target's height. `posh history` uses it.
+  - `dump_vt_mirror(rows, cols)` is the frame dump the codecs apply into a
+    ring-less mirror of that size. It is bounded to what that mirror can show
+    when the mirror is the session's width and at least its height, and is
+    `dump_vt()`'s bytes otherwise.
   - `dump_vt_flat()` targets a **real tty** carrying whatever mode state the
     previous application left behind, so it opens by resetting that state
     (`DRAWABLE_STATE_RESET`). It draws only the active grid and never
@@ -184,8 +188,9 @@ Encrypted UDP datagrams using AES-128-GCM with mosh's nonce layout
 (direction bit + 63-bit sequence number), replay protection with a reorder
 window, timestamp echo for RFC 6298 RTT estimation, fragmentation for large
 frames, and server-side roaming by adopting the source address of the newest
-authenticated datagram (late reorders never re-target the stream). State sync sends complete `dump_vt()` frames (or a
-prefix/suffix diff against the last acked frame); a client that advertises
+authenticated datagram (late reorders never re-target the stream). State sync sends the frame dump
+(`dump_vt_mirror()`: the screen, plus only as much scrollback as a taller
+mirror shows), or a prefix/suffix diff of it against the last acked frame; a client that advertises
 SCROLLBACK also accumulates the primary-screen scrollback incrementally
 (append-only rows, per-frame cost bounded by inter-frame growth rather than
 ring depth — RFC 0002); user input is delivered reliably via cumulative
@@ -239,8 +244,8 @@ instead of scrollback. Either way, grabbing the wheel costs the outer
 terminal's click-to-select while active; a session app that tracks the mouse
 itself (vim, tmux) keeps the wheel.
 
-Known simplifications relative to mosh: frames carry `dump_vt()` state (or
-a prefix/suffix diff) rather than mosh's SSP protobuf instructions with
+Known simplifications relative to mosh: frames carry a VT dump of the
+screen (`dump_vt_mirror()`), or a prefix/suffix diff, rather than mosh's SSP protobuf instructions with
 zlib; no utmp/motd integration. The full parity contract — what is
 mirrored, what is deliberately dropped, and the open gaps — is FDR 0003
 (`docs/features/`), with the living checklist in issue #44.

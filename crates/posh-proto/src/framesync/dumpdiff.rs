@@ -1,5 +1,5 @@
 //! `DumpDiff` codec (#15): today's behavior, extracted verbatim. The server
-//! ships the full `dump_vt` either whole (`Full`) or as a prefix/suffix
+//! ships the full frame dump either whole (`Full`) or as a prefix/suffix
 //! byte-diff against the acked frame (`Diff`); the client reconstructs the full
 //! dump and reparses it into a fresh `Terminal`. This is the default codec, the
 //! keyframe path for the others, and the only one a baseline peer ever

@@ -8,7 +8,7 @@
 //!   * client-side **apply** — given a received body, update the client's model.
 //!
 //! Two impls ship today:
-//!   * [`DumpDiff`] — today's behavior verbatim (full `dump_vt` + prefix/suffix
+//!   * [`DumpDiff`] — today's behavior verbatim (the full frame dump + prefix/suffix
 //!     byte-diff on the server; `apply_diff` + a fresh-`Terminal` reparse on the
 //!     client). The default and the keyframe path; no behavior change.
 //!   * [`MorphDelta`] — the prototype. The server emits a minimal forward
@@ -87,7 +87,7 @@ impl FrameSync {
 
 /// The client-acked baseline a server-side encoder may build an incremental
 /// body against. `num` is the acked frame number (the body's `base`); `dump`
-/// is that frame's `dump_vt` bytes (the byte-diff base); `snapshot` is the
+/// is that frame's frame-dump bytes (the byte-diff base); `snapshot` is the
 /// rendered screen state at that frame (the morph base). `alt_screen`/`rows`/
 /// `cols` capture the parts of the terminal state that `Snapshot` does **not**
 /// carry, so an encoder can detect a transition a morph cannot express and
