@@ -52,16 +52,18 @@ pub struct ServerSide {
 }
 
 impl ServerSide {
-    fn new(rows: u16, cols: u16) -> ServerSide {
+    fn new(rows: u16, cols: u16, ring: usize) -> ServerSide {
         ServerSide {
-            term: Terminal::with_scrollback(rows, cols, 0),
+            term: Terminal::with_scrollback(rows, cols, ring),
         }
     }
 
-    fn baseline_now(&self, num: u64) -> Baseline {
+    /// The server's current state as `lane`'s client would mirror it: the dump
+    /// is the cheapest one for that client's geometry (`dump_vt_mirror`).
+    fn baseline_now(&self, num: u64, lane: &ClientLane) -> Baseline {
         Baseline {
             num,
-            dump: self.term.dump_vt(),
+            dump: self.term.dump_vt_mirror(lane.client.rows, lane.client.cols),
             snapshot: Snapshot::from_term(&self.term),
             alt_screen: self.term.is_alt_screen(),
             rows: self.term.rows(),
@@ -74,17 +76,16 @@ impl ServerSide {
     fn encode_for(&self, lane: &mut ClientLane) {
         let num = lane.next_num;
         lane.next_num += 1;
-        let dump = self.term.dump_vt();
-        let snapshot = Snapshot::from_term(&self.term);
+        let baseline = self.baseline_now(num, lane);
         let cur = CurrentFrame {
-            dump: &dump,
-            snapshot: &snapshot,
-            alt_screen: self.term.is_alt_screen(),
-            rows: self.term.rows(),
-            cols: self.term.cols(),
+            dump: &baseline.dump,
+            snapshot: &baseline.snapshot,
+            alt_screen: baseline.alt_screen,
+            rows: baseline.rows,
+            cols: baseline.cols,
         };
         let body = lane.enc.encode(lane.acked.as_ref(), &cur);
-        lane.produced.push_back(self.baseline_now(num));
+        lane.produced.push_back(baseline);
         lane.send_frame(ServerFrame {
             flags: 0,
             caps: vec![],
@@ -205,10 +206,13 @@ pub struct ClientLane {
     produced: VecDeque<Baseline>,
     to_client: VecDeque<ServerFrame>,
     to_server: VecDeque<ClientAck>,
+    /// Encoded byte length of the largest frame sent on this lane.
+    largest_frame_bytes: usize,
 }
 
 impl FrameChannel for ClientLane {
     fn send_frame(&mut self, frame: ServerFrame) {
+        self.largest_frame_bytes = self.largest_frame_bytes.max(frame.encode().len());
         self.to_client.push_back(frame);
     }
 
@@ -227,6 +231,7 @@ impl ClientLane {
             produced: VecDeque::new(),
             to_client: VecDeque::new(),
             to_server: VecDeque::new(),
+            largest_frame_bytes: 0,
         }
     }
 
@@ -318,11 +323,27 @@ impl FrameHarness {
     /// A harness with one client at the server's own size — the same-geometry
     /// case. Use [`FrameHarness::add_client`] for a differently-sized one.
     pub fn new(rows: u16, cols: u16, sync: FrameSync) -> FrameHarness {
+        FrameHarness::with_ring(rows, cols, sync, 0)
+    }
+
+    /// [`FrameHarness::new`] with a server that keeps `ring` rows of
+    /// scrollback, as production does (10,000). Clients stay ring-less.
+    pub fn with_ring(rows: u16, cols: u16, sync: FrameSync, ring: usize) -> FrameHarness {
         FrameHarness {
-            server: ServerSide::new(rows, cols),
+            server: ServerSide::new(rows, cols, ring),
             lanes: vec![ClientLane::new(rows, cols, sync)],
             sync,
         }
+    }
+
+    /// The largest encoded frame sent to any client so far, in bytes.
+    pub fn largest_frame_bytes(&self) -> usize {
+        self.lanes.iter().map(|l| l.largest_frame_bytes).max().unwrap_or(0)
+    }
+
+    /// The largest encoded frame sent to `id` so far, in bytes.
+    pub fn largest_frame_bytes_for(&self, id: ClientId) -> usize {
+        self.lane(id).largest_frame_bytes
     }
 
     /// Attach another client at ITS OWN geometry, which need not match the
@@ -450,6 +471,46 @@ impl FrameHarness {
         );
     }
 
+    /// The content invariant for a client TALLER than a ring-backed server.
+    ///
+    /// A taller mirror of a session with scrollback is not equal to the
+    /// session's grid: the dump replays history ahead of the grid, so the
+    /// extra rows at the top are the session's most recent scrollback, with
+    /// the grid at the bottom. So the client must show the last `client_rows`
+    /// rows of [scrollback…, grid] — the expected rows come from
+    /// `Terminal::dump_text()` (scrollback plus screen, trailing blanks
+    /// trimmed; the harness feeds only short unwrapped lines, so its rows map
+    /// one to one) — and the server's own rows must be a suffix of them.
+    pub fn assert_mirrors_session_tail(&self, id: ClientId) {
+        let client = &self.lane(id).client.term;
+        let mut history: Vec<String> =
+            self.server.term.dump_text().lines().map(str::to_string).collect();
+        while history.last().is_some_and(|r| r.is_empty()) {
+            history.pop();
+        }
+        let tail = &history[history.len().saturating_sub(usize::from(client.rows()))..];
+        let skip = tail.iter().take_while(|r| r.is_empty()).count();
+        let expected = &tail[skip..];
+        let server_rows = content_rows(&self.server.term);
+        let client_rows = content_rows(client);
+        assert_eq!(
+            client_rows, expected,
+            "client {id:?} ({}x{}) is not the session's last {} rows",
+            client.rows(),
+            client.cols(),
+            client.rows(),
+        );
+        assert!(
+            client_rows.ends_with(&server_rows),
+            "the session's grid is not at the bottom of client {id:?}:\n  server rows: {server_rows:?}\n  client rows: {client_rows:?}",
+        );
+        assert_eq!(
+            cursor_row_text(client),
+            cursor_row_text(&self.server.term),
+            "client {id:?}'s cursor is on different content than the server's",
+        );
+    }
+
     /// The client mirror reproduces the server's *visible* screen exactly. A
     /// background-color bleed / over-paint (posh#100) is precisely a violation
     /// of this on the client side: cells carrying a background the source cell
@@ -480,6 +541,16 @@ impl FrameHarness {
 mod mismatched_size_tests {
     use super::*;
 
+    /// Scroll `count` numbered lines through the server, 50 per `feed`: one
+    /// encode per chunk instead of per line keeps a ring-backed server's
+    /// full-ring dumps (the thing the size tests measure) affordable in debug.
+    fn feed_numbered_lines(h: &mut FrameHarness, count: u16) {
+        let lines: Vec<String> = (0..count).map(|i| format!("line {i:04}\r\n")).collect();
+        for chunk in lines.chunks(50) {
+            h.feed(chunk.concat().as_bytes());
+        }
+    }
+
     /// The production shape (posh#139): the daemon sizes the pty to the
     /// SMALLEST attached client, so a larger client permanently renders a grid
     /// smaller than its own terminal. Both clients consume the SAME frame
@@ -505,10 +576,10 @@ mod mismatched_size_tests {
         }
     }
 
-    /// Scrolled far enough to fill scrollback, which routes `dump_vt` down its
-    /// bottom-landing flow instead of the homed draw — the case where the
-    /// content sits at the taller client's BOTTOM rather than its top. The
-    /// content assertion is anchor-agnostic precisely so both are accepted.
+    /// Scrolled past the visible grid on a ring-less server, so the screen
+    /// holds the tail of the output and no scrollback is replayed. It does NOT
+    /// exercise the scrollback-replay path — see
+    /// `a_taller_client_mirrors_a_scrolled_session_with_a_real_ring` for that.
     #[test]
     fn a_taller_client_mirrors_a_scrolled_session() {
         let mut h = FrameHarness::new(24, 80, FrameSync::DumpDiff);
@@ -523,6 +594,56 @@ mod mismatched_size_tests {
         h.assert_mirrors_content(ClientId::PRIMARY);
         h.assert_mirrors_content(tall);
         h.assert_converged(); // the same-size client still matches exactly
+    }
+
+    /// The ring-replay branch, finally exercised: the server keeps real
+    /// scrollback, so a taller client's frames carry a scrollback tail while
+    /// the same-size client's carry none. Both must mirror the session, and
+    /// no frame may carry the whole ring (posh#225).
+    #[test]
+    fn a_taller_client_mirrors_a_scrolled_session_with_a_real_ring() {
+        let mut h = FrameHarness::with_ring(24, 80, FrameSync::DumpDiff, 10_000);
+        let tall = h.add_client(50, 80);
+        feed_numbered_lines(&mut h, 2_000);
+        h.feed(b"prompt$ ");
+        h.deliver_all();
+        h.assert_mirrors_content(ClientId::PRIMARY);
+        h.assert_mirrors_session_tail(tall);
+        h.assert_converged(); // the same-size client (client 0) still matches exactly
+        for id in [ClientId::PRIMARY, tall] {
+            assert!(
+                h.largest_frame_bytes_for(id) < 16_384,
+                "a frame toward {id:?} was {} bytes — it carried the ring",
+                h.largest_frame_bytes_for(id),
+            );
+        }
+    }
+
+    /// A WIDER client of a ring-backed server. `dump_vt_mirror` falls back to
+    /// the full dump for any geometry but same-width, so this client's frames
+    /// stay ring-sized. This pins a KNOWN LIMITATION of posh#225 Stage 1: a
+    /// viewport wider than the session keeps ring-sized frames until paced
+    /// delivery (Stage 2) bounds its backlog, or session geometry on the frame
+    /// (RFC 0012) makes mirrors session-sized. Only size facts are asserted
+    /// for the wide client; no existing oracle expresses its content.
+    #[test]
+    fn a_wider_client_of_a_ring_backed_session_keeps_ring_sized_frames() {
+        let mut h = FrameHarness::with_ring(24, 80, FrameSync::DumpDiff, 10_000);
+        let wide = h.add_client(24, 120);
+        feed_numbered_lines(&mut h, 2_000);
+        h.feed(b"prompt$ ");
+        h.deliver_all();
+        h.assert_mirrors_content(ClientId::PRIMARY);
+        assert!(
+            h.largest_frame_bytes_for(ClientId::PRIMARY) < 16_384,
+            "the same-size client's frame was {} bytes",
+            h.largest_frame_bytes_for(ClientId::PRIMARY),
+        );
+        assert!(
+            h.largest_frame_bytes_for(wide) > 16_384,
+            "the wide client's frames are expected to be ring-sized (known limitation) but the largest was {} bytes",
+            h.largest_frame_bytes_for(wide),
+        );
     }
 
     /// A full-screen app on the alt screen, mirrored onto a taller client. This
