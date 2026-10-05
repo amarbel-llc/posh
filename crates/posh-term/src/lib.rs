@@ -30,6 +30,7 @@
 //!   (`dump_vt` for a ring-less mirror of that size, with the scrollback
 //!   replay bounded where that is proven equivalent; the frame-transport
 //!   serializer, posh#225)
+//! - `Terminal::dump_vt_mirror_is_bounded(&self, mirror_rows: u16, mirror_cols: u16) -> bool`
 //! - `Terminal::dump_vt_flat(&self) -> Vec<u8>` (single-screen variant: active
 //!   grid only, never switches the target's buffers)
 //! - `Terminal::dump_screen_switch(&self) -> Vec<u8>` (in-place repaint that

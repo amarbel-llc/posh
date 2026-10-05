@@ -306,7 +306,7 @@ impl Terminal {
     ///   text and cursor but, as always, drops a grid head's soft-wrap flag,
     ///   which nothing can regenerate by replay.
     pub fn dump_vt_mirror(&self, mirror_rows: u16, mirror_cols: u16) -> Vec<u8> {
-        let tail = if mirror_cols != self.cols() || mirror_rows < self.rows() {
+        let tail = if !self.dump_vt_mirror_is_bounded(mirror_rows, mirror_cols) {
             usize::MAX
         } else if mirror_rows == self.rows() {
             0
@@ -314,6 +314,16 @@ impl Terminal {
             2 * usize::from(mirror_rows)
         };
         self.dump_vt_tail(tail)
+    }
+
+    /// Whether [`Terminal::dump_vt_mirror`] bounds the scrollback replay for a
+    /// mirror of this geometry (same width, at least this height), as opposed
+    /// to falling back to `dump_vt`'s bytes. A bounded dump is shaped for that
+    /// mirror size; the fallback renders on a mirror of any size. Callers use
+    /// this to share one dump between mirrors that all get the fallback, and
+    /// to know when a mirror's resize makes its in-flight frames stale.
+    pub fn dump_vt_mirror_is_bounded(&self, mirror_rows: u16, mirror_cols: u16) -> bool {
+        mirror_cols == self.cols() && mirror_rows >= self.rows()
     }
 
     /// [`Terminal::dump_vt`] with the scrollback replay bounded to the NEWEST
@@ -1361,6 +1371,23 @@ mod cursor_mismatch_tests {
         let full = t.dump_vt();
         for (rows, cols) in [(10, 80), (23, 80), (24, 120), (32, 120), (24, 60), (32, 60)] {
             assert!(t.dump_vt_mirror(rows, cols) == full, "{rows}x{cols} must be dump_vt's bytes");
+        }
+    }
+
+    /// `dump_vt_mirror_is_bounded` names the rule `dump_vt_mirror` applies:
+    /// over a deep ring, it holds exactly where the dump differs from
+    /// `dump_vt`'s bytes, on the bounded and fallback geometries above.
+    #[test]
+    fn mirror_dump_is_bounded_agrees_with_dump_vt_mirror() {
+        let t = scrolled(24, 80, 1000, 500);
+        let full = t.dump_vt();
+        for rows in bounded_heights(&t) {
+            assert!(t.dump_vt_mirror_is_bounded(rows, 80), "{rows}x80 is bounded");
+            assert!(t.dump_vt_mirror(rows, 80) != full, "{rows}x80's dump is bounded");
+        }
+        for (rows, cols) in [(0, 0), (10, 80), (23, 80), (24, 120), (32, 120), (24, 60), (32, 60)] {
+            assert!(!t.dump_vt_mirror_is_bounded(rows, cols), "{rows}x{cols} falls back");
+            assert!(t.dump_vt_mirror(rows, cols) == full, "{rows}x{cols}'s dump is dump_vt's");
         }
     }
 
