@@ -2111,9 +2111,14 @@ pub(crate) fn server_loop(
                 // put into a scrollback frame that may have been lost; if a
                 // visible-frame ack confirmed those, the rows of a
                 // dropped-then-superseded scrollback frame would never be
-                // re-shipped (finding #1).
+                // re-shipped (finding #1). The dump is shaped for the peer's
+                // mirror, which holds no ring: dump_vt would replay the whole
+                // scrollback ring into every frame (posh#225). `src` is resized
+                // to client_size with the peer, so this is the bounded, homed
+                // dump; a peer resize touches `src`, so the next frame is
+                // rebuilt for the new geometry even if the shell is silent.
                 producer.advance_visible(
-                    stats.time_dump_vt(|| src.dump_vt()),
+                    stats.time_dump_vt(|| src.dump_vt_mirror(client_size.0, client_size.1)),
                     Snapshot::from_term(src),
                     src.is_alt_screen(),
                     (src.rows(), src.cols()),
@@ -3766,6 +3771,160 @@ mod tests {
         assert!(
             saw_resync_full,
             "server never sent a fresh Full keyframe after CLIENT_FLAG_RESYNC"
+        );
+        assert!(saw_shutdown, "server never wound down");
+        server.join().unwrap();
+    }
+
+    #[test]
+    fn visible_frames_follow_the_peer_geometry_not_the_scrollback_ring() {
+        // posh#225: a visible frame is mirrored into a ring-less terminal, so it
+        // must not replay the scrollback ring. A ~3,000-line flood puts ~100 KiB
+        // in the ring; a RESYNC then forces a Full keyframe of the settled
+        // screen, the frame that replayed the whole ring when built from
+        // dump_vt. Every visible body must stay screen-sized. Then the peer
+        // grows to 40 rows (same width) while the shell is silent: the resize
+        // alone must bring a frame built for 40 rows — the reflow pulls 16
+        // ring rows into the grid, so its row 0 is `line 2961`, where a frame
+        // shaped for the old 24 rows would show `line 2977`.
+        const BOUND: usize = 16 * 1024;
+        let key = Key::random();
+        let (server_conn, port) = Connection::server((62700, 62799), &key, Family::Inet).unwrap();
+        let script = "i=0; while [ $i -lt 3000 ]; do \
+                      echo \"line $i the quick brown fox jumps over\"; \
+                      i=$((i+1)); done; sleep 600";
+        let cmd: Vec<String> = vec!["/bin/sh".into(), "-c".into(), script.into()];
+        let child = crate::pty::spawn_shell(Some(&cmd), 24, 80, &[], None).unwrap();
+        util::set_nonblocking(child.master).unwrap();
+        let server = std::thread::spawn(move || server_loop(server_conn, child, 24, 80, None, false));
+
+        let addr = format!("127.0.0.1:{port}").parse().unwrap();
+        let mut conn = Connection::client(addr, &key).unwrap();
+        let mut fragmenter = Fragmenter::new();
+        let mut assembly = FragmentAssembly::new();
+        let mirror_row0 = |dump: &[u8], rows: u16| {
+            let mut mirror = Terminal::new(rows, 80);
+            mirror.process(dump);
+            mirror.screen().row(0).unwrap().text(true)
+        };
+
+        // The client's applied visible frame: (frame_num, reconstructed dump).
+        let mut held: Option<(u64, Vec<u8>)> = None;
+        let mut largest_visible = 0usize;
+        let mut rows = 24u16;
+        let mut flood_done = false;
+        let mut resync_at: Option<u64> = None;
+        let mut saw_resync_full = false;
+        let mut resize_at: Option<u64> = None;
+        let mut resized_row0: Option<String> = None;
+        let mut shutting = false;
+        let mut saw_shutdown = false;
+        let deadline = now_ms() + 20_000;
+        while now_ms() < deadline {
+            let acked = held.as_ref().map_or(0, |h| h.0);
+            // One-shot, like the real client: a repeated RESYNC landing after
+            // the keyframe would force another 24-row frame past resize_at.
+            let want_resync = flood_done && resync_at.is_none();
+            if want_resync {
+                resync_at = Some(acked);
+            }
+            if saw_resync_full && resize_at.is_none() {
+                resize_at = Some(acked);
+                rows = 40;
+            }
+            let flags = if shutting || resized_row0.is_some() {
+                shutting = true;
+                sync::CLIENT_FLAG_SHUTDOWN
+            } else if want_resync {
+                sync::CLIENT_FLAG_RESYNC
+            } else {
+                0
+            };
+            let msg = ClientMessage {
+                flags,
+                caps: vec![],
+                acked_frame: acked,
+                rows,
+                cols: 80,
+                input_base: 0,
+                input: vec![],
+            };
+            for frag in fragmenter.make_fragments(&msg.encode(), sync::FRAGMENT_CONTENTS_MAX) {
+                conn.send(&frag.to_bytes()).unwrap();
+            }
+            if saw_shutdown {
+                break;
+            }
+            std::thread::sleep(std::time::Duration::from_millis(50));
+            loop {
+                match conn.recv() {
+                    Ok(Some(payload)) => {
+                        let Ok(frag) = sync::Fragment::from_bytes(&payload) else {
+                            continue;
+                        };
+                        let Some(assembled) = assembly.add(frag) else {
+                            continue;
+                        };
+                        let Ok(frame) = ServerFrame::decode(&assembled) else {
+                            continue;
+                        };
+                        if frame.flags & sync::FLAG_SHUTDOWN != 0 {
+                            saw_shutdown = true;
+                        }
+                        let applied = match &frame.body {
+                            FrameBody::Full(b) => {
+                                largest_visible = largest_visible.max(b.len());
+                                Some(b.clone())
+                            }
+                            FrameBody::Diff { base, diff, .. } => {
+                                largest_visible = largest_visible.max(diff.len());
+                                held.as_ref()
+                                    .filter(|h| h.0 == *base)
+                                    .and_then(|h| sync::apply_diff(&h.1, diff))
+                            }
+                            _ => None,
+                        };
+                        let Some(dump) = applied else {
+                            continue;
+                        };
+                        if held.as_ref().is_some_and(|h| h.0 >= frame.frame_num) {
+                            continue; // a retransmission of an applied frame
+                        }
+                        let num = frame.frame_num;
+                        if resync_at.is_some_and(|at| num > at)
+                            && matches!(frame.body, FrameBody::Full(_))
+                        {
+                            saw_resync_full = true;
+                        }
+                        if resize_at.is_some_and(|at| num > at) && resized_row0.is_none() {
+                            resized_row0 = Some(mirror_row0(&dump, 40));
+                        }
+                        if !flood_done {
+                            let mut mirror = Terminal::new(24, 80);
+                            mirror.process(&dump);
+                            flood_done = (0..24).any(|r| {
+                                mirror.screen().row(r).unwrap().text(true).starts_with("line 2999 ")
+                            });
+                        }
+                        held = Some((num, dump));
+                    }
+                    Ok(None) => continue,
+                    Err(e) if e.kind() == std::io::ErrorKind::WouldBlock => break,
+                    Err(_) => break,
+                }
+            }
+        }
+        assert!(flood_done, "the flood never reached the screen");
+        assert!(saw_resync_full, "no Full keyframe after CLIENT_FLAG_RESYNC");
+        assert!(
+            largest_visible <= BOUND,
+            "a visible frame body was {largest_visible} bytes (bound {BOUND}): \
+             it carried the scrollback ring"
+        );
+        let row0 = resized_row0.expect("no visible frame after the peer grew to 40 rows");
+        assert!(
+            row0.starts_with("line 2961 "),
+            "the post-resize frame was not built for 40 rows: mirror row 0 = {row0:?}"
         );
         assert!(saw_shutdown, "server never wound down");
         server.join().unwrap();
