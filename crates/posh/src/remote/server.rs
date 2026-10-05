@@ -1,6 +1,7 @@
 //! Roaming remote server (mosh-server port, simplified SSP): owns the PTY
 //! and a posh_term::Terminal, and syncs screen state to the client as
-//! dump_vt frames (full or diffed against the last client-acked frame).
+//! frame dumps (`dump_vt_mirror` for the peer's geometry), full or diffed
+//! against the last client-acked frame.
 //!
 //! # DNR — the Architecture-A half is superseded by M2 (ADR 0007)
 //!
@@ -2111,12 +2112,17 @@ pub(crate) fn server_loop(
                 // put into a scrollback frame that may have been lost; if a
                 // visible-frame ack confirmed those, the rows of a
                 // dropped-then-superseded scrollback frame would never be
-                // re-shipped (finding #1). The dump is shaped for the peer's
-                // mirror, which holds no ring: dump_vt would replay the whole
-                // scrollback ring into every frame (posh#225). `src` is resized
-                // to client_size with the peer, so this is the bounded, homed
-                // dump; a peer resize touches `src`, so the next frame is
-                // rebuilt for the new geometry even if the shell is silent.
+                // re-shipped (finding #1).
+                //
+                // The dump is shaped for the peer's mirror, which holds no
+                // ring: dump_vt would replay the whole scrollback ring into
+                // every frame (posh#225). `src` is resized to client_size with
+                // the peer, so this is normally the bounded, homed dump —
+                // unless the application switched column mode (DECCOLM), which
+                // can resize `src` without the peer, and that geometry falls back
+                // to dump_vt's ring-sized bytes. A peer resize touches `src`,
+                // so the next frame is rebuilt for the new geometry even if
+                // the shell is silent.
                 producer.advance_visible(
                     stats.time_dump_vt(|| src.dump_vt_mirror(client_size.0, client_size.1)),
                     Snapshot::from_term(src),
@@ -3816,7 +3822,8 @@ mod tests {
         let mut resync_at: Option<u64> = None;
         let mut saw_resync_full = false;
         let mut resize_at: Option<u64> = None;
-        let mut resized_row0: Option<String> = None;
+        let mut resized_ok = false;
+        let mut last_resized_row0: Option<String> = None;
         let mut shutting = false;
         let mut saw_shutdown = false;
         let deadline = now_ms() + 20_000;
@@ -3832,7 +3839,7 @@ mod tests {
                 resize_at = Some(acked);
                 rows = 40;
             }
-            let flags = if shutting || resized_row0.is_some() {
+            let flags = if shutting || resized_ok {
                 shutting = true;
                 sync::CLIENT_FLAG_SHUTDOWN
             } else if want_resync {
@@ -3896,15 +3903,25 @@ mod tests {
                         {
                             saw_resync_full = true;
                         }
-                        if resize_at.is_some_and(|at| num > at) && resized_row0.is_none() {
-                            resized_row0 = Some(mirror_row0(&dump, 40));
+                        // A 24-row frame the server built before it read the
+                        // resize can still be numbered past resize_at: wait
+                        // for the 40-row one rather than judging the first.
+                        if resize_at.is_some_and(|at| num > at) && !resized_ok {
+                            let row0 = mirror_row0(&dump, 40);
+                            resized_ok = row0.starts_with("line 2961 ");
+                            last_resized_row0 = Some(row0);
                         }
                         if !flood_done {
+                            // Settled, not merely started: a frame cut from a
+                            // read that split the last line would let its tail
+                            // dirty the screen again after the RESYNC.
                             let mut mirror = Terminal::new(24, 80);
                             mirror.process(&dump);
-                            flood_done = (0..24).any(|r| {
-                                mirror.screen().row(r).unwrap().text(true).starts_with("line 2999 ")
-                            });
+                            let row = |r| mirror.screen().row(r).unwrap().text(true);
+                            let cursor = mirror.cursor();
+                            flood_done = row(22) == "line 2999 the quick brown fox jumps over"
+                                && row(23).is_empty()
+                                && (cursor.row, cursor.col) == (23, 0);
                         }
                         held = Some((num, dump));
                     }
@@ -3921,10 +3938,10 @@ mod tests {
             "a visible frame body was {largest_visible} bytes (bound {BOUND}): \
              it carried the scrollback ring"
         );
-        let row0 = resized_row0.expect("no visible frame after the peer grew to 40 rows");
         assert!(
-            row0.starts_with("line 2961 "),
-            "the post-resize frame was not built for 40 rows: mirror row 0 = {row0:?}"
+            resized_ok,
+            "no frame built for 40 rows arrived after the peer grew (silent shell); \
+             last post-resize mirror row 0 = {last_resized_row0:?}"
         );
         assert!(saw_shutdown, "server never wound down");
         server.join().unwrap();
