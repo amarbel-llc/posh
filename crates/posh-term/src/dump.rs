@@ -1070,8 +1070,8 @@ mod cursor_mismatch_tests {
     }
 
     /// ALT SCREEN with scrollback, replayed TALLER. `dump_vt` routes this to
-    /// `CursorAnchor::Absolute` (the relative anchor is gated on
-    /// `sb_len > 0 && !alt_active`), because the alt branch re-homes and redraws
+    /// `CursorAnchor::Absolute` (the relative anchor is gated on replaying at
+    /// least one scrollback row and `!alt_active`), because the alt branch re-homes and redraws
     /// the alt grid rather than placing it by a bottom-landing flow. This test
     /// pins that the absolute anchor really is height-independent here: a
     /// full-screen app's cursor must land on its own content at any replay
@@ -1288,5 +1288,140 @@ mod cursor_mismatch_tests {
         let t = scrolled(24, 80, 1000, 30); // only a handful of rows have scrolled off
         assert!(t.primary_scrollback_len() > 0 && t.primary_scrollback_len() < 10);
         assert_eq!(t.dump_vt_tail(10), t.dump_vt());
+    }
+
+    /// For each target height, mirror the tail dump — with the tail callers
+    /// compute, `target_rows - source_rows` saturating at 0 — and the full
+    /// dump, and require the same visible state.
+    fn assert_tail_renders_like_full(t: &Terminal, target_rows: &[u16]) {
+        for &rows in target_rows {
+            let tail = usize::from(rows).saturating_sub(usize::from(t.rows()));
+            assert_eq!(
+                mirror_flat(rows, t.cols(), &t.dump_vt_tail(tail)),
+                mirror_flat(rows, t.cols(), &t.dump_vt()),
+                "target_rows={rows} tail={tail}",
+            );
+        }
+    }
+
+    /// A mirror SHORTER than the source (a client smaller than the session,
+    /// transiently): the tail is 0, and the homed grid must overflow the
+    /// short target exactly as the bottom-landing flow does.
+    #[test]
+    fn tail_dump_renders_like_the_full_dump_on_a_shorter_mirror() {
+        let t = scrolled(24, 80, 1000, 500);
+        assert_tail_renders_like_full(&t, &[10, 23]);
+    }
+
+    /// Soft wraps (one straddling the scrollback/grid seam, one inside the
+    /// grid), SGR left active at a row's end, wide characters at the right
+    /// margin, and a cursor left mid-line.
+    #[test]
+    fn tail_dump_renders_rich_content_like_the_full_dump() {
+        let mut t = Terminal::with_scrollback(24, 80, 1000);
+        for i in 0..60 {
+            t.process(
+                format!("\x1b[1;3{}mstyled {i:03}\x1b[0m plain 漢字 {}\r\n", i % 8, "w".repeat(i % 7))
+                    .as_bytes(),
+            );
+        }
+        // A two-row logical line followed by exactly 22 rows and the prompt
+        // row: its head is the newest ring row and its tail is grid row 0,
+        // so the soft wrap straddles the ring/grid seam.
+        t.process(format!("SEAM{}\r\n", "s".repeat(156)).as_bytes());
+        // A wrap entirely inside the grid, with a style active across it
+        // (2 rows).
+        t.process(format!("\x1b[1;32mGRIDWRAP{}\x1b[0m\r\n", "g".repeat(110)).as_bytes());
+        // Wide characters ending exactly at the right margin (1 row), and
+        // one that does not fit at the last column and wraps (2 rows).
+        t.process(format!("{}漢字\r\n", "x".repeat(76)).as_bytes());
+        t.process(format!("{}漢\r\n", "y".repeat(79)).as_bytes());
+        // A row ending with a non-default style still active (1 row).
+        t.process(b"\x1b[41;1mred to the end\r\n");
+        for i in 0..16 {
+            t.process(format!("\x1b[0mfiller {i:02}\r\n").as_bytes());
+        }
+        t.process(b"prompt$ mid-line");
+        t.process(b"\x1b[5D");
+        let row0 = t.screen().row(0).unwrap().text(false);
+        assert!(
+            row0.starts_with("ssss"),
+            "test setup: grid row 0 must be the seam line's tail, got {row0:?}",
+        );
+        assert!(
+            t.screen().row(23).unwrap().text(false).starts_with("prompt$"),
+            "test setup: the prompt is on the bottom row",
+        );
+        assert_tail_renders_like_full(&t, &[24, 25, 32, 50]);
+    }
+
+    /// Pending wrap at the last column of the bottom row, with scrollback.
+    #[test]
+    fn tail_dump_renders_pending_wrap_like_the_full_dump() {
+        let mut t = scrolled(24, 80, 1000, 100);
+        t.process(b"\r\n");
+        t.process(&[b'W'; 80]);
+        assert_eq!((t.cursor().row, t.cursor().col), (23, 79));
+        assert_tail_renders_like_full(&t, &[24, 25, 32, 50]);
+    }
+
+    /// The alt screen active over a primary with scrollback: the tail rule
+    /// still replays primary rows behind the alt screen when taller, and the
+    /// visible alt state must match either way.
+    #[test]
+    fn tail_dump_renders_the_alt_screen_like_the_full_dump() {
+        let mut t = scrolled(24, 80, 1000, 500);
+        t.process(b"\x1b[?1049h");
+        t.process(b"\x1b[3;10HALT-TOP\x1b[24;1HALT-BOTTOM\x1b[12;5HALT-CURSOR");
+        assert_tail_renders_like_full(&t, &[24, 25, 32, 50]);
+    }
+
+    /// A scrolled session with a non-default scroll region and origin mode,
+    /// its cursor inside the region below the top margin.
+    fn region_session() -> Terminal {
+        let mut t = scrolled(24, 80, 1000, 500);
+        t.process(b"\x1b[5;20r\x1b[?6h");
+        t.process(b"\x1b[3;7HREGION-MARK");
+        t
+    }
+
+    /// Mirror `dump` into a fresh ring-less terminal and return it.
+    fn mirror(rows: u16, cols: u16, dump: &[u8]) -> Terminal {
+        let mut t = Terminal::with_scrollback(rows, cols, 0);
+        t.process(dump);
+        t
+    }
+
+    /// Scroll region + origin mode at the source height: the zero-tail dump
+    /// takes the homed `draw_grid` branch with an absolute CUP, so it is
+    /// asserted against the SOURCE. Equality with `dump_vt` is deliberately
+    /// NOT asserted: `dump_vt`'s scrollback-replay branch moves the cursor
+    /// with a CUU that the restored top margin clamps, leaving it on the
+    /// margin (posh#228).
+    #[test]
+    fn zero_tail_dump_reproduces_a_scroll_region_at_the_same_height() {
+        let t = region_session();
+        let m = mirror(24, 80, &t.dump_vt_tail(0));
+        assert_eq!(m.cursor(), t.cursor());
+        assert_eq!(m.dump_vt_flat(), t.dump_vt_flat());
+    }
+
+    /// Scroll region + origin mode on taller mirrors: the tail and the full
+    /// dump both take the scrollback-replay branch, so this pins that the
+    /// tail preserves `dump_vt`'s behaviour. Both currently inherit posh#228's
+    /// clamped cursor; fixing posh#228 in the shared branch should keep this
+    /// green.
+    #[test]
+    fn tail_dump_renders_a_scroll_region_like_the_full_dump_on_a_taller_mirror() {
+        assert_tail_renders_like_full(&region_session(), &[25, 32, 50]);
+    }
+
+    /// The correct behaviour `dump_vt` should have under a scroll region: the
+    /// replayed cursor lands where the source's is.
+    #[test]
+    #[ignore = "posh#228: dump_vt's relative cursor anchor is clamped by a scroll region's top margin"]
+    fn full_dump_reproduces_a_scroll_region_cursor_at_the_same_height() {
+        let t = region_session();
+        assert_eq!(mirror(24, 80, &t.dump_vt()).cursor(), t.cursor());
     }
 }
