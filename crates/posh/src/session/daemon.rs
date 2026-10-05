@@ -4441,6 +4441,16 @@ mod tests {
         ///   next `maybe_queue_scrollback` fails `has_acked_base` and queues
         ///   nothing. History stops flowing until an ack lands on a held
         ///   frame again.
+        ///
+        /// "Healthy" here means a LOCAL, zero-round-trip reader, and even
+        /// that is better than production does. Under a flood production's
+        /// best case is already lag 1–2: `daemon_main` reads an ack in a
+        /// later iteration's client pass, and its `POLLOUT` rule (see
+        /// [`FloodDrain::OneWritePerChunk`]) makes it one write per two
+        /// chunks. A remote viewport, whose acks cross a real round trip,
+        /// spends the whole flood in the lost-base regime. So the cadences
+        /// the regression test calls healthy are a best case, not what a
+        /// remote viewport sees.
         Lagged(usize),
     }
 
@@ -4486,9 +4496,19 @@ mod tests {
         /// - `daemon_main` arms `POLLOUT` only when `write_buf` was non-empty
         ///   BEFORE `poll`, so a frame queued into an empty buffer is written
         ///   on the NEXT iteration; the harness writes it in the same one.
+        ///   And the delay compounds: that next iteration queues its own
+        ///   chunk before writing, the write empties the buffer, and the
+        ///   iteration after it arms no `POLLOUT` again — so production's
+        ///   steady state under a flood is one write per TWO chunks, and its
+        ///   per-write burst is about two chunks' frames, not one.
         /// - The reader's ack is applied before the next chunk. The daemon
         ///   can read it no earlier than the next iteration's client pass,
         ///   which runs AFTER that iteration's PTY chunk was broadcast.
+        ///
+        /// `FloodRun::peak_undrained == 0` is therefore a statement about
+        /// this model — every chunk's frames left in the write that followed
+        /// it — not about production, where a frame waits at least one
+        /// iteration by construction.
         OneWritePerChunk,
     }
 
@@ -4557,10 +4577,12 @@ mod tests {
     const FLOOD_LINE_LEN: usize = 102;
 
     /// The `SO_SNDBUF`/`SO_RCVBUF` request [`FloodDrain::OneWritePerChunk`]
-    /// pins its socketpair to. Sized so that even a host that takes the
-    /// request literally accepts, in one write, the largest per-chunk burst
-    /// the regression test's own bounds allow (a 64 KiB visible frame plus a
-    /// 32 KiB scrollback frame).
+    /// pins its socketpair to. Sized so that a host which takes the request
+    /// literally is still expected to accept, in one write, the largest
+    /// per-chunk burst the regression test's own bounds allow
+    /// ([`FLOOD_WRITE_CAPACITY_NEEDED`]). Expected, not known:
+    /// [`flood_socket_supports_bounds`] checks what the host actually
+    /// granted, and the bounds are skipped where it fell short.
     const FLOOD_SOCKET_BUFFER: libc::c_int = 128 * 1024;
 
     /// The most rows one PTY chunk of `chunk` flood bytes can scroll off.
@@ -4843,9 +4865,9 @@ mod tests {
     /// drains the way `daemon_main` drains it — one non-blocking
     /// `stream.write` per PTY chunk into a real socketpair — against a reader
     /// that empties the socket instantly. Shows whether the backlog reaches
-    /// `MAX_CLIENT_BACKLOG` with a healthy reader, and with ideal acks. Acks
-    /// are delivery-gated here ([`FloodAcks`]): the reader acks only what the
-    /// one write per chunk has actually delivered.
+    /// `MAX_CLIENT_BACKLOG` with a healthy reader. Acks are delivery-gated
+    /// here ([`FloodAcks`]): the reader acks only what the one write per
+    /// chunk has actually delivered.
     /// `just debug-cargo test --release -p posh --bin posh posh225_flood_backlog_ideal_reader_measurement -- --ignored --nocapture`.
     #[test]
     #[ignore = "posh#225 measurement: slow, prints a table, asserts nothing"]
@@ -4913,15 +4935,34 @@ mod tests {
                 drain: FloodDrain::OneWritePerChunk,
                 prefill_rows: SCROLLBACK + 200,
             };
-            let r = measure_flood(&flood, case);
-            // Checked FIRST for every cadence: it is what the test is named
-            // for, and everything below presumes it.
+            // `Never` is quadratic — every chunk's scrollback frame re-carries
+            // every un-acked row — and its only assertion is the visible-frame
+            // bound, which half the flood shows as well as all of it.
+            let offered = match acks {
+                FloodAcks::Never => &flood[..128 * KIB],
+                _ => &flood[..],
+            };
+            let r = measure_flood(offered, case);
+            // Checked FIRST and unconditionally for every cadence: it is what
+            // the test is named for, and everything below presumes it.
             assert!(
                 r.largest_visible < 64 * KIB,
                 "acks={}: a visible frame was {} bytes — it is carrying the scrollback ring",
                 acks.label(),
                 r.largest_visible,
             );
+            // `Never` stops here. No delivery assertion, and none on the
+            // backlog: with acks withheld the v1 scrollback frame re-carries
+            // every un-acked row on every chunk (the second amplifier, out of
+            // scope above), and nothing is ever confirmed. Only the visible
+            // frame is pinned.
+            if matches!(acks, FloodAcks::Never) {
+                continue;
+            }
+            // Everything below depends on what one write moves on this host.
+            if !flood_socket_supports_bounds(case, &r) {
+                continue;
+            }
             match acks {
                 // A reader that keeps up, and one that lags inside the
                 // producer's outstanding window: the backlog stays flat AND
@@ -4939,12 +4980,6 @@ mod tests {
                 // scrollback protocol makes no promise here, and the v2 send
                 // cursor is what bounds it.
                 FloodAcks::Lagged(5) => assert_backlog_bounded(case, &r),
-                // No delivery assertion, and none on the backlog: with acks
-                // withheld the v1 scrollback frame re-carries every un-acked
-                // row on every chunk (the second amplifier, out of scope
-                // above), and nothing is ever confirmed. Only the visible
-                // frame is pinned.
-                FloodAcks::Never => {}
                 other => unreachable!("no assertions defined for acks={}", other.label()),
             }
         }
@@ -4956,14 +4991,9 @@ mod tests {
     /// This runs the SAME helpers against the one case where frames are
     /// already small today — a short flood into an EMPTY ring, where the
     /// visible body is still a small `Diff` — so the delivery-gated ack model
-    /// and the assertions' slack are exercised now rather than first met by
+    /// and the assertions' slack are guarded now rather than first met by
     /// the task that un-ignores the regression.
-    ///
-    /// `#[ignore]`d with the rest of the block: it leans on a pinned socket
-    /// buffer whose per-write capacity has only been observed on Linux.
-    /// `just debug-cargo test -p posh --bin posh posh225_flood_harness -- --ignored`.
     #[test]
-    #[ignore = "posh#225 harness self-check: un-ignore together with the regression test"]
     fn posh225_flood_harness_delivery_assertions_hold_while_frames_are_small() {
         const KIB: usize = 1024;
         let flood = newline_flood(64 * KIB);
@@ -4978,14 +5008,57 @@ mod tests {
             let r = measure_flood(&flood, case);
             print_flood_row(case, &r);
             assert!(r.rows_scrolled > 0, "the flood must scroll rows off for this to mean anything");
+            if !flood_socket_supports_bounds(case, &r) {
+                continue;
+            }
             assert_backlog_bounded(case, &r);
+            // `Lagged(5)` is the lost-base regime: no delivery contract (and,
+            // until visible frames stop replaying the ring, no visible-frame
+            // bound either — its `Full`s carry the whole of this short ring).
             if !matches!(acks, FloodAcks::Lagged(5)) {
+                assert!(
+                    r.largest_visible < 64 * KIB,
+                    "acks={}: a visible frame was {} bytes — this scenario no longer keeps frames small",
+                    acks.label(),
+                    r.largest_visible,
+                );
                 assert_history_flowed(case, &r);
             }
         }
     }
 
+    /// The least one write into the empty pinned socket must move for the
+    /// backlog and delivery bounds to mean anything: a whole chunk's frames,
+    /// as the regression test bounds them (a 64 KiB visible frame plus a
+    /// 32 KiB scrollback frame).
+    const FLOOD_WRITE_CAPACITY_NEEDED: usize = 96 * 1024;
+
+    /// Whether this host's socketpair gives [`assert_backlog_bounded`] and
+    /// [`assert_history_flowed`] their footing. A caller that gets `false`
+    /// must SKIP them — they would fail for the host's reason, not posh's.
+    ///
+    /// macOS gap (posh#214): the backlog/delivery bounds assume one write
+    /// moves a whole chunk's frames (>= 96 KiB into an empty socketpair). A
+    /// host whose pinned buffer grants less — macOS `AF_UNIX`, or a Linux
+    /// with a low `net.core.wmem_max`, which is why this is a runtime check
+    /// and not a `cfg` — skips them; macOS would need a measured capacity, or
+    /// a drain loop instead of one write per chunk.
+    fn flood_socket_supports_bounds(case: FloodCase, r: &FloodRun) -> bool {
+        let supported = r.socket_write_capacity >= FLOOD_WRITE_CAPACITY_NEEDED;
+        if !supported {
+            eprintln!(
+                "acks={}: skipping backlog/delivery bounds: socket write capacity {} < {} bytes",
+                case.acks.label(),
+                r.socket_write_capacity,
+                FLOOD_WRITE_CAPACITY_NEEDED,
+            );
+        }
+        supported
+    }
+
     /// A draining client's backlog stayed far below `MAX_CLIENT_BACKLOG`.
+    /// Presumes [`flood_socket_supports_bounds`]: how much backlog one write
+    /// per chunk leaves behind is a function of what one write moves.
     fn assert_backlog_bounded(case: FloodCase, r: &FloodRun) {
         let acks = case.acks.label();
         assert_eq!(
@@ -5003,19 +5076,23 @@ mod tests {
     /// History actually reached the reader: every row the flood scrolled off
     /// was shipped, and acked up to the cadence's own lag. For a
     /// [`FloodDrain::OneWritePerChunk`] run under `EveryNewest(1)` or a
-    /// `Lagged(k)` with `k <= 4` whose visible frames the caller has already
-    /// bounded below 64 KiB.
+    /// `Lagged(k)` with `k <= 4`.
+    ///
+    /// Two preconditions are the CALLER's to establish first, and both
+    /// callers do: it has asserted `largest_visible < 64 KiB`, and it has
+    /// checked [`flood_socket_supports_bounds`] (skipping this otherwise).
     ///
     /// The argument, by induction over chunks. Suppose every earlier chunk's
     /// frames were delivered in the iteration that queued them. Then every
     /// earlier ack was on schedule and landed on a held frame (`current`
     /// itself, or at most 8 frames behind it), so the base is held and the
     /// scrollback floor trails by at most `k` chunks. This chunk therefore
-    /// queues one visible frame (< 64 KiB) and one scrollback frame carrying
-    /// at most `k + 1` chunks of rows (< 32 KiB, asserted) — a burst below
-    /// the socket's per-write capacity (>= 96 KiB, asserted), which the one
-    /// write moves whole. So this chunk's frames are delivered in its own
-    /// iteration too, and its ack is on schedule.
+    /// queues one visible frame (< 64 KiB, the caller's) and one scrollback
+    /// frame carrying at most `k + 1` chunks of rows (< 32 KiB, asserted
+    /// here) — a burst within the socket's per-write capacity (>= 96 KiB,
+    /// the caller's), which the one write moves whole. So this chunk's
+    /// frames are delivered in its own iteration too, and its ack is on
+    /// schedule.
     fn assert_history_flowed(case: FloodCase, r: &FloodRun) {
         const KIB: usize = 1024;
         let acks = case.acks.label();
@@ -5024,14 +5101,9 @@ mod tests {
             FloodAcks::Lagged(k) if k <= 4 => k as u64,
             _ => panic!("acks={acks}: no delivery contract for this cadence"),
         };
-        // A property of the HOST, not of posh: without it the argument above
-        // has no footing and the assertions below would fail for the wrong
-        // reason.
-        assert!(
-            r.socket_write_capacity >= 96 * KIB,
-            "harness: one write into the pinned socket accepted only {} bytes on this host; \
-             the delivery assertions need 96 KiB",
-            r.socket_write_capacity,
+        debug_assert!(
+            r.socket_write_capacity >= FLOOD_WRITE_CAPACITY_NEEDED,
+            "the caller must check flood_socket_supports_bounds before asserting delivery",
         );
         assert!(
             r.largest_scrollback < 32 * KIB,
