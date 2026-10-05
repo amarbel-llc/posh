@@ -4398,4 +4398,337 @@ mod tests {
              the client-acked frame 1"
         );
     }
+
+    // ---- posh#225: write_buf growth under a newline flood (MEASUREMENT) ----
+
+    /// How the lossy client's `Tag::FrameAck`s arrive during the flood.
+    #[derive(Clone, Copy)]
+    enum FloodAcks {
+        /// No ack after the attach baseline.
+        Never,
+        /// Every `k` chunks the client acks the NEWEST frame queued so far
+        /// (zero-latency but bursty).
+        EveryNewest(usize),
+        /// After every chunk the client acks the frame that was newest `k`
+        /// chunks ago (a constant ack lag of `k` PTY chunks).
+        Lagged(usize),
+    }
+
+    impl FloodAcks {
+        fn label(self) -> String {
+            match self {
+                FloodAcks::Never => "never".into(),
+                FloodAcks::EveryNewest(k) => format!("newest/{k}"),
+                FloodAcks::Lagged(k) => format!("lag {k}"),
+            }
+        }
+    }
+
+    /// How the client's `write_buf` drains during the flood.
+    #[derive(Clone, Copy)]
+    enum FloodDrain {
+        /// Nothing is ever drained; the run stops where the daemon would
+        /// drop the client (`MAX_CLIENT_BACKLOG`).
+        Never,
+        /// `write_buf` is emptied after every chunk: isolates per-chunk size.
+        Always,
+        /// The daemon loop's real drain against a real socketpair: ONE
+        /// non-blocking `stream.write(&write_buf)` per PTY chunk (daemon_main
+        /// does exactly one per poll iteration), with an ideal reader that
+        /// empties the socket before the next chunk.
+        OneWritePerChunk,
+    }
+
+    impl FloodDrain {
+        fn label(self) -> &'static str {
+            match self {
+                FloodDrain::Never => "never",
+                FloodDrain::Always => "always",
+                FloodDrain::OneWritePerChunk => "1write",
+            }
+        }
+    }
+
+    /// What one flood run queued for the client.
+    #[derive(Default)]
+    struct FloodRun {
+        fed: usize,
+        chunks: usize,
+        /// The largest backlog seen right after a chunk was queued. Under
+        /// `FloodDrain::Always` that is the largest single-chunk burst (one
+        /// visible + one scrollback frame).
+        peak_write_buf: usize,
+        /// `OneWritePerChunk`: the most one `stream.write` accepted.
+        largest_socket_write: usize,
+        /// Bytes queued as visible frames (`Full`/`Diff`) vs scrollback frames.
+        visible_bytes: u64,
+        scrollback_bytes: u64,
+        largest_visible: usize,
+        largest_scrollback: usize,
+        largest_scrollback_rows: usize,
+        crossed_backlog_at: Option<usize>,
+        /// Visible frames that went out as a `Full` keyframe, not a `Diff`.
+        full_frames: usize,
+        scrollback_frames: usize,
+        /// Scrollback rows shipped (with repeats) vs rows that actually
+        /// scrolled off during the flood vs rows the acks confirmed.
+        rows_shipped: u64,
+        rows_scrolled: u64,
+        rows_acked: u64,
+    }
+
+    /// One flood run's knobs.
+    #[derive(Clone, Copy)]
+    struct FloodCase {
+        /// PTY chunk size fed per `broadcast_output` (production reads 4096).
+        chunk: usize,
+        acks: FloodAcks,
+        drain: FloodDrain,
+        /// Rows scrolled into the ring BEFORE the client attaches (a
+        /// long-lived session's history); `sb_floor` is anchored past them
+        /// exactly as the daemon's Init arm does.
+        prefill_rows: usize,
+    }
+
+    /// `total` bytes of distinct ~100-byte lines, CRLF-terminated as a PTY in
+    /// ONLCR mode delivers them (the `nix gc` "deleting '/nix/store/…'" shape).
+    fn newline_flood(total: usize) -> Vec<u8> {
+        let mut out = Vec::with_capacity(total + 128);
+        let mut i: u64 = 0;
+        while out.len() < total {
+            let hash = u128::from(i).wrapping_mul(0x9E37_79B9_7F4A_7C15_F39C_C060_5CED_C835);
+            out.extend_from_slice(
+                format!("{i:08} deleting '/nix/store/{hash:032x}-some-derivation-output-name-{i:08}'\r\n")
+                    .as_bytes(),
+            );
+            i += 1;
+        }
+        out.truncate(total);
+        out
+    }
+
+    /// Drive one flood through the production `broadcast_output` path for a
+    /// lossy, scrollback-wanting client shaped like the M2 bridge's daemon
+    /// Init (`CAP_LOSSY` + `CAP_SCROLLBACK` + `CAP_BASE_SUM`, relay.rs
+    /// `init_payload`/`content_caps`), at the daemon's own ring depth.
+    fn measure_flood(flood: &[u8], case: FloodCase) -> FloodRun {
+        let (rows, cols) = (50u16, 200u16);
+        let mut term = Terminal::with_scrollback(rows, cols, SCROLLBACK);
+        for i in 0..case.prefill_rows {
+            term.process(format!("{i:08} pre-attach history row, as long as a flood line, padded out to ~100 bytes ........\r\n").as_bytes());
+        }
+        let (mut c, mut peer) = lossy_conn(
+            rows,
+            cols,
+            &[
+                caps::Cap { id: caps::CAP_SCROLLBACK, payload: vec![0] },
+                caps::Cap { id: caps::CAP_BASE_SUM, payload: vec![] },
+            ],
+        );
+        assert!(c.lossy && c.wants_scrollback());
+        c.stream.set_nonblocking(true).unwrap();
+        peer.set_nonblocking(true).unwrap();
+        let mut sink = vec![0u8; 1 << 20];
+        // Forward-only scrollback from attach, as the daemon's Init arm sets it.
+        c.sb_floor = term.primary_scrollback_total();
+        // The attach keyframe, acked: the baseline scrollback frames gate on.
+        assert!(c.queue_frame_from(&term));
+        c.apply_frame_ack(&ipc::encode_frame_ack(1, 0));
+        c.write_buf.clear();
+
+        let mut run = FloodRun::default();
+        // newest[i] = the newest frame number after chunk i (newest[0] = attach).
+        let mut newest: Vec<u64> = vec![1];
+        for piece in flood.chunks(case.chunk) {
+            term.process(piece);
+            let before = c.write_buf.len();
+            broadcast_output(std::slice::from_mut(&mut c), &term, piece);
+            run.fed += piece.len();
+            run.chunks += 1;
+
+            let mut fb = FrameBuffer::new();
+            fb.feed(&c.write_buf[before..]);
+            while let Some(rec) = fb.next().unwrap() {
+                assert_eq!(rec.tag, Tag::Frame);
+                let wire = ipc::HEADER_LEN + rec.payload.len();
+                match ServerFrame::decode(&rec.payload).unwrap().body {
+                    FrameBody::Scrollback { rows, .. } => {
+                        run.scrollback_frames += 1;
+                        run.scrollback_bytes += wire as u64;
+                        run.rows_shipped += rows.len() as u64;
+                        if wire > run.largest_scrollback {
+                            run.largest_scrollback = wire;
+                            run.largest_scrollback_rows = rows.len();
+                        }
+                    }
+                    body => {
+                        if matches!(body, FrameBody::Full(_)) {
+                            run.full_frames += 1;
+                        }
+                        run.visible_bytes += wire as u64;
+                        run.largest_visible = run.largest_visible.max(wire);
+                    }
+                }
+            }
+            run.peak_write_buf = run.peak_write_buf.max(c.write_buf.len());
+
+            newest.push(c.producer.as_ref().unwrap().current_num());
+            let ack = match case.acks {
+                FloodAcks::Never => None,
+                FloodAcks::EveryNewest(k) => (run.chunks % k == 0).then(|| *newest.last().unwrap()),
+                FloodAcks::Lagged(k) => newest.len().checked_sub(1 + k).map(|i| newest[i]),
+            };
+            if let Some(n) = ack {
+                c.apply_frame_ack(&ipc::encode_frame_ack(n, 0));
+            }
+
+            match case.drain {
+                FloodDrain::Always => c.write_buf.clear(),
+                FloodDrain::Never => {}
+                FloodDrain::OneWritePerChunk => {
+                    match std::io::Write::write(&mut c.stream, &c.write_buf) {
+                        Ok(n) => {
+                            c.write_buf.drain(..n);
+                            run.largest_socket_write = run.largest_socket_write.max(n);
+                        }
+                        Err(e) if e.kind() == std::io::ErrorKind::WouldBlock => {}
+                        Err(e) => panic!("daemon-side write: {e}"),
+                    }
+                    loop {
+                        match std::io::Read::read(&mut peer, &mut sink) {
+                            Ok(0) => break,
+                            Ok(_) => {}
+                            Err(e) if e.kind() == std::io::ErrorKind::WouldBlock => break,
+                            Err(e) => panic!("reader-side read: {e}"),
+                        }
+                    }
+                }
+            }
+            if c.write_buf.len() > MAX_CLIENT_BACKLOG {
+                // The daemon loop's `clients.retain` drops the client here.
+                run.crossed_backlog_at = Some(run.fed);
+                break;
+            }
+        }
+        run.rows_scrolled = term.primary_scrollback_total() - c.sb_floor;
+        run.rows_acked = c.acked_sb_total.max(c.sb_floor) - c.sb_floor;
+        run
+    }
+
+    fn print_flood_header() {
+        println!(
+            "{:>6} {:>10} {:>7} | {:>8} {:>6} {:>9} | {:>10} {:>7} | {:>11} {:>11} {:>7} | {:>9} {:>9} {:>6} | {:>5} {:>5} {:>9} {:>8} {:>8}",
+            "chunk", "acks", "drain", "fed", "chunks", "cross@fed", "peak_wbuf", "max_wr", "vis_bytes", "sb_bytes", "q/fed",
+            "max_vis", "max_sb", "sbrows", "full", "sbfrm", "rows_sent", "scrolled", "sb_acked",
+        );
+    }
+
+    fn print_flood_row(case: FloodCase, r: &FloodRun) {
+        println!(
+            "{:>6} {:>10} {:>7} | {:>8} {:>6} {:>9} | {:>10} {:>7} | {:>11} {:>11} {:>7.1} | {:>9} {:>9} {:>6} | {:>5} {:>5} {:>9} {:>8} {:>8}",
+            case.chunk,
+            case.acks.label(),
+            case.drain.label(),
+            r.fed,
+            r.chunks,
+            r.crossed_backlog_at.map_or_else(|| "never".to_string(), |at| at.to_string()),
+            r.peak_write_buf,
+            r.largest_socket_write,
+            r.visible_bytes,
+            r.scrollback_bytes,
+            (r.visible_bytes + r.scrollback_bytes) as f64 / r.fed as f64,
+            r.largest_visible,
+            r.largest_scrollback,
+            r.largest_scrollback_rows,
+            r.full_frames,
+            r.scrollback_frames,
+            r.rows_shipped,
+            r.rows_scrolled,
+            r.rows_acked,
+        );
+    }
+
+    /// posh#225 MEASUREMENT (assertion-free; `#[ignore]`d because it is slow
+    /// and proves nothing by passing): how much the daemon queues for a lossy
+    /// scrollback client during a newline flood, by PTY-chunk size and ack
+    /// cadence. Prints one table row per run. Debug builds take many minutes;
+    /// run it optimized:
+    /// `just debug-cargo test --release -p posh --bin posh posh225_flood_backlog_measurement -- --ignored --nocapture`.
+    ///
+    /// The daemon's PTY read buffer is 4096 bytes, so 4 KiB is the largest
+    /// chunk production can produce; 64 KiB is included only for the shape.
+    #[test]
+    #[ignore = "posh#225 measurement: slow, prints a table, asserts nothing"]
+    fn posh225_flood_backlog_measurement() {
+        const KIB: usize = 1024;
+        let flood = newline_flood(2 * KIB * KIB);
+        let cadences = [
+            FloodAcks::Never,
+            FloodAcks::EveryNewest(1),
+            FloodAcks::EveryNewest(10),
+            FloodAcks::EveryNewest(100),
+            FloodAcks::Lagged(1),
+            FloodAcks::Lagged(4),
+            FloodAcks::Lagged(5),
+            FloodAcks::Lagged(10),
+            FloodAcks::Lagged(100),
+        ];
+        println!(
+            "\nposh#225 flood: 50x200, ring {SCROLLBACK} rows, ~102-byte lines, {} bytes offered per run",
+            flood.len()
+        );
+        println!("\n== A: client attaches to an EMPTY ring ==");
+        print_flood_header();
+        for chunk in [KIB, 4 * KIB, 64 * KIB] {
+            for acks in cadences {
+                for drain in [FloodDrain::Never, FloodDrain::Always] {
+                    let case = FloodCase { chunk, acks, drain, prefill_rows: 0 };
+                    print_flood_row(case, &measure_flood(&flood, case));
+                }
+            }
+        }
+        println!("\n== B: client attaches to a FULL ring ({SCROLLBACK} rows of history), production chunk size ==");
+        print_flood_header();
+        for acks in cadences {
+            for drain in [FloodDrain::Never, FloodDrain::Always] {
+                let case = FloodCase { chunk: 4 * KIB, acks, drain, prefill_rows: SCROLLBACK + 200 };
+                print_flood_row(case, &measure_flood(&flood, case));
+            }
+        }
+    }
+
+    /// posh#225 MEASUREMENT, the socket-accurate companion to
+    /// [`posh225_flood_backlog_measurement`]: the same flood, but `write_buf`
+    /// drains the way `daemon_main` drains it — one non-blocking
+    /// `stream.write` per PTY chunk into a real socketpair — against a reader
+    /// that empties the socket instantly. Shows whether the backlog reaches
+    /// `MAX_CLIENT_BACKLOG` with a healthy reader, and with ideal acks.
+    /// `just debug-cargo test --release -p posh --bin posh posh225_flood_backlog_ideal_reader_measurement -- --ignored --nocapture`.
+    #[test]
+    #[ignore = "posh#225 measurement: slow, prints a table, asserts nothing"]
+    fn posh225_flood_backlog_ideal_reader_measurement() {
+        const KIB: usize = 1024;
+        let flood = newline_flood(2 * KIB * KIB);
+        println!(
+            "\nposh#225 flood, one socket write per chunk + ideal reader: 50x200, ring {SCROLLBACK} rows, {} bytes offered per run",
+            flood.len()
+        );
+        print_flood_header();
+        for prefill_rows in [0, SCROLLBACK + 200] {
+            for chunk in [KIB, 4 * KIB] {
+                for acks in [
+                    FloodAcks::EveryNewest(1),
+                    FloodAcks::Lagged(1),
+                    FloodAcks::Lagged(4),
+                    FloodAcks::Lagged(5),
+                    FloodAcks::Never,
+                ] {
+                    let case = FloodCase { chunk, acks, drain: FloodDrain::OneWritePerChunk, prefill_rows };
+                    let r = measure_flood(&flood, case);
+                    print!("{}", if prefill_rows == 0 { "empty ring " } else { "FULL ring  " });
+                    print_flood_row(case, &r);
+                }
+            }
+        }
+    }
 }
