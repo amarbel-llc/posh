@@ -259,34 +259,53 @@ impl Terminal {
     /// would render from `dump_vt`.
     ///
     /// A ring-less mirror discards replayed scrollback, except that a mirror
-    /// taller than this terminal shows `mirror_rows - self.rows()` of those
-    /// rows above the grid, because the flow lands at its bottom. So for a
-    /// mirror of the SAME WIDTH and at least this height, only that many of
-    /// the newest scrollback rows are replayed (none at the same height, where
-    /// the grid is drawn from home exactly as when the ring is empty), and the
-    /// dump's size follows the screen instead of the ring — posh#225, where a
-    /// 10,000-row ring made every frame ~1 MiB.
+    /// taller than this terminal shows some of those rows above the grid,
+    /// because the flow lands at its bottom. So for a mirror of the SAME WIDTH:
+    ///
+    /// - at this height, no scrollback is replayed: the grid is drawn from
+    ///   home exactly as when the ring is empty;
+    /// - taller, the newest `2 * mirror_rows` scrollback rows are replayed —
+    ///   deliberately more than the `mirror_rows - self.rows()` the mirror
+    ///   shows. The flow can make fewer lines than rows: a soft-wrapped row
+    ///   followed by an empty unwrapped one shares a line with it (the empty
+    ///   row emits nothing to autowrap onto). Each lost line needs such a
+    ///   pair, so the replay makes at least half as many lines as rows and
+    ///   certainly overfills the mirror; the overflow scrolls off its top and
+    ///   the flow lands at the bottom exactly as `dump_vt`'s does.
+    ///
+    /// Either way the dump's size follows the screen instead of the ring —
+    /// posh#225, where a 10,000-row ring made every frame ~1 MiB.
     ///
     /// Every other geometry gets `dump_vt`'s bytes, because a row count cannot
-    /// express what the full replay does there. On a wider mirror a
+    /// express what the full replay does there. On a wider mirror each
     /// soft-wrapped row rejoins its continuation, so the replay makes fewer
     /// lines than rows were counted and `dump_vt` fills the freed lines from
-    /// older ring rows a row tail does not carry: the tail's content lands a
-    /// row high over a blank bottom row. On a shorter mirror `dump_vt` anchors
-    /// the cursor to its bottom-landing flow while the homed grid places it
-    /// absolutely, so the two leave the cursor on different rows. (A narrower
-    /// mirror re-wraps too and falls back the same way; that case is not
-    /// separately demonstrated.) Session geometry on the frame (RFC 0012)
-    /// would make every mirror session-sized and retire the fallback.
+    /// older ring rows a row tail does not carry: with n rejoined wraps in the
+    /// replayed rows, the tail's content lands n rows high over n blank rows.
+    /// On a shorter mirror `dump_vt` anchors the cursor to its bottom-landing
+    /// flow while the homed grid places it absolutely, so the two leave the
+    /// cursor on different rows. (A narrower mirror re-wraps too and falls
+    /// back the same way; that case is not separately demonstrated.) Session
+    /// geometry on the frame (RFC 0012) would make every mirror session-sized
+    /// and retire the fallback.
     ///
-    /// Known divergence at the same geometry: `dump_vt`'s replay branch
-    /// misplaces the cursor under a scroll region with a non-default top
-    /// margin (posh#228); the homed branch taken here does not.
+    /// Known divergences at the same geometry, where the homed branch taken
+    /// here is right and `dump_vt` is not:
+    /// - `dump_vt`'s replay branch anchors the cursor relative to the end of
+    ///   its flow, but the modes and graphics replayed in between can move
+    ///   the cursor first (DECSTBM, DECOM, tab stops, kitty placements,
+    ///   DECCOLM) (posh#228);
+    /// - a soft-wrapped grid row followed by an empty unwrapped one loses a
+    ///   line in `dump_vt`'s flow, which then lands one row low (posh#229).
+    ///   The homed branch keeps the text and cursor but, as always, drops
+    ///   that row's soft-wrap flag, which nothing can regenerate by replay.
     pub fn dump_vt_mirror(&self, mirror_rows: u16, mirror_cols: u16) -> Vec<u8> {
-        let tail = if mirror_cols == self.cols() && mirror_rows >= self.rows() {
-            usize::from(mirror_rows - self.rows())
-        } else {
+        let tail = if mirror_cols != self.cols() || mirror_rows < self.rows() {
             usize::MAX
+        } else if mirror_rows == self.rows() {
+            0
+        } else {
+            2 * usize::from(mirror_rows)
         };
         self.dump_vt_tail(tail)
     }
@@ -294,7 +313,8 @@ impl Terminal {
     /// [`Terminal::dump_vt`] with the scrollback replay bounded to the NEWEST
     /// `max_scrollback_rows` rows of the ring; `usize::MAX` is `dump_vt`. Only
     /// [`Terminal::dump_vt_mirror`]'s geometry rule makes a bound safe — the
-    /// `a_row_tail_cannot_reproduce_*` tests show where a bare row count fails.
+    /// `a_row_tail_cannot_reproduce_*` tests show where a bare row-difference
+    /// count fails.
     fn dump_vt_tail(&self, max_scrollback_rows: usize) -> Vec<u8> {
         self.dump_vt_impl(false, max_scrollback_rows)
     }
@@ -1337,17 +1357,19 @@ mod cursor_mismatch_tests {
     fn mirror_dump_size_is_independent_of_ring_depth() {
         let t = scrolled(50, 200, 10_000, 20_000);
         assert!(t.dump_vt().len() > 200_000, "premise: the full dump carries the ring");
-        let bounded = t.dump_vt_mirror(50, 200);
-        assert!(bounded.len() < 16_384, "same-geometry dump was {} bytes", bounded.len());
+        let same = t.dump_vt_mirror(50, 200);
+        assert!(same.len() < 16_384, "same-geometry dump was {} bytes", same.len());
+        let taller = t.dump_vt_mirror(100, 200);
+        assert!(taller.len() < 65_536, "taller-mirror dump was {} bytes", taller.len());
     }
 
-    /// A taller mirror whose extra rows exceed what the ring holds: replay
-    /// what exists, which is all of it.
+    /// A taller mirror whose over-provisioned replay (`2 * mirror_rows`)
+    /// exceeds what the ring holds: replay what exists, which is all of it.
     #[test]
     fn mirror_dump_clamps_to_the_rows_the_ring_holds() {
         let t = scrolled(24, 80, 1000, 30); // only a handful of rows have scrolled off
         assert!(t.primary_scrollback_len() > 0 && t.primary_scrollback_len() < 10);
-        assert!(t.dump_vt_mirror(34, 80) == t.dump_vt());
+        assert!(t.dump_vt_mirror(25, 80) == t.dump_vt());
     }
 
     /// A scrolled 24x80 session whose grid holds a soft-wrapped line.
@@ -1362,12 +1384,12 @@ mod cursor_mismatch_tests {
         t
     }
 
-    /// Why a WIDER mirror falls back (reviewer finding C1): a soft-wrapped
-    /// row rejoins its continuation on the wider mirror, so a row tail of
-    /// `mirror_rows - rows` makes one line too few. `dump_vt` fills that
-    /// line from an older ring row; the row tail leaves the content a row
-    /// high over a blank bottom row. Do not "optimise" the fallback away
-    /// without making this pass the other way.
+    /// Why a WIDER mirror falls back: a soft-wrapped row rejoins its
+    /// continuation on the wider mirror, so a row tail of `mirror_rows - rows`
+    /// makes one line too few. `dump_vt` fills that line from an older ring
+    /// row; the row tail leaves the content a row high over a blank bottom
+    /// row. Do not "optimise" the fallback away without making this pass the
+    /// other way.
     #[test]
     fn a_row_tail_cannot_reproduce_a_wider_mirror() {
         let t = wrapped_grid_session();
@@ -1381,8 +1403,7 @@ mod cursor_mismatch_tests {
         }
     }
 
-    /// Why a SHORTER mirror falls back (reviewer finding C2): a zero tail
-    /// takes the homed grid and an absolute CUP, `dump_vt` the bottom-landing
+    /// Why a SHORTER mirror falls back: a zero tail takes the homed grid and an absolute CUP, `dump_vt` the bottom-landing
     /// flow and a relative anchor, and on a short target they part ways:
     /// source row 5 of 24 lands on mirror row 5 from the row tail and row 0
     /// (CUU clamped at the top) from `dump_vt`.
@@ -1396,12 +1417,13 @@ mod cursor_mismatch_tests {
         assert_eq!((row_tail.cursor().row, full.cursor().row), (5, 0));
     }
 
-    /// Reviewer finding C3 claimed a shorter mirror would also differ in
-    /// background colour (`draw_grid`'s `\r\n` without a pen reset). It does
-    /// not reproduce in a posh-term mirror, whose scrolled-in lines never
-    /// take the pen's background; only the C2 cursor difference remains.
+    /// On a shorter mirror a zero-row replay matches `dump_vt` in text and in
+    /// background colour, even with a red pen on a row that overflows the
+    /// target: `draw_grid` emits `\r\n` without a pen reset, but scrolled-in
+    /// lines take no pen background in a posh-term mirror. (The cursor is
+    /// what differs; see the test above.)
     #[test]
-    fn a_row_tail_on_a_shorter_mirror_differs_only_in_the_cursor() {
+    fn a_row_tail_on_a_shorter_mirror_matches_text_and_backgrounds() {
         let mut t = scrolled(24, 80, 1000, 500);
         t.process(b"\x1b[16;1H\x1b[2K\x1b[41mX\x1b[0m\x1b[17;1H\x1b[2Khi");
         let row_tail = mirror(10, 80, &t.dump_vt_tail(0));
@@ -1413,7 +1435,6 @@ mod cursor_mismatch_tests {
         };
         assert_eq!(rows_text(&row_tail), rows_text(&full));
         assert_eq!(backgrounds(&row_tail), backgrounds(&full));
-        assert_ne!(row_tail.cursor(), full.cursor());
     }
 
     /// Soft wraps (one straddling the scrollback/grid seam, one inside the
@@ -1421,8 +1442,10 @@ mod cursor_mismatch_tests {
     /// margin, and a cursor left mid-line.
     #[test]
     fn mirror_dump_renders_rich_content_like_the_full_dump() {
+        // Deep enough that even the tallest mirror's `2 * mirror_rows` replay
+        // is a strict subset of the ring.
         let mut t = Terminal::with_scrollback(24, 80, 1000);
-        for i in 0..60 {
+        for i in 0..300 {
             t.process(
                 format!("\x1b[1;3{}mstyled {i:03}\x1b[0m plain 漢字 {}\r\n", i % 8, "w".repeat(i % 7))
                     .as_bytes(),
@@ -1461,7 +1484,7 @@ mod cursor_mismatch_tests {
     /// Pending wrap at the last column of the bottom row, with scrollback.
     #[test]
     fn mirror_dump_renders_pending_wrap_like_the_full_dump() {
-        let mut t = scrolled(24, 80, 1000, 100);
+        let mut t = scrolled(24, 80, 1000, 500);
         t.process(b"\r\n");
         t.process(&[b'W'; 80]);
         assert_eq!((t.cursor().row, t.cursor().col), (23, 79));
@@ -1495,25 +1518,39 @@ mod cursor_mismatch_tests {
         t
     }
 
-    /// Scroll region + origin mode at the source geometry: the bounded dump
-    /// takes the homed `draw_grid` branch with an absolute CUP, so it is
-    /// asserted against the SOURCE. Equality with `dump_vt` is deliberately
-    /// NOT asserted: `dump_vt`'s scrollback-replay branch moves the cursor
-    /// with a CUU that the restored top margin clamps, leaving it on the
-    /// margin (posh#228).
-    #[test]
-    fn mirror_dump_reproduces_a_scroll_region_at_the_same_geometry() {
-        let t = region_session();
-        let m = mirror(24, 80, &t.dump_vt_mirror(24, 80));
+    /// A scrolled session with a custom tab stop and the cursor mid-screen,
+    /// with no scroll region.
+    fn tab_stop_session() -> Terminal {
+        let mut t = scrolled(24, 80, 1000, 500);
+        t.process(b"\x1b[3g\x1b[1;5H\x1bH"); // clear tab stops, set one at column 5
+        t.process(b"\x1b[10;20H");
+        t
+    }
+
+    /// At the source geometry the bounded dump takes the homed `draw_grid`
+    /// branch with an absolute CUP, so where `dump_vt` is known to be wrong it
+    /// is asserted against the SOURCE (cursor and visible state) instead.
+    fn assert_same_geometry_mirror_reproduces_source(t: &Terminal) {
+        let m = mirror(t.rows(), t.cols(), &t.dump_vt_mirror(t.rows(), t.cols()));
         assert_eq!(m.cursor(), t.cursor());
         assert_eq!(m.dump_vt_flat(), t.dump_vt_flat());
+    }
+
+    /// Scroll region + origin mode at the source geometry. Equality with
+    /// `dump_vt` is deliberately NOT asserted: `dump_vt`'s replay branch
+    /// anchors the cursor relative to the end of its flow, but the modes
+    /// replayed in between move the cursor first — here DECSTBM and DECOM
+    /// home it (posh#228).
+    #[test]
+    fn mirror_dump_reproduces_a_scroll_region_at_the_same_geometry() {
+        assert_same_geometry_mirror_reproduces_source(&region_session());
     }
 
     /// Scroll region + origin mode on taller mirrors: the bounded and the full
     /// dump both take the scrollback-replay branch, so this pins that the
     /// bound preserves `dump_vt`'s behaviour. Both currently inherit
-    /// posh#228's clamped cursor; fixing posh#228 in the shared branch should
-    /// keep this green.
+    /// posh#228's misplaced cursor; fixing posh#228 in the shared branch
+    /// should keep this green.
     #[test]
     fn mirror_dump_renders_a_scroll_region_like_the_full_dump_on_a_taller_mirror() {
         let t = region_session();
@@ -1523,9 +1560,112 @@ mod cursor_mismatch_tests {
     /// The correct behaviour `dump_vt` should have under a scroll region: the
     /// replayed cursor lands where the source's is.
     #[test]
-    #[ignore = "posh#228: dump_vt's relative cursor anchor is clamped by a scroll region's top margin"]
+    #[ignore = "posh#228: modes replayed after dump_vt's flow move the cursor its relative anchor assumes"]
     fn full_dump_reproduces_a_scroll_region_cursor_at_the_same_height() {
         let t = region_session();
         assert_eq!(mirror(24, 80, &t.dump_vt()).cursor(), t.cursor());
+    }
+
+    /// A custom tab stop at the source geometry, no scroll region. Equality
+    /// with `dump_vt` is deliberately NOT asserted: the tab-stop replay
+    /// between `dump_vt`'s flow and its relative cursor anchor moves the
+    /// cursor, so `dump_vt`'s mirror puts it on row 0 (posh#228).
+    #[test]
+    fn mirror_dump_reproduces_tab_stops_at_the_same_geometry() {
+        assert_same_geometry_mirror_reproduces_source(&tab_stop_session());
+    }
+
+    /// A custom tab stop on taller mirrors: bounded == full, both inheriting
+    /// posh#228; fixing posh#228 in the shared branch should keep this green.
+    #[test]
+    fn mirror_dump_renders_tab_stops_like_the_full_dump_on_a_taller_mirror() {
+        let t = tab_stop_session();
+        assert_mirror_renders_like_full(&t, &bounded_heights(&t)[1..]);
+    }
+
+    /// The correct behaviour `dump_vt` should have with a custom tab stop.
+    #[test]
+    #[ignore = "posh#228: modes replayed after dump_vt's flow move the cursor its relative anchor assumes"]
+    fn full_dump_reproduces_a_tab_stop_session_cursor_at_the_same_height() {
+        let t = tab_stop_session();
+        assert_eq!(mirror(24, 80, &t.dump_vt()).cursor(), t.cursor());
+    }
+
+    /// A command that wrapped by one character and was backspaced over: the
+    /// head is a soft-wrapped grid row (22) followed by an EMPTY unwrapped
+    /// row (23) holding the cursor. In a replay flow that pair shares a line
+    /// — the empty row emits nothing to autowrap onto — so the flow makes one
+    /// line fewer than it has rows (posh#229).
+    fn empty_continuation_session() -> Terminal {
+        let mut t = scrolled(24, 80, 1000, 500);
+        t.process(b"\r\n");
+        t.process(&[b'a'; 81]);
+        t.process(b"\x08 \x08");
+        assert!(t.screen().row(22).unwrap().wrapped(), "test setup: the head stays wrapped");
+        assert_eq!(rows_text(&t)[23], "", "test setup: the continuation is empty");
+        assert_eq!((t.cursor().row, t.cursor().col), (23, 0));
+        t
+    }
+
+    /// The empty continuation at the source geometry. Equality with `dump_vt`
+    /// is deliberately NOT asserted: `dump_vt`'s flow loses a line on the pair
+    /// and lands every grid row one row low, while the homed grid places from
+    /// the top and is faithful in text and cursor (posh#229).
+    #[test]
+    fn mirror_dump_reproduces_an_empty_continuation_at_the_same_geometry() {
+        let t = empty_continuation_session();
+        let m = mirror(24, 80, &t.dump_vt_mirror(24, 80));
+        assert_eq!(m.cursor(), t.cursor());
+        assert_eq!(rows_text(&m), rows_text(&t));
+        // The one known difference: a soft-wrap flag whose continuation row
+        // prints nothing cannot be regenerated by replaying rows — nothing
+        // autowraps onto the empty row. The homed grid has always lost it
+        // whenever the ring is empty; it does not change what is displayed.
+        // posh#229 is the same root cause in the flow branch, where it costs
+        // a whole line.
+        assert!(t.screen().row(22).unwrap().wrapped());
+        assert!(!m.screen().row(22).unwrap().wrapped());
+    }
+
+    /// The empty continuation on taller mirrors. The flow is one line short in
+    /// BOTH dumps; replaying `2 * mirror_rows` rows overfills the mirror, so
+    /// the bounded flow lands at the bottom exactly as the full one does.
+    /// (Replaying exactly the height difference did not: it left the mirror
+    /// top-aligned over a blank bottom row.)
+    #[test]
+    fn mirror_dump_renders_an_empty_continuation_like_the_full_dump_on_a_taller_mirror() {
+        let t = empty_continuation_session();
+        assert_mirror_renders_like_full(&t, &bounded_heights(&t)[1..]);
+    }
+
+    /// Empty-continuation pairs INSIDE the replayed ring window, each losing
+    /// a line in both flows: over-provisioning must still land the bounded
+    /// flow exactly where the full one lands.
+    #[test]
+    fn mirror_dump_renders_empty_continuations_in_the_ring_like_the_full_dump() {
+        let mut t = scrolled(24, 80, 1000, 500);
+        for _ in 0..3 {
+            t.process(b"\r\n");
+            t.process(&[b'a'; 81]);
+            t.process(b"\x08 \x08");
+        }
+        for i in 0..30 {
+            t.process(format!("\r\nafter {i:02}").as_bytes());
+        }
+        assert_mirror_renders_like_full(&t, &bounded_heights(&t)[1..]);
+    }
+
+    /// The correct behaviour `dump_vt` should have with an empty
+    /// continuation in the grid.
+    #[test]
+    #[ignore = "posh#229: dump_vt's flow loses a line on a wrapped row followed by an empty one"]
+    fn full_dump_reproduces_an_empty_continuation_at_the_same_height() {
+        let t = empty_continuation_session();
+        let m = mirror(24, 80, &t.dump_vt());
+        let visible = |t: &Terminal| {
+            let rows = rows_text(t);
+            (t.cursor(), rows[0].clone(), rows[23].clone())
+        };
+        assert_eq!(visible(&m), visible(&t));
     }
 }
