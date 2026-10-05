@@ -410,10 +410,17 @@ impl ClientConn {
     /// per-client shape (mid-overlay attach replay, resync keyframe), kept in
     /// one place so the frame-input contract cannot drift across call sites.
     /// `broadcast_output` deliberately keeps its batched form: it derives the
-    /// inputs once and clones them per client.
+    /// inputs once per geometry and clones them per client.
+    ///
+    /// The dump is built for the geometry of THIS client's terminal — what its
+    /// ring-less mirror can show — not replayed from the whole scrollback ring,
+    /// which made every frame ~1 MiB once the ring filled (posh#225). A client
+    /// that has not reported a size yet, or one wider, narrower or shorter than
+    /// `src`, still gets the full dump: a row count cannot reproduce the full
+    /// replay there. The rule itself lives in `Terminal::dump_vt_mirror`.
     fn queue_frame_from(&mut self, src: &Terminal) -> bool {
         self.queue_frame(
-            src.dump_vt(),
+            src.dump_vt_mirror(self.rows, self.cols),
             Snapshot::from_term(src),
             src.is_alt_screen(),
             (src.rows(), src.cols()),
@@ -680,23 +687,46 @@ impl ClientConn {
 
 /// Broadcasts a PTY-output chunk to every attached client: a posh-proto
 /// `ServerFrame` (`Tag::Frame`) for each frame-capable client, the raw `bcast`
-/// bytes (`Tag::Output`) for the rest. The dump/snapshot frame inputs are
-/// derived once from `term` and cloned per producer — each client diffs against
-/// its OWN acked base — and ONLY when at least one client is frame-capable, so a
-/// session with none pays exactly today's cost and emits exactly today's
-/// `Tag::Output` bytes (the gate-off invariant).
+/// bytes (`Tag::Output`) for the rest. The snapshot frame inputs are derived
+/// once from `term` and cloned per producer — each client diffs against its OWN
+/// acked base — and the dump once per DISTINCT client geometry, since each
+/// client's dump is built for its own terminal (`ClientConn::queue_frame_from`,
+/// posh#225). Both ONLY when at least one client is frame-capable, so a session
+/// with none pays exactly today's cost and emits exactly today's `Tag::Output`
+/// bytes (the gate-off invariant).
 fn broadcast_output(clients: &mut [ClientConn], term: &Terminal, bcast: &[u8]) {
     let frame_inputs = clients.iter().any(|c| c.producer.is_some()).then(|| {
         (
-            term.dump_vt(),
             Snapshot::from_term(term),
             term.is_alt_screen(),
             (term.rows(), term.cols()),
         )
     });
+    // One dump per distinct client geometry: clients of the same size share it.
+    let mut dumps: Vec<((u16, u16), Vec<u8>)> = Vec::new();
     for c in clients.iter_mut() {
         let produced = match &frame_inputs {
-            Some((dump, snap, alt, dims)) => c.queue_frame(dump.clone(), snap.clone(), *alt, *dims),
+            Some((snap, alt, dims)) => {
+                // A producer-less client never reads the dump (`queue_frame`
+                // returns false for it), so it is handed an empty one rather
+                // than costing a dump of its geometry. It is still CALLED:
+                // `queue_frame` marks a due activity answer sent before it
+                // looks at the producer, and skipping it would change that.
+                let dump = if c.producer.is_some() {
+                    let geometry = (c.rows, c.cols);
+                    match dumps.iter().find(|(g, _)| *g == geometry) {
+                        Some((_, d)) => d.clone(),
+                        None => {
+                            let d = term.dump_vt_mirror(c.rows, c.cols);
+                            dumps.push((geometry, d.clone()));
+                            d
+                        }
+                    }
+                } else {
+                    Vec::new()
+                };
+                c.queue_frame(dump, snap.clone(), *alt, *dims)
+            }
             None => false,
         };
         if !produced {
@@ -2786,6 +2816,13 @@ mod tests {
     /// `base_dump` (empty = a fresh blank screen, the plain [`reconstruct`] case;
     /// non-empty = the coalesced case, [`reconstruct_coalesced`]).
     fn reconstruct_seeded(write_buf: &[u8], rows: u16, cols: u16, base_dump: &[u8]) -> Snapshot {
+        Snapshot::from_term(&mirror_frames(write_buf, rows, cols, base_dump))
+    }
+
+    /// The scratch terminal [`reconstruct_seeded`] renders: a RING-LESS mirror
+    /// of `rows` x `cols`, seeded with `base_dump`, with `write_buf`'s queued
+    /// frames applied — for tests that read the mirror's rows, not a Snapshot.
+    fn mirror_frames(write_buf: &[u8], rows: u16, cols: u16, base_dump: &[u8]) -> Terminal {
         let mut fb = FrameBuffer::new();
         fb.feed(write_buf);
         let mut term = Terminal::with_scrollback(rows, cols, 0);
@@ -2800,7 +2837,7 @@ mod tests {
                 ApplyOutcome::ReackAndWait => panic!("DumpDiff could not apply a queued body"),
             }
         }
-        Snapshot::from_term(&term)
+        term
     }
 
     #[test]
@@ -4399,6 +4436,106 @@ mod tests {
         );
     }
 
+    // ---- posh#225: each viewport's frame is built for its own geometry ----
+
+    /// A 24x80 session whose 2,000-row ring is FULL of distinct, unwrapped
+    /// rows: `dump_vt` replays all of them (~150 KB), so any visible frame that
+    /// carries the ring is unmistakably over the 64 KiB these tests allow.
+    fn full_ring_term() -> Terminal {
+        const RING: usize = 2000;
+        let mut term = Terminal::with_scrollback(24, 80, RING);
+        for i in 0..RING + 200 {
+            term.process(format!("{i:06} ring row, distinct and unwrapped, padded to ~70 bytes ......\r\n").as_bytes());
+        }
+        term.process(b"$ ls");
+        assert!(term.dump_vt().len() > 128 * 1024, "the fixture's ring must dwarf the screen");
+        term
+    }
+
+    /// The one visible frame `broadcast_output` queued for a fresh frame
+    /// client — a `Full` (a fresh producer has only the empty frame-0 base) —
+    /// as its dump bytes.
+    fn only_full_body(write_buf: &[u8]) -> Vec<u8> {
+        let mut bodies = decode_frame_bodies(write_buf);
+        assert_eq!(bodies.len(), 1, "one broadcast, one visible frame");
+        match bodies.remove(0) {
+            FrameBody::Full(dump) => dump,
+            other => panic!("a fresh producer's first frame must be a Full, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn a_same_size_client_gets_screen_sized_frames_from_a_full_ring() {
+        let term = full_ring_term();
+        let (mut c, _peer) = frame_capable_conn(term.rows(), term.cols());
+        broadcast_output(std::slice::from_mut(&mut c), &term, b"<raw bytes ignored>");
+        let dump = only_full_body(&c.write_buf);
+        assert!(dump.len() < 64 * 1024, "a same-size frame carried {} bytes of ring", dump.len());
+    }
+
+    #[test]
+    fn a_taller_client_gets_a_bounded_tail_not_the_ring() {
+        let term = full_ring_term();
+        let (mut same, _ps) = frame_capable_conn(term.rows(), term.cols());
+        let (mut taller, _pt) = frame_capable_conn(term.rows() + 16, term.cols());
+        broadcast_output(std::slice::from_mut(&mut same), &term, b"<raw bytes ignored>");
+        broadcast_output(std::slice::from_mut(&mut taller), &term, b"<raw bytes ignored>");
+        let same = only_full_body(&same.write_buf);
+        let taller = only_full_body(&taller.write_buf);
+        assert!(taller.len() < 64 * 1024, "a taller frame carried {} bytes of ring", taller.len());
+        // The taller mirror shows rows above the grid, so its frame carries a
+        // scrollback tail the same-size one does not.
+        assert!(
+            taller.len() > same.len(),
+            "a taller frame ({} bytes) must carry a tail a same-size one ({} bytes) does not",
+            taller.len(),
+            same.len(),
+        );
+    }
+
+    /// KNOWN LIMITATION (posh#225 Stage 1), pinned so it is retired on purpose:
+    /// `dump_vt_mirror` falls back to the full replay wherever a row count
+    /// cannot reproduce it, so a WIDER viewport — the larger of two
+    /// differently-sized viewports on one session — keeps ring-sized frames.
+    /// Paced send-time delivery (Stage 2) bounds its backlog regardless of
+    /// frame size, and session geometry on the frame (RFC 0012) would make
+    /// every mirror session-sized; either change is where this test moves.
+    #[test]
+    fn a_wider_client_still_gets_the_full_dump() {
+        let term = full_ring_term();
+        let (mut c, _peer) = frame_capable_conn(term.rows(), term.cols() + 20);
+        broadcast_output(std::slice::from_mut(&mut c), &term, b"<raw bytes ignored>");
+        assert_eq!(only_full_body(&c.write_buf), term.dump_vt());
+    }
+
+    #[test]
+    fn clients_of_different_sizes_each_get_their_own_dump() {
+        let term = full_ring_term();
+        let (rows, cols) = (term.rows(), term.cols());
+        let (same, _ps) = frame_capable_conn(rows, cols);
+        let (taller, _pt) = frame_capable_conn(rows + 16, cols);
+        let mut clients = vec![same, taller];
+        broadcast_output(&mut clients, &term, b"<raw bytes ignored>");
+        let same_dump = only_full_body(&clients[0].write_buf);
+        let taller_dump = only_full_body(&clients[1].write_buf);
+        assert_ne!(same_dump, taller_dump, "each geometry gets its own dump");
+        // Each client's ring-less mirror, at ITS size, shows the session's
+        // grid along its bottom rows.
+        for c in &clients {
+            let mirror = mirror_frames(&c.write_buf, c.rows, c.cols, &[]);
+            let offset = c.rows - rows;
+            for r in 0..rows {
+                assert_eq!(
+                    row_text(&mirror, offset + r),
+                    row_text(&term, r),
+                    "a {}x{} mirror diverged at session row {r}",
+                    c.rows,
+                    c.cols,
+                );
+            }
+        }
+    }
+
     // ---- posh#225: write_buf growth under a newline flood (MEASUREMENT) ----
 
     /// How the lossy client's `Tag::FrameAck`s arrive during the flood.
@@ -4919,7 +5056,6 @@ mod tests {
     /// sent. The healthy cadences therefore also assert that every row the
     /// flood scrolled off was shipped and acked ([`assert_history_flowed`]).
     #[test]
-    #[ignore = "posh#225: fails until visible frames stop replaying the ring (Task 1.3)"]
     fn posh225_full_ring_flood_keeps_visible_frames_screen_sized() {
         const KIB: usize = 1024;
         let flood = newline_flood(256 * KIB);
