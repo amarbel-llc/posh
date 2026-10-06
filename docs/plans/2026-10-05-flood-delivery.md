@@ -3874,6 +3874,9 @@ bottom once Stage 7 is done, or sooner only if the operator re-orders it.
 | 16 | **posh#241** — `just lint-fmt` does not gate Rust formatting (`conformist.nix` is nixfmt + shfmt only); `remote/server.rs` fails `rustfmt --check` on master | Task 3.1 | Repo-level gap; decide rustfmt-in-conformist (one mechanical reformat commit) vs documenting the exclusion in AGENTS.md. |
 | 17 | **posh#242** — `switch_route_target` can pick a connection that never sent `Init` (a concurrent `posh list` probe) in the never-typed tie case | posh#239 review | One-line filter on `initialized()` + a test. Pre-existing. |
 | 18 | **posh#243** — RFC 0009 v2: a body lost on the wire while a later body is in flight becomes an unrepairable forward jump indistinguishable from eviction | Task 3.3 review | Inherited from `server_loop`; reachable on the default path since Stage 3. Operator kept the two-body window (2026-10-06). Proper fix: an eviction marker in RFC 0009, with Stage 4 (holes). |
+| 19 | **posh#245** — a height grow pops ring rows back onto the grid without lowering `scrollback_total`; they are delivered again when they re-scroll | Stage 3 whole-stage review | Pre-existing, v1 too; multi-viewport sessions only. Needs a posh-term API addition (the popped count). |
+| 20 | **posh#246** — v2 measurement gaps: the slow-reader loss (6,400 vs v1's ~4,300) is unanalysed; the visible-base cliff past ~2 s RTT is unmeasurable in a 2 MiB flood | Task 3.3 Part B | Longer-flood harness case or field data; Task 3.4 may change the slow-reader number. |
+| 21 | **posh#244** — `history_resend_after`'s doubling duplicates `remote/agent.rs`'s private `backed_off` | Stage 3 simplify | Share one helper when either site is next touched (Task 3.4). |
 
 Recorded elsewhere rather than filed: the `ClientConn::mirror_geometry()`
 accessor is a comment on **posh#210** (the `CAP_SESSION_SIZE` / RFC 0012

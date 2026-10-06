@@ -205,8 +205,10 @@ _POSH_PACED_
 	session is never slowed. Read once per attach: a change takes effect on
 	the next attach, without restarting the session. No effect on a local
 	*posh attach* (unpaced until a later stage) or on a viewport reached
-	through the relay (_POSH_MUX_SESSIONS=0_). The *Ctrl-^* palette's *About /
-	transport info* lists it.
+	through the relay (_POSH_MUX_SESSIONS=0_). A paced viewport that also
+	advertises _SCROLLBACK2_ (every current one) receives its scrollback as
+	windowed, addressed RFC 0009 v2 bodies; _0_ keeps RFC 0002 history as
+	well. The *Ctrl-^* palette's *About / transport info* lists it.
 
 _POSH_GRAB_MOUSE_
 	_on_/_off_ (default _off_): at a bare prompt the wheel scrolls the

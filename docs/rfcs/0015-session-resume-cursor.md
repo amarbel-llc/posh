@@ -68,7 +68,10 @@ interpreted as described in RFC 2119.
 
 ### 1. The cursor
 
-`SessionResume` is the aggregate of every offset a reattach MUST resume:
+`SessionResume` is the aggregate of every offset a reattach MUST resume
+(one exception, until posh#225 Stage 5 moves it here: the RFC 0009 v2
+history epoch and row count ride the viewport's `SCROLLBACK2` entry, which
+an M2 bridge re-Init carries — RFC 0009 §5):
 
 ```rust
 pub struct SessionResume {

@@ -130,7 +130,11 @@ From the user's seat, scrollback behaves as it would in a local terminal:
   width." This matches tmux/less, which also redraw on resize, and keeps
   all reflow server-side. The alternative (client-side rewrap of its own
   ring) is explicitly rejected — it would duplicate `posh_term`'s reflow
-  on the wrong side of the wire.
+  on the wrong side of the wire. *Update 2026-10-06 (posh#225 Stage 3):*
+  on a paced RFC 0009 v2 viewport only the viewport's OWN resize clears
+  its ring; a session-side resize (another viewport attaching narrower,
+  leaving, or a height grow) re-anchors it in the same epoch, and a
+  reconnect continues it (RFC 0009 §5, FDR 0021 decision 12).
 - **Frozen live view while scrolled.** Consistent with copy-mode/less;
   output is not lost (it accumulates into the ring) but the viewport does
   not auto-follow until the user returns to the bottom.

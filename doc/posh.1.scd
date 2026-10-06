@@ -507,8 +507,9 @@ _POSH_PACED_
 	one per PTY read, so under a flood the live screen jumps to the latest
 	state. Read per attach: takes effect on the next attach without
 	restarting the session. No effect on a local *posh attach* (unpaced
-	until a later stage) or a relayed viewport (_POSH_MUX_SESSIONS=0_). FDR
-	0021; see *posh-client*(1).
+	until a later stage) or a relayed viewport (_POSH_MUX_SESSIONS=0_). Also
+	selects addressed RFC 0009 v2 scrollback for the viewport; _0_ keeps RFC
+	0002 history. FDR 0021; see *posh-client*(1).
 
 _POSH_GRAB_MOUSE_
 	_on_/_off_ (default _off_): when on, the client grabs the wheel on
