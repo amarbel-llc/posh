@@ -5295,8 +5295,15 @@ mod tests {
         /// unpaced rule picks — one queueing step per chunk — but a paced
         /// client builds a frame only every [`PACED_FRAME_FLOOR_MS`] or
         /// more, so `k` chunks is far fewer than `k` frames, and the cliff
-        /// above sits at an RTT of about four ack waits instead: see
-        /// `posh225_flood_backlog_ideal_reader_measurement`.)
+        /// above sits at an RTT of about five ack waits instead (RTT >
+        /// 5 x `PACED_ACK_WAIT_MS` - pace): a pair goes out every wait, the
+        /// outstanding window holds 4 pairs, and the acked scrollback slot of
+        /// the pair sent at T is still the oldest held after 4 more pairs —
+        /// the 5th, at T + 5 waits, evicts it. See
+        /// `posh225_flood_backlog_ideal_reader_measurement`. Under
+        /// [`FloodDrain::Trickle`] the RTT clock starts at queue time + 1
+        /// step, not at delivery, so a late-delivered frame's RTT is
+        /// absorbed rather than added.)
         Lagged(usize),
     }
 
@@ -5994,9 +6001,13 @@ mod tests {
         // Per-read frames first, then the same runs for a paced client whose
         // fake clock advances 1 ms per chunk (see `FloodCase::pace`), plus
         // real round trips for it — `lag k` is then a k ms RTT: between the
-        // floor and the ack wait, past the wait, and past about four waits,
-        // where the 8-frame outstanding window (four visible + scrollback
-        // pairs at one pair per wait) evicts every frame before its ack lands.
+        // floor and the ack wait, past the wait, and past about five waits
+        // (RTT > 5 x PACED_ACK_WAIT_MS - pace): the 8-frame outstanding window
+        // holds 4 visible + scrollback pairs at one pair per wait, and the
+        // acked scrollback slot of the pair sent at T is still the oldest held
+        // after 4 more pairs, so the 5th (T + 1250 ms) evicts it. `lag 1500`
+        // is past that cliff. Only the 1 KiB-chunk flood (2048 ms) is long
+        // enough for that RTT; the 4 KiB (512 ms) row is uninformative.
         for pace in [None, Some(1)] {
             let mut cadences = vec![
                 FloodAcks::EveryNewest(1),
@@ -6006,7 +6017,7 @@ mod tests {
                 FloodAcks::Never,
             ];
             if pace.is_some() {
-                cadences.extend([FloodAcks::Lagged(50), FloodAcks::Lagged(300), FloodAcks::Lagged(1200)]);
+                cadences.extend([FloodAcks::Lagged(50), FloodAcks::Lagged(300), FloodAcks::Lagged(1500)]);
             }
             for prefill_rows in [0, SCROLLBACK + 200] {
                 for chunk in [KIB, 4 * KIB] {
