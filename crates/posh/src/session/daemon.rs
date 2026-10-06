@@ -912,6 +912,22 @@ impl ClientConn {
 // its Init still gets raw `Tag::Output` (`is_frame_capable`). The env var is
 // now ignored; rollback to Architecture A is the bootstrap-side `POSH_RELAY=0`.
 
+/// The fields both backlog log lines carry (posh#131 diagnosis): stalled vs
+/// bursty, and `paced=` — a paced viewport holds at most one frame pair
+/// (RFC 0008 §3.2), so a paced client at the high-water mark or dropped is
+/// a posh bug, not a slow reader. Telling the viewport why it was dropped
+/// is posh#226.
+fn backlog_log_fields(c: &ClientConn, now: u64) -> String {
+    format!(
+        "fd={} backlog={} drained_total={} last_drain_age_ms={} paced={}",
+        c.stream.as_raw_fd(),
+        c.write_buf.len(),
+        c.bytes_drained,
+        now.saturating_sub(c.last_drain_ms),
+        u8::from(c.is_paced()),
+    )
+}
+
 /// Broadcasts a PTY-output chunk to every attached client: a posh-proto
 /// `ServerFrame` (`Tag::Frame`) for each frame-capable client, the raw `bcast`
 /// bytes (`Tag::Output`) for the rest. The snapshot frame inputs are derived
@@ -1674,13 +1690,7 @@ fn daemon_loop(
                 c.hiwater_mb = mb;
                 util::log_write(
                     "warn",
-                    &format!(
-                        "client backlog high-water fd={} backlog={} drained_total={} last_drain_age_ms={}",
-                        c.stream.as_raw_fd(),
-                        c.write_buf.len(),
-                        c.bytes_drained,
-                        now.saturating_sub(c.last_drain_ms),
-                    ),
+                    &format!("client backlog high-water {}", backlog_log_fields(c, now)),
                 );
             }
         }
@@ -1695,13 +1705,7 @@ fn daemon_loop(
             if c.write_buf.len() > MAX_CLIENT_BACKLOG {
                 util::log_write(
                     "warn",
-                    &format!(
-                        "dropping slow client fd={} backlog={} drained_total={} last_drain_age_ms={}",
-                        c.stream.as_raw_fd(),
-                        c.write_buf.len(),
-                        c.bytes_drained,
-                        now.saturating_sub(c.last_drain_ms),
-                    ),
+                    &format!("dropping slow client {}", backlog_log_fields(c, now)),
                 );
                 false
             } else {
@@ -6264,6 +6268,20 @@ mod tests {
         let mut table = vec![caps::encode_paced()];
         table.extend_from_slice(extra);
         lossy_conn(rows, cols, &table)
+    }
+
+    #[test]
+    fn backlog_log_fields_say_whether_the_client_is_paced() {
+        let (paced, _p) = paced_conn(24, 80, &[]);
+        let (plain, _q) = lossy_conn(24, 80, &[]);
+        let now = util::now_ms();
+        for (c, want) in [(&paced, "paced=1"), (&plain, "paced=0")] {
+            let fields = backlog_log_fields(c, now);
+            assert!(fields.ends_with(want), "{fields}");
+            for key in ["fd=", "backlog=", "drained_total=", "last_drain_age_ms="] {
+                assert!(fields.contains(key), "{fields} lacks {key}");
+            }
+        }
     }
 
     #[test]
