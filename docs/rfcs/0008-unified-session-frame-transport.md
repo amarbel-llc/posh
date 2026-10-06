@@ -180,6 +180,39 @@ A connection receiving the switch record:
   unknown-tag rule) — an old relay leaves its viewport on the original
   session, a visible no-op rather than an error.
 
+#### 3.2 Paced delivery (posh#225)
+
+Added 2026-10-06 (FDR 0021). A client that advertises `CAP_PACED` (RFC 0001
+id 23) on its `Tag::Init` (§1.1) asks the daemon to decide what to send at
+send time rather than per PTY read. For such a client the daemon:
+
+- MUST NOT queue a visible frame per PTY read. It MUST hold at most one
+  unsent visible frame for the client, plus the history (`SCROLLBACK`) body
+  that rides immediately behind that frame.
+- builds a fresh visible frame only at a *send opportunity*: the client's
+  outgoing buffer is empty AND its last fresh visible frame is acknowledged
+  (a `FrameAck` at or beyond it, or the §2 self-ack) or an
+  implementation-defined wait has elapsed since that frame was queued.
+  Implementations SHOULD also space fresh frames by a floor. At an
+  opportunity the frame is built from the terminal as it is then, for the
+  client's current geometry (§2); screens produced in between are never
+  built.
+- MUST mark every event that owes the client a frame — attach, the §2
+  regeometry frame, a `FRAME_ACK_RESYNC`, an activity answer, a broadcast
+  source swap — as owed, and serve it at the next opportunity. A RESYNC
+  also releases the wait for an acknowledgement: the client rejected what
+  was outstanding, so its ack is not coming.
+- MUST deliver an owed frame before it sends `Exit`.
+- MUST NOT apply backpressure to the PTY: output is read and fed to the
+  terminal exactly as for any other client. Pacing changes when a frame is
+  built for the client, never how fast the session runs.
+
+A client that does not advertise `CAP_PACED` receives §2/§3 delivery
+unchanged, so two clients of one session may run different modes side by
+side. An M2 bridge forwards its viewport's `CAP_PACED` entry into the daemon
+Init; a relay does not (ADR 0007), so a relayed viewport is unpaced. The
+wait and the floor are implementation values (FDR 0021), not protocol.
+
 ### 4. Capability re-homing
 
 No new registry ids are allocated; the socket reuses the RFC 0001 §3 registry.
