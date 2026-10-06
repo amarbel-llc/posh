@@ -227,7 +227,8 @@ _POSH_WEDGE_CAPTURE_
 	shape — peer address, heard age, live and cumulative agent channel
 	counts, whether it still owns _agent/sock_, its session-channel count,
 	and _session_frames=_, the visible session frames forwarded to
-	viewports since the peer started (scrollback frames excluded) —
+	viewports across its live session channels (scrollback frames
+	excluded; a closed channel's count drops out) —
 	appended to its persistent per-client-host log (see *agent*
 	above).
 

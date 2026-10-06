@@ -722,7 +722,9 @@ fn about_summary(st: &ClientState) -> String {
         env!("POSH_BUILD"),
         gate("POSH_MUX", crate::remote::mux::mux_selected()),
         gate("POSH_MUX_SESSIONS", crate::remote::mux::mux_sessions_selected()),
-        gate("POSH_PACED", st.paced),
+        // Effective only on a mux session channel: the relay does not
+        // forward CAP_PACED (ADR 0007).
+        gate("POSH_PACED", st.paced && matches!(st.wire, Wire::Mux(_))),
         gate("POSH_CHANNELS", crate::remote::sshwrap::channels_selected()),
         gate("POSH_CONGESTION", crate::remote::agent::congestion_selected()),
         gate("POSH_RELAY", relay_on),

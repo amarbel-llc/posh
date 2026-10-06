@@ -355,6 +355,26 @@ where it differs** from this section. The user-facing record is FDR 0021.
   limitation); history across a reconnect (Stage 5); a dropped viewport is
   not told why (posh#226).
 - **posh#227** closes with this stage (decision 6, implemented here).
+- **Post-review cleanup.** The whole-stage review found that the daemon
+  loop reset every framed client's scrollback floor on ANY resize event (a
+  client attaching or leaving, a height-only resize, a mux reconnect), which
+  skipped the rows a paced viewport still held unshipped since its last
+  paced pair — a silent hole in its ring. The floor now resets only when the
+  session WIDTH changes (`reset_scrollback_floors_on_reflow`; RFC 0002 §4's
+  reflow trigger), pinned by `a_same_width_attach_does_not_skip_a_paced_clients_unshipped_history`.
+  A side effect for every framed viewport: rows a session-height SHRINK
+  pushes into scrollback now ship (the reset used to skip them). Not
+  addressed: a height GROW pulls rows back out of the ring without lowering
+  the monotonic total, so those rows ship again when they re-scroll — true
+  before this change too — and a paced viewport holding unshipped rows
+  across a grow may be sent rows it already holds. Refactors with no behaviour change: one entry point,
+  `ClientConn::request_frame_from`, for every frame-owing event (paced:
+  mark dirty; framed: build now), over the mechanism `build_frame_from`,
+  with a RESYNC's release of the ack wait moved into `apply_frame_ack`; the
+  morph regeometry keyframe's number is recorded by `queue_frame` when the
+  keyframe is built rather than predicted at prepare time
+  (`RegeometryKeyframe`); `Pacing.last_fresh` keeps only the send time, the
+  outstanding test being the producer's `acked_num() < last_visible_num()`.
 - **Exit check: NOT yet done.** The field run — a `nix gc`-shaped flood on a
   remote session, SIGUSR2 to the mux peer twice and `session_frames=`
   compared, Ctrl-C mid-flood — needs this build deployed to the remote host.
@@ -1094,10 +1114,10 @@ Corrections to the task-level text that stood here before are marked
   `write_buf`, so at most one ring (~1 MiB) is ever queued. It is **not**
   closed as *bandwidth*: a never-acking paced viewport is re-sent up to a
   ring of history every `PACED_ACK_WAIT_MS`. Stage 3 closes that.
-  Expected but unverified until Task 2.5's measurement: with far fewer
-  frames in flight per round trip, a remote viewport's acks land inside
-  the producer's 8-frame window again, so it leaves the lost-base regime
-  in which v1 history stops entirely.
+  Measured in Task 2.5: with far fewer frames in flight per round trip, a
+  remote viewport's acks land inside the producer's 8-frame window again,
+  so it leaves the lost-base regime in which v1 history stops entirely —
+  below the RTT cliff (≈ 5 × `PACED_ACK_WAIT_MS`), not above it.
 - **Two constants, both used.** `PACED_FRAME_FLOOR_MS = 20` — the least
   time between two fresh frames however promptly the viewport acks (caps
   encode work during a flood at ≤ 50 frames/s); `PACED_ACK_WAIT_MS = 250`
@@ -1926,8 +1946,10 @@ flood tests.
 and rings) to `posh225_flood_backlog_ideal_reader_measurement`, run it
 (`just debug-cargo test --release -p posh --bin posh posh225_flood_backlog_ideal_reader_measurement -- --ignored --nocapture`),
 and keep the paced rows for Task 2.8. In particular record, for `Lagged(5)`
-paced, whether `sb_acked` is now non-zero — the "remote viewport leaves the
-lost-base regime" expectation above is unverified until this row.
+paced, whether `sb_acked` is now non-zero — the row that tests the "remote
+viewport leaves the lost-base regime" expectation above. (Measured: it holds
+below the RTT cliff, ≈ 5 × `PACED_ACK_WAIT_MS`, not above; see "Stage 2 as
+built".)
 
 **Step 4: Commit** — message (measurement rows in the body):
 `posh#225 Stage 2: paced flood regression tests and measurements`
@@ -2300,8 +2322,8 @@ bottom once Stage 7 is done, or sooner only if the operator re-orders it.
 | 11 | **posh#231** — can an orphaned zero-width spacer cell break the soft-wrap replay? | Stage 1 review | A reviewer's theoretical gap; not established that posh-term can produce the state. |
 | 12 | **posh#230** — build `ClientConn` test fixtures from one constructor | Stage 1 cleanup | Test maintenance; eight struct literals today. |
 | 13 | **posh#232** — a shared send/receive helper for `remote/server.rs`'s tests | Stage 1 cleanup | Test maintenance; ~a dozen copies of one loop. |
-
 | 14 | *(no issue)* — `relay.rs`: `content_caps` has no doc comment of its own; `forwarded_client_caps`'s doc (`:220-229`) is fused onto it, and `bridge_init_content` now points readers there | Task 2.2 review | Pre-existing; a one-line doc fix in a separate commit. Operator sequenced it here (2026-10-06). |
+| 15 | **posh#239** — `the_daemon_loop_sends_a_resized_client_a_frame_for_its_new_geometry` fails intermittently with "capability payload/entry truncated" in `mirror_frames` | Stage 2 test runs | Pre-existing (a Stage 1 test; fails with the pre-Stage-2 daemon too). Reproduce with `just debug-cargo-flake 12 session::daemon`; passes run alone. Can trip the pre-merge hook. |
 
 Recorded elsewhere rather than filed: the `ClientConn::mirror_geometry()`
 accessor is a comment on **posh#210** (the `CAP_SESSION_SIZE` / RFC 0012

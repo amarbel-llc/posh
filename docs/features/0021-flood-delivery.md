@@ -26,13 +26,20 @@ is sent at most one screen at a time, and that screen is the newest.
   restarting the session. When on, the viewport advertises `CAP_PACED`
   (RFC 0001 id 23) on every message and the M2 bridge carries it into the
   daemon's Init. The palette's About view lists `POSH_PACED` with the other
-  gates and its state for this attach.
+  gates, `on` only when this attach rides a mux session channel (a relayed
+  attach is not paced, below).
 - **What the user sees:** during a flood the live screen jumps to the latest
   state rather than replaying every intermediate one, and at most one screen
   is in flight to the viewport. What the user sees and what their keystrokes
-  act on stay in step — Ctrl-C mid-flood takes visible effect at once. The
-  program in the session is never slowed: the PTY is read and the terminal fed
-  exactly as before.
+  act on stay close in step — the screen after a Ctrl-C mid-flood arrives at
+  the next send opportunity (at most `PACED_ACK_WAIT_MS` away), though behind
+  any scrollback frame already queued ahead of it (up to a ring, ~1 MB, until
+  Stage 3). The program in the session is never slowed: the PTY is read and
+  the terminal fed exactly as before.
+- **Interactive cost:** typing faster than one round trip, each echo frame
+  waits for the previous frame's ack (at least `PACED_FRAME_FLOOR_MS`, and
+  `PACED_ACK_WAIT_MS` when an ack is lost) — one frame per RTT, as mosh
+  does, by design.
 - **Not paced:** a local `posh attach` (it does not advertise the capability
   yet — a later stage), and a viewport reached through the relay
   (`POSH_MUX_SESSIONS=0`): the relay does not forward `CAP_PACED` (ADR 0007).
@@ -157,7 +164,7 @@ modes, and an older viewport keeps working against a newer daemon.
 - Relay exclusion: ADR 0007. Frame dumps: Stage 1 (RFC 0008 §2,
   `Terminal::dump_vt_mirror`).
 - Code: `session::daemon` (`Pacing`, `ClientConn::paced_send_at`,
-  `owe_paced_frame`, `send_paced_frames`, `paced_poll_timeout`,
+  `request_frame_from`, `send_paced_frames`, `paced_poll_timeout`,
   `flush_paced_frames`), `session::parse_paced_gate`,
   `remote::client::outgoing_caps`, the M2 bridge's Init in `remote::server`.
 - Implementation plan: `docs/plans/2026-10-05-flood-delivery.md`.
