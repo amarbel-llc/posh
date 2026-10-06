@@ -14,6 +14,7 @@ use crate::pty::{self, PtyChild};
 use crate::remote::caps;
 use crate::remote::display::Snapshot;
 use crate::remote::framesync::FrameProducer;
+use crate::remote::history::{HistoryCursor, HistoryStart, SB2_ROWS_PER_BODY};
 use crate::remote::introspect;
 use crate::remote::sync::{base_checksum, FrameBody, ServerFrame};
 use crate::session::ipc::{self, FrameBuffer, SessionInfo, Tag};
@@ -75,6 +76,17 @@ const PACED_ACK_WAIT_MS: u64 = 250;
 /// How often a paced viewport's `paced ack latency` log line may repeat
 /// (posh#225 Stage 3.0): the field series Task 3.4 is tuned from.
 const ACK_LOG_INTERVAL_MS: u64 = 10_000;
+/// v2 history (posh#225 Stage 3): rows a paced viewport may have in flight
+/// before its ack — about two bodies per round trip, the daemon's stand-in
+/// for `server_loop`'s SRTT-paced send interval. The static share Task 3.4
+/// makes dynamic. A tuning value: change it only with a measurement in FDR 0021.
+const HISTORY_WINDOW_ROWS: u64 = 2 * SB2_ROWS_PER_BODY;
+/// The v2 resend floor before any ack latency has been measured: TCP's
+/// initial RTO. A tuning value, as above.
+const HISTORY_RESEND_INITIAL_MS: u64 = 4 * PACED_ACK_WAIT_MS;
+/// Resend backoff: the floor doubles per resend without ack progress, at
+/// most this many times.
+const HISTORY_RESEND_MAX_DOUBLINGS: u32 = 3;
 
 /// Ensures the session exists, forking off a daemon when needed. Returns
 /// true when a new session was created. The daemon is a double-forked
@@ -331,8 +343,18 @@ struct Pacing {
     /// (posh#225 Stage 3.0): what an ack's round trip is measured from.
     /// Emptied on a RESYNC, with `last_fresh`.
     sent_frames: VecDeque<(u64, u64)>,
-    /// Its frame-ack timing (posh#225 Stage 3.0): diagnostic only.
+    /// Its frame-ack timing (posh#225 Stage 3.0): logged, and the RTT the
+    /// v2 resend floor follows (`history_resend_after`).
     acks: AckLatency,
+    /// RFC 0009 v2 history (posh#225 Stage 3): `Some` when this paced
+    /// viewport's Init carried a well-formed `CAP_SCROLLBACK2`; it then gets
+    /// `Scrollback2` bodies and never v1 `Scrollback` frames.
+    history: Option<HistoryCursor>,
+    /// Whether the newest paced send was a history body (`server_loop`'s
+    /// `last_was_sb`): when both kinds are due, the other one goes.
+    last_was_history: bool,
+    /// Resend bodies since the v2 ack last advanced (the backoff exponent).
+    history_resends: u32,
 }
 
 /// The most entries `Pacing::sent_frames` keeps: 16 unacked visible frames
@@ -424,6 +446,48 @@ impl ClientConn {
                 self.record_at = now;
             }
         }
+        // posh#225 Stage 3 (RFC 0009 §3): a v2 viewport's cumulative ack,
+        // forwarded by the M2 bridge on every change. On an Init this finds
+        // no cursor yet: `open_history` takes the Init's count itself.
+        if let Some(entry) = caps::find(table, caps::CAP_SCROLLBACK2)
+            .and_then(|c| caps::decode_scrollback2_client(&c.payload).ok())
+        {
+            if let Some(p) = self.pacing.as_mut() {
+                if p.history.as_mut().is_some_and(|h| h.on_ack(entry.epoch, entry.acked_rows)) {
+                    p.history_resends = 0;
+                }
+            }
+        }
+    }
+
+    /// Open this paced viewport's v2 cursor from its Init's SCROLLBACK2
+    /// entry, at `term`'s total (the daemon's Init arm, beside `sb_floor`).
+    /// A viewport holding an epoch is continued at its count, so a
+    /// reconnect keeps its ring (a fresh epoch would make it clear it); one
+    /// holding none (epoch 0) gets a fresh epoch. A bare re-Init keeps the
+    /// cursor it has.
+    fn open_history(&mut self, term: &Terminal) {
+        if self.producer.is_none() {
+            return;
+        }
+        let entry = caps::find(&self.caps, caps::CAP_SCROLLBACK2)
+            .and_then(|c| caps::decode_scrollback2_client(&c.payload).ok());
+        let (Some(p), Some(entry)) = (self.pacing.as_mut(), entry) else {
+            return;
+        };
+        if p.history.is_some() {
+            return;
+        }
+        let start = match entry.epoch {
+            0 => HistoryStart::Fresh,
+            epoch => HistoryStart::Continue {
+                epoch,
+                rows: entry.acked_rows,
+            },
+        };
+        let mut cursor = HistoryCursor::new((self.rows, self.cols));
+        cursor.activate(start, term.primary_scrollback_total());
+        p.history = Some(cursor);
     }
 
     /// RFC 0013 §5.2: this client asked for the activity label and has not
@@ -688,15 +752,19 @@ impl ClientConn {
     /// Build this paced client's fresh visible frame from `src` now — for
     /// its current geometry (`build_frame_from`, which also records
     /// `visible_shaped_for`), with any v1 scrollback right behind it
-    /// (posh#181 threading) — and record when it was sent.
+    /// (posh#181 threading) unless it takes v2 history, which has its own
+    /// opportunity (`history_send_at`) — and record when it was sent.
     fn send_paced_frame(&mut self, src: &Terminal, now: u64) {
         if !self.build_frame_from(src) {
             return;
         }
-        self.maybe_queue_scrollback(src);
+        if !self.has_history() {
+            self.maybe_queue_scrollback(src);
+        }
         let sent = self.producer.as_ref().map(FrameProducer::last_visible_num);
         if let Some(p) = self.pacing.as_mut() {
             p.dirty = false;
+            p.last_was_history = false;
             p.last_fresh = Some(now);
             if let Some(num) = sent {
                 if p.sent_frames.len() == SENT_FRAME_LOG_CAP {
@@ -705,6 +773,74 @@ impl ClientConn {
                 p.sent_frames.push_back((num, now));
             }
         }
+    }
+
+    /// Whether this client takes RFC 0009 v2 history (`Pacing::history`).
+    fn has_history(&self) -> bool {
+        self.pacing.as_ref().is_some_and(|p| p.history.is_some())
+    }
+
+    /// The v2 resend floor: twice the measured ack latency (never under the
+    /// ack wait), `HISTORY_RESEND_INITIAL_MS` before any sample, doubled per
+    /// resend without progress.
+    fn history_resend_after(&self) -> u64 {
+        let Some(p) = self.pacing.as_ref() else {
+            return HISTORY_RESEND_INITIAL_MS;
+        };
+        let base = p
+            .acks
+            .srtt_ms
+            .map_or(HISTORY_RESEND_INITIAL_MS, |s| (2 * s).max(PACED_ACK_WAIT_MS));
+        base << p.history_resends.min(HISTORY_RESEND_MAX_DOUBLINGS)
+    }
+
+    /// When this client may next be sent a history body from `term` — the
+    /// history half of the one-predicate rule (`send_paced_frames` and
+    /// `paced_poll_timeout` both ask it). Fresh rows with room in the
+    /// window: the floor after the last body. Otherwise, rows in flight: the
+    /// resend deadline. `None` with bytes queued, or with nothing fresh and
+    /// nothing in flight.
+    fn history_send_at(&self, term: &Terminal) -> Option<u64> {
+        let h = self.pacing.as_ref().and_then(|p| p.history)?;
+        if !self.write_buf.is_empty() || self.producer.is_none() {
+            return None;
+        }
+        let fresh = h.avail(term.primary_scrollback_total()) > h.sent_upto();
+        if fresh && h.in_flight() < HISTORY_WINDOW_ROWS {
+            return Some(h.last_send() + PACED_FRAME_FLOOR_MS);
+        }
+        (h.in_flight() > 0).then(|| h.last_send() + self.history_resend_after())
+    }
+
+    /// Queue one v2 body from `term` (the session terminal) — from the send
+    /// cursor, or from the ack when the resend floor has passed — riding the
+    /// newest visible frame number (RFC 0009 §2: an annotation; the producer
+    /// does not advance), with the epoch ack beside it.
+    fn send_history_body(&mut self, term: &Terminal, now: u64) {
+        let rto = self.history_resend_after();
+        let flags = self.echo_flag | self.overlay_flag;
+        let (Some(producer), Some(p)) = (self.producer.as_ref(), self.pacing.as_mut()) else {
+            return;
+        };
+        let Some(h) = p.history.as_mut() else {
+            return;
+        };
+        if h.resend_due(now, rto) {
+            p.history_resends += 1;
+        }
+        let body = h.next_body(term, now, rto, SB2_ROWS_PER_BODY);
+        let epoch = h.epoch().expect("an open cursor is active");
+        p.last_was_history = true;
+        let bytes = ServerFrame {
+            flags,
+            caps: caps::own_table(&[caps::encode_scrollback2_ack(epoch)]),
+            frame_num: producer.current_num(),
+            input_ack: 0,
+            echo_ack: 0,
+            body,
+        }
+        .encode();
+        self.queue(Tag::Frame, &bytes);
     }
 
     /// [`queue_frame`] with its inputs derived from one source terminal, for
@@ -762,7 +898,7 @@ impl ClientConn {
         let stamp_base_sum = lossy && caps::find(&self.caps, caps::CAP_BASE_SUM).is_some();
         // RFC 0013 §5.2: the activity label rides this visible frame only
         // when it changed since this client last received it (or never did).
-        let activity_cap: Vec<caps::Cap> = if self.answer_due() {
+        let mut frame_caps: Vec<caps::Cap> = if self.answer_due() {
             self.activity_sent = self.activity_now.clone();
             let mut entries: Vec<caps::Cap> =
                 self.activity_now.iter().map(caps::encode_session_activity).collect();
@@ -781,6 +917,12 @@ impl ClientConn {
         } else {
             Vec::new()
         };
+        // RFC 0009 §1.1 (posh#225 Stage 3): a v2 viewport adopts its epoch
+        // from the server's SCROLLBACK2 entry on the first frame it gets, so
+        // every visible frame to it carries one, as `server_loop`'s do.
+        if let Some(epoch) = self.pacing.as_ref().and_then(|p| p.history).and_then(|h| h.epoch()) {
+            frame_caps.push(caps::encode_scrollback2_ack(epoch));
+        }
         let encoded = match self.producer.as_mut() {
             None => return false,
             Some(producer) => {
@@ -805,7 +947,7 @@ impl ClientConn {
                     // FDR 0008: FLAG_OVERLAY rides too while the shell overlay
                     // is up (posh#178).
                     flags: self.echo_flag | self.overlay_flag,
-                    caps: caps::own_table(&activity_cap),
+                    caps: caps::own_table(&frame_caps),
                     frame_num,
                     input_ack: 0,
                     echo_ack: 0,
@@ -1254,25 +1396,38 @@ fn broadcast_source_swap(clients: &mut [ClientConn], src: &Terminal, bcast: &[u8
 }
 
 /// The paced send pass (posh#225, RFC 0008 §3.2): every paced client with a
-/// send opportunity at `now` gets ONE fresh visible frame built from `src`
-/// as it is now. Screens produced since its last frame were never built.
-/// Runs at the end of a loop iteration; `now` is a parameter so tests
-/// drive a fake clock.
-fn send_paced_frames(clients: &mut [ClientConn], src: &Terminal, now: u64) {
+/// send opportunity at `now` gets ONE body — a fresh visible frame built
+/// from `src` as it is now (screens produced since its last frame were
+/// never built), or a v2 history body from `history`. When both are due,
+/// the kind that did not go last goes (`server_loop`'s coin); the other
+/// goes next iteration, after the drain. `history` is the session terminal,
+/// `None` while the escape overlay is up (as `server_loop` pauses history
+/// for it). Runs at the end of a loop iteration; `now` is a parameter so
+/// tests drive a fake clock.
+fn send_paced_frames(clients: &mut [ClientConn], src: &Terminal, history: Option<&Terminal>, now: u64) {
     for c in clients.iter_mut() {
-        if c.paced_send_at().is_some_and(|at| now >= at) {
-            c.send_paced_frame(src, now);
+        let screen = c.paced_send_at().is_some_and(|at| now >= at);
+        let rows = history.filter(|t| c.history_send_at(t).is_some_and(|at| now >= at));
+        let last_was_history = c.pacing.as_ref().is_some_and(|p| p.last_was_history);
+        match (screen, rows) {
+            (true, Some(t)) if !last_was_history => c.send_history_body(t, now),
+            (true, _) => c.send_paced_frame(src, now),
+            (false, Some(t)) => c.send_history_body(t, now),
+            (false, None) => {}
         }
     }
 }
 
 /// The daemon's poll timeout: milliseconds until the nearest paced send
-/// opportunity, `0` when one is already due, `-1` (block) when no paced
-/// client owes a frame — never a busy-wait.
-fn paced_poll_timeout(clients: &[ClientConn], now: u64) -> i32 {
+/// opportunity — a visible frame, or a history body from `history` (the
+/// session terminal, `None` while the escape overlay is up) — `0` when one
+/// is already due, `-1` (block) when no paced client owes either — never a
+/// busy-wait.
+fn paced_poll_timeout(clients: &[ClientConn], history: Option<&Terminal>, now: u64) -> i32 {
     clients
         .iter()
-        .filter_map(ClientConn::paced_send_at)
+        .flat_map(|c| [c.paced_send_at(), history.and_then(|t| c.history_send_at(t))])
+        .flatten()
         .map(|at| at.saturating_sub(now))
         .min()
         .map_or(-1, |ms| i32::try_from(ms).unwrap_or(i32::MAX))
@@ -1618,6 +1773,32 @@ fn reset_scrollback_floors_on_reflow(clients: &mut [ClientConn], term: &Terminal
     }
 }
 
+/// v2 row spaces (RFC 0009 §1.1, posh#225 Stage 3), run beside
+/// `reset_scrollback_floors_on_reflow`. A viewport whose own reported size
+/// changed cleared its ring, so it gets a new epoch at the current total.
+/// A session width change reflowed the daemon's ring, renumbering its rows;
+/// every OTHER viewport is re-anchored at the reflowed total in the SAME
+/// epoch — its ring and ack stay valid, and rows not yet sent become a
+/// forward jump — so another viewport attaching narrower, or leaving, never
+/// clears its history (v1 never did).
+fn reset_history_on_resize(clients: &mut [ClientConn], term: &Terminal, cols_before: u16) {
+    let total = term.primary_scrollback_total();
+    let reflowed = term.cols() != cols_before;
+    for c in clients.iter_mut() {
+        let size = (c.rows, c.cols);
+        let Some(p) = c.pacing.as_mut() else { continue };
+        let Some(h) = p.history.as_mut() else { continue };
+        let before = h.epoch();
+        h.on_client_size(size, total);
+        if h.epoch() != before {
+            p.history_resends = 0;
+        } else if reflowed {
+            h.reanchor(total);
+            p.history_resends = 0;
+        }
+    }
+}
+
 /// The environment a session daemon adds on top of its own when it spawns the
 /// session shell: the session's identity, and always a non-empty TERM —
 /// `term` (the daemon's own `TERM` reading) when it has one, a resolved one
@@ -1951,8 +2132,9 @@ fn daemon_loop(
         };
 
         // Block until an fd is ready or the nearest paced send opportunity
-        // (posh#225): `-1` while no paced client owes a frame.
-        match util::poll(&mut fds, paced_poll_timeout(clients, now)) {
+        // (posh#225): `-1` while no paced client owes a frame or a history
+        // body (history pauses while the escape overlay is up).
+        match util::poll(&mut fds, paced_poll_timeout(clients, overlay.is_none().then_some(&*term), now)) {
             Ok(_) => {}
             Err(e) if e.kind() == std::io::ErrorKind::Interrupted => continue,
             Err(e) => {
@@ -2256,6 +2438,11 @@ fn daemon_loop(
                                     if !framed_before && c.producer.is_some() {
                                         c.sb_floor = term.primary_scrollback_total();
                                     }
+                                    // RFC 0009 v2 (posh#225 Stage 3): a paced
+                                    // viewport that advertised SCROLLBACK2 gets
+                                    // its history cursor here; a bare re-Init is
+                                    // a no-op inside.
+                                    c.open_history(term);
                                     // Replay the current screen so the client
                                     // sees state it missed (including the first
                                     // attach to a detached-created session). The
@@ -2492,6 +2679,7 @@ fn daemon_loop(
                     }
                 }
                 reset_scrollback_floors_on_reflow(clients, term, cols_before);
+                reset_history_on_resize(clients, term, cols_before);
             }
             // Replay after the resize so the dump reflects the client's size.
             // Skip if the client was removed this iteration. github #16.
@@ -2554,8 +2742,9 @@ fn daemon_loop(
         // posh#225 (RFC 0008 §3.2): the paced send pass runs last, so its
         // frames reflect everything this iteration fed the terminal. A frame
         // queued here is written next iteration (`POLLOUT` is armed for a
-        // non-empty `write_buf`).
-        send_paced_frames(clients, src, util::now_ms());
+        // non-empty `write_buf`). v2 history comes from the session terminal
+        // and pauses while the escape overlay is up.
+        send_paced_frames(clients, src, overlay.is_none().then_some(&*term), util::now_ms());
     };
 
     // A paced client's last screen may still be owed (posh#225): build it now,
@@ -5935,7 +6124,7 @@ mod tests {
         match case.pace {
             Some(_) => {
                 assert!(c.request_frame_from(&term));
-                send_paced_frames(std::slice::from_mut(&mut c), &term, 0);
+                send_paced_frames(std::slice::from_mut(&mut c), &term, Some(&term), 0);
                 assert_eq!(c.producer.as_ref().unwrap().last_visible_num(), 1, "the attach keyframe is frame 1");
             }
             None => assert!(c.request_frame_from(&term)),
@@ -6028,7 +6217,7 @@ mod tests {
                     now += ms;
                     continue;
                 }
-                let timeout = paced_poll_timeout(std::slice::from_ref(&c), now);
+                let timeout = paced_poll_timeout(std::slice::from_ref(&c), None, now);
                 assert!(timeout >= 0, "{what}: dirty and idle at t={now} but the poll would block");
                 assert!(timeout > 0, "{what}: due at t={now} yet the send pass sent nothing: a busy loop");
                 let acked = c.producer.as_ref().unwrap().acked_num();
@@ -6065,7 +6254,7 @@ mod tests {
         during_flood: bool,
     ) {
         let before = c.write_buf.len();
-        send_paced_frames(std::slice::from_mut(c), term, now);
+        send_paced_frames(std::slice::from_mut(c), term, Some(term), now);
         ledger.account(run, &c.write_buf[before..], during_flood);
         run.peak_write_buf = run.peak_write_buf.max(c.write_buf.len());
         newest.push(c.producer.as_ref().unwrap().current_num());
@@ -6720,7 +6909,7 @@ mod tests {
         broadcast_output(std::slice::from_mut(&mut c), &term, b"x");
         assert_eq!(c.paced_send_at(), Some(0), "never sent: due at once");
 
-        send_paced_frames(std::slice::from_mut(&mut c), &term, 100);
+        send_paced_frames(std::slice::from_mut(&mut c), &term, Some(&term), 100);
         assert_eq!(c.paced_send_at(), None, "sent: owes nothing");
 
         term.process(b" two");
@@ -6739,11 +6928,11 @@ mod tests {
     #[test]
     fn paced_poll_timeout_is_the_nearest_deadline_and_never_negative() {
         let now = 100;
-        assert_eq!(paced_poll_timeout(&[], now), -1, "no clients");
+        assert_eq!(paced_poll_timeout(&[], None, now), -1, "no clients");
         let (mut plain, _p0) = frame_capable_conn(5, 24);
-        assert_eq!(paced_poll_timeout(std::slice::from_ref(&plain), now), -1, "no paced client");
+        assert_eq!(paced_poll_timeout(std::slice::from_ref(&plain), None, now), -1, "no paced client");
         let (clean, _p1) = paced_conn(5, 24, &[]);
-        assert_eq!(paced_poll_timeout(std::slice::from_ref(&clean), now), -1, "a clean paced client");
+        assert_eq!(paced_poll_timeout(std::slice::from_ref(&clean), None, now), -1, "a clean paced client");
 
         // Each produces a real frame 1; its send time is then set directly
         // (the clock is the test's). `a` acked it — due at the floor; `b`
@@ -6767,18 +6956,18 @@ mod tests {
             ..Pacing::default()
         });
         let mut clients = vec![a, b];
-        assert_eq!(paced_poll_timeout(&clients, now), 20);
+        assert_eq!(paced_poll_timeout(&clients, None, now), 20);
 
         plain.write_buf.resize(1024, 0);
         clients.push(plain);
-        assert_eq!(paced_poll_timeout(&clients, now), 20, "a non-paced backlog changes nothing");
+        assert_eq!(paced_poll_timeout(&clients, None, now), 20, "a non-paced backlog changes nothing");
 
         clients[0].pacing = Some(Pacing {
             dirty: true,
             last_fresh: Some(50),
             ..Pacing::default()
         });
-        assert_eq!(paced_poll_timeout(&clients, now), 0, "overdue: never negative");
+        assert_eq!(paced_poll_timeout(&clients, None, now), 0, "overdue: never negative");
     }
 
     #[test]
@@ -6795,7 +6984,7 @@ mod tests {
             broadcast_output(std::slice::from_mut(&mut c), &term, b"x");
             assert!(c.write_buf.is_empty(), "a broadcast queues nothing for it");
         }
-        send_paced_frames(std::slice::from_mut(&mut c), &term, 40);
+        send_paced_frames(std::slice::from_mut(&mut c), &term, Some(&term), 40);
         let frames = decode_server_frames(&c.write_buf);
         assert_eq!(frames.len(), 1, "one frame however many screens went by");
         assert!(matches!(frames[0].body, FrameBody::Full(_)), "got {:?}", frames[0].body);
@@ -6809,7 +6998,7 @@ mod tests {
         assert_eq!(c.pacing.as_ref().map(|p| (p.dirty, p.last_fresh)), Some((false, Some(40))));
         assert_eq!(c.producer.as_ref().unwrap().last_visible_num(), num, "the producer names it");
         c.write_buf.clear();
-        send_paced_frames(std::slice::from_mut(&mut c), &term, 40);
+        send_paced_frames(std::slice::from_mut(&mut c), &term, Some(&term), 40);
         assert!(c.write_buf.is_empty(), "a clean client is sent nothing");
     }
 
@@ -6836,7 +7025,7 @@ mod tests {
         assert_eq!(scrolled, 10);
         broadcast_output(std::slice::from_mut(&mut c), &term, b"x");
         assert!(c.write_buf.is_empty());
-        send_paced_frames(std::slice::from_mut(&mut c), &term, 0);
+        send_paced_frames(std::slice::from_mut(&mut c), &term, Some(&term), 0);
 
         let frames = decode_server_frames(&c.write_buf);
         assert_eq!(frames.len(), 2, "the visible frame, then its scrollback");
@@ -6866,7 +7055,7 @@ mod tests {
         let (plain, _p2) = frame_capable_conn(rows, cols);
         term.process(b"one");
         broadcast_output(std::slice::from_mut(&mut owing), &term, b"x");
-        send_paced_frames(std::slice::from_mut(&mut owing), &term, 100);
+        send_paced_frames(std::slice::from_mut(&mut owing), &term, Some(&term), 100);
         owing.write_buf.clear();
         term.process(b" last");
         broadcast_output(std::slice::from_mut(&mut owing), &term, b"x");
@@ -6910,7 +7099,7 @@ mod tests {
     ) -> (ClientConn, UnixStream) {
         let (mut c, peer) = paced_conn(term.rows(), term.cols(), extra);
         broadcast_output(std::slice::from_mut(&mut c), term, b"x");
-        send_paced_frames(std::slice::from_mut(&mut c), term, now);
+        send_paced_frames(std::slice::from_mut(&mut c), term, Some(term), now);
         assert!(!c.write_buf.is_empty(), "the setup frame was sent");
         let sent = c.producer.as_ref().unwrap().last_visible_num();
         c.apply_frame_ack(&ipc::encode_frame_ack(sent, 0));
@@ -6922,7 +7111,7 @@ mod tests {
     /// returns the frames it queued.
     fn send_at_the_opportunity(c: &mut ClientConn, term: &Terminal) -> Vec<ServerFrame> {
         let at = c.paced_send_at().expect("a frame is owed and due");
-        send_paced_frames(std::slice::from_mut(c), term, at);
+        send_paced_frames(std::slice::from_mut(c), term, Some(term), at);
         decode_server_frames(&c.write_buf)
     }
 
@@ -6934,7 +7123,7 @@ mod tests {
         queue_replay(&mut c, &term);
         assert!(c.write_buf.is_empty(), "the replay queues nothing at once");
         assert!(c.owes_paced_frame());
-        send_paced_frames(std::slice::from_mut(&mut c), &term, 0);
+        send_paced_frames(std::slice::from_mut(&mut c), &term, Some(&term), 0);
         let frames = decode_server_frames(&c.write_buf);
         assert_eq!(frames.len(), 1);
         assert!(matches!(frames[0].body, FrameBody::Full(_)), "got {:?}", frames[0].body);
@@ -6946,14 +7135,14 @@ mod tests {
         term.process(b"hello");
         let (mut c, _peer) = paced_conn(5, 24, &[]);
         broadcast_output(std::slice::from_mut(&mut c), &term, b"x");
-        send_paced_frames(std::slice::from_mut(&mut c), &term, 100);
+        send_paced_frames(std::slice::from_mut(&mut c), &term, Some(&term), 100);
         let sent = c.producer.as_ref().unwrap().last_visible_num();
         c.write_buf.clear();
 
         handle_frame_ack(&mut c, &ipc::encode_frame_ack(sent, ipc::FRAME_ACK_RESYNC), &term, 100);
         assert!(c.write_buf.is_empty(), "the recovering frame waits for the pass");
         assert_eq!(c.paced_send_at(), Some(0), "the RESYNC released the ack wait");
-        send_paced_frames(std::slice::from_mut(&mut c), &term, 101);
+        send_paced_frames(std::slice::from_mut(&mut c), &term, Some(&term), 101);
         let frames = decode_server_frames(&c.write_buf);
         assert_eq!(frames.len(), 1);
         assert!(matches!(frames[0].body, FrameBody::Full(_)), "got {:?}", frames[0].body);
@@ -7041,7 +7230,10 @@ mod tests {
         assert!(c.write_buf.is_empty(), "the swap queues nothing for a paced client");
         assert!(c.owes_paced_frame());
 
-        let frames = send_at_the_opportunity(&mut c, &overlay);
+        // The overlay is up: the pass gets no history terminal.
+        let at = c.paced_send_at().expect("a frame is owed and due");
+        send_paced_frames(std::slice::from_mut(&mut c), &overlay, None, at);
+        let frames = decode_server_frames(&c.write_buf);
         assert_eq!(frames.len(), 1);
         assert!(matches!(frames[0].body, FrameBody::Full(_)), "got {:?}", frames[0].body);
     }
@@ -7330,7 +7522,7 @@ mod tests {
                 broadcast_output(&mut clients, &term, piece);
                 // Every chunk is a paced send opportunity: the paced client
                 // acks each frame at once and the clock steps a frame floor.
-                send_paced_frames(&mut clients, &term, i as u64 * PACED_FRAME_FLOOR_MS);
+                send_paced_frames(&mut clients, &term, Some(&term), i as u64 * PACED_FRAME_FLOOR_MS);
                 stream.append(&mut clients[plain_at].write_buf);
                 if with_paced {
                     let paced = &mut clients[0];
@@ -7363,7 +7555,7 @@ mod tests {
         term.process(bytes);
         broadcast_output(std::slice::from_mut(c), term, bytes);
         c.write_buf.clear();
-        send_paced_frames(std::slice::from_mut(c), term, now);
+        send_paced_frames(std::slice::from_mut(c), term, Some(term), now);
         let sent = c.producer.as_ref().unwrap().last_visible_num();
         assert!(sent > before, "the send pass at t={now} sent no frame");
         sent
@@ -7446,7 +7638,7 @@ mod tests {
 
         scroll_off(&mut term, 14);
         broadcast_output(std::slice::from_mut(&mut c), &term, b"x");
-        send_paced_frames(std::slice::from_mut(&mut c), &term, 100);
+        send_paced_frames(std::slice::from_mut(&mut c), &term, Some(&term), 100);
         let frames = decode_server_frames(&c.write_buf);
         assert_eq!(frames.len(), 2, "the visible frame, then its scrollback");
         assert!(matches!(frames[1].body, FrameBody::Scrollback { .. }), "got {:?}", frames[1].body);
@@ -7539,5 +7731,498 @@ mod tests {
         assert!(acks.min_ms >= Some(300), "min {:?}", acks.min_ms);
         let srtt = acks.srtt_ms.expect("a sample");
         assert!((300..=310).contains(&srtt), "srtt {srtt} ms ({acks:?})");
+    }
+
+    // ---- posh#225 Stage 3: v2 history ----
+
+    fn sb2_entry(epoch: u8, acked_rows: u64) -> caps::Cap {
+        caps::encode_scrollback2_client(&caps::Scrollback2Client {
+            ring_depth: 0,
+            epoch,
+            acked_rows,
+        })
+    }
+
+    /// A paced client whose Init carried SCROLLBACK + `entry`, opened the
+    /// way the daemon's Init arm opens it.
+    fn paced_v2_conn(term: &Terminal, entry: caps::Cap) -> (ClientConn, UnixStream) {
+        let (mut c, peer) = paced_conn(term.rows(), term.cols(), &[SCROLLBACK_CAP[0].clone(), entry]);
+        c.sb_floor = term.primary_scrollback_total();
+        c.open_history(term);
+        (c, peer)
+    }
+
+    /// What the viewport's next message would forward: its cumulative ack.
+    fn ack_history(c: &mut ClientConn, epoch: u8, rows: u64) {
+        c.absorb_client_caps(&[sb2_entry(epoch, rows)], 0, false);
+    }
+
+    /// `(epoch, row_offset, rows)` of every v2 body among `frames`.
+    fn history_bodies(frames: &[ServerFrame]) -> Vec<(u8, u64, usize)> {
+        frames
+            .iter()
+            .filter_map(|f| match &f.body {
+                FrameBody::Scrollback2 {
+                    epoch,
+                    row_offset,
+                    rows,
+                } => Some((*epoch, *row_offset, rows.len())),
+                _ => None,
+            })
+            .collect()
+    }
+
+    fn history_of(c: &ClientConn) -> Option<HistoryCursor> {
+        c.pacing.as_ref().and_then(|p| p.history)
+    }
+
+    /// A terminal whose screen is full, so every further line scrolls
+    /// exactly one row into its `ring`-row scrollback.
+    fn v2_term(rows: u16, cols: u16, ring: usize) -> Terminal {
+        let mut t = Terminal::with_scrollback(rows, cols, ring);
+        for _ in 1..rows {
+            t.process(b"-\r\n");
+        }
+        assert_eq!(t.primary_scrollback_total(), 0);
+        t
+    }
+
+    /// Scroll `n` distinct rows into the ring.
+    fn scroll_rows(term: &mut Terminal, n: u64) {
+        let first = term.primary_scrollback_total();
+        for i in first..first + n {
+            term.process(format!("history row {i:05}\r\n").as_bytes());
+        }
+        assert_eq!(term.primary_scrollback_total(), first + n);
+    }
+
+    /// The newest `n` ring rows, oldest first.
+    fn newest_ring_rows(term: &Terminal, n: usize) -> Vec<Vec<u8>> {
+        let len = term.primary_scrollback_len();
+        (len - n..len).map(|i| term.dump_scrollback_row(i).unwrap()).collect()
+    }
+
+    /// Runs the send pass at this client's history opportunity — its buffer
+    /// cleared first, as if the reader drained it — and returns the frames
+    /// it queued.
+    fn pass_at_the_history_opportunity(c: &mut ClientConn, term: &Terminal) -> Vec<ServerFrame> {
+        c.write_buf.clear();
+        let at = c.history_send_at(term).expect("a history body is due");
+        send_paced_frames(std::slice::from_mut(c), term, Some(term), at);
+        decode_server_frames(&c.write_buf)
+    }
+
+    fn last_history_send(c: &ClientConn) -> u64 {
+        history_of(c).expect("a cursor").last_send()
+    }
+
+    /// A v2 viewport whose attach keyframe (frame 1) was built and acked
+    /// through the bridge, its buffer cleared. No paced frame went out, so
+    /// its next screen is due at once while history waits for its floor.
+    fn v2_conn_with_an_acked_attach(term: &Terminal) -> (ClientConn, UnixStream) {
+        let (mut c, peer) = paced_v2_conn(term, sb2_entry(0, 0));
+        assert!(c.build_frame_from(term));
+        c.apply_frame_ack(&ipc::encode_frame_ack(1, 0));
+        c.write_buf.clear();
+        (c, peer)
+    }
+
+    #[test]
+    fn a_paced_scrollback2_init_opens_a_history_cursor_and_nothing_else_does() {
+        let term = v2_term(5, 24, 100);
+        let (c, _p0) = paced_v2_conn(&term, sb2_entry(0, 0));
+        assert_eq!(history_of(&c).and_then(|h| h.epoch()), Some(1), "epoch 0: a fresh epoch");
+
+        let (mut v1, _p1) = paced_conn(5, 24, &SCROLLBACK_CAP);
+        v1.open_history(&term);
+        assert!(v1.is_paced());
+        assert_eq!(history_of(&v1), None, "no id 10: v1 history");
+
+        let (mut unpaced, _p2) = lossy_conn(5, 24, &[SCROLLBACK_CAP[0].clone(), sb2_entry(0, 0)]);
+        unpaced.open_history(&term);
+        assert_eq!(unpaced.pacing, None, "v2 is gated on pacing");
+
+        let short = caps::Cap {
+            id: caps::CAP_SCROLLBACK2,
+            payload: vec![0; 9],
+        };
+        let (malformed, _p3) = paced_v2_conn(&term, short);
+        assert!(malformed.is_paced());
+        assert_eq!(history_of(&malformed), None, "a malformed entry is ignored");
+    }
+
+    #[test]
+    fn a_viewport_holding_an_epoch_continues_it_at_its_count() {
+        let mut term = v2_term(5, 24, 100);
+        scroll_rows(&mut term, 20);
+        let (mut c, _peer) = paced_v2_conn(&term, sb2_entry(7, 40));
+        scroll_rows(&mut term, 3);
+        let frames = pass_at_the_history_opportunity(&mut c, &term);
+        assert_eq!(history_bodies(&frames), vec![(7, 40, 3)]);
+    }
+
+    #[test]
+    fn a_bare_reinit_keeps_the_history_cursor() {
+        let mut term = v2_term(5, 24, 100);
+        let (mut c, _peer) = paced_v2_conn(&term, sb2_entry(0, 0));
+        scroll_rows(&mut term, 8);
+        pass_at_the_history_opportunity(&mut c, &term);
+        ack_history(&mut c, 1, 5);
+        let before = history_of(&c).expect("a cursor");
+        assert_eq!(before.acked_rows(), 5);
+        c.apply_init(&ipc::encode_resize(5, 24));
+        c.open_history(&term);
+        assert_eq!(history_of(&c), Some(before));
+    }
+
+    #[test]
+    fn every_frame_to_a_v2_viewport_carries_the_scrollback2_ack() {
+        let mut term = v2_term(5, 24, 100);
+        let (mut v2, _p0) = paced_v2_conn(&term, sb2_entry(0, 0));
+        let (mut v1, _p1) = paced_conn(5, 24, &SCROLLBACK_CAP);
+        term.process(b"a line\r\n");
+        for c in [&mut v2, &mut v1] {
+            broadcast_output(std::slice::from_mut(c), &term, b"x");
+            let frames = send_at_the_opportunity(c, &term);
+            assert!(
+                matches!(frames[0].body, FrameBody::Full(_) | FrameBody::Diff { .. }),
+                "a visible frame first, got {:?}",
+                frames[0].body
+            );
+        }
+        let ack = |c: &ClientConn| {
+            let frames = decode_server_frames(&c.write_buf);
+            caps::find(&frames[0].caps, caps::CAP_SCROLLBACK2).map(|cap| cap.payload.clone())
+        };
+        assert_eq!(ack(&v2), Some(vec![0x02, 1]), "the server's {{0x02, epoch}} entry");
+        assert_eq!(ack(&v1), None, "a paced non-v2 client's frame carries no id 10");
+
+        // A non-paced client that advertised id 10 is byte-identical whether
+        // or not `open_history` ran for it: it is a no-op without pacing.
+        let stream = |open: bool| -> Vec<u8> {
+            let mut term = v2_term(5, 24, 100);
+            let (mut c, _peer) = lossy_conn(5, 24, &[SCROLLBACK_CAP[0].clone(), sb2_entry(0, 0)]);
+            c.sb_floor = term.primary_scrollback_total();
+            if open {
+                c.open_history(&term);
+            }
+            assert!(c.request_frame_from(&term));
+            c.apply_frame_ack(&ipc::encode_frame_ack(1, 0));
+            for n in [1, 3, 7] {
+                scroll_rows(&mut term, n);
+                broadcast_output(std::slice::from_mut(&mut c), &term, b"x");
+                let newest = c.producer.as_ref().unwrap().current_num();
+                c.apply_frame_ack(&ipc::encode_frame_ack(newest, 0));
+            }
+            let frames = decode_server_frames(&c.write_buf);
+            assert!(frames.iter().any(|f| matches!(f.body, FrameBody::Scrollback { .. })), "v1 history");
+            assert!(frames.iter().all(|f| caps::find(&f.caps, caps::CAP_SCROLLBACK2).is_none()));
+            c.write_buf
+        };
+        let (plain, opened) = (stream(false), stream(true));
+        assert!(!plain.is_empty());
+        assert!(plain == opened, "open_history changed a non-paced client's stream");
+    }
+
+    #[test]
+    fn a_v2_viewport_gets_scrollback2_bodies_and_never_v1() {
+        let mut term = v2_term(5, 24, 1000);
+        let (mut c, _peer) = v2_conn_with_an_acked_attach(&term);
+        scroll_rows(&mut term, 10);
+        broadcast_output(std::slice::from_mut(&mut c), &term, b"x");
+
+        let frames = send_at_the_opportunity(&mut c, &term);
+        assert_eq!(frames.len(), 1, "one visible frame and nothing behind it: {frames:?}");
+        assert!(
+            matches!(frames[0].body, FrameBody::Full(_) | FrameBody::Diff { .. }),
+            "a visible body, got {:?}",
+            frames[0].body
+        );
+
+        let visible = c.producer.as_ref().unwrap().last_visible_num();
+        let current = c.producer.as_ref().unwrap().current_num();
+        let frames = pass_at_the_history_opportunity(&mut c, &term);
+        assert_eq!(frames.len(), 1);
+        match &frames[0].body {
+            FrameBody::Scrollback2 {
+                epoch,
+                row_offset,
+                rows,
+            } => {
+                assert_eq!((*epoch, *row_offset), (1, 0));
+                assert_eq!(*rows, newest_ring_rows(&term, 10));
+            }
+            other => panic!("expected a v2 body, got {other:?}"),
+        }
+        assert_eq!(frames[0].frame_num, visible, "it rides the newest visible number");
+        assert_eq!(
+            c.producer.as_ref().unwrap().current_num(),
+            current,
+            "and takes no producer slot"
+        );
+    }
+
+    #[test]
+    fn screen_and_history_take_turns_when_both_are_due() {
+        let mut term = v2_term(5, 24, 1000);
+        let (mut c, _peer) = paced_v2_conn(&term, sb2_entry(0, 0));
+        term.process(b"$ ");
+        broadcast_output(std::slice::from_mut(&mut c), &term, b"x");
+        send_paced_frames(std::slice::from_mut(&mut c), &term, Some(&term), 0);
+        let sent = c.producer.as_ref().unwrap().last_visible_num();
+        c.apply_frame_ack(&ipc::encode_frame_ack(sent, 0));
+        c.write_buf.clear();
+
+        scroll_rows(&mut term, 10);
+        broadcast_output(std::slice::from_mut(&mut c), &term, b"x");
+        let now = PACED_FRAME_FLOOR_MS;
+        assert_eq!(c.paced_send_at(), Some(now));
+        assert_eq!(c.history_send_at(&term), Some(now));
+        send_paced_frames(std::slice::from_mut(&mut c), &term, Some(&term), now);
+        let frames = decode_server_frames(&c.write_buf);
+        assert_eq!(history_bodies(&frames), vec![(1, 0, 10)], "after a visible send, history");
+        assert_eq!(frames.len(), 1, "one body per opportunity");
+
+        c.write_buf.clear();
+        scroll_rows(&mut term, 5);
+        broadcast_output(std::slice::from_mut(&mut c), &term, b"x");
+        let now = 2 * PACED_FRAME_FLOOR_MS;
+        assert!(c.paced_send_at().is_some_and(|at| at <= now));
+        assert_eq!(c.history_send_at(&term), Some(now));
+        send_paced_frames(std::slice::from_mut(&mut c), &term, Some(&term), now);
+        let frames = decode_server_frames(&c.write_buf);
+        assert_eq!(frames.len(), 1, "one body per opportunity");
+        assert_eq!(history_bodies(&frames), vec![], "after history, the screen");
+        assert!(!c.owes_paced_frame());
+    }
+
+    #[test]
+    fn a_history_body_carries_at_most_sb2_rows_per_body() {
+        let mut term = v2_term(5, 24, 1000);
+        let (mut c, _peer) = paced_v2_conn(&term, sb2_entry(0, 0));
+        scroll_rows(&mut term, 600);
+        let mut lens = Vec::new();
+        while c.history_send_at(&term).is_some() {
+            let bodies = history_bodies(&pass_at_the_history_opportunity(&mut c, &term));
+            let &[(epoch, row_offset, rows)] = bodies.as_slice() else {
+                panic!("one body per pass, got {bodies:?}");
+            };
+            lens.push(rows);
+            ack_history(&mut c, epoch, row_offset + rows as u64);
+            c.write_buf.clear();
+        }
+        assert_eq!(lens, vec![256, 256, 88]);
+    }
+
+    #[test]
+    fn history_waits_for_room_in_the_window() {
+        let mut term = v2_term(5, 24, 1000);
+        let (mut c, _peer) = paced_v2_conn(&term, sb2_entry(0, 0));
+        scroll_rows(&mut term, 600);
+        let first = history_bodies(&pass_at_the_history_opportunity(&mut c, &term));
+        let after_first = last_history_send(&c);
+        let second = history_bodies(&pass_at_the_history_opportunity(&mut c, &term));
+        let last = last_history_send(&c);
+        assert_eq!((first, second), (vec![(1, 0, 256)], vec![(1, 256, 256)]));
+        assert_eq!(last, after_first + PACED_FRAME_FLOOR_MS, "successive floors");
+        c.write_buf.clear();
+        assert_eq!(
+            c.history_send_at(&term),
+            Some(last + HISTORY_RESEND_INITIAL_MS),
+            "88 fresh rows wait: the window is full"
+        );
+        ack_history(&mut c, 1, 256);
+        assert_eq!(c.history_send_at(&term), Some(last + PACED_FRAME_FLOOR_MS), "room again");
+        let third = history_bodies(&pass_at_the_history_opportunity(&mut c, &term));
+        assert_eq!(third, vec![(1, 512, 88)]);
+    }
+
+    #[test]
+    fn a_withheld_ack_is_resent_from_the_ack_only_after_the_floor() {
+        let mut term = v2_term(5, 24, 1000);
+        let (mut c, _peer) = paced_v2_conn(&term, sb2_entry(0, 0));
+        scroll_rows(&mut term, 512);
+        pass_at_the_history_opportunity(&mut c, &term);
+        pass_at_the_history_opportunity(&mut c, &term);
+        ack_history(&mut c, 1, 100);
+        let last = last_history_send(&c);
+        c.write_buf.clear();
+        send_paced_frames(std::slice::from_mut(&mut c), &term, Some(&term), last + PACED_FRAME_FLOOR_MS);
+        assert!(c.write_buf.is_empty(), "nothing is resent at the floor");
+        assert_eq!(c.history_send_at(&term), Some(last + HISTORY_RESEND_INITIAL_MS));
+        let frames = pass_at_the_history_opportunity(&mut c, &term);
+        assert_eq!(history_bodies(&frames), vec![(1, 100, 256)], "resent from the ack");
+    }
+
+    #[test]
+    fn resends_back_off_while_acks_stay_withheld() {
+        let mut term = v2_term(5, 24, 1000);
+        let (mut c, _peer) = paced_v2_conn(&term, sb2_entry(0, 0));
+        scroll_rows(&mut term, 10);
+        pass_at_the_history_opportunity(&mut c, &term);
+        let base = HISTORY_RESEND_INITIAL_MS;
+        for doublings in [1, 2, 4, 8, 8] {
+            c.write_buf.clear();
+            let last = last_history_send(&c);
+            assert_eq!(c.history_send_at(&term), Some(last + doublings * base));
+            let frames = pass_at_the_history_opportunity(&mut c, &term);
+            assert_eq!(history_bodies(&frames), vec![(1, 0, 10)], "resent from the ack");
+        }
+        c.write_buf.clear();
+        ack_history(&mut c, 1, 5);
+        let last = last_history_send(&c);
+        assert_eq!(c.history_send_at(&term), Some(last + base), "an advancing ack resets the backoff");
+    }
+
+    #[test]
+    fn the_resend_floor_follows_the_measured_ack_latency() {
+        let term = v2_term(5, 24, 100);
+        let (mut c, _peer) = paced_v2_conn(&term, sb2_entry(0, 0));
+        let mut resend_after = |srtt: Option<u64>| {
+            c.pacing.as_mut().unwrap().acks.srtt_ms = srtt;
+            c.history_resend_after()
+        };
+        assert_eq!(resend_after(Some(600)), 1200);
+        assert_eq!(resend_after(Some(50)), PACED_ACK_WAIT_MS, "never under the ack wait");
+        assert_eq!(resend_after(None), HISTORY_RESEND_INITIAL_MS, "before any sample");
+    }
+
+    #[test]
+    fn a_stale_epoch_or_backward_ack_is_ignored() {
+        let term = v2_term(5, 24, 100);
+        let (mut c, _peer) = paced_v2_conn(&term, sb2_entry(0, 0));
+        ack_history(&mut c, 1, 5);
+        ack_history(&mut c, 2, 9);
+        assert_eq!(history_of(&c).unwrap().acked_rows(), 5, "another epoch's ack");
+        ack_history(&mut c, 1, 3);
+        assert_eq!(history_of(&c).unwrap().acked_rows(), 5, "a backward ack");
+    }
+
+    #[test]
+    fn a_stalled_v2_viewport_gets_one_forward_jump_of_the_evicted_span() {
+        let mut term = v2_term(5, 20, 50);
+        let (mut c, _peer) = paced_v2_conn(&term, sb2_entry(0, 0));
+        scroll_rows(&mut term, 10);
+        let first = history_bodies(&pass_at_the_history_opportunity(&mut c, &term));
+        assert_eq!(first, vec![(1, 0, 10)]);
+        ack_history(&mut c, 1, 10);
+        c.write_buf.clear();
+        scroll_rows(&mut term, 200);
+        let avail = 210;
+
+        // (row_offset, rows) of every body, the first included; the rows
+        // delivered after it.
+        let mut spans: Vec<(u64, u64)> = vec![(0, 10)];
+        let mut delivered: Vec<Vec<u8>> = Vec::new();
+        while c.history_send_at(&term).is_some() {
+            for f in pass_at_the_history_opportunity(&mut c, &term) {
+                if let FrameBody::Scrollback2 {
+                    epoch,
+                    row_offset,
+                    rows,
+                } = f.body
+                {
+                    ack_history(&mut c, epoch, row_offset + rows.len() as u64);
+                    spans.push((row_offset, rows.len() as u64));
+                    delivered.extend(rows);
+                }
+            }
+            c.write_buf.clear();
+        }
+        let jumps: Vec<(u64, u64)> = spans
+            .windows(2)
+            .map(|w| (w[0].0 + w[0].1, w[1].0))
+            .filter(|(end, next)| end != next)
+            .collect();
+        let f = avail - 50;
+        assert_eq!(jumps, vec![(10, f)], "one forward jump of the {} evicted rows", f - 10);
+        assert_eq!(delivered, newest_ring_rows(&term, 50), "the whole retained ring, in order");
+    }
+
+    #[test]
+    fn a_viewports_own_resize_bumps_its_epoch_and_a_width_change_reanchors_the_others() {
+        let mut term = v2_term(5, 24, 100);
+        let (a, _pa) = paced_v2_conn(&term, sb2_entry(0, 0));
+        let (b, _pb) = paced_v2_conn(&term, sb2_entry(0, 0));
+        let mut clients = vec![a, b];
+        let epochs = |cs: &[ClientConn]| -> Vec<Option<u8>> {
+            cs.iter().map(|c| history_of(c).and_then(|h| h.epoch())).collect()
+        };
+        // `b` holds rows 0..8, acked to 5.
+        scroll_rows(&mut term, 8);
+        assert_eq!(history_bodies(&pass_at_the_history_opportunity(&mut clients[1], &term)), vec![(1, 0, 8)]);
+        ack_history(&mut clients[1], 1, 5);
+        clients[1].write_buf.clear();
+
+        assert!(clients[0].apply_resize(&ipc::encode_resize(6, 24)));
+        let cols = term.cols();
+        reset_history_on_resize(&mut clients, &term, cols);
+        assert_eq!(epochs(&clients), vec![Some(2), Some(1)], "only the resized viewport");
+
+        // A session width change: `a`'s size is unchanged since, so neither
+        // bumps; `b` keeps its epoch, its ack, and its count.
+        term.resize(5, 30);
+        reset_history_on_resize(&mut clients, &term, 24);
+        assert_eq!(epochs(&clients), vec![Some(2), Some(1)], "a reflow bumps no epoch");
+        let b = history_of(&clients[1]).unwrap();
+        assert_eq!((b.acked_rows(), b.sent_upto()), (5, 8), "the viewport's ring stays valid");
+        assert_eq!(b.avail(term.primary_scrollback_total()), 8, "re-anchored at its send cursor");
+
+        for (c, want) in clients.iter_mut().zip([2u8, 1]) {
+            broadcast_output(std::slice::from_mut(c), &term, b"x");
+            let frames = send_at_the_opportunity(c, &term);
+            let ack = caps::find(&frames[0].caps, caps::CAP_SCROLLBACK2).expect("the ack rides it");
+            assert_eq!(caps::decode_scrollback2_ack(&ack.payload).unwrap(), want);
+            c.write_buf.clear();
+        }
+
+        // `b`'s next fresh body continues from its previous `sent_upto`.
+        scroll_rows(&mut term, 3);
+        ack_history(&mut clients[1], 1, 8);
+        let frames = pass_at_the_history_opportunity(&mut clients[1], &term);
+        assert_eq!(history_bodies(&frames), vec![(1, 8, 3)]);
+    }
+
+    #[test]
+    fn no_history_body_while_the_overlay_is_up() {
+        let mut term = v2_term(5, 24, 100);
+        let (mut c, _peer) = paced_v2_conn(&term, sb2_entry(0, 0));
+        scroll_rows(&mut term, 10);
+        let now = 10 * HISTORY_RESEND_INITIAL_MS;
+        assert!(c.history_send_at(&term).is_some_and(|at| at <= now), "rows are pending");
+        send_paced_frames(std::slice::from_mut(&mut c), &term, None, now);
+        assert!(c.write_buf.is_empty(), "no body while the overlay is up");
+        assert_eq!(paced_poll_timeout(std::slice::from_ref(&c), None, now), -1);
+    }
+
+    #[test]
+    fn the_poll_wakes_for_pending_history() {
+        let mut term = v2_term(5, 24, 100);
+        let (c, _peer) = paced_v2_conn(&term, sb2_entry(0, 0));
+        scroll_rows(&mut term, 10);
+        assert!(!c.owes_paced_frame(), "a clean screen");
+        let now = 5;
+        assert_eq!(c.history_send_at(&term), Some(PACED_FRAME_FLOOR_MS));
+        assert_eq!(
+            paced_poll_timeout(std::slice::from_ref(&c), Some(&term), now),
+            (PACED_FRAME_FLOOR_MS - now) as i32
+        );
+    }
+
+    #[test]
+    fn the_exit_flush_sends_only_the_screen() {
+        let mut term = v2_term(5, 24, 1000);
+        let (mut c, _peer) = v2_conn_with_an_acked_attach(&term);
+        scroll_rows(&mut term, 10);
+        broadcast_output(std::slice::from_mut(&mut c), &term, b"x");
+        assert!(c.history_send_at(&term).is_some(), "rows are pending");
+        flush_paced_frames(std::slice::from_mut(&mut c), &term, 0);
+        let frames = decode_server_frames(&c.write_buf);
+        assert_eq!(frames.len(), 1, "the screen and nothing else: {frames:?}");
+        assert!(
+            matches!(frames[0].body, FrameBody::Full(_) | FrameBody::Diff { .. }),
+            "got {:?}",
+            frames[0].body
+        );
     }
 }

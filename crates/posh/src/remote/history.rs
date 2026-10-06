@@ -2,9 +2,9 @@
 //! acknowledged scrollback stream. Shared by the single-peer `server_loop`
 //! and the session daemon's paced viewports (posh#225 Stage 3).
 //!
-//! Items marked `allow(dead_code)` have only test callers until the session
-//! daemon opens a cursor per paced viewport (posh#225 Task 3.3);
-//! `server_loop` uses the subset it always used.
+//! The session daemon opens a cursor per paced viewport (posh#225 Task 3.3);
+//! `server_loop` uses the subset it always used. An item marked
+//! `allow(dead_code)` has only test callers.
 
 use posh_term::Terminal;
 
@@ -24,7 +24,6 @@ pub(crate) enum HistoryStart {
     /// The viewport's epoch, continued: row `rows` is the next row scrolled.
     /// Forward-only — rows scrolled while it was elsewhere are not this
     /// cursor's (Stage 5 passes an earlier position from the resume cursor).
-    #[allow(dead_code)]
     Continue { epoch: u8, rows: u64 },
 }
 
@@ -118,18 +117,36 @@ impl HistoryCursor {
         }
     }
 
-    /// Open the next epoch at `total` (the byte wraps); a no-op when
+    /// Open the next epoch at `total` (the byte wraps past 0, which a
+    /// viewport advertises to mean "no epoch held": 255 → 1); a no-op when
     /// inactive. In-flight bodies of the old epoch are discarded by the
     /// viewport, and its acks of them ignored here.
     pub(crate) fn bump_epoch(&mut self, total: u64) {
         if !self.active {
             return;
         }
-        self.epoch = self.epoch.wrapping_add(1);
+        self.epoch = match self.epoch.wrapping_add(1) {
+            0 => 1,
+            next => next,
+        };
         self.anchor_abs = total;
         self.anchor_rel = 0;
         self.acked_rows = 0;
         self.sent_upto = 0;
+    }
+
+    /// Re-anchor the row space at the terminal's (reflowed) `total` without
+    /// a new epoch: the viewport's ring and acks stay valid, and the next
+    /// row offered is `sent_upto` — rows the reflow renumbered before they
+    /// were sent become a forward jump. For a session width change seen by
+    /// a viewport whose own size did not change (posh#225 Stage 3); a no-op
+    /// when inactive.
+    pub(crate) fn reanchor(&mut self, total: u64) {
+        if !self.active {
+            return;
+        }
+        self.anchor_abs = total;
+        self.anchor_rel = self.sent_upto;
     }
 
     /// The current epoch, or `None` while inactive (no ack entry is owed).
@@ -153,7 +170,6 @@ impl HistoryCursor {
         self.active && (self.avail(total) > self.sent_upto || self.resend_due(now, rto))
     }
 
-    #[allow(dead_code)]
     pub(crate) fn in_flight(&self) -> u64 {
         self.sent_upto.saturating_sub(self.acked_rows)
     }
@@ -163,12 +179,10 @@ impl HistoryCursor {
         self.acked_rows
     }
 
-    #[allow(dead_code)]
     pub(crate) fn sent_upto(&self) -> u64 {
         self.sent_upto
     }
 
-    #[allow(dead_code)]
     pub(crate) fn last_send(&self) -> u64 {
         self.last_send
     }
@@ -399,7 +413,33 @@ mod tests {
             total(&t),
         );
         wrap.on_client_size((5, 21), total(&t));
-        assert_eq!(wrap.epoch(), Some(0), "the epoch byte wraps");
+        assert_eq!(wrap.epoch(), Some(1), "the epoch byte wraps past 0 (\"none held\")");
+    }
+
+    #[test]
+    fn reanchor_keeps_the_epoch_and_continues_from_the_send_cursor() {
+        let mut t = term();
+        let mut c = active(&t);
+        scroll(&mut t, 10);
+        c.next_body(&t, 0, RTO, 6);
+        c.on_ack(1, 4);
+        assert_eq!(c.sent_upto(), 6);
+        // A reflow renumbers the ring: the total jumps, and rows 6..10 were
+        // never sent.
+        scroll(&mut t, 30);
+        c.reanchor(total(&t));
+        assert_eq!(c.epoch(), Some(1), "no new epoch");
+        assert_eq!(c.acked_rows(), 4, "the viewport's ack stays valid");
+        assert_eq!(c.sent_upto(), 6);
+        assert_eq!(c.avail(total(&t)), 6, "avail continues from sent_upto");
+        scroll(&mut t, 3);
+        assert_eq!(c.avail(total(&t)), 9);
+        let (epoch, row_offset, rows) = split(c.next_body(&t, 1, RTO, 256));
+        assert_eq!((epoch, row_offset, rows), (1, 6, newest_rows(&t, 3)));
+
+        let mut idle = HistoryCursor::new((5, 20));
+        idle.reanchor(total(&t));
+        assert_eq!(idle.epoch(), None, "an inactive cursor is untouched");
     }
 
     #[test]

@@ -3233,16 +3233,16 @@ fn apply_frame(st: &mut ClientState, frame: &ServerFrame) -> bool {
             st.stats.record_apply_dup();
             return true; // fully covered retransmission
         }
-        if *row_offset < st.sb2_rows {
-            // Partial overlap: a conforming server anchors at our ack, so this
-            // is transient reordering — discard and let the re-anchor arrive.
-            st.stats.record_apply_basemis();
-            return true;
-        }
+        // Partial overlap: the rows below our count are ones we hold, the
+        // rest are new — append only the tail. The session daemon resends
+        // from a lagging ack (posh#225 Stage 3), so an overlap is routine,
+        // not reordering; discarding it would stall the stream until a
+        // resend happened to start exactly at our count.
+        let fresh = &rows[st.sb2_rows.saturating_sub(*row_offset) as usize..];
         // In-order append, or a forward jump (server-ring eviction): the gap is
         // permanently lost and the partial view is first-class (FDR 0005).
-        let grew = rows.len();
-        st.scrollback.append(rows);
+        let grew = fresh.len();
+        st.scrollback.append(fresh);
         if st.scroll_offset > 0 {
             set_scroll(st, st.scroll_offset + grew);
         }
@@ -6420,7 +6420,7 @@ mod tests {
     #[test]
     fn scrollback2_apply_rules_never_touch_applied_num() {
         // RFC 0009 §3/§4: dup discard, in-order append, forward-jump accept,
-        // partial-overlap discard, epoch gating — and applied_num is inert
+        // partial-overlap tail append, epoch gating — and applied_num is inert
         // throughout (the class-killing invariant).
         let mut st = test_state(5, 20);
         st.applied_num = 7;
@@ -6449,16 +6449,47 @@ mod tests {
         assert!(apply_frame(&mut st, &body(3, 0, 2)));
         assert_eq!(st.sb2_rows, 2);
         assert_eq!(st.scrollback.len(), 2);
-        // Partial overlap: discarded (a conforming server re-anchors at our ack).
+        // Partial overlap: only the rows past our count are appended (a
+        // resend from a lagging ack, posh#225 Stage 3).
         assert!(apply_frame(&mut st, &body(3, 1, 3)));
-        assert_eq!(st.sb2_rows, 2);
+        assert_eq!(st.sb2_rows, 4);
+        assert_eq!(st.scrollback.len(), 4);
         // Forward jump (server-ring eviction): accepted; the gap is lost
         // history and the partial view is first-class (FDR 0005).
         assert!(apply_frame(&mut st, &body(3, 10, 1)));
         assert_eq!(st.sb2_rows, 11);
-        assert_eq!(st.scrollback.len(), 3);
+        assert_eq!(st.scrollback.len(), 5);
         // The invariant that kills the #95/#117 class:
         assert_eq!(st.applied_num, 7, "scrollback v2 must never advance applied_num");
+    }
+
+    /// posh#225 Stage 3: the session daemon resends from the viewport's
+    /// cumulative ack, which can lag what the viewport already applied; the
+    /// overlapping body's tail is appended exactly once.
+    #[test]
+    fn scrollback2_partial_overlap_appends_only_the_tail() {
+        let mut st = test_state(5, 20);
+        st.sb2_epoch = Some(1);
+        let body = |off: u64, n: u64| ServerFrame {
+            flags: 0,
+            caps: vec![],
+            frame_num: 1,
+            input_ack: 0,
+            echo_ack: 0,
+            body: FrameBody::Scrollback2 {
+                epoch: 1,
+                row_offset: off,
+                rows: (off..off + n).map(|i| format!("row {i:02}\r\n").into_bytes()).collect(),
+            },
+        };
+        assert!(apply_frame(&mut st, &body(0, 10)));
+        assert!(apply_frame(&mut st, &body(5, 10)));
+        assert_eq!(st.sb2_rows, 15);
+        assert_eq!(st.scrollback.len(), 15, "no duplicated rows");
+        for i in 0..15 {
+            let want = format!("row {i:02}\r\n").into_bytes();
+            assert_eq!(st.scrollback.row(i), Some(&want[..]), "rows 0..15, each once, in order");
+        }
     }
 
     #[test]
