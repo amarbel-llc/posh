@@ -2316,20 +2316,28 @@ Corrections to the task-level text that stood here before are marked
 - **One body per opportunity; screen and history keep separate clocks.**
   The visible opportunity is Stage 2's, unchanged (`paced_send_at`). History
   has its own (`history_send_at`): `write_buf` empty, and either fresh rows
-  with room in the window → `last history send + PACED_FRAME_FLOOR_MS`, or
-  rows in flight with no room / no fresh rows → `last history send +
-  history_resend_after()`. When both are due in one pass, the kind that did
+  with room in the window → due now (**corrected 2026-10-06 after Part B's
+  measurement:** the expansion first gated fresh bodies on
+  `PACED_FRAME_FLOOR_MS` too, which capped history at 256 rows per 20 ms ≈
+  12,800 rows/s and lost 20% of a 40,000 rows/s flood to eviction even with
+  prompt acks — where v1 lost nothing; the operator chose window + socket
+  backpressure as the only limiter), or rows in flight with no room / no
+  fresh rows → `last history send + history_resend_after()`. When both are
+  due in one pass, the kind that did
   not go last goes (`server_loop`'s coin); the other goes next iteration,
   after the drain. So the screen's cadence is Stage 2's, and the backlog is
   at most ONE body — a visible frame or a ≤ 256-row history body. The v1
   scrollback frame no longer rides behind a v2 viewport's visible frame.
 - **History is ack-clocked by a fixed window: `HISTORY_WINDOW_ROWS = 2 ×
-  SB2_ROWS_PER_BODY` (512 rows) in flight.** The daemon has no RTT and the
-  bridge drains its socket at once, so without a window history would flow
-  at 256 rows per floor (12,800 rows/s) whatever the link — the swamping
-  decision 3 forbids. `server_loop` gets the same effect from its SRTT/2
-  send interval (about two bodies per RTT). The window is the static
-  stand-in for Task 3.4's dynamic share: throughput ≈ 512 rows per RTT.
+  SB2_ROWS_PER_BODY` (512 rows) in flight — and by nothing else.** The
+  daemon has no RTT and the bridge drains its socket at once, so without a
+  window history would flow as fast as the socket accepts bodies whatever
+  the link — the swamping decision 3 forbids. With it, a body goes out
+  whenever `write_buf` is empty and fewer than 512 rows are unacked:
+  throughput ≈ 512 rows per RTT (on a 1 ms link that is far above any
+  flood; on a 300 ms link ≈ 1,700 rows/s). `server_loop` gets the same
+  effect from its SRTT/2 send interval (about two bodies per RTT). The
+  window is the static stand-in for Task 3.4's dynamic share.
 - **The resend floor is the measured ack latency, with a conservative
   start and backoff:** `history_resend_after() = base << min(resends, 3)`,
   `base = max(PACED_ACK_WAIT_MS, 2 × ack srtt)` once Task 3.0 has a
@@ -3676,7 +3684,10 @@ bottom once Stage 7 is done, or sooner only if the operator re-orders it.
 | 12 | **posh#230** — build `ClientConn` test fixtures from one constructor | Stage 1 cleanup | Test maintenance; eight struct literals today. |
 | 13 | **posh#232** — a shared send/receive helper for `remote/server.rs`'s tests | Stage 1 cleanup | Test maintenance; ~a dozen copies of one loop. |
 | 14 | *(no issue)* — `relay.rs`: `content_caps` has no doc comment of its own; `forwarded_client_caps`'s doc (`:220-229`) is fused onto it, and `bridge_init_content` now points readers there | Task 2.2 review | Pre-existing; a one-line doc fix in a separate commit. Operator sequenced it here (2026-10-06). |
-| 15 | **posh#239** — `the_daemon_loop_sends_a_resized_client_a_frame_for_its_new_geometry` fails intermittently with "capability payload/entry truncated" in `mirror_frames` | Stage 2 test runs | Pre-existing (a Stage 1 test; fails with the pre-Stage-2 daemon too). Reproduce with `just debug-cargo-flake 12 session::daemon`; passes run alone. Can trip the pre-merge hook. |
+| 15 | **posh#239** — `the_daemon_loop_sends_a_resized_client_a_frame_for_its_new_geometry` fails intermittently with "capability payload/entry truncated" in `mirror_frames` | Stage 2 test runs | Root cause: a test-side race on raw pre-Init output. Test fixed; the production side (a connection received broadcast output before its Init) fixed and merged 2026-10-06 (`5be221b`). **Closed.** |
+| 16 | **posh#241** — `just lint-fmt` does not gate Rust formatting (`conformist.nix` is nixfmt + shfmt only); `remote/server.rs` fails `rustfmt --check` on master | Task 3.1 | Repo-level gap; decide rustfmt-in-conformist (one mechanical reformat commit) vs documenting the exclusion in AGENTS.md. |
+| 17 | **posh#242** — `switch_route_target` can pick a connection that never sent `Init` (a concurrent `posh list` probe) in the never-typed tie case | posh#239 review | One-line filter on `initialized()` + a test. Pre-existing. |
+| 18 | **posh#243** — RFC 0009 v2: a body lost on the wire while a later body is in flight becomes an unrepairable forward jump indistinguishable from eviction | Task 3.3 review | Inherited from `server_loop`; reachable on the default path since Stage 3. Operator kept the two-body window (2026-10-06). Proper fix: an eviction marker in RFC 0009, with Stage 4 (holes). |
 
 Recorded elsewhere rather than filed: the `ClientConn::mirror_geometry()`
 accessor is a comment on **posh#210** (the `CAP_SESSION_SIZE` / RFC 0012

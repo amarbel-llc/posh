@@ -41,8 +41,7 @@ is sent at most one screen at a time, and that screen is the newest.
   (every current roaming viewport) gets its scrollback from the daemon as
   RFC 0009 v2 bodies: rows addressed in an epoch-scoped row space and
   acknowledged cumulatively, resent from the acknowledgement, one body per
-  send opportunity, at most two bodies (`HISTORY_WINDOW_ROWS`, 512 rows) in
-  flight. Rows the session's ring evicted before their turn are skipped as
+  send opportunity, at most `HISTORY_WINDOW_ROWS` (512 rows) in flight. Rows the session's ring evicted before their turn are skipped as
   one forward jump. A reconnect continues the viewport's epoch, so its ring
   is kept and history resumes forward-only, as before (posh#225 Stage 3). A
   paced viewport that does not advertise it, and every unpaced one, keeps v1
@@ -119,16 +118,22 @@ Settled for Stage 3 (addressed history), 2026-10-06:
    a viewport's history cursor only when its Init carried both `CAP_PACED` and
    a well-formed `SCROLLBACK2` entry. `POSH_PACED=0` therefore returns a
    viewport to v1 history, and an unpaced viewport's bytes do not change.
-9. **One body per opportunity, with a coin.** The screen keeps decision 1's
-   opportunity; history has its own — an empty buffer, and fresh rows with
-   room in the window (the floor after the last body) or rows in flight (the
-   resend deadline). When both are due, the kind that did not go last goes
-   (`server_loop`'s coin), so the backlog is at most one body. A history body
-   rides the newest visible frame number without taking a producer slot, and
-   is never acknowledged by `FrameAck` (RFC 0009 §2, §4).
-10. **The window is `HISTORY_WINDOW_ROWS` (two bodies) in flight**: the
-    daemon's static stand-in for `server_loop`'s SRTT-paced send interval —
-    without it history would flow at 256 rows per floor whatever the link.
+9. **One body per opportunity, with a coin; the first tie goes to the
+   screen.** The screen keeps decision 1's opportunity, floor included;
+   history has its own — an empty buffer, and fresh rows with room in the
+   window (due at once: the frame floor caps the screen's encode cost, and a
+   body is a row copy) or rows in flight (the resend deadline). When both
+   are due, the kind that did not go last goes (`server_loop`'s coin), and
+   the first tie goes to the screen (live screen first, UX decision 3), so
+   the backlog is at most one body. A history body rides the newest visible
+   frame number without taking a producer slot, and is never acknowledged
+   by `FrameAck` (RFC 0009 §2, §4).
+10. **History is rate-limited by the window and the socket only**: at most
+    `HISTORY_WINDOW_ROWS` (512 rows, two full bodies) in flight before the
+    ack — a fresh body carries at most the room left in it — and a body only
+    into an empty buffer. Throughput is about one window per round trip; the
+    window is the daemon's static stand-in for `server_loop`'s SRTT-paced
+    send interval (Task 3.4 makes it dynamic).
 11. **Resend from the ack after twice the measured ack latency**, never under
     `PACED_ACK_WAIT_MS`, `HISTORY_RESEND_INITIAL_MS` before any sample, and
     doubled per resend without ack progress up to
@@ -151,28 +156,48 @@ Settled for Stage 3 (addressed history), 2026-10-06:
 
 ## Limitations
 
-- **History trickles at about one window per round trip** (≈ 512 rows/RTT)
-  for a v2 viewport, so a flood longer than the ring at that rate loses its
-  oldest rows as a forward jump — silent until Stage 4 draws it. (A paced v1
-  viewport keeps Stage 2's cliff: above ≈ 5 × `PACED_ACK_WAIT_MS` RTT its
-  base is lost and v1 history is withheld until the flood ends.) Part B of
-  Task 3.3 measures both.
+- **History flows at most one window per round trip** (`HISTORY_WINDOW_ROWS`
+  = 512 rows per RTT, and no faster than the socket drains) for a v2
+  viewport, so a flood that outruns that for longer than the ring loses its
+  oldest rows as forward jumps — silent until Stage 4 draws it. Measured
+  (2 MiB flood, 20,511 rows, 10,000-row ring): prompt acks deliver every
+  row once at both 1 KiB/ms and 4 KiB/ms (≈ 40,000 rows/s), as a paced v1
+  viewport does; RTT 50 ms delivers every row at 1 KiB/ms but 14,127 at
+  4 KiB/ms (6,384 in 4 jumps; 512 rows / 50 ms ≈ 10,000 rows/s); RTT
+  300 ms delivers 12,400 at 1 KiB/ms (8,111 in 13 jumps), and 1,500 and
+  2,500 ms, or 300 ms at 4 KiB/ms, about the ring (10,512–10,774). No row
+  is ever delivered twice below the first resend floor, none differs from
+  the session's, and every row is acked. (A paced v1 viewport keeps
+  Stage 2's cliff: above ≈ 5 × `PACED_ACK_WAIT_MS` RTT its base is lost and
+  v1 history is withheld until the flood ends — 0 rows acked at 1,500 ms.
+  The v2 viewport's visible base survived every measured RTT up to 2,500 ms:
+  no screen was built without an acked base, against 3 for v1 at 1,500 ms;
+  but the 2 MiB flood ends before a 2,500 ms ack could land, so that RTT's
+  visible cliff is not exercised.)
 - **A never-acking v2 viewport is re-sent at most one window (512 rows) per
-  resend floor**, backing off to one per 8 × the floor. This is bandwidth,
-  not backlog: at most one body is ever queued. (A paced v1 viewport that
-  never acks is still re-sent up to one ring of history every
-  `PACED_ACK_WAIT_MS`.)
+  resend floor**, backing off to one per 8 × the floor (measured: rounds at
+  1, 2, 4 and 8 s after the first window). This is bandwidth, not backlog:
+  at most one body is ever queued. Over a 2 MiB flood and a 20 s tail it
+  was sent 160–163 KB of history (1,536 rows); a paced v1 viewport
+  that never acks is re-sent up to one ring every `PACED_ACK_WAIT_MS`
+  (2.2–7.9 MB over the flood alone).
 - **A history body lost on the wire while a later body is in flight is
   accepted by the viewport as a forward jump** and cannot be repaired by the
   daemon's resend-from-ack (RFC 0009 has no eviction-vs-loss marker); with
-  two bodies in flight, a body lost under a flood becomes a hole Stage 4
-  will draw as "not received". `HISTORY_WINDOW_ROWS = SB2_ROWS_PER_BODY`
-  (one body in flight) would remove the loss hole at half the throughput —
-  an operator decision.
+  several bodies in flight, a body lost under a flood becomes a hole Stage 4
+  will draw as "not received". Removing the hole needs one BODY in flight,
+  not merely a 256-row window: since bodies go without a floor they are
+  often smaller than 256 rows, so `HISTORY_WINDOW_ROWS = SB2_ROWS_PER_BODY`
+  alone no longer does it — an operator decision (posh#243).
 - **A reader slower than the flood loses the rows the ring evicts before
   their turn**; for a v2 viewport each loss is a forward jump of exactly that
   span, and the reader ends holding the whole retained ring. The live screen
-  still ends on the last screen.
+  still ends on the last screen. Measured (1 KiB/ms reader, 4 KiB/ms
+  flood): 14,111 of 20,511 rows delivered, 6,400 lost in 7 jumps (prompt
+  acks); 13,007 delivered, 7,504 lost (50 ms RTT) — more than the ~4,300 a
+  v1 viewport never shipped (not yet analysed: v2 moves at most 256 rows per
+  body and alternates bodies with screens), but with nothing repeated and
+  one ≤ 26.7 KB body queued at a time (v1: one ring-sized ~1 MB frame).
 - **A mismatched-geometry viewport** (wider, narrower or shorter than the
   session), or any viewport while an application has switched column mode
   (DECCOLM), still gets ring-sized frames (`dump_vt`'s fallback) — but one at
@@ -187,10 +212,10 @@ Settled for Stage 3 (addressed history), 2026-10-06:
 |---|---|---|---|
 | `PACED_FRAME_FLOOR_MS` (`session/daemon.rs`) | 20 ms | `server_loop`'s send-interval floor (`SEND_INTERVAL_MIN`); ≤ 50 frames/s of encode work per viewport | prompt acks: 26 visible frames for 512 chunks, peak backlog one frame pair (below); revisit if a measured flood shows encode cost or a frame rate the eye notices |
 | `PACED_ACK_WAIT_MS` (`session/daemon.rs`) | 250 ms | `server_loop`'s send-interval ceiling (`SEND_INTERVAL_MAX`); bounds the stall a lost ack can cause | never-acked: one visible frame per wait; it sets a v1 viewport's history RTT cliff (≈ 5 × this, Limitations) — raise it if field RTTs approach the cliff; it is also the v2 resend floor's minimum |
-| `HISTORY_WINDOW_ROWS` (`session/daemon.rs`) | 512 rows (2 × `SB2_ROWS_PER_BODY`) | v2 rows in flight before the ack: about two bodies per round trip, `server_loop`'s SRTT/2 send interval as a static window; Task 3.4 makes it dynamic | measurement: Task 3.3 Part B |
-| `HISTORY_RESEND_INITIAL_MS` (`session/daemon.rs`) | 1000 ms (4 × `PACED_ACK_WAIT_MS`) | the v2 resend floor before any ack latency is measured: TCP's initial RTO; afterwards `max(PACED_ACK_WAIT_MS, 2 × srtt)` | measurement: Task 3.3 Part B |
-| `HISTORY_RESEND_MAX_DOUBLINGS` (`session/daemon.rs`) | 3 | the resend floor doubles per resend without ack progress, so a never-acking viewport is re-sent one window per 1, 2, 4, 8, 8, … × the floor | measurement: Task 3.3 Part B |
-| `SB2_ROWS_PER_BODY` (`remote/history.rs`, shared with `server_loop`) | 256 rows | RFC 0009 §2's per-body cap: bounds one body, and with it the backlog ahead of a screen | measurement: Task 3.3 Part B |
+| `HISTORY_WINDOW_ROWS` (`session/daemon.rs`) | 512 rows (2 × `SB2_ROWS_PER_BODY`) | v2 rows in flight before the ack — with the socket, THE history rate limit (no frame floor): one window per round trip, `server_loop`'s SRTT/2 send interval as a static window; Task 3.4 makes it dynamic | prompt acks deliver a 4 KiB/ms flood whole; 50 ms RTT loses 6,384 of it and RTT ≥ 300 ms keeps about the ring (below); the field ack latencies (Task 3.0) decide Task 3.4's share |
+| `HISTORY_RESEND_INITIAL_MS` (`session/daemon.rs`) | 1000 ms (4 × `PACED_ACK_WAIT_MS`) | the v2 resend floor before any ack latency is measured: TCP's initial RTO; afterwards `max(PACED_ACK_WAIT_MS, 2 × srtt)` | at RTT 1,500 ms one window (512 rows) is re-sent spuriously before the first sample; none at ≤ 300 ms |
+| `HISTORY_RESEND_MAX_DOUBLINGS` (`session/daemon.rs`) | 3 | the resend floor doubles per resend without ack progress, so a never-acking viewport is re-sent one window per 1, 2, 4, 8, 8, … × the floor | never-acked: 160–163 KB of history over 2 MiB + 20 s, against 2.2–7.9 MB for v1 |
+| `SB2_ROWS_PER_BODY` (`remote/history.rs`, shared with `server_loop`) | 256 rows | RFC 0009 §2's per-body cap: bounds one body, and with it the backlog ahead of a screen | every v2 run's backlog peaks at one body (≤ 26,676 B); with prompt acks bodies are about one chunk's rows, and the peak backlog 5,132–8,476 B |
 
 The first two start at `server_loop`'s send-interval clamp, are tuned
 independently of it, and every lever here changes only with a measurement
@@ -212,8 +237,42 @@ chunk, `--release`). Re-run with
 | paced, 1 KiB chunks, RTT 1500 ms | every one a `Full` | 1,045,177 B (7 scrollback frames) | 0 acked: base lost (the RTT cliff) | still attached |
 | paced, slow reader (1 KiB/ms) | at most 1 queued | one ring-sized scrollback frame | ~4,300 of 20,511 rows never shipped (ring eviction) | ends on the last screen |
 
+The same command prints the v2 rows (posh#225 Stage 3; empty ring shown — a
+full ring differs by the 49 rows the prefill's last screen adds). History is
+"delivered / lost in forward jumps" of 20,511 rows scrolled; every acking
+run acked all 20,511, and every run delivered no row that differed from the
+session's and ended on the last screen with no screen built against a lost
+base.
+
+| Case | Peak backlog | History bytes | Delivered / jumped | Repeated |
+|---|---|---|---|---|
+| v2, 1 KiB chunks, prompt acks | 5,149 B | 2.23 MB (1,942 bodies) | 20,511 / 0 | 0 |
+| v2, 1 KiB chunks, RTT 50 ms | 5,132 B | 2.24 MB (2,004) | 20,511 / 0 | 0 |
+| v2, 1 KiB chunks, RTT 300 ms | 26,676 B | 1.30 MB (256) | 12,400 / 8,111 (13 jumps) | 0 |
+| v2, 1 KiB chunks, RTT 1,500 ms | 26,676 B | 1.13 MB (93) | 10,774 / 9,737 (3) | 0 |
+| v2, 1 KiB chunks, RTT 2,500 ms | 26,676 B | 1.12 MB (92) | 10,768 / 9,743 (2) | 0 |
+| v2, 1 KiB chunks, never acked | 26,676 B | 163 KB (55) | 1,024 / 9,743 (2) | 512 |
+| v2, 4 KiB chunks, prompt acks | 8,476 B | 2.16 MB (486) | 20,511 / 0 | 0 |
+| v2, 4 KiB chunks, RTT 50 ms | 26,676 B | 1.48 MB (134) | 14,127 / 6,384 (4) | 0 |
+| v2, 4 KiB chunks, RTT 300 ms | 26,676 B | 1.10 MB (54) | 10,543 / 9,968 (2) | 0 |
+| v2, 4 KiB chunks, RTT 1,500 ms | 26,676 B | 1.10 MB (53) | 10,512 / 9,999 (1) | 0 |
+| v2, 4 KiB chunks, RTT 2,500 ms | 26,676 B | 1.12 MB (54) | 10,512 / 9,999 (1) | 256 |
+| v2, 4 KiB chunks, never acked | 26,676 B | 161 KB (17) | 768 / 9,999 (1) | 768 |
+| v2, slow reader (1 KiB/ms), prompt acks | 26,676 B | 1.47 MB (57) | 14,111 / 6,400 (7) | 0 |
+| v2, slow reader, RTT 50 ms | 26,676 B | 1.36 MB (56) | 13,007 / 7,504 (4) | 0 |
+
+The regression tests (`posh225_v2_*`, a 256 KiB flood of 2,521–2,570 rows,
+inside the ring) pin: every row delivered exactly once and acked at prompt,
+50 ms and 300 ms RTTs; at 1,500 ms every row delivered with one spurious
+window (512 rows) re-sent; a backlog of one body (< 64 KiB) for every
+cadence; a never-acked viewport holding exactly the first window with resend
+rounds at 1, 2, 4 and 8 s; and a slow reader losing only rows the ring
+evicted before their turn.
+
 Unpaced streams are byte-identical to before this feature, including beside a
-paced viewport on the same session.
+paced viewport on the same session — and unpaced and paced v1 streams are
+byte-identical beside a v2 viewport (every non-v2 row above is unchanged by
+Stage 3).
 
 ## Rollback
 
