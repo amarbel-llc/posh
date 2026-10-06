@@ -846,12 +846,13 @@ attached, and the session log shows no `client backlog high-water` lines.
 
 ## Stage 2 — send-time, paced screen delivery
 
+Expanded 2026-10-06 against HEAD `be8ccbb`.
+
 Decisions 2, 5, 6, 13. After this stage the daemon holds at most one
 unsent screen per capable viewport, whatever the frame size.
 
 **The model, mirrored from `server_loop`:** per viewport, a `dirty` flag
-(the source terminal's `generation()` moved past the last framed one) and
-a *send opportunity*. An opportunity exists when the viewport's
+and a *send opportunity*. An opportunity exists when the viewport's
 `write_buf` is empty **and** the previous fresh frame is acknowledged or a
 pacing interval has elapsed. `broadcast_output` stops encoding for these
 viewports; it only marks them dirty. Encoding happens at the opportunity,
@@ -865,65 +866,1094 @@ the floor that keeps a lost ack from stalling the screen. Start with
 `server_loop`'s clamp (20 ms floor, 250 ms ceiling) and treat the exact
 numbers as a tuning task with a recorded measurement.
 
-### Task 2.1: Allocate the capability
-- Files: `crates/posh-proto/src/caps.rs`; `docs/rfcs/0001-*.md` (registry
-  table, in place).
-- `CAP_PACED` (next free id — read the RFC 0001 table first): a viewport
-  advertises it to say "decide what to send me at send time". Payload one
-  version byte, room to grow (Stage 3 adds the history ceiling).
-- Tests: encode/decode round trip; unknown-payload-length tolerated.
+### Facts re-verified at `be8ccbb` (Stage 2 rests on these)
 
-### Task 2.2: The viewport advertises it; the bridge carries it
-- Files: `remote/client.rs` (advertise beside `CAP_SCROLLBACK2`, ~`:3810`),
-  `remote/relay.rs:246-251` (`content_caps` — the Init path; this is
-  negotiated on Init, not an introspection forward), `remote/server.rs`
-  bridge tests (`:4724`, `:5080` assert the Init table).
-- Lever: `POSH_PACED` on the viewport — unset/`1` advertises, `0` does
-  not. Parsed once, by one function, shared by remote and (Stage 6) local.
-- Tests: default advertises; `POSH_PACED=0` does not; the bridge's daemon
-  Init carries it iff the viewport's message did.
+Corrections to the task-level text that stood here before are marked
+**corrected**.
 
-### Task 2.3: Daemon — dirty tracking and send-time production
-- Files: `session/daemon.rs` — `ClientConn` (new: `paced`, `last_gen`,
-  `fresh_sent_ms`, `fresh_num`), `broadcast_output`, `queue_frame`, the
-  main loop's write section (`:1800-1829`) and `util::poll` timeout
-  (`:1391`, today `-1`).
-- A paced viewport is skipped by `broadcast_output` (marked dirty). After
-  the per-client read/write section, a new pass produces at most one fresh
-  visible frame per paced viewport that has an opportunity. The poll
-  timeout becomes the nearest pacing deadline among dirty paced viewports,
-  `-1` when there is none.
-- Tests (in-process, the `measure_flood` harness extended with a paced
-  client and a fake clock injected as a `now_ms` parameter — do not sleep
-  in tests):
-  - a flood with acks withheld queues **exactly one** visible frame, then
-    one per interval;
-  - with prompt acks, frames ≤ chunks and `write_buf` never holds two
-    visible frames;
-  - `peak_write_buf` < 64 KiB for every cadence in `FloodAcks`, full ring
-    or empty;
-  - the final frame after the flood ends reflects the terminal's last
-    state (no stale screen at quiescence — the `server_loop` wedge class;
-    mirror its `force_frame`-at-quiescence nudge).
-- A viewport without `CAP_PACED` takes the existing path untouched: assert
-  its byte stream for a fixed input is identical before and after
-  (`posh225_*` measurement on a non-paced client as the witness).
+- **Capability id.** `caps.rs` allocates 0–22 (`CAP_PUSH_CMD_REQUEST = 22`,
+  `caps.rs:178`) plus 224/225; RFC 0001's table (`0001-*.md:231-257`)
+  lists `23–223` unassigned (`:256`). RFC 0012 does **not** reserve a
+  number — it says the id "MUST be allocated in RFC 0001's capability
+  registry" and fixes none (`0012-*.md:51-54`). `CAP_PACED = 23`.
+- **Payload shape to copy.** The forward-compatible decoder in the file is
+  `decode_push_cmd_request` (`caps.rs:500-503`): reads its prefix, ignores
+  trailing bytes. Exact-length decoders (`decode_scrollback2_client`
+  `:538-547`, `decode_session_kind` `:474-479`) are the shape *not* to
+  copy for a payload that must grow. Tests sit at the end of `caps.rs`'s
+  `mod tests` (`push_cmd_ids_are_the_next_free_pair` `:1411`, the id-pin
+  pattern).
+- **The remote viewport advertises on every message.** `outgoing_caps`
+  (`remote/client.rs:3793`) builds the table for every `ClientMessage`
+  (the protocol is connectionless); `CAP_SCROLLBACK2` at `:3810-3818`,
+  `CAP_MORPH` behind its gate at `:3826-3834`. Codec levers are parsed
+  once into `ClientState` at construction (`framesync` at `:1775`, field
+  `:1631`); there are two `ClientState` literals (`:1783`, `test_state`
+  `:5369`). Default-on gates use `util::parse_default_on_gate`
+  (`util.rs:99-104`; e.g. `mux::mux_sessions_selected`, `mux.rs:111-113`),
+  and the About view lists gates (`client.rs:720-728`).
+- **Where the daemon Init is formed — corrected.** The plan put the cap in
+  `relay::content_caps` (`relay.rs:246-251`). ADR 0007 ("No new features on
+  the relay or Architecture A … Anything new lands on M2", `0007-*.md:66-67`)
+  forbids that. The M2 bridge forms the daemon Init from the **first**
+  `ClientMessage` on an `Awaiting` channel at `remote/server.rs:986-995`
+  (`content_caps(&msg.caps)` plus the bridge's own `CLIENT_IDENT`) and
+  keeps it as `SessionBridge::content` (`:346`), which an FDR 0012 re-home
+  reuses (`rehome_bridge`, `:1122-1135`). `CAP_PACED` is added there, so a
+  relayed viewport stays unpaced — the same split RFC 0016 made for
+  push-cmd (`the_relay_never_forwards_push_cmd`, `server.rs:3066`). It is
+  Init-only: `bridge_client_message`'s per-message `Tag::ClientCaps`
+  forward (`:1153-1170`) does not carry it, and the daemon reads it only on
+  Init.
+- **Bridge tests — corrected line numbers.** `:4724`/`:5080` were stale.
+  The Init-table assertions are in `mux_peer_opens_daemonlink_per_session_channel`
+  (`server.rs:4886`, Init decode `:4909-4913`) and
+  `mux_peer_switch_rehomes_channel_with_frame_and_input_continuity`
+  (`:5203`, `:5245-5258`); the cheap seams are `test_bridge` (`:2802`) and
+  `rehome_bridge_seeds_frame_offset_and_reinits` (`:2915`).
+- **The bridge drains the daemon socket as fast as it reads.** Every daemon
+  `Tag::Frame` is rewrapped and sent on the wire at once
+  (`server.rs:698-728`), holding only the newest for retransmit. So for a
+  bridged viewport the daemon's `write_buf` is empty almost always; the
+  end-to-end `FrameAck` (`forward_ack`, `relay.rs:197-217`) is the only
+  backpressure that reflects the viewport's link. This is why the
+  opportunity waits on the ack.
+- **Daemon structure — corrected line numbers.** `ClientConn`
+  `daemon.rs:150-275` (Stage 1's `visible_shaped_for` `:268`,
+  `regeometry_keyframe` `:274`); `apply_init` `:350-378` (sets `lossy` /
+  `coalesce` from the Init table — the shape `pacing` copies);
+  `maybe_enable_frames` `:486-490`; `queue_frame_from` `:508-516`;
+  `queue_frame` `:535-629`; `apply_frame_ack` `:647-693`;
+  `maybe_queue_scrollback` `:718-795`; `broadcast_output` `:816-874`;
+  `handle_frame_ack` `:889-893`; `broadcast_source_swap` `:902-909`;
+  teardown (`ExitCause`/`Exit` to every client) `:1361-1371`;
+  `daemon_loop` `:1427`; loop-top `now` `:1482`; high-water line
+  `:1483-1498`; `clients.retain` drop `:1506-1522`; **`util::poll(&mut fds,
+  -1)` at `:1553`** (the plan said `:1391`); PTY read + `broadcast_output`
+  `:1680-1743` (call at `:1731`); overlay broadcast `:1776-1781`; client
+  section `:1785-2159` — Init `:1836-1861`, `FrameAck` `:1944-1948`,
+  **the one write per client `:1962-1991`** (the plan said `:1800-1829`),
+  regeometry `:1999-2001`, replay `:2104-2128`; end-of-iteration
+  activity-answer pass `:2161-2167`.
+- **`POLLOUT` is armed only for a non-empty `write_buf`** (`:1527-1533`).
+  A frame queued into an empty buffer at the end of an iteration is
+  written on the next one. The paced send pass therefore belongs at the
+  end of the iteration, beside the activity-answer pass.
+- **The daemon has no generation tracking** (no `generation()` call in
+  `daemon.rs`), and its broadcast source switches between two terminals
+  (session and escape overlay, `active_source`) whose generation counters
+  are unrelated. **Corrected:** `dirty` is an event flag set where the
+  daemon already knows output reached the source (`broadcast_output`) and
+  where an event owes a frame, not a generation comparison.
+- **Every site that queues a visible frame today**, each of which must
+  respect pacing for a paced client: `broadcast_output` (per PTY read and
+  overlay read), the attach/regeometry replay (`:2124`), the RESYNC
+  keyframe (`handle_frame_ack`), the activity-answer pass (`:2165` — it
+  fires on every title change, so left alone it would bypass pacing during
+  a flood that sets the title), and `broadcast_source_swap` (via
+  `broadcast_output`).
+- **Teardown sends `Exit` without a final frame** (`:1366-1370`). Today
+  every screen was already queued; with pacing a dirty client's last
+  screen would be lost. A flush is added.
+- **`server_loop`'s clamp** lives in `remote/datagram.rs:29-30`
+  (`SEND_INTERVAL_MIN = 20`, `SEND_INTERVAL_MAX = 250`, private);
+  `send_interval()` is `datagram.rs:316-318` (SRTT/2 clamped). `server_loop`
+  gates fresh frames on it at `server.rs:1982-1983` and sets its poll
+  deadline from it at `:1434-1436`. The #117 quiescence nudge
+  (`:1946-1969`, `visible_frame_leapt`) guards a v1-scrollback ack that
+  leaps a visible frame; the daemon's scrollback threads off the visible
+  frame queued just before it (`advance_scrollback_after_visible`,
+  posh#181), so the daemon has no leap to guard. What the daemon must
+  guarantee instead is that a dirty paced viewport always has a deadline
+  (no stale screen at quiescence).
+- **`FrameProducer`** (`posh-proto/src/framesync/producer.rs`):
+  `acked_num()` `:132`, `last_visible_num()` `:378`, `acked_dump()` `:154`
+  (the acked frame's dump — the test seam for "which screen did it get"),
+  outstanding window 8 (`:262`). `ack` sets `acked_num` even when the
+  acked frame was evicted (`:314`), so "the fresh frame is acked" is
+  `acked_num() >= fresh_num` in every regime.
+- **The flood harness drives `broadcast_output` directly**, not
+  `daemon_loop` (`measure_flood`, `daemon.rs:5273-5406`). The fake clock is
+  therefore a `now: u64` parameter on the new free functions, which
+  `daemon_loop` calls with `util::now_ms()`. `FloodCase` (`:5190`) is a
+  `Copy` struct literal at each call site; eight `ClientConn` literals
+  exist (`:1640`, `:2606`, `:2729`, `:2772`, `:3378`, `:3663`, `:4299`,
+  `:4508` — posh#230), so new state goes in **one** field.
+- **v1 history under pacing — corrected expectation.** The plan asked for
+  `peak_write_buf` < 64 KiB for every cadence. With v1 scrollback riding
+  behind each paced visible frame, one scrollback frame carries every row
+  scrolled since the viewport's ack — at 20 ms between frames and ~4 MB/s
+  of output, ~800 rows (~90 KB) with prompt acks, up to a ring with none.
+  Stage 2's bound is structural instead: **at most one visible frame and
+  the one scrollback frame behind it are ever queued**, so the backlog
+  cannot accumulate toward `MAX_CLIENT_BACKLOG`. The per-body cap is Stage
+  3's (`SB2_ROWS_PER_BODY`).
 
-### Task 2.4: The backstop stays, and says so
-- `MAX_CLIENT_BACKLOG` remains for non-frame clients and bugs (decision 6).
-  Add the `paced=` flag to the `dropping slow client` log line so a drop
-  of a paced viewport is recognisable as a bug.
-- The reason reaching the viewport is posh#226; link it, do not do it here.
+### Design choices this expansion makes (the task-level text left them open)
 
-### Task 2.5: Records
-- FDR *Flood delivery* created at `experimental` in the commit that lands
-  2.3 (levers: `POSH_PACED`; rollback: unset the cap).
-- RFC 0008 §3: the send discipline for a paced session-socket client.
+- **v1 history for a paced viewport rides the same opportunity**, queued
+  right behind the paced visible frame by the same call
+  (`maybe_queue_scrollback`, unchanged). Reason: it is the least change
+  that keeps the backlog bounded — emitting it per PTY read (as today)
+  would reintroduce one queued frame per read — and it keeps posh#181's
+  threading (a scrollback frame names the visible frame queued just before
+  it). Stage 3 replaces it with v2 for paced viewports.
+- **Stage 1's "never-acked viewports still cross the cap via v1 re-carry"
+  is closed for paced viewports** as far as the *cap* goes: a scrollback
+  frame is queued only at an opportunity, which needs an empty
+  `write_buf`, so at most one ring (~1 MiB) is ever queued. It is **not**
+  closed as *bandwidth*: a never-acking paced viewport is re-sent up to a
+  ring of history every `PACED_ACK_WAIT_MS`. Stage 3 closes that.
+  Expected but unverified until Task 2.5's measurement: with far fewer
+  frames in flight per round trip, a remote viewport's acks land inside
+  the producer's 8-frame window again, so it leaves the lost-base regime
+  in which v1 history stops entirely.
+- **Two constants, both used.** `PACED_FRAME_FLOOR_MS = 20` — the least
+  time between two fresh frames however promptly the viewport acks (caps
+  encode work during a flood at ≤ 50 frames/s); `PACED_ACK_WAIT_MS = 250`
+  — the longest a dirty viewport waits for an ack. Both start at
+  `server_loop`'s clamp; each is one `const` in `daemon.rs` with a comment
+  naming it a tuning value that changes only with a measurement recorded
+  in the FDR. They are not shared with `datagram.rs` because they will be
+  tuned independently.
+- **All paced state is one field**, `pacing: Option<Pacing>`: `Some`
+  exactly when the Init table carried a well-formed `CAP_PACED`, so "not
+  paced" is visibly `None` and each of the eight literals gains one line.
+- **One predicate** (`ClientConn::paced_send_at`) feeds both the send pass
+  and the poll timeout, so the two cannot disagree (a disagreement is
+  either a busy loop or a stale screen).
+- **Event sites use one verb.** `ClientConn::owe_paced_frame(release_ack_wait)`
+  marks a paced client dirty and returns `true`, so every site reads
+  `if !c.owe_paced_frame(..) { /* today's path */ }` and a non-paced
+  client provably takes today's path. A RESYNC releases the ack wait (the
+  viewport gave up on what was outstanding, so waiting for its ack would
+  stall the recovery for `PACED_ACK_WAIT_MS`); nothing else does.
+- **The regeometry frame under pacing.** `prepare_regeometry_frame`
+  decides the debt exactly as for any client and, for a MorphDelta client,
+  drops the base and sets `regeometry_keyframe = current_num() + 1`. The
+  replay site turns the debt into `owe_paced_frame(false)`. The next paced
+  frame is built by `queue_frame_from`, whose `note_visible_dump_shape`
+  re-records `visible_shaped_for` and so ends the debt; on the paced path
+  the next frame produced is always that visible frame (its scrollback
+  frame follows it), so `current_num() + 1` still names the keyframe. It
+  does not release the ack wait: frames in flight for the old geometry are
+  still valid input. The new-geometry frame therefore lands within one ack
+  (≤ `PACED_ACK_WAIT_MS`) — Stage 1's "about a round trip (plus pacing)"
+  transient, now with a stated bound.
+- **A self-acked paced client** (the reliable local socket, Stage 6) is
+  always "acked", so its opportunity is "`write_buf` empty and the floor
+  elapsed" — socket backpressure plus the floor. No special case.
+- **The gate function is default-on only.** `parse_paced_gate` is
+  `util::parse_default_on_gate`, matching the remote rollout. Stage 6's
+  local attach defaults **off** (decision 13): Task 6.2 extends the one
+  function with the path's default rather than adding a second parser.
+  Not added now, because an unused `Local` variant fails `clippy -D
+  warnings`.
+- **Observability for the exit check is missing and is added (Task 2.7).**
+  The mux peer's SIGUSR2 line reports only `session_channels=`
+  (`server.rs:425-441`); nothing counts frames forwarded.
+
+### Task 2.1: Allocate `CAP_PACED` (id 23)
+
+**Promotion criteria:** N/A — an id nothing sends yet.
+
+**Files:**
+- Modify: `crates/posh-proto/src/caps.rs` — the constant after
+  `CAP_PUSH_CMD_REQUEST` (`:173-178`); helpers after
+  `decode_push_cmd_request` (`:500-503`); tests at the end of `mod tests`
+  (after `push_cmd_offer_is_an_empty_entry`, `:1435`).
+- Modify: `docs/rfcs/0001-target-grammar-and-capability-table.md` — a row
+  for 23 after `:255`; `23–223` at `:256` becomes `24–223`.
+
+**Step 1: Write the failing tests** (`caps.rs` `mod tests`):
+
+```rust
+    /// posh#225 Stage 2 takes the next free id after push-cmd's pair.
+    /// Pinned so a later allocation cannot silently collide with it.
+    #[test]
+    fn paced_id_is_the_next_free_after_push_cmd_request() {
+        assert_eq!(CAP_PACED, 23);
+    }
+
+    /// RFC 0008 §3.2: a version byte, nothing else in v1.
+    #[test]
+    fn paced_entry_carries_its_version() {
+        let cap = encode_paced();
+        assert_eq!((cap.id, cap.payload.clone()), (CAP_PACED, vec![PACED_VERSION]));
+        assert_eq!(decode_paced(&cap.payload), Some(PACED_VERSION));
+    }
+
+    /// Room to grow (Stage 3 appends the history ceiling): a reader takes
+    /// the version byte and ignores what follows; an empty payload or
+    /// version 0 is malformed, and a malformed entry means "not paced".
+    #[test]
+    fn paced_entry_tolerates_appended_fields_and_rejects_an_empty_one() {
+        assert_eq!(decode_paced(&[2, 0xaa, 0xbb]), Some(2));
+        assert_eq!(decode_paced(&[]), None);
+        assert_eq!(decode_paced(&[0]), None);
+    }
+```
+
+**Step 2: Run** `just debug-cargo test -p posh-proto paced` — expected:
+compile error, `cannot find value CAP_PACED`.
+
+**Step 3: Implement.**
+
+```rust
+/// Paced delivery (posh#225; RFC 0008 §3.2, FDR 0021). Client entry: "decide
+/// what to send me at send time". A session daemon then builds at most one
+/// fresh visible frame for this client per send opportunity — its outgoing
+/// buffer empty and its last fresh frame acked or a wait elapsed — from the
+/// terminal as it is then, instead of one per PTY read. Payload: a version
+/// byte ([`PACED_VERSION`]); later versions append fields a v1 reader
+/// ignores. Init-only on the session socket; an M2 bridge carries the
+/// viewport's entry into the daemon Init, a relay does not (ADR 0007), so a
+/// relayed viewport is unpaced. A server never sends it.
+pub const CAP_PACED: u8 = 23;
+/// The [`CAP_PACED`] payload version this build writes.
+pub const PACED_VERSION: u8 = 1;
+```
+
+```rust
+/// This build's [`CAP_PACED`] entry.
+pub fn encode_paced() -> Cap {
+    Cap { id: CAP_PACED, payload: vec![PACED_VERSION] }
+}
+
+/// The version of a [`CAP_PACED`] payload: `None` when it is empty or names
+/// version 0 (malformed: the entry is ignored and the client is unpaced).
+/// Bytes after the version byte belong to later versions and are ignored.
+pub fn decode_paced(payload: &[u8]) -> Option<u8> {
+    payload.first().copied().filter(|v| *v != 0)
+}
+```
+
+**Step 4: Run** `just debug-cargo test -p posh-proto caps` — expected PASS.
+
+**Step 5: RFC 0001 row.** Insert after the id 22 row:
+
+```
+| 23 | `PACED` | client | ≥ 1 byte | Paced delivery (RFC 0008 §3.2, allocated 2026-10-06): a version byte (`1`); later versions append fields a reader ignores. Advertised on `Tag::Init` by a viewport that asks the session daemon to decide what to send at send time — at most one fresh visible frame per send opportunity, built from the terminal as it is then. An M2 bridge carries the viewport's entry into the daemon Init; a relay does not (ADR 0007), so a relayed viewport is unpaced. A server MUST NOT send it. |
+```
+
+and change the `23–223` row to `24–223`.
+
+**Step 6: Commit** — message:
+`posh-proto: allocate CAP_PACED (id 23) for send-time delivery (posh#225 Stage 2)`
+
+### Task 2.2: The viewport advertises it; the M2 bridge carries it
+
+**Promotion criteria:** N/A — until Task 2.3 the daemon ignores id 23
+(unknown ids are skipped), so this changes no behaviour.
+
+**Files:**
+- Modify: `crates/posh/src/session/mod.rs` — the gate (shared by both
+  clients; Stage 6 reuses it), tests in `mod tests` (`:999`).
+- Modify: `crates/posh/src/remote/client.rs` — `ClientState` field beside
+  `framesync` (`:1631`), its two literals (`:1783`, `test_state` `:5369`),
+  `outgoing_caps` (`:3793`, after the `CAP_MORPH` block `:3826-3834`),
+  the About gate list (`:720-728`), tests near
+  `outgoing_caps_advertises_v2_and_drops_v1_once_acked` (`:6477`).
+- Modify: `crates/posh/src/remote/server.rs` — the `Awaiting` → `Linked`
+  Init formation (`:986-995`), tests near `:2915` and `:3066`.
+- Do **not** modify `crates/posh/src/remote/relay.rs` (ADR 0007).
+
+**Step 1: The gate — failing test** (`session/mod.rs` `mod tests`):
+
+```rust
+    /// `POSH_PACED` is a default-on off-switch (decision 13: the remote path
+    /// ships on): unset, empty, `1` and anything unrecognised advertise;
+    /// the shared off spellings do not.
+    #[test]
+    fn paced_gate_is_on_unless_switched_off() {
+        for on in [None, Some(""), Some("1"), Some("yes"), Some("bogus")] {
+            assert!(parse_paced_gate(on), "{on:?}");
+        }
+        for off in ["0", "false", "off", "no", " OFF "] {
+            assert!(!parse_paced_gate(Some(off)), "{off:?}");
+        }
+    }
+```
+
+Run `just debug-cargo test -p posh --bin posh paced_gate` — expected:
+compile error (`parse_paced_gate`).
+
+**Step 2: Implement** in `session/mod.rs`:
+
+```rust
+/// The paced-delivery gate (posh#225, FDR 0021): whether a viewport
+/// advertises `CAP_PACED`. A default-on off-switch — the shared
+/// [`util::parse_default_on_gate`] shape, `POSH_PACED=0` the rollback, read
+/// by the viewport so it takes effect on its next attach without
+/// restarting the session. Pure, so tests need not touch the environment.
+pub fn parse_paced_gate(value: Option<&str>) -> bool {
+    util::parse_default_on_gate(value)
+}
+
+/// [`parse_paced_gate`] of `$POSH_PACED`. Read once per attach.
+pub fn paced_selected() -> bool {
+    parse_paced_gate(std::env::var("POSH_PACED").ok().as_deref())
+}
+```
+
+Run — expected PASS.
+
+**Step 3: The viewport — failing tests** (`client.rs` tests):
+
+```rust
+    /// posh#225 Stage 2: a viewport advertises CAP_PACED on every message
+    /// (the bridge forms the daemon Init from whichever arrives first).
+    #[test]
+    fn outgoing_caps_advertises_paced_by_default() {
+        let mut st = test_state(5, 20);
+        let caps = outgoing_caps(&mut st);
+        let entry = caps::find(&caps, caps::CAP_PACED).expect("paced advertised");
+        assert_eq!(caps::decode_paced(&entry.payload), Some(caps::PACED_VERSION));
+    }
+
+    /// `POSH_PACED=0`: today's delivery, nothing advertised.
+    #[test]
+    fn outgoing_caps_omits_paced_when_the_gate_is_off() {
+        let mut st = test_state(5, 20);
+        st.paced = false;
+        assert!(caps::find(&outgoing_caps(&mut st), caps::CAP_PACED).is_none());
+    }
+```
+
+Run `just debug-cargo test -p posh --bin posh outgoing_caps` — expected:
+compile error (`no field paced`).
+
+**Step 4: Implement.** `ClientState` gains, after `framesync`:
+
+```rust
+    /// Paced delivery (`POSH_PACED`, posh#225): whether every message
+    /// advertises `CAP_PACED`. Read once at construction.
+    paced: bool,
+```
+
+`run`'s literal (`:1783`) sets `paced: crate::session::paced_selected()`;
+`test_state` sets `paced: true` (the default). In `outgoing_caps`, after
+the `CAP_MORPH` block:
+
+```rust
+    // posh#225 Stage 2 (RFC 0008 §3.2): ask for send-time delivery. Every
+    // message, like SCROLLBACK2: the M2 bridge forms the daemon Init from
+    // the first message it sees on a channel.
+    if st.paced {
+        extra.push(caps::encode_paced());
+    }
+```
+
+In the About gate list (`:720-728`) add
+`gate("POSH_PACED", crate::session::paced_selected())` after
+`POSH_MUX_SESSIONS` (one more `{}` in the format string) — it answers "is
+this viewport paced?" from the palette until Stage 7's `posh status` field.
+
+Run `just debug-cargo test -p posh --bin posh outgoing_caps` — expected
+PASS, including `outgoing_caps_advertises_v2_and_drops_v1_once_acked`.
+
+**Step 5: The bridge — failing tests** (`server.rs` tests, after
+`the_relay_never_forwards_push_cmd`):
+
+```rust
+    /// posh#225 Stage 2, ADR 0007: the M2 bridge carries the viewport's
+    /// CAP_PACED into the daemon Init iff the viewport advertised it.
+    #[test]
+    fn bridge_init_carries_paced_iff_the_viewport_advertised_it() {
+        let with = bridge_init_content(&caps::own_table(&[caps::encode_paced()]));
+        assert_eq!(caps::find(&with, caps::CAP_PACED), Some(&caps::encode_paced()));
+        let without = bridge_init_content(&caps::own_table(&[]));
+        assert!(caps::find(&without, caps::CAP_PACED).is_none());
+    }
+
+    /// The relay never forwards it: a relayed viewport stays unpaced.
+    #[test]
+    fn the_relay_never_forwards_paced() {
+        let table = vec![caps::encode_paced()];
+        assert!(crate::remote::relay::content_caps(&table).is_empty());
+        assert!(crate::remote::relay::forwarded_client_caps(&table).is_empty());
+    }
+
+    /// FDR 0012 re-home re-Inits the new daemon with the same negotiation:
+    /// a paced viewport stays paced across a switch.
+    #[test]
+    fn rehome_bridge_keeps_paced_in_the_reinit() {
+        let (mut b, _peer) = test_bridge();
+        b.content = bridge_init_content(&[caps::encode_paced()]);
+        let mut connect = |_: &str| {
+            let (a, other) = std::os::unix::net::UnixStream::pair().unwrap();
+            std::mem::forget(other);
+            Ok(a)
+        };
+        rehome_bridge(&mut b, "work/s-1", &mut connect).unwrap();
+        let mut fb = crate::session::ipc::FrameBuffer::new();
+        fb.feed(&b.daemon.link.write);
+        let init = fb.next().unwrap().unwrap();
+        assert_eq!(init.tag, crate::session::ipc::Tag::Init);
+        let (table, _) = caps::decode_table(&init.payload[4..]).unwrap();
+        assert!(caps::find(&table, caps::CAP_PACED).is_some());
+    }
+```
+
+Run `just debug-cargo test -p posh --bin posh paced` — expected: compile
+error (`bridge_init_content`).
+
+**Step 6: Implement** beside `bridge_client_message`:
+
+```rust
+/// The client half of the daemon `Tag::Init` this bridge sends for a
+/// channel: the relay's content caps (RFC 0008 §4) plus what only the M2
+/// bridge carries (ADR 0007) — the viewport's `CAP_PACED` entry
+/// (posh#225, RFC 0008 §3.2), verbatim. The caller appends its own
+/// identity. Retained as `SessionBridge::content`, so a re-home re-Inits
+/// with the same negotiation.
+fn bridge_init_content(client_caps: &[caps::Cap]) -> Vec<caps::Cap> {
+    let mut content = crate::remote::relay::content_caps(client_caps);
+    content.extend(caps::find(client_caps, caps::CAP_PACED).cloned());
+    content
+}
+```
+
+and at `:987` replace `crate::remote::relay::content_caps(&msg.caps)` with
+`bridge_init_content(&msg.caps)`.
+
+**Step 7: Run** `just debug-cargo test -p posh --bin posh remote::` —
+expected PASS (`mux_peer_opens_daemonlink_per_session_channel` still sees
+its lossy Init; its `cm()` advertises no `CAP_PACED`, which is fine).
+Then `just debug-cargo clippy -p posh --all-targets -- -D warnings` —
+clean.
+
+**Step 8: Commit** — message:
+`viewport advertises CAP_PACED (POSH_PACED, default on); the M2 bridge carries it into the daemon Init (posh#225 Stage 2)`
+
+### Task 2.3: Daemon — paced delivery core
+
+The commit that makes a paced viewport paced. FDR 0021 is created at
+`experimental` and RFC 0008 gains §3.2 **in this commit**.
+
+**Promotion criteria:** N/A — opt-out on the viewport (`POSH_PACED=0`,
+next attach).
+
+**Files:**
+- Modify: `crates/posh/src/session/daemon.rs` — constants beside
+  `MAX_CLIENT_BACKLOG` (`:62`); a `Pacing` struct after `ClientConn`
+  (`:275`); the `pacing` field on `ClientConn` and all eight literals
+  (`:1640`, `:2606`, `:2729`, `:2772`, `:3378`, `:3663`, `:4299`, `:4508`
+  — `pacing: None`); `apply_init` (`:350-378`); new `ClientConn` methods
+  after `maybe_enable_frames` (`:486-490`); `broadcast_output`
+  (`:816-874`); new free functions after `broadcast_source_swap`
+  (`:902-909`); `daemon_loop`'s poll (`:1553`) and end of iteration
+  (`:2161-2167`); `daemon_main`'s teardown (`:1361-1371`).
+- Create: `docs/features/0021-flood-delivery.md`.
+- Modify: `docs/rfcs/0008-unified-session-frame-transport.md` — new
+  `#### 3.2` after §3.1 (`:153-181`, before `### 4.` at `:183`).
+
+**Step 1: Record the non-paced witness BEFORE touching code.** Run
+`just debug-cargo test --release -p posh --bin posh posh225_flood_backlog_ideal_reader_measurement -- --ignored --nocapture`
+and keep the printed table (it goes in this task's commit message). Step 12
+re-runs it; every row must be identical — the client in that harness is
+not paced, so its stream must not move.
+
+**Step 2: Failing tests — state and predicate** (new block at the end of
+`daemon.rs`'s `mod tests`, headed `// ---- posh#225 Stage 2: paced
+delivery ----`). A helper first:
+
+```rust
+    /// A lossy client shaped like an M2 bridge's daemon Init with the
+    /// viewport's CAP_PACED, plus any `extra` content caps.
+    fn paced_conn(rows: u16, cols: u16, extra: &[caps::Cap]) -> (ClientConn, UnixStream) {
+        let mut table = vec![caps::encode_paced()];
+        table.extend_from_slice(extra);
+        lossy_conn(rows, cols, &table)
+    }
+```
+
+Tests (one line each on what they assert):
+
+- `paced_cap_on_init_makes_a_paced_client_and_a_bare_reinit_keeps_it` —
+  `paced_conn` → `c.pacing == Some(Pacing::default())`; after setting
+  `dirty = true`, a bare 4-byte re-`Init` (`apply_init(&encode_resize(..))`)
+  leaves `pacing` (and `dirty`) intact; `lossy_conn(..., &[])` →
+  `pacing == None`; an Init whose `CAP_PACED` payload is empty → `None`.
+- `broadcast_output_only_marks_a_paced_client_dirty` — feed a line,
+  `broadcast_output(slice, &term, b"x")`: the paced client's `write_buf`
+  is empty, `pacing.dirty` is true, `visible_shaped_for` is unchanged,
+  and the producer's `current_num()` did not move.
+- `paced_send_at_waits_for_an_empty_buffer_then_an_ack_or_the_wait` —
+  with a fake `now`: not dirty → `None`; dirty and never sent → `Some(0)`;
+  after `send_paced_frames(.., now = 100)`: not dirty → `None`; dirty
+  again with the frame unacked and `write_buf` cleared →
+  `Some(100 + PACED_ACK_WAIT_MS)`; after `apply_frame_ack` of
+  `last_visible_num()` → `Some(100 + PACED_FRAME_FLOOR_MS)`; with
+  `write_buf` non-empty → `None`.
+- `paced_poll_timeout_is_the_nearest_deadline_and_never_negative` — no
+  clients / no paced clients / a clean paced client → `-1`; two dirty
+  paced clients due at 120 and 350 with `now = 100` → `20`; an overdue one
+  → `0`; a non-paced client with a full `write_buf` changes nothing.
+- `send_paced_frames_builds_one_frame_from_the_terminal_as_it_is_then` —
+  dirty a paced client, feed three more distinct lines WITHOUT calling the
+  pass, then `send_paced_frames(.., now)`: exactly one `Tag::Frame` with a
+  visible body was queued; ack it; `producer.acked_dump()` equals
+  `term.dump_vt_mirror(rows, cols)` (the latest screen, not an
+  intermediate one); `pacing == Some(Pacing { dirty: false, last_fresh:
+  Some((last_visible_num, now)) })`; a second pass at the same `now`
+  queues nothing.
+- `send_paced_frames_carries_scrollback_right_behind_the_visible_frame` —
+  `paced_conn(.., &[CAP_SCROLLBACK])`, attach keyframe acked, scroll ten
+  rows, pass: two frames, visible then `FrameBody::Scrollback` whose
+  `base` is the visible frame's number (posh#181), carrying the ten rows.
+- `flush_paced_frames_sends_a_dirty_clients_last_screen` — a paced client
+  dirty with an unacked frame outstanding and `now` before its deadline:
+  `flush_paced_frames` queues a frame anyway; a clean paced client and a
+  non-paced client get nothing.
+
+Run `just debug-cargo test -p posh --bin posh paced` — expected: compile
+errors (`Pacing`, `send_paced_frames`, …).
+
+**Step 3: Implement the state.**
+
+```rust
+/// Paced delivery (posh#225, RFC 0008 §3.2): the least time between two
+/// fresh visible frames to one paced viewport, however promptly it acks.
+/// Starts at `server_loop`'s send-interval floor (`datagram::SEND_INTERVAL_MIN`).
+/// A tuning value: change it only with a measurement recorded in FDR 0021.
+const PACED_FRAME_FLOOR_MS: u64 = 20;
+/// The longest a dirty paced viewport waits for the ack of its last fresh
+/// frame before it is sent the next anyway — what keeps a lost ack from
+/// stalling its screen. Starts at `server_loop`'s send-interval ceiling
+/// (`SEND_INTERVAL_MAX`). A tuning value, as above.
+const PACED_ACK_WAIT_MS: u64 = 250;
+```
+
+```rust
+/// A paced client's send-time state (posh#225, RFC 0008 §3.2).
+#[derive(Debug, Default, Clone, Copy, PartialEq, Eq)]
+struct Pacing {
+    /// A visible frame is owed: output reached the broadcast source since
+    /// the last paced frame, or an event (attach replay, regeometry,
+    /// resync, activity answer, source swap) asked for one.
+    dirty: bool,
+    /// The newest paced visible frame's number and when it was queued (the
+    /// caller's clock). `None` before the first, and after a RESYNC (the
+    /// client gave up on what was outstanding): the next frame then waits
+    /// only for an empty `write_buf`.
+    last_fresh: Option<(u64, u64)>,
+}
+```
+
+`ClientConn` gains, after `regeometry_keyframe`:
+
+```rust
+    /// Paced delivery (posh#225): `Some` exactly when this client's Init
+    /// carried a well-formed `CAP_PACED`. Its visible frames are not built
+    /// per PTY read: `broadcast_output` and every other frame-owing site
+    /// mark it dirty (`owe_paced_frame`), and `send_paced_frames` builds at
+    /// most one per send opportunity (`paced_send_at`).
+    pacing: Option<Pacing>,
+```
+
+In `apply_init`, beside `lossy`/`coalesce` (preserved across a bare
+re-Init exactly as they are):
+
+```rust
+                    // posh#225 (RFC 0008 §3.2): a viewport that asked for
+                    // send-time delivery. A repeated Init keeps the state.
+                    let paced = caps::find(&advertised, caps::CAP_PACED)
+                        .is_some_and(|c| caps::decode_paced(&c.payload).is_some());
+                    self.pacing = paced.then(|| self.pacing.unwrap_or_default());
+```
+
+**Step 4: Implement the predicate and the verbs** (`impl ClientConn`):
+
+```rust
+    /// Paced AND framed: a paced client without a producer (not frame
+    /// capable) takes the raw `Tag::Output` path like any other.
+    fn is_paced(&self) -> bool {
+        self.pacing.is_some() && self.producer.is_some()
+    }
+
+    /// When this client may next be sent a fresh visible frame, on the
+    /// caller's clock: `None` when it is not paced, owes nothing, or still
+    /// has bytes queued (`POLLOUT` will wake the loop for those). The ONE
+    /// predicate behind `send_paced_frames` and `paced_poll_timeout`, so
+    /// the two cannot disagree — a disagreement is a busy loop or a stale
+    /// screen.
+    fn paced_send_at(&self) -> Option<u64> {
+        let pacing = self.pacing.filter(|p| p.dirty)?;
+        let producer = self.producer.as_ref()?;
+        if !self.write_buf.is_empty() {
+            return None;
+        }
+        Some(match pacing.last_fresh {
+            None => 0,
+            Some((num, at)) if producer.acked_num() >= num => at + PACED_FRAME_FLOOR_MS,
+            Some((_, at)) => at + PACED_ACK_WAIT_MS,
+        })
+    }
+
+    /// For a paced client, record that a visible frame is owed and return
+    /// `true`: the caller must not build one now — `send_paced_frames` will.
+    /// `release_ack_wait` also forgets the outstanding frame (a RESYNC: the
+    /// client rejected it, so its ack is not coming). Any other client:
+    /// `false`, and the caller takes today's path.
+    fn owe_paced_frame(&mut self, release_ack_wait: bool) -> bool {
+        if !self.is_paced() {
+            return false;
+        }
+        if let Some(p) = self.pacing.as_mut() {
+            p.dirty = true;
+            if release_ack_wait {
+                p.last_fresh = None;
+            }
+        }
+        true
+    }
+
+    /// Build this paced client's fresh visible frame from `src` now — for
+    /// its current geometry (`queue_frame_from`, which also records
+    /// `visible_shaped_for`), with any v1 scrollback right behind it
+    /// (posh#181 threading) — and record it as the newest fresh frame.
+    fn send_paced_frame(&mut self, src: &Terminal, now: u64) {
+        if !self.queue_frame_from(src) {
+            return;
+        }
+        self.maybe_queue_scrollback(src);
+        let num = self.producer.as_ref().map_or(0, FrameProducer::last_visible_num);
+        if let Some(p) = self.pacing.as_mut() {
+            *p = Pacing { dirty: false, last_fresh: Some((num, now)) };
+        }
+    }
+```
+
+**Step 5: Implement the pass, the timeout and the flush** (free functions
+after `broadcast_source_swap`):
+
+```rust
+/// The paced send pass (posh#225, RFC 0008 §3.2): every paced client with a
+/// send opportunity at `now` gets ONE fresh visible frame built from `src`
+/// as it is now. Screens produced since its last frame were never built.
+/// Runs at the end of a loop iteration; `now` is a parameter so tests
+/// drive a fake clock.
+fn send_paced_frames(clients: &mut [ClientConn], src: &Terminal, now: u64) {
+    for c in clients.iter_mut() {
+        if c.paced_send_at().is_some_and(|at| now >= at) {
+            c.send_paced_frame(src, now);
+        }
+    }
+}
+
+/// The daemon's poll timeout: milliseconds until the nearest paced send
+/// opportunity, `0` when one is already due, `-1` (block) when no paced
+/// client owes a frame — never a busy-wait.
+fn paced_poll_timeout(clients: &[ClientConn], now: u64) -> i32 {
+    clients
+        .iter()
+        .filter_map(ClientConn::paced_send_at)
+        .map(|at| at.saturating_sub(now))
+        .min()
+        .map_or(-1, |ms| i32::try_from(ms).unwrap_or(i32::MAX))
+}
+
+/// Before `Exit`: every paced client that still owes a frame gets it now,
+/// whatever its pacing — the session's last screen must not be lost.
+fn flush_paced_frames(clients: &mut [ClientConn], src: &Terminal, now: u64) {
+    for c in clients.iter_mut().filter(|c| c.pacing.is_some_and(|p| p.dirty)) {
+        c.send_paced_frame(src, now);
+    }
+}
+```
+
+**Step 6: `broadcast_output` skips paced clients.** Three edits, so a
+paced client takes no dump, no cache key and no frame:
+
+- `producers` counts `c.producer.is_some() && !c.is_paced()`;
+- `keys` maps `(c.producer.is_some() && !c.is_paced()).then(|| c.note_visible_dump_shape(term))`
+  (a paced client's `visible_shaped_for` must keep naming the dump it
+  actually holds);
+- the loop's first statement:
+  `if c.owe_paced_frame(false) { continue; }` with the comment "A paced
+  client is only marked dirty: its frame is built at its next send
+  opportunity (`send_paced_frames`), from the terminal as it is then."
+
+The doc comment above `broadcast_output` gains one sentence saying so.
+
+**Step 7: Wire `daemon_loop` and the teardown.**
+- `:1553`: `util::poll(&mut fds, paced_poll_timeout(clients, now))` (`now`
+  is the loop-top `util::now_ms()` at `:1482`).
+- After the activity-answer pass (`:2161-2167`, which reuses its `src`):
+  `send_paced_frames(clients, src, util::now_ms());` with a comment that
+  it runs last so the frame reflects everything this iteration fed the
+  terminal, and that a frame queued here is written next iteration
+  (`POLLOUT`, `:1527-1533`).
+- `daemon_main` teardown, before the `ExitCause` loop (`:1366`):
+  `flush_paced_frames(&mut clients, &term, util::now_ms());` (the overlay
+  is already closed there, so `term` is the source).
+
+**Step 8: Run** `just debug-cargo test -p posh --bin posh paced` —
+expected PASS. Then `just debug-cargo test -p posh --bin posh session::daemon`
+— expected PASS: no existing test constructs a paced client.
+
+**Step 9: FDR 0021.** Create `docs/features/0021-flood-delivery.md`
+(`status: experimental`, `date:` the commit date), modelled on FDR 0020's
+sections (Problem Statement, Interface, Examples, Decisions, Limitations,
+Rollback, More Information) plus FDR 0019's Tuning Levers:
+- *Problem*: posh#225 — a session that out-produces a viewport dropped it;
+  Stage 1 shrank the frame, Stage 2 bounds the queue.
+- *Interface*: `POSH_PACED` on the viewport (default on for remote/M2
+  attach; `0`/`false`/`off`/`no` off; read per attach); what the user sees
+  (the live screen jumps to latest; at most one screen in flight); local
+  attach unpaced until Stage 6; a relayed viewport (`POSH_MUX_SESSIONS=0`)
+  unpaced (ADR 0007).
+- *Decisions*: link the UX design doc's decisions 2, 5, 6, 13 (do not
+  restate them) and this stage's choices: ack-or-wait opportunity, the
+  floor, v1 history riding the opportunity, RESYNC releases the wait,
+  regeometry waits for the next opportunity, the exit flush.
+- *Limitations*: v1 history (≤ one ring re-carried per `PACED_ACK_WAIT_MS`
+  to a never-acking viewport; Stage 3); a mismatched-geometry viewport
+  still gets ring-sized frames, but one at a time; history still lost
+  across reconnect (Stage 5); posh#226 (a drop is unexplained).
+- *Tuning Levers*: `PACED_FRAME_FLOOR_MS`, `PACED_ACK_WAIT_MS` — values,
+  origin (`server_loop`'s clamp), "measurement: Task 2.5" placeholder that
+  Task 2.8 fills.
+- *Rollback*: `POSH_PACED=0` on the viewport; next attach; no session
+  restart; two viewports on one session may differ.
+
+**Step 10: RFC 0008 §3.2** — "Paced delivery (posh#225)". Normative:
+- A client advertising `CAP_PACED` on `Tag::Init` (§1.1) asks the daemon to
+  decide at send time. The daemon MUST NOT queue a visible frame for it per
+  PTY read; it MUST hold at most one unsent visible frame for it, plus the
+  history body that rides behind that frame.
+- A *send opportunity* exists when the client's outgoing buffer is empty
+  AND its last fresh visible frame is acknowledged (a `FrameAck` at or
+  beyond it, or the §2 self-ack) or an implementation-defined wait has
+  elapsed since it was queued. Implementations SHOULD also space fresh
+  frames by a floor. At an opportunity the daemon builds the frame from
+  the terminal as it is then, for the client's current geometry (§2).
+- Events that owe a frame (attach, the §2 regeometry frame, a RESYNC,
+  an activity answer, a source swap) mark it owed and are served at the
+  next opportunity; a RESYNC releases the wait for an ack.
+- A daemon MUST deliver an owed frame before it sends `Exit`.
+- Pacing MUST NOT apply backpressure to the PTY: output is read and fed to
+  the terminal as for any client (UX design decision 5).
+- A client that does not advertise `CAP_PACED` receives §2/§3 delivery
+  unchanged. An M2 bridge forwards its viewport's entry into the daemon
+  Init; a relay does not (ADR 0007).
+- The intervals are implementation values (FDR 0021), not protocol.
+
+**Step 11: Lint.** `just lint-fmt` — clean;
+`just debug-cargo clippy -p posh --all-targets -- -D warnings` — clean.
+
+**Step 12: Re-run the Step 1 measurement** — expected: byte-identical
+table (the harness client is not paced).
+
+**Step 13: Commit** — message (paste Step 1's table under the body):
+`daemon: send-time, paced visible frames for CAP_PACED viewports (posh#225 Stage 2)`
+with a body naming: at most one visible frame (+ its scrollback) queued
+per paced viewport; ack-or-wait opportunity with a floor; poll timeout =
+nearest opportunity; exit flush; non-paced clients byte-identical
+(measurement table unchanged); FDR 0021 experimental; RFC 0008 §3.2.
+
+### Task 2.4: Daemon — every frame-owing event respects pacing
+
+**Promotion criteria:** N/A.
+
+**Files:**
+- Modify: `crates/posh/src/session/daemon.rs` — `handle_frame_ack`
+  (`:889-893`); the replay block (`:2104-2128`) extracted into a helper;
+  the activity-answer pass (`:2161-2167`) extracted into a helper; tests in
+  the Stage 2 block.
+
+**Step 1: Failing tests:**
+
+- `a_paced_attach_replay_is_built_by_the_send_pass` — a fresh
+  `paced_conn`, `queue_replay(&mut c, &term)`: nothing queued, `dirty`;
+  `send_paced_frames(.., now = 0)`: one `Full` visible frame (the fresh
+  producer has no base).
+- `a_paced_resync_releases_the_ack_wait` — paced client with an unacked
+  fresh frame sent at `now = 100`, then `handle_frame_ack(&mut c,
+  &encode_frame_ack(n, FRAME_ACK_RESYNC), &term)`: nothing queued at once;
+  `paced_send_at() == Some(0)`; the pass at `now = 101` queues a `Full`.
+- `a_paced_regeometry_frame_is_the_next_paced_frame` — paced client at
+  24x80, frame sent and acked; `apply_resize` to 30x80;
+  `prepare_regeometry_frame()` is true; `queue_replay` queues nothing and
+  sets `dirty`; after the opportunity, the frame is queued,
+  `visible_shaped_for == Some((30, 80))` and `owes_regeometry_frame()` is
+  false.
+- `a_paced_morph_regeometry_frame_is_a_full` — the same with
+  `paced_conn(.., &[CAP_MORPH])`: the paced frame is a `Full` and
+  `regeometry_keyframe` names its number.
+- `a_paced_activity_answer_rides_the_next_paced_frame` — paced client that
+  wants activity; title changes twice with no opportunity in between
+  (`queue_due_answers` called after each): nothing queued; the next pass
+  queues ONE frame carrying the second label.
+- `a_source_swap_marks_a_paced_client_dirty_and_its_next_frame_is_full` —
+  `broadcast_source_swap` queues nothing for the paced client; the pass
+  queues a `Full`.
+
+Run `just debug-cargo test -p posh --bin posh a_paced` — expected:
+compile errors (`queue_replay`, `queue_due_answers`).
+
+**Step 2: Implement.**
+
+```rust
+fn handle_frame_ack(c: &mut ClientConn, payload: &[u8], src: &Terminal) {
+    // A paced client's recovering Full waits only for an empty buffer:
+    // the RESYNC released its ack wait.
+    if c.apply_frame_ack(payload) && !c.owe_paced_frame(true) {
+        c.queue_frame_from(src);
+    }
+}
+```
+
+Extract the replay body (`:2118-2127`) as
+
+```rust
+/// The attach / regeometry replay for one client (github #16; posh#225):
+/// a paced client is marked as owing a frame, a framed one is queued a
+/// frame for its geometry now, a baseline one the flat dump.
+fn queue_replay(c: &mut ClientConn, src: &Terminal) {
+    let produced = c.owe_paced_frame(false) || (c.producer.is_some() && c.queue_frame_from(src));
+    if !produced {
+        c.queue(Tag::Output, &src.dump_vt_flat());
+    }
+}
+```
+
+keeping the existing comments at the call site, and the activity pass as
+
+```rust
+/// RFC 0013 §5.2 / RFC 0016 §2: a due answer that did not ride a frame
+/// this iteration rides one of its own — for a paced client, its next
+/// paced frame (a title that changes every line would otherwise bypass
+/// pacing).
+fn queue_due_answers(clients: &mut [ClientConn], src: &Terminal) {
+    for c in clients.iter_mut().filter(|c| c.producer.is_some() && c.answer_due()) {
+        if !c.owe_paced_frame(false) {
+            c.queue_frame_from(src);
+        }
+    }
+}
+```
+
+`broadcast_source_swap` needs no change: it drops every base, then
+`broadcast_output` marks the paced client dirty, so its next paced frame is
+a `Full`. The regeometry path needs no change beyond `queue_replay`: see
+"The regeometry frame under pacing" above.
+
+**Step 3: Run** `just debug-cargo test -p posh --bin posh session::daemon`
+— expected PASS (the regeometry, resync and activity tests of Stage 1 and
+earlier exercise the non-paced branch of the same helpers).
+
+**Step 4: Commit** — message:
+`daemon: replay, resync, regeometry and activity frames respect pacing (posh#225 Stage 2)`
+
+### Task 2.5: The flood, paced — harness, regression tests, measurement
+
+**Promotion criteria:** N/A.
+
+**Files:**
+- Modify: `crates/posh/src/session/daemon.rs` — the posh#225 test block:
+  `FloodCase` (`:5190`), `FloodRun` (`:5154`), `measure_flood`
+  (`:5273-5406`), every `FloodCase` literal (`pace: None`), the
+  ideal-reader measurement (`:5501`), new tests after `:5654`.
+
+**Step 1: Extend the harness** (no new assertions yet).
+- `FloodCase` gains `pace: Option<u64>` — `Some(ms)` runs a PACED client
+  on a fake clock that advances `ms` per chunk (`1` models ~4 MB/s, the
+  `nix gc` shape); `None` is today's client, byte-for-byte today's loop.
+- `FloodRun` gains `visible_frames: usize`, `visible_frames_during_flood:
+  usize`, `max_visible_queued: usize` (visible frames in `write_buf` after
+  any queueing step), and `last_screen_delivered: Option<bool>` (paced
+  runs only).
+- In `measure_flood`, when `case.pace` is `Some(ms)`:
+  - build the client with `paced_conn(rows, cols, &[SCROLLBACK, BASE_SUM])`;
+  - the attach keyframe goes through the real path:
+    `c.owe_paced_frame(false); send_paced_frames(slice, &term, 0);`, then
+    ack frame 1 and clear `write_buf` as today;
+  - per chunk, in production order: `term.process` + `broadcast_output`
+    (marks dirty, queues nothing); the drain step (unchanged); the ack
+    step (unchanged); then `send_paced_frames(slice, &term, now)`, parse
+    the bytes it queued with the existing frame-accounting loop (moved into
+    a closure so both modes share it), push `newest`; then `now += ms`;
+  - after the last chunk, an idle tail: repeat drain → ack (per cadence) →
+    `now += ms` → send pass until `!dirty && write_buf.is_empty()`;
+    assert it ends within `now ≤ flood_end + 4 * PACED_ACK_WAIT_MS`
+    (otherwise the pacing has a stale-screen hole); then ack
+    `last_visible_num()` and set `last_screen_delivered =
+    Some(producer.acked_dump() == Some(&term.dump_vt_mirror(rows, cols)[..]))`.
+- `print_flood_row` gains a `paced` column.
+
+Run `just debug-cargo test -p posh --bin posh posh225` — expected PASS:
+every existing case has `pace: None`.
+
+**Step 2: Failing tests** (they fail on assertions only if pacing is
+broken; write them, run them, and expect PASS — if one fails, the core is
+wrong; stop and report rather than loosen it):
+
+- `posh225_paced_flood_without_acks_sends_one_visible_frame_per_ack_wait`
+  — 2 MiB flood, 4 KiB chunks, `pace: Some(1)`, `FloodAcks::Never`,
+  `FloodDrain::Always` (isolates pacing from the socket): the flood spans
+  `t = 0..=511`, so `visible_frames_during_flood == 1 + (511 -
+  PACED_FRAME_FLOOR_MS) / PACED_ACK_WAIT_MS` (frames at 20 and 270 —
+  computed from the constants, not hard-coded); `last_screen_delivered ==
+  Some(true)`.
+- `posh225_paced_flood_with_prompt_acks_never_queues_two_visible_frames`
+  — 256 KiB, `EveryNewest(1)`, `OneWritePerChunk`, full ring:
+  `max_visible_queued <= 1`; `visible_frames <= chunks /
+  PACED_FRAME_FLOOR_MS as usize + 2`; `largest_visible < 64 KiB`.
+- `posh225_paced_flood_backlog_is_one_frame_pair_for_every_cadence` — for
+  `Never`, `EveryNewest(1)`, `Lagged(2)`, `Lagged(5)` × prefill `0` and
+  `SCROLLBACK + 200`, `OneWritePerChunk`, the WHOLE 256 KiB flood (pacing
+  removes the per-chunk quadratic that made `Never` too slow before):
+  `crossed_backlog_at == None`; `max_visible_queued <= 1`;
+  `peak_write_buf <= largest_visible + largest_scrollback` (at most one
+  pair queued); `largest_visible < 64 KiB`. No 64 KiB bound on
+  `peak_write_buf` — see the corrected expectation above; Task 3.3 adds it
+  when v2 caps the body.
+- `posh225_paced_flood_ends_on_the_last_screen` — every cadence above:
+  `last_screen_delivered == Some(true)` (no stale screen at quiescence).
+- `posh225_paced_flood_delivers_history_with_prompt_acks` — 256 KiB,
+  `EveryNewest(1)`, `OneWritePerChunk`, full ring; guarded by
+  `flood_socket_supports_bounds`: `rows_acked == rows_scrolled` after the
+  tail. (If the host's write capacity is below a paced scrollback frame —
+  ~90 KB at a 20 ms floor — the guard skips; that is the harness, not
+  posh.)
+- `non_paced_stream_is_identical_beside_a_paced_client` — the
+  "existing path untouched" witness that stays in the suite: two
+  identical 24x80, 1000-row terminals fed `newline_flood(64 KiB)` in 4 KiB
+  chunks through `broadcast_output`; run A has one
+  `scrollback_capable_conn(24, 80)`; run B has the same plus a
+  `paced_conn(24, 80, &[])` of the SAME geometry (so the pre-Stage-2 dump
+  cache would have shared a dump with it). Drain the non-paced client's
+  `write_buf` into a `Vec` after each chunk; the two `Vec`s are equal.
+
+Run `just debug-cargo test -p posh --bin posh posh225_paced` and
+`just debug-cargo test -p posh --bin posh non_paced_stream` — expected
+PASS. Release mode (`--release`) if debug is too slow, as for the existing
+flood tests.
+
+**Step 3: Measure.** Add paced rows (`pace: Some(1)`, the same cadences
+and rings) to `posh225_flood_backlog_ideal_reader_measurement`, run it
+(`just debug-cargo test --release -p posh --bin posh posh225_flood_backlog_ideal_reader_measurement -- --ignored --nocapture`),
+and keep the paced rows for Task 2.8. In particular record, for `Lagged(5)`
+paced, whether `sb_acked` is now non-zero — the "remote viewport leaves the
+lost-base regime" expectation above is unverified until this row.
+
+**Step 4: Commit** — message (measurement rows in the body):
+`posh#225 Stage 2: paced flood regression tests and measurements`
+
+### Task 2.6: The backstop stays, and says so
+
+**Promotion criteria:** N/A.
+
+`MAX_CLIENT_BACKLOG` remains for non-frame clients and bugs (decision 6).
+A drop of a paced viewport must read as a bug.
+
+**Files:**
+- Modify: `crates/posh/src/session/daemon.rs` — the high-water line
+  (`:1487-1495`) and the drop line (`:1508-1517`); a test in the Stage 2
+  block.
+
+**Step 1: Failing test** —
+`backlog_log_fields_say_whether_the_client_is_paced`: for a `paced_conn`
+and a `lossy_conn`, `backlog_log_fields(&c, now)` ends in `paced=1` and
+`paced=0` respectively and still carries `fd=`, `backlog=`,
+`drained_total=`, `last_drain_age_ms=`.
+
+Run `just debug-cargo test -p posh --bin posh backlog_log_fields` —
+expected: compile error.
+
+**Step 2: Implement** — one formatter both lines use:
+
+```rust
+/// The fields both backlog log lines carry (posh#131 diagnosis): stalled vs
+/// bursty, and `paced=` — a paced viewport holds at most one frame pair
+/// (RFC 0008 §3.2), so a paced client at the high-water mark or dropped is
+/// a posh bug, not a slow reader. Telling the viewport why it was dropped
+/// is posh#226.
+fn backlog_log_fields(c: &ClientConn, now: u64) -> String {
+    format!(
+        "fd={} backlog={} drained_total={} last_drain_age_ms={} paced={}",
+        c.stream.as_raw_fd(),
+        c.write_buf.len(),
+        c.bytes_drained,
+        now.saturating_sub(c.last_drain_ms),
+        u8::from(c.is_paced()),
+    )
+}
+```
+
+The lines become `client backlog high-water {}` and `dropping slow client
+{}` with `backlog_log_fields(c, now)`; the existing prefixes stay (they are
+grep targets).
+
+**Step 3: Run** `just debug-cargo test -p posh --bin posh session::daemon`
+— expected PASS.
+
+**Step 4: Commit** — message:
+`daemon: backlog log lines say paced= — a dropped paced viewport is a bug (posh#225; reason to the viewport is posh#226)`
+
+### Task 2.7: A frame counter on the mux peer (for the exit check)
+
+**Promotion criteria:** N/A — diagnostic only.
+
+Verified missing: the agent-only/mux peer's SIGUSR2 line
+(`server.rs:425-441`) reports `session_channels=` and no frame count.
+
+**Files:**
+- Modify: `crates/posh/src/remote/server.rs` — `SessionBridge`
+  (`:309-347`) gains `visible_forwarded: u64`; its literal at `:1017-1034`
+  and `test_bridge` (`:2802`) set `0`; the `Tag::Frame` arm (`:698-728`)
+  increments it when `!scrollback`; the SIGUSR2 line gains
+  `session_frames={}`.
+- Modify: `doc/posh-server.1.scd` — the SIGUSR2 paragraph's mux-peer
+  sentence (`:226-230`) names the visible-frame count.
+
+**Step 1: Failing test** — `session_frames_forwarded_sums_linked_channels`:
+two `PeerChannel::Linked(test_bridge())` with counts 3 and 4 plus an
+`Awaiting` channel → `session_frames_forwarded(&channels) == 7`.
+
+**Step 2: Implement** `fn session_frames_forwarded(channels: &[PeerChannel]) -> u64`
+and use it in the SIGUSR2 line. Run
+`just debug-cargo test -p posh --bin posh session_frames_forwarded` —
+expected PASS; `just lint-doc` — clean.
+
+**Step 3: Commit** — message:
+`mux peer: count visible frames forwarded in the SIGUSR2 line (posh#225 Stage 2 exit check)`
+
+### Task 2.8: Records
+
+**Files:**
+- Modify: `docs/features/0021-flood-delivery.md` — Tuning Levers gets
+  Task 2.5's measured paced rows (and how to re-run them); Limitations
+  gets the Lagged-cadence finding either way.
+- Modify: `doc/posh-client.1.scd` ENVIRONMENT (beside `POSH_FRAMESYNC`,
+  `:187`) and `doc/posh.1.scd` ENVIRONMENT (beside `POSH_FRAMESYNC`,
+  `:498`): `POSH_PACED` — default on for remote attach, `0` off, read per
+  attach, takes effect on the next attach without restarting the session;
+  local attach unaffected until Stage 6. (Task 7.1 is the checklist; the
+  lever's entry lands with the lever.)
+- Modify: this plan — a "Stage 2 as built" section in the style of
+  "Stage 1 as built", superseding this stage's task text where it differs.
+
+**Step 1:** `just lint-doc` and `just lint-fmt` — clean (scdoc: no line
+starting with `[`, no `*` inside `_italic_`).
+
+**Step 2: Commit** — message:
+`docs: POSH_PACED in the man pages; FDR 0021 measurements; Stage 2 as built (posh#225)`
+with `Closes #227` in the body (queue row 2: decision 6 settled it; this
+stage implements it).
+
+**Step 3:** merge the stage with `merge-this-session` (its pre-merge hook
+is the CI lane; do not run `just` first).
 
 **Stage 2 exit check:** a remote flood shows the bridge forwarding a
-handful of frames per second instead of one per PTY read
-(`just debug-posh-dump` on the bridge; add a counter to the status line if
-one is missing), and Ctrl-C mid-flood repaints within one pacing interval.
+handful of visible frames per second instead of one per PTY read — send
+SIGUSR2 to the mux peer twice a few seconds apart and compare
+`session_frames=` in its per-client-host log (`<base>/agent/mux-<ID>.log`,
+`posh-server(1)`) — and Ctrl-C mid-flood repaints within one pacing
+interval. Unverified: whether `just debug-posh-dump <pid>` signals the mux
+peer process; if it does not, `kill -USR2 <mux peer pid>` and read that log.
 
 ---
 
