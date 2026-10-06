@@ -341,6 +341,11 @@ struct SessionBridge {
     /// negotiation. The client's consumable caps do not change across a
     /// switch (same client), so re-homing must not silently downgrade them.
     content: Vec<caps::Cap>,
+    /// The SCROLLBACK2 payload last forwarded to the daemon as `ClientCaps`
+    /// (posh#225 Stage 3): the viewport sends its cumulative ack on every
+    /// message, the socket is reliable, so only a changed payload is worth a
+    /// record. Cleared on a re-home — the new daemon has not heard it.
+    sb2_forwarded: Option<Vec<u8>>,
     /// Visible (non-scrollback) daemon frames forwarded on this channel, for
     /// the SIGUSR2 `session_frames=` count.
     visible_forwarded: u64,
@@ -1048,6 +1053,7 @@ fn handle_session_instruction(
                             last_send: 0,
                             echo: crate::remote::sync::EchoAck::resume(resume.echo),
                             frame_flags: 0,
+                            sb2_forwarded: None,
                             visible_forwarded: 0,
                         }));
                     }
@@ -1149,18 +1155,24 @@ fn rehome_bridge(
         b.client_size,
         &b.content,
     )?;
+    // The new daemon has heard no ack yet; its Init carried `content`'s
+    // entry, and the next message's entry is forwarded afresh.
+    b.sb2_forwarded = None;
     Ok(())
 }
 
 /// The client half of the daemon `Tag::Init` this bridge sends for a
 /// channel: the relay's content caps (RFC 0008 §4) plus what only the M2
 /// bridge carries (ADR 0007) — the viewport's `CAP_PACED` entry
-/// (posh#225, RFC 0008 §3.2), verbatim. The caller appends its own
-/// identity. Retained as `SessionBridge::content`, so a re-home re-Inits
-/// with the same negotiation.
+/// (posh#225, RFC 0008 §3.2) and its `CAP_SCROLLBACK2` entry (RFC 0009 §3,
+/// the epoch and count the daemon opens its history cursor from), each
+/// verbatim. The caller appends its own identity. Retained as
+/// `SessionBridge::content`, so a re-home re-Inits with the same
+/// negotiation.
 fn bridge_init_content(client_caps: &[caps::Cap]) -> Vec<caps::Cap> {
     let mut content = crate::remote::relay::content_caps(client_caps);
     content.extend(caps::find(client_caps, caps::CAP_PACED).cloned());
+    content.extend(caps::find(client_caps, caps::CAP_SCROLLBACK2).cloned());
     content
 }
 
@@ -1191,6 +1203,20 @@ fn bridge_client_message(b: &mut SessionBridge, msg: &crate::remote::sync::Clien
             .filter(|c| matches!(c.id, caps::CAP_PUSH_CMD | caps::CAP_PUSH_CMD_REQUEST))
             .cloned(),
     );
+    // posh#225 Stage 3: the viewport's SCROLLBACK2 entry is its cumulative
+    // v2 ack (RFC 0009 §3); forward it when it changed (the socket is
+    // reliable), and keep `content`'s copy current so a re-home re-Inits
+    // the new daemon at the viewport's position, not its first message's.
+    if let Some(entry) = caps::find(&msg.caps, caps::CAP_SCROLLBACK2) {
+        if b.sb2_forwarded.as_deref() != Some(&entry.payload[..]) {
+            b.sb2_forwarded = Some(entry.payload.clone());
+            forwarded.push(entry.clone());
+        }
+        match b.content.iter_mut().find(|c| c.id == caps::CAP_SCROLLBACK2) {
+            Some(held) => *held = entry.clone(),
+            None => b.content.push(entry.clone()),
+        }
+    }
     if !forwarded.is_empty() {
         ipc::append_frame(
             &mut b.daemon.link.write,
@@ -2804,6 +2830,7 @@ mod tests {
             echo: crate::remote::sync::EchoAck::resume(resume.echo),
             frame_flags: 0,
             content: Vec::new(),
+            sb2_forwarded: None,
             visible_forwarded: 0,
         };
         (b, peer)
@@ -3101,6 +3128,126 @@ mod tests {
         assert_eq!(init.tag, crate::session::ipc::Tag::Init);
         let (table, _) = caps::decode_table(&init.payload[4..]).unwrap();
         assert!(caps::find(&table, caps::CAP_PACED).is_some());
+    }
+
+    /// The viewport's v2 SCROLLBACK2 entry as it rides every message.
+    fn sb2(epoch: u8, rows: u64) -> caps::Cap {
+        caps::encode_scrollback2_client(&caps::Scrollback2Client {
+            ring_depth: 0,
+            epoch,
+            acked_rows: rows,
+        })
+    }
+
+    /// Every `Tag::ClientCaps` table the bridge queued to the daemon link.
+    fn client_caps_records(b: &SessionBridge) -> Vec<Vec<caps::Cap>> {
+        let mut fb = crate::session::ipc::FrameBuffer::new();
+        fb.feed(&b.daemon.link.write);
+        let mut records = Vec::new();
+        while let Ok(Some(rec)) = fb.next() {
+            if rec.tag == crate::session::ipc::Tag::ClientCaps {
+                records.push(caps::decode_table(&rec.payload).unwrap().0);
+            }
+        }
+        records
+    }
+
+    /// A quiet message (no input, current size) carrying `caps`.
+    fn send_caps(b: &mut SessionBridge, caps: Vec<caps::Cap>) {
+        let msg = crate::remote::sync::ClientMessage {
+            flags: 0,
+            caps,
+            acked_frame: 0,
+            rows: b.client_size.0,
+            cols: b.client_size.1,
+            input_base: 0,
+            input: Vec::new(),
+        };
+        assert!(bridge_client_message(b, &msg));
+    }
+
+    /// posh#225 Stage 3: the M2 bridge carries the viewport's SCROLLBACK2
+    /// entry into the daemon Init iff the viewport advertised it.
+    #[test]
+    fn bridge_init_carries_the_viewports_scrollback2_entry() {
+        let with = bridge_init_content(&[sb2(0, 0)]);
+        assert_eq!(caps::find(&with, caps::CAP_SCROLLBACK2), Some(&sb2(0, 0)));
+        let without = bridge_init_content(&[]);
+        assert!(caps::find(&without, caps::CAP_SCROLLBACK2).is_none());
+    }
+
+    /// ADR 0007: the relay never carries it.
+    #[test]
+    fn the_relay_never_carries_scrollback2() {
+        let table = vec![sb2(1, 5)];
+        assert!(crate::remote::relay::content_caps(&table).is_empty());
+        assert!(crate::remote::relay::forwarded_client_caps(&table).is_empty());
+    }
+
+    #[test]
+    fn the_bridge_forwards_a_changed_scrollback2_ack_once() {
+        let (mut b, _peer) = test_bridge();
+        send_caps(&mut b, vec![sb2(1, 5)]);
+        assert_eq!(client_caps_records(&b), vec![vec![sb2(1, 5)]]);
+        send_caps(&mut b, vec![sb2(1, 5)]);
+        assert_eq!(client_caps_records(&b).len(), 1, "an unchanged ack is not re-sent");
+        send_caps(&mut b, vec![sb2(1, 9)]);
+        assert_eq!(
+            client_caps_records(&b),
+            vec![vec![sb2(1, 5)], vec![sb2(1, 9)]]
+        );
+    }
+
+    #[test]
+    fn the_bridge_keeps_its_init_content_at_the_viewports_latest_entry() {
+        let (mut b, _peer) = test_bridge();
+        b.content = bridge_init_content(&[sb2(1, 0)]);
+        send_caps(&mut b, vec![sb2(1, 5)]);
+        send_caps(&mut b, vec![sb2(1, 9)]);
+        assert_eq!(caps::find(&b.content, caps::CAP_SCROLLBACK2), Some(&sb2(1, 9)));
+        assert_eq!(
+            b.content
+                .iter()
+                .filter(|c| c.id == caps::CAP_SCROLLBACK2)
+                .count(),
+            1
+        );
+    }
+
+    #[test]
+    fn rehome_bridge_reinits_with_the_latest_scrollback2_entry_and_forwards_afresh() {
+        let (mut b, _peer) = test_bridge();
+        b.content = bridge_init_content(&[sb2(0, 0)]);
+        send_caps(&mut b, vec![sb2(3, 77)]);
+        let mut connect = |_: &str| {
+            let (a, other) = std::os::unix::net::UnixStream::pair().unwrap();
+            std::mem::forget(other);
+            Ok(a)
+        };
+        rehome_bridge(&mut b, "work/s-1", &mut connect).unwrap();
+        let mut fb = crate::session::ipc::FrameBuffer::new();
+        fb.feed(&b.daemon.link.write);
+        let init = fb.next().unwrap().unwrap();
+        assert_eq!(init.tag, crate::session::ipc::Tag::Init);
+        let (table, _) = caps::decode_table(&init.payload[4..]).unwrap();
+        let entry = caps::find(&table, caps::CAP_SCROLLBACK2).expect("id 10 in the re-Init");
+        let got = caps::decode_scrollback2_client(&entry.payload).unwrap();
+        assert_eq!((got.epoch, got.acked_rows), (3, 77));
+        send_caps(&mut b, vec![sb2(3, 77)]);
+        assert_eq!(
+            client_caps_records(&b),
+            vec![vec![sb2(3, 77)]],
+            "the new daemon leg is told the position afresh"
+        );
+    }
+
+    #[test]
+    fn a_message_without_scrollback2_forwards_nothing_for_it() {
+        let (mut b, _peer) = test_bridge();
+        b.content = bridge_init_content(&[sb2(1, 5)]);
+        send_caps(&mut b, Vec::new());
+        assert!(client_caps_records(&b).is_empty());
+        assert_eq!(caps::find(&b.content, caps::CAP_SCROLLBACK2), Some(&sb2(1, 5)));
     }
 
     #[test]
