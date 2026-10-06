@@ -353,10 +353,14 @@ struct Pacing {
     /// viewport's Init carried a well-formed `CAP_SCROLLBACK2`; it then gets
     /// `Scrollback2` bodies and never v1 `Scrollback` frames.
     history: Option<HistoryCursor>,
+    /// This viewport's Init asked for the v2 extent (posh#225 Stage 4):
+    /// latched when its cursor opens (`open_history`), as `server_loop`
+    /// latches `peer_wants_extent`.
+    wants_extent: bool,
     /// The v2 extent (RFC 0009 §3.1, posh#225 Stage 4) as of the newest
-    /// pass with the session terminal; rides every frame to a viewport that
-    /// asked; frozen under the escape overlay. `None` for a viewport that
-    /// did not ask, or has no cursor.
+    /// pass with the session terminal (`refresh_history_extent`); rides
+    /// every frame of its epoch (`queue_frame`); frozen under the escape
+    /// overlay. `None` for a viewport that did not ask, or has no cursor.
     extent: Option<caps::Scrollback2Extent>,
     /// Whether the newest paced send was a visible frame (`server_loop`'s
     /// `last_was_sb`, inverted): when both kinds are due, the other one
@@ -438,8 +442,10 @@ impl ClientConn {
     /// Retain the RFC 0014 entries in a cap table (§3): identity and state,
     /// keyed to this connection. `from_init` marks the table as this
     /// attachment's own (its pid becomes `attach_pid`); a later `ClientCaps`
-    /// identity with another pid is the origin behind a relay.
-    fn absorb_client_caps(&mut self, table: &[caps::Cap], now: u64, from_init: bool) {
+    /// identity with another pid is the origin behind a relay. `total` is
+    /// the session terminal's primary-scrollback total, which a v2 viewport
+    /// reset's fresh epoch opens at (`HistoryCursor::on_ack`).
+    fn absorb_client_caps(&mut self, table: &[caps::Cap], now: u64, from_init: bool, total: u64) {
         // RFC 0013 §5.2: an activity-label request latches for the
         // connection (the client re-sends it on every message anyway).
         if caps::find(table, caps::CAP_SESSION_ACTIVITY).is_some() {
@@ -471,7 +477,7 @@ impl ClientConn {
             .and_then(|c| caps::decode_scrollback2_client(&c.payload).ok())
         {
             if let Some(h) = self.history_mut() {
-                h.on_ack(entry.epoch, entry.acked_rows, now);
+                h.on_ack(entry.epoch, entry.acked_rows, now, total);
             }
         }
     }
@@ -488,6 +494,9 @@ impl ClientConn {
         }
         let entry = caps::find(&self.caps, caps::CAP_SCROLLBACK2)
             .and_then(|c| caps::decode_scrollback2_client(&c.payload).ok());
+        let wants_extent = caps::find(&self.caps, caps::CAP_SCROLLBACK2_EXTENT)
+            .and_then(|c| caps::decode_scrollback2_extent_request(&c.payload))
+            .is_some();
         let (Some(p), Some(entry)) = (self.pacing.as_mut(), entry) else {
             return;
         };
@@ -504,9 +513,10 @@ impl ClientConn {
         let mut cursor = HistoryCursor::new((self.rows, self.cols));
         cursor.activate(start, term.primary_scrollback_total());
         p.history = Some(cursor);
+        p.wants_extent = wants_extent;
         // Seed the cached extent, so a frame sent before the first send pass
         // (the overlay up at attach) still carries one beside the id-10 entry.
-        self.note_history_extent(term);
+        self.refresh_history_extent(term);
     }
 
     /// RFC 0013 §5.2: this client asked for the activity label and has not
@@ -549,8 +559,9 @@ impl ClientConn {
     /// `decode_resize` rejects any non-4-byte payload; a cap-extended Init
     /// must still size the PTY. An absent or malformed trailing table leaves
     /// any previously negotiated caps in place (a bare re-`Init` on SIGCONT
-    /// resume does not wipe them).
-    fn apply_init(&mut self, payload: &[u8]) -> bool {
+    /// resume does not wipe them). `total` is the session terminal's
+    /// primary-scrollback total (`absorb_client_caps`).
+    fn apply_init(&mut self, payload: &[u8], total: u64) -> bool {
         self.init_applied = true;
         let resized = payload.get(..4).is_some_and(|prefix| self.apply_resize(prefix));
         if payload.len() > 4 {
@@ -576,7 +587,7 @@ impl ClientConn {
                     // RFC 0014: a client's Init table may carry its identity
                     // and state (the local client always does; a relay carries
                     // its own identity here and the origin's via ClientCaps).
-                    self.absorb_client_caps(&advertised, util::now_ms(), true);
+                    self.absorb_client_caps(&advertised, util::now_ms(), true, total);
                     self.caps = advertised;
                 }
                 Err(e) => util::log_write(
@@ -808,18 +819,12 @@ impl ClientConn {
         self.history().is_some()
     }
 
-    /// This client's Init asked for the v2 extent (posh#225 Stage 4).
-    fn wants_history_extent(&self) -> bool {
-        caps::find(&self.caps, caps::CAP_SCROLLBACK2_EXTENT)
-            .and_then(|c| caps::decode_scrollback2_extent_request(&c.payload))
-            .is_some()
-    }
-
     /// Refresh the cached extent (`Pacing::extent`) from the session
-    /// terminal.
-    fn note_history_extent(&mut self, term: &Terminal) {
-        let wants = self.wants_history_extent();
+    /// terminal: the one place it is computed, so it is `None` for a
+    /// viewport that did not ask (`Pacing::wants_extent`).
+    fn refresh_history_extent(&mut self, term: &Terminal) {
         if let Some(p) = self.pacing.as_mut() {
+            let wants = p.wants_extent;
             p.extent = p.history.and_then(|h| h.extent(term)).filter(|_| wants);
         }
     }
@@ -863,17 +868,19 @@ impl ClientConn {
     /// that asked, the extent as of this body (RFC 0009 §3.1), refreshing
     /// `Pacing::extent`.
     fn send_history_body(&mut self, term: &Terminal, now: u64) {
+        if self.producer.is_none() {
+            return;
+        }
         let rto = self.history_resend_after();
         let flags = self.echo_flag | self.overlay_flag;
-        let wants_extent = self.wants_history_extent();
-        let (Some(producer), Some(p)) = (self.producer.as_ref(), self.pacing.as_mut()) else {
-            return;
-        };
-        let Some(h) = p.history.as_mut() else {
+        let Some(h) = self.history_mut() else {
             return;
         };
         let (epoch, body) = h.next_body(term, now, rto, HISTORY_WINDOW_ROWS);
-        p.extent = wants_extent.then(|| h.extent(term)).flatten();
+        self.refresh_history_extent(term);
+        let (Some(producer), Some(p)) = (self.producer.as_ref(), self.pacing.as_mut()) else {
+            return;
+        };
         p.last_was_screen = false;
         let mut entries = vec![caps::encode_scrollback2_ack(epoch)];
         entries.extend(p.extent.as_ref().map(caps::encode_scrollback2_extent));
@@ -966,14 +973,17 @@ impl ClientConn {
         // RFC 0009 §1.1 (posh#225 Stage 3): a v2 viewport adopts its epoch
         // from the server's SCROLLBACK2 entry on the first frame it gets, so
         // every visible frame to it carries one, as `server_loop`'s do.
-        if let Some(epoch) = self.history().and_then(HistoryCursor::epoch) {
+        let epoch = self.history().and_then(HistoryCursor::epoch);
+        if let Some(epoch) = epoch {
             frame_caps.push(caps::encode_scrollback2_ack(epoch));
         }
-        // RFC 0009 §3.1 (posh#225 Stage 4): beside it, the cached extent, to
-        // a viewport that asked (`Pacing::extent`; refreshed per send pass,
-        // on a resize and when the cursor opens).
+        // RFC 0009 §3.1 (posh#225 Stage 4): beside it, the cached extent
+        // (`Pacing::extent`, `None` for a viewport that did not ask) — only
+        // when it names the epoch the id-10 entry does. A bump since the
+        // last refresh (a resize, a viewport reset) omits it until the next
+        // send pass refreshes it; never one of another epoch.
         let extent = self.pacing.as_ref().and_then(|p| p.extent);
-        if let Some(x) = extent.filter(|_| self.wants_history_extent()) {
+        if let Some(x) = extent.filter(|x| Some(x.epoch) == epoch) {
             frame_caps.push(caps::encode_scrollback2_extent(&x));
         }
         let encoded = match self.producer.as_mut() {
@@ -1445,7 +1455,7 @@ fn broadcast_source_swap(clients: &mut [ClientConn], src: &Terminal, bcast: &[u8
 fn send_paced_frames(clients: &mut [ClientConn], src: &Terminal, history: Option<&Terminal>, now: u64) {
     for c in clients.iter_mut() {
         if let Some(t) = history {
-            c.note_history_extent(t);
+            c.refresh_history_extent(t);
         }
         let screen = c.paced_send_at().is_some_and(|at| now >= at);
         let rows = history.filter(|t| c.history_send_at(t).is_some_and(|at| now >= at));
@@ -1834,10 +1844,6 @@ fn reset_history_on_resize(clients: &mut [ClientConn], term: &Terminal, (rows_be
         if !h.on_client_size(size, total) && renumbered {
             h.reanchor(total);
         }
-        // The cached extent must name the epoch the next frame's id-10 entry
-        // does, even if that frame goes out under the overlay or in the exit
-        // flush (no send pass with the session terminal in between).
-        c.note_history_extent(term);
     }
 }
 
@@ -2462,7 +2468,7 @@ fn daemon_loop(
                                     c.last_input_ms = util::now_ms();
                                 }
                                 Tag::Init => {
-                                    if c.apply_init(&frame.payload) {
+                                    if c.apply_init(&frame.payload, term.primary_scrollback_total()) {
                                         resized = true;
                                     }
                                     push_for = push_for.or(take_push_request(&c.caps, &mut served_pushes));
@@ -2506,7 +2512,12 @@ fn daemon_loop(
                                     // arrive. A malformed table is dropped, the
                                     // held record kept.
                                     if let Ok((table, _)) = caps::decode_table(&frame.payload) {
-                                        c.absorb_client_caps(&table, util::now_ms(), false);
+                                        c.absorb_client_caps(
+                                            &table,
+                                            util::now_ms(),
+                                            false,
+                                            term.primary_scrollback_total(),
+                                        );
                                         push_for = push_for.or(take_push_request(&table, &mut served_pushes));
                                     }
                                 }
@@ -2856,7 +2867,7 @@ mod tests {
             pid: 100,
             start_unix_ms: 1,
         };
-        c.absorb_client_caps(&[introspect::encode_client_ident(&relay)], 5, true);
+        c.absorb_client_caps(&[introspect::encode_client_ident(&relay)], 5, true, 0);
         assert_eq!(c.attach_pid, Some(100));
         assert_eq!(c.record.via_relay_pid, None);
         let origin = introspect::Ident {
@@ -2871,6 +2882,7 @@ mod tests {
             ],
             1_000,
             false,
+            0,
         );
         assert_eq!(c.record.via_relay_pid, Some(100));
         assert_eq!(c.record.ident.as_ref().map(|i| i.pid), Some(200));
@@ -2886,6 +2898,7 @@ mod tests {
             }],
             2_000,
             false,
+            0,
         );
         assert_eq!(c.record.state, Some(state));
     }
@@ -3280,7 +3293,7 @@ mod tests {
     /// Init, so it has no caps and no producer but IS attached.
     fn baseline_conn() -> ClientConn {
         let mut c = test_client_conn();
-        c.apply_init(&ipc::encode_resize(24, 80));
+        c.apply_init(&ipc::encode_resize(24, 80), 0);
         c
     }
 
@@ -3290,7 +3303,7 @@ mod tests {
         let mut payload = ipc::encode_resize(24, 80).to_vec();
         payload.extend_from_slice(&caps::encode_table(&caps::own_table(&[])));
 
-        let resized = c.apply_init(&payload);
+        let resized = c.apply_init(&payload, 0);
 
         assert!(resized, "resize prefix must still size the PTY");
         assert_eq!((c.rows, c.cols), (24, 80), "size decoded from the 4-byte prefix");
@@ -3305,7 +3318,7 @@ mod tests {
     fn bare_init_records_empty_caps_and_resizes() {
         let mut c = test_client_conn();
 
-        let resized = c.apply_init(&ipc::encode_resize(10, 40));
+        let resized = c.apply_init(&ipc::encode_resize(10, 40), 0);
 
         assert!(resized, "a baseline 4-byte Init still resizes");
         assert_eq!((c.rows, c.cols), (10, 40));
@@ -3319,9 +3332,9 @@ mod tests {
         let mut c = test_client_conn();
         let mut first = ipc::encode_resize(24, 80).to_vec();
         first.extend_from_slice(&caps::encode_table(&caps::own_table(&[])));
-        c.apply_init(&first);
+        c.apply_init(&first, 0);
 
-        c.apply_init(&ipc::encode_resize(30, 100));
+        c.apply_init(&ipc::encode_resize(30, 100), 0);
 
         assert_eq!((c.rows, c.cols), (30, 100), "the re-Init still resizes");
         assert!(
@@ -3407,7 +3420,7 @@ mod tests {
         };
         let mut init = ipc::encode_resize(rows, cols).to_vec();
         init.extend_from_slice(&caps::encode_table(&caps::own_table(&[])));
-        c.apply_init(&init);
+        c.apply_init(&init, 0);
         c.maybe_enable_frames();
         (c, peer)
     }
@@ -3455,7 +3468,7 @@ mod tests {
             id: caps::CAP_KITTY_KEYBOARD,
             payload: vec![flags],
         }])));
-        c.apply_init(&init);
+        c.apply_init(&init, 0);
         c.maybe_enable_frames();
         (c, peer)
     }
@@ -3655,7 +3668,7 @@ mod tests {
         // NOT capable (bare Init) => none — the one remaining skew axis now
         // that the daemon-side gate is retired (posh#171).
         let mut baseline = test_client_conn();
-        baseline.apply_init(&ipc::encode_resize(24, 80));
+        baseline.apply_init(&ipc::encode_resize(24, 80), 0);
         baseline.maybe_enable_frames();
         assert!(baseline.producer.is_none(), "a non-capable client never gets a producer");
     }
@@ -3883,7 +3896,7 @@ mod tests {
 
         // No cap table in the Init => baseline peer; gate ON.
         let mut c = test_client_conn();
-        c.apply_init(&ipc::encode_resize(rows, cols));
+        c.apply_init(&ipc::encode_resize(rows, cols), 0);
         c.maybe_enable_frames();
         assert!(c.producer.is_none(), "a non-capable client never gets a producer");
 
@@ -3908,7 +3921,7 @@ mod tests {
 
         let (capable, _pc) = frame_capable_conn(rows, cols);
         let mut baseline = test_client_conn();
-        baseline.apply_init(&ipc::encode_resize(rows, cols));
+        baseline.apply_init(&ipc::encode_resize(rows, cols), 0);
         baseline.maybe_enable_frames();
         assert!(baseline.producer.is_none());
 
@@ -3985,7 +3998,7 @@ mod tests {
         // builds no producer and serves the baseline raw dump.
         {
             let mut c = test_client_conn();
-            c.apply_init(&ipc::encode_resize(rows, cols));
+            c.apply_init(&ipc::encode_resize(rows, cols), 0);
             c.maybe_enable_frames();
             assert!(c.producer.is_none(), "cell 2: no cap table ⇒ no producer even with gate on");
             broadcast_output(std::slice::from_mut(&mut c), &term, raw);
@@ -4075,7 +4088,7 @@ mod tests {
             id: caps::CAP_SCROLLBACK,
             payload: vec![0],
         }])));
-        c.apply_init(&init);
+        c.apply_init(&init, 0);
         c.maybe_enable_frames();
         (c, peer)
     }
@@ -4364,7 +4377,7 @@ mod tests {
         table.extend_from_slice(extra);
         let mut init = ipc::encode_resize(rows, cols).to_vec();
         init.extend_from_slice(&caps::encode_table(&caps::own_table(&table)));
-        c.apply_init(&init);
+        c.apply_init(&init, 0);
         c.maybe_enable_frames();
         (c, peer)
     }
@@ -4397,6 +4410,7 @@ mod tests {
             }],
             0,
             false,
+            0,
         );
         assert!(c.wants_activity);
         term.process(b" one");
@@ -4454,6 +4468,7 @@ mod tests {
             }],
             0,
             false,
+            0,
         );
         c.activity_now = Some(label("fish"));
         assert!(c.request_frame_from(&term));
@@ -4482,7 +4497,7 @@ mod tests {
         };
         let wants = |c: &mut ClientConn, ids: &[u8]| {
             let table: Vec<caps::Cap> = ids.iter().map(|&id| caps::Cap { id, payload: vec![] }).collect();
-            c.absorb_client_caps(&table, 0, false);
+            c.absorb_client_caps(&table, 0, false, 0);
         };
         let mut term = Terminal::with_scrollback(24, 80, 0);
         term.process(b"hello");
@@ -4563,18 +4578,18 @@ mod tests {
             id: caps::CAP_LOSSY,
             payload: vec![],
         }])));
-        c.apply_init(&init);
+        c.apply_init(&init, 0);
         assert!(c.lossy, "CAP_LOSSY on Init marks the client lossy");
 
         // A bare re-Init preserves it (skips the cap block), like `self.caps`.
-        c.apply_init(&ipc::encode_resize(30, 100));
+        c.apply_init(&ipc::encode_resize(30, 100), 0);
         assert!(c.lossy, "a bare re-Init preserves the lossy marker");
 
         // A reliable Init (no CAP_LOSSY) leaves it false.
         let mut r = test_client_conn();
         let mut rinit = ipc::encode_resize(24, 80).to_vec();
         rinit.extend_from_slice(&caps::encode_table(&caps::own_table(&[])));
-        r.apply_init(&rinit);
+        r.apply_init(&rinit, 0);
         assert!(!r.lossy, "no CAP_LOSSY ⇒ reliable");
     }
 
@@ -5000,7 +5015,7 @@ mod tests {
             id: caps::CAP_COALESCE,
             payload: vec![],
         }])));
-        c.apply_init(&init);
+        c.apply_init(&init, 0);
         c.maybe_enable_frames();
         (c, peer)
     }
@@ -5211,7 +5226,7 @@ mod tests {
             caps::Cap { id: caps::CAP_COALESCE, payload: vec![] },
             caps::Cap { id: caps::CAP_SCROLLBACK, payload: vec![0] },
         ])));
-        c.apply_init(&init);
+        c.apply_init(&init, 0);
         c.maybe_enable_frames();
         (c, peer)
     }
@@ -5499,7 +5514,7 @@ mod tests {
 
         // A baseline client is never owed one (it has no producer).
         let mut baseline = test_client_conn();
-        baseline.apply_init(&ipc::encode_resize(rows, cols));
+        baseline.apply_init(&ipc::encode_resize(rows, cols), 0);
         assert!(!resize_like_the_loop(&mut baseline, &term, rows + 16, cols));
     }
 
@@ -5693,7 +5708,7 @@ mod tests {
             if framed {
                 init.extend_from_slice(&caps::encode_table(&caps::own_table(&[])));
             }
-            c.apply_init(&init);
+            c.apply_init(&init, 0);
             c.maybe_enable_frames();
             broadcast_output(std::slice::from_mut(&mut c), &term, b"raw");
             if framed {
@@ -6153,14 +6168,7 @@ mod tests {
                 .and_then(|cap| caps::decode_scrollback2_extent(&cap.payload))
                 .filter(|x| self.epoch == Some(x.epoch))
             {
-                self.extent = Some(match self.extent {
-                    Some(held) => caps::Scrollback2Extent {
-                        epoch: x.epoch,
-                        avail_rows: held.avail_rows.max(x.avail_rows),
-                        evicted_upto: held.evicted_upto.max(x.evicted_upto),
-                    },
-                    None => x,
-                });
+                self.extent.get_or_insert(x).merge(&x);
             }
             if let FrameBody::Scrollback2 {
                 epoch,
@@ -6426,7 +6434,7 @@ mod tests {
                 handle_frame_ack(&mut c, &ipc::encode_frame_ack(n, 0), &term, now);
             }
             if let Some(ms) = case.pace {
-                ledger.ack_history(&mut c, case.acks, run.chunks, now, ms);
+                ledger.ack_history(&mut c, &term, case.acks, run.chunks, now, ms);
             }
 
             if let Some(ms) = case.pace {
@@ -6496,7 +6504,7 @@ mod tests {
                 if let Some(n) = ledger.deliverable_ack(eligible) {
                     handle_frame_ack(&mut c, &ipc::encode_frame_ack(n, 0), &term, now);
                 }
-                ledger.ack_history(&mut c, case.acks, step, now, ms);
+                ledger.ack_history(&mut c, &term, case.acks, step, now, ms);
                 paced_flood_send_pass(&mut c, &term, now, &mut ledger, &mut run, &mut newest, false);
                 newest_avail.push(now + ms);
                 if !c.write_buf.is_empty() || !(c.owes_paced_frame() || history_pending(&c, now)) {
@@ -6739,11 +6747,11 @@ mod tests {
         }
 
         /// The v2 viewport's cumulative ack at `now` under `acks`, applied
-        /// through `Tag::ClientCaps`'s path (`absorb_client_caps`). A no-op
-        /// for a v1 run, and for an ack the cursor already has.
-        fn ack_history(&self, c: &mut ClientConn, acks: FloodAcks, step: usize, now: u64, ms: u64) {
+        /// through `Tag::ClientCaps`'s path (`absorb_client_caps`) at `term`'s
+        /// total. A no-op for a v1 run, and for an ack the cursor already has.
+        fn ack_history(&self, c: &mut ClientConn, term: &Terminal, acks: FloodAcks, step: usize, now: u64, ms: u64) {
             if let Some((epoch, rows)) = self.viewport.as_ref().and_then(|v| v.ack(acks, step, now, ms)) {
-                c.absorb_client_caps(&[sb2_entry(epoch, rows)], now, false);
+                c.absorb_client_caps(&[sb2_entry(epoch, rows)], now, false, term.primary_scrollback_total());
             }
         }
 
@@ -7330,7 +7338,7 @@ mod tests {
         assert_eq!(c.pacing, Some(Pacing::default()));
         assert!(c.is_paced());
         c.pacing.as_mut().unwrap().dirty = true;
-        c.apply_init(&ipc::encode_resize(30, 100));
+        c.apply_init(&ipc::encode_resize(30, 100), 0);
         assert_eq!(
             c.pacing,
             Some(Pacing {
@@ -7546,7 +7554,7 @@ mod tests {
         let mut c = test_client_conn();
         let mut init = ipc::encode_resize(5, 24).to_vec();
         init.extend_from_slice(&caps::encode_table(&[caps::encode_paced()]));
-        c.apply_init(&init);
+        c.apply_init(&init, 0);
         c.maybe_enable_frames();
         assert!(c.pacing.is_some() && c.producer.is_none());
         assert!(!c.is_paced());
@@ -7674,6 +7682,7 @@ mod tests {
             }],
             0,
             false,
+            0,
         );
         c.activity_now = Some(label("vim"));
         queue_due_answers(std::slice::from_mut(&mut c), &term);
@@ -8035,7 +8044,7 @@ mod tests {
                     }
                     handle_frame_ack(c, &ipc::encode_frame_ack(sent, 0), &term, now);
                     if let Some(h) = history_of(c) {
-                        ack_history(c, h.epoch().unwrap(), h.sent_upto());
+                        ack_history(c, &term, h.epoch().unwrap(), h.sent_upto());
                     }
                     c.write_buf.clear();
                 }
@@ -8270,10 +8279,11 @@ mod tests {
 
     /// What the viewport's next message would forward: its cumulative ack,
     /// landing as of the cursor's last send — where these tests' clock
-    /// stands — so an advancing ack restarts the resend clock there.
-    fn ack_history(c: &mut ClientConn, epoch: u8, rows: u64) {
+    /// stands — so an advancing ack restarts the resend clock there — at
+    /// `term`'s total, as the daemon's `Tag::ClientCaps` arm passes it.
+    fn ack_history(c: &mut ClientConn, term: &Terminal, epoch: u8, rows: u64) {
         let now = history_of(c).map_or(0, |h| h.last_send());
-        c.absorb_client_caps(&[sb2_entry(epoch, rows)], now, false);
+        c.absorb_client_caps(&[sb2_entry(epoch, rows)], now, false, term.primary_scrollback_total());
     }
 
     /// `(epoch, row_offset, rows)` of every v2 body among `frames`.
@@ -8386,10 +8396,10 @@ mod tests {
         let (mut c, _peer) = paced_v2_conn(&term, sb2_entry(0, 0));
         scroll_rows(&mut term, 8);
         pass_at_the_history_opportunity(&mut c, &term);
-        ack_history(&mut c, 1, 5);
+        ack_history(&mut c, &term, 1, 5);
         let before = history_of(&c).expect("a cursor");
         assert_eq!(before.acked_rows(), 5);
-        c.apply_init(&ipc::encode_resize(5, 24));
+        c.apply_init(&ipc::encode_resize(5, 24), term.primary_scrollback_total());
         c.open_history(&term);
         assert_eq!(history_of(&c), Some(before));
     }
@@ -8445,8 +8455,8 @@ mod tests {
 
     /// A viewport that cleared its count under an epoch the daemon never
     /// bumped (its own resize whose size change never arrived) acks 0
-    /// again: the next history opportunity is due at once and opens epoch 2,
-    /// and every frame after it carries the new epoch and its extent.
+    /// again: the ack opens epoch 2 at once, and every frame after it
+    /// carries the new epoch and its extent.
     #[test]
     fn an_ack_back_to_zero_is_a_viewport_reset_answered_with_a_fresh_epoch() {
         let mut term = v2_term(5, 24, 1000);
@@ -8454,19 +8464,14 @@ mod tests {
         scroll_rows(&mut term, 8);
         assert_eq!(history_bodies(&pass_at_the_history_opportunity(&mut c, &term)), vec![(1, 0, 8)]);
         c.write_buf.clear();
-        ack_history(&mut c, 1, 5);
+        ack_history(&mut c, &term, 1, 5);
         let last = last_history_send(&c);
         assert!(c.history_send_at(&term).is_some_and(|at| at > last), "rows 5..8 await the resend");
 
-        ack_history(&mut c, 1, 0);
-        assert_eq!(c.history_send_at(&term), Some(last), "a reset is due at once");
-        let frames = pass_at_the_history_opportunity(&mut c, &term);
-        assert_eq!(history_bodies(&frames), vec![(2, 0, 0)], "epoch 2, anchored at the total");
-        assert_eq!(sb2_epochs(&frames), vec![Some(2)]);
-        assert_eq!(extents(&frames), vec![extent(2, 0, 0)]);
-        assert_eq!(history_of(&c).and_then(|h| h.epoch()), Some(2));
+        ack_history(&mut c, &term, 1, 0);
+        assert_eq!(history_of(&c).and_then(|h| h.epoch()), Some(2), "the reset bumps at once");
+        assert_eq!(c.history_send_at(&term), None, "epoch 2: nothing fresh, nothing in flight");
 
-        c.write_buf.clear();
         broadcast_output(std::slice::from_mut(&mut c), &term, b"x");
         let frames = send_at_the_opportunity(&mut c, &term);
         assert_eq!(sb2_epochs(&frames), vec![Some(2)], "a visible frame names the new epoch");
@@ -8567,7 +8572,7 @@ mod tests {
                 panic!("one body per pass, got {bodies:?}");
             };
             lens.push(rows);
-            ack_history(&mut c, epoch, row_offset + rows as u64);
+            ack_history(&mut c, &term, epoch, row_offset + rows as u64);
             c.write_buf.clear();
         }
         assert_eq!(lens, vec![256, 256, 88]);
@@ -8590,7 +8595,7 @@ mod tests {
             Some(last + HISTORY_RESEND_INITIAL_MS),
             "88 fresh rows wait: the window is full"
         );
-        ack_history(&mut c, 1, 256);
+        ack_history(&mut c, &term, 1, 256);
         assert_eq!(c.history_send_at(&term), Some(last), "room again: due at once");
         let third = history_bodies(&pass_at_the_history_opportunity(&mut c, &term));
         assert_eq!(third, vec![(1, 512, 88)]);
@@ -8603,7 +8608,7 @@ mod tests {
         scroll_rows(&mut term, 512);
         pass_at_the_history_opportunity(&mut c, &term);
         pass_at_the_history_opportunity(&mut c, &term);
-        ack_history(&mut c, 1, 100);
+        ack_history(&mut c, &term, 1, 100);
         let last = last_history_send(&c);
         c.write_buf.clear();
         send_paced_frames(std::slice::from_mut(&mut c), &term, Some(&term), last + PACED_FRAME_FLOOR_MS);
@@ -8628,7 +8633,7 @@ mod tests {
             assert_eq!(history_bodies(&frames), vec![(1, 0, 10)], "resent from the ack");
         }
         c.write_buf.clear();
-        ack_history(&mut c, 1, 5);
+        ack_history(&mut c, &term, 1, 5);
         let last = last_history_send(&c);
         assert_eq!(c.history_send_at(&term), Some(last + base), "an advancing ack resets the backoff");
     }
@@ -8650,10 +8655,10 @@ mod tests {
     fn a_stale_epoch_or_backward_ack_is_ignored() {
         let term = v2_term(5, 24, 100);
         let (mut c, _peer) = paced_v2_conn(&term, sb2_entry(0, 0));
-        ack_history(&mut c, 1, 5);
-        ack_history(&mut c, 2, 9);
+        ack_history(&mut c, &term, 1, 5);
+        ack_history(&mut c, &term, 2, 9);
         assert_eq!(history_of(&c).unwrap().acked_rows(), 5, "another epoch's ack");
-        ack_history(&mut c, 1, 3);
+        ack_history(&mut c, &term, 1, 3);
         assert_eq!(history_of(&c).unwrap().acked_rows(), 5, "a backward ack");
     }
 
@@ -8664,7 +8669,7 @@ mod tests {
         scroll_rows(&mut term, 10);
         let first = history_bodies(&pass_at_the_history_opportunity(&mut c, &term));
         assert_eq!(first, vec![(1, 0, 10)]);
-        ack_history(&mut c, 1, 10);
+        ack_history(&mut c, &term, 1, 10);
         c.write_buf.clear();
         scroll_rows(&mut term, 200);
         let avail = 210;
@@ -8681,7 +8686,7 @@ mod tests {
                     rows,
                 } = f.body
                 {
-                    ack_history(&mut c, epoch, row_offset + rows.len() as u64);
+                    ack_history(&mut c, &term, epoch, row_offset + rows.len() as u64);
                     spans.push((row_offset, rows.len() as u64));
                     delivered.extend(rows);
                 }
@@ -8710,7 +8715,7 @@ mod tests {
         // `b` holds rows 0..8, acked to 5.
         scroll_rows(&mut term, 8);
         assert_eq!(history_bodies(&pass_at_the_history_opportunity(&mut clients[1], &term)), vec![(1, 0, 8)]);
-        ack_history(&mut clients[1], 1, 5);
+        ack_history(&mut clients[1], &term, 1, 5);
         clients[1].write_buf.clear();
         // Rows 8..10 scroll but are not sent before the reflow.
         scroll_rows(&mut term, 2);
@@ -8740,7 +8745,7 @@ mod tests {
         // `b`'s next fresh body starts at the count at the reflow: a forward
         // jump over the 2 unsent rows, never a silent seam.
         scroll_rows(&mut term, 3);
-        ack_history(&mut clients[1], 1, 8);
+        ack_history(&mut clients[1], &term, 1, 8);
         let frames = pass_at_the_history_opportunity(&mut clients[1], &term);
         assert_eq!(history_bodies(&frames), vec![(1, 10, 3)]);
     }
@@ -8760,7 +8765,7 @@ mod tests {
         // The tall viewport holds rows 0..6; rows 6..10 are not sent yet.
         scroll_rows(&mut term, 6);
         assert_eq!(history_bodies(&pass_at_the_history_opportunity(&mut clients[1], &term)), vec![(1, 0, 6)]);
-        ack_history(&mut clients[1], 1, 6);
+        ack_history(&mut clients[1], &term, 1, 6);
         clients[1].write_buf.clear();
         let held = newest_ring_rows(&term, 6);
         scroll_rows(&mut term, 4);
@@ -8784,7 +8789,7 @@ mod tests {
                     rows,
                 } = f.body
                 {
-                    ack_history(&mut clients[0], epoch, row_offset + rows.len() as u64);
+                    ack_history(&mut clients[0], &term, epoch, row_offset + rows.len() as u64);
                     delivered.extend(rows);
                 }
             }
@@ -9114,7 +9119,7 @@ mod tests {
         scroll_rows(&mut term, 10);
         let first = pass_at_the_history_opportunity(&mut c, &term);
         assert_eq!(history_bodies(&first), vec![(1, 0, 10)]);
-        ack_history(&mut c, 1, 10);
+        ack_history(&mut c, &term, 1, 10);
         c.write_buf.clear();
         scroll_rows(&mut term, 200);
         let frames = pass_at_the_history_opportunity(&mut c, &term);
@@ -9145,7 +9150,7 @@ mod tests {
         let mut clients = vec![short, tall];
         scroll_rows(&mut term, 6);
         assert_eq!(history_bodies(&pass_at_the_history_opportunity(&mut clients[1], &term)), vec![(1, 0, 6)]);
-        ack_history(&mut clients[1], 1, 6);
+        ack_history(&mut clients[1], &term, 1, 6);
         clients[1].write_buf.clear();
         scroll_rows(&mut term, 4);
 
@@ -9193,8 +9198,10 @@ mod tests {
     }
 
     /// RFC 0009 §3.1: the extent names the epoch of the id-10 entry beside
-    /// it — even when the viewport's own resize bumps the epoch while the
-    /// overlay is up, so no send pass refreshes the cache before the frame.
+    /// it. Under the overlay no send pass refreshes the cache: after a
+    /// re-anchor (same epoch) the frame carries the cached extent, whose
+    /// floor is at most the live one; after the viewport's own resize bumps
+    /// the epoch, it carries none — never one of another epoch.
     #[test]
     fn a_resize_under_the_overlay_keeps_the_extent_in_the_frames_epoch() {
         let mut term = v2_term(5, 24, 1000);
@@ -9204,20 +9211,33 @@ mod tests {
         broadcast_output(&mut clients, &term, b"x");
         let frames = send_at_the_opportunity(&mut clients[0], &term);
         assert_eq!(extents(&frames), vec![extent(1, 5, 0)]);
-        let sent = clients[0].producer.as_ref().unwrap().last_visible_num();
-        clients[0].apply_frame_ack(&ipc::encode_frame_ack(sent, 0));
-        clients[0].write_buf.clear();
+        let overlay_frame = |clients: &mut Vec<ClientConn>, term: &Terminal| {
+            let sent = clients[0].producer.as_ref().unwrap().last_visible_num();
+            clients[0].apply_frame_ack(&ipc::encode_frame_ack(sent, 0));
+            clients[0].write_buf.clear();
+            broadcast_output(clients, term, b"x");
+            let at = clients[0].paced_send_at().expect("a frame is owed");
+            send_paced_frames(clients, term, None, at);
+            let frames = decode_server_frames(&clients[0].write_buf);
+            assert_eq!(frames.len(), 1, "one visible frame: {frames:?}");
+            frames
+        };
 
+        // A width reflow the viewport did not report: a re-anchor.
+        let before = (term.rows(), term.cols());
+        term.resize(5, 30);
+        reset_history_on_resize(&mut clients, &term, before);
+        let frames = overlay_frame(&mut clients, &term);
+        assert_eq!(sb2_epochs(&frames), vec![Some(1)], "no new epoch");
+        assert_eq!(extents(&frames), vec![extent(1, 5, 0)], "the cached extent of the same epoch");
+
+        // The viewport's own resize: a bump.
         assert!(clients[0].apply_resize(&ipc::encode_resize(6, 24)));
         let size = (term.rows(), term.cols());
         reset_history_on_resize(&mut clients, &term, size);
-        broadcast_output(&mut clients, &term, b"x");
-        let at = clients[0].paced_send_at().expect("a frame is owed");
-        send_paced_frames(&mut clients, &term, None, at);
-        let frames = decode_server_frames(&clients[0].write_buf);
-        assert_eq!(frames.len(), 1, "one visible frame: {frames:?}");
+        let frames = overlay_frame(&mut clients, &term);
         assert_eq!(sb2_epochs(&frames), vec![Some(2)], "the bumped epoch");
-        assert_eq!(extents(&frames), vec![extent(2, 0, 0)], "an extent of the same epoch");
+        assert_eq!(extents(&frames), vec![None], "no extent of another epoch");
     }
 
     /// The cache is seeded when the cursor opens: a visible frame built

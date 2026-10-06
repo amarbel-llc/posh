@@ -596,11 +596,17 @@ impl ScrollbackRing {
     /// bytes the body carried; it does not derive them from the visible
     /// body). A hole goes with the row after it.
     pub fn append(&mut self, rows: &[Vec<u8>]) {
+        self.append_owned(rows.iter().cloned());
+    }
+
+    /// [`Self::append`], moving owned rows in rather than copying them (a
+    /// held body drained into the ring is already owned).
+    pub fn append_owned(&mut self, rows: impl IntoIterator<Item = Vec<u8>>) {
         for row in rows {
             if self.rows.len() >= self.capacity {
                 self.rows.pop_front();
             }
-            self.rows.push_back(row.clone());
+            self.rows.push_back(row);
             self.appended += 1;
         }
         let first = self.first_number();

@@ -47,9 +47,12 @@ pub(crate) fn history_view_len(scrollback: &ScrollbackRing, arriving: u64) -> us
 
 /// The words of a hole row (UX decision 8) — the one place they live.
 pub(crate) fn hole_label(lines: u64, arriving: bool) -> String {
-    let plural = if lines == 1 { "" } else { "s" };
     let what = if arriving { "arriving" } else { "not received" };
-    format!("{} line{plural} {what}", display::group_thousands(lines))
+    format!(
+        "{} line{} {what}",
+        display::group_thousands(lines),
+        display::plural(lines)
+    )
 }
 
 /// A hole row as ring-row bytes: dim, centred in `cols`, truncated so it
@@ -150,7 +153,6 @@ pub(crate) fn compose_scroll_frame(
     *scroll_memo = Some(memo);
 
     let rows_usize = rows as usize;
-    let view_len = scrollback.view_len();
     let sb_len = history_view_len(scrollback, arriving);
     // Visible grid rows serialized in the same per-row byte format as the ring,
     // so the whole logical history is one uniform sequence (FDR 0005).
@@ -167,16 +169,12 @@ pub(crate) fn compose_scroll_frame(
     let mut term = Terminal::with_scrollback(rows, cols, 0);
     let count = end - top;
     for (j, i) in (top..end).enumerate() {
-        let row: Cow<[u8]> = if i < view_len {
-            match scrollback.view_row(i) {
-                Some(ViewRow::Row(bytes)) => Cow::Borrowed(bytes),
-                Some(ViewRow::NotReceived(n)) => Cow::Owned(hole_row(&hole_label(n, false), cols)),
-                None => Cow::Borrowed(&[]),
-            }
-        } else if i < sb_len {
-            Cow::Owned(hole_row(&hole_label(arriving, true), cols))
-        } else {
-            Cow::Borrowed(&visible[i - sb_len])
+        // Past the ring's view rows: the arriving row, then the live grid.
+        let row: Cow<[u8]> = match scrollback.view_row(i) {
+            Some(ViewRow::Row(bytes)) => Cow::Borrowed(bytes),
+            Some(ViewRow::NotReceived(n)) => Cow::Owned(hole_row(&hole_label(n, false), cols)),
+            None if i < sb_len => Cow::Owned(hole_row(&hole_label(arriving, true), cols)),
+            None => Cow::Borrowed(&visible[i - sb_len]),
         };
         let row: &[u8] = &row;
         // The final row drops its trailing CRLF so it doesn't scroll the grid.

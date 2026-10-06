@@ -930,18 +930,21 @@ pub fn draw_bar_row(fb: &mut Snapshot, row: usize, text: &str) {
 /// reached this viewport yet (posh#225 Stage 4) — named only when non-zero,
 /// so a caught-up view keeps the plain text.
 pub fn apply_scroll_indicator(fb: &mut Snapshot, lines_up: usize, arriving: u64) {
-    let plural = |n: u64| if n == 1 { "" } else { "s" };
-    let up = format!("{lines_up} line{} up", plural(lines_up as u64));
-    let text = if arriving == 0 {
-        format!("-- SCROLLBACK · {up} · scroll down or press a key to resume --")
+    let arriving_part = if arriving == 0 {
+        String::new()
     } else {
-        format!(
-            "-- SCROLLBACK · {up} · {} line{} still arriving · scroll down or press a key to resume --",
-            group_thousands(arriving),
-            plural(arriving)
-        )
+        format!(" · {} line{} still arriving", group_thousands(arriving), plural(arriving))
     };
+    let text = format!(
+        "-- SCROLLBACK · {lines_up} line{} up{arriving_part} · scroll down or press a key to resume --",
+        plural(lines_up as u64)
+    );
     draw_top_bar(fb, &text);
+}
+
+/// The plural suffix for a count of `n` lines: `""` for one, `"s"` otherwise.
+pub fn plural(n: u64) -> &'static str {
+    if n == 1 { "" } else { "s" }
 }
 
 /// `n` in decimal with a comma between each group of three digits

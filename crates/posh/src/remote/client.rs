@@ -2654,19 +2654,27 @@ fn wheel_active(st: &ClientState) -> bool {
 fn reset_history_for_own_resize(st: &mut ClientState) {
     // RFC 0002 §4: a width change rewraps the server's ring, so absolute row
     // continuity ends. Drop the accumulated ring, discard the scroll view by
-    // virtue of the repaint, and stop advertising SCROLLBACK for the resize
-    // message so the server restarts appended-row counting afresh.
-    st.scrollback.clear();
-    st.scroll_offset = 0; // FDR 0005: a resize returns to the live view
-    st.suppress_scrollback_once = true;
+    // virtue of the repaint (FDR 0005: a resize returns to the live view),
+    // and stop advertising SCROLLBACK for the resize message so the server
+    // restarts appended-row counting afresh.
     // v2 (RFC 0009): expect a fresh epoch — the server, seeing our new size,
     // bumps it; until its ack arrives, in-flight v2 bodies from the
-    // superseded row space are discarded (unknown epoch). The extent and
-    // the held bodies belong to the old row space too (§3.1).
-    st.sb2_epoch = None;
+    // superseded row space are discarded (unknown epoch).
+    clear_v2_row_space(st, None);
+    st.suppress_scrollback_once = true;
+}
+
+/// Open a new history row space (RFC 0009 §1.1): `epoch` adopted from the
+/// server, or `None` awaiting one after this viewport's own resize. Drops
+/// the ring, the scroll view, the count, and the extent and held bodies,
+/// which belong to the old row space (§3.1).
+fn clear_v2_row_space(st: &mut ClientState, epoch: Option<u8>) {
+    st.scrollback.clear();
+    st.scroll_offset = 0;
     st.sb2_rows = 0;
     st.sb2_extent = None;
     st.sb2_held.clear();
+    st.sb2_epoch = epoch;
 }
 
 /// Sets the scroll-view offset via the shared [`scrollview::set_scroll`],
@@ -3163,12 +3171,7 @@ fn process_frame(st: &mut ClientState, frame: &ServerFrame) -> bool {
     if let Some(cap) = caps::find(&frame.caps, caps::CAP_SCROLLBACK2) {
         if let Ok(epoch) = caps::decode_scrollback2_ack(&cap.payload) {
             if st.sb2_epoch != Some(epoch) {
-                st.scrollback.clear();
-                st.scroll_offset = 0;
-                st.sb2_rows = 0;
-                st.sb2_epoch = Some(epoch);
-                st.sb2_extent = None;
-                st.sb2_held.clear();
+                clear_v2_row_space(st, Some(epoch));
             }
         }
     }
@@ -3182,9 +3185,7 @@ fn process_frame(st: &mut ClientState, frame: &ServerFrame) -> bool {
     {
         // Marked before adopting: a raised extent can add the arriving row.
         let mark = history_mark(st);
-        let held = st.sb2_extent.get_or_insert(x);
-        held.avail_rows = held.avail_rows.max(x.avail_rows);
-        held.evicted_upto = held.evicted_upto.max(x.evicted_upto);
+        st.sb2_extent.get_or_insert(x).merge(&x);
         settle_history(st);
         keep_history_anchor(st, mark);
     }
@@ -3238,32 +3239,36 @@ fn clear_reack(st: &mut ClientState) {
 /// its body, so whenever `sb2_extent` is `Some`, `T >= evicted_upto` and a
 /// body that reaches the hold branch is above the floor.
 fn apply_scrollback2_rows(st: &mut ClientState, row_offset: u64, rows: &[Vec<u8>]) {
-    if row_offset > st.sb2_rows {
-        if st.sb2_extent.is_some() {
-            // Past the bound the body is dropped: the go-back-N resend from
-            // our ack (which stays at the gap) sends it again.
-            st.sb2_held.hold(row_offset, rows);
-            settle_history(st);
-            return;
+    if row_offset > st.sb2_rows && st.sb2_extent.is_some() {
+        // Past the bound the body is dropped: the go-back-N resend from our
+        // ack (which stays at the gap) sends it again.
+        st.sb2_held.hold(row_offset, rows);
+    } else {
+        if row_offset > st.sb2_rows {
+            st.scrollback.mark_not_received(row_offset - st.sb2_rows);
+            st.sb2_rows = row_offset;
         }
-        st.scrollback.mark_not_received(row_offset - st.sb2_rows);
-        st.sb2_rows = row_offset;
+        if let Some(skip) = claim_scrollback2_tail(st, row_offset, rows.len()) {
+            st.scrollback.append(&rows[skip..]);
+        }
     }
-    append_scrollback2_tail(st, row_offset, rows);
     settle_history(st);
 }
 
-/// Append the part of a body at `row_offset <= T` past `T`, and advance
-/// `T` to its end. Partial overlap is routine — the session daemon resends
-/// from a lagging ack (posh#225 Stage 3) — so the rows below `T`, which
-/// this viewport holds (or labelled not received), are skipped.
-fn append_scrollback2_tail(st: &mut ClientState, row_offset: u64, rows: &[Vec<u8>]) {
-    let end = row_offset + rows.len() as u64;
+/// For a body of `len` rows at `row_offset <= T`: where its part past `T`
+/// begins (an index into the body), advancing `T` to its end — or `None`
+/// when `T` already covers it. Partial overlap is routine — the session
+/// daemon resends from a lagging ack (posh#225 Stage 3) — so the rows below
+/// `T`, which this viewport holds (or labelled not received), are skipped.
+/// The caller appends `body[skip..]`.
+fn claim_scrollback2_tail(st: &mut ClientState, row_offset: u64, len: usize) -> Option<usize> {
+    let end = row_offset + len as u64;
     if end <= st.sb2_rows {
-        return;
+        return None;
     }
-    st.scrollback.append(&rows[(st.sb2_rows - row_offset) as usize..]);
+    let skip = (st.sb2_rows - row_offset) as usize;
     st.sb2_rows = end;
+    Some(skip)
 }
 
 /// Advance `T` over what is held from it and over what can no longer
@@ -3272,7 +3277,10 @@ fn append_scrollback2_tail(st: &mut ClientState, row_offset: u64, rows: &[Vec<u8
 fn settle_history(st: &mut ClientState) {
     loop {
         if let Some((off, rows)) = st.sb2_held.take_reachable(st.sb2_rows) {
-            append_scrollback2_tail(st, off, &rows);
+            // The held body is owned: move its tail into the ring.
+            if let Some(skip) = claim_scrollback2_tail(st, off, rows.len()) {
+                st.scrollback.append_owned(rows.into_iter().skip(skip));
+            }
             continue;
         }
         let floor = st.sb2_extent.map_or(0, |x| x.evicted_upto);
@@ -6984,9 +6992,10 @@ mod tests {
         for frame in &frames[1..] {
             process_frame(&mut st, frame);
         }
+        let total = term.primary_scrollback_total();
         let ack = |st: &mut ClientState, cursor: &mut HistoryCursor, now: u64| {
             if let Some(epoch) = st.sb2_epoch {
-                cursor.on_ack(epoch, acked(st), now);
+                cursor.on_ack(epoch, acked(st), now, total);
             }
         };
         ack(&mut st, &mut cursor, 0);
@@ -7041,7 +7050,7 @@ mod tests {
         scroll_session(&mut term, 20);
         process_frame(&mut st, &cursor_frame(&mut cursor, &term, 0));
         assert_eq!((st.sb2_epoch, st.sb2_rows), (Some(1), 20));
-        assert!(cursor.on_ack(1, acked(&mut st), 0));
+        assert!(cursor.on_ack(1, acked(&mut st), 0, term.primary_scrollback_total()));
 
         // The SIGWINCH path; the cursor hears of no size change.
         reset_history_for_own_resize(&mut st);
@@ -7053,11 +7062,10 @@ mod tests {
         assert_eq!((st.sb2_epoch, st.sb2_rows), (Some(1), 0), "the same epoch, re-adopted at 0");
         assert_eq!(st.sb2_held.rows(), 5, "the body at 20 is held: the stall's signature");
         assert_eq!(acked(&mut st), 0);
-        assert!(!cursor.on_ack(1, acked(&mut st), 10), "a reset, not an advance");
-        assert!(cursor.reset_pending());
-
         let total = term.primary_scrollback_total();
-        assert!(cursor.wants(total, 10, CURSOR_RTO, u64::MAX), "the fresh epoch is due at once");
+        assert!(!cursor.on_ack(1, acked(&mut st), 10, total), "a reset, not an advance");
+        assert_eq!(cursor.epoch(), Some(2), "the reset bumps at once");
+
         process_frame(&mut st, &cursor_frame(&mut cursor, &term, 10));
         assert_eq!(st.sb2_epoch, Some(2), "a fresh epoch, adopted");
         assert_eq!(st.sb2_rows, 0);
@@ -7068,7 +7076,10 @@ mod tests {
             scroll_session(&mut term, n);
             process_frame(&mut st, &cursor_frame(&mut cursor, &term, now));
             let before = cursor.acked_rows();
-            assert!(cursor.on_ack(2, acked(&mut st), now), "the ack advances again");
+            assert!(
+                cursor.on_ack(2, acked(&mut st), now, term.primary_scrollback_total()),
+                "the ack advances again"
+            );
             assert_eq!(cursor.acked_rows(), before + n);
         }
         assert_eq!(st.sb2_rows, 7);

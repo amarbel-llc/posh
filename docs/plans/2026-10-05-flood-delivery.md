@@ -615,13 +615,15 @@ RFC 0001 row 24.
     after, `sb2_rows=11906 held=0 holes=0 rows_not_received=0
     held_drains=16 extent=(11938, 1938)`. The daemon's backoff test now
     measures gaps between successive row-0 sends (RFC 0009 §4, new bullet).
-  - **A reset under the same epoch** (`HistoryCursor::reset_pending`). A
+  - **A reset under the same epoch** (`HistoryCursor::on_ack`). A
     viewport that clears its count on its own resize under an epoch the
     sender never bumped (the intermediate size lost on the roaming path,
     the final size unchanged) re-adopted the epoch at `T = 0` and held the
     sender's bodies at its old cursor forever. A same-epoch ack of 0 after
-    the ack has advanced is a reset: the sender bumps on its next body.
-    Accepted cost (verified against `Datagram::recv`, which delivers late
+    the ack has advanced is a reset: the sender bumps at the ack (`on_ack`
+    takes the terminal's total; the simplify pass replaced a lazy
+    `reset_pending` bump in `next_body`), and the viewport learns the
+    fresh epoch from the next frame's id-10 entry. Accepted cost (verified against `Datagram::recv`, which delivers late
     reorders inside its 64-packet window): a stale 0 from the first round
     trip after adoption costs the viewport the ring of an epoch it adopted
     one reorder window ago (RFC 0009 §3.1, "A reset under the same epoch").
@@ -658,6 +660,22 @@ RFC 0001 row 24.
   Limitations (the posh#243 bullet rewritten, the reordering cost, the
   detach seam), a `SB2_HELD_MAX_ROWS` lever row with no measurement yet;
   `posh-client(1)` one sentence under `POSH_GRAB_MOUSE`.
+- **Simplify pass** (the commit after the records one): the daemon latches
+  `Pacing.wants_extent` at `open_history` and computes the cached extent in
+  one `refresh_history_extent` (send pass, history body, open); `queue_frame`
+  emits it only when its epoch matches the cursor's, which replaced the
+  resize-path refresh (a bump omits the extent until the next pass; a
+  re-anchor keeps the epoch and the cached floor is ≤ the live one). The
+  viewport clears its v2 row space in one `clear_v2_row_space`;
+  `apply_scrollback2_rows` has one exit; a drained held body is moved into
+  the ring (`ScrollbackRing::append_owned`) instead of copied twice;
+  `Scrollback2Extent::merge` holds the per-field-maximum rule;
+  `compose_scroll_frame`'s row loop is one `match`; `display::plural`
+  serves the bar and the hole label. Declined: dropping
+  `HistoryCursor::last_send` (its "due at once" would become a `Some(0)`
+  sentinel; a dozen tests pin `Some(last)`), merging `hole_label` into
+  `hole_row` (the test seam), and bracketing the v1 scrollback path with
+  `keep_history_anchor` (v1 is unchanged by design).
 - **Exit check: NOT yet done.** The Stage 4 exit check (end of Task 4.4)
   needs this build on both ends of a paced, mux-attached session; step (1)
   needs a throttled link (unverified how).

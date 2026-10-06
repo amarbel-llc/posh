@@ -615,6 +615,16 @@ pub struct Scrollback2Extent {
     pub evicted_upto: u64,
 }
 
+impl Scrollback2Extent {
+    /// Fold in a `newer` extent of the same epoch (the caller's to check):
+    /// each field takes the maximum, so a reordered older entry never
+    /// lowers what is held (RFC 0009 §3.1: both only grow within an epoch).
+    pub fn merge(&mut self, newer: &Self) {
+        self.avail_rows = self.avail_rows.max(newer.avail_rows);
+        self.evicted_upto = self.evicted_upto.max(newer.evicted_upto);
+    }
+}
+
 /// The v1 server payload: version, epoch, two u64 LE fields.
 const SCROLLBACK2_EXTENT_V1_LEN: usize = 18;
 
@@ -1035,6 +1045,22 @@ pub fn decode_metrics(payload: &[u8]) -> Option<[f64; METRICS_FIELDS]> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn scrollback2_extent_merge_takes_each_fields_maximum() {
+        let x = |avail_rows, evicted_upto| Scrollback2Extent {
+            epoch: 3,
+            avail_rows,
+            evicted_upto,
+        };
+        let mut held = x(100, 40);
+        held.merge(&x(90, 50));
+        assert_eq!(held, x(100, 50), "per field, not the newer entry wholesale");
+        held.merge(&x(80, 10));
+        assert_eq!(held, x(100, 50), "an older entry lowers nothing");
+        held.merge(&x(120, 60));
+        assert_eq!(held, x(120, 60));
+    }
 
     #[test]
     fn server_ident_roundtrips_and_rejects_truncation() {
