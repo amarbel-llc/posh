@@ -292,6 +292,13 @@ struct ClientConn {
     /// mark it dirty (`request_frame_from`), and `send_paced_frames` builds
     /// at most one per send opportunity (`paced_send_at`).
     pacing: Option<Pacing>,
+    /// Whether this connection's `Tag::Init` has been applied (`apply_init`;
+    /// read through `initialized`). Until then the daemon does not know
+    /// whether it is a frame viewport, a baseline one, or a one-shot control
+    /// connection (`posh list`'s Info probe, `history`, `kill`, a switch
+    /// request) that never Inits, so it is sent no broadcast output
+    /// (posh#239): the attach replay its Init triggers is its first screen.
+    init_applied: bool,
 }
 
 /// See `ClientConn::regeometry_keyframe`.
@@ -391,6 +398,7 @@ impl ClientConn {
     /// any previously negotiated caps in place (a bare re-`Init` on SIGCONT
     /// resume does not wipe them).
     fn apply_init(&mut self, payload: &[u8]) -> bool {
+        self.init_applied = true;
         let resized = payload.get(..4).is_some_and(|prefix| self.apply_resize(prefix));
         if payload.len() > 4 {
             match caps::decode_table(&payload[4..]) {
@@ -425,6 +433,13 @@ impl ClientConn {
             }
         }
         resized
+    }
+
+    /// Whether this connection's `Tag::Init` has been applied (see
+    /// `init_applied`). `rows > 0` is no proxy: a `Tag::Resize` before the
+    /// Init sizes a client too.
+    fn initialized(&self) -> bool {
+        self.init_applied
     }
 
     /// Applies a `Tag::Resize` payload: the client's reported size. Returns
@@ -1005,7 +1020,11 @@ fn broadcast_output(clients: &mut [ClientConn], term: &Terminal, bcast: &[u8]) {
         dump
     };
     for (i, c) in clients.iter_mut().enumerate() {
-        if c.owe_paced_frame() {
+        // posh#239: a connection whose Init is not yet applied is sent
+        // nothing — not even `Tag::Output` (a frame viewport would paint it
+        // raw, and the relay would take it for a frames-off daemon). Its
+        // Init's attach replay covers what it missed.
+        if !c.initialized() || c.owe_paced_frame() {
             continue;
         }
         let produced = match &frame_inputs {
@@ -1151,17 +1170,18 @@ enum QueryPolicy {
 /// RFC 0010: pick the query-reply policy from the attached clients. The client
 /// capability is a GATE (does the real terminal speak kitty?), not a value.
 fn query_policy(clients: &[ClientConn]) -> QueryPolicy {
-    if clients.is_empty() {
+    // posh#239: a connection whose Init is not yet applied is sent no output,
+    // so its terminal never sees the query; it neither answers nor votes.
+    let attached = || clients.iter().filter(|c| c.initialized());
+    if attached().next().is_none() {
         return QueryPolicy::Answer; // model is authoritative with no client
     }
-    if clients.iter().any(|c| c.producer.is_none()) {
+    if attached().any(|c| c.producer.is_none()) {
         return QueryPolicy::Silent; // a legacy client's real terminal answers
     }
     // All frame clients: the kitty reply is spoken only if every real terminal
     // supports it (advertised CAP_KITTY_KEYBOARD). Absence ⇒ suppress kitty.
-    let all_kitty = clients
-        .iter()
-        .all(|c| caps::find(&c.caps, caps::CAP_KITTY_KEYBOARD).is_some());
+    let all_kitty = attached().all(|c| caps::find(&c.caps, caps::CAP_KITTY_KEYBOARD).is_some());
     if all_kitty {
         QueryPolicy::Answer
     } else {
@@ -1903,6 +1923,7 @@ fn daemon_loop(
                     visible_shaped_for: None,
                     regeometry_keyframe: None,
                     pacing: None,
+                    init_applied: false,
                 });
             }
         }
@@ -2091,7 +2112,10 @@ fn daemon_loop(
                                     // attach to a detached-created session). The
                                     // dump is queued after the resize below so
                                     // it reflects the new client size. github #16.
-                                    needs_replay = has_pty_output;
+                                    // It also covers everything the client was
+                                    // not sent before this Init (posh#239), which
+                                    // is only ever PTY output or an overlay's.
+                                    needs_replay = has_pty_output || overlay.is_some();
                                 }
                                 Tag::Resize => {
                                     if c.apply_resize(&frame.payload) {
@@ -2865,7 +2889,16 @@ mod tests {
             visible_shaped_for: None,
             regeometry_keyframe: None,
             pacing: None,
+            init_applied: false,
         }
+    }
+
+    /// A baseline (legacy) viewport: `test_client_conn` after a bare 4-byte
+    /// Init, so it has no caps and no producer but IS attached.
+    fn baseline_conn() -> ClientConn {
+        let mut c = test_client_conn();
+        c.apply_init(&ipc::encode_resize(24, 80));
+        c
     }
 
     #[test]
@@ -2987,6 +3020,7 @@ mod tests {
             visible_shaped_for: None,
             regeometry_keyframe: None,
             pacing: None,
+            init_applied: false,
         };
         let mut init = ipc::encode_resize(rows, cols).to_vec();
         init.extend_from_slice(&caps::encode_table(&caps::own_table(&[])));
@@ -3031,6 +3065,7 @@ mod tests {
             visible_shaped_for: None,
             regeometry_keyframe: None,
             pacing: None,
+            init_applied: false,
         };
         let mut init = ipc::encode_resize(rows, cols).to_vec();
         init.extend_from_slice(&caps::encode_table(&caps::own_table(&[caps::Cap {
@@ -3082,8 +3117,19 @@ mod tests {
     fn query_policy_legacy_client_is_silent() {
         // A legacy (non-frame) client's real terminal answers the raw query, so
         // the daemon must stay silent — no double reply.
-        let legacy = test_client_conn(); // no producer, no caps
+        let legacy = baseline_conn(); // no producer, no caps
         assert_eq!(query_policy(std::slice::from_ref(&legacy)), QueryPolicy::Silent);
+    }
+
+    #[test]
+    fn query_policy_ignores_a_connection_before_its_init() {
+        // posh#239: a not-yet-Init connection (a viewport mid-attach, or a
+        // `posh list` probe that never Inits) is sent no output, so its
+        // terminal never sees the query and must not silence the daemon.
+        let pending = test_client_conn();
+        assert_eq!(query_policy(std::slice::from_ref(&pending)), QueryPolicy::Answer);
+        let (frame, _pf) = kitty_frame_conn(24, 80, 0);
+        assert_eq!(query_policy(&[frame, pending]), QueryPolicy::Answer);
     }
 
     #[test]
@@ -3126,7 +3172,7 @@ mod tests {
         // A legacy client present ⇒ silent regardless of the frame clients'
         // caps (the legacy terminal answers the raw query).
         let (frame, _pf) = kitty_frame_conn(24, 80, 0);
-        let legacy = test_client_conn();
+        let legacy = baseline_conn();
         let clients = vec![frame, legacy];
         assert_eq!(query_policy(&clients), QueryPolicy::Silent);
     }
@@ -3639,6 +3685,7 @@ mod tests {
             visible_shaped_for: None,
             regeometry_keyframe: None,
             pacing: None,
+            init_applied: false,
         };
         let mut init = ipc::encode_resize(rows, cols).to_vec();
         init.extend_from_slice(&caps::encode_table(&caps::own_table(&[caps::Cap {
@@ -3925,6 +3972,7 @@ mod tests {
             visible_shaped_for: None,
             regeometry_keyframe: None,
             pacing: None,
+            init_applied: false,
         };
         let mut table = vec![caps::Cap {
             id: caps::CAP_LOSSY,
@@ -4562,6 +4610,7 @@ mod tests {
             visible_shaped_for: None,
             regeometry_keyframe: None,
             pacing: None,
+            init_applied: false,
         };
         let mut init = ipc::encode_resize(rows, cols).to_vec();
         init.extend_from_slice(&caps::encode_table(&caps::own_table(&[caps::Cap {
@@ -4772,6 +4821,7 @@ mod tests {
             visible_shaped_for: None,
             regeometry_keyframe: None,
             pacing: None,
+            init_applied: false,
         };
         let mut init = ipc::encode_resize(rows, cols).to_vec();
         init.extend_from_slice(&caps::encode_table(&caps::own_table(&[
@@ -5180,10 +5230,11 @@ mod tests {
             socket_dir: temp_base(),
             group: "default".into(),
         };
-        // The shell stays silent until B's `go` line: a PTY chunk the daemon
-        // reads between accepting a client and reading its Init reaches that
-        // client as raw `Tag::Output` (it is not frame-capable yet), so output
-        // racing the attaches leaked records this test cannot decode (posh#239).
+        // The shell stays silent until B's `go` line, so the whole screen is
+        // drawn with both clients attached. (The guard predates the posh#239
+        // fix, when output racing an attach reached that client as raw
+        // `Tag::Output`; `the_daemon_loop_sends_no_output_before_a_clients_init`
+        // now pins that race.)
         let script =
             "read go; i=1; while [ $i -le 60 ]; do echo row$i; i=$((i+1)); done; printf 'tail$ '; exec sleep 30";
         let handle = spawn_test_daemon(
@@ -5238,6 +5289,133 @@ mod tests {
         assert_eq!(row_text(&mirror, 38).trim_end(), "row60");
         assert_eq!(row_text(&mirror, 15).trim_end(), "row37", "history fills the rows above the grid");
         drop((a, b));
+        assert_eq!(handle.shutdown(), caps::SessionEnd::Killed);
+    }
+
+    // ---- posh#239: no output before a client's Init ----
+
+    /// A connection straight from `accept` has not said what it is: a frame
+    /// viewport, a baseline one, or a control connection that never Inits.
+    /// It is sent nothing until its Init is applied; afterwards a baseline
+    /// client takes `Tag::Output` and a frame-capable one a frame.
+    #[test]
+    fn broadcast_output_sends_nothing_to_a_client_before_its_init() {
+        let term = full_ring_term();
+        for framed in [false, true] {
+            let mut c = test_client_conn();
+            broadcast_to(&mut c, &term);
+            assert!(c.write_buf.is_empty(), "framed={framed}: a pre-Init client was sent output");
+
+            let mut init = ipc::encode_resize(term.rows(), term.cols()).to_vec();
+            if framed {
+                init.extend_from_slice(&caps::encode_table(&caps::own_table(&[])));
+            }
+            c.apply_init(&init);
+            c.maybe_enable_frames();
+            broadcast_output(std::slice::from_mut(&mut c), &term, b"raw");
+            if framed {
+                assert_eq!(only_full_body(&c.write_buf), term.dump_vt_mirror(term.rows(), term.cols()));
+            } else {
+                let mut fb = FrameBuffer::new();
+                fb.feed(&c.write_buf);
+                let rec = fb.next().unwrap().expect("one record");
+                assert_eq!((rec.tag, rec.payload.as_slice()), (Tag::Output, b"raw".as_slice()));
+            }
+        }
+    }
+
+    /// The race itself, through the PRODUCTION `daemon_loop`: the shell
+    /// floods from the start, so the iteration that accepts each connection
+    /// also reads PTY output — before that connection's first record can be
+    /// read. A control connection (a `posh history`-style probe, which never
+    /// Inits) gets only its reply, and a frame client that attaches mid-flood
+    /// gets only frames, ending on the full final screen.
+    #[test]
+    fn the_daemon_loop_sends_no_output_before_a_clients_init() {
+        use std::io::Read as _;
+        let cfg = Config {
+            socket_dir: temp_base(),
+            group: "default".into(),
+        };
+        let script = "(while :; do echo flood; done) & f=$!; read go; kill $f; wait; \
+             i=1; while [ $i -le 60 ]; do echo row$i; i=$((i+1)); done; printf 'tail$ '; exec sleep 30";
+        let handle = spawn_test_daemon(
+            &cfg,
+            "r1",
+            Some(vec!["sh".into(), "-c".into(), script.into()]),
+            SessionKind::Anonymous,
+        );
+        let socket = cfg.socket_path("r1").unwrap();
+        // Read records off `s` until one satisfies `done`, failing after ~10 s.
+        let read_until = |s: &mut UnixStream, fb: &mut FrameBuffer, done: &mut dyn FnMut(ipc::Frame) -> bool| {
+            let mut tmp = [0u8; 65536];
+            for _ in 0..50 {
+                while let Some(rec) = fb.next().unwrap() {
+                    if done(rec) {
+                        return;
+                    }
+                }
+                match s.read(&mut tmp) {
+                    Ok(0) => panic!("daemon closed the connection"),
+                    Ok(n) => fb.feed(&tmp[..n]),
+                    Err(e) if matches!(e.kind(), std::io::ErrorKind::WouldBlock | std::io::ErrorKind::TimedOut) => {}
+                    Err(e) => panic!("read: {e}"),
+                }
+            }
+            panic!("timed out waiting on the daemon");
+        };
+        let connect = || {
+            let s = UnixStream::connect(&socket).unwrap();
+            s.set_read_timeout(Some(std::time::Duration::from_millis(200))).unwrap();
+            s
+        };
+        // History probes until the flood is visibly running; each probe's
+        // first record must be its reply.
+        let mut flooding = false;
+        for _ in 0..50 {
+            let mut probe = connect();
+            ipc::send(probe.as_raw_fd(), Tag::History, &ipc::encode_history_format(false)).unwrap();
+            read_until(&mut probe, &mut FrameBuffer::new(), &mut |rec| {
+                assert_eq!(rec.tag, Tag::History, "a control connection was sent {:?} before its reply", rec.tag);
+                flooding = String::from_utf8_lossy(&rec.payload).contains("flood");
+                true
+            });
+            if flooding {
+                break;
+            }
+        }
+        assert!(flooding, "the shell never started flooding");
+
+        let mut a = connect();
+        let mut init = ipc::encode_resize(24, 80).to_vec();
+        init.extend_from_slice(&caps::encode_table(&caps::own_table(&[])));
+        ipc::send(a.as_raw_fd(), Tag::Init, &init).unwrap();
+        ipc::send(a.as_raw_fd(), Tag::Input, b"go\n").unwrap();
+        // The client's mirror, applied frame by frame (as `mirror_frames` does).
+        let mut mirror = Terminal::with_scrollback(24, 80, 0);
+        let mut applied: Vec<u8> = Vec::new();
+        let mut first = true;
+        read_until(&mut a, &mut FrameBuffer::new(), &mut |rec| {
+            assert_eq!(rec.tag, Tag::Frame, "a frame client was sent {:?}", rec.tag);
+            let body = ServerFrame::decode(&rec.payload).unwrap().body;
+            match DumpDiff.apply(24, 80, &applied, &mut mirror, &body) {
+                ApplyOutcome::Advanced { dump } => applied = dump,
+                ApplyOutcome::AdvancedNoDump | ApplyOutcome::NoChange => {}
+                ApplyOutcome::ReackAndWait => panic!("DumpDiff could not apply a frame"),
+            }
+            // `a` attached mid-flood: its first screen must already show it,
+            // or the race window this test exists for was empty.
+            if std::mem::take(&mut first) {
+                assert!(
+                    (0..24).any(|r| row_text(&mirror, r).trim_end() == "flood"),
+                    "a's first frame shows no flood rows: the attach did not race output"
+                );
+            }
+            row_text(&mirror, 23).starts_with("tail$")
+        });
+        assert_eq!(row_text(&mirror, 22).trim_end(), "row60");
+        assert_eq!(row_text(&mirror, 0).trim_end(), "row38", "the whole screen, rows up from the bottom");
+        drop(a);
         assert_eq!(handle.shutdown(), caps::SessionEnd::Killed);
     }
 

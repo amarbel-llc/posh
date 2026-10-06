@@ -540,8 +540,9 @@ enum FirstRecord {
 /// records (none expected before the first frame/output) are skipped.
 ///
 /// The daemon greets a new frame-capable client with an attach replay only when
-/// the session has produced output (`daemon.rs`: `needs_replay = has_pty_output`);
-/// on a frames-off daemon that replay is a `Tag::Output`, and every later PTY
+/// the session has produced output (`daemon.rs`: `needs_replay = has_pty_output
+/// || overlay.is_some()`), and nothing reaches a connection before its Init is
+/// applied (posh#239), so that replay is the first record; on a frames-off daemon that replay is a `Tag::Output`, and every later PTY
 /// chunk broadcasts as `Tag::Output` too — so a real interactive session (which
 /// prompts at once) classifies immediately. But a session whose create-command
 /// prints NOTHING yet (`sleep 30`, a headless worker that computes before

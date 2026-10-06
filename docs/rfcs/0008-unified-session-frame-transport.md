@@ -81,6 +81,12 @@ send unconditionally.
   table from its peer MUST treat the peer as baseline.
 - A receiver seeing a `PROTOCOL_VERSION` higher than it implements MUST fall
   back to baseline (`Tag::Output`) interpretation, never guess.
+- The daemon MUST NOT send a connection any session output (`Tag::Output` or
+  `Tag::Frame`) before it has processed that connection's `Tag::Init`: until
+  then it cannot know which interpretation the peer expects, and a connection
+  that never sends one (an Info, History, Kill or switch-request client) is
+  not a viewer. The attach replay the Init triggers is the client's first
+  screen (posh#239).
 
 ### 2. The reliable transport as the degenerate datagram
 
