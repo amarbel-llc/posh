@@ -5283,6 +5283,16 @@ mod tests {
         /// spends the whole flood in the lost-base regime. So the cadences
         /// the regression test calls healthy are a best case, not what a
         /// remote viewport sees.
+        ///
+        /// For a PACED run ([`FloodCase::pace`]) `k` is a round trip in clock
+        /// steps, not frames: at time `now` the client acks the newest frame
+        /// it had received by `now - k * pace` ms, so `Lagged(k)` models an
+        /// RTT of `k * pace` ms. (During the flood that is the same frame the
+        /// unpaced rule picks — one queueing step per chunk — but a paced
+        /// client builds a frame only every [`PACED_FRAME_FLOOR_MS`] or
+        /// more, so `k` chunks is far fewer than `k` frames, and the cliff
+        /// above sits at an RTT of about four ack waits instead: see
+        /// `posh225_flood_backlog_ideal_reader_measurement`.)
         Lagged(usize),
     }
 
@@ -5342,15 +5352,28 @@ mod tests {
         /// it — not about production, where a frame waits at least one
         /// iteration by construction.
         OneWritePerChunk,
+        /// A SLOW reader: as [`FloodDrain::OneWritePerChunk`] (one write per
+        /// step, ideal reader, delivery-gated acks), but each write moves at
+        /// most `n` bytes. Frames then outlive the step that queued them, so
+        /// `write_buf` is non-empty at later send passes — the case the
+        /// empty-buffer half of `paced_send_at` exists for.
+        Trickle(usize),
     }
 
     impl FloodDrain {
-        fn label(self) -> &'static str {
+        fn label(self) -> String {
             match self {
-                FloodDrain::Never => "never",
-                FloodDrain::Always => "always",
-                FloodDrain::OneWritePerChunk => "1write",
+                FloodDrain::Never => "never".into(),
+                FloodDrain::Always => "always".into(),
+                FloodDrain::OneWritePerChunk => "1write".into(),
+                FloodDrain::Trickle(n) => format!("trkl{n}"),
             }
+        }
+
+        /// Whether acks are delivery-gated: the drain writes into the real
+        /// socket and the reader can ack only what it has received.
+        fn is_gated(self) -> bool {
+            matches!(self, FloodDrain::OneWritePerChunk | FloodDrain::Trickle(_))
         }
     }
 
@@ -5388,6 +5411,17 @@ mod tests {
         rows_shipped: u64,
         rows_scrolled: u64,
         rows_acked: u64,
+        /// Visible frames queued after the attach keyframe: during the flood
+        /// plus, for a paced run, its idle tail.
+        visible_frames: usize,
+        /// Visible frames queued while chunks were still being fed.
+        visible_frames_during_flood: usize,
+        /// The most visible frames sitting in `write_buf` (whole or partly
+        /// written) right after any step that queued frames.
+        max_visible_queued: usize,
+        /// Paced runs only: whether the client, acking the last visible frame
+        /// once the idle tail went quiet, holds the terminal's final screen.
+        last_screen_delivered: Option<bool>,
     }
 
     /// One flood run's knobs.
@@ -5401,6 +5435,12 @@ mod tests {
         /// long-lived session's history); `sb_floor` is anchored past them
         /// exactly as the daemon's Init arm does.
         prefill_rows: usize,
+        /// `Some(ms)`: the client advertises `CAP_PACED`, and a fake clock
+        /// advances `ms` per chunk, the paced send pass running after each
+        /// one (`1` models ~4 MB/s of 4 KiB reads, the `nix gc` shape).
+        /// Under it `Lagged(k)` is an RTT of `k * ms` ms ([`FloodAcks::Lagged`]).
+        /// `None`: today's per-read-frame client, exactly as before pacing.
+        pace: Option<u64>,
     }
 
     /// Bytes in every [`newline_flood`] line, CRLF included. Each is 100
@@ -5481,16 +5521,17 @@ mod tests {
         for i in 0..case.prefill_rows {
             term.process(format!("{i:08} pre-attach history row, as long as a flood line, padded out to ~100 bytes ........\r\n").as_bytes());
         }
-        let (mut c, mut peer) = lossy_conn(
-            rows,
-            cols,
-            &[
-                caps::Cap { id: caps::CAP_SCROLLBACK, payload: vec![0] },
-                caps::Cap { id: caps::CAP_BASE_SUM, payload: vec![] },
-            ],
-        );
+        let content = [
+            caps::Cap { id: caps::CAP_SCROLLBACK, payload: vec![0] },
+            caps::Cap { id: caps::CAP_BASE_SUM, payload: vec![] },
+        ];
+        let (mut c, mut peer) = match case.pace {
+            Some(_) => paced_conn(rows, cols, &content),
+            None => lossy_conn(rows, cols, &content),
+        };
         assert!(c.lossy && c.wants_scrollback());
-        let gated = matches!(case.drain, FloodDrain::OneWritePerChunk);
+        assert_eq!(c.is_paced(), case.pace.is_some());
+        let gated = case.drain.is_gated();
         if gated {
             pin_socket_buffer(&c.stream, libc::SO_SNDBUF, FLOOD_SOCKET_BUFFER);
             pin_socket_buffer(&peer, libc::SO_RCVBUF, FLOOD_SOCKET_BUFFER);
@@ -5509,21 +5550,31 @@ mod tests {
         // Forward-only scrollback from attach, as the daemon's Init arm sets it.
         c.sb_floor = term.primary_scrollback_total();
         // The attach keyframe, acked: the baseline scrollback frames gate on.
-        // It never touches the socket, so it counts as delivered.
-        assert!(c.queue_frame_from(&term));
+        // It never touches the socket, so it counts as delivered. A paced
+        // client's goes through the real path — owed, then built by the send
+        // pass at t = 0 — so its first fresh frame is on the clock.
+        match case.pace {
+            Some(_) => {
+                assert!(c.owe_paced_frame(false));
+                send_paced_frames(std::slice::from_mut(&mut c), &term, 0);
+                assert_eq!(c.producer.as_ref().unwrap().last_visible_num(), 1, "the attach keyframe is frame 1");
+            }
+            None => assert!(c.queue_frame_from(&term)),
+        }
         c.apply_frame_ack(&ipc::encode_frame_ack(1, 0));
         c.write_buf.clear();
 
-        // newest[i] = the newest frame number after chunk i (newest[0] = attach).
+        // newest[i] = the newest frame number after queueing step i
+        // (newest[0] = attach). A non-paced client's queueing step is the
+        // chunk's broadcast; a paced client's is the send pass after it.
         let mut newest: Vec<u64> = vec![1];
-        // Delivery bookkeeping for the gated mode, in bytes of the stream
-        // queued since attach: where each not-yet-delivered frame ends, how
-        // much of the stream the reader has received, and the newest frame
-        // it has received in full.
-        let mut queued_total: u64 = 0;
-        let mut delivered_total: u64 = 0;
-        let mut undelivered: std::collections::VecDeque<(u64, u64)> = std::collections::VecDeque::new();
-        let mut delivered_frontier: u64 = 1;
+        // Paced runs: newest_avail[i] = when newest[i] reached the reader (the
+        // attach keyframe at t = 0; a send pass's frame one clock step after
+        // the pass) — what a `Lagged` round trip counts from.
+        let mut newest_avail: Vec<u64> = vec![0];
+        let mut ledger = FloodLedger::new(gated);
+        // The paced client's clock: chunk i is fed at `i * ms`.
+        let mut now: u64 = 0;
         for piece in flood.chunks(case.chunk) {
             term.process(piece);
             let before = c.write_buf.len();
@@ -5531,16 +5582,216 @@ mod tests {
             run.fed += piece.len();
             run.chunks += 1;
 
+            if case.pace.is_some() {
+                assert_eq!(c.write_buf.len(), before, "a paced client is only marked dirty");
+            } else {
+                ledger.account(&mut run, &c.write_buf[before..], true);
+                run.peak_write_buf = run.peak_write_buf.max(c.write_buf.len());
+                newest.push(c.producer.as_ref().unwrap().current_num());
+            }
+
+            // Drain BEFORE the ack: what the reader can ack this chunk is
+            // decided by what this chunk's write delivered.
+            ledger.drain(&mut run, &mut c, case.drain, &mut peer, &mut sink);
+            let eligible = match case.pace {
+                Some(ms) => paced_ack_eligible(case.acks, run.chunks, &newest, &newest_avail, now, ms),
+                None => flood_ack_eligible(case.acks, run.chunks, &newest),
+            };
+            if let Some(n) = ledger.deliverable_ack(eligible) {
+                c.apply_frame_ack(&ipc::encode_frame_ack(n, 0));
+            }
+
+            if let Some(ms) = case.pace {
+                paced_flood_send_pass(&mut c, &term, now, &mut ledger, &mut run, &mut newest, true);
+                newest_avail.push(now + ms);
+                now += ms;
+            }
+
+            if c.write_buf.len() > MAX_CLIENT_BACKLOG {
+                // The daemon loop's `clients.retain` drops the client here.
+                run.crossed_backlog_at = Some(run.fed);
+                break;
+            }
+        }
+
+        // A paced client's idle tail: the PTY has gone quiet, but the loop
+        // keeps draining, acking and running the send pass until the client
+        // owes nothing and has nothing queued. The clock moves the way the
+        // daemon loop wakes: one step while bytes are queued (`POLLOUT`), and
+        // otherwise straight to the nearest event — the send opportunity
+        // `paced_poll_timeout` names, or the next ack's arrival — so the tail
+        // is a quiescence proof of the production wake path, not a scan.
+        //
+        // The stale-screen bound is on the IDLE time — the clock spent with
+        // an empty buffer while a frame was owed, which is pacing's own
+        // waiting — and is a few ack waits. Time spent draining queued bytes
+        // is the reader's (a `Trickle` reader can take seconds over one
+        // ring-sized scrollback frame); each such step must make progress.
+        if let (Some(ms), None) = (case.pace, run.crossed_backlog_at) {
+            let mut step = run.chunks;
+            let mut idle: u64 = 0;
+            let what = format!("acks={} drain={}", case.acks.label(), case.drain.label());
+            while c.pacing.is_some_and(|p| p.dirty) || !c.write_buf.is_empty() {
+                let queued = c.write_buf.len();
+                ledger.drain(&mut run, &mut c, case.drain, &mut peer, &mut sink);
+                assert!(
+                    queued == 0 || c.write_buf.len() < queued,
+                    "{what}: a write at t={now} moved nothing: the tail would never end",
+                );
+                step += 1;
+                let eligible = paced_ack_eligible(case.acks, step, &newest, &newest_avail, now, ms);
+                if let Some(n) = ledger.deliverable_ack(eligible) {
+                    c.apply_frame_ack(&ipc::encode_frame_ack(n, 0));
+                }
+                paced_flood_send_pass(&mut c, &term, now, &mut ledger, &mut run, &mut newest, false);
+                newest_avail.push(now + ms);
+                if !c.write_buf.is_empty() || !c.pacing.is_some_and(|p| p.dirty) {
+                    now += ms;
+                    continue;
+                }
+                let timeout = paced_poll_timeout(std::slice::from_ref(&c), now);
+                assert!(timeout >= 0, "{what}: dirty and idle at t={now} but the poll would block");
+                assert!(timeout > 0, "{what}: due at t={now} yet the send pass sent nothing: a busy loop");
+                let acked = c.producer.as_ref().unwrap().acked_num();
+                let wake = paced_next_ack_at(case.acks, &newest, &newest_avail, acked, now, ms)
+                    .map_or(now + timeout as u64, |at| at.min(now + timeout as u64));
+                idle += wake - now;
+                now = wake;
+                assert!(
+                    idle <= 4 * PACED_ACK_WAIT_MS,
+                    "{what}: the last screen was owed with nothing queued for {idle} ms (t={now})",
+                );
+            }
+            let last = c.producer.as_ref().unwrap().last_visible_num();
+            c.apply_frame_ack(&ipc::encode_frame_ack(last, 0));
+            run.last_screen_delivered = Some(
+                c.producer.as_ref().unwrap().acked_dump() == Some(&term.dump_vt_mirror(rows, cols)[..]),
+            );
+        }
+        run.rows_scrolled = term.primary_scrollback_total() - c.sb_floor;
+        run.rows_acked = c.acked_sb_total.max(c.sb_floor) - c.sb_floor;
+        run
+    }
+
+    /// One paced send pass of a flood run at `now`, its queued frames
+    /// accounted like a non-paced chunk's.
+    fn paced_flood_send_pass(
+        c: &mut ClientConn,
+        term: &Terminal,
+        now: u64,
+        ledger: &mut FloodLedger,
+        run: &mut FloodRun,
+        newest: &mut Vec<u64>,
+        during_flood: bool,
+    ) {
+        let before = c.write_buf.len();
+        send_paced_frames(std::slice::from_mut(c), term, now);
+        ledger.account(run, &c.write_buf[before..], during_flood);
+        run.peak_write_buf = run.peak_write_buf.max(c.write_buf.len());
+        newest.push(c.producer.as_ref().unwrap().current_num());
+    }
+
+    /// The frame the cadence would ack at queueing step `step` (1-based),
+    /// given `newest` (see [`FloodAcks`]).
+    fn flood_ack_eligible(acks: FloodAcks, step: usize, newest: &[u64]) -> Option<u64> {
+        match acks {
+            FloodAcks::Never => None,
+            FloodAcks::EveryNewest(k) => step.is_multiple_of(k).then(|| *newest.last().unwrap()),
+            FloodAcks::Lagged(k) => newest.len().checked_sub(1 + k).map(|i| newest[i]),
+        }
+    }
+
+    /// A paced run's [`flood_ack_eligible`]: `Lagged(k)` is an RTT of
+    /// `k * ms` — the newest frame that had reached the reader by then
+    /// (`avail`, nondecreasing, parallel to `newest`).
+    fn paced_ack_eligible(
+        acks: FloodAcks,
+        step: usize,
+        newest: &[u64],
+        avail: &[u64],
+        now: u64,
+        ms: u64,
+    ) -> Option<u64> {
+        match acks {
+            FloodAcks::Lagged(k) => {
+                let cutoff = now.checked_sub(k as u64 * ms)?;
+                avail.partition_point(|&at| at <= cutoff).checked_sub(1).map(|i| newest[i])
+            }
+            other => flood_ack_eligible(other, step, newest),
+        }
+    }
+
+    /// When the next ack that would move a paced client's base arrives,
+    /// after `now` — the tail's other wake source besides the send
+    /// opportunity. `None` when none is coming.
+    fn paced_next_ack_at(
+        acks: FloodAcks,
+        newest: &[u64],
+        avail: &[u64],
+        acked: u64,
+        now: u64,
+        ms: u64,
+    ) -> Option<u64> {
+        match acks {
+            FloodAcks::Never => None,
+            FloodAcks::EveryNewest(_) => (*newest.last().unwrap() > acked).then_some(now + ms),
+            FloodAcks::Lagged(k) => newest
+                .iter()
+                .zip(avail)
+                .map(|(&num, &at)| (num, at + k as u64 * ms))
+                .find(|&(num, arrives)| num > acked && arrives > now)
+                .map(|(_, arrives)| arrives),
+        }
+    }
+
+    /// A flood run's bookkeeping on its client's stream, in bytes queued
+    /// since attach: what each queueing step put into `write_buf`, what has
+    /// left it, and — for a delivery-gated run — what the reader received.
+    struct FloodLedger {
+        gated: bool,
+        queued_total: u64,
+        drained_total: u64,
+        delivered_total: u64,
+        /// Gated runs: where each not-yet-delivered frame ends in the stream.
+        undelivered: std::collections::VecDeque<(u64, u64)>,
+        /// Gated runs: the newest frame the reader has received in full.
+        delivered_frontier: u64,
+        /// Where each frame still (at least partly) in `write_buf` ends, and
+        /// whether it is a visible frame.
+        in_buf: std::collections::VecDeque<(u64, bool)>,
+        /// How many of `in_buf`'s frames are visible.
+        visible_in_buf: usize,
+    }
+
+    impl FloodLedger {
+        fn new(gated: bool) -> Self {
+            FloodLedger {
+                gated,
+                queued_total: 0,
+                drained_total: 0,
+                delivered_total: 0,
+                undelivered: std::collections::VecDeque::new(),
+                delivered_frontier: 1,
+                in_buf: std::collections::VecDeque::new(),
+                visible_in_buf: 0,
+            }
+        }
+
+        /// Account the frames one queueing step appended to `write_buf`.
+        fn account(&mut self, run: &mut FloodRun, queued: &[u8], during_flood: bool) {
             let mut fb = FrameBuffer::new();
-            fb.feed(&c.write_buf[before..]);
+            fb.feed(queued);
             while let Some(rec) = fb.next().unwrap() {
                 assert_eq!(rec.tag, Tag::Frame);
                 let wire = ipc::HEADER_LEN + rec.payload.len();
                 let frame = ServerFrame::decode(&rec.payload).unwrap();
-                if gated {
-                    queued_total += wire as u64;
-                    undelivered.push_back((frame.frame_num, queued_total));
+                self.queued_total += wire as u64;
+                if self.gated {
+                    self.undelivered.push_back((frame.frame_num, self.queued_total));
                 }
+                let visible = !matches!(frame.body, FrameBody::Scrollback { .. });
+                self.in_buf.push_back((self.queued_total, visible));
+                self.visible_in_buf += usize::from(visible);
                 match frame.body {
                     FrameBody::Scrollback { rows, .. } => {
                         run.scrollback_frames += 1;
@@ -5557,20 +5808,35 @@ mod tests {
                         }
                         run.visible_bytes += wire as u64;
                         run.largest_visible = run.largest_visible.max(wire);
+                        run.visible_frames += 1;
+                        if during_flood {
+                            run.visible_frames_during_flood += 1;
+                        }
                     }
                 }
             }
-            run.peak_write_buf = run.peak_write_buf.max(c.write_buf.len());
+            run.max_visible_queued = run.max_visible_queued.max(self.visible_in_buf);
+        }
 
-            newest.push(c.producer.as_ref().unwrap().current_num());
-
-            // Drain BEFORE the ack: what the reader can ack this chunk is
-            // decided by what this chunk's write delivered.
-            match case.drain {
+        /// The drain step, per [`FloodDrain`].
+        fn drain(
+            &mut self,
+            run: &mut FloodRun,
+            c: &mut ClientConn,
+            mode: FloodDrain,
+            peer: &mut UnixStream,
+            sink: &mut [u8],
+        ) {
+            let before = c.write_buf.len();
+            match mode {
                 FloodDrain::Always => c.write_buf.clear(),
                 FloodDrain::Never => {}
-                FloodDrain::OneWritePerChunk => {
-                    match std::io::Write::write(&mut c.stream, &c.write_buf) {
+                FloodDrain::OneWritePerChunk | FloodDrain::Trickle(_) => {
+                    let limit = match mode {
+                        FloodDrain::Trickle(n) => n.min(c.write_buf.len()),
+                        _ => c.write_buf.len(),
+                    };
+                    match std::io::Write::write(&mut c.stream, &c.write_buf[..limit]) {
                         Ok(n) => {
                             c.write_buf.drain(..n);
                             run.largest_socket_write = run.largest_socket_write.max(n);
@@ -5578,49 +5844,46 @@ mod tests {
                         Err(e) if e.kind() == std::io::ErrorKind::WouldBlock => {}
                         Err(e) => panic!("daemon-side write: {e}"),
                     }
-                    delivered_total += read_until_dry(&mut peer, &mut sink);
-                    while undelivered.front().is_some_and(|&(_, end)| end <= delivered_total) {
-                        delivered_frontier = undelivered.pop_front().unwrap().0;
+                    self.delivered_total += read_until_dry(peer, sink);
+                    while self.undelivered.front().is_some_and(|&(_, end)| end <= self.delivered_total) {
+                        self.delivered_frontier = self.undelivered.pop_front().unwrap().0;
                     }
                 }
             }
-            run.peak_undrained = run.peak_undrained.max(c.write_buf.len());
-
-            let eligible = match case.acks {
-                FloodAcks::Never => None,
-                FloodAcks::EveryNewest(k) => (run.chunks % k == 0).then(|| *newest.last().unwrap()),
-                FloodAcks::Lagged(k) => newest.len().checked_sub(1 + k).map(|i| newest[i]),
-            };
-            // Frames are numbered and delivered in order, so the newest frame
-            // that is both eligible and delivered is the smaller of the two.
-            // An ack at or below the last one is a no-op (`FrameProducer::ack`).
-            let ack = if gated { eligible.map(|n| n.min(delivered_frontier)) } else { eligible };
-            if let Some(n) = ack {
-                c.apply_frame_ack(&ipc::encode_frame_ack(n, 0));
+            self.drained_total += (before - c.write_buf.len()) as u64;
+            while self.in_buf.front().is_some_and(|&(end, _)| end <= self.drained_total) {
+                let (_, visible) = self.in_buf.pop_front().unwrap();
+                self.visible_in_buf -= usize::from(visible);
             }
+            run.peak_undrained = run.peak_undrained.max(c.write_buf.len());
+        }
 
-            if c.write_buf.len() > MAX_CLIENT_BACKLOG {
-                // The daemon loop's `clients.retain` drops the client here.
-                run.crossed_backlog_at = Some(run.fed);
-                break;
+        /// The ack the client sends for the cadence's `eligible` frame:
+        /// under a gated run, the newest frame that is both eligible and
+        /// delivered (frames are numbered and delivered in order, so the
+        /// smaller of the two). An ack at or below the last one is a no-op
+        /// (`FrameProducer::ack`).
+        fn deliverable_ack(&self, eligible: Option<u64>) -> Option<u64> {
+            if self.gated {
+                eligible.map(|n| n.min(self.delivered_frontier))
+            } else {
+                eligible
             }
         }
-        run.rows_scrolled = term.primary_scrollback_total() - c.sb_floor;
-        run.rows_acked = c.acked_sb_total.max(c.sb_floor) - c.sb_floor;
-        run
     }
 
     fn print_flood_header() {
         println!(
-            "{:>6} {:>10} {:>7} | {:>8} {:>6} {:>9} | {:>10} {:>7} | {:>11} {:>11} {:>7} | {:>9} {:>9} {:>6} | {:>5} {:>5} {:>9} {:>8} {:>8}",
+            "{:>6} {:>10} {:>7} | {:>8} {:>6} {:>9} | {:>10} {:>7} | {:>11} {:>11} {:>7} | {:>9} {:>9} {:>6} | {:>5} {:>5} {:>9} {:>8} {:>8} | {:>5} {:>6} {:>7} {:>5} {:>4}",
             "chunk", "acks", "drain", "fed", "chunks", "cross@fed", "peak_wbuf", "max_wr", "vis_bytes", "sb_bytes", "q/fed",
             "max_vis", "max_sb", "sbrows", "full", "sbfrm", "rows_sent", "scrolled", "sb_acked",
+            "paced", "visfrm", "inflood", "maxvq", "last",
         );
     }
 
     fn print_flood_row(case: FloodCase, r: &FloodRun) {
         println!(
-            "{:>6} {:>10} {:>7} | {:>8} {:>6} {:>9} | {:>10} {:>7} | {:>11} {:>11} {:>7.1} | {:>9} {:>9} {:>6} | {:>5} {:>5} {:>9} {:>8} {:>8}",
+            "{:>6} {:>10} {:>7} | {:>8} {:>6} {:>9} | {:>10} {:>7} | {:>11} {:>11} {:>7.1} | {:>9} {:>9} {:>6} | {:>5} {:>5} {:>9} {:>8} {:>8} | {:>5} {:>6} {:>7} {:>5} {:>4}",
             case.chunk,
             case.acks.label(),
             case.drain.label(),
@@ -5640,6 +5903,11 @@ mod tests {
             r.rows_shipped,
             r.rows_scrolled,
             r.rows_acked,
+            case.pace.map_or_else(|| "-".to_string(), |ms| format!("{ms}ms")),
+            r.visible_frames,
+            r.visible_frames_during_flood,
+            r.max_visible_queued,
+            r.last_screen_delivered.map_or("-", |ok| if ok { "yes" } else { "NO" }),
         );
     }
 
@@ -5677,7 +5945,7 @@ mod tests {
         for chunk in [KIB, 4 * KIB, 64 * KIB] {
             for acks in cadences {
                 for drain in [FloodDrain::Never, FloodDrain::Always] {
-                    let case = FloodCase { chunk, acks, drain, prefill_rows: 0 };
+                    let case = FloodCase { chunk, acks, drain, prefill_rows: 0, pace: None };
                     print_flood_row(case, &measure_flood(&flood, case));
                 }
             }
@@ -5686,7 +5954,7 @@ mod tests {
         print_flood_header();
         for acks in cadences {
             for drain in [FloodDrain::Never, FloodDrain::Always] {
-                let case = FloodCase { chunk: 4 * KIB, acks, drain, prefill_rows: SCROLLBACK + 200 };
+                let case = FloodCase { chunk: 4 * KIB, acks, drain, prefill_rows: SCROLLBACK + 200, pace: None };
                 print_flood_row(case, &measure_flood(&flood, case));
             }
         }
@@ -5712,26 +5980,38 @@ mod tests {
         );
         let probe = measure_flood(
             &flood[..KIB],
-            FloodCase { chunk: KIB, acks: FloodAcks::Never, drain: FloodDrain::OneWritePerChunk, prefill_rows: 0 },
+            FloodCase { chunk: KIB, acks: FloodAcks::Never, drain: FloodDrain::OneWritePerChunk, prefill_rows: 0, pace: None },
         );
         println!(
             "socket buffers pinned to {FLOOD_SOCKET_BUFFER} bytes; one write into the empty socket accepts {} bytes on this host",
             probe.socket_write_capacity
         );
         print_flood_header();
-        for prefill_rows in [0, SCROLLBACK + 200] {
-            for chunk in [KIB, 4 * KIB] {
-                for acks in [
-                    FloodAcks::EveryNewest(1),
-                    FloodAcks::Lagged(1),
-                    FloodAcks::Lagged(4),
-                    FloodAcks::Lagged(5),
-                    FloodAcks::Never,
-                ] {
-                    let case = FloodCase { chunk, acks, drain: FloodDrain::OneWritePerChunk, prefill_rows };
-                    let r = measure_flood(&flood, case);
-                    print!("{}", if prefill_rows == 0 { "empty ring " } else { "FULL ring  " });
-                    print_flood_row(case, &r);
+        // Per-read frames first, then the same runs for a paced client whose
+        // fake clock advances 1 ms per chunk (see `FloodCase::pace`), plus
+        // real round trips for it — `lag k` is then a k ms RTT: between the
+        // floor and the ack wait, past the wait, and past about four waits,
+        // where the 8-frame outstanding window (four visible + scrollback
+        // pairs at one pair per wait) evicts every frame before its ack lands.
+        for pace in [None, Some(1)] {
+            let mut cadences = vec![
+                FloodAcks::EveryNewest(1),
+                FloodAcks::Lagged(1),
+                FloodAcks::Lagged(4),
+                FloodAcks::Lagged(5),
+                FloodAcks::Never,
+            ];
+            if pace.is_some() {
+                cadences.extend([FloodAcks::Lagged(50), FloodAcks::Lagged(300), FloodAcks::Lagged(1200)]);
+            }
+            for prefill_rows in [0, SCROLLBACK + 200] {
+                for chunk in [KIB, 4 * KIB] {
+                    for acks in cadences.iter().copied() {
+                        let case = FloodCase { chunk, acks, drain: FloodDrain::OneWritePerChunk, prefill_rows, pace };
+                        let r = measure_flood(&flood, case);
+                        print!("{}", if prefill_rows == 0 { "empty ring " } else { "FULL ring  " });
+                        print_flood_row(case, &r);
+                    }
                 }
             }
         }
@@ -5767,6 +6047,7 @@ mod tests {
                 acks,
                 drain: FloodDrain::OneWritePerChunk,
                 prefill_rows: SCROLLBACK + 200,
+                pace: None,
             };
             // `Never` is quadratic — every chunk's scrollback frame re-carries
             // every un-acked row — and its only assertion is the visible-frame
@@ -5835,6 +6116,7 @@ mod tests {
                 acks,
                 drain: FloodDrain::OneWritePerChunk,
                 prefill_rows: 0,
+                pace: None,
             };
             let r = measure_flood(&flood, case);
             print_flood_row(case, &r);
@@ -6365,5 +6647,238 @@ mod tests {
         let frames = send_at_the_opportunity(&mut c, &overlay);
         assert_eq!(frames.len(), 1);
         assert!(matches!(frames[0].body, FrameBody::Full(_)), "got {:?}", frames[0].body);
+    }
+
+    // ---- posh#225 Stage 2: the flood, paced ----
+
+    /// The ack cadences the paced flood tests sweep, at `pace: Some(1)` so a
+    /// `Lagged(k)` is a `k` ms round trip ([`FloodAcks::Lagged`]): a prompt
+    /// reader, an RTT between the frame floor and the ack wait (its acks
+    /// land before the wait expires, so frames go out an RTT apart), one past
+    /// the ack wait (every frame goes out on the wait, unacked), and a reader
+    /// that never acks.
+    const PACED_FLOOD_CADENCES: [FloodAcks; 4] = [
+        FloodAcks::Never,
+        FloodAcks::EveryNewest(1),
+        FloodAcks::Lagged(50),
+        FloodAcks::Lagged(300),
+    ];
+
+    /// A paced, socket-drained flood case at the production chunk size.
+    fn paced_flood_case(acks: FloodAcks, prefill_rows: usize) -> FloodCase {
+        FloodCase {
+            chunk: 4 * 1024,
+            acks,
+            drain: FloodDrain::OneWritePerChunk,
+            prefill_rows,
+            pace: Some(1),
+        }
+    }
+
+    /// With no ack after attach and a buffer that always drains (isolating
+    /// pacing from the socket), a paced client is sent one visible frame per
+    /// ack wait however many screens the flood produces.
+    ///
+    /// The count, from the harness's clock: the attach keyframe is sent and
+    /// acked at t = 0, so the first opportunity is the FLOOR after it; that
+    /// frame is never acked, so each later one waits a whole ack wait. The
+    /// 512 chunks are fed at t = 0, pace, …, pace * 511 (the send pass right
+    /// after each), giving frames at FLOOR, FLOOR + WAIT, … up to the last
+    /// chunk's t: `1 + (pace * 511 - FLOOR) / WAIT` (20 and 270 today).
+    #[test]
+    fn posh225_paced_flood_without_acks_sends_one_visible_frame_per_ack_wait() {
+        const KIB: usize = 1024;
+        const PACE_MS: u64 = 1;
+        let flood = newline_flood(2 * KIB * KIB);
+        let case = FloodCase {
+            chunk: 4 * KIB,
+            acks: FloodAcks::Never,
+            drain: FloodDrain::Always,
+            prefill_rows: 0,
+            pace: Some(PACE_MS),
+        };
+        let r = measure_flood(&flood, case);
+        assert_eq!(r.chunks, 512);
+        let flood_end = PACE_MS * (r.chunks as u64 - 1);
+        let expected = 1 + (flood_end - PACED_FRAME_FLOOR_MS) / PACED_ACK_WAIT_MS;
+        assert_eq!(r.visible_frames_during_flood as u64, expected);
+        assert_eq!(r.last_screen_delivered, Some(true), "the idle tail delivered the last screen");
+    }
+
+    /// A prompt reader on a real socket: at most one visible frame is ever
+    /// queued, at most one per frame floor is built, and each stays
+    /// screen-sized though the ring is full.
+    #[test]
+    fn posh225_paced_flood_with_prompt_acks_never_queues_two_visible_frames() {
+        const KIB: usize = 1024;
+        let flood = newline_flood(256 * KIB);
+        let case = paced_flood_case(FloodAcks::EveryNewest(1), SCROLLBACK + 200);
+        let r = measure_flood(&flood, case);
+        print_flood_header();
+        print_flood_row(case, &r);
+        assert!(r.max_visible_queued <= 1, "{} visible frames were queued at once", r.max_visible_queued);
+        let bound = r.chunks / PACED_FRAME_FLOOR_MS as usize + 2;
+        assert!(
+            r.visible_frames <= bound,
+            "{} visible frames for {} chunks (at most {bound} at one per {PACED_FRAME_FLOOR_MS} ms)",
+            r.visible_frames,
+            r.chunks,
+        );
+        assert!(r.largest_visible < 64 * KIB, "a visible frame was {} bytes", r.largest_visible);
+    }
+
+    /// Whatever the ack cadence, a paced client's backlog is at most one
+    /// visible frame and its scrollback frame. Against this ideal reader that
+    /// holds by timing alone (every burst leaves in the write after it); the
+    /// empty-buffer gate that makes it hold for a slow reader is pinned by
+    /// [`posh225_paced_flood_with_a_slow_reader_queues_one_frame_pair`].
+    /// (The v1 scrollback frame is not capped here — with acks withheld it
+    /// re-carries every un-acked row; posh#225 Task 3.3 bounds it.)
+    #[test]
+    fn posh225_paced_flood_backlog_is_one_frame_pair_for_every_cadence() {
+        const KIB: usize = 1024;
+        let flood = newline_flood(256 * KIB);
+        print_flood_header();
+        for prefill_rows in [0, SCROLLBACK + 200] {
+            for acks in PACED_FLOOD_CADENCES {
+                let case = paced_flood_case(acks, prefill_rows);
+                let r = measure_flood(&flood, case);
+                print_flood_row(case, &r);
+                let what = format!("acks={} prefill={prefill_rows}", acks.label());
+                assert_eq!(r.crossed_backlog_at, None, "{what}: crossed MAX_CLIENT_BACKLOG");
+                assert!(r.max_visible_queued <= 1, "{what}: {} visible frames queued at once", r.max_visible_queued);
+                assert!(
+                    r.peak_write_buf <= r.largest_visible + r.largest_scrollback,
+                    "{what}: backlog peaked at {} bytes, more than one frame pair ({} + {})",
+                    r.peak_write_buf,
+                    r.largest_visible,
+                    r.largest_scrollback,
+                );
+                assert!(r.largest_visible < 64 * KIB, "{what}: a visible frame was {} bytes", r.largest_visible);
+            }
+        }
+    }
+
+    /// No stale screen at quiescence: whatever the cadence, once the flood
+    /// stops the paced client is sent the terminal's final screen.
+    #[test]
+    fn posh225_paced_flood_ends_on_the_last_screen() {
+        const KIB: usize = 1024;
+        let flood = newline_flood(256 * KIB);
+        for prefill_rows in [0, SCROLLBACK + 200] {
+            for acks in PACED_FLOOD_CADENCES {
+                let r = measure_flood(&flood, paced_flood_case(acks, prefill_rows));
+                assert_eq!(
+                    r.last_screen_delivered,
+                    Some(true),
+                    "acks={} prefill={prefill_rows}: the client was left on a stale screen",
+                    acks.label(),
+                );
+            }
+        }
+    }
+
+    /// Pacing must not starve history: with a prompt reader every row the
+    /// flood scrolled off is acked once the tail goes quiet.
+    #[test]
+    fn posh225_paced_flood_delivers_history_with_prompt_acks() {
+        const KIB: usize = 1024;
+        let flood = newline_flood(256 * KIB);
+        let case = paced_flood_case(FloodAcks::EveryNewest(1), SCROLLBACK + 200);
+        let r = measure_flood(&flood, case);
+        if !flood_socket_supports_bounds(case, &r) {
+            return;
+        }
+        assert!(r.rows_scrolled > 0, "the flood must scroll rows off for this to mean anything");
+        assert_eq!(r.rows_acked, r.rows_scrolled, "every scrolled-off row reached the reader and was acked");
+    }
+
+    /// A SLOW reader (1 KiB per 1 ms step, against frame pairs of ~5 KB to
+    /// ~1 MB): frames outlive the step that queued them, so later send
+    /// passes find bytes still queued. The empty-buffer gate in
+    /// `paced_send_at` must hold them off — at most one visible frame and
+    /// one frame pair is ever queued — and the tail must still end on the
+    /// last screen. Verified by hand: deleting that gate
+    /// (`if !self.write_buf.is_empty() { return None; }`) fails THIS test on
+    /// `max_visible_queued`, while every other `posh225_paced_*` test, whose
+    /// ideal reader empties each burst in one write, still passes.
+    #[test]
+    fn posh225_paced_flood_with_a_slow_reader_queues_one_frame_pair() {
+        const KIB: usize = 1024;
+        let flood = newline_flood(2 * KIB * KIB);
+        print_flood_header();
+        for prefill_rows in [0, SCROLLBACK + 200] {
+            for acks in [FloodAcks::EveryNewest(1), FloodAcks::Lagged(50), FloodAcks::Lagged(300)] {
+                let case = FloodCase {
+                    drain: FloodDrain::Trickle(KIB),
+                    ..paced_flood_case(acks, prefill_rows)
+                };
+                let r = measure_flood(&flood, case);
+                print_flood_row(case, &r);
+                let what = format!("acks={} prefill={prefill_rows}", acks.label());
+                assert!(r.peak_undrained > 0, "{what}: the reader never fell behind — this proves nothing");
+                assert!(r.max_visible_queued <= 1, "{what}: {} visible frames queued at once", r.max_visible_queued);
+                assert!(
+                    r.peak_write_buf <= r.largest_visible + r.largest_scrollback,
+                    "{what}: backlog peaked at {} bytes, more than one frame pair ({} + {})",
+                    r.peak_write_buf,
+                    r.largest_visible,
+                    r.largest_scrollback,
+                );
+                assert_eq!(r.last_screen_delivered, Some(true), "{what}: left on a stale screen");
+            }
+        }
+    }
+
+    /// The existing path untouched: a non-paced client's byte stream is the
+    /// same whether or not a paced client of the same geometry is attached
+    /// beside it. The paced client comes FIRST in the slice, so a paced arm
+    /// in `broadcast_output` that stopped the loop (`break` for `continue`)
+    /// would starve the plain client behind it. This pins the STREAM only:
+    /// with equal geometry a shared dump and a separately built one are
+    /// byte-identical, so whether the paced client takes part in the dump
+    /// cache is pinned by `broadcast_output_only_marks_a_paced_client_dirty`.
+    #[test]
+    fn non_paced_stream_is_identical_beside_a_paced_client() {
+        const KIB: usize = 1024;
+        let flood = newline_flood(64 * KIB);
+        let stream_of_the_non_paced_client = |with_paced: bool| -> Vec<u8> {
+            let mut term = Terminal::with_scrollback(24, 80, 1000);
+            let (plain, _plain_peer) = scrollback_capable_conn(24, 80);
+            let mut clients = Vec::new();
+            let mut _paced_peer = None;
+            if with_paced {
+                let (paced, peer) = paced_conn(24, 80, &[]);
+                clients.push(paced);
+                _paced_peer = Some(peer);
+            }
+            clients.push(plain);
+            let plain_at = clients.len() - 1;
+            let mut stream = Vec::new();
+            for (i, piece) in flood.chunks(4 * KIB).enumerate() {
+                term.process(piece);
+                broadcast_output(&mut clients, &term, piece);
+                // Every chunk is a paced send opportunity: the paced client
+                // acks each frame at once and the clock steps a frame floor.
+                send_paced_frames(&mut clients, &term, i as u64 * PACED_FRAME_FLOOR_MS);
+                stream.append(&mut clients[plain_at].write_buf);
+                if with_paced {
+                    let paced = &mut clients[0];
+                    let sent = paced.producer.as_ref().unwrap().last_visible_num();
+                    paced.apply_frame_ack(&ipc::encode_frame_ack(sent, 0));
+                    paced.write_buf.clear();
+                }
+            }
+            if with_paced {
+                let sent = clients[0].producer.as_ref().unwrap().last_visible_num();
+                assert!(sent > 1, "the paced client must be sent frames for this to mean anything");
+            }
+            stream
+        };
+        let alone = stream_of_the_non_paced_client(false);
+        let beside = stream_of_the_non_paced_client(true);
+        assert!(!alone.is_empty());
+        assert_eq!(alone.len(), beside.len(), "the non-paced stream changed length");
+        assert!(alone == beside, "the non-paced stream changed beside a paced client");
     }
 }
