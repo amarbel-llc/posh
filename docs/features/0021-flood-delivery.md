@@ -65,7 +65,9 @@ viewport). Settled for this stage, 2026-10-06:
 2. **A floor spaces fresh frames** (`PACED_FRAME_FLOOR_MS`) however promptly
    the viewport acks, capping encode work during a flood.
 3. **The frame is built at the opportunity**, from the terminal as it is then;
-   output only marks the viewport dirty. Screens produced in between are
+   output only marks the viewport dirty, and so does every event that owes a
+   frame (the attach replay, the RESYNC keyframe, the regeometry frame, an
+   activity answer, an overlay source swap). Screens produced in between are
    never built, let alone queued. The poll timeout is the nearest
    opportunity, and `-1` when no paced viewport owes a frame (no busy-wait).
 4. **v1 history rides the opportunity**, right behind the paced visible frame
@@ -80,11 +82,6 @@ viewport). Settled for this stage, 2026-10-06:
 
 ## Limitations
 
-- **The attach replay, RESYNC keyframe, regeometry frame, activity answer and
-  source-swap frames are still built when their event happens**, outside the
-  pacing — one frame per event, not per read, so they cannot accumulate
-  during a flood of output. They join the paced path in a follow-up
-  (posh#225).
 - **v1 history re-carry.** A paced viewport that never acks is re-sent up to
   one ring of history every `PACED_ACK_WAIT_MS`. The cap is not at risk (at
   most one visible frame and its scrollback frame are ever queued), but the

@@ -493,7 +493,8 @@ impl ClientConn {
     /// frame is still owed (the replay waits for the session's first PTY
     /// output) is harmless: it only ever makes the next visible frame a
     /// `Full`, and building that frame re-records `visible_shaped_for`, which
-    /// ends the debt.
+    /// ends the debt. For a paced client the frame also waits for its next
+    /// send opportunity (`queue_replay` marks it owed; posh#225).
     fn prepare_regeometry_frame(&mut self) -> bool {
         if !self.owes_regeometry_frame() {
             return false;
@@ -597,7 +598,8 @@ impl ClientConn {
     }
 
     /// [`queue_frame`] with its inputs derived from one source terminal — the
-    /// per-client shape (mid-overlay attach replay, resync keyframe), kept in
+    /// per-client shape (attach replay, resync keyframe, activity answer, the
+    /// paced send `send_paced_frame`), kept in
     /// one place so the frame-input contract cannot drift across call sites.
     /// `broadcast_output` deliberately keeps its batched form: it derives the
     /// snapshot, alt flag and dims once per broadcast and builds the dump once
@@ -1007,9 +1009,41 @@ fn broadcast_output(clients: &mut [ClientConn], term: &Terminal, bcast: &[u8]) {
 /// its held frame on the same RESYNC, so without this forced frame both ends
 /// sit silent forever. Mirrors the single-peer server's `force_frame = true`
 /// ("ships it even if the screen is static", server.rs).
+///
+/// A paced client's recovering `Full` is instead its next paced frame
+/// (posh#225, RFC 0008 §3.2), and waits only for an empty buffer: the RESYNC
+/// released its ack wait, since the ack for the rejected frame is not coming.
 fn handle_frame_ack(c: &mut ClientConn, payload: &[u8], src: &Terminal) {
-    if c.apply_frame_ack(payload) {
+    if c.apply_frame_ack(payload) && !c.owe_paced_frame(true) {
         c.queue_frame_from(src);
+    }
+}
+
+/// The attach / regeometry replay for one client (github #16; posh#225): a
+/// paced client is marked as owing a frame (its next paced frame is built
+/// for its current geometry, which ends any regeometry debt), a framed one is
+/// queued a frame for its geometry now, a baseline one the flat dump.
+///
+/// Derives the dump/snapshot frame inputs ONLY when a producer exists —
+/// exactly the lazy guard `broadcast_output` uses — so a non-capable client
+/// pays only the single `dump_vt_flat` it always did.
+fn queue_replay(c: &mut ClientConn, src: &Terminal) {
+    let produced = c.owe_paced_frame(false) || (c.producer.is_some() && c.queue_frame_from(src));
+    if !produced {
+        c.queue(Tag::Output, &src.dump_vt_flat());
+    }
+}
+
+/// RFC 0013 §5.2 / RFC 0016 §2: an answer that is due and was not on a
+/// replay (a bridge's `Tag::ClientCaps` request, a label change on an idle
+/// screen) rides a frame of its own rather than wait for output — for a
+/// paced client, its next paced frame (a title that changes every line would
+/// otherwise bypass pacing during a flood). Runs before `send_paced_frames`.
+fn queue_due_answers(clients: &mut [ClientConn], src: &Terminal) {
+    for c in clients.iter_mut().filter(|c| c.producer.is_some() && c.answer_due()) {
+        if !c.owe_paced_frame(false) {
+            c.queue_frame_from(src);
+        }
     }
 }
 
@@ -2160,7 +2194,8 @@ fn daemon_loop(
             // RFC 0013 §5.2 / RFC 0016 §2: a request this client's messages
             // latched after the loop-top refresh (Init, Tag::ClientCaps) is
             // answered this iteration — on the replay below, else by the
-            // end-of-iteration pass — not after the next output.
+            // end-of-iteration pass — not after the next output. A paced
+            // client's answer rides its next paced frame (posh#225).
             if !remove && clients[i].wants_activity && clients[i].activity_now.is_none() {
                 clients[i].activity_now =
                     Some(current_activity(pty_fd, term, &mut activity_process, &mut activity_probe_at));
@@ -2272,16 +2307,9 @@ fn daemon_loop(
                 // up it is what every client sees (FDR 0008), so a client
                 // attaching / resuming mid-overlay must base on the overlay
                 // screen, not the live session underneath (see `active_source`).
+                // A paced client's replay is its next paced frame (posh#225).
                 let src = active_source(overlay.as_ref().map(|o| &o.term), term);
-                let c = &mut clients[i];
-                // Derive the dump/snapshot frame inputs ONLY when a producer
-                // exists — exactly the lazy guard `broadcast_output` uses — so a
-                // gate-off or non-capable client (the Phase 1 default, hit on
-                // every attach) pays only the single `dump_vt_flat` it always did.
-                let produced = c.producer.is_some() && c.queue_frame_from(src);
-                if !produced {
-                    c.queue(Tag::Output, &src.dump_vt_flat());
-                }
+                queue_replay(&mut clients[i], src);
             }
             // Escape-to-shell (FDR 0008): a client asked to open the overlay.
             // Deferred here so the source swap can iterate every client's
@@ -2315,13 +2343,10 @@ fn daemon_loop(
             }
         }
 
-        // RFC 0013 §5.2 / RFC 0016 §2: an answer that is due and was not on a
-        // replay (a bridge's Tag::ClientCaps request, a label change on an
-        // idle screen) rides a frame of its own rather than wait for output.
+        // RFC 0013 §5.2 / RFC 0016 §2: due answers not on a replay ride a
+        // frame of their own (a paced client's: its next paced frame).
         let src = active_source(overlay.as_ref().map(|o| &o.term), term);
-        for c in clients.iter_mut().filter(|c| c.producer.is_some() && c.answer_due()) {
-            c.queue_frame_from(src);
-        }
+        queue_due_answers(clients, src);
 
         // posh#225 (RFC 0008 §3.2): the paced send pass runs last, so its
         // frames reflect everything this iteration fed the terminal. A frame
@@ -6195,5 +6220,150 @@ mod tests {
         let frame = fb.next().unwrap().expect("one record");
         assert_eq!((frame.tag, frame.payload.as_slice()), (Tag::Output, &b"hi"[..]));
         assert_eq!(c.paced_send_at(), None);
+    }
+
+    /// A paced client's first fresh frame, sent at `now` and acked, with its
+    /// queued bytes cleared: the state every event-site test below starts from.
+    fn paced_conn_with_an_acked_frame(
+        term: &Terminal,
+        extra: &[caps::Cap],
+        now: u64,
+    ) -> (ClientConn, UnixStream) {
+        let (mut c, peer) = paced_conn(term.rows(), term.cols(), extra);
+        broadcast_output(std::slice::from_mut(&mut c), term, b"x");
+        send_paced_frames(std::slice::from_mut(&mut c), term, now);
+        assert!(!c.write_buf.is_empty(), "the setup frame was sent");
+        let sent = c.producer.as_ref().unwrap().last_visible_num();
+        c.apply_frame_ack(&ipc::encode_frame_ack(sent, 0));
+        c.write_buf.clear();
+        (c, peer)
+    }
+
+    /// Runs the paced send pass at this client's send opportunity and
+    /// returns the frames it queued.
+    fn send_at_the_opportunity(c: &mut ClientConn, term: &Terminal) -> Vec<ServerFrame> {
+        let at = c.paced_send_at().expect("a frame is owed and due");
+        send_paced_frames(std::slice::from_mut(c), term, at);
+        decode_server_frames(&c.write_buf)
+    }
+
+    #[test]
+    fn a_paced_attach_replay_is_built_by_the_send_pass() {
+        let mut term = Terminal::with_scrollback(5, 24, 100);
+        term.process(b"hello");
+        let (mut c, _peer) = paced_conn(5, 24, &[]);
+        queue_replay(&mut c, &term);
+        assert!(c.write_buf.is_empty(), "the replay queues nothing at once");
+        assert!(c.pacing.unwrap().dirty);
+        send_paced_frames(std::slice::from_mut(&mut c), &term, 0);
+        let frames = decode_server_frames(&c.write_buf);
+        assert_eq!(frames.len(), 1);
+        assert!(matches!(frames[0].body, FrameBody::Full(_)), "got {:?}", frames[0].body);
+    }
+
+    #[test]
+    fn a_paced_resync_releases_the_ack_wait() {
+        let mut term = Terminal::with_scrollback(5, 24, 100);
+        term.process(b"hello");
+        let (mut c, _peer) = paced_conn(5, 24, &[]);
+        broadcast_output(std::slice::from_mut(&mut c), &term, b"x");
+        send_paced_frames(std::slice::from_mut(&mut c), &term, 100);
+        let sent = c.producer.as_ref().unwrap().last_visible_num();
+        c.write_buf.clear();
+
+        handle_frame_ack(&mut c, &ipc::encode_frame_ack(sent, ipc::FRAME_ACK_RESYNC), &term);
+        assert!(c.write_buf.is_empty(), "the recovering frame waits for the pass");
+        assert_eq!(c.paced_send_at(), Some(0), "the RESYNC released the ack wait");
+        send_paced_frames(std::slice::from_mut(&mut c), &term, 101);
+        let frames = decode_server_frames(&c.write_buf);
+        assert_eq!(frames.len(), 1);
+        assert!(matches!(frames[0].body, FrameBody::Full(_)), "got {:?}", frames[0].body);
+    }
+
+    #[test]
+    fn a_paced_regeometry_frame_is_the_next_paced_frame() {
+        let mut term = Terminal::with_scrollback(24, 80, 100);
+        term.process(b"hello\r\n$ ");
+        let (mut c, _peer) = paced_conn_with_an_acked_frame(&term, &[], 0);
+        assert!(c.apply_resize(&ipc::encode_resize(30, 80)));
+        assert!(c.prepare_regeometry_frame());
+        queue_replay(&mut c, &term);
+        assert!(c.write_buf.is_empty(), "the regeometry frame waits for the pass");
+        assert!(c.pacing.unwrap().dirty);
+        assert!(c.paced_send_at().is_some_and(|at| at > 0), "it keeps the last fresh frame (no release)");
+
+        let frames = send_at_the_opportunity(&mut c, &term);
+        assert_eq!(frames.len(), 1);
+        assert_eq!(c.visible_shaped_for, Some((30, 80)));
+        assert!(!c.owes_regeometry_frame(), "the paced frame ended the debt");
+    }
+
+    #[test]
+    fn a_paced_morph_regeometry_frame_is_a_full() {
+        let mut term = Terminal::with_scrollback(24, 80, 100);
+        term.process(b"hello\r\n$ ");
+        let morph = [caps::Cap {
+            id: caps::CAP_MORPH,
+            payload: vec![],
+        }];
+        let (mut c, _peer) = paced_conn_with_an_acked_frame(&term, &morph, 0);
+        assert!(c.uses_morph());
+        assert!(c.apply_resize(&ipc::encode_resize(30, 80)));
+        assert!(c.prepare_regeometry_frame());
+        queue_replay(&mut c, &term);
+        assert!(c.write_buf.is_empty());
+
+        let frames = send_at_the_opportunity(&mut c, &term);
+        assert_eq!(frames.len(), 1);
+        assert!(matches!(frames[0].body, FrameBody::Full(_)), "got {:?}", frames[0].body);
+        assert_eq!(c.regeometry_keyframe, Some(frames[0].frame_num));
+    }
+
+    #[test]
+    fn a_paced_activity_answer_rides_the_next_paced_frame() {
+        let label = |process: &str| caps::SessionActivity {
+            process: process.into(),
+            title: String::new(),
+        };
+        let mut term = Terminal::with_scrollback(24, 80, 100);
+        term.process(b"hello");
+        let (mut c, _peer) = paced_conn_with_an_acked_frame(&term, &[], 100);
+        c.absorb_client_caps(
+            &[caps::Cap {
+                id: caps::CAP_SESSION_ACTIVITY,
+                payload: vec![],
+            }],
+            0,
+            false,
+        );
+        c.activity_now = Some(label("vim"));
+        queue_due_answers(std::slice::from_mut(&mut c), &term);
+        assert!(c.write_buf.is_empty(), "the answer waits for the next paced frame");
+        assert!(c.answer_due(), "the answer was not consumed early");
+        assert_eq!(c.activity_sent, None);
+        c.activity_now = Some(label("less"));
+        queue_due_answers(std::slice::from_mut(&mut c), &term);
+        assert!(c.write_buf.is_empty());
+
+        let frames = send_at_the_opportunity(&mut c, &term);
+        assert_eq!(frames.len(), 1, "one frame for both changes");
+        let got = caps::find(&frames[0].caps, caps::CAP_SESSION_ACTIVITY).expect("the answer rides it");
+        assert_eq!(caps::decode_session_activity(&got.payload).unwrap(), label("less"));
+    }
+
+    #[test]
+    fn a_source_swap_marks_a_paced_client_dirty_and_its_next_frame_is_full() {
+        let mut session = Terminal::with_scrollback(24, 80, 100);
+        session.process(b"hello");
+        let (mut c, _peer) = paced_conn_with_an_acked_frame(&session, &[], 0);
+        let mut overlay = Terminal::new(24, 80);
+        overlay.process(b"overlay$ ");
+        broadcast_source_swap(std::slice::from_mut(&mut c), &overlay, &overlay.dump_vt_flat());
+        assert!(c.write_buf.is_empty(), "the swap queues nothing for a paced client");
+        assert!(c.pacing.unwrap().dirty);
+
+        let frames = send_at_the_opportunity(&mut c, &overlay);
+        assert_eq!(frames.len(), 1);
+        assert!(matches!(frames[0].body, FrameBody::Full(_)), "got {:?}", frames[0].body);
     }
 }
