@@ -2071,67 +2071,1399 @@ peer process; if it does not, `kill -USR2 <mux peer pid>` and read that log.
 
 ## Stage 3 — addressed history on the daemon path, with the trickle
 
-Decisions 1, 3, 7.
+Expanded 2026-10-06 against HEAD `5be221b`.
 
-### Task 3.1: Extract `server_loop`'s v2 cursor into a shared type
-- Files: new `crates/posh/src/remote/sb2.rs` (or `posh-proto` if the
-  harness needs it); `remote/server.rs:1301-1307`, `:1863-1888`,
-  `:2012-2022`, `:2172-2205`.
-- A `HistoryCursor { epoch, epoch_base, acked_rows, sent_upto, last_send }`
-  with `on_client_entry`, `on_resize`, `want(now, rto)`, and
-  `next_body(term, cap) -> FrameBody::Scrollback2`. Pure refactor first:
-  `server_loop` uses it and its tests are unchanged. The daemon comment
-  "mirror of server.rs:761-770 — keep in sync" is what this removes.
-- Tests: the existing v2 tests pass untouched; add unit tests for the
-  cursor (in-order, RTO re-anchor, eviction forward jump, epoch bump).
+Decisions 1, 3, 7 (and 2, 5, 6 constrain it). After this stage a paced
+remote viewport gets its history as RFC 0009 v2 bodies — every row
+addressed in an epoch-scoped row space, acknowledged cumulatively, resent
+from the acknowledgement, and skipped past (a forward jump) only when the
+session's ring evicted it first — instead of v1 frames that re-carry every
+un-acked row. Task 3.4 (the dynamic trickle) is expanded but **HELD**.
 
-### Task 3.2: The bridge carries the viewport's v2 entry
-- Files: `remote/relay.rs` (`content_caps` gains `CAP_SCROLLBACK2` for
-  Init), `remote/server.rs:1156-1169` (`bridge_client_message` forwards
-  the per-message `CAP_SCROLLBACK2` entry — it carries the cumulative ack —
-  via `Tag::ClientCaps`, in the M2 bridge's own list, never the relay's).
-- Tests: the daemon sees v2 on Init and a fresh ack on each client message.
+**The model, mirrored from `server_loop`:** one addressed history stream
+per viewport beside its paced screen. At a send opportunity the daemon
+sends ONE body: the screen when it is owed, a history body when rows are
+pending, and — when both are — whichever kind did not go last (the
+`last_was_sb` coin). History never occupies a visible frame slot and is
+never acknowledged by `acked_frame` (RFC 0009 §4), so it cannot lose the
+screen's diff base, and the screen's ack pacing cannot starve it.
 
-### Task 3.3: Daemon emits v2 for paced viewports
-- Files: `session/daemon.rs` — a `HistoryCursor` per paced viewport that
-  advertised v2; `absorb_client_caps` feeds it; the send pass from 2.3
-  alternates screen and history bodies. v1 `maybe_queue_scrollback` remains
-  for non-paced viewports only.
-- The server's `SCROLLBACK2` ack entry rides every frame (the viewport
-  keys its ring reset off it — `remote/client.rs:3126-3139`).
-- Tests: rows shipped == rows scrolled (no repeats) under every
-  `FloodAcks` cadence; with acks withheld, rows are resent only after the
-  RTO and from the ack; a flood of more than one ring with a stalled
-  viewport yields one forward jump of the right size; the Task 0.2 test's
-  `Never` cadence now also satisfies the backlog bounds (delete its
-  carve-out).
+### Facts re-verified at `5be221b` (Stage 3 rests on these)
+
+Corrections to the task-level text that stood here before are marked
+**corrected**.
+
+- **`server_loop`'s v2 state — corrected line numbers.** `SB2_ROWS_PER_BODY
+  = 256` at `remote/server.rs:52-55`. The state is seven loose locals at
+  `:1328-1341` (`sb2_active`, `sb2_epoch` starting at 1, `sb2_epoch_base`,
+  `sb2_acked_rows`, `sb2_sent_upto`, `sb2_last_send`, `sb2_size`). The
+  per-message client entry opens the epoch on first sight at the current
+  monotonic total and takes `max(acked, entry.acked_rows)` only when the
+  entry's epoch matches (`:1892-1909`). A changed client size bumps the
+  epoch (`wrapping_add`) and re-anchors only while active, but `sb2_size`
+  tracks the size from the start (`:1910-1922`). Wanting a body:
+  `avail > sent_upto || resend_due`, where `resend_due = acked < sent_upto
+  && now - last_send >= conn.rto()` (`:2046-2054`); the coin is
+  `make_sb2 = want_sb2 && (!want_visible || !last_was_sb)` (`:2055`). The
+  body (`:2215-2249`) starts at `max(resend_due ? acked : sent_upto,
+  floor_rel)` with `floor_rel = avail - min(ring_len, avail)` — eviction is
+  a forward jump — maps relative row `r` to ring index `ring_len - (avail -
+  r)`, caps at `SB2_ROWS_PER_BODY`, and sets `sent_upto`/`last_send`. It
+  rides `frame_num = producer.current_num()` without advancing the producer
+  (`:2187-2193`, `:2544`). The server entry `encode_scrollback2_ack(epoch)`
+  rides every frame while active (`:2345-2350`). The plan's `:1301-1307`,
+  `:1863-1888`, `:2012-2022`, `:2172-2205` were stale.
+- **`server_loop`'s v2 path has one end-to-end test**, in the CLIENT's
+  module: `remote::client::tests::wedge_repro_server_loop_with_loss_and_titles`
+  (`client.rs:5487`), which asserts v2 engaged. `server.rs`'s own
+  scrollback tests (`run_scrollback_session`, `:4205`) drive v1 only. So
+  "the existing v2 tests pass untouched" means that one test plus the
+  client-side apply tests (`scrollback2_apply_rules_never_touch_applied_num`
+  `:6421`, `scrollback2_epoch_adoption_resets_ring_and_count` `:6465`).
+- **The "keep in sync" comment is NOT removed by `HistoryCursor` —
+  corrected.** `daemon.rs:905` ("mirror of server.rs:761-770 — keep in
+  sync") sits in `maybe_queue_scrollback` and mirrors `server_loop`'s **v1**
+  row-range computation (`server.rs:2267-2277` today), which both producers
+  keep. Task 3.1 only repairs its stale line reference.
+- **Where the v2 Init entry goes — corrected.** The plan put
+  `CAP_SCROLLBACK2` in `relay::content_caps` (`relay.rs:246-251`). ADR 0007
+  forbids additions to the relay (the same correction Stage 2 made for
+  `CAP_PACED`). The M2 bridge forms the daemon Init in `bridge_init_content`
+  (`server.rs:1158-1168`, called at `:1007` from the first `ClientMessage`
+  on an `Awaiting` channel) and retains it as `SessionBridge::content`
+  (`:346`), which `rehome_bridge` re-Inits with (`:1143-1156`). The
+  per-message forward is `bridge_client_message` (`:1170-1220`): the relay's
+  `forwarded_client_caps` (`relay.rs:230-244`: ident, state, upstream,
+  activity) plus the bridge's own additions (push-cmd, `:1186-1196`), sent
+  as one `Tag::ClientCaps` (`:1197-1203`), then `forward_ack`
+  (`relay.rs:197-217`). Both v2 additions go in the bridge.
+- **`SessionBridge::content` is frozen at the first message.** A re-home
+  re-Inits with that first message's caps, so a `SCROLLBACK2` entry in it
+  would carry the viewport's position as of the channel's first message
+  (epoch 0, 0 rows). Task 3.2 refreshes the entry in `content` on every
+  message.
+- **The bridge holds Scrollback2 frames in its scrollback slot**
+  (`relay::is_scrollback_frame`, `relay.rs:404-409`; `held.hold`,
+  `server.rs:747`) and releases them on `acked_frame >= frame_num`
+  (`relay.rs:364-370`). A v2 body rides the newest visible number, so once
+  that visible frame is acked the bridge stops retransmitting a lost body:
+  **the daemon's own resend from the v2 ack is required for correctness**,
+  not an optimisation.
+- **The viewport** (`remote/client.rs`): advertises `CAP_SCROLLBACK2` on
+  every message carrying `{ring_depth 0, epoch (0 while unknown),
+  acked_rows = T}` and keeps v1 `CAP_SCROLLBACK` only until it has adopted
+  an epoch (`outgoing_caps`, `:3800-3832`); omits both for exactly one
+  message after its own resize (`suppress_scrollback_once`). On ANY own
+  size change — height included — it clears its ring, sets `sb2_epoch =
+  None` and `T = 0` (`:2045-2094`). It adopts the server's epoch from the
+  `SCROLLBACK2` ack on any frame — caps are read before the body
+  (`:3137-3146`, then `apply_frame` at `:3174`) — clearing its ring on a
+  change. A v2 body is handled before the stale gate (`:3219-3252`): wrong
+  epoch → discard; fully covered → dup; partial overlap → discard; else
+  append (a forward jump is appended silently) and `T = end`. The plan's
+  `:3126-3139` and `:3212-3245` were stale. **It does not clear its ring on
+  a reconnect or an FDR 0012 switch**, so today's v1 history continues
+  across both with a silent seam.
+- **`ScrollbackRing`** is `remote/sync.rs:550-580` (`new`, `append`,
+  `clear`); the daemon's tests already import it (`daemon.rs:2983`).
+- **Caps** (`posh-proto/src/caps.rs`): `CAP_SCROLLBACK2 = 10` (`:72-80`);
+  `Scrollback2Client {ring_depth, epoch, acked_rows}`,
+  `encode/decode_scrollback2_client` (`:542-574`, exactly 10 bytes),
+  `encode/decode_scrollback2_ack` (`:576-592`, `{0x02, epoch}`).
+  `CAP_PACED = 23`, `PACED_VERSION = 1` (`:179-190`); `decode_paced` reads
+  the version byte and ignores the rest (`:528-530`) — Task 3.4's ceiling
+  appends there. `FrameBody::Scrollback2 { epoch, row_offset, rows }` is
+  `posh-proto/src/frame.rs:145-149`.
+- **Daemon — what Stage 2 and posh#239 left.** `ClientConn` `daemon.rs:161-302`
+  (`pacing: Option<Pacing>` `:294`, `init_applied` `:301`,
+  `visible_shaped_for` `:281`, `regeometry_keyframe` `:288`); `Pacing
+  { dirty, last_fresh: Option<u64> }` `:313-325` (derives `Default, Copy,
+  PartialEq`); `absorb_client_caps` `:332-357` — **ignores
+  `CAP_SCROLLBACK2` today**; `apply_init` `:400-436` (re-derives `pacing`
+  from each table, preserving its state: `paced.then_some(self.pacing
+  .unwrap_or_default())`); `paced_send_at` `:576-587`; `owes_paced_frame`
+  `:591`; `request_frame_from` `:614`; `send_paced_frame` `:622-631`
+  (visible frame, then v1 `maybe_queue_scrollback`); `build_frame_from`
+  `:648`; `queue_frame` `:675-773` (frame caps are
+  `own_table(&activity_cap)` at `:731`, the only place a server entry can
+  ride a visible frame); `apply_frame_ack` `:792-843` (no clock
+  parameter); `maybe_queue_scrollback` `:868-945` (v1, `want =
+  frame_sb_total - max(acked_sb_total, sb_floor)`); `backlog_log_fields`
+  `:961-970`; `broadcast_output` `:985-1050` (a paced client is skipped
+  entirely, `:1027`); `handle_frame_ack` `:1069-1073`; `send_paced_frames`
+  `:1117-1123`; `paced_poll_timeout` `:1128-1135`; `flush_paced_frames`
+  `:1139-1143`; `reset_scrollback_floors_on_reflow` `:1465-1475` (early
+  return unless the session WIDTH changed). In `daemon_loop`: the
+  high-water / drop lines `:1745-1773`, the poll `:1806`, the Init arm
+  `:2091-2119` (sets `sb_floor` for a freshly framed client at `:2107-2109`),
+  `Tag::ClientCaps` `:2125-2134`, `Tag::FrameAck` `:2202-2206`, the
+  disconnect line `:2316-2322`, the `resized` block `:2326-2343`, the
+  replay `:2350-2366`, the end-of-iteration passes `:2399-2406`, the exit
+  flush `:2413-2417`. Eight `ClientConn` literals (`:1925`, `:2891`,
+  `:3022`, `:3067`, `:3687`, `:3974`, `:4612`, `:4823`; posh#230).
+- **The session daemon has no SIGUSR2 dump and no ack timing.** No
+  `SIGUSR2` in `session/` (`rg`); `paced_send_at` only polls
+  `acked_num()`. Its diagnostic surfaces are (a) its log, which it always
+  opens (`util::log_init(&cfg.log_path(name))`, `daemon.rs:1516`;
+  `<base>/…/<session>.log`) — the high-water and drop lines
+  (`backlog_log_fields`) and `client disconnected fd= remaining=`; and (b)
+  the RFC 0014 status socket (`status_response`, `:1655-1678`; four
+  callers, one in `server.rs:1547`), whose client lines are rendered from
+  the CLIENT's own reported record (`introspect::render_client_line`) in a
+  fixed key order (RFC 0014 §4.2). A paced viewport never reaches the
+  high-water or drop line — its backlog is bounded — so on a healthy field
+  run the only line that names it today is the disconnect line, which
+  carries no fields.
+- **The flood harness acks through `apply_frame_ack` directly**
+  (`measure_flood`, `daemon.rs:5786`, `:5823`, `:5866`, `:5888`), not
+  `handle_frame_ack` (`:4486`, `:4492`, `:5026`, `:5135`, `:6797` and the
+  loop are its only callers). Its `FloodLedger::account` classifies a frame
+  as visible unless it is a v1 `Scrollback` (`:6014`) — a `Scrollback2`
+  would be miscounted as visible. `FloodCase` (`:5651-5666`) gains a field
+  in every literal.
+- **The Task 0.2 carve-out stays — corrected.**
+  `posh225_full_ring_flood_keeps_visible_frames_screen_sized`
+  (`daemon.rs:6262`) runs a NON-paced client (`pace: None`). Stage 3 keeps
+  non-paced viewports on v1 byte-for-byte, so its `Never` carve-out stays
+  until Stage 7 retires per-read delivery. The bound it defers is asserted
+  for paced v2 viewports by Task 3.3's tests instead.
+- **FDR 0021's slow-reader loss is not fully removable — corrected
+  expectation.** At `Trickle(1 KiB)` the reader drains ~10 rows/ms against
+  ~40 rows/ms scrolled; rows the ring evicts before their turn are gone
+  whatever the body size. What Stage 3 changes: the backlog is one ≤ 256-row
+  body (not a ring-sized frame), every lost row is a forward jump of
+  exactly the evicted span (the viewport accounts for it; Stage 4 draws
+  it), and the viewport ends holding the whole retained ring.
+- **posh#240 is closed only for v2 viewports.** The issue
+  (`v1 scrollback re-carry + retained-base apply can append rows twice`)
+  also reaches unpaced lossy viewports — a relayed one
+  (`POSH_MUX_SESSIONS=0`, ADR 0007) or `POSH_PACED=0` — which stay on v1
+  until Stage 7. The issue text itself asks to be closed with a pointer
+  when Stage 3 lands; the commit that closes it says what remains.
+- **The visible-base RTT cliff moves.** Stage 2's cliff (≈ 5 ×
+  `PACED_ACK_WAIT_MS`) came from v1 scrollback frames occupying half of
+  `FrameProducer`'s 8-frame outstanding window (`producer.rs:262`). v2
+  bodies occupy none, so a paced v2 viewport's visible base survives an RTT
+  up to ≈ 8 × `PACED_ACK_WAIT_MS` less one pace (≈ 2 s). *Unverified until
+  Task 3.3 Part B measures it* (a `Lagged(2500)` row is added for that).
+- **poshterity's framereplay does not model scrollback**
+  (`poshterity/src/framereplay.rs:24`, `:159-162`: "Scrollback production
+  isn't modelled here yet (github #75 follow-up)").
+
+### Design choices this expansion makes (the task-level text left them open)
+
+- **Ack latency is sampled in `handle_frame_ack`, not `apply_frame_ack`.**
+  The plan said "stamped in `apply_frame_ack`", which has 34 call sites and
+  no clock; `handle_frame_ack` is the daemon loop's one entry and has five
+  test callers, so it gains `now: u64`. A sample is `now − last_fresh` when
+  an ack moves `acked_num` from below the newest paced visible frame to at
+  or beyond it — exactly "the newest fresh frame's round trip", including
+  the bridge and the viewport's apply. Every ack (advancing or not) stamps
+  `last_ack_at`. Unpaced clients record nothing (the state lives in
+  `Pacing`), so their streams and literals are untouched.
+- **3.0's surfaces are log lines, not the status socket.** `posh status`
+  client lines are the client's own record in RFC 0014 §4.2's fixed key
+  order; adding daemon-measured keys means an RFC 0014 edit and four
+  `status_response` callers — that is Task 7.1's "`posh status` shows each
+  viewport's mode", where it belongs. 3.0 adds the latency to
+  `backlog_log_fields`, gives the disconnect line those fields, and adds one
+  throttled `paced ack latency` line per paced viewport (≤ one per
+  `ACK_LOG_INTERVAL_MS` = 10 s, only when new samples arrived), so a field
+  `nix gc` leaves a time series in the session log without detaching.
+- **`HistoryCursor` lives in `crates/posh/src/remote/history.rs`, not
+  posh-proto.** Both users (`server_loop`, the session daemon) are in
+  `posh`; framereplay does not model scrollback, so nothing outside `posh`
+  needs it. When the github #75 follow-up models v2 in poshterity, the
+  move is mechanical (the type depends only on `posh_term::Terminal` and
+  posh-proto types). `SB2_ROWS_PER_BODY` moves with it.
+- **The cursor keeps `server_loop`'s inactive-until-advertised shape**
+  (`active` inside, `size` tracked from construction) so the extraction is
+  exact, including the corner where the first v2 message also changes size.
+- **A new attachment CONTINUES the viewport's epoch at its count.** The
+  daemon opens a cursor per attachment, while the viewport keeps its ring
+  across a reconnect and a switch. Opening a fresh epoch would make the
+  viewport clear its ring on every mux reconnect — a visible regression of
+  today's (v1) behaviour. So the cursor opens from the Init's
+  `SCROLLBACK2` entry: epoch 0 (the viewport holds none) → a fresh epoch 1
+  at row 0; epoch `e`, count `T` → epoch `e`, the next scrolled row is row
+  `T`. That reproduces today's forward-only seam exactly, and it is the
+  input Stage 5 needs (`HistoryStart` takes a starting position; Stage 5
+  passes an earlier absolute one from the resume cursor). Decision 10's
+  "fill order and starting position are per-viewport inputs" is met by the
+  same type. Consequence: an FDR 0012 switch continues the viewport's
+  epoch into the new session's rows — today's v1 behaviour; Stage 5 gives
+  a switch a fresh epoch.
+- **The bridge refreshes the `SCROLLBACK2` entry in `content` and dedupes
+  its forward.** Every viewport message carries the entry; the bridge
+  forwards it as `Tag::ClientCaps` only when its payload differs from the
+  last forwarded one (`SessionBridge::sb2_forwarded`; the socket is
+  reliable, so dedupe loses nothing), and a re-home clears that memory.
+- **v2 is gated on pacing, not just on the advertisement.** The bridge
+  forwards what the viewport advertised; the daemon opens a cursor only
+  for a paced, framed client. `POSH_PACED=0` therefore remains a complete
+  rollback to Stage 1 delivery (v1 history), and a non-paced client's bytes
+  do not change. The cursor lives inside `Pacing`, so "not paced" implies
+  "no v2" by construction and no `ClientConn` literal changes.
+- **One body per opportunity; screen and history keep separate clocks.**
+  The visible opportunity is Stage 2's, unchanged (`paced_send_at`). History
+  has its own (`history_send_at`): `write_buf` empty, and either fresh rows
+  with room in the window → `last history send + PACED_FRAME_FLOOR_MS`, or
+  rows in flight with no room / no fresh rows → `last history send +
+  history_resend_after()`. When both are due in one pass, the kind that did
+  not go last goes (`server_loop`'s coin); the other goes next iteration,
+  after the drain. So the screen's cadence is Stage 2's, and the backlog is
+  at most ONE body — a visible frame or a ≤ 256-row history body. The v1
+  scrollback frame no longer rides behind a v2 viewport's visible frame.
+- **History is ack-clocked by a fixed window: `HISTORY_WINDOW_ROWS = 2 ×
+  SB2_ROWS_PER_BODY` (512 rows) in flight.** The daemon has no RTT and the
+  bridge drains its socket at once, so without a window history would flow
+  at 256 rows per floor (12,800 rows/s) whatever the link — the swamping
+  decision 3 forbids. `server_loop` gets the same effect from its SRTT/2
+  send interval (about two bodies per RTT). The window is the static
+  stand-in for Task 3.4's dynamic share: throughput ≈ 512 rows per RTT.
+- **The resend floor is the measured ack latency, with a conservative
+  start and backoff:** `history_resend_after() = base << min(resends, 3)`,
+  `base = max(PACED_ACK_WAIT_MS, 2 × ack srtt)` once Task 3.0 has a
+  sample, else `HISTORY_RESEND_INITIAL_MS = 4 × PACED_ACK_WAIT_MS` (1 s,
+  TCP's initial RTO); `resends` counts resend bodies without ack progress
+  and resets when the ack advances or the epoch bumps. Using
+  `PACED_ACK_WAIT_MS` alone would resend spuriously at any RTT above
+  250 ms; the backoff turns a never-acking viewport's re-send into at most
+  one window per 1, 2, 4, 8, 8, … s.
+- **Epoch bumps per client on its own size change AND on a session width
+  change.** RFC 0009 §1.1 requires a bump when "the client's reported
+  terminal size changes", and the viewport clears its ring on any own
+  resize (height too). Without the per-client bump the next body would be a
+  forward jump past rows the viewport itself discarded, which Stage 4 would
+  draw as "not received". The session width change (RFC 0002 §4 reflow) is
+  the existing trigger; both live in one function beside
+  `reset_scrollback_floors_on_reflow`.
+- **History comes from the session terminal and pauses while the overlay
+  is up**, as `server_loop` (`:2050`); it does NOT pause on the alternate
+  screen (`server_loop` `:2042-2045`).
+
+### Task 3.0: Ack-latency observability (no behaviour change)
+
+**Promotion criteria:** N/A — diagnostic only.
+
+**Files:**
+- Modify: `crates/posh/src/session/daemon.rs` — constants beside
+  `PACED_ACK_WAIT_MS` (`:73`); `AckLatency` after `Pacing` (`:325`), the
+  `acks` field on `Pacing`; `ClientConn::note_frame_ack` after
+  `apply_frame_ack` (`:843`); `backlog_log_fields` (`:961-970`);
+  `handle_frame_ack` (`:1069-1073`) and its callers (`:2202-2206`, `:4486`,
+  `:4492`, `:5026`, `:5135`, `:6797`); the loop-top breadcrumb
+  (`:1745-1755`); the disconnect line (`:2316-2322`); the flood harness's
+  cadence acks (`:5823`, `:5866`); tests after the Stage 2 block
+  (`:7198`).
+- Modify: `docs/features/0021-flood-delivery.md` — a *Diagnostics*
+  paragraph at the end of Interface.
+
+**Step 1: Record the witness BEFORE touching code.** Run
+`just debug-cargo test --release -p posh --bin posh posh225_flood_backlog_ideal_reader_measurement -- --ignored --nocapture`
+and keep the table (scratchpad). Step 8 re-runs it; every row must be
+identical — this task changes no stream.
+
+**Step 2: Failing tests** (new block `// ---- posh#225 Stage 3: ack latency
+----` after `non_paced_stream_is_identical_beside_a_paced_client`):
+
+- `a_paced_clients_ack_of_its_newest_frame_is_a_latency_sample` —
+  `paced_conn(24, 80, &[])`, `broadcast_output` a line, `send_paced_frames`
+  at `now = 100`; `handle_frame_ack(&mut c, &encode_frame_ack(last_visible,
+  0), &term, 340)`: `acks.last_ms == Some(240)`, `srtt_ms == Some(240)`,
+  `min_ms == Some(240)`, `max_ms == 240`, `samples == 1`, `last_ack_at ==
+  Some(340)`.
+- `ack_latency_smooths_and_keeps_min_and_max` — samples 240 then 40:
+  `srtt_ms == Some((7 * 240 + 40) / 8)`, `min_ms == Some(40)`, `max_ms ==
+  240`, `samples == 2`.
+- `an_ack_below_the_newest_frame_stamps_arrival_but_is_no_sample` — two
+  paced frames sent unacked (at 100, then at `100 + PACED_ACK_WAIT_MS`
+  after re-dirtying and clearing `write_buf`); ack the FIRST at 400:
+  `last_ack_at == Some(400)`, `samples == 0`.
+- `a_repeated_or_resync_ack_is_no_sample` — after one sample, the same ack
+  again → `samples` unchanged, `last_ack_at` moves; a
+  `FRAME_ACK_RESYNC` ack of a new frame → no sample.
+- `an_unpaced_client_records_no_ack_latency` — `lossy_conn`;
+  `handle_frame_ack` → `pacing == None` still.
+- `backlog_log_fields_carry_the_ack_latency` — a paced client with no
+  sample ends `… paced=1 ack_ms=none ack_n=0 ack_age_ms=none`; after the
+  240 ms sample at 340, at `now = 400`: `ack_ms=240/240/240/240 ack_n=1
+  ack_age_ms=60`; a `lossy_conn` ends `paced=0 ack_ms=none ack_n=0
+  ack_age_ms=none`. The Stage 2 test
+  `backlog_log_fields_say_whether_the_client_is_paced` still passes
+  (it checks the leading fields).
+- `the_ack_latency_line_is_due_once_per_interval_with_new_samples` —
+  `ack_latency_log_line(&mut c, now)`: `None` with no samples; `Some` at the
+  first sample (starts `paced ack latency fd=` and ends `new=1`); `None`
+  again at `now + 1` with no new sample, `None` with a new sample before
+  `ACK_LOG_INTERVAL_MS` has passed, `Some(.. new=1)` once it has.
+- `posh225_paced_flood_measures_the_round_trip_as_ack_latency` — 256 KiB,
+  `paced_flood_case(FloodAcks::Lagged(300), 0)`; `measure_flood` returns the
+  client's `AckLatency` in a new `FloodRun::ack_latency` field: `min_ms >=
+  Some(300)` and `srtt_ms` in `300..=310` (expected ≈ 301: the RTT plus the
+  one pace step before the frame reaches the reader). If it is outside,
+  stop and report — the harness's ack timing, not the threshold, is wrong.
+
+Run `just debug-cargo test -p posh --bin posh ack_latency` — expected:
+compile errors (`AckLatency`, the `handle_frame_ack` arity).
+
+**Step 3: Implement the state.**
+
+```rust
+/// How often a paced viewport's `paced ack latency` log line may repeat
+/// (posh#225 Stage 3.0): the field series Task 3.4 is tuned from.
+const ACK_LOG_INTERVAL_MS: u64 = 10_000;
+```
+
+```rust
+/// A paced viewport's frame-ack timing (posh#225 Stage 3.0): the round trip
+/// of its newest fresh visible frame — queued, through the bridge and the
+/// link, applied, acked — which is the only RTT the daemon can see. Read by
+/// the history resend floor (Task 3.3) and the trickle (Task 3.4).
+#[derive(Debug, Default, Clone, Copy, PartialEq, Eq)]
+struct AckLatency {
+    /// When the newest `Tag::FrameAck` arrived, advancing or not.
+    last_ack_at: Option<u64>,
+    last_ms: Option<u64>,
+    /// Smoothed like TCP's SRTT: the first sample, then 7/8 old + 1/8 new.
+    srtt_ms: Option<u64>,
+    min_ms: Option<u64>,
+    max_ms: u64,
+    samples: u64,
+    /// `samples` at the last `paced ack latency` line, and when it was written.
+    logged_samples: u64,
+    logged_at: Option<u64>,
+}
+
+impl AckLatency {
+    fn record(&mut self, ms: u64) {
+        self.last_ms = Some(ms);
+        self.srtt_ms = Some(self.srtt_ms.map_or(ms, |s| (7 * s + ms) / 8));
+        self.min_ms = Some(self.min_ms.map_or(ms, |m| m.min(ms)));
+        self.max_ms = self.max_ms.max(ms);
+        self.samples += 1;
+    }
+
+    /// `ack_ms=<last>/<srtt>/<min>/<max> ack_n=<samples> ack_age_ms=<ms>`,
+    /// `none` where there is nothing yet.
+    fn log_fields(&self, now: u64) -> String { /* … */ }
+}
+```
+
+`Pacing` gains `acks: AckLatency` (its `Default` keeps
+`paced_cap_on_init_makes_a_paced_client_and_a_bare_reinit_keeps_it`'s
+`Some(Pacing::default())` true).
+
+**Step 4: Implement the sampling.** `impl ClientConn`:
+
+```rust
+    /// Record a frame ack's arrival for a paced client (posh#225 Stage 3.0):
+    /// `acked_before` is the producer's `acked_num()` before the ack was
+    /// applied. A sample when this ack is the one that confirmed the newest
+    /// paced visible frame, measured from when that frame was queued.
+    fn note_frame_ack(&mut self, acked_before: Option<u64>, now: u64) {
+        let Some(producer) = self.producer.as_ref() else { return };
+        let (acked, newest) = (producer.acked_num(), producer.last_visible_num());
+        let Some(p) = self.pacing.as_mut() else { return };
+        p.acks.last_ack_at = Some(now);
+        if let (Some(before), Some(sent)) = (acked_before, p.last_fresh) {
+            if before < newest && acked >= newest {
+                p.acks.record(now.saturating_sub(sent));
+            }
+        }
+    }
+```
+
+```rust
+fn handle_frame_ack(c: &mut ClientConn, payload: &[u8], src: &Terminal, now: u64) {
+    let acked_before = c.producer.as_ref().map(FrameProducer::acked_num);
+    let resync = c.apply_frame_ack(payload);
+    c.note_frame_ack(acked_before, now);
+    if resync {
+        c.request_frame_from(src);
+    }
+}
+```
+
+(A RESYNC clears `last_fresh` inside `apply_frame_ack`, so it is never a
+sample.) Update the loop arm to pass `util::now_ms()` and the five test
+callers to pass `0` (or the test's clock). In `measure_flood`, the two
+cadence acks (`:5823`, `:5866`) become `handle_frame_ack(&mut c, &…,
+&term, now)`; the attach ack (`:5786`) and the final ack (`:5888`) stay
+`apply_frame_ack`, so the harness's artificial t = 0 keyframe is not a
+sample. For an unpaced run `handle_frame_ack` is `apply_frame_ack` plus a
+no-op, so the stream is unchanged. `FloodRun` gains `ack_latency:
+Option<AckLatency>` (the client's `pacing.acks` at the end of the run;
+`None` unpaced) for the flood test above.
+
+**Step 5: Implement the surfaces.**
+- `backlog_log_fields` appends `" {}", c.pacing.map_or_else(||
+  AckLatency::default().log_fields(now), |p| p.acks.log_fields(now))` after
+  `paced=`.
+- `fn ack_latency_log_line(c: &mut ClientConn, now: u64) -> Option<String>`
+  — due when `samples > logged_samples` and `logged_at` is `None` or at
+  least `ACK_LOG_INTERVAL_MS` old; returns `format!("paced ack latency {}
+  new={}", backlog_log_fields(c, now), samples - logged_samples)` and
+  records `logged_samples`/`logged_at`.
+- Loop top, in the breadcrumb loop (`:1746`): `if let Some(line) =
+  ack_latency_log_line(c, now) { util::log_write("info", &line); }`.
+- Disconnect line (`:2317-2322`): compute `backlog_log_fields(&clients[i],
+  util::now_ms())` before `clients.remove(i)` and log `client disconnected
+  {fields} remaining={}` (the prefix and `fd=` are unchanged grep targets).
+
+**Step 6: Run** `just debug-cargo test -p posh --bin posh ack_latency` and
+`just debug-cargo test -p posh --bin posh backlog_log_fields` — expected
+PASS. Then `just debug-cargo test -p posh --bin posh session::daemon` —
+expected PASS.
+
+**Step 7: FDR 0021 Diagnostics.** One paragraph at the end of Interface:
+the session daemon's log (`<base>/…/<session>.log`) carries, per paced
+viewport, `paced ack latency … ack_ms=<last>/<srtt>/<min>/<max> ack_n=
+ack_age_ms= new=` at most every 10 s while frames are acked, and the same
+fields on `client disconnected`; `ack_ms` is the round trip of the newest
+paced screen frame (daemon → bridge → link → viewport → back). Status
+unchanged (`experimental`).
+
+**Step 8: Lint and witness.** `just lint-fmt`;
+`just debug-cargo clippy -p posh --all-targets -- -D warnings` — clean.
+Re-run Step 1's measurement — expected: identical rows.
+
+**Step 9: Commit** — message:
+`daemon: record and log each paced viewport's ack latency (posh#225 Stage 3.0)`
+with a body naming the sample rule, the three log surfaces, and "no stream
+changes (measurement table identical)".
+
+**Field step (operator, after 3.0 merges and deploys):** run a `nix gc` in
+a remote mux-attached session, then read the remote session log for
+`paced ack latency` lines (idle before, during, after). These numbers gate
+Task 3.4.
+
+### Task 3.1: Extract `server_loop`'s v2 cursor into `HistoryCursor` (pure refactor)
+
+**Promotion criteria:** N/A — no behaviour change.
+
+**Files:**
+- Create: `crates/posh/src/remote/history.rs`.
+- Modify: `crates/posh/src/remote/mod.rs` — `pub mod history;` beside
+  `pub mod framesync` (`:40`).
+- Modify: `crates/posh/src/remote/server.rs` — remove `SB2_ROWS_PER_BODY`
+  (`:52-55`); replace the locals (`:1328-1341`), the entry/size blocks
+  (`:1892-1922`), `now_wants` (`:1923-1924`), `want_sb2` (`:2039-2054`),
+  the body (`:2215-2249`), the ack entry (`:2345-2350`).
+- Modify: `crates/posh/src/session/daemon.rs:905` — the stale "mirror of
+  server.rs:761-770" becomes "mirror of `server_loop`'s v1 scrollback body
+  (`remote/server.rs`) — keep in sync" (no line numbers).
+
+**Step 1: Witness.** Run
+`just debug-cargo test -p posh --bin posh wedge_repro_server_loop_with_loss_and_titles -- --nocapture`
+and `just debug-cargo test -p posh --bin posh scrollback2` — expected PASS;
+keep the printed `sb2_rows=` line.
+
+**Step 2: Failing tests** (`history.rs` `mod tests`; a 5x20 terminal with a
+50-row ring, `scroll(term, n)` feeding `n` distinct `"{i:04}\r\n"` lines
+after filling the screen):
+
+- `a_cursor_is_inert_until_activated` — `HistoryCursor::new((5, 20))`:
+  `epoch() == None`, `wants(..) == false`; `on_client_size((6, 20), total)`
+  records the size without bumping (after `activate`, `epoch() ==
+  Some(1)`).
+- `a_fresh_cursor_numbers_rows_from_its_opening_total` — activate `Fresh`
+  at total `t0`, scroll 10: `avail == 10`; `next_body(.., cap 4)` →
+  `Scrollback2 { epoch: 1, row_offset: 0, rows }` whose rows equal
+  `term.dump_scrollback_row(ring_len - 10 + k)`; the next body starts at 4.
+- `a_body_carries_at_most_the_cap` — scroll 600 (ring 50): bodies of
+  `cap` rows until caught up.
+- `an_ack_moves_only_forward_and_only_in_its_epoch` — `on_ack(1, 5)` →
+  acked 5; `on_ack(1, 3)` → 5; `on_ack(2, 9)` → 5 (wrong epoch).
+- `a_resend_starts_at_the_ack_and_waits_for_the_rto` — send 0..8 at
+  `now = 0`, `on_ack(1, 3)`: `resend_due(10, 100) == false` and `wants(..,
+  10, 100) == false` (caught up); at `now = 100`: `resend_due` true and
+  `next_body` starts at 3.
+- `evicted_rows_become_one_forward_jump` — send 0..10, scroll 100 more
+  (ring 50): `next_body` starts at `avail - 50` (> 10: a jump of
+  `avail - 50 - 10`), and bodies after it are contiguous.
+- `a_size_change_bumps_the_epoch_and_reanchors` — active, scroll 10, send:
+  `on_client_size((6, 20), total)` → `epoch() == Some(2)`, `avail == 0`,
+  `acked_rows() == 0`, `sent_upto() == 0`; the same size again → no bump;
+  epoch 255 bumps to 0 (`wrapping_add`, as today).
+- `bump_epoch_reanchors_unconditionally_when_active`.
+- `a_continued_cursor_resumes_the_viewports_count` — `activate(Continue {
+  epoch: 7, rows: 40 }, total)`, scroll 3: `epoch() == Some(7)`, `avail ==
+  43`, `acked_rows() == 40`; `next_body` → `row_offset 40`, the 3 newest
+  ring rows. (Used by Task 3.3; `server_loop` never continues.)
+- `a_continued_cursor_never_offers_rows_from_before_its_anchor` — continue
+  at `rows: 40` over a full ring, scroll 5, send them, let the RTO pass
+  with no ack: the resend body starts at 40, never below it, though the
+  ring holds older rows (the floor is `max(anchor_rel, avail - ring_len)`).
+
+Run `just debug-cargo test -p posh --bin posh remote::history` — expected:
+compile error (module missing).
+
+**Step 3: Implement** `history.rs`:
+
+```rust
+//! RFC 0009 v2 history: the send cursor of the addressed, cumulatively
+//! acknowledged scrollback stream. Shared by the single-peer `server_loop`
+//! and the session daemon's paced viewports (posh#225 Stage 3).
+
+use posh_term::Terminal;
+
+use crate::remote::caps::Scrollback2Client;
+use crate::remote::sync::FrameBody;
+
+/// Max rows per v2 body (RFC 0009 §2): chunks a long-disconnect resend into
+/// fragmentation-friendly frames; the cumulative repeat loop carries the
+/// rest forward as acks advance.
+pub(crate) const SB2_ROWS_PER_BODY: u64 = 256;
+
+/// Where a cursor's row space starts (decision 10: a per-viewport input).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum HistoryStart {
+    /// The cursor's own epoch; row 0 is the next row scrolled.
+    Fresh,
+    /// The viewport's epoch, continued: row `rows` is the next row scrolled.
+    /// Forward-only — rows scrolled while it was elsewhere are not this
+    /// cursor's (Stage 5 passes an earlier position from the resume cursor).
+    Continue { epoch: u8, rows: u64 },
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) struct HistoryCursor {
+    active: bool,
+    epoch: u8,
+    /// The monotonic primary-scrollback total at which relative row
+    /// `anchor_rel` begins (relative row r is absolute row
+    /// `anchor_abs + r - anchor_rel`).
+    anchor_abs: u64,
+    anchor_rel: u64,
+    acked_rows: u64,
+    sent_upto: u64,
+    last_send: u64,
+    size: (u16, u16),
+}
+
+impl HistoryCursor {
+    pub(crate) fn new(size: (u16, u16)) -> Self;          // inactive, epoch 1
+    pub(crate) fn activate(&mut self, start: HistoryStart, total: u64); // no-op when active
+    /// `server_loop`'s per-message entry: open on first sight, then ack.
+    pub(crate) fn on_client_entry(&mut self, entry: &Scrollback2Client, total: u64);
+    /// Cumulative ack in `epoch`; returns whether it advanced.
+    pub(crate) fn on_ack(&mut self, epoch: u8, acked_rows: u64) -> bool;
+    /// Records `size`; bumps when active and it changed (RFC 0009 §1.1).
+    pub(crate) fn on_client_size(&mut self, size: (u16, u16), total: u64);
+    pub(crate) fn bump_epoch(&mut self, total: u64);       // no-op when inactive
+    pub(crate) fn epoch(&self) -> Option<u8>;               // None when inactive
+    pub(crate) fn avail(&self, total: u64) -> u64 {
+        self.anchor_rel + total.saturating_sub(self.anchor_abs)
+    }
+    pub(crate) fn resend_due(&self, now: u64, rto: u64) -> bool {
+        self.acked_rows < self.sent_upto && now.saturating_sub(self.last_send) >= rto
+    }
+    pub(crate) fn wants(&self, total: u64, now: u64, rto: u64) -> bool {
+        self.active && (self.avail(total) > self.sent_upto || self.resend_due(now, rto))
+    }
+    pub(crate) fn in_flight(&self) -> u64 { self.sent_upto.saturating_sub(self.acked_rows) }
+    pub(crate) fn acked_rows(&self) -> u64;
+    pub(crate) fn sent_upto(&self) -> u64;
+    pub(crate) fn last_send(&self) -> u64;
+    /// The next body, exactly `server_loop`'s: from the ack when a resend is
+    /// due, else from the send cursor; never below the eviction floor (a
+    /// forward jump) nor below `anchor_rel`; at most `cap` rows.
+    pub(crate) fn next_body(&mut self, term: &Terminal, now: u64, rto: u64, cap: u64) -> FrameBody {
+        let total = term.primary_scrollback_total();
+        let ring_len = term.primary_scrollback_len() as u64;
+        let avail = self.avail(total);
+        let floor_rel = self.anchor_rel.max(avail.saturating_sub(ring_len));
+        let cursor = if self.resend_due(now, rto) { self.acked_rows } else { self.sent_upto };
+        let start = cursor.max(floor_rel);
+        let count = (avail - start).min(cap) as usize;
+        let rows = (0..count)
+            .map(|k| {
+                let r = start + k as u64;
+                term.dump_scrollback_row((ring_len - (avail - r)) as usize).unwrap_or_default()
+            })
+            .collect();
+        self.sent_upto = start + count as u64;
+        self.last_send = now;
+        FrameBody::Scrollback2 { epoch: self.epoch, row_offset: start, rows }
+    }
+}
+```
+
+With `anchor_rel = 0`, `floor_rel` is `server_loop`'s `avail - min(ring_len,
+avail)` exactly. `Fresh` sets `anchor_abs = total`, `anchor_rel = acked =
+sent = 0` and keeps `epoch`; `Continue` sets `epoch`, `anchor_rel = acked =
+sent = rows`. `bump_epoch` is `server_loop`'s re-anchor (`wrapping_add(1)`,
+`anchor_abs = total`, everything else 0).
+
+Run `just debug-cargo test -p posh --bin posh remote::history` — expected
+PASS.
+
+**Step 4: Switch `server_loop`.**
+- `:1328-1341` → `let mut sb2 = HistoryCursor::new((rows, cols));` (one
+  comment carrying the old block's explanation).
+- `:1892-1909` → `if let Some(c) = caps::find(..).and_then(|cap|
+  caps::decode_scrollback2_client(&cap.payload).ok()) {
+  sb2.on_client_entry(&c, term.primary_scrollback_total()); }`.
+- `:1910-1922` → `sb2.on_client_size(client_size, term.primary_scrollback_total());`.
+- `:1923-1924` → `let now_wants = sb2.epoch().is_none() && …`.
+- `:2046-2054` → `let want_sb2 = overlay.is_none() && !force_frame &&
+  !shutdown && paced && sb2.wants(cur_sb_total, now, conn.rto());` (the
+  `sb2_avail`/`sb2_resend_due` locals go).
+- `:2215-2249` → `sb2.next_body(&term, now, conn.rto(), SB2_ROWS_PER_BODY)`
+  (the comment stays).
+- `:2348-2350` → `if let Some(epoch) = sb2.epoch() {
+  extras.push(caps::encode_scrollback2_ack(epoch)); }`.
+- `use crate::remote::history::{HistoryCursor, SB2_ROWS_PER_BODY};`.
+
+**Step 5: Run** Step 1's two commands — expected PASS, the
+`wedge_repro` line unchanged in shape (its numbers vary run to run with
+induced loss). Then `just debug-cargo test -p posh --bin posh remote::` —
+expected PASS; `just debug-cargo clippy -p posh --all-targets -- -D
+warnings` — clean.
+
+**Step 6: Commit** — message:
+`remote: extract server_loop's v2 history cursor into HistoryCursor (posh#225 Stage 3; no behaviour change)`
+
+### Task 3.2: The M2 bridge carries the viewport's `SCROLLBACK2` entry and its ack
+
+**Promotion criteria:** N/A — until Task 3.3 the daemon ignores the entry
+(`absorb_client_caps` and `apply_init` do not read id 10), so no stream
+changes.
+
+**Files:**
+- Modify: `crates/posh/src/remote/server.rs` — `SessionBridge`
+  (`:309-350`) gains `sb2_forwarded: Option<Vec<u8>>`; its literals
+  (`:1037-1055`, `test_bridge`'s at `:2856-2862`) set `None`;
+  `bridge_init_content` (`:1158-1168`); `bridge_client_message`
+  (`:1186-1203`); `rehome_bridge` (`:1143-1156`); tests after
+  `rehome_bridge_keeps_paced_in_the_reinit` (`:3144`).
+- Do **not** modify `crates/posh/src/remote/relay.rs` (ADR 0007).
+
+**Step 1: Failing tests** (`server.rs` `mod tests`; a helper
+`fn sb2(epoch: u8, rows: u64) -> caps::Cap` = `encode_scrollback2_client`
+with `ring_depth: 0`, and `fn client_caps_records(b: &SessionBridge) ->
+Vec<Vec<caps::Cap>>` decoding every `Tag::ClientCaps` in
+`b.daemon.link.write`):
+
+- `bridge_init_carries_the_viewports_scrollback2_entry` —
+  `bridge_init_content(&[sb2(0, 0)])` contains it verbatim; without it, no
+  id 10.
+- `the_relay_never_carries_scrollback2` — `relay::content_caps(&[sb2(1,
+  5)])` and `relay::forwarded_client_caps(&[sb2(1, 5)])` are empty.
+- `the_bridge_forwards_a_changed_scrollback2_ack_once` — `test_bridge()`;
+  a `ClientMessage` (rows/cols = `b.client_size`, no input) with
+  `caps: vec![sb2(1, 5)]` → one `ClientCaps` record holding exactly
+  `sb2(1, 5)`; the same message again → no new record; `sb2(1, 9)` → a
+  record with it.
+- `the_bridge_keeps_its_init_content_at_the_viewports_latest_entry` —
+  after messages with `sb2(1, 5)` then `sb2(1, 9)`, `caps::find(&b.content,
+  CAP_SCROLLBACK2) == Some(&sb2(1, 9))`.
+- `rehome_bridge_reinits_with_the_latest_scrollback2_entry_and_forwards_afresh`
+  — as `rehome_bridge_keeps_paced_in_the_reinit` (`:3144`), after a message
+  with `sb2(3, 77)`: the re-Init's table decodes id 10 as `{epoch 3,
+  acked_rows 77}`; the next message carrying the same `sb2(3, 77)` is
+  forwarded (the dedupe memory was cleared).
+- `a_message_without_scrollback2_forwards_nothing_for_it` — the
+  resize-suppressed message (no entry) adds no `ClientCaps` record and
+  leaves `content`'s entry alone.
+
+Run `just debug-cargo test -p posh --bin posh scrollback2` — expected:
+compile errors / assertion failures.
+
+**Step 2: Implement.**
+
+```rust
+fn bridge_init_content(client_caps: &[caps::Cap]) -> Vec<caps::Cap> {
+    let mut content = crate::remote::relay::content_caps(client_caps);
+    content.extend(caps::find(client_caps, caps::CAP_PACED).cloned());
+    // posh#225 Stage 3 (RFC 0009 on the session socket): the viewport's v2
+    // entry — its epoch and count, from which the daemon opens the cursor.
+    content.extend(caps::find(client_caps, caps::CAP_SCROLLBACK2).cloned());
+    content
+}
+```
+
+In `bridge_client_message`, after the push-cmd extension:
+
+```rust
+    // posh#225 Stage 3: the viewport's SCROLLBACK2 entry is its cumulative
+    // v2 ack (RFC 0009 §3); forward it when it changed (the socket is
+    // reliable), and keep `content`'s copy current so a re-home re-Inits
+    // the new daemon at the viewport's position, not its first message's.
+    if let Some(entry) = caps::find(&msg.caps, caps::CAP_SCROLLBACK2) {
+        if b.sb2_forwarded.as_deref() != Some(&entry.payload[..]) {
+            b.sb2_forwarded = Some(entry.payload.clone());
+            forwarded.push(entry.clone());
+        }
+        match b.content.iter_mut().find(|c| c.id == caps::CAP_SCROLLBACK2) {
+            Some(held) => *held = entry.clone(),
+            None => b.content.push(entry.clone()),
+        }
+    }
+```
+
+`rehome_bridge` sets `b.sb2_forwarded = None` after the new leg links. The
+doc comment on `bridge_init_content` names the entry beside `CAP_PACED`.
+
+**Step 3: Run** `just debug-cargo test -p posh --bin posh remote::` —
+expected PASS (`mux_peer_opens_daemonlink_per_session_channel`'s `cm()`
+advertises no id 10). `just debug-cargo clippy -p posh --all-targets -- -D
+warnings` — clean.
+
+**Step 4: Commit** — message:
+`M2 bridge: carry the viewport's SCROLLBACK2 entry into the daemon Init and forward its ack (posh#225 Stage 3)`
+
+### Task 3.3: The daemon sends addressed (v2) history to paced viewports
+
+Two commits: **Part A** is the behaviour (state, wiring, unit tests, FDR
+lines); **Part B** is the flood harness, the regression tests and the
+measurement.
+
+**Promotion criteria:** N/A — opt-out on the viewport (`POSH_PACED=0`,
+next attach) returns it to v1 history.
+
+#### Part A — the core
+
+**Files:**
+- Modify: `crates/posh/src/session/daemon.rs` — constants beside
+  `PACED_ACK_WAIT_MS` (`:73`); `Pacing` (`:313-325`) gains `history`,
+  `last_was_history`, `history_resends`; `use
+  crate::remote::history::{HistoryCursor, HistoryStart, SB2_ROWS_PER_BODY}`;
+  `absorb_client_caps` (`:332-357`); new `ClientConn` methods after
+  `send_paced_frame` (`:631`); `send_paced_frame` (`:622-631`);
+  `queue_frame`'s caps (`:688-706`, `:731`); `send_paced_frames`
+  (`:1117-1123`), `paced_poll_timeout` (`:1128-1135`); a new
+  `reset_history_on_resize` after `reset_scrollback_floors_on_reflow`
+  (`:1475`); `daemon_loop` — the poll (`:1806`), the Init arm
+  (`:2107-2109`), the `resized` block (`:2342`), the send pass (`:2406`);
+  every test call of `send_paced_frames` / `paced_poll_timeout`; tests in
+  a `// ---- posh#225 Stage 3: v2 history ----` block.
+- Modify: `docs/features/0021-flood-delivery.md` — Interface and
+  Limitations (below).
+
+**Step 1: Record the witness BEFORE touching code** — the Step 1
+measurement of Task 3.0 (re-run it at this HEAD). Part B Step 6 compares.
+
+**Step 2: Failing tests.** Helpers first:
+
+```rust
+    fn sb2_entry(epoch: u8, acked_rows: u64) -> caps::Cap {
+        caps::encode_scrollback2_client(&caps::Scrollback2Client { ring_depth: 0, epoch, acked_rows })
+    }
+
+    /// A paced client whose Init carried SCROLLBACK + `entry`, opened the
+    /// way the daemon's Init arm opens it.
+    fn paced_v2_conn(term: &Terminal, entry: caps::Cap) -> (ClientConn, UnixStream) {
+        let (mut c, peer) = paced_conn(term.rows(), term.cols(), &[SCROLLBACK_CAP[0].clone(), entry]);
+        c.sb_floor = term.primary_scrollback_total();
+        c.open_history(term);
+        (c, peer)
+    }
+
+    /// What the viewport's next message would forward: its cumulative ack.
+    fn ack_history(c: &mut ClientConn, epoch: u8, rows: u64) {
+        c.absorb_client_caps(&[sb2_entry(epoch, rows)], 0, false);
+    }
+
+    fn history_bodies(frames: &[ServerFrame]) -> Vec<(u8, u64, usize)> // (epoch, row_offset, rows)
+```
+
+Tests (one line each on what they assert):
+
+- `a_paced_scrollback2_init_opens_a_history_cursor_and_nothing_else_does`
+  — `paced_v2_conn(.., sb2_entry(0, 0))` → `history` is `Some` with epoch
+  1; `paced_conn` without id 10 → `None`; `lossy_conn` with id 10 →
+  `pacing == None`; a 9-byte id-10 payload → `None`.
+- `a_viewport_holding_an_epoch_continues_it_at_its_count` —
+  `sb2_entry(7, 40)`: scroll 3, the history body is `(7, 40, 3)`.
+- `a_bare_reinit_keeps_the_history_cursor` — ack 5 rows, then
+  `apply_init(&encode_resize(..))`: the cursor is unchanged.
+- `every_frame_to_a_v2_viewport_carries_the_scrollback2_ack` — the paced
+  visible frame's caps decode id 10 as `{0x02, 1}`; a paced non-v2 client's
+  frame carries no id 10; a `lossy_conn` fed the same output is
+  byte-identical to a twin built before this change (compare two
+  `lossy_conn`s, one given an `open_history` call — it must be a no-op).
+- `a_v2_viewport_gets_scrollback2_bodies_and_never_v1` — attach frame acked,
+  scroll 10, pass at the visible opportunity: ONE visible frame, no
+  `FrameBody::Scrollback` behind it; pass at the history opportunity:
+  `Scrollback2 { epoch: 1, row_offset: 0 }` with the 10 rows equal to
+  `term.dump_scrollback_row(..)`, its `frame_num` equal to
+  `last_visible_num()`, the producer's `current_num()` unmoved.
+- `screen_and_history_take_turns_when_both_are_due` — with both due at one
+  `now`: after a visible send the pass sends history; with both due again
+  (buffer cleared, both clocks past), it sends the screen.
+- `a_history_body_carries_at_most_sb2_rows_per_body` — scroll 600 with
+  prompt acks: bodies of 256, 256, 88.
+- `history_waits_for_room_in_the_window` — no acks: two bodies (0..256,
+  256..512) at successive floors, then `history_send_at() == last send +
+  HISTORY_RESEND_INITIAL_MS` though 88 fresh rows wait; `ack_history(1,
+  256)` → due at the floor again, next body starts at 512.
+- `a_withheld_ack_is_resent_from_the_ack_only_after_the_floor` — after
+  0..512 and `ack_history(1, 100)`: nothing at `last + floor`; at `last +
+  HISTORY_RESEND_INITIAL_MS` the body starts at 100.
+- `resends_back_off_while_acks_stay_withheld` — successive resend deadlines
+  are `base`, `2 base`, `4 base`, `8 base`, `8 base` after the last send;
+  an advancing `ack_history` resets to `base`.
+- `the_resend_floor_follows_the_measured_ack_latency` — `acks.srtt_ms =
+  Some(600)` → `history_resend_after() == 1200`; `Some(50)` →
+  `PACED_ACK_WAIT_MS`; `None` → `HISTORY_RESEND_INITIAL_MS`.
+- `a_stale_epoch_or_backward_ack_is_ignored` — `ack_history(2, 9)` in epoch
+  1 and `ack_history(1, 3)` after 5 leave the ack at 5.
+- `a_stalled_v2_viewport_gets_one_forward_jump_of_the_evicted_span` — a
+  5x20 terminal with a 50-row ring: send one body (0..10) and ack it; scroll
+  200 more with no pass; then passes with prompt acks until caught up: the
+  bodies' offsets are `0, f, f + n…` with exactly one discontinuity, `f ==
+  avail - 50` (the jump is `f - 10` rows, the rows evicted before their
+  turn), and the rows delivered after it are the ring's 50, in order.
+- `a_viewports_own_resize_bumps_its_epoch_and_a_width_change_bumps_all` —
+  two v2 clients; `apply_resize` one to a new height and
+  `reset_history_on_resize(&mut clients, &term, cols)`: its epoch is 2, the
+  other's 1; then resize the terminal's width and call it with the old
+  width: both bump; the next frame to each carries its new epoch.
+- `no_history_body_while_the_overlay_is_up` — `send_paced_frames(.., src,
+  None, now)` sends no `Scrollback2` though rows are pending, and
+  `paced_poll_timeout(.., None, now) == -1` for a clean screen.
+- `the_poll_wakes_for_pending_history` — clean screen, pending rows:
+  `paced_poll_timeout(.., Some(&term), now)` is the history floor deadline.
+- `the_exit_flush_sends_only_the_screen` — `flush_paced_frames` on a dirty
+  v2 client with pending rows queues one visible frame and no body.
+
+Run `just debug-cargo test -p posh --bin posh v2` — expected: compile
+errors (`open_history`, the new arities).
+
+**Step 3: Implement the state.**
+
+```rust
+/// v2 history (posh#225 Stage 3): rows a paced viewport may have in flight
+/// before its ack — about two bodies per round trip, the daemon's stand-in
+/// for `server_loop`'s SRTT-paced send interval. The static share Task 3.4
+/// makes dynamic. A tuning value: change it only with a measurement in FDR 0021.
+const HISTORY_WINDOW_ROWS: u64 = 2 * SB2_ROWS_PER_BODY;
+/// The v2 resend floor before any ack latency has been measured: TCP's
+/// initial RTO. A tuning value, as above.
+const HISTORY_RESEND_INITIAL_MS: u64 = 4 * PACED_ACK_WAIT_MS;
+/// Resend backoff: the floor doubles per resend without ack progress, at
+/// most this many times.
+const HISTORY_RESEND_MAX_DOUBLINGS: u32 = 3;
+```
+
+`Pacing` gains:
+
+```rust
+    /// RFC 0009 v2 history (posh#225 Stage 3): `Some` when this paced
+    /// viewport's Init carried a well-formed `CAP_SCROLLBACK2`; it then gets
+    /// `Scrollback2` bodies and never v1 `Scrollback` frames.
+    history: Option<HistoryCursor>,
+    /// Whether the newest paced send was a history body (`server_loop`'s
+    /// `last_was_sb`): when both kinds are due, the other one goes.
+    last_was_history: bool,
+    /// Resend bodies since the v2 ack last advanced (the backoff exponent).
+    history_resends: u32,
+```
+
+**Step 4: Open, ack, bump.** `impl ClientConn`:
+
+```rust
+    /// Open this paced viewport's v2 cursor from its Init's SCROLLBACK2
+    /// entry, at `term`'s total (the daemon's Init arm, beside `sb_floor`).
+    /// A viewport holding an epoch is continued at its count, so a
+    /// reconnect keeps its ring (a fresh epoch would make it clear it); one
+    /// holding none (epoch 0) gets a fresh epoch. A bare re-Init keeps the
+    /// cursor it has.
+    fn open_history(&mut self, term: &Terminal) {
+        if self.producer.is_none() {
+            return;
+        }
+        let entry = caps::find(&self.caps, caps::CAP_SCROLLBACK2)
+            .and_then(|c| caps::decode_scrollback2_client(&c.payload).ok());
+        let (Some(p), Some(entry)) = (self.pacing.as_mut(), entry) else { return };
+        if p.history.is_some() {
+            return;
+        }
+        let start = match entry.epoch {
+            0 => HistoryStart::Fresh,
+            epoch => HistoryStart::Continue { epoch, rows: entry.acked_rows },
+        };
+        let mut cursor = HistoryCursor::new((self.rows, self.cols));
+        cursor.activate(start, term.primary_scrollback_total());
+        p.history = Some(cursor);
+    }
+```
+
+In `absorb_client_caps`, after the push-cmd latch:
+
+```rust
+        // posh#225 Stage 3 (RFC 0009 §3): a v2 viewport's cumulative ack,
+        // forwarded by the M2 bridge on every change.
+        if let Some(entry) = caps::find(table, caps::CAP_SCROLLBACK2)
+            .and_then(|c| caps::decode_scrollback2_client(&c.payload).ok())
+        {
+            if let Some(p) = self.pacing.as_mut() {
+                if p.history.as_mut().is_some_and(|h| h.on_ack(entry.epoch, entry.acked_rows)) {
+                    p.history_resends = 0;
+                }
+            }
+        }
+```
+
+(On an Init it runs inside `apply_init`, before `open_history`, and finds
+no cursor: the Init's count is taken by `open_history` itself.)
+
+```rust
+/// v2 epochs (RFC 0009 §1.1, posh#225 Stage 3), run beside
+/// `reset_scrollback_floors_on_reflow`: a viewport whose own reported size
+/// changed cleared its ring, and a session width change reflowed the
+/// daemon's, so each re-anchors at the current total in a new epoch.
+fn reset_history_on_resize(clients: &mut [ClientConn], term: &Terminal, cols_before: u16) {
+    let total = term.primary_scrollback_total();
+    let reflowed = term.cols() != cols_before;
+    for c in clients.iter_mut() {
+        let size = (c.rows, c.cols);
+        let Some(p) = c.pacing.as_mut() else { continue };
+        let Some(h) = p.history.as_mut() else { continue };
+        let before = h.epoch();
+        h.on_client_size(size, total);
+        if reflowed && h.epoch() == before {
+            h.bump_epoch(total);
+        }
+        if h.epoch() != before {
+            p.history_resends = 0;
+        }
+    }
+}
+```
+
+**Step 5: The history opportunity and the body.** `impl ClientConn`:
+
+```rust
+    fn has_history(&self) -> bool {
+        self.pacing.is_some_and(|p| p.history.is_some())
+    }
+
+    /// The v2 resend floor: twice the measured ack latency (never under the
+    /// ack wait), `HISTORY_RESEND_INITIAL_MS` before any sample, doubled per
+    /// resend without progress.
+    fn history_resend_after(&self) -> u64 {
+        let Some(p) = self.pacing.as_ref() else { return HISTORY_RESEND_INITIAL_MS };
+        let base = p.acks.srtt_ms.map_or(HISTORY_RESEND_INITIAL_MS, |s| (2 * s).max(PACED_ACK_WAIT_MS));
+        base << p.history_resends.min(HISTORY_RESEND_MAX_DOUBLINGS)
+    }
+
+    /// When this client may next be sent a history body — the history half
+    /// of the one-predicate rule (`send_paced_frames` and
+    /// `paced_poll_timeout` both ask it). Fresh rows with room in the
+    /// window: the floor after the last body. Otherwise, rows in flight: the
+    /// resend deadline. `None` with bytes queued, or with nothing fresh and
+    /// nothing in flight.
+    fn history_send_at(&self, term: &Terminal) -> Option<u64> {
+        let h = self.pacing.and_then(|p| p.history)?;
+        if !self.write_buf.is_empty() || self.producer.is_none() {
+            return None;
+        }
+        let fresh = h.avail(term.primary_scrollback_total()) > h.sent_upto();
+        if fresh && h.in_flight() < HISTORY_WINDOW_ROWS {
+            return Some(h.last_send() + PACED_FRAME_FLOOR_MS);
+        }
+        (h.in_flight() > 0).then(|| h.last_send() + self.history_resend_after())
+    }
+
+    /// Queue one v2 body from `term` (the session terminal), riding the
+    /// newest visible frame number (RFC 0009 §2: an annotation).
+    fn send_history_body(&mut self, term: &Terminal, now: u64) {
+        let rto = self.history_resend_after();
+        let flags = self.echo_flag | self.overlay_flag;
+        let (Some(producer), Some(p)) = (self.producer.as_ref(), self.pacing.as_mut()) else { return };
+        let Some(h) = p.history.as_mut() else { return };
+        if h.resend_due(now, rto) {
+            p.history_resends += 1;
+        }
+        let body = h.next_body(term, now, rto, SB2_ROWS_PER_BODY);
+        let epoch = h.epoch().expect("an open cursor is active");
+        p.last_was_history = true;
+        let bytes = ServerFrame {
+            flags,
+            caps: caps::own_table(&[caps::encode_scrollback2_ack(epoch)]),
+            frame_num: producer.current_num(),
+            input_ack: 0,
+            echo_ack: 0,
+            body,
+        }
+        .encode();
+        self.queue(Tag::Frame, &bytes);
+    }
+```
+
+(`HistoryCursor` is `Copy`, so `history_send_at` reads a copy; the
+mutating paths take `as_mut`.) In `send_paced_frame`: call
+`maybe_queue_scrollback(src)` only when `!self.has_history()`, and set
+`p.last_was_history = false` beside `dirty = false`. In `queue_frame`,
+after building `activity_cap`: when `self.pacing.and_then(|p|
+p.history).and_then(|h| h.epoch())` is `Some(e)`, push
+`caps::encode_scrollback2_ack(e)` (a v2 viewport adopts the epoch from the
+first frame it gets — RFC 0009 §1.1).
+
+**Step 6: The pass and the poll.**
+
+```rust
+fn send_paced_frames(clients: &mut [ClientConn], src: &Terminal, history: Option<&Terminal>, now: u64) {
+    for c in clients.iter_mut() {
+        let screen = c.paced_send_at().is_some_and(|at| now >= at);
+        let rows = history.filter(|t| c.history_send_at(t).is_some_and(|at| now >= at));
+        let last_was_history = c.pacing.is_some_and(|p| p.last_was_history);
+        match (screen, rows) {
+            (true, Some(t)) if !last_was_history => c.send_history_body(t, now),
+            (true, _) => c.send_paced_frame(src, now),
+            (false, Some(t)) => c.send_history_body(t, now),
+            (false, None) => {}
+        }
+    }
+}
+
+fn paced_poll_timeout(clients: &[ClientConn], history: Option<&Terminal>, now: u64) -> i32 {
+    clients
+        .iter()
+        .flat_map(|c| [c.paced_send_at(), history.and_then(|t| c.history_send_at(t))])
+        .flatten()
+        .map(|at| at.saturating_sub(now))
+        .min()
+        .map_or(-1, |ms| i32::try_from(ms).unwrap_or(i32::MAX))
+}
+```
+
+Doc comments say: `history` is the session terminal, `None` while the
+escape overlay is up (`server_loop` `:2050`). Update every test call
+(`send_paced_frames(.., &term, now)` → `(.., &term, Some(&term), now)`,
+except `a_source_swap_marks_a_paced_client_dirty_and_its_next_frame_is_full`
+which passes `None`; `paced_poll_timeout(.., now)` → `(.., None, now)`).
+`flush_paced_frames` is unchanged (screen only).
+
+**Step 7: Wire `daemon_loop`.**
+- Init arm, after `c.sb_floor = …` (`:2107-2109`):
+  `c.open_history(term);` (for every Init, not only the first: a bare
+  re-Init is a no-op inside).
+- `resized` block, after `reset_scrollback_floors_on_reflow` (`:2342`):
+  `reset_history_on_resize(clients, term, cols_before);`.
+- Poll (`:1806`): `paced_poll_timeout(clients, overlay.is_none().then_some(&*term), now)`.
+- Send pass (`:2406`): `send_paced_frames(clients, src,
+  overlay.is_none().then_some(&*term), util::now_ms());`.
+
+**Step 8: Run** `just debug-cargo test -p posh --bin posh v2` and
+`just debug-cargo test -p posh --bin posh session::daemon` — expected PASS:
+every Stage 2 paced test builds clients without id 10, so they keep v1
+history behind their frames (`send_paced_frames_carries_scrollback_right_behind_the_visible_frame`
+is the regression witness).
+
+**Step 9: FDR 0021 (status stays `experimental`).**
+- *Interface*: a paced viewport that advertises `SCROLLBACK2` (every
+  current roaming viewport) gets RFC 0009 v2 history from the daemon:
+  rows addressed and acknowledged, resent from the ack, one body per send
+  opportunity, at most two bodies in flight; a reconnect continues its
+  epoch (forward-only, as before).
+- *Decisions*: one body per opportunity with the coin; the window; the
+  resend floor and backoff; the epoch rules; continue-on-attach.
+- *Limitations*: "v1 history re-carry" becomes "a never-acking viewport is
+  re-sent at most one window (512 rows) per resend floor, backing off to one
+  per 8 × the floor"; "History during a flood needs RTT below ≈ 5 ×
+  `PACED_ACK_WAIT_MS`" becomes "history trickles at about one window per
+  round trip (≈ 512 rows/RTT), so a flood longer than the ring at that rate
+  loses its oldest rows as a forward jump — silent until Stage 4 draws it";
+  the slow-reader bullet becomes "a reader slower than the flood loses the
+  rows the ring evicts before their turn; each loss is a forward jump of
+  exactly that span, and the reader ends holding the whole retained ring".
+  Part B fills the numbers.
+- *Tuning Levers*: `HISTORY_WINDOW_ROWS`, `HISTORY_RESEND_INITIAL_MS`,
+  `HISTORY_RESEND_MAX_DOUBLINGS`, `SB2_ROWS_PER_BODY` (shared with
+  `server_loop`); "measurement: Task 3.3 Part B".
+
+**Step 10: Lint.** `just lint-fmt`; `just debug-cargo clippy -p posh
+--all-targets -- -D warnings` — clean.
+
+**Step 11: Commit** — message:
+`daemon: addressed v2 history for paced viewports (posh#225 Stage 3)`
+with a body naming: v2 for paced viewports that advertised SCROLLBACK2, v1
+unchanged for everyone else; one body per opportunity (screen/history
+coin); a 512-row ack-clocked window; resend from the ack after twice the
+measured ack latency, backing off; epoch per own resize and width change;
+continue-on-attach.
+
+#### Part B — the flood, addressed: harness, regression tests, measurement
+
+**Files:**
+- Modify: `crates/posh/src/session/daemon.rs` — the posh#225 test block:
+  `FloodCase` (`:5651-5666`) and every literal; `FloodRun` (`:5603-5647`);
+  `measure_flood` (`:5740-5896`); `FloodLedger` (`:5972-6095`);
+  `print_flood_header`/`print_flood_row` (`:6097-6125`); the ideal-reader
+  measurement (`:6196-6244`); `PACED_FLOOD_CADENCES` (`:6974`) is reused;
+  new tests after the Stage 3.0 block.
+- Modify: `docs/features/0021-flood-delivery.md` — the measured rows.
+
+**Step 1: Extend the harness** (no new assertions yet).
+- `FloodCase` gains `v2: bool` — `true` (paced only) adds `sb2_entry(0, 0)`
+  to the client's Init and calls `c.open_history(&term)` right after
+  `c.sb_floor = …`. Every existing literal sets `false`;
+  `paced_flood_case` sets `false` too (so Stage 2's tests stay v1), and a
+  new `paced_v2_flood_case(acks, prefill)` sets `true`.
+- A reference: after each chunk, append the rows it scrolled
+  (`term.dump_scrollback_row(ring_len - k ..)` for the `k` new ones) to
+  `reference: Vec<Vec<u8>>`, indexed by relative row from attach.
+- A viewport model, `FloodViewport`, applying RFC 0009 §1.1/§3 exactly as
+  `remote/client.rs:3137-3146` and `:3219-3252` do: adopt the epoch from
+  any frame's id-10 ack (clearing on change), then for a `Scrollback2`
+  body: wrong epoch → `rows_stale`; covered → `rows_repeated += n`;
+  partial overlap → `rows_repeated += n`; else, if `row_offset > t` →
+  `forward_jumps += 1`, `rows_jumped += row_offset - t`; compare each
+  appended row with `reference[row_offset + i]` (`rows_mismatched` on a
+  difference); `t = end`. It records `(at, t)` after every application.
+- `FloodLedger` keeps the decoded frames: `pending: VecDeque<(end,
+  ServerFrame)>`. A gated drain pops the frames it delivered and hands them
+  to the viewport model at that step's `now`; `Always` hands them over at
+  `account`; `Never` never does. `account` counts a `Scrollback2` as
+  history, not visible (`history_bodies`, `largest_history_body`,
+  `scrollback_bytes`, `rows_shipped`).
+- v2 acks follow the cadence: `EveryNewest(1)` → the viewport's current
+  `t`; `Lagged(k)` → its `t` as of `now - k * pace` (the latest `(at, t)` at
+  or before it); `Never` → none. Applied through
+  `c.absorb_client_caps(&[sb2_entry(epoch, t)], now, false)` — the path
+  `Tag::ClientCaps` takes.
+- `FloodRun` gains `history_bodies`, `largest_history_body`, `rows_unique`
+  (the viewport's final `t`), `rows_repeated`, `forward_jumps`,
+  `rows_jumped`, `rows_mismatched`, `rows_stale`; for a v2 run
+  `rows_acked` is the cursor's `acked_rows()`.
+- The idle tail, for a v2 run, continues until the screen is not owed, the
+  buffer is empty, the cursor has no fresh rows and its `in_flight() == 0`
+  — except under `Never`, where history cannot progress without an ack
+  (the window stays full), so the tail runs a fixed `NEVER_ACK_TAIL_MS =
+  20_000` of fake time (long enough for resends at 1, 2, 4 and 8 s) and
+  stops. It wakes at the nearest of `paced_poll_timeout(..,
+  Some(&term), now)`, the next frame ack, and the next v2 ack
+  (`paced_next_history_ack_at`: the first `(at, t)` with `t >
+  acked_rows()` and `at + k * pace > now`). The visible idle bound stays;
+  the tail as a whole is bounded by `HISTORY_TAIL_BOUND_MS = 120_000`
+  (assert, so a non-terminating tail fails instead of hanging).
+- `print_flood_row` gains `v2 hbody uniq rep jmp jumped` columns (`-` for
+  non-v2 runs); every pre-existing column is printed as before.
+
+Run `just debug-cargo test -p posh --bin posh posh225` — expected PASS:
+no existing case sets `v2`.
+
+**Step 2: Regression tests** (write, run, expect PASS — if one fails, the
+core is wrong: stop and report rather than loosen it). All at 4 KiB chunks,
+`pace: Some(1)`, `OneWritePerChunk` unless named:
+
+- `posh225_v2_flood_ships_every_scrolled_row_exactly_once` — 256 KiB,
+  `EveryNewest(1)`, `Lagged(50)`, `Lagged(300)` × prefill `0` and
+  `SCROLLBACK + 200`: `rows_shipped == rows_scrolled`, `rows_unique ==
+  rows_scrolled`, `rows_repeated == 0`, `forward_jumps == 0`,
+  `rows_mismatched == 0`, `rows_acked == rows_scrolled`. (No repeats at
+  these RTTs because the first resend floor, 1 s, exceeds them and the
+  measured floor is ≥ 2 RTT afterwards.) This is the posh#240 witness for
+  v2: no row reaches the viewport twice.
+- `posh225_v2_flood_backlog_is_one_body_for_every_cadence` — 256 KiB, every
+  cadence in `PACED_FLOOD_CADENCES` plus `Lagged(1500)` × both prefills:
+  `crossed_backlog_at == None`; `max_visible_queued <= 1`;
+  `peak_write_buf <= largest_visible.max(largest_history_body)` (one body
+  at a time); **`peak_write_buf < 64 KiB`** — the bound Task 2.5 deferred;
+  `largest_visible < 64 KiB`; `last_screen_delivered == Some(true)`.
+- `posh225_v2_flood_at_a_1500_ms_rtt_delivers_its_history` — 256 KiB,
+  `Lagged(1500)`, both prefills: `rows_unique == rows_scrolled`,
+  `rows_acked == rows_scrolled`, `forward_jumps == 0`, `rows_mismatched ==
+  0`, `rows_repeated <= 2 * HISTORY_WINDOW_ROWS` (at most the spurious
+  resends before the first latency sample), and `full_frames == 0` (the
+  visible base now survives this RTT; expected — if it fails, record the
+  measured cliff in the FDR instead of asserting it, and say so in the
+  commit). Stage 2 measured 0 rows acked here.
+- `posh225_v2_flood_without_acks_resends_one_window_per_backed_off_floor` —
+  256 KiB, `Never`, `FloodDrain::Always`: the viewport receives rows
+  `0..HISTORY_WINDOW_ROWS` and nothing beyond (`rows_unique ==
+  HISTORY_WINDOW_ROWS`: no ack, no room); the history bodies' send times
+  after the first window are spaced at `HISTORY_RESEND_INITIAL_MS × 1, 2, 4,
+  8, 8 …` (recorded by the harness per body); total history bytes over
+  the run are at most `(1 + resend rounds) × HISTORY_WINDOW_ROWS` rows'
+  worth — against Stage 2's one ring per ack wait.
+- `posh225_v2_slow_reader_loses_only_rows_evicted_before_their_turn` —
+  2 MiB, `FloodDrain::Trickle(1 KiB)`, `EveryNewest(1)` and `Lagged(50)`,
+  both prefills: `rows_unique + rows_jumped == rows_scrolled` (every row
+  is delivered or inside a forward jump — no silent seam), `rows_mismatched
+  == 0`, `rows_repeated == 0`, the viewport's final `t == avail`, and the
+  last forward jump ends at or before `avail - SCROLLBACK` (every row the
+  ring still holds at the end was delivered; the model records each jump's
+  end), `max_visible_queued <= 1`, `peak_write_buf <=
+  largest_visible.max(largest_history_body)`, `last_screen_delivered ==
+  Some(true)`. Print the row; the measured loss goes in the FDR beside
+  Stage 2's ~4,300.
+- `non_paced_and_v1_paced_streams_are_identical_beside_a_v2_client` —
+  extend `non_paced_stream_is_identical_beside_a_paced_client`'s closure
+  with a third run that also attaches a `paced_v2_conn` (acked each step
+  through both `handle_frame_ack` and `ack_history`): the non-paced
+  client's stream equals run A's.
+
+Run `just debug-cargo test --release -p posh --bin posh posh225_v2` and
+`just debug-cargo test -p posh --bin posh non_paced_and_v1_paced` —
+expected PASS.
+
+**Step 3: Measure.** Add v2 rows to
+`posh225_flood_backlog_ideal_reader_measurement`: `pace: Some(1)`, `v2:
+true`, cadences `EveryNewest(1)`, `Lagged(50)`, `Lagged(300)`,
+`Lagged(1500)`, `Lagged(2500)` (the expected new visible cliff), `Never`,
+both rings, 1 KiB and 4 KiB chunks, plus a `Trickle(1 KiB)` row. Run
+`just debug-cargo test --release -p posh --bin posh posh225_flood_backlog_ideal_reader_measurement -- --ignored --nocapture`.
+
+**Step 4: Witness.** Every pre-existing column of every non-v2 row of the
+table equals Part A Step 1's (no non-v2 stream moved).
+
+**Step 5: FDR 0021.** Tuning Levers: the v2 rows (how to re-run them).
+Limitations: the numbers for the RTT rows, the never-acked re-send, the
+slow reader; the measured visible cliff (or that `Lagged(2500)` showed
+none).
+
+**Step 6: Lint** (`just lint-fmt`, clippy as above) and **commit** —
+message:
+`posh#225 Stage 3: v2 flood harness, regression tests and measurements`
+with the v2 measurement rows in the body and:
+`Closes #240` — plus one sentence: "v2 viewports (paced, the default
+remote path) get each row exactly once by address; an unpaced lossy
+viewport (relayed, or `POSH_PACED=0`) stays on v1 until the old delivery
+mode is retired (Stage 7)."
 
 ### Task 3.4: The trickle — live first, history by backpressure
-- Lever: the history ceiling rides `CAP_PACED`'s payload (rows per body;
-  `0` = live only), set on the viewport by `POSH_HISTORY_ROWS` (name and
-  default are an **open item** in the design doc — propose `256`, matching
-  `SB2_ROWS_PER_BODY`, and confirm with the operator before merging).
-- Dynamic share: start at the ceiling; halve the per-body row budget when
-  the last screen frame's ack took more than twice the running minimum;
-  double (up to the ceiling) when it did not. A screen body always wins
-  the opportunity when the viewport is dirty; a history body takes it
-  otherwise, and at least every Nth opportunity while the budget is
-  non-zero so history cannot starve on a busy screen.
-- Tests: with a slow fake link, screen latency stays within one interval
-  while history advances; with ceiling `0`, no history body is ever sent;
-  budget shrinks under induced ack delay and recovers.
-- This is the task most likely to need tuning against a real link; record
-  the measurement recipe (extend `debug-mux-load`) and the chosen numbers
-  in the FDR.
+
+> **HELD until the field `nix gc` data (ack latencies from Task 3.0) exists
+> — do not start.** The lever and the backpressure rule below are
+> PROPOSED. Plan open question 3 (the lever's name, default and signal) is
+> the gate; the operator answers it from that data.
+
+**What the field data must show to choose the default:** the `paced ack
+latency` series from the session log for (a) an idle session (the link's
+floor — `min`), (b) a `nix gc` flood with Stage 3's static window, and (c)
+the same flood with history held off (`HISTORY_WINDOW_ROWS` forced to 0 in
+a debug build, or an older viewport). If (b)'s `srtt` stays within 2 ×
+(a)'s `min`, history is not what delays the screen on that link and the
+ceiling only sets catch-up speed — propose the largest ceiling that keeps
+(b) there. If (b) inflates past 2 × min while (c) does not, the halving
+rule below is what bites, and the default is the ceiling at which (b)'s
+srtt settles at ≈ 2 × min. If (c) inflates too, the link is saturated by
+screens alone and the trickle can only stay out of the way (budget → 0).
+
+**Promotion criteria:** the lever's default is set by the field data
+above; `POSH_HISTORY_ROWS=0` is the opt-out (live-only), read per attach.
+
+**Files (proposed):**
+- Modify: `crates/posh-proto/src/caps.rs` — `PACED_VERSION = 2`;
+  `encode_paced(history_rows: u16)` writes `[2, rows u16 LE]`;
+  `decode_paced_history_rows(payload) -> Option<u16>` (`None` for a v1
+  payload — the daemon then uses `SB2_ROWS_PER_BODY`). `decode_paced`
+  unchanged (version byte only). Tests at the end of `mod tests` (after
+  `paced_entry_tolerates_appended_fields_and_rejects_an_empty_one`).
+- Modify: `docs/rfcs/0001-target-grammar-and-capability-table.md` — row 23:
+  "v2 appends the history ceiling (u16 LE rows per body; `0` = live only)".
+- Modify: `crates/posh/src/session/mod.rs` — `parse_history_rows(Option<&str>)
+  -> u16` (unset/unparseable → 256; `0` → 0; clamp to `u16::MAX`) and
+  `history_rows_selected()`.
+- Modify: `crates/posh/src/remote/client.rs` — `ClientState::history_rows`
+  beside `paced`; `outgoing_caps` writes `encode_paced(st.history_rows)`;
+  the About gate list names `POSH_HISTORY_ROWS`.
+- Modify: `crates/posh/src/session/daemon.rs` — `Pacing.history_ceiling:
+  u16` (from Init), `history_budget: u16`; `history_send_at` /
+  `send_history_body` / `send_paced_frames` (below).
+- Modify: `doc/posh-client.1.scd`, `doc/posh.1.scd` ENVIRONMENT —
+  `POSH_HISTORY_ROWS` (the lever's man entry lands with the lever).
+
+**The rule (proposed):**
+- **Budget.** Starts at the ceiling. On each ack-latency sample (Task 3.0):
+  `sample > 2 × min_ms` → `budget = budget / 2`; else `budget =
+  min(2 × budget, ceiling)` (from 0, back to 1). Body rows = `budget`;
+  window = `2 × budget`. Ceiling `0` → no history body is ever sent (the
+  cursor still opens and the epoch still rides frames, so turning it on
+  next attach continues cleanly).
+- **Priority.** A screen body always wins an opportunity when the screen
+  is owed; a history body takes an opportunity otherwise, and at least
+  every `HISTORY_EVERY_NTH = 4`th opportunity while the budget is non-zero
+  (replacing 3.3's 1:1 coin), so history cannot starve on a busy screen.
+
+**Steps (to run when un-held):**
+1. caps tests: `paced_v2_payload_carries_the_history_ceiling`,
+   `a_v1_paced_payload_has_no_ceiling`, `the_ceiling_is_little_endian_u16`;
+   run `just debug-cargo test -p posh-proto paced` (fail → implement → pass).
+2. Gate tests in `session/mod.rs`: `history_rows_gate_defaults_and_parses`
+   (unset → 256, `"0"` → 0, `"1000"` → 1000, `"x"` → 256, `"70000"` →
+   `u16::MAX`); viewport test `outgoing_caps_carries_the_history_ceiling`.
+   Run `just debug-cargo test -p posh --bin posh history_rows`.
+3. Daemon tests: `a_zero_ceiling_sends_no_history_body` (flood, prompt
+   acks: `history_bodies == 0`, the epoch ack still rides frames);
+   `the_budget_halves_on_an_inflated_ack_and_recovers` (feed samples 100,
+   300, 300 → budget 256, 128, 64; then 100, 100 → 128, 256);
+   `a_busy_screen_still_gets_every_nth_opportunity_for_history` (dirty at
+   every pass: one history body per `HISTORY_EVERY_NTH` sends);
+   `the_screen_always_wins_when_owed_below_the_nth` (bodies 1..N−1 are
+   screens). Run `just debug-cargo test -p posh --bin posh trickle`.
+4. Flood tests: `posh225_trickle_keeps_screen_latency_within_one_wait_while_history_advances`
+   — a harness link whose RTT grows with the bytes in flight (a new
+   `FloodAcks::Loaded { base_ms, ms_per_kib }`): the time from a screen
+   becoming owed to its frame being sent stays ≤ `PACED_ACK_WAIT_MS`
+   while `rows_unique` keeps rising; `posh225_trickle_budget_tracks_induced_ack_delay`.
+5. Measurement: extend `just debug-mux-load` (justfile `:778`, group
+   `debug`) with a loaded-link flood scenario that prints the per-viewport
+   `paced ack latency` series and history rows/s; record the command and
+   the chosen numbers in FDR 0021's Tuning Levers.
+6. Records: man pages (`POSH_HISTORY_ROWS`), RFC 0001 row 23, FDR 0021
+   (Interface: the lever; Tuning Levers: budget rule, `HISTORY_EVERY_NTH`,
+   the measured default), plan open question 3 → answered.
+7. Commit — message:
+   `viewport: POSH_HISTORY_ROWS; daemon: history share by ack-latency backpressure (posh#225 Stage 3)`.
 
 ### Task 3.5: Records
-- RFC 0009: the session-socket path (Init-persistent advertisement +
-  per-message ack via `ClientCaps`), stays `experimental`.
-- FDR *Flood delivery*: the trickle lever and its measured default.
 
-**Stage 3 exit check:** after `nix gc` on a remote attach, wheel-up shows
-the output contiguous; `posh history` on the session and the viewport's
-scrollback agree for the last screenfuls.
+**Files:**
+- Modify: `docs/rfcs/0009-scrollback-stream-separation.md` — a new
+  `### 5. The session-socket path` before Security Considerations
+  (`:202`), status stays `experimental`:
+  - On the session socket (RFC 0008) capabilities are Init-persistent: a
+    client advertises `SCROLLBACK2` on its `Tag::Init` (an M2 bridge
+    carries its viewport's entry; a relay does not, ADR 0007) and sends
+    each changed cumulative ack as a `Tag::ClientCaps` entry; a daemon
+    reads the ack from either.
+  - The daemon emits v2 only to a client that also advertised `CAP_PACED`
+    (RFC 0008 §3.2); others keep RFC 0002.
+  - A new attachment's row space continues the epoch and count the Init
+    entry names (epoch 0: a fresh epoch at row 0); rows scrolled before
+    the attachment are not delivered (Stage 5 amends this with the resume
+    cursor).
+  - The epoch bumps on the client's own reported size change and on a
+    session width change.
+  - Covered Requirements gains the Task 3.2 bridge tests and the Task 3.3
+    daemon tests.
+- Modify: `docs/rfcs/0008-unified-session-frame-transport.md` §3.2
+  (`:189-220`): "plus the history (`SCROLLBACK`) body that rides
+  immediately behind that frame" becomes: for a client on RFC 0009 v2,
+  history bodies are sent at their own opportunities, one body per
+  opportunity, at most one unsent body held; for an RFC 0002 client, as
+  before.
+- Modify: `docs/features/0021-flood-delivery.md` — anything Parts A/B left
+  as a placeholder; the Limitations list no longer says "(Stage 3)" for
+  the cliff, the re-send and the slow reader.
+- Modify: this plan — a "Stage 3 as built" section in the style of
+  "Stage 2 as built", superseding this stage's task text where it differs.
+- Man pages: none until Task 3.4 lands its lever (`docs/README.md`: status
+  and records move with the code; no lever exists yet).
+
+**Step 1:** `just lint-doc` and `just lint-fmt` — clean.
+
+**Step 2: Commit** — message:
+`docs: RFC 0009 session-socket path; RFC 0008 §3.2 history bodies; Stage 3 as built (posh#225)`
+
+**Step 3:** merge with `merge-this-session` (its pre-merge hook is the CI
+lane; do not run `just` first). Task 3.4 stays held.
+
+**Stage 3 exit check:** with this build on the remote host, in a
+mux-attached session (paced, the default): (1) the session log shows
+`paced ack latency` lines during a `nix gc` — keep them, they are Task
+3.4's input; (2) after the `nix gc`, wheel up: the output is contiguous up
+to where history could keep up (≈ 512 rows per round trip) — older than
+that is a forward jump, silent until Stage 4; (3) `posh history
+<host>:<session> | tail -n 200` and the last 200 rows of the viewport's
+scrollback agree; (4) detach and re-attach: the viewport keeps its ring
+(continue-on-attach), and only rows scrolled while detached are missing.
 
 ---
 
