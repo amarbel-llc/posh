@@ -344,6 +344,22 @@ struct SessionBridge {
     /// negotiation. The client's consumable caps do not change across a
     /// switch (same client), so re-homing must not silently downgrade them.
     content: Vec<caps::Cap>,
+    /// Visible (non-scrollback) daemon frames forwarded on this channel, for
+    /// the SIGUSR2 `session_frames=` count.
+    visible_forwarded: u64,
+}
+
+/// Visible session frames forwarded across every linked channel; exists for
+/// the posh#225 Stage 2 exit check (a paced flood forwards a handful per
+/// second, not one per PTY read).
+fn session_frames_forwarded(channels: &[PeerChannel]) -> u64 {
+    channels
+        .iter()
+        .map(|c| match c {
+            PeerChannel::Linked(b) => b.visible_forwarded,
+            PeerChannel::Awaiting { .. } => 0,
+        })
+        .sum()
 }
 
 /// A channel the wire opened whose first `ClientMessage` (caps + geometry)
@@ -429,13 +445,14 @@ pub(crate) fn mux_peer_loop(
             util::log_write(
                 "status",
                 &format!(
-                    "agent-only: peer={} heard={heard_age}ms agent_channels={} opened_total={} owns_agent_sock={} session_channels={}",
+                    "agent-only: peer={} heard={heard_age}ms agent_channels={} opened_total={} owns_agent_sock={} session_channels={} session_frames={}",
                     conn.remote()
                         .map_or_else(|| "none".to_string(), |a| a.to_string()),
                     d.live_channels,
                     d.next_channel_id.saturating_sub(1),
                     d.symlink_ok,
                     channels.len(),
+                    session_frames_forwarded(&channels),
                 ),
             );
         }
@@ -723,6 +740,9 @@ pub(crate) fn mux_peer_loop(
                             );
                             b.last_retx = now;
                             b.last_send = now;
+                        }
+                        if !scrollback {
+                            b.visible_forwarded += 1;
                         }
                         b.daemon.held.hold(out.frame_num, bytes, scrollback);
                     }
@@ -1031,6 +1051,7 @@ fn handle_session_instruction(
                             last_send: 0,
                             echo: crate::remote::sync::EchoAck::resume(resume.echo),
                             frame_flags: 0,
+                            visible_forwarded: 0,
                         }));
                     }
                     Err(e) => {
@@ -2838,6 +2859,7 @@ mod tests {
             echo: crate::remote::sync::EchoAck::resume(resume.echo),
             frame_flags: 0,
             content: Vec::new(),
+            visible_forwarded: 0,
         };
         (b, peer)
     }
@@ -2853,6 +2875,24 @@ mod tests {
             }
         }
         fed
+    }
+
+    #[test]
+    fn session_frames_forwarded_sums_linked_channels() {
+        let (mut a, _pa) = test_bridge();
+        a.visible_forwarded = 3;
+        let (mut b, _pb) = test_bridge();
+        b.visible_forwarded = 4;
+        let channels = vec![
+            PeerChannel::Linked(Box::new(a)),
+            PeerChannel::Awaiting {
+                chan: channel::ChannelId::new(false, channel::KIND_SESSION, 4),
+                target: String::new(),
+                resume: crate::remote::resume::SessionResume::INITIAL,
+            },
+            PeerChannel::Linked(Box::new(b)),
+        ];
+        assert_eq!(session_frames_forwarded(&channels), 7);
     }
 
     #[test]

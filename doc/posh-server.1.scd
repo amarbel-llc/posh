@@ -225,8 +225,10 @@ _POSH_WEDGE_CAPTURE_
 	distinguish a roam the server has not re-pinned from one-way packet
 	loss or a dead client. An *agent* mux peer answers with its own
 	shape — peer address, heard age, live and cumulative agent channel
-	counts, whether it still owns _agent/sock_, and its session-channel
-	count — appended to its persistent per-client-host log (see *agent*
+	counts, whether it still owns _agent/sock_, its session-channel count,
+	and _session_frames=_, the visible session frames forwarded to
+	viewports since the peer started (scrollback frames excluded) —
+	appended to its persistent per-client-host log (see *agent*
 	above).
 
 *SIGHUP*
