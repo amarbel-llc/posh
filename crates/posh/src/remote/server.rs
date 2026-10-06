@@ -34,7 +34,7 @@ use crate::remote::crypto::Key;
 use crate::remote::diag;
 use crate::remote::display::Snapshot;
 use crate::remote::framesync::FrameProducer;
-use crate::remote::history::{HistoryCursor, SB2_ROWS_PER_BODY};
+use crate::remote::history::HistoryCursor;
 use crate::remote::introspect;
 use crate::remote::datagram::{Connection, Family, DEFAULT_PORT_RANGE, SEND_INTERVAL_MIN};
 use crate::remote::stats::Stats;
@@ -1212,10 +1212,8 @@ fn bridge_client_message(b: &mut SessionBridge, msg: &crate::remote::sync::Clien
             b.sb2_forwarded = Some(entry.payload.clone());
             forwarded.push(entry.clone());
         }
-        match b.content.iter_mut().find(|c| c.id == caps::CAP_SCROLLBACK2) {
-            Some(held) => *held = entry.clone(),
-            None => b.content.push(entry.clone()),
-        }
+        b.content.retain(|c| c.id != caps::CAP_SCROLLBACK2);
+        b.content.push(entry.clone());
     }
     if !forwarded.is_empty() {
         ipc::append_frame(
@@ -2043,12 +2041,13 @@ pub(crate) fn server_loop(
             // Independent of the alt screen — the primary ring only grows on
             // the primary screen, and delivering retained history is
             // orthogonal to what is currently displayed. Alternates with
-            // visible frames via the same last_was_sb coin as v1.
+            // visible frames via the same last_was_sb coin as v1. No row
+            // window: the SRTT-paced send interval is this loop's limiter.
             let want_sb2 = overlay.is_none()
                 && !force_frame
                 && !shutdown
                 && paced
-                && sb2.wants(cur_sb_total, now, conn.rto());
+                && sb2.wants(cur_sb_total, now, conn.rto(), u64::MAX);
             let make_sb2 = want_sb2 && (!want_visible || !last_was_sb);
             let make_visible = want_visible && !make_scrollback && !make_sb2;
 
@@ -2217,7 +2216,7 @@ pub(crate) fn server_loop(
                     // permanently-lost history — and by a per-body row cap so
                     // a long-disconnect resend chunks instead of building one
                     // oversized frame.
-                    sb2.next_body(&term, now, conn.rto(), SB2_ROWS_PER_BODY)
+                    sb2.next_body(&term, now, conn.rto(), u64::MAX).1
                 } else if current_is_sb {
                     // Scrollback body (RFC 0002 §2), fresh or retransmitted:
                     // the rows that entered scrollback between the acked

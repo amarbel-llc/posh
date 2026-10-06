@@ -149,13 +149,15 @@ Settled for Stage 3 (addressed history), 2026-10-06:
     body once the visible frame it rode is acked, so this resend is required
     for correctness, not an optimisation.
 12. **The epoch bumps for a viewport on its own size change** (it cleared
-    its ring). **A session width change re-anchors every other viewport
-    without a bump**: the reflow renumbered the daemon's ring, so the row
-    space continues at the reflowed total from the viewport's send cursor —
-    its ring and ack stay valid. Rows the reflow renumbered before they were
-    sent are not delivered, with no gap in the numbering (a silent seam, as
-    v1's history resumes after a reflow); rows sent but lost before it reach
-    the viewport as a forward jump (RFC 0009 §5). Another viewport attaching narrower, or leaving, therefore never
+    its ring). **A session width change, or a height grow, re-anchors
+    every other viewport without a bump**: a width reflow renumbers the
+    daemon's ring and a height grow pops ring rows back onto the grid
+    without lowering the total, so the row space is re-anchored at the
+    viewport's row count as of the resize — its ring and ack stay valid.
+    Rows scrolled before the resize but not yet sent, and rows sent but
+    lost, reach the viewport as ONE forward jump at that count (a resend
+    from a lagging ack is floored there as an empty body), so nothing is
+    silently skipped (RFC 0009 §5; UX decision 1). Another viewport attaching narrower, or leaving, therefore never
     clears this one's history (v1 never did). The epoch byte skips 0 on wrap
     (255 → 1): a viewport advertises 0 to mean it holds none.
 13. **A new attachment continues the viewport's epoch at its count** (epoch
@@ -217,8 +219,8 @@ Settled for Stage 3 (addressed history), 2026-10-06:
 - **Rows scrolled while a viewport is detached are not delivered**: a
   reconnect keeps the viewport's ring and continues forward-only from the
   attachment (decision 13); history across a reconnect is Stage 5. Rows a
-  session width change renumbered before they were sent are likewise a
-  silent seam (decision 12).
+  session width change or height grow left unsent become a forward jump
+  at the resize (decision 12) — labelled by Stage 4, not repaired.
 - **An unpaced or relayed viewport stays on v1 (RFC 0002) history** — a
   local `posh attach` (Stage 6 moves it), a relayed one
   (`POSH_MUX_SESSIONS=0`), or one with `POSH_PACED=0` — with v1's re-carry

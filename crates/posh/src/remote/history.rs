@@ -3,8 +3,7 @@
 //! and the session daemon's paced viewports (posh#225 Stage 3).
 //!
 //! The session daemon opens a cursor per paced viewport (posh#225 Task 3.3);
-//! `server_loop` uses the subset it always used. An item marked
-//! `allow(dead_code)` has only test callers.
+//! `server_loop` uses the subset it always used, with an unbounded window.
 
 use posh_term::Terminal;
 
@@ -48,6 +47,9 @@ pub(crate) struct HistoryCursor {
     acked_rows: u64,
     sent_upto: u64,
     last_send: u64,
+    /// Resend bodies since the ack last advanced (the caller's backoff
+    /// exponent); zeroed with every new row space.
+    resends: u32,
     size: (u16, u16),
 }
 
@@ -63,6 +65,7 @@ impl HistoryCursor {
             acked_rows: 0,
             sent_upto: 0,
             last_send: 0,
+            resends: 0,
             size,
         }
     }
@@ -104,17 +107,21 @@ impl HistoryCursor {
             return false;
         }
         self.acked_rows = acked_rows;
+        self.resends = 0;
         true
     }
 
     /// Record the viewport's reported `size`. A change while active
     /// invalidates the epoch's row space (RFC 0009 §1.1: reflow; the viewport
     /// cleared its ring and awaits a fresh epoch), so the epoch bumps.
-    pub(crate) fn on_client_size(&mut self, size: (u16, u16), total: u64) {
-        if size != self.size {
-            self.size = size;
-            self.bump_epoch(total);
+    /// Returns whether it bumped.
+    pub(crate) fn on_client_size(&mut self, size: (u16, u16), total: u64) -> bool {
+        if size == self.size {
+            return false;
         }
+        self.size = size;
+        self.bump_epoch(total);
+        self.active
     }
 
     /// Open the next epoch at `total` (the byte wraps past 0, which a
@@ -133,20 +140,27 @@ impl HistoryCursor {
         self.anchor_rel = 0;
         self.acked_rows = 0;
         self.sent_upto = 0;
+        self.resends = 0;
     }
 
-    /// Re-anchor the row space at the terminal's (reflowed) `total` without
-    /// a new epoch: the viewport's ring and acks stay valid, and the next
-    /// row offered is `sent_upto` — rows the reflow renumbered before they
-    /// were sent become a forward jump. For a session width change seen by
-    /// a viewport whose own size did not change (posh#225 Stage 3); a no-op
-    /// when inactive.
+    /// Re-anchor the row space at the terminal's renumbered `total` without
+    /// a new epoch, for a session resize seen by a viewport whose own size
+    /// did not change (posh#225 Stage 3): a width reflow, or a height grow
+    /// that popped ring rows back onto the grid — neither moves the total,
+    /// so the old mapping would offer other rows under the old numbers. The
+    /// viewport's ring and acks stay valid; numbering continues at the count
+    /// as of the resize, so rows not yet sent, and rows sent but lost (a
+    /// resend from the ack is floored at the anchor: a 0-row body), become
+    /// ONE forward jump the viewport records — nothing is silently skipped.
+    /// A no-op when inactive.
     pub(crate) fn reanchor(&mut self, total: u64) {
         if !self.active {
             return;
         }
+        let at = self.avail(total);
         self.anchor_abs = total;
-        self.anchor_rel = self.sent_upto;
+        self.anchor_rel = at;
+        self.resends = 0;
     }
 
     /// The current epoch, or `None` while inactive (no ack entry is owed).
@@ -160,50 +174,81 @@ impl HistoryCursor {
     }
 
     /// Rows are sent but unacked and the last body is at least `rto` old.
-    pub(crate) fn resend_due(&self, now: u64, rto: u64) -> bool {
-        self.acked_rows < self.sent_upto && now.saturating_sub(self.last_send) >= rto
+    fn resend_due(&self, now: u64, rto: u64) -> bool {
+        self.in_flight() > 0 && now.saturating_sub(self.last_send) >= rto
     }
 
-    /// A body is owed: fresh rows beyond the send cursor, or a resend from
-    /// the ack.
-    pub(crate) fn wants(&self, total: u64, now: u64, rto: u64) -> bool {
-        self.active && (self.avail(total) > self.sent_upto || self.resend_due(now, rto))
+    /// When the next body is due, for a viewport allowed `window` rows in
+    /// flight: fresh rows with room in the window are due at once (the last
+    /// send, never later than now); otherwise rows in flight are due their
+    /// resend at `rto` past the last send. `None` while inactive, or with
+    /// nothing fresh and nothing in flight.
+    pub(crate) fn next_due(&self, total: u64, rto: u64, window: u64) -> Option<u64> {
+        if !self.active {
+            return None;
+        }
+        if self.avail(total) > self.next_fresh() && self.in_flight() < window {
+            return Some(self.last_send);
+        }
+        (self.in_flight() > 0).then(|| self.last_send + rto)
     }
 
-    pub(crate) fn in_flight(&self) -> u64 {
+    /// A body is owed at `now` ([`Self::next_due`]).
+    pub(crate) fn wants(&self, total: u64, now: u64, rto: u64, window: u64) -> bool {
+        self.next_due(total, rto, window).is_some_and(|at| now >= at)
+    }
+
+    /// Resend bodies since the ack last advanced.
+    pub(crate) fn resends(&self) -> u32 {
+        self.resends
+    }
+
+    fn in_flight(&self) -> u64 {
         self.sent_upto.saturating_sub(self.acked_rows)
     }
 
-    #[allow(dead_code)]
+    /// Where a fresh body starts: past everything sent and everything acked
+    /// (a late ack for a wider window can pass a resend-rewound cursor).
+    fn next_fresh(&self) -> u64 {
+        self.sent_upto.max(self.acked_rows)
+    }
+
+    #[cfg(test)]
     pub(crate) fn acked_rows(&self) -> u64 {
         self.acked_rows
     }
 
+    #[cfg(test)]
     pub(crate) fn sent_upto(&self) -> u64 {
         self.sent_upto
     }
 
+    #[cfg(test)]
     pub(crate) fn last_send(&self) -> u64 {
         self.last_send
     }
 
-    /// The next body (RFC 0009 §2): rows of this epoch from the send cursor
-    /// (or from the ack when a resend is due), never below what the ring
-    /// retains — an evicted gap becomes a forward jump the viewport accepts
-    /// as permanently-lost history — nor below `anchor_rel`, and at most
-    /// `cap` rows. Advances the send cursor and stamps `now` as the last send.
-    pub(crate) fn next_body(&mut self, term: &Terminal, now: u64, rto: u64, cap: u64) -> FrameBody {
+    /// The next body and its epoch (RFC 0009 §2): rows of this epoch from
+    /// the send cursor (or from the ack when a resend is due), never below
+    /// what the ring retains — an evicted gap becomes a forward jump the
+    /// viewport accepts as permanently-lost history — nor below
+    /// `anchor_rel`. A resend takes a whole body ([`SB2_ROWS_PER_BODY`]); a
+    /// fresh body at most the room left in `window`. Advances the send
+    /// cursor and stamps `now` as the last send.
+    pub(crate) fn next_body(&mut self, term: &Terminal, now: u64, rto: u64, window: u64) -> (u8, FrameBody) {
         let total = term.primary_scrollback_total();
         let ring_len = term.primary_scrollback_len() as u64;
         let avail = self.avail(total);
         let floor_rel = self.anchor_rel.max(avail - ring_len.min(avail));
-        let cursor = if self.resend_due(now, rto) {
-            self.acked_rows
+        let (cursor, cap) = if self.resend_due(now, rto) {
+            self.resends += 1;
+            (self.acked_rows, SB2_ROWS_PER_BODY)
         } else {
-            self.sent_upto
+            let room = window.saturating_sub(self.in_flight());
+            (self.next_fresh(), SB2_ROWS_PER_BODY.min(room))
         };
         let start = cursor.max(floor_rel);
-        let count = (avail - start).min(cap) as usize;
+        let count = avail.saturating_sub(start).min(cap) as usize;
         let rows = (0..count)
             .map(|k| {
                 let r = start + k as u64;
@@ -215,11 +260,12 @@ impl HistoryCursor {
             .collect();
         self.sent_upto = start + count as u64;
         self.last_send = now;
-        FrameBody::Scrollback2 {
+        let body = FrameBody::Scrollback2 {
             epoch: self.epoch,
             row_offset: start,
             rows,
-        }
+        };
+        (self.epoch, body)
     }
 }
 
@@ -228,11 +274,17 @@ mod tests {
     use super::*;
 
     const RTO: u64 = 100;
+    /// `server_loop`'s window: no limit.
+    const ANY: u64 = u64::MAX;
 
     /// A 5x20 terminal with a 50-row ring, its screen filled so every
     /// further line scrolls exactly one row into the ring.
     fn term() -> Terminal {
-        let mut t = Terminal::with_scrollback(5, 20, 50);
+        term_with_ring(50)
+    }
+
+    fn term_with_ring(ring: usize) -> Terminal {
+        let mut t = Terminal::with_scrollback(5, 20, ring);
         t.process(b"a\r\nb\r\nc\r\nd\r\n");
         assert_eq!(t.primary_scrollback_total(), 0);
         t
@@ -263,13 +315,16 @@ mod tests {
             .collect()
     }
 
-    fn split(body: FrameBody) -> (u8, u64, Vec<Vec<u8>>) {
+    fn split((epoch, body): (u8, FrameBody)) -> (u8, u64, Vec<Vec<u8>>) {
         match body {
             FrameBody::Scrollback2 {
-                epoch,
+                epoch: in_body,
                 row_offset,
                 rows,
-            } => (epoch, row_offset, rows),
+            } => {
+                assert_eq!(epoch, in_body, "the returned epoch is the body's");
+                (epoch, row_offset, rows)
+            }
             other => panic!("not a v2 body: {other:?}"),
         }
     }
@@ -286,16 +341,16 @@ mod tests {
         let mut c = HistoryCursor::new((5, 20));
         scroll(&mut t, 10);
         assert_eq!(c.epoch(), None);
-        assert!(!c.wants(total(&t), 0, RTO));
-        assert!(!c.wants(total(&t), 10 * RTO, RTO));
-        c.on_client_size((6, 20), total(&t));
-        assert_eq!(c.epoch(), None, "an inactive cursor never bumps");
+        assert_eq!(c.next_due(total(&t), RTO, ANY), None);
+        assert!(!c.wants(total(&t), 10 * RTO, RTO, ANY));
+        assert!(!c.on_client_size((6, 20), total(&t)), "an inactive cursor never bumps");
+        assert_eq!(c.epoch(), None);
         c.bump_epoch(total(&t));
         assert_eq!(c.epoch(), None);
         c.activate(HistoryStart::Fresh, total(&t));
         assert_eq!(c.epoch(), Some(1));
         // The size was recorded while inactive: the same size is no change.
-        c.on_client_size((6, 20), total(&t));
+        assert!(!c.on_client_size((6, 20), total(&t)));
         assert_eq!(c.epoch(), Some(1));
     }
 
@@ -306,7 +361,7 @@ mod tests {
         let mut c = active(&t);
         scroll(&mut t, 10);
         assert_eq!(c.avail(total(&t)), 10);
-        assert!(c.wants(total(&t), 0, RTO));
+        assert_eq!(c.next_due(total(&t), RTO, 4), Some(0), "fresh rows: due at once");
         let (epoch, row_offset, rows) = split(c.next_body(&t, 0, RTO, 4));
         assert_eq!((epoch, row_offset), (1, 0));
         let len = ring_len(&t);
@@ -315,28 +370,47 @@ mod tests {
             .collect();
         assert_eq!(rows, expected);
         assert_eq!(c.sent_upto(), 4);
+        assert_eq!(c.next_due(total(&t), RTO, 4), Some(RTO), "the window is full");
+        c.on_ack(1, 4);
+        assert_eq!(c.next_due(total(&t), RTO, 4), Some(0), "room again");
         let (_, row_offset, rows) = split(c.next_body(&t, 0, RTO, 4));
         assert_eq!(row_offset, 4);
         assert_eq!(rows.len(), 4);
     }
 
     #[test]
-    fn a_body_carries_at_most_the_cap() {
-        let mut t = term();
+    fn a_body_carries_at_most_sb2_rows_per_body() {
+        let mut t = term_with_ring(1000);
         let mut c = active(&t);
         scroll(&mut t, 600);
         let mut lens = Vec::new();
         let mut next = None;
-        while c.wants(total(&t), 0, RTO) {
-            let (_, row_offset, rows) = split(c.next_body(&t, 0, RTO, 16));
+        while c.wants(total(&t), 0, RTO, ANY) {
+            let (_, row_offset, rows) = split(c.next_body(&t, 0, RTO, ANY));
             if let Some(n) = next {
                 assert_eq!(row_offset, n, "bodies are contiguous");
             }
             next = Some(row_offset + rows.len() as u64);
             lens.push(rows.len());
         }
-        assert_eq!(lens, vec![16, 16, 16, 2]);
+        assert_eq!(lens, vec![256, 256, 88]);
         assert_eq!(c.sent_upto(), 600);
+    }
+
+    #[test]
+    fn a_fresh_body_takes_at_most_the_room_in_the_window() {
+        let mut t = term_with_ring(1000);
+        let mut c = active(&t);
+        scroll(&mut t, 600);
+        let (_, row_offset, rows) = split(c.next_body(&t, 0, RTO, 300));
+        assert_eq!((row_offset, rows.len()), (0, 256));
+        assert_eq!(c.next_due(total(&t), RTO, 300), Some(0), "room for 44 more");
+        let (_, row_offset, rows) = split(c.next_body(&t, 0, RTO, 300));
+        assert_eq!((row_offset, rows.len()), (256, 44));
+        assert_eq!(c.next_due(total(&t), RTO, 300), Some(RTO), "full: only the resend is due");
+        c.on_ack(1, 256);
+        let (_, row_offset, rows) = split(c.next_body(&t, 1, RTO, 300));
+        assert_eq!((row_offset, rows.len()), (300, 256));
     }
 
     #[test]
@@ -356,18 +430,45 @@ mod tests {
         let mut t = term();
         let mut c = active(&t);
         scroll(&mut t, 8);
-        let (_, row_offset, rows) = split(c.next_body(&t, 0, RTO, 256));
+        let (_, row_offset, rows) = split(c.next_body(&t, 0, RTO, ANY));
         assert_eq!((row_offset, rows.len()), (0, 8));
         assert_eq!(c.last_send(), 0);
         c.on_ack(1, 3);
         assert_eq!(c.in_flight(), 5);
         assert!(!c.resend_due(10, RTO));
-        assert!(!c.wants(total(&t), 10, RTO), "caught up and not yet due");
+        assert!(!c.wants(total(&t), 10, RTO, ANY), "caught up and not yet due");
+        assert_eq!(c.next_due(total(&t), RTO, ANY), Some(RTO));
         assert!(c.resend_due(100, RTO));
-        assert!(c.wants(total(&t), 100, RTO));
-        let (_, row_offset, rows) = split(c.next_body(&t, 100, RTO, 256));
+        assert!(c.wants(total(&t), 100, RTO, ANY));
+        let (_, row_offset, rows) = split(c.next_body(&t, 100, RTO, ANY));
         assert_eq!((row_offset, rows), (3, newest_rows(&t, 5)));
         assert_eq!(c.last_send(), 100);
+        assert_eq!(c.resends(), 1, "a resend counts");
+        split(c.next_body(&t, 200, RTO, ANY));
+        assert_eq!(c.resends(), 2);
+        assert!(!c.on_ack(1, 3), "a repeated ack does not advance");
+        assert_eq!(c.resends(), 2, "nor reset the count");
+        assert!(c.on_ack(1, 5));
+        assert_eq!(c.resends(), 0, "an advancing ack resets it");
+    }
+
+    #[test]
+    fn a_late_ack_past_a_rewound_resend_is_not_sent_again() {
+        let mut t = term_with_ring(1000);
+        let mut c = active(&t);
+        scroll(&mut t, 600);
+        while c.wants(total(&t), 0, RTO, ANY) {
+            c.next_body(&t, 0, RTO, ANY);
+        }
+        c.on_ack(1, 3);
+        let (_, row_offset, rows) = split(c.next_body(&t, RTO, RTO, ANY));
+        assert_eq!((row_offset, rows.len()), (3, 256), "the resend rewinds the cursor");
+        assert_eq!(c.sent_upto(), 259);
+        // The ack of the first window's bodies lands after the resend.
+        assert!(c.on_ack(1, 400));
+        assert_eq!(c.next_due(total(&t), RTO, ANY), Some(RTO), "rows past the ack: due");
+        let (_, row_offset, rows) = split(c.next_body(&t, RTO + 1, RTO, ANY));
+        assert_eq!((row_offset, rows), (400, newest_rows(&t, 200)), "fresh from the ack");
     }
 
     #[test]
@@ -375,18 +476,16 @@ mod tests {
         let mut t = term();
         let mut c = active(&t);
         scroll(&mut t, 10);
-        let (_, row_offset, rows) = split(c.next_body(&t, 0, RTO, 256));
+        let (_, row_offset, rows) = split(c.next_body(&t, 0, RTO, ANY));
         assert_eq!((row_offset, rows.len()), (0, 10));
         scroll(&mut t, 100);
         let avail = c.avail(total(&t));
         assert_eq!(avail, 110);
-        let (_, row_offset, rows) = split(c.next_body(&t, 1, RTO, 20));
+        let (_, row_offset, rows) = split(c.next_body(&t, 1, RTO, ANY));
         assert_eq!(row_offset, avail - 50, "a jump of avail - 50 - 10 rows");
         assert!(row_offset > 10);
-        assert_eq!(rows, newest_rows(&t, 50)[..20].to_vec());
-        let (_, row_offset, rows) = split(c.next_body(&t, 1, RTO, 20));
-        assert_eq!(row_offset, avail - 50 + 20, "contiguous after the jump");
-        assert_eq!(rows, newest_rows(&t, 50)[20..40].to_vec());
+        assert_eq!(rows, newest_rows(&t, 50), "then the whole retained ring");
+        assert_eq!(c.sent_upto(), avail);
     }
 
     #[test]
@@ -394,14 +493,17 @@ mod tests {
         let mut t = term();
         let mut c = active(&t);
         scroll(&mut t, 10);
-        c.next_body(&t, 0, RTO, 256);
+        c.next_body(&t, 0, RTO, ANY);
         c.on_ack(1, 4);
-        c.on_client_size((6, 20), total(&t));
+        split(c.next_body(&t, RTO, RTO, ANY));
+        assert_eq!(c.resends(), 1);
+        assert!(c.on_client_size((6, 20), total(&t)), "it bumped");
         assert_eq!(c.epoch(), Some(2));
         assert_eq!(c.avail(total(&t)), 0);
         assert_eq!(c.acked_rows(), 0);
         assert_eq!(c.sent_upto(), 0);
-        c.on_client_size((6, 20), total(&t));
+        assert_eq!(c.resends(), 0);
+        assert!(!c.on_client_size((6, 20), total(&t)));
         assert_eq!(c.epoch(), Some(2), "the same size again is no change");
 
         let mut wrap = HistoryCursor::new((5, 20));
@@ -417,25 +519,40 @@ mod tests {
     }
 
     #[test]
-    fn reanchor_keeps_the_epoch_and_continues_from_the_send_cursor() {
+    fn reanchor_keeps_the_epoch_and_jumps_to_the_count_at_the_resize() {
         let mut t = term();
         let mut c = active(&t);
         scroll(&mut t, 10);
-        c.next_body(&t, 0, RTO, 6);
+        c.next_body(&t, 0, RTO, 8);
         c.on_ack(1, 4);
-        assert_eq!(c.sent_upto(), 6);
-        // A reflow renumbers the ring: the total jumps, and rows 6..10 were
-        // never sent.
-        scroll(&mut t, 30);
+        assert_eq!(c.sent_upto(), 8);
+        // A reflow renumbers the ring without moving the total; rows 8..10
+        // were never sent, rows 4..8 are in flight.
+        t.resize(5, 30);
+        assert_eq!(total(&t), 10);
         c.reanchor(total(&t));
         assert_eq!(c.epoch(), Some(1), "no new epoch");
         assert_eq!(c.acked_rows(), 4, "the viewport's ack stays valid");
-        assert_eq!(c.sent_upto(), 6);
-        assert_eq!(c.avail(total(&t)), 6, "avail continues from sent_upto");
+        assert_eq!(c.sent_upto(), 8);
+        assert_eq!(c.in_flight(), 4);
+        assert_eq!(c.avail(total(&t)), 10, "numbering continues at the count");
+
+        // A resend from the lagging ack is floored at the anchor: an empty
+        // body at the reflow count, inside the same jump.
+        let mut lagging = c;
+        let (_, row_offset, rows) = split(lagging.next_body(&t, RTO, RTO, ANY));
+        assert_eq!((row_offset, rows.len()), (10, 0));
+        assert_eq!(lagging.resends(), 1);
+        lagging.reanchor(total(&t));
+        assert_eq!(lagging.resends(), 0, "a new row space resets the backoff");
+
         scroll(&mut t, 3);
-        assert_eq!(c.avail(total(&t)), 9);
-        let (epoch, row_offset, rows) = split(c.next_body(&t, 1, RTO, 256));
-        assert_eq!((epoch, row_offset, rows), (1, 6, newest_rows(&t, 3)));
+        assert_eq!(c.avail(total(&t)), 13);
+        let (epoch, row_offset, rows) = split(c.next_body(&t, 1, RTO, ANY));
+        assert_eq!((epoch, row_offset, rows), (1, 10, newest_rows(&t, 3)));
+        // What a reader that expects the next body at its last end sees.
+        let expected_next = 8;
+        assert_eq!(row_offset - expected_next, 2, "a forward jump of the 2 unsent rows");
 
         let mut idle = HistoryCursor::new((5, 20));
         idle.reanchor(total(&t));
@@ -447,7 +564,7 @@ mod tests {
         let mut t = term();
         let mut c = active(&t);
         scroll(&mut t, 10);
-        c.next_body(&t, 0, RTO, 256);
+        c.next_body(&t, 0, RTO, ANY);
         c.on_ack(1, 4);
         c.bump_epoch(total(&t));
         assert_eq!(c.epoch(), Some(2));
@@ -457,7 +574,7 @@ mod tests {
         c.bump_epoch(total(&t));
         assert_eq!(c.epoch(), Some(3), "no size change needed");
         scroll(&mut t, 2);
-        let (epoch, row_offset, rows) = split(c.next_body(&t, 0, RTO, 256));
+        let (epoch, row_offset, rows) = split(c.next_body(&t, 0, RTO, ANY));
         assert_eq!((epoch, row_offset, rows), (3, 0, newest_rows(&t, 2)));
     }
 
@@ -472,7 +589,7 @@ mod tests {
         assert_eq!(c.avail(total(&t)), 43);
         assert_eq!(c.acked_rows(), 40);
         assert_eq!(c.sent_upto(), 40);
-        let (epoch, row_offset, rows) = split(c.next_body(&t, 0, RTO, 256));
+        let (epoch, row_offset, rows) = split(c.next_body(&t, 0, RTO, ANY));
         assert_eq!((epoch, row_offset, rows), (7, 40, newest_rows(&t, 3)));
     }
 
@@ -484,16 +601,16 @@ mod tests {
         let mut c = HistoryCursor::new((5, 20));
         c.activate(HistoryStart::Continue { epoch: 7, rows: 40 }, total(&t));
         scroll(&mut t, 5);
-        let (_, row_offset, rows) = split(c.next_body(&t, 0, RTO, 256));
+        let (_, row_offset, rows) = split(c.next_body(&t, 0, RTO, ANY));
         assert_eq!((row_offset, rows.len()), (40, 5));
         assert!(c.resend_due(RTO, RTO), "no ack: the RTO passes");
-        let (_, row_offset, rows) = split(c.next_body(&t, RTO, RTO, 256));
+        let (_, row_offset, rows) = split(c.next_body(&t, RTO, RTO, ANY));
         assert_eq!((row_offset, rows), (40, newest_rows(&t, 5)));
         // The anchor, not the ack, is the floor: even an ack below it (which
         // the API cannot produce) resends from the anchor, though the ring
         // holds 45 older rows.
         c.acked_rows = 0;
-        let (_, row_offset, _) = split(c.next_body(&t, 3 * RTO, RTO, 256));
+        let (_, row_offset, _) = split(c.next_body(&t, 3 * RTO, RTO, ANY));
         assert_eq!(row_offset, 40);
     }
 }

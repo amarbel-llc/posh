@@ -443,7 +443,9 @@ the wire contract is RFC 0009 §5 (new) and RFC 0008 §3.2 (amended).
     attached under smallest-wins. Only a viewport's OWN size change bumps
     its epoch. The test is
     `a_viewports_own_resize_bumps_its_epoch_and_a_width_change_reanchors_the_others`
-    (renamed from the task text's "…bumps_all").
+    (renamed from the task text's "…bumps_all"). The post-review cleanup
+    (below) changed WHERE the re-anchor lands and added the height-grow
+    trigger.
   - **The viewport appends the tail of a partial overlap** instead of
     discarding the body (`remote/client.rs`,
     `scrollback2_partial_overlap_appends_only_the_tail`): a resend from a
@@ -480,8 +482,9 @@ the wire contract is RFC 0009 §5 (new) and RFC 0008 §3.2 (amended).
     limited by the window and socket backpressure only; a fresh body is
     capped at the room left in the window, so at most 512 rows are ever in
     flight (the window is exact); and the first screen/history tie goes to
-    the screen (`Pacing::default` sets `last_was_history`; UX decision 3).
-    The floor stays for the screen. After: prompt acks deliver every row at
+    the screen (UX decision 3 — after the cleanup the coin bit is
+    `Pacing.last_was_screen`, whose derived `false` makes the first tie the
+    screen's). The floor stays for the screen. After: prompt acks deliver every row at
     1 KiB and 4 KiB chunks, peak backlog 5–8 KB, bodies of about one chunk's
     rows, one per loop iteration.
   - The `Lagged(2500)` row cannot reach the visible-base cliff the "Facts"
@@ -514,10 +517,40 @@ the wire contract is RFC 0009 §5 (new) and RFC 0008 §3.2 (amended).
 - **Known limitations** (FDR 0021 Limitations): history throughput is one
   static window per RTT until Task 3.4; a body lost under a later one is an
   unrepairable forward jump indistinguishable from eviction (posh#243, with
-  Stage 4); rows scrolled while detached, and rows a width change
-  renumbered before they were sent, are not delivered (Stage 5 for the
-  former); unpaced and relayed viewports stay on v1 until Stage 7; the
-  slow-reader loss is larger than v1's ~4,300 and not yet analysed.
+  Stage 4); rows scrolled while detached are not delivered (Stage 5), and
+  rows a width change or height grow left unsent become a forward jump at
+  the resize (labelled by Stage 4); unpaced and relayed viewports stay on
+  v1 until Stage 7; the slow-reader loss is larger than v1's ~4,300 and
+  not yet analysed; ring rows a height grow pops back onto the grid
+  re-enter the ring under new numbers when they re-scroll, so a viewport
+  already holding them gets them twice (pre-existing, v1 too; untracked).
+- **Post-review cleanup** (the commit after 3.5's records; whole-stage
+  review + simplify): (a) a session HEIGHT GROW also re-anchors other
+  viewports — posh-term pops ring rows back onto the grid without lowering
+  the total, so the cursor's ring-index mapping would otherwise offer older
+  rows under newer numbers (test by row content:
+  `a_session_height_grow_reanchors_the_other_viewports`); a shrink pushes
+  rows through the total like a scroll and needs nothing; (b)
+  **`reanchor` lands at the viewport's row COUNT as of the resize**, not at
+  its send cursor, so rows scrolled-but-unsent and sent-but-lost become one
+  forward jump instead of a silent seam (UX decision 1;
+  `reanchor_keeps_the_epoch_and_jumps_to_the_count_at_the_resize`); (c) a
+  fresh body starts at `max(sent_upto, acked_rows)` — a late ack past a
+  rewound resend no longer re-sends held rows
+  (`a_late_ack_past_a_rewound_resend_is_not_sent_again`); (d) the cursor
+  owns the window (`next_due`/`next_body(.., window)` cap a fresh body at
+  the room left; `server_loop` passes an unbounded window) and the resend
+  count (zeroed by an advancing ack, a bump or a re-anchor), `on_client_size`
+  reports whether it bumped, `next_body` returns the epoch, `ClientConn`
+  gains `history()`/`history_mut()`; (e) **screen priority was tried and
+  reverted**: without the coin, a reader whose drain exceeds the 20 ms
+  floor under continuous output gets no history until the output stops,
+  which contradicts decision 3's "a share of what is left" (the lever's
+  `0` is the only live-only mode); the coin stays as
+  `Pacing.last_was_screen`; (f) `AckLatency::take_log_line` checks and
+  stamps in one step; a comment says why `datagram::RttEstimator` is not
+  reused (it drops ≥ 5 s samples, the stalled-viewport regime this exists
+  to see).
 - **posh#240 narrowed, not closed, by `c950f8e`:** a v2 viewport (paced,
   the default remote path) gets each row at most once by address; an
   unpaced or relayed viewport stays on v1 until Stage 7, and v2 still loses

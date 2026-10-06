@@ -330,7 +330,7 @@ enum RegeometryKeyframe {
 }
 
 /// A paced client's send-time state (posh#225, RFC 0008 §3.2).
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Default, Clone, PartialEq, Eq)]
 struct Pacing {
     /// A visible frame is owed: output reached the broadcast source since
     /// the last paced frame, or an event (attach replay, regeometry,
@@ -353,26 +353,10 @@ struct Pacing {
     /// viewport's Init carried a well-formed `CAP_SCROLLBACK2`; it then gets
     /// `Scrollback2` bodies and never v1 `Scrollback` frames.
     history: Option<HistoryCursor>,
-    /// Whether the newest paced send was a history body (`server_loop`'s
-    /// `last_was_sb`): when both kinds are due, the other one goes.
-    last_was_history: bool,
-    /// Resend bodies since the v2 ack last advanced (the backoff exponent).
-    history_resends: u32,
-}
-
-impl Default for Pacing {
-    fn default() -> Self {
-        Pacing {
-            dirty: false,
-            last_fresh: None,
-            sent_frames: VecDeque::new(),
-            acks: AckLatency::default(),
-            history: None,
-            // The first tie goes to the screen (live screen first).
-            last_was_history: true,
-            history_resends: 0,
-        }
-    }
+    /// Whether the newest paced send was a visible frame (`server_loop`'s
+    /// `last_was_sb`, inverted): when both kinds are due, the other one
+    /// goes. False before any send, so the first tie is the screen's.
+    last_was_screen: bool,
 }
 
 /// The most entries `Pacing::sent_frames` keeps: 16 unacked visible frames
@@ -385,8 +369,11 @@ const SENT_FRAME_LOG_CAP: usize = 16;
 /// of a paced visible frame — from when it was queued, through the bridge
 /// and the link, applied, to when its ack arrived — which is the only RTT
 /// the daemon can see. Each frame is sampled at most once — an ack that
-/// confirms several logged frames samples only the newest. Read by the history resend floor
-/// (Task 3.3) and the trickle (Task 3.4).
+/// confirms several logged frames samples only the newest. Read by
+/// `history_resend_after` and the backlog/ack-latency log lines. Its own
+/// integer filter, not `datagram::RttEstimator`: that one serves a
+/// `Connection`'s timestamp echoes and drops samples of 5 s or more — the
+/// stalled-viewport regime this one exists to see.
 #[derive(Debug, Default, Clone, Copy, PartialEq, Eq)]
 struct AckLatency {
     /// When the newest `Tag::FrameAck` arrived, advancing or not.
@@ -424,13 +411,21 @@ impl AckLatency {
         format!("ack_ms={ms} ack_n={} ack_age_ms={age}", self.samples)
     }
 
-    /// Whether a `paced ack latency` line is due at `now`: new samples since
-    /// the last one, which is at least `ACK_LOG_INTERVAL_MS` old.
-    fn log_due(&self, now: u64) -> bool {
-        self.samples > self.logged_samples
+    /// When a `paced ack latency` line is due at `now` — new samples since
+    /// the last one, which is at least `ACK_LOG_INTERVAL_MS` old — stamp it
+    /// as written and return the samples new since the last.
+    fn take_log_line(&mut self, now: u64) -> Option<u64> {
+        let due = self.samples > self.logged_samples
             && self
                 .logged_at
-                .is_none_or(|at| now.saturating_sub(at) >= ACK_LOG_INTERVAL_MS)
+                .is_none_or(|at| now.saturating_sub(at) >= ACK_LOG_INTERVAL_MS);
+        if !due {
+            return None;
+        }
+        let new = self.samples - self.logged_samples;
+        self.logged_samples = self.samples;
+        self.logged_at = Some(now);
+        Some(new)
     }
 }
 
@@ -470,10 +465,8 @@ impl ClientConn {
         if let Some(entry) = caps::find(table, caps::CAP_SCROLLBACK2)
             .and_then(|c| caps::decode_scrollback2_client(&c.payload).ok())
         {
-            if let Some(p) = self.pacing.as_mut() {
-                if p.history.as_mut().is_some_and(|h| h.on_ack(entry.epoch, entry.acked_rows)) {
-                    p.history_resends = 0;
-                }
+            if let Some(h) = self.history_mut() {
+                h.on_ack(entry.epoch, entry.acked_rows);
             }
         }
     }
@@ -782,7 +775,7 @@ impl ClientConn {
         let sent = self.producer.as_ref().map(FrameProducer::last_visible_num);
         if let Some(p) = self.pacing.as_mut() {
             p.dirty = false;
-            p.last_was_history = false;
+            p.last_was_screen = true;
             p.last_fresh = Some(now);
             if let Some(num) = sent {
                 if p.sent_frames.len() == SENT_FRAME_LOG_CAP {
@@ -793,9 +786,18 @@ impl ClientConn {
         }
     }
 
-    /// Whether this client takes RFC 0009 v2 history (`Pacing::history`).
+    /// This client's RFC 0009 v2 history cursor (`Pacing::history`).
+    fn history(&self) -> Option<&HistoryCursor> {
+        self.pacing.as_ref()?.history.as_ref()
+    }
+
+    fn history_mut(&mut self) -> Option<&mut HistoryCursor> {
+        self.pacing.as_mut()?.history.as_mut()
+    }
+
+    /// Whether this client takes RFC 0009 v2 history.
     fn has_history(&self) -> bool {
-        self.pacing.as_ref().is_some_and(|p| p.history.is_some())
+        self.history().is_some()
     }
 
     /// The v2 resend floor: twice the measured ack latency (never under the
@@ -809,27 +811,25 @@ impl ClientConn {
             .acks
             .srtt_ms
             .map_or(HISTORY_RESEND_INITIAL_MS, |s| (2 * s).max(PACED_ACK_WAIT_MS));
-        base << p.history_resends.min(HISTORY_RESEND_MAX_DOUBLINGS)
+        let resends = p.history.map_or(0, |h| h.resends());
+        base << resends.min(HISTORY_RESEND_MAX_DOUBLINGS)
     }
 
     /// When this client may next be sent a history body from `term` — the
     /// history half of the one-predicate rule (`send_paced_frames` and
-    /// `paced_poll_timeout` both ask it). Fresh rows with room in the
-    /// window: due at once (`last_send`, never later than now) — history is
-    /// limited only by the window and the socket, not by the frame floor.
-    /// Otherwise, rows in flight: the resend deadline. `None` with bytes
-    /// queued (so a due body, once queued, cannot busy-loop the poll), or
-    /// with nothing fresh and nothing in flight.
+    /// `paced_poll_timeout` both ask it): the cursor's `next_due` within
+    /// `HISTORY_WINDOW_ROWS` — not the frame floor — and `None` with bytes
+    /// queued, so a due body, once queued, cannot busy-loop the poll.
     fn history_send_at(&self, term: &Terminal) -> Option<u64> {
-        let h = self.pacing.as_ref().and_then(|p| p.history)?;
+        let h = self.history()?;
         if !self.write_buf.is_empty() || self.producer.is_none() {
             return None;
         }
-        let fresh = h.avail(term.primary_scrollback_total()) > h.sent_upto();
-        if fresh && h.in_flight() < HISTORY_WINDOW_ROWS {
-            return Some(h.last_send());
-        }
-        (h.in_flight() > 0).then(|| h.last_send() + self.history_resend_after())
+        h.next_due(
+            term.primary_scrollback_total(),
+            self.history_resend_after(),
+            HISTORY_WINDOW_ROWS,
+        )
     }
 
     /// Queue one v2 body from `term` (the session terminal) — from the send
@@ -845,18 +845,8 @@ impl ClientConn {
         let Some(h) = p.history.as_mut() else {
             return;
         };
-        // A fresh body carries at most the room left in the window, so at
-        // most HISTORY_WINDOW_ROWS are ever in flight; a resend restarts the
-        // count from the ack and takes a whole body.
-        let cap = if h.resend_due(now, rto) {
-            p.history_resends += 1;
-            SB2_ROWS_PER_BODY
-        } else {
-            SB2_ROWS_PER_BODY.min(HISTORY_WINDOW_ROWS.saturating_sub(h.in_flight()))
-        };
-        let body = h.next_body(term, now, rto, cap);
-        let epoch = h.epoch().expect("an open cursor is active");
-        p.last_was_history = true;
+        let (epoch, body) = h.next_body(term, now, rto, HISTORY_WINDOW_ROWS);
+        p.last_was_screen = false;
         let bytes = ServerFrame {
             flags,
             caps: caps::own_table(&[caps::encode_scrollback2_ack(epoch)]),
@@ -946,7 +936,7 @@ impl ClientConn {
         // RFC 0009 §1.1 (posh#225 Stage 3): a v2 viewport adopts its epoch
         // from the server's SCROLLBACK2 entry on the first frame it gets, so
         // every visible frame to it carries one, as `server_loop`'s do.
-        if let Some(epoch) = self.pacing.as_ref().and_then(|p| p.history).and_then(|h| h.epoch()) {
+        if let Some(epoch) = self.history().and_then(HistoryCursor::epoch) {
             frame_caps.push(caps::encode_scrollback2_ack(epoch));
         }
         let encoded = match self.producer.as_mut() {
@@ -1088,17 +1078,12 @@ impl ClientConn {
         false
     }
 
-    /// Record a frame ack's arrival for a paced client (posh#225 Stage 3.0):
-    /// `acked_before` is the producer's `acked_num()` before the ack was
-    /// applied. An ack that ADVANCED it is a sample: the round trip of the
-    /// newest logged paced visible frame it confirms (an ack naming the
-    /// scrollback slot after visible frame N confirms N), measured from when
-    /// that frame was queued. Every logged frame it confirms is then
-    /// dropped, so a frame is sampled at most once. Not the NEWEST frame's
-    /// ack only: with an RTT past `PACED_ACK_WAIT_MS` and steady output a
-    /// newer frame is always queued before the ack lands, and that regime
-    /// is the one the signal is for. A repeated ack advances nothing, and a
-    /// RESYNC emptied the log in `apply_frame_ack`: neither is a sample.
+    /// Record a frame ack's arrival for a paced client (posh#225 Stage 3.0);
+    /// `acked_before` is the producer's `acked_num()` before it applied. An
+    /// ack that advanced it samples the round trip of the newest logged
+    /// frame it confirms, and drops every logged frame it confirms — not
+    /// just the newest frame's ack, which a long RTT under steady output
+    /// never sees. A repeated ack or a RESYNC is no sample.
     fn note_frame_ack(&mut self, acked_before: Option<u64>, now: u64) {
         let (Some(before), Some(producer)) = (acked_before, self.producer.as_ref()) else {
             return;
@@ -1260,19 +1245,8 @@ fn backlog_log_fields(c: &ClientConn, now: u64) -> String {
 /// 3.0), when one is due — `None` for a client that is not paced — and
 /// records that it was written. `new=` counts the samples since the last.
 fn ack_latency_log_line(c: &mut ClientConn, now: u64) -> Option<String> {
-    let acks = c.pacing.as_ref()?.acks;
-    if !acks.log_due(now) {
-        return None;
-    }
-    let line = format!(
-        "paced ack latency {} new={}",
-        backlog_log_fields(c, now),
-        acks.samples - acks.logged_samples
-    );
-    let p = c.pacing.as_mut()?;
-    p.acks.logged_samples = acks.samples;
-    p.acks.logged_at = Some(now);
-    Some(line)
+    let new = c.pacing.as_mut()?.acks.take_log_line(now)?;
+    Some(format!("paced ack latency {} new={new}", backlog_log_fields(c, now)))
 }
 
 /// Broadcasts a PTY-output chunk to every attached client: a posh-proto
@@ -1425,18 +1399,18 @@ fn broadcast_source_swap(clients: &mut [ClientConn], src: &Terminal, bcast: &[u8
 /// send opportunity at `now` gets ONE body — a fresh visible frame built
 /// from `src` as it is now (screens produced since its last frame were
 /// never built), or a v2 history body from `history`. When both are due,
-/// the kind that did not go last goes (`server_loop`'s coin); the other
-/// goes next iteration, after the drain. `history` is the session terminal,
-/// `None` while the escape overlay is up (as `server_loop` pauses history
-/// for it). Runs at the end of a loop iteration; `now` is a parameter so
-/// tests drive a fake clock.
+/// the kind that did not go last goes (`server_loop`'s coin; the first tie
+/// is the screen's); the other goes next iteration, after the drain.
+/// `history` is the session terminal, `None` while the escape overlay is up
+/// (as `server_loop` pauses history for it). Runs at the end of a loop
+/// iteration; `now` is a parameter so tests drive a fake clock.
 fn send_paced_frames(clients: &mut [ClientConn], src: &Terminal, history: Option<&Terminal>, now: u64) {
     for c in clients.iter_mut() {
         let screen = c.paced_send_at().is_some_and(|at| now >= at);
         let rows = history.filter(|t| c.history_send_at(t).is_some_and(|at| now >= at));
-        let last_was_history = c.pacing.as_ref().is_some_and(|p| p.last_was_history);
+        let last_was_screen = c.pacing.as_ref().is_some_and(|p| p.last_was_screen);
         match (screen, rows) {
-            (true, Some(t)) if !last_was_history => c.send_history_body(t, now),
+            (true, Some(t)) if last_was_screen => c.send_history_body(t, now),
             (true, _) => c.send_paced_frame(src, now),
             (false, Some(t)) => c.send_history_body(t, now),
             (false, None) => {}
@@ -1800,27 +1774,24 @@ fn reset_scrollback_floors_on_reflow(clients: &mut [ClientConn], term: &Terminal
 }
 
 /// v2 row spaces (RFC 0009 §1.1, posh#225 Stage 3), run beside
-/// `reset_scrollback_floors_on_reflow`. A viewport whose own reported size
-/// changed cleared its ring, so it gets a new epoch at the current total.
-/// A session width change reflowed the daemon's ring, renumbering its rows;
-/// every OTHER viewport is re-anchored at the reflowed total in the SAME
-/// epoch — its ring and ack stay valid, and rows not yet sent become a
-/// forward jump — so another viewport attaching narrower, or leaving, never
-/// clears its history (v1 never did).
-fn reset_history_on_resize(clients: &mut [ClientConn], term: &Terminal, cols_before: u16) {
+/// `reset_scrollback_floors_on_reflow` with the session size from before
+/// the resize. A viewport whose own reported size changed cleared its ring,
+/// so it gets a new epoch at the current total. Every OTHER viewport keeps
+/// its epoch, ring and ack, and is re-anchored (`HistoryCursor::reanchor`:
+/// unsent and sent-but-lost rows become one forward jump) when the
+/// daemon's ring was renumbered under it without the total moving: a width
+/// change reflowed it, or a height grow popped ring rows back onto the
+/// grid. A height shrink needs nothing: it pushes grid rows into the ring
+/// through the total, as a scroll does. So another viewport attaching
+/// narrower, or leaving, never clears its history (v1 never did).
+fn reset_history_on_resize(clients: &mut [ClientConn], term: &Terminal, (rows_before, cols_before): (u16, u16)) {
     let total = term.primary_scrollback_total();
-    let reflowed = term.cols() != cols_before;
+    let renumbered = term.cols() != cols_before || term.rows() > rows_before;
     for c in clients.iter_mut() {
         let size = (c.rows, c.cols);
-        let Some(p) = c.pacing.as_mut() else { continue };
-        let Some(h) = p.history.as_mut() else { continue };
-        let before = h.epoch();
-        h.on_client_size(size, total);
-        if h.epoch() != before {
-            p.history_resends = 0;
-        } else if reflowed {
+        let Some(h) = c.history_mut() else { continue };
+        if !h.on_client_size(size, total) && renumbered {
             h.reanchor(total);
-            p.history_resends = 0;
         }
     }
 }
@@ -2689,7 +2660,7 @@ fn daemon_loop(
                 resized = true;
             }
             if resized {
-                let cols_before = term.cols();
+                let (rows_before, cols_before) = (term.rows(), term.cols());
                 apply_client_size(clients, pty_fd, term);
                 // Keep the escape overlay sized to the session in lockstep (FDR
                 // 0008): both PTYs and both terminal models track the new dims.
@@ -2705,7 +2676,7 @@ fn daemon_loop(
                     }
                 }
                 reset_scrollback_floors_on_reflow(clients, term, cols_before);
-                reset_history_on_resize(clients, term, cols_before);
+                reset_history_on_resize(clients, term, (rows_before, cols_before));
             }
             // Replay after the resize so the dump reflects the client's size.
             // Skip if the client was removed this iteration. github #16.
@@ -6421,7 +6392,8 @@ mod tests {
             let history_pending = |c: &ClientConn, now: u64| match history_of(c) {
                 None => false,
                 Some(_) if matches!(case.acks, FloodAcks::Never) => now < never_tail_end,
-                Some(h) => h.avail(term.primary_scrollback_total()) > h.sent_upto() || h.in_flight() > 0,
+                // Fresh rows or rows in flight, whatever the window.
+                Some(h) => h.next_due(term.primary_scrollback_total(), 0, u64::MAX).is_some(),
             };
             while c.owes_paced_frame() || !c.write_buf.is_empty() || history_pending(&c, now) {
                 assert!(
@@ -8177,7 +8149,7 @@ mod tests {
     }
 
     fn history_of(c: &ClientConn) -> Option<HistoryCursor> {
-        c.pacing.as_ref().and_then(|p| p.history)
+        c.history().copied()
     }
 
     /// A terminal whose screen is full, so every further line scrolls
@@ -8367,7 +8339,7 @@ mod tests {
     }
 
     #[test]
-    fn screen_and_history_take_turns_when_both_are_due() {
+    fn the_screen_takes_the_first_tie_then_screen_and_history_alternate() {
         let mut term = v2_term(5, 24, 1000);
         let (mut c, _peer) = paced_v2_conn(&term, sb2_entry(0, 0));
         scroll_rows(&mut term, 10);
@@ -8562,20 +8534,22 @@ mod tests {
         assert_eq!(history_bodies(&pass_at_the_history_opportunity(&mut clients[1], &term)), vec![(1, 0, 8)]);
         ack_history(&mut clients[1], 1, 5);
         clients[1].write_buf.clear();
+        // Rows 8..10 scroll but are not sent before the reflow.
+        scroll_rows(&mut term, 2);
 
         assert!(clients[0].apply_resize(&ipc::encode_resize(6, 24)));
-        let cols = term.cols();
-        reset_history_on_resize(&mut clients, &term, cols);
+        let size = (term.rows(), term.cols());
+        reset_history_on_resize(&mut clients, &term, size);
         assert_eq!(epochs(&clients), vec![Some(2), Some(1)], "only the resized viewport");
 
         // A session width change: `a`'s size is unchanged since, so neither
         // bumps; `b` keeps its epoch, its ack, and its count.
         term.resize(5, 30);
-        reset_history_on_resize(&mut clients, &term, 24);
+        reset_history_on_resize(&mut clients, &term, (5, 24));
         assert_eq!(epochs(&clients), vec![Some(2), Some(1)], "a reflow bumps no epoch");
         let b = history_of(&clients[1]).unwrap();
         assert_eq!((b.acked_rows(), b.sent_upto()), (5, 8), "the viewport's ring stays valid");
-        assert_eq!(b.avail(term.primary_scrollback_total()), 8, "re-anchored at its send cursor");
+        assert_eq!(b.avail(term.primary_scrollback_total()), 10, "re-anchored at the count");
 
         for (c, want) in clients.iter_mut().zip([2u8, 1]) {
             broadcast_output(std::slice::from_mut(c), &term, b"x");
@@ -8585,11 +8559,63 @@ mod tests {
             c.write_buf.clear();
         }
 
-        // `b`'s next fresh body continues from its previous `sent_upto`.
+        // `b`'s next fresh body starts at the count at the reflow: a forward
+        // jump over the 2 unsent rows, never a silent seam.
         scroll_rows(&mut term, 3);
         ack_history(&mut clients[1], 1, 8);
         let frames = pass_at_the_history_opportunity(&mut clients[1], &term);
-        assert_eq!(history_bodies(&frames), vec![(1, 8, 3)]);
+        assert_eq!(history_bodies(&frames), vec![(1, 10, 3)]);
+    }
+
+    /// posh#225 Stage 3: a session HEIGHT grow pops ring rows back onto the
+    /// grid without moving the total, renumbering the ring under every
+    /// viewport whose own size did not change — unless it is re-anchored,
+    /// its next body offers rows it already holds under newer numbers.
+    #[test]
+    fn a_session_height_grow_reanchors_the_other_viewports() {
+        let mut term = v2_term(5, 24, 100);
+        let (short, _ps) = paced_v2_conn(&term, sb2_entry(0, 0));
+        let (mut tall, _pt) = paced_conn(8, 24, &[SCROLLBACK_CAP[0].clone(), sb2_entry(0, 0)]);
+        tall.sb_floor = term.primary_scrollback_total();
+        tall.open_history(&term);
+        let mut clients = vec![short, tall];
+        // The tall viewport holds rows 0..6; rows 6..10 are not sent yet.
+        scroll_rows(&mut term, 6);
+        assert_eq!(history_bodies(&pass_at_the_history_opportunity(&mut clients[1], &term)), vec![(1, 0, 6)]);
+        ack_history(&mut clients[1], 1, 6);
+        clients[1].write_buf.clear();
+        let held = newest_ring_rows(&term, 6);
+        scroll_rows(&mut term, 4);
+
+        // The short viewport leaves: the session grows to the tall one's
+        // height, popping 3 ring rows back onto the grid.
+        clients.remove(0);
+        let before = (term.rows(), term.cols());
+        term.resize(8, 24);
+        assert_eq!(term.primary_scrollback_len(), 7, "3 ring rows popped onto the grid");
+        reset_history_on_resize(&mut clients, &term, before);
+        assert_eq!(history_of(&clients[0]).and_then(|h| h.epoch()), Some(1), "no new epoch");
+
+        scroll_rows(&mut term, 1);
+        let mut delivered: Vec<Vec<u8>> = Vec::new();
+        while clients[0].history_send_at(&term).is_some() {
+            for f in pass_at_the_history_opportunity(&mut clients[0], &term) {
+                if let FrameBody::Scrollback2 {
+                    epoch,
+                    row_offset,
+                    rows,
+                } = f.body
+                {
+                    ack_history(&mut clients[0], epoch, row_offset + rows.len() as u64);
+                    delivered.extend(rows);
+                }
+            }
+            clients[0].write_buf.clear();
+        }
+        assert!(!delivered.is_empty(), "the new row is delivered");
+        for row in &delivered {
+            assert!(!held.contains(row), "re-delivered a held row: {}", String::from_utf8_lossy(row));
+        }
     }
 
     #[test]
