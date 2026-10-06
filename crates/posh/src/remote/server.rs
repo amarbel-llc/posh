@@ -1164,15 +1164,18 @@ fn rehome_bridge(
 /// The client half of the daemon `Tag::Init` this bridge sends for a
 /// channel: the relay's content caps (RFC 0008 §4) plus what only the M2
 /// bridge carries (ADR 0007) — the viewport's `CAP_PACED` entry
-/// (posh#225, RFC 0008 §3.2) and its `CAP_SCROLLBACK2` entry (RFC 0009 §3,
-/// the epoch and count the daemon opens its history cursor from), each
-/// verbatim. The caller appends its own identity. Retained as
-/// `SessionBridge::content`, so a re-home re-Inits with the same
+/// (posh#225, RFC 0008 §3.2), its `CAP_SCROLLBACK2` entry (RFC 0009 §3,
+/// the epoch and count the daemon opens its history cursor from) and its
+/// `CAP_SCROLLBACK2_EXTENT` request (RFC 0009 §3.1, posh#225 Stage 4), each
+/// verbatim. The extent request is Init-only: it never changes, so it is
+/// not forwarded per message. The caller appends its own identity. Retained
+/// as `SessionBridge::content`, so a re-home re-Inits with the same
 /// negotiation.
 fn bridge_init_content(client_caps: &[caps::Cap]) -> Vec<caps::Cap> {
     let mut content = crate::remote::relay::content_caps(client_caps);
     content.extend(caps::find(client_caps, caps::CAP_PACED).cloned());
     content.extend(caps::find(client_caps, caps::CAP_SCROLLBACK2).cloned());
+    content.extend(caps::find(client_caps, caps::CAP_SCROLLBACK2_EXTENT).cloned());
     content
 }
 
@@ -1354,6 +1357,10 @@ pub(crate) fn server_loop(
     // is a cumulative repeat-until-acked stream (like the input channel),
     // fully outside the producer's visible frame slots.
     let mut sb2 = HistoryCursor::new((rows, cols));
+    // RFC 0009 §3.1 (posh#225 Stage 4): the peer asked for the v2 extent on
+    // some message; latched for the connection. Sent beside the SCROLLBACK2
+    // ack on every frame while `sb2` is active.
+    let mut peer_wants_extent = false;
 
     // Agent forwarding (FDR 0004). The bidirectional agent byte stream and the
     // peer's per-message AGENT_FORWARD advertisement. `agent_seen` latches once
@@ -1914,6 +1921,11 @@ pub(crate) fn server_loop(
                         {
                             sb2.on_client_entry(&c, term.primary_scrollback_total());
                         }
+                        // RFC 0009 §3.1 (posh#225 Stage 4): a request for the
+                        // v2 extent latches for the connection.
+                        peer_wants_extent |= caps::find(&msg.caps, caps::CAP_SCROLLBACK2_EXTENT)
+                            .and_then(|c| caps::decode_scrollback2_extent_request(&c.payload))
+                            .is_some();
                         // A client resize invalidates the epoch's row space
                         // (reflow; the client cleared its ring and awaits a
                         // fresh epoch): bump and re-anchor. handle_client_message
@@ -2317,6 +2329,10 @@ pub(crate) fn server_loop(
                 // epoch adoption) off it.
                 if let Some(epoch) = sb2.epoch() {
                     extras.push(caps::encode_scrollback2_ack(epoch));
+                }
+                // Beside it, the extent (RFC 0009 §3.1), to a peer that asked.
+                if peer_wants_extent {
+                    extras.extend(sb2.extent(&term).as_ref().map(caps::encode_scrollback2_extent));
                 }
                 if peer_wants_scrollback {
                     // Acknowledge that we emit scrollback bodies (RFC 0002
@@ -3195,6 +3211,35 @@ mod tests {
             client_caps_records(&b),
             vec![vec![sb2(1, 5)], vec![sb2(1, 9)]]
         );
+    }
+
+    /// posh#225 Stage 4 (RFC 0009 §3.1): the M2 bridge carries the
+    /// viewport's extent request into the daemon Init, verbatim, iff the
+    /// viewport sent it.
+    #[test]
+    fn bridge_init_carries_the_viewports_extent_request() {
+        let request = caps::encode_scrollback2_extent_request();
+        let with = bridge_init_content(&[sb2(0, 0), request.clone()]);
+        assert_eq!(caps::find(&with, caps::CAP_SCROLLBACK2_EXTENT), Some(&request));
+        let without = bridge_init_content(&[sb2(0, 0)]);
+        assert!(caps::find(&without, caps::CAP_SCROLLBACK2_EXTENT).is_none());
+    }
+
+    /// ADR 0007: the relay never carries it.
+    #[test]
+    fn the_relay_never_carries_the_extent_request() {
+        let table = vec![caps::encode_scrollback2_extent_request()];
+        assert!(crate::remote::relay::content_caps(&table).is_empty());
+        assert!(crate::remote::relay::forwarded_client_caps(&table).is_empty());
+    }
+
+    /// The request is Init-only on the socket: it never changes, so a
+    /// message carrying it forwards only its id-10 ack.
+    #[test]
+    fn the_bridge_does_not_forward_the_extent_request_per_message() {
+        let (mut b, _peer) = test_bridge();
+        send_caps(&mut b, vec![sb2(1, 5), caps::encode_scrollback2_extent_request()]);
+        assert_eq!(client_caps_records(&b), vec![vec![sb2(1, 5)]]);
     }
 
     #[test]

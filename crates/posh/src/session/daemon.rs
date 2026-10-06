@@ -353,6 +353,11 @@ struct Pacing {
     /// viewport's Init carried a well-formed `CAP_SCROLLBACK2`; it then gets
     /// `Scrollback2` bodies and never v1 `Scrollback` frames.
     history: Option<HistoryCursor>,
+    /// The v2 extent (RFC 0009 §3.1, posh#225 Stage 4) as of the newest
+    /// pass with the session terminal; rides every frame to a viewport that
+    /// asked; frozen under the escape overlay. `None` for a viewport that
+    /// did not ask, or has no cursor.
+    extent: Option<caps::Scrollback2Extent>,
     /// Whether the newest paced send was a visible frame (`server_loop`'s
     /// `last_was_sb`, inverted): when both kinds are due, the other one
     /// goes. False before any send, so the first tie is the screen's.
@@ -499,6 +504,9 @@ impl ClientConn {
         let mut cursor = HistoryCursor::new((self.rows, self.cols));
         cursor.activate(start, term.primary_scrollback_total());
         p.history = Some(cursor);
+        // Seed the cached extent, so a frame sent before the first send pass
+        // (the overlay up at attach) still carries one beside the id-10 entry.
+        self.note_history_extent(term);
     }
 
     /// RFC 0013 §5.2: this client asked for the activity label and has not
@@ -800,6 +808,22 @@ impl ClientConn {
         self.history().is_some()
     }
 
+    /// This client's Init asked for the v2 extent (posh#225 Stage 4).
+    fn wants_history_extent(&self) -> bool {
+        caps::find(&self.caps, caps::CAP_SCROLLBACK2_EXTENT)
+            .and_then(|c| caps::decode_scrollback2_extent_request(&c.payload))
+            .is_some()
+    }
+
+    /// Refresh the cached extent (`Pacing::extent`) from the session
+    /// terminal.
+    fn note_history_extent(&mut self, term: &Terminal) {
+        let wants = self.wants_history_extent();
+        if let Some(p) = self.pacing.as_mut() {
+            p.extent = p.history.and_then(|h| h.extent(term)).filter(|_| wants);
+        }
+    }
+
     /// The v2 resend floor: twice the measured ack latency (never under the
     /// ack wait), `HISTORY_RESEND_INITIAL_MS` before any sample, doubled per
     /// resend without progress.
@@ -835,10 +859,13 @@ impl ClientConn {
     /// Queue one v2 body from `term` (the session terminal) — from the send
     /// cursor, or from the ack when the resend floor has passed — riding the
     /// newest visible frame number (RFC 0009 §2: an annotation; the producer
-    /// does not advance), with the epoch ack beside it.
+    /// does not advance), with the epoch ack beside it — and, to a viewport
+    /// that asked, the extent as of this body (RFC 0009 §3.1), refreshing
+    /// `Pacing::extent`.
     fn send_history_body(&mut self, term: &Terminal, now: u64) {
         let rto = self.history_resend_after();
         let flags = self.echo_flag | self.overlay_flag;
+        let wants_extent = self.wants_history_extent();
         let (Some(producer), Some(p)) = (self.producer.as_ref(), self.pacing.as_mut()) else {
             return;
         };
@@ -846,10 +873,13 @@ impl ClientConn {
             return;
         };
         let (epoch, body) = h.next_body(term, now, rto, HISTORY_WINDOW_ROWS);
+        p.extent = wants_extent.then(|| h.extent(term)).flatten();
         p.last_was_screen = false;
+        let mut entries = vec![caps::encode_scrollback2_ack(epoch)];
+        entries.extend(p.extent.as_ref().map(caps::encode_scrollback2_extent));
         let bytes = ServerFrame {
             flags,
-            caps: caps::own_table(&[caps::encode_scrollback2_ack(epoch)]),
+            caps: caps::own_table(&entries),
             frame_num: producer.current_num(),
             input_ack: 0,
             echo_ack: 0,
@@ -938,6 +968,13 @@ impl ClientConn {
         // every visible frame to it carries one, as `server_loop`'s do.
         if let Some(epoch) = self.history().and_then(HistoryCursor::epoch) {
             frame_caps.push(caps::encode_scrollback2_ack(epoch));
+        }
+        // RFC 0009 §3.1 (posh#225 Stage 4): beside it, the cached extent, to
+        // a viewport that asked (`Pacing::extent`; refreshed per send pass,
+        // on a resize and when the cursor opens).
+        let extent = self.pacing.as_ref().and_then(|p| p.extent);
+        if let Some(x) = extent.filter(|_| self.wants_history_extent()) {
+            frame_caps.push(caps::encode_scrollback2_extent(&x));
         }
         let encoded = match self.producer.as_mut() {
             None => return false,
@@ -1402,10 +1439,14 @@ fn broadcast_source_swap(clients: &mut [ClientConn], src: &Terminal, bcast: &[u8
 /// the kind that did not go last goes (`server_loop`'s coin; the first tie
 /// is the screen's); the other goes next iteration, after the drain.
 /// `history` is the session terminal, `None` while the escape overlay is up
-/// (as `server_loop` pauses history for it). Runs at the end of a loop
+/// (as `server_loop` pauses history for it), which also freezes each
+/// client's cached v2 extent (`Pacing::extent`). Runs at the end of a loop
 /// iteration; `now` is a parameter so tests drive a fake clock.
 fn send_paced_frames(clients: &mut [ClientConn], src: &Terminal, history: Option<&Terminal>, now: u64) {
     for c in clients.iter_mut() {
+        if let Some(t) = history {
+            c.note_history_extent(t);
+        }
         let screen = c.paced_send_at().is_some_and(|at| now >= at);
         let rows = history.filter(|t| c.history_send_at(t).is_some_and(|at| now >= at));
         let last_was_screen = c.pacing.as_ref().is_some_and(|p| p.last_was_screen);
@@ -1793,6 +1834,10 @@ fn reset_history_on_resize(clients: &mut [ClientConn], term: &Terminal, (rows_be
         if !h.on_client_size(size, total) && renumbered {
             h.reanchor(total);
         }
+        // The cached extent must name the epoch the next frame's id-10 entry
+        // does, even if that frame goes out under the overlay or in the exit
+        // flush (no send pass with the session terminal in between).
+        c.note_history_extent(term);
     }
 }
 
@@ -6008,6 +6053,13 @@ mod tests {
         rows_mismatched: u64,
         rows_stale: u64,
         viewport_rows: u64,
+        /// Extent runs ([`FloodCase::extent`], posh#225 Stage 4): forward
+        /// jumps the viewport's extent did not mark as evicted, its extent
+        /// at the end, and the rows that extent says are still arriving
+        /// (`avail_rows - max(t, evicted_upto)`); `None` without an extent.
+        jumps_unmarked: usize,
+        end_extent: Option<caps::Scrollback2Extent>,
+        rows_arriving: Option<u64>,
         /// Paced runs: visible frames built while the producer held no acked
         /// base (the lost-base regime, [`FloodAcks::Lagged`]). `full_frames`
         /// cannot show it under a flood: `DumpDiff` also sends a `Full`
@@ -6038,6 +6090,10 @@ mod tests {
         /// history (posh#225 Stage 3), modelled by a [`FloodViewport`] whose
         /// cumulative ack follows `acks` on the same RTT clock.
         v2: bool,
+        /// v2 runs only: the Init also asks for the v2 extent
+        /// (`CAP_SCROLLBACK2_EXTENT`, posh#225 Stage 4), which the
+        /// [`FloodViewport`] adopts and judges each forward jump against.
+        extent: bool,
     }
 
     /// A v2 run's tail under [`FloodAcks::Never`]: history cannot progress
@@ -6058,11 +6114,18 @@ mod tests {
     /// appended (the prefix counts as repeated; posh#225 Stage 3 Part A
     /// changed the viewport to this); `row_offset > t` → a forward jump. Each
     /// appended row is checked against `reference` (relative row r is the
-    /// r-th row scrolled after attach).
+    /// r-th row scrolled after attach). With the extent (posh#225 Stage 4)
+    /// it also keeps the newest extent of its epoch (the per-field maximum)
+    /// and counts a forward jump NOT marked by it — one landing above the
+    /// sender's floor, which only a lost body could produce. The harness
+    /// is lossless, so every jump should be marked; the model keeps today's
+    /// jump accounting either way.
     #[derive(Default)]
     struct FloodViewport {
         epoch: Option<u8>,
         t: u64,
+        extent: Option<caps::Scrollback2Extent>,
+        jumps_unmarked: usize,
         /// `(at, t)` after every frame applied: what a `Lagged` ack reads.
         log: Vec<(u64, u64)>,
         reference: Vec<Vec<u8>>,
@@ -6083,7 +6146,21 @@ mod tests {
                 if self.epoch != Some(epoch) {
                     self.epoch = Some(epoch);
                     self.t = 0;
+                    self.extent = None;
                 }
+            }
+            if let Some(x) = caps::find(&frame.caps, caps::CAP_SCROLLBACK2_EXTENT)
+                .and_then(|cap| caps::decode_scrollback2_extent(&cap.payload))
+                .filter(|x| self.epoch == Some(x.epoch))
+            {
+                self.extent = Some(match self.extent {
+                    Some(held) => caps::Scrollback2Extent {
+                        epoch: x.epoch,
+                        avail_rows: held.avail_rows.max(x.avail_rows),
+                        evicted_upto: held.evicted_upto.max(x.evicted_upto),
+                    },
+                    None => x,
+                });
             }
             if let FrameBody::Scrollback2 {
                 epoch,
@@ -6104,6 +6181,9 @@ mod tests {
                         self.forward_jumps += 1;
                         self.rows_jumped += row_offset - self.t;
                         self.jump_ends.push(*row_offset);
+                        if self.extent.is_none_or(|x| *row_offset > x.evicted_upto) {
+                            self.jumps_unmarked += 1;
+                        }
                     }
                     for (i, row) in rows.iter().enumerate().skip(skip as usize) {
                         if self.reference.get((row_offset + i as u64) as usize) != Some(row) {
@@ -6246,8 +6326,12 @@ mod tests {
             caps::Cap { id: caps::CAP_BASE_SUM, payload: vec![] },
         ];
         assert!(!case.v2 || case.pace.is_some(), "v2 history is gated on pacing");
+        assert!(!case.extent || case.v2, "the extent rides v2 history");
         if case.v2 {
             content.push(sb2_entry(0, 0));
+        }
+        if case.extent {
+            content.push(caps::encode_scrollback2_extent_request());
         }
         let (mut c, mut peer) = match case.pace {
             Some(_) => paced_conn(rows, cols, &content),
@@ -6471,6 +6555,9 @@ mod tests {
             run.rows_mismatched = v.rows_mismatched;
             run.rows_stale = v.rows_stale;
             run.viewport_rows = v.t;
+            run.jumps_unmarked = v.jumps_unmarked;
+            run.end_extent = v.extent;
+            run.rows_arriving = v.extent.map(|x| x.avail_rows - v.t.max(x.evicted_upto));
         }
         run
     }
@@ -6723,18 +6810,20 @@ mod tests {
 
     fn print_flood_header() {
         println!(
-            "{:>6} {:>10} {:>7} | {:>8} {:>6} {:>9} | {:>10} {:>7} | {:>11} {:>11} {:>7} | {:>9} {:>9} {:>6} | {:>5} {:>5} {:>9} {:>8} {:>8} | {:>5} {:>6} {:>7} {:>5} {:>4} | {:>6} | {:>2} {:>5} {:>6} {:>6} {:>5} {:>3} {:>6} {:>4}",
+            "{:>6} {:>10} {:>7} | {:>8} {:>6} {:>9} | {:>10} {:>7} | {:>11} {:>11} {:>7} | {:>9} {:>9} {:>6} | {:>5} {:>5} {:>9} {:>8} {:>8} | {:>5} {:>6} {:>7} {:>5} {:>4} | {:>6} | {:>2} {:>5} {:>6} {:>6} {:>5} {:>3} {:>6} {:>4} | {:>4} {:>5}",
             "chunk", "acks", "drain", "fed", "chunks", "cross@fed", "peak_wbuf", "max_wr", "vis_bytes", "sb_bytes", "q/fed",
             "max_vis", "max_sb", "sbrows", "full", "sbfrm", "rows_sent", "scrolled", "sb_acked",
             "paced", "visfrm", "inflood", "maxvq", "last", "nobase",
             "v2", "hbody", "max_hb", "uniq", "rep", "jmp", "jumped", "mism",
+            "unmk", "arr",
         );
     }
 
     fn print_flood_row(case: FloodCase, r: &FloodRun) {
         let v2 = |n: String| if case.v2 { n } else { "-".to_string() };
+        let ext = |n: String| if case.extent { n } else { "-".to_string() };
         println!(
-            "{:>6} {:>10} {:>7} | {:>8} {:>6} {:>9} | {:>10} {:>7} | {:>11} {:>11} {:>7.1} | {:>9} {:>9} {:>6} | {:>5} {:>5} {:>9} {:>8} {:>8} | {:>5} {:>6} {:>7} {:>5} {:>4} | {:>6} | {:>2} {:>5} {:>6} {:>6} {:>5} {:>3} {:>6} {:>4}",
+            "{:>6} {:>10} {:>7} | {:>8} {:>6} {:>9} | {:>10} {:>7} | {:>11} {:>11} {:>7.1} | {:>9} {:>9} {:>6} | {:>5} {:>5} {:>9} {:>8} {:>8} | {:>5} {:>6} {:>7} {:>5} {:>4} | {:>6} | {:>2} {:>5} {:>6} {:>6} {:>5} {:>3} {:>6} {:>4} | {:>4} {:>5}",
             case.chunk,
             case.acks.label(),
             case.drain.label(),
@@ -6768,6 +6857,8 @@ mod tests {
             v2(r.forward_jumps.to_string()),
             v2(r.rows_jumped.to_string()),
             v2(r.rows_mismatched.to_string()),
+            ext(r.jumps_unmarked.to_string()),
+            ext(r.rows_arriving.map_or_else(|| "none".to_string(), |n| n.to_string())),
         );
     }
 
@@ -6805,7 +6896,8 @@ mod tests {
         for chunk in [KIB, 4 * KIB, 64 * KIB] {
             for acks in cadences {
                 for drain in [FloodDrain::Never, FloodDrain::Always] {
-                    let case = FloodCase { chunk, acks, drain, prefill_rows: 0, pace: None, v2: false };
+                    let case =
+                        FloodCase { chunk, acks, drain, prefill_rows: 0, pace: None, v2: false, extent: false };
                     print_flood_row(case, &measure_flood(&flood, case));
                 }
             }
@@ -6815,7 +6907,15 @@ mod tests {
         for acks in cadences {
             for drain in [FloodDrain::Never, FloodDrain::Always] {
                 let case =
-                    FloodCase { chunk: 4 * KIB, acks, drain, prefill_rows: SCROLLBACK + 200, pace: None, v2: false };
+                    FloodCase {
+                        chunk: 4 * KIB,
+                        acks,
+                        drain,
+                        prefill_rows: SCROLLBACK + 200,
+                        pace: None,
+                        v2: false,
+                        extent: false,
+                    };
                 print_flood_row(case, &measure_flood(&flood, case));
             }
         }
@@ -6848,6 +6948,7 @@ mod tests {
                 prefill_rows: 0,
                 pace: None,
                 v2: false,
+                extent: false,
             },
         );
         println!(
@@ -6886,6 +6987,7 @@ mod tests {
                             prefill_rows,
                             pace,
                             v2: false,
+                            extent: false,
                         };
                         let r = measure_flood(&flood, case);
                         print!("{}", if prefill_rows == 0 { "empty ring " } else { "FULL ring  " });
@@ -6928,6 +7030,31 @@ mod tests {
                 print_flood_row(case, &measure_flood(&flood, case));
             }
         }
+        // The same v2 viewport asking for the extent (posh#225 Stage 4):
+        // `unmk` counts forward jumps it did not mark as evicted (the
+        // harness is lossless, so every jump should be marked), `arr` the
+        // rows its final extent says are still arriving.
+        for prefill_rows in [0, SCROLLBACK + 200] {
+            let label = if prefill_rows == 0 { "empty ring " } else { "FULL ring  " };
+            for chunk in [KIB, 4 * KIB] {
+                for acks in [FloodAcks::EveryNewest(1), FloodAcks::Lagged(300)] {
+                    let case = FloodCase {
+                        chunk,
+                        ..paced_v2x_flood_case(acks, prefill_rows)
+                    };
+                    print!("{label}");
+                    print_flood_row(case, &measure_flood(&flood, case));
+                }
+            }
+            for acks in [FloodAcks::EveryNewest(1), FloodAcks::Lagged(50)] {
+                let case = FloodCase {
+                    drain: FloodDrain::Trickle(KIB),
+                    ..paced_v2x_flood_case(acks, prefill_rows)
+                };
+                print!("{label}");
+                print_flood_row(case, &measure_flood(&flood, case));
+            }
+        }
     }
 
     /// posh#225 regression: a newline flood into a session whose ring is
@@ -6962,6 +7089,7 @@ mod tests {
                 prefill_rows: SCROLLBACK + 200,
                 pace: None,
                 v2: false,
+                extent: false,
             };
             // `Never` is quadratic — every chunk's scrollback frame re-carries
             // every un-acked row — and its only assertion is the visible-frame
@@ -7032,6 +7160,7 @@ mod tests {
                 prefill_rows: 0,
                 pace: None,
                 v2: false,
+                extent: false,
             };
             let r = measure_flood(&flood, case);
             print_flood_row(case, &r);
@@ -7677,6 +7806,7 @@ mod tests {
             prefill_rows,
             pace: Some(1),
             v2: false,
+            extent: false,
         }
     }
 
@@ -7685,6 +7815,15 @@ mod tests {
         FloodCase {
             v2: true,
             ..paced_flood_case(acks, prefill_rows)
+        }
+    }
+
+    /// [`paced_v2_flood_case`] whose viewport asks for the v2 extent
+    /// (posh#225 Stage 4).
+    fn paced_v2x_flood_case(acks: FloodAcks, prefill_rows: usize) -> FloodCase {
+        FloodCase {
+            extent: true,
+            ..paced_v2_flood_case(acks, prefill_rows)
         }
     }
 
@@ -7710,6 +7849,7 @@ mod tests {
             prefill_rows: 0,
             pace: Some(PACE_MS),
             v2: false,
+            extent: false,
         };
         let r = measure_flood(&flood, case);
         assert_eq!(r.chunks, 512);
@@ -8832,5 +8972,290 @@ mod tests {
                 assert_eq!(r.last_screen_delivered, Some(true), "{what}: left on a stale screen");
             }
         }
+    }
+
+    // ---- posh#225 Stage 4: the v2 extent ----
+
+    /// [`paced_v2_conn`] (a fresh epoch) whose Init also asks for the v2
+    /// extent (RFC 0009 §3.1).
+    fn paced_v2x_conn(term: &Terminal) -> (ClientConn, UnixStream) {
+        let (mut c, peer) = paced_conn(
+            term.rows(),
+            term.cols(),
+            &[
+                SCROLLBACK_CAP[0].clone(),
+                sb2_entry(0, 0),
+                caps::encode_scrollback2_extent_request(),
+            ],
+        );
+        c.sb_floor = term.primary_scrollback_total();
+        c.open_history(term);
+        (c, peer)
+    }
+
+    /// The id-24 server entry of each frame, decoded.
+    fn extents(frames: &[ServerFrame]) -> Vec<Option<caps::Scrollback2Extent>> {
+        frames
+            .iter()
+            .map(|f| {
+                caps::find(&f.caps, caps::CAP_SCROLLBACK2_EXTENT)
+                    .map(|c| caps::decode_scrollback2_extent(&c.payload).expect("a well-formed extent"))
+            })
+            .collect()
+    }
+
+    fn extent(epoch: u8, avail_rows: u64, evicted_upto: u64) -> Option<caps::Scrollback2Extent> {
+        Some(caps::Scrollback2Extent {
+            epoch,
+            avail_rows,
+            evicted_upto,
+        })
+    }
+
+    #[test]
+    fn a_v2_viewport_that_asks_gets_the_extent_on_every_frame() {
+        let mut term = v2_term(5, 24, 1000);
+        let (mut c, _peer) = paced_v2x_conn(&term);
+        scroll_rows(&mut term, 10);
+        broadcast_output(std::slice::from_mut(&mut c), &term, b"x");
+        let visible = send_at_the_opportunity(&mut c, &term);
+        assert_eq!(history_bodies(&visible), vec![], "the screen goes first");
+        assert_eq!(extents(&visible), vec![extent(1, 10, 0)]);
+        let history = pass_at_the_history_opportunity(&mut c, &term);
+        assert_eq!(history_bodies(&history), vec![(1, 0, 10)]);
+        assert_eq!(extents(&history), vec![extent(1, 10, 0)]);
+    }
+
+    #[test]
+    fn a_v2_viewport_that_does_not_ask_gets_no_extent() {
+        let mut term = v2_term(5, 24, 1000);
+        let (mut c, _peer) = paced_v2_conn(&term, sb2_entry(0, 0));
+        scroll_rows(&mut term, 10);
+        broadcast_output(std::slice::from_mut(&mut c), &term, b"x");
+        let mut frames = send_at_the_opportunity(&mut c, &term);
+        frames.extend(pass_at_the_history_opportunity(&mut c, &term));
+        assert_eq!(frames.len(), 2);
+        assert_eq!(history_bodies(&frames), vec![(1, 0, 10)]);
+        assert_eq!(c.pacing.as_ref().unwrap().extent, None);
+        for f in &frames {
+            let ids: Vec<u8> = f.caps.iter().map(|c| c.id).collect();
+            assert_eq!(ids, vec![caps::CAP_PROTOCOL_VERSION, caps::CAP_SCROLLBACK2], "as before Stage 4");
+        }
+    }
+
+    #[test]
+    fn a_request_without_scrollback2_gets_no_extent() {
+        let mut term = v2_term(5, 24, 1000);
+        let request = caps::encode_scrollback2_extent_request();
+        let (mut paced, _p0) = paced_conn(5, 24, &[SCROLLBACK_CAP[0].clone(), request.clone()]);
+        paced.sb_floor = term.primary_scrollback_total();
+        paced.open_history(&term);
+        assert!(paced.is_paced() && !paced.has_history(), "paced, v1 history");
+        scroll_rows(&mut term, 10);
+        broadcast_output(std::slice::from_mut(&mut paced), &term, b"x");
+        let frames = send_at_the_opportunity(&mut paced, &term);
+        assert!(!frames.is_empty());
+        assert!(extents(&frames).iter().all(Option::is_none), "no cursor: no extent");
+
+        let (mut lossy, _p1) = lossy_conn(5, 24, &[SCROLLBACK_CAP[0].clone(), sb2_entry(0, 0), request]);
+        lossy.sb_floor = term.primary_scrollback_total();
+        lossy.open_history(&term);
+        assert!(lossy.request_frame_from(&term));
+        scroll_rows(&mut term, 3);
+        broadcast_output(std::slice::from_mut(&mut lossy), &term, b"x");
+        let frames = decode_server_frames(&lossy.write_buf);
+        assert!(!frames.is_empty());
+        assert!(extents(&frames).iter().all(Option::is_none), "not paced: no extent");
+    }
+
+    /// The marker and the jump agree on the wire: a body after an eviction
+    /// starts at its own frame's `evicted_upto`.
+    #[test]
+    fn the_extent_floor_is_the_daemons_eviction_floor() {
+        let mut term = v2_term(5, 20, 50);
+        let (mut c, _peer) = paced_v2x_conn(&term);
+        scroll_rows(&mut term, 10);
+        let first = pass_at_the_history_opportunity(&mut c, &term);
+        assert_eq!(history_bodies(&first), vec![(1, 0, 10)]);
+        ack_history(&mut c, 1, 10);
+        c.write_buf.clear();
+        scroll_rows(&mut term, 200);
+        let frames = pass_at_the_history_opportunity(&mut c, &term);
+        let &[(_, row_offset, _)] = history_bodies(&frames).as_slice() else {
+            panic!("one body, got {frames:?}");
+        };
+        assert_eq!(extents(&frames), vec![extent(1, 210, 210 - 50)]);
+        assert_eq!(row_offset, 210 - 50, "the body starts at its frame's floor");
+    }
+
+    /// `a_session_height_grow_reanchors_the_other_viewports`' setup: after
+    /// the re-anchor, the floor is the viewport's count as of the resize.
+    #[test]
+    fn the_extent_floor_is_the_count_at_a_session_resize() {
+        let mut term = v2_term(5, 24, 100);
+        let (short, _ps) = paced_v2x_conn(&term);
+        let (mut tall, _pt) = paced_conn(
+            8,
+            24,
+            &[
+                SCROLLBACK_CAP[0].clone(),
+                sb2_entry(0, 0),
+                caps::encode_scrollback2_extent_request(),
+            ],
+        );
+        tall.sb_floor = term.primary_scrollback_total();
+        tall.open_history(&term);
+        let mut clients = vec![short, tall];
+        scroll_rows(&mut term, 6);
+        assert_eq!(history_bodies(&pass_at_the_history_opportunity(&mut clients[1], &term)), vec![(1, 0, 6)]);
+        ack_history(&mut clients[1], 1, 6);
+        clients[1].write_buf.clear();
+        scroll_rows(&mut term, 4);
+
+        clients.remove(0);
+        let before = (term.rows(), term.cols());
+        term.resize(8, 24);
+        reset_history_on_resize(&mut clients, &term, before);
+        scroll_rows(&mut term, 1);
+        let frames = pass_at_the_history_opportunity(&mut clients[0], &term);
+        assert_eq!(history_bodies(&frames), vec![(1, 10, 1)]);
+        assert_eq!(extents(&frames), vec![extent(1, 11, 10)], "the floor is the count at the resize");
+    }
+
+    /// Under the escape overlay the send pass has no session terminal: a
+    /// visible frame carries the extent of the newest pass that had one.
+    #[test]
+    fn the_extent_freezes_while_the_overlay_is_up() {
+        let mut term = v2_term(5, 24, 1000);
+        let (mut c, _peer) = paced_v2x_conn(&term);
+        scroll_rows(&mut term, 5);
+        broadcast_output(std::slice::from_mut(&mut c), &term, b"x");
+        let frames = send_at_the_opportunity(&mut c, &term);
+        assert_eq!(extents(&frames), vec![extent(1, 5, 0)]);
+        let sent = c.producer.as_ref().unwrap().last_visible_num();
+        c.apply_frame_ack(&ipc::encode_frame_ack(sent, 0));
+        c.write_buf.clear();
+
+        scroll_rows(&mut term, 5);
+        broadcast_output(std::slice::from_mut(&mut c), &term, b"x");
+        let at = c.paced_send_at().expect("a frame is owed");
+        send_paced_frames(std::slice::from_mut(&mut c), &term, None, at);
+        let frames = decode_server_frames(&c.write_buf);
+        assert_eq!(history_bodies(&frames), vec![], "no history under the overlay");
+        assert_eq!(extents(&frames), vec![extent(1, 5, 0)], "the cached extent, not avail 10");
+    }
+
+    /// The id-10 entry of each frame, decoded to its epoch.
+    fn sb2_epochs(frames: &[ServerFrame]) -> Vec<Option<u8>> {
+        frames
+            .iter()
+            .map(|f| {
+                caps::find(&f.caps, caps::CAP_SCROLLBACK2).map(|c| caps::decode_scrollback2_ack(&c.payload).unwrap())
+            })
+            .collect()
+    }
+
+    /// RFC 0009 §3.1: the extent names the epoch of the id-10 entry beside
+    /// it — even when the viewport's own resize bumps the epoch while the
+    /// overlay is up, so no send pass refreshes the cache before the frame.
+    #[test]
+    fn a_resize_under_the_overlay_keeps_the_extent_in_the_frames_epoch() {
+        let mut term = v2_term(5, 24, 1000);
+        let (c, _peer) = paced_v2x_conn(&term);
+        let mut clients = vec![c];
+        scroll_rows(&mut term, 5);
+        broadcast_output(&mut clients, &term, b"x");
+        let frames = send_at_the_opportunity(&mut clients[0], &term);
+        assert_eq!(extents(&frames), vec![extent(1, 5, 0)]);
+        let sent = clients[0].producer.as_ref().unwrap().last_visible_num();
+        clients[0].apply_frame_ack(&ipc::encode_frame_ack(sent, 0));
+        clients[0].write_buf.clear();
+
+        assert!(clients[0].apply_resize(&ipc::encode_resize(6, 24)));
+        let size = (term.rows(), term.cols());
+        reset_history_on_resize(&mut clients, &term, size);
+        broadcast_output(&mut clients, &term, b"x");
+        let at = clients[0].paced_send_at().expect("a frame is owed");
+        send_paced_frames(&mut clients, &term, None, at);
+        let frames = decode_server_frames(&clients[0].write_buf);
+        assert_eq!(frames.len(), 1, "one visible frame: {frames:?}");
+        assert_eq!(sb2_epochs(&frames), vec![Some(2)], "the bumped epoch");
+        assert_eq!(extents(&frames), vec![extent(2, 0, 0)], "an extent of the same epoch");
+    }
+
+    /// The cache is seeded when the cursor opens: a visible frame built
+    /// before any send pass already carries the extent.
+    #[test]
+    fn the_first_visible_frame_after_open_history_carries_the_extent() {
+        let mut term = v2_term(5, 24, 1000);
+        scroll_rows(&mut term, 7);
+        let (mut c, _peer) = paced_v2x_conn(&term);
+        assert!(c.build_frame_from(&term));
+        let frames = decode_server_frames(&c.write_buf);
+        assert_eq!(sb2_epochs(&frames), vec![Some(1)]);
+        assert_eq!(extents(&frames), vec![extent(1, 0, 0)]);
+    }
+
+    /// The harness is lossless, so every forward jump in a flood that
+    /// outruns the window is an eviction — and the extent riding with the
+    /// body must mark it (`evicted_upto` at or past where it lands).
+    #[test]
+    fn posh225_v2_extent_marks_every_flood_jump_as_evicted() {
+        const KIB: usize = 1024;
+        let flood = newline_flood(2 * KIB * KIB);
+        print_flood_header();
+        for prefill_rows in [0, SCROLLBACK + 200] {
+            let slow = [FloodAcks::EveryNewest(1), FloodAcks::Lagged(50)].map(|acks| FloodCase {
+                drain: FloodDrain::Trickle(KIB),
+                ..paced_v2x_flood_case(acks, prefill_rows)
+            });
+            let lagged = FloodCase {
+                chunk: KIB,
+                ..paced_v2x_flood_case(FloodAcks::Lagged(300), prefill_rows)
+            };
+            for case in slow.into_iter().chain([lagged]) {
+                let r = measure_flood(&flood, case);
+                print_flood_row(case, &r);
+                let what = format!(
+                    "acks={} drain={} prefill={prefill_rows}",
+                    case.acks.label(),
+                    case.drain.label()
+                );
+                assert!(r.forward_jumps > 0, "{what}: the flood never outran the window — this proves nothing");
+                assert_eq!(r.jumps_unmarked, 0, "{what}: a jump the extent did not mark as evicted");
+                assert_eq!(
+                    r.end_extent.map(|x| x.avail_rows),
+                    Some(r.rows_scrolled),
+                    "{what}: the final extent's rows"
+                );
+            }
+        }
+    }
+
+    /// A reader that keeps up ends with nothing arriving.
+    #[test]
+    fn posh225_v2_extent_counts_nothing_arriving_once_caught_up() {
+        const KIB: usize = 1024;
+        let flood = newline_flood(256 * KIB);
+        print_flood_header();
+        for acks in [FloodAcks::EveryNewest(1), FloodAcks::Lagged(50), FloodAcks::Lagged(300)] {
+            let case = paced_v2x_flood_case(acks, 0);
+            let r = measure_flood(&flood, case);
+            print_flood_row(case, &r);
+            assert_eq!(r.rows_arriving, Some(0), "acks={}", acks.label());
+        }
+    }
+
+    /// Without acks the window never reopens: the extent says rows are
+    /// still arriving.
+    #[test]
+    fn posh225_v2_extent_without_acks_reports_rows_still_arriving() {
+        const KIB: usize = 1024;
+        let flood = newline_flood(256 * KIB);
+        let case = paced_v2x_flood_case(FloodAcks::Never, 0);
+        let r = measure_flood(&flood, case);
+        print_flood_header();
+        print_flood_row(case, &r);
+        assert!(r.rows_arriving > Some(0), "rows still arriving: {:?}", r.rows_arriving);
     }
 }

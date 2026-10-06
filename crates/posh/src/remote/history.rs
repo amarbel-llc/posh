@@ -7,7 +7,7 @@
 
 use posh_term::Terminal;
 
-use crate::remote::caps::Scrollback2Client;
+use crate::remote::caps::{Scrollback2Client, Scrollback2Extent};
 use crate::remote::sync::FrameBody;
 
 /// Max rows per v2 body (RFC 0009 §2): chunks a long-disconnect resend into
@@ -228,6 +228,29 @@ impl HistoryCursor {
         self.last_send
     }
 
+    /// Rows available in this epoch at `term`, and the floor below which no
+    /// body starts — the ring's eviction floor, never below `anchor_rel`
+    /// (a re-anchor's count, a continued viewport's count). One computation
+    /// for `next_body` and `extent`, so the marker and the jump agree.
+    fn avail_and_floor(&self, term: &Terminal) -> (u64, u64) {
+        let avail = self.avail(term.primary_scrollback_total());
+        let ring_len = term.primary_scrollback_len() as u64;
+        (avail, self.anchor_rel.max(avail - ring_len.min(avail)))
+    }
+
+    /// What a viewport needs to tell eviction from loss (RFC 0009 §3.1,
+    /// posh#225 Stage 4): `None` while inactive.
+    pub(crate) fn extent(&self, term: &Terminal) -> Option<Scrollback2Extent> {
+        self.active.then(|| {
+            let (avail_rows, evicted_upto) = self.avail_and_floor(term);
+            Scrollback2Extent {
+                epoch: self.epoch,
+                avail_rows,
+                evicted_upto,
+            }
+        })
+    }
+
     /// The next body and its epoch (RFC 0009 §2): rows of this epoch from
     /// the send cursor (or from the ack when a resend is due), never below
     /// what the ring retains — an evicted gap becomes a forward jump the
@@ -236,10 +259,8 @@ impl HistoryCursor {
     /// fresh body at most the room left in `window`. Advances the send
     /// cursor and stamps `now` as the last send.
     pub(crate) fn next_body(&mut self, term: &Terminal, now: u64, rto: u64, window: u64) -> (u8, FrameBody) {
-        let total = term.primary_scrollback_total();
         let ring_len = term.primary_scrollback_len() as u64;
-        let avail = self.avail(total);
-        let floor_rel = self.anchor_rel.max(avail - ring_len.min(avail));
+        let (avail, floor_rel) = self.avail_and_floor(term);
         let (cursor, cap) = if self.resend_due(now, rto) {
             self.resends += 1;
             (self.acked_rows, SB2_ROWS_PER_BODY)
@@ -612,5 +633,117 @@ mod tests {
         c.acked_rows = 0;
         let (_, row_offset, _) = split(c.next_body(&t, 3 * RTO, RTO, ANY));
         assert_eq!(row_offset, 40);
+    }
+
+    // ---- posh#225 Stage 4: the extent (RFC 0009 §3.1) ----
+
+    fn ext(epoch: u8, avail_rows: u64, evicted_upto: u64) -> Option<Scrollback2Extent> {
+        Some(Scrollback2Extent {
+            epoch,
+            avail_rows,
+            evicted_upto,
+        })
+    }
+
+    #[test]
+    fn the_extent_is_none_until_activated() {
+        let mut t = term();
+        let mut c = HistoryCursor::new((5, 20));
+        scroll(&mut t, 10);
+        assert_eq!(c.extent(&t), None);
+        c.activate(HistoryStart::Fresh, total(&t));
+        assert_eq!(c.extent(&t), ext(1, 0, 0));
+    }
+
+    #[test]
+    fn the_extent_counts_the_rows_of_the_epoch() {
+        let mut t = term();
+        let c = active(&t);
+        scroll(&mut t, 10);
+        assert_eq!(c.extent(&t), ext(1, 10, 0));
+    }
+
+    /// The marker and the jump agree: the floor the extent reports is
+    /// where the next body starts.
+    #[test]
+    fn the_extent_floor_rises_as_the_ring_evicts() {
+        let mut t = term();
+        let mut c = active(&t);
+        scroll(&mut t, 10);
+        c.next_body(&t, 0, RTO, ANY);
+        scroll(&mut t, 100);
+        let x = c.extent(&t).unwrap();
+        assert_eq!(x.avail_rows, 110);
+        assert_eq!(x.evicted_upto, x.avail_rows - 50);
+        let (_, row_offset, _) = split(c.next_body(&t, 1, RTO, ANY));
+        assert_eq!(row_offset, x.evicted_upto, "the jump lands on the reported floor");
+    }
+
+    #[test]
+    fn the_extent_floor_is_the_count_at_a_reanchor() {
+        let mut t = term();
+        let mut c = active(&t);
+        scroll(&mut t, 10);
+        c.next_body(&t, 0, RTO, 8);
+        c.on_ack(1, 4);
+        t.resize(5, 30);
+        c.reanchor(total(&t));
+        assert_eq!(c.extent(&t).unwrap().evicted_upto, 10);
+        scroll(&mut t, 3);
+        assert_eq!(c.extent(&t), ext(1, 13, 10));
+        let (_, row_offset, _) = split(c.next_body(&t, 1, RTO, ANY));
+        assert_eq!(row_offset, 10, "the next body starts at the floor");
+    }
+
+    /// A continued cursor's floor is the viewport's own count, so it labels
+    /// nothing the viewport did not already hold.
+    #[test]
+    fn a_continued_cursors_floor_is_the_viewports_count() {
+        let mut t = term();
+        scroll(&mut t, 60);
+        assert_eq!(ring_len(&t), 50, "the ring is full");
+        let mut c = HistoryCursor::new((5, 20));
+        c.activate(HistoryStart::Continue { epoch: 7, rows: 40 }, total(&t));
+        assert_eq!(c.extent(&t), ext(7, 40, 40));
+    }
+
+    #[test]
+    fn the_extent_floor_never_falls_within_an_epoch() {
+        let mut t = term();
+        let mut c = active(&t);
+        let mut floors = Vec::new();
+        let mut note = |c: &HistoryCursor, t: &Terminal| floors.push(c.extent(t).unwrap().evicted_upto);
+        scroll(&mut t, 10);
+        note(&c, &t);
+        c.next_body(&t, 0, RTO, ANY);
+        note(&c, &t);
+        scroll(&mut t, 120);
+        note(&c, &t);
+        c.next_body(&t, 1, RTO, ANY);
+        note(&c, &t);
+        // A height shrink pushes grid rows into the ring (the total moves);
+        // a height grow pops ring rows back without moving it, which the
+        // daemon follows with a re-anchor.
+        t.resize(3, 20);
+        note(&c, &t);
+        t.resize(8, 20);
+        c.reanchor(total(&t));
+        note(&c, &t);
+        scroll(&mut t, 70);
+        note(&c, &t);
+        c.next_body(&t, 2, RTO, ANY);
+        note(&c, &t);
+        assert!(floors.windows(2).all(|w| w[0] <= w[1]), "non-decreasing: {floors:?}");
+        assert!(floors.last() > floors.first(), "and it rose: {floors:?}");
+    }
+
+    #[test]
+    fn a_bump_resets_the_extent() {
+        let mut t = term();
+        let mut c = active(&t);
+        scroll(&mut t, 100);
+        c.next_body(&t, 0, RTO, ANY);
+        c.bump_epoch(total(&t));
+        assert_eq!(c.extent(&t), ext(2, 0, 0));
     }
 }

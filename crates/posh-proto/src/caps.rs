@@ -188,6 +188,19 @@ pub const CAP_PUSH_CMD_REQUEST: u8 = 22;
 pub const CAP_PACED: u8 = 23;
 /// The [`CAP_PACED`] payload version this build writes.
 pub const PACED_VERSION: u8 = 1;
+/// Scrollback v2 extent (RFC 0009 §3.1; posh#225 Stage 4, posh#243). Client
+/// entry: a version byte ([`SCROLLBACK2_EXTENT_VERSION`]) asking the server
+/// to report its extent; Init-persistent on the session socket (an M2
+/// bridge carries it, a relay does not — ADR 0007). Server entry: version,
+/// epoch, the rows available in the epoch, and the row below which nothing
+/// in the epoch will be sent again — so a client can tell rows the server
+/// evicted (not received) from a body lost on the wire (held for the
+/// resend). Later versions append; readers ignore trailing bytes. Its own
+/// id because the id-10 server entry's decoder is exact-length: an old
+/// viewport would stop adopting epochs if that entry grew.
+pub const CAP_SCROLLBACK2_EXTENT: u8 = 24;
+/// The [`CAP_SCROLLBACK2_EXTENT`] payload version this build writes.
+pub const SCROLLBACK2_EXTENT_VERSION: u8 = 1;
 
 /// Why a session ended, as its daemon (or a standalone server) knew it.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -589,6 +602,63 @@ pub fn decode_scrollback2_ack(payload: &[u8]) -> Result<u8> {
         return Err(Error::from("SCROLLBACK2 ack payload is not {0x02, epoch}"));
     }
     Ok(payload[1])
+}
+
+/// A server's [`CAP_SCROLLBACK2_EXTENT`] entry, decoded.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct Scrollback2Extent {
+    pub epoch: u8,
+    /// Rows the epoch's row space holds (the next row scrolled is this one).
+    pub avail_rows: u64,
+    /// No body of this epoch will start below this row again; rows below it
+    /// that a client lacks are permanently lost to it.
+    pub evicted_upto: u64,
+}
+
+/// The v1 server payload: version, epoch, two u64 LE fields.
+const SCROLLBACK2_EXTENT_V1_LEN: usize = 18;
+
+/// A client's [`CAP_SCROLLBACK2_EXTENT`] entry: "report your extent".
+pub fn encode_scrollback2_extent_request() -> Cap {
+    Cap {
+        id: CAP_SCROLLBACK2_EXTENT,
+        payload: vec![SCROLLBACK2_EXTENT_VERSION],
+    }
+}
+
+/// The version of a client [`CAP_SCROLLBACK2_EXTENT`] payload, as
+/// [`decode_paced`]: `None` when it is empty or names version 0 (malformed:
+/// the client is treated as not asking). Bytes after the version are ignored.
+pub fn decode_scrollback2_extent_request(payload: &[u8]) -> Option<u8> {
+    payload.first().copied().filter(|v| *v != 0)
+}
+
+/// A server's [`CAP_SCROLLBACK2_EXTENT`] entry.
+pub fn encode_scrollback2_extent(x: &Scrollback2Extent) -> Cap {
+    let mut payload = Vec::with_capacity(SCROLLBACK2_EXTENT_V1_LEN);
+    payload.push(SCROLLBACK2_EXTENT_VERSION);
+    payload.push(x.epoch);
+    payload.extend_from_slice(&x.avail_rows.to_le_bytes());
+    payload.extend_from_slice(&x.evicted_upto.to_le_bytes());
+    Cap {
+        id: CAP_SCROLLBACK2_EXTENT,
+        payload,
+    }
+}
+
+/// Decode a server [`CAP_SCROLLBACK2_EXTENT`] payload: `None` for version 0
+/// or fewer than 18 bytes; bytes past the v1 fields belong to later
+/// versions and are ignored.
+pub fn decode_scrollback2_extent(payload: &[u8]) -> Option<Scrollback2Extent> {
+    let p = payload.get(..SCROLLBACK2_EXTENT_V1_LEN)?;
+    if p[0] == 0 {
+        return None;
+    }
+    Some(Scrollback2Extent {
+        epoch: p[1],
+        avail_rows: u64::from_le_bytes(p[2..10].try_into().ok()?),
+        evicted_upto: u64::from_le_bytes(p[10..18].try_into().ok()?),
+    })
 }
 
 /// Max agent-stream bytes carried by one [`CAP_AGENT_DATA`] entry: the table's
@@ -1487,5 +1557,68 @@ mod tests {
         assert_eq!(decode_paced(&[2, 0xaa, 0xbb]), Some(2));
         assert_eq!(decode_paced(&[]), None);
         assert_eq!(decode_paced(&[0]), None);
+    }
+
+    /// RFC 0009 §3.1 (posh#225 Stage 4): the server entry is version,
+    /// epoch, then two u64 LE fields — 18 bytes in v1.
+    #[test]
+    fn scrollback2_extent_roundtrips() {
+        assert_eq!(CAP_SCROLLBACK2_EXTENT, 24);
+        let x = Scrollback2Extent {
+            epoch: 7,
+            avail_rows: u64::MAX,
+            evicted_upto: 0,
+        };
+        let cap = encode_scrollback2_extent(&x);
+        assert_eq!(cap.id, CAP_SCROLLBACK2_EXTENT);
+        assert_eq!(cap.payload.len(), 18);
+        assert_eq!(&cap.payload[..2], &[SCROLLBACK2_EXTENT_VERSION, 7]);
+        assert_eq!(decode_scrollback2_extent(&cap.payload), Some(x));
+        let y = Scrollback2Extent {
+            epoch: 1,
+            avail_rows: 1_000,
+            evicted_upto: 950,
+        };
+        assert_eq!(decode_scrollback2_extent(&encode_scrollback2_extent(&y).payload), Some(y));
+    }
+
+    /// Later versions append: a reader ignores what follows the v1 fields,
+    /// and a short payload or version 0 is malformed (the entry is ignored).
+    #[test]
+    fn scrollback2_extent_ignores_trailing_bytes_and_rejects_short_or_version_0() {
+        let x = Scrollback2Extent {
+            epoch: 3,
+            avail_rows: 40,
+            evicted_upto: 12,
+        };
+        let mut long = encode_scrollback2_extent(&x).payload;
+        long.extend_from_slice(&[0xaa, 0xbb, 0xcc]);
+        assert_eq!(decode_scrollback2_extent(&long), Some(x));
+        let full = encode_scrollback2_extent(&x).payload;
+        assert_eq!(decode_scrollback2_extent(&full[..17]), None);
+        let mut v0 = full.clone();
+        v0[0] = 0;
+        assert_eq!(decode_scrollback2_extent(&v0), None);
+        assert_eq!(decode_scrollback2_extent(&[]), None);
+    }
+
+    /// The client half is a version byte asking for the extent, read as
+    /// `decode_paced` reads its entry.
+    #[test]
+    fn the_extent_request_is_a_version_byte() {
+        let cap = encode_scrollback2_extent_request();
+        assert_eq!((cap.id, cap.payload), (CAP_SCROLLBACK2_EXTENT, vec![1]));
+        assert_eq!(decode_scrollback2_extent_request(&[1, 9]), Some(1));
+        assert_eq!(decode_scrollback2_extent_request(&[]), None);
+        assert_eq!(decode_scrollback2_extent_request(&[0]), None);
+    }
+
+    /// Why id 24 exists rather than a longer id-10 server entry: an old
+    /// viewport reads that entry exact-length, so a grown one would stop it
+    /// adopting epochs.
+    #[test]
+    fn the_scrollback2_ack_decoder_is_exact_length() {
+        assert!(decode_scrollback2_ack(&[0x02, 1, 0]).is_err());
+        assert_eq!(decode_scrollback2_ack(&[0x02, 1]).unwrap(), 1);
     }
 }

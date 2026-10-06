@@ -178,6 +178,49 @@ entry on every message. RFC 0002 §3's remaining accumulation rules (the
 ring is partial and monotonic; a `Full` body MUST NOT clear it; local
 scroll-view behavior is out of scope) carry over unchanged.
 
+#### 3.1 The extent (posh#243)
+
+Added 2026-10-06 (posh#225 Stage 4). A forward jump (§3) means either that
+the server's ring evicted rows, or — on a lossy link — that a body was lost
+while a later one was in flight. The **extent** lets a client tell them
+apart. A new RFC 0001 §3 registry entry is allocated:
+
+| id | Name | Direction | Payload | Meaning |
+|---|---|---|---|---|
+| 24 | `SCROLLBACK2_EXTENT` | both | client: ≥ 1 byte; server: ≥ 18 bytes | Client entry: a version byte (`1`) asking the server to report its extent. Server entry: `{version: u8 = 1, epoch: u8, avail_rows: u64 LE, evicted_upto: u64 LE}`. |
+
+- `avail_rows` is the number of rows the epoch's row space holds: the next
+  row scrolled is row `avail_rows`. `evicted_upto` is the row below which
+  the server will send no body of this epoch again — its ring's eviction
+  floor, or the point the row space was re-anchored at (§5), whichever is
+  higher. Rows below it that the client lacks are permanently lost to it.
+- A server that received the request MUST carry its extent beside every
+  server `SCROLLBACK2` entry it sends to that client, naming the same epoch.
+  A session daemon MAY repeat the last extent it computed while history is
+  paused (for instance under an escape overlay, when it has no session
+  terminal to compute one from). A server MUST NOT send the extent to a
+  client that did not ask.
+- `evicted_upto` MUST be the row below which no body of this epoch will
+  start: the server MUST NOT afterwards send a v2 body of the epoch that
+  starts below it. Neither
+  field decreases within an epoch, so a client MAY keep the maximum of each
+  it has seen, and a reordered older extent does no harm.
+- Readers MUST ignore bytes past the fields they know (later versions
+  append). A payload shorter than its version's fields, or one naming
+  version `0`, is malformed and MUST be ignored.
+- The request is a separate id, not a longer `SCROLLBACK2` entry, because
+  that entry's server half is read exact-length by clients that predate
+  this section: a grown entry would stop them adopting epochs.
+- On the session socket (§5) the request is Init-persistent: a client sends
+  it on its `Tag::Init`; an M2 bridge carries its viewport's request into
+  the daemon Init (and a re-homed daemon's re-Init) and does not forward it
+  per message; a relay does not carry it (ADR 0007). A roaming server
+  latches the request for the connection once any message carries it.
+
+This section so far specifies the server half. The client half — how a
+client that asked uses the extent — lands with the first client that asks
+(posh#225 Stage 4); no reference client sends the request yet.
+
 ### 4. Sequencing invariants (the class-killer)
 
 Once separated, each stream's acknowledgement attests exactly one thing,
@@ -314,6 +357,10 @@ Tests MUST use `bats-emo` binary injection (`require_bin POSH posh`) once a
 | §5, daemon gating, row space and epochs | `session::daemon::tests::a_paced_scrollback2_init_opens_a_history_cursor_and_nothing_else_does`, `a_viewport_holding_an_epoch_continues_it_at_its_count`, `a_bare_reinit_keeps_the_history_cursor`, `every_frame_to_a_v2_viewport_carries_the_scrollback2_ack`, `a_v2_viewport_gets_scrollback2_bodies_and_never_v1`, `a_stale_epoch_or_backward_ack_is_ignored`, `a_viewports_own_resize_bumps_its_epoch_and_a_width_change_reanchors_the_others`, `a_session_height_grow_reanchors_the_other_viewports` | v2 only for a paced client that advertised `SCROLLBACK2`; continue-on-attach; the server entry on every frame; bodies annotated with the newest visible number and never v1; own-resize bump; width-change and height-grow re-anchor (asserted by row content). |
 | §5 with RFC 0008 §3.2, delivery | `session::daemon::tests::the_screen_takes_the_first_tie_then_screen_and_history_alternate`, `a_history_body_carries_at_most_sb2_rows_per_body`, `history_waits_for_room_in_the_window`, `a_withheld_ack_is_resent_from_the_ack_only_after_the_floor`, `resends_back_off_while_acks_stay_withheld`, `the_resend_floor_follows_the_measured_ack_latency`, `a_stalled_v2_viewport_gets_one_forward_jump_of_the_evicted_span`, `no_history_body_while_the_overlay_is_up`, `the_poll_wakes_for_pending_history`, `the_exit_flush_sends_only_the_screen` | One body per opportunity; the in-flight window; resend from the ack with backoff; eviction as one forward jump. |
 | §3/§5 under a flood | `session::daemon::tests::posh225_v2_flood_ships_every_scrolled_row_exactly_once`, `posh225_v2_flood_backlog_is_one_body_for_every_cadence`, `posh225_v2_flood_at_a_1500_ms_rtt_delivers_its_history`, `posh225_v2_flood_without_acks_resends_one_window_per_backed_off_floor`, `posh225_v2_slow_reader_loses_only_rows_evicted_before_their_turn`, `non_paced_and_v1_paced_streams_are_identical_beside_a_v2_client` | Every row exactly once at 0/50/300 ms RTT and all delivered at 1,500 ms; one unsent body at a time; a slow reader loses only evicted rows, each inside a forward jump; RFC 0002 clients' streams unchanged beside a v2 client. |
+| §3.1, the extent's payloads | `posh-proto caps::tests::scrollback2_extent_roundtrips`, `scrollback2_extent_ignores_trailing_bytes_and_rejects_short_or_version_0`, `the_extent_request_is_a_version_byte`, `the_scrollback2_ack_decoder_is_exact_length` | 18-byte v1 server entry; trailing bytes ignored; short or version-0 payloads ignored; why id 10 cannot grow. |
+| §3.1, the floor is the send floor | `remote::history::tests::the_extent_is_none_until_activated`, `the_extent_counts_the_rows_of_the_epoch`, `the_extent_floor_rises_as_the_ring_evicts`, `the_extent_floor_is_the_count_at_a_reanchor`, `a_continued_cursors_floor_is_the_viewports_count`, `the_extent_floor_never_falls_within_an_epoch`, `a_bump_resets_the_extent` | `evicted_upto` is where the next body starts (eviction, re-anchor, continued attach); non-decreasing within an epoch. |
+| §3.1/§5, the daemon reports it | `session::daemon::tests::a_v2_viewport_that_asks_gets_the_extent_on_every_frame`, `a_v2_viewport_that_does_not_ask_gets_no_extent`, `a_request_without_scrollback2_gets_no_extent`, `the_extent_floor_is_the_daemons_eviction_floor`, `the_extent_floor_is_the_count_at_a_session_resize`, `the_extent_freezes_while_the_overlay_is_up`, `a_resize_under_the_overlay_keeps_the_extent_in_the_frames_epoch`, `the_first_visible_frame_after_open_history_carries_the_extent`, `posh225_v2_extent_marks_every_flood_jump_as_evicted`, `posh225_v2_extent_counts_nothing_arriving_once_caught_up`, `posh225_v2_extent_without_acks_reports_rows_still_arriving` | Every frame carrying the server `SCROLLBACK2` entry, only to a client that asked; a body starts at its frame's floor; every flood jump is marked. |
+| §3.1/§5, the M2 bridge carries the request | `remote::server::tests::bridge_init_carries_the_viewports_extent_request`, `the_relay_never_carries_the_extent_request`, `the_bridge_does_not_forward_the_extent_request_per_message` | Init-only through the bridge; never the relay (ADR 0007). |
 | §4, the #95 leap is impossible end-to-end | `remote::client::tests::wedge_repro_server_loop_with_loss_and_titles` | The real `server_loop` under 35% induced loss with v2 negotiated: `reack=0`, `base_sum_mismatch=0`, and the harness asserts v2 engaged (epoch adopted, rows accumulated), so it cannot vacuously pass. |
 
 ## Compatibility
@@ -331,9 +378,10 @@ Tests MUST use `bats-emo` binary injection (`require_bin POSH posh`) once a
   extended loss harness above) and this RFC is accepted, RFC 0002's status
   becomes `superseded by RFC-0009`; until then RFC 0002 remains the
   operative scrollback specification and the two documents cross-reference.
-- **Registry allocations.** Capability id `10` and body kind `7` are
-  allocated within RFC 0001's registries and follow its rules for unknown
-  entries.
+- **Registry allocations.** Capability ids `10` and `24` (§3.1, added
+  2026-10-06) and body kind `7` are allocated within RFC 0001's registries
+  and follow its rules for unknown entries. A server that predates §3.1
+  ignores the request; a client that does not ask is sent no extent.
 
 ## References
 
