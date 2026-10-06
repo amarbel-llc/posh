@@ -3201,6 +3201,7 @@ mod tests {
         let mut applier = DumpDiff;
         let mut applied: Vec<u8> = base_dump.to_vec();
         while let Some(frame) = fb.next().unwrap() {
+            assert_eq!(frame.tag, Tag::Frame, "frame-capable client must receive Tag::Frame");
             let body = ServerFrame::decode(&frame.payload).unwrap().body;
             match applier.apply(rows, cols, &applied, &mut term, &body) {
                 ApplyOutcome::Advanced { dump } => applied = dump,
@@ -5174,7 +5175,12 @@ mod tests {
             socket_dir: temp_base(),
             group: "default".into(),
         };
-        let script = "i=1; while [ $i -le 60 ]; do echo row$i; i=$((i+1)); done; printf 'tail$ '; exec sleep 30";
+        // The shell stays silent until B's `go` line: a PTY chunk the daemon
+        // reads between accepting a client and reading its Init reaches that
+        // client as raw `Tag::Output` (it is not frame-capable yet), so output
+        // racing the attaches leaked records this test cannot decode (posh#239).
+        let script =
+            "read go; i=1; while [ $i -le 60 ]; do echo row$i; i=$((i+1)); done; printf 'tail$ '; exec sleep 30";
         let handle = spawn_test_daemon(
             &cfg,
             "g1",
@@ -5191,6 +5197,10 @@ mod tests {
             s
         };
         let (mut a, mut b) = (attach(), attach());
+        // B's Input follows B's Init on B's socket, and A's Init was sent
+        // before B connected, so by the time the daemon writes `go` to the
+        // PTY both Inits are processed and every output chunk is framed.
+        ipc::send(b.as_raw_fd(), Tag::Input, b"go\n").unwrap();
         // Read `s` into `buf` until `done(buf)` holds, failing after ~10 s.
         let read_until = |s: &mut UnixStream, buf: &mut Vec<u8>, done: &dyn Fn(&[u8]) -> bool| {
             let mut tmp = [0u8; 65536];
