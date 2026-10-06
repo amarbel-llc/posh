@@ -162,8 +162,16 @@ on an epoch change, §1.1). On receiving a v2 body of its current epoch:
   skipped rows are permanently lost to this client. The client MUST accept
   the jump (the partial view is first-class, FDR 0005) and MAY render a
   local gap indicator; it MUST NOT stall waiting for the gap to be filled.
-- `row_offset < T < row_offset + appended` (partial overlap): a conforming
-  server never produces this (section 4); the client MUST discard the body.
+- `row_offset < T < row_offset + appended` (partial overlap): the rows
+  below `T` are ones the client holds and the rest are new. A sender that
+  resends from a lagging acknowledgement (one the client had already
+  overtaken when the resend was cut, section 5) MAY produce this. The
+  client MUST append only the tail — the rows at and beyond `T` — and set
+  `T = row_offset + appended`; it MUST NOT append the overlapping rows
+  again. (Amended 2026-10-06, posh#225 Stage 3: this bullet said a
+  conforming server never produces a partial overlap and the client
+  discards it. Discarding it would stall the stream until a resend happened
+  to start exactly at `T`.)
 
 The client reports `T` as `acked_sb_rows` in its `SCROLLBACK2` capability
 entry on every message. RFC 0002 §3's remaining accumulation rules (the
@@ -186,8 +194,11 @@ and implementations MUST keep them independent:
   MUST size scrollback retransmission only from `acked_sb_rows`: each v2
   body it emits MUST be anchored at the latest `acked_sb_rows` received
   (or at its own later send cursor / post-eviction floor — never below
-  `acked_sb_rows`, which is what excludes the partial overlap of
-  section 3).
+  `acked_sb_rows`). Anchoring at the acknowledgement does not exclude the
+  partial overlap of section 3: the client may have accepted rows past
+  the `acked_sb_rows` the server last received, so a resend from it can
+  overlap rows the client holds, which the client resolves by appending
+  only the tail.
 - Scrollback bodies MUST NOT occupy visible frame-sequence slots: a v2
   server's frame producer advances its frame number only for visible
   bodies, and its retransmission window (`outstanding`, RTO) covers only
@@ -198,6 +209,70 @@ and implementations MUST keep them independent:
 These invariants eliminate the posh#95/#117 mechanism by construction: no
 scrollback acknowledgement can assert visible delivery, so no visible frame
 can be leapt, staled, or laundered by scrollback traffic.
+
+### 5. The session-socket path
+
+Added 2026-10-06 (posh#225 Stage 3; FDR 0021). Between a session daemon and
+its client on the session socket (RFC 0008), v2 runs as sections 1–4
+specify, with these differences:
+
+- **Advertisement and acknowledgement.** Capabilities on the socket are
+  Init-persistent (RFC 0008 §1.1), not per-message. A client advertises
+  `SCROLLBACK2` on its `Tag::Init`; the entry names the epoch and count it
+  holds. It sends each changed cumulative acknowledgement as a
+  `SCROLLBACK2` entry in a `Tag::ClientCaps` record. A daemon reads the
+  acknowledgement from either. An M2 bridge carries its viewport's entry
+  into the daemon Init, forwards the viewport's entry as `Tag::ClientCaps`
+  when its payload changed (the socket is reliable, so an unchanged one is
+  not re-sent), and re-Inits a re-homed daemon with the viewport's latest
+  entry. A relay does not carry the entry (ADR 0007), so a relayed viewport
+  stays on RFC 0002.
+- **Gating.** A daemon MUST emit v2 bodies only to a client that advertised
+  both `SCROLLBACK2` and `CAP_PACED` (RFC 0008 §3.2), and then carries its
+  server `SCROLLBACK2` entry on every frame to that client. Every other
+  client — unpaced, or paced without `SCROLLBACK2` — keeps RFC 0002
+  scrollback unchanged. When a v2 body is sent is RFC 0008 §3.2's rule.
+- **A new attachment continues the client's row space.** The daemon opens
+  the row space from the Init entry: epoch `0` (the client holds none) opens
+  a fresh epoch whose row 0 is the first row scrolled after the attachment;
+  epoch `e` with count `T` continues epoch `e`, the next row scrolled being
+  row `T`. So a client keeps its ring across a reconnect or a re-home, and
+  the row space continues forward-only across the seam: rows scrolled
+  before the attachment (while detached, say) are not delivered. A later
+  amendment gives the attachment a starting position from the resume
+  cursor (RFC 0015; posh#225 Stage 5).
+- **Epoch values.** The server never uses epoch `0`, which a client
+  advertises to mean "holds none": a bump skips it on wrap (255 → 1). The
+  reference roaming server shares this cursor and the rule.
+- **Bump versus re-anchor.** The daemon bumps a client's epoch when that
+  client's OWN reported size changes (§1.1: it cleared its ring). A session
+  width change — a reflow (RFC 0002 §4), for instance another client
+  attaching narrower or leaving under smallest-wins sizing — RE-ANCHORS
+  every other v2 client in its SAME epoch: the daemon maps its reflowed
+  total to that client's send cursor, so the next row scrolled after the
+  reflow is numbered right after the last row sent. The client's ring and
+  acknowledgement stay valid. Rows the reflow renumbered before they were
+  sent are not delivered, and because the numbering continues at the send
+  cursor the client sees no offset gap for them — a silent seam, as a v1
+  client's history resumes "afresh from the resized ring" (RFC 0002 §4).
+  Rows sent before the
+  reflow but lost are not resent (no resend reaches below the re-anchor
+  point); the next body reaches the client as a forward jump over them
+  (§3). This is §1.1's "MAY bump" declined: a bump would clear the
+  client's ring whenever another client resized the session.
+- **Resend and overlap.** The daemon resends from the latest acknowledgement
+  it has received after an implementation-defined floor (FDR 0021). Because
+  that acknowledgement crosses a bridge and a link, it can lag rows the
+  client already accepted, so a resend MAY partially overlap; the client
+  appends only the tail (§3).
+- **Annotation.** A v2 body's carrying `frame_num` is the newest visible
+  frame number (§2), and the body takes no visible frame-sequence slot
+  (§4).
+
+**Open issue (posh#243).** A body lost on the wire while a later body is in
+flight reaches the client as a forward jump that the resend from the
+acknowledgement cannot repair and that the client cannot tell from an
+eviction; distinguishing them needs an eviction marker in this protocol.
 
 ## Security Considerations
 
@@ -232,7 +307,13 @@ Tests MUST use `bats-emo` binary injection (`require_bin POSH posh`) once a
 |---|---|---|
 | §2, v2 body encode/decode roundtrip + bounds | `posh-proto frame::tests::scrollback2_body_roundtrips_and_bounds` | `epoch`/`row_offset`/`appended`/rows survive roundtrip; truncated and oversized bodies are rejected. |
 | §1, cap payload roundtrips | `posh remote::client::tests::outgoing_caps_advertises_v2_and_drops_v1_once_acked` | The 10-byte client entry carries epoch + `acked_sb_rows`; the v1 entry rides only until v2 is acked. |
-| §1.1/§3, epoch adoption + offset-gated append | `remote::client::tests::scrollback2_epoch_adoption_resets_ring_and_count`, `scrollback2_apply_rules_never_touch_applied_num` | Epoch change clears the ring and zeroes `T`; dup discard / in-order append / forward-jump accept / partial-overlap discard behave per §3; `applied_num` is inert throughout (§4). |
+| §1.1/§3, epoch adoption + offset-gated append | `remote::client::tests::scrollback2_epoch_adoption_resets_ring_and_count`, `scrollback2_apply_rules_never_touch_applied_num` | Epoch change clears the ring and zeroes `T`; dup discard / in-order append / forward-jump accept / partial-overlap tail append behave per §3; `applied_num` is inert throughout (§4). |
+| §3, partial overlap appends only the tail | `remote::client::tests::scrollback2_partial_overlap_appends_only_the_tail` | A body overlapping rows the client holds appends each new row once, in order. |
+| §5, the shared send cursor | `remote::history::tests::a_continued_cursor_resumes_the_viewports_count`, `a_continued_cursor_never_offers_rows_from_before_its_anchor`, `a_size_change_bumps_the_epoch_and_reanchors`, `reanchor_keeps_the_epoch_and_continues_from_the_send_cursor`, `bump_epoch_reanchors_unconditionally_when_active`, `an_ack_moves_only_forward_and_only_in_its_epoch`, `a_resend_starts_at_the_ack_and_waits_for_the_rto`, `evicted_rows_become_one_forward_jump` | Continue-on-attach at the Init's count; the epoch skips 0 on wrap; a re-anchor keeps the epoch and ack; ack, resend and eviction rules shared with the roaming server. |
+| §5, the M2 bridge carries the entry and the ack | `remote::server::tests::bridge_init_carries_the_viewports_scrollback2_entry`, `the_relay_never_carries_scrollback2`, `the_bridge_forwards_a_changed_scrollback2_ack_once`, `the_bridge_keeps_its_init_content_at_the_viewports_latest_entry`, `rehome_bridge_reinits_with_the_latest_scrollback2_entry_and_forwards_afresh`, `a_message_without_scrollback2_forwards_nothing_for_it` | Init carries the viewport's entry (never the relay, ADR 0007); a changed ack is forwarded once as `Tag::ClientCaps`; a re-home re-Inits at the latest entry. |
+| §5, daemon gating, row space and epochs | `session::daemon::tests::a_paced_scrollback2_init_opens_a_history_cursor_and_nothing_else_does`, `a_viewport_holding_an_epoch_continues_it_at_its_count`, `a_bare_reinit_keeps_the_history_cursor`, `every_frame_to_a_v2_viewport_carries_the_scrollback2_ack`, `a_v2_viewport_gets_scrollback2_bodies_and_never_v1`, `a_stale_epoch_or_backward_ack_is_ignored`, `a_viewports_own_resize_bumps_its_epoch_and_a_width_change_reanchors_the_others` | v2 only for a paced client that advertised `SCROLLBACK2`; continue-on-attach; the server entry on every frame; bodies annotated with the newest visible number and never v1; own-resize bump, width-change re-anchor. |
+| §5 with RFC 0008 §3.2, delivery | `session::daemon::tests::screen_and_history_take_turns_when_both_are_due`, `a_history_body_carries_at_most_sb2_rows_per_body`, `history_waits_for_room_in_the_window`, `a_withheld_ack_is_resent_from_the_ack_only_after_the_floor`, `resends_back_off_while_acks_stay_withheld`, `the_resend_floor_follows_the_measured_ack_latency`, `a_stalled_v2_viewport_gets_one_forward_jump_of_the_evicted_span`, `no_history_body_while_the_overlay_is_up`, `the_poll_wakes_for_pending_history`, `the_exit_flush_sends_only_the_screen` | One body per opportunity; the in-flight window; resend from the ack with backoff; eviction as one forward jump. |
+| §3/§5 under a flood | `session::daemon::tests::posh225_v2_flood_ships_every_scrolled_row_exactly_once`, `posh225_v2_flood_backlog_is_one_body_for_every_cadence`, `posh225_v2_flood_at_a_1500_ms_rtt_delivers_its_history`, `posh225_v2_flood_without_acks_resends_one_window_per_backed_off_floor`, `posh225_v2_slow_reader_loses_only_rows_evicted_before_their_turn`, `non_paced_and_v1_paced_streams_are_identical_beside_a_v2_client` | Every row exactly once at 0/50/300 ms RTT and all delivered at 1,500 ms; one unsent body at a time; a slow reader loses only evicted rows, each inside a forward jump; RFC 0002 clients' streams unchanged beside a v2 client. |
 | §4, the #95 leap is impossible end-to-end | `remote::client::tests::wedge_repro_server_loop_with_loss_and_titles` | The real `server_loop` under 35% induced loss with v2 negotiated: `reack=0`, `base_sum_mismatch=0`, and the harness asserts v2 engaged (epoch adopted, rows accumulated), so it cannot vacuously pass. |
 
 ## Compatibility

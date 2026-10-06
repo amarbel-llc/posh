@@ -16,7 +16,10 @@ it could draw one, a newer one existed.
 
 Stage 1 shrank each frame to the viewport's screen (`dump_vt_mirror` instead
 of the whole ring). This feature, Stage 2, bounds the queue: a paced viewport
-is sent at most one screen at a time, and that screen is the newest.
+is sent at most one screen at a time, and that screen is the newest. Stage 3
+gives such a viewport its history as addressed RFC 0009 v2 bodies — rows
+addressed, acknowledged, and resent only from the viewport's acknowledgement — so
+history neither re-carries the ring nor costs the screen its diff base.
 
 ## Interface
 
@@ -62,11 +65,16 @@ is sent at most one screen at a time, and that screen is the newest.
   paced screen frame, from when the daemon queued it to when its ack
   arrived (daemon → bridge → link → viewport → back); each frame is sampled
   at most once — an ack that confirms several frames samples only the
-  newest — whether or not a newer frame was already in flight. `srtt` is smoothed like TCP's, `ack_age_ms` is the time
-  since the last ack of any kind, and `new=` counts samples since the
-  previous line (posh#225 Stage 3.0).
+  newest logged frame at or below the acked number, so an ack naming a v1
+  scrollback slot times the visible frame below it — whether or not a newer
+  frame was already in flight. A v2 history body is never a sample (it is
+  acknowledged by row, not by `FrameAck`). `srtt` is smoothed like TCP's,
+  `ack_age_ms` is the time since the last ack of any kind, and `new=` counts
+  samples since the previous line (posh#225 Stage 3.0). This series is
+  Task 3.4's input.
 
-The wire contract is RFC 0008 §3.2.
+The wire contract is RFC 0008 §3.2, and RFC 0009 §5 for v2 history on the
+session socket.
 
 ## Examples
 
@@ -144,8 +152,10 @@ Settled for Stage 3 (addressed history), 2026-10-06:
     its ring). **A session width change re-anchors every other viewport
     without a bump**: the reflow renumbered the daemon's ring, so the row
     space continues at the reflowed total from the viewport's send cursor —
-    its ring and ack stay valid, and rows not yet sent become a forward
-    jump. Another viewport attaching narrower, or leaving, therefore never
+    its ring and ack stay valid. Rows the reflow renumbered before they were
+    sent are not delivered, with no gap in the numbering (a silent seam, as
+    v1's history resumes after a reflow); rows sent but lost before it reach
+    the viewport as a forward jump (RFC 0009 §5). Another viewport attaching narrower, or leaving, therefore never
     clears this one's history (v1 never did). The epoch byte skips 0 on wrap
     (255 → 1): a viewport advertises 0 to mean it holds none.
 13. **A new attachment continues the viewport's epoch at its count** (epoch
@@ -159,7 +169,9 @@ Settled for Stage 3 (addressed history), 2026-10-06:
 - **History flows at most one window per round trip** (`HISTORY_WINDOW_ROWS`
   = 512 rows per RTT, and no faster than the socket drains) for a v2
   viewport, so a flood that outruns that for longer than the ring loses its
-  oldest rows as forward jumps — silent until Stage 4 draws it. Measured
+  oldest rows as forward jumps — silent until Stage 4 draws it. The window
+  is static until Task 3.4 (held for the field ack-latency data) sizes the
+  history share by backpressure. Measured
   (2 MiB flood, 20,511 rows, 10,000-row ring): prompt acks deliver every
   row once at both 1 KiB/ms and 4 KiB/ms (≈ 40,000 rows/s), as a paced v1
   viewport does; RTT 50 ms delivers every row at 1 KiB/ms but 14,127 at
@@ -202,7 +214,16 @@ Settled for Stage 3 (addressed history), 2026-10-06:
   session), or any viewport while an application has switched column mode
   (DECCOLM), still gets ring-sized frames (`dump_vt`'s fallback) — but one at
   a time.
-- **History is still lost across a reconnect** (a later stage).
+- **Rows scrolled while a viewport is detached are not delivered**: a
+  reconnect keeps the viewport's ring and continues forward-only from the
+  attachment (decision 13); history across a reconnect is Stage 5. Rows a
+  session width change renumbered before they were sent are likewise a
+  silent seam (decision 12).
+- **An unpaced or relayed viewport stays on v1 (RFC 0002) history** — a
+  local `posh attach` (Stage 6 moves it), a relayed one
+  (`POSH_MUX_SESSIONS=0`), or one with `POSH_PACED=0` — with v1's re-carry
+  of every un-acked row and, on a lossy link, posh#240's double append,
+  until Stage 7 retires the old delivery mode.
 - **A viewport that is dropped is not told why** (posh#226); with pacing the
   drop is now a backstop, not the flood outcome.
 
@@ -290,6 +311,12 @@ modes, and an older viewport keeps working against a newer daemon.
   `request_frame_from`, `send_paced_frames`, `paced_poll_timeout`,
   `flush_paced_frames`; v2: `ClientConn::open_history`, `history_send_at`,
   `send_history_body`, `reset_history_on_resize`), `remote::history`
-  (`HistoryCursor`, shared with `server_loop`), `session::parse_paced_gate`,
-  `remote::client::outgoing_caps`, the M2 bridge's Init in `remote::server`.
+  (`crates/posh/src/remote/history.rs`: `HistoryCursor`, `HistoryStart`,
+  `SB2_ROWS_PER_BODY`, shared with `server_loop`),
+  `session::parse_paced_gate`, `remote::client::outgoing_caps`, the M2
+  bridge's Init and ack forward in `remote::server` (`bridge_init_content`,
+  `bridge_client_message`). The flood harness and its viewport model are
+  `session::daemon`'s tests (`measure_flood`, `FloodLedger`,
+  `FloodViewport`).
+- Wire for v2 history on the session socket: RFC 0009 §5.
 - Implementation plan: `docs/plans/2026-10-05-flood-delivery.md`.

@@ -188,13 +188,23 @@ A connection receiving the switch record:
 
 #### 3.2 Paced delivery (posh#225)
 
-Added 2026-10-06 (FDR 0021). A client that advertises `CAP_PACED` (RFC 0001
+Added 2026-10-06 (FDR 0021); the history rule amended the same day for
+RFC 0009 v2 clients (posh#225 Stage 3). A client that advertises `CAP_PACED` (RFC 0001
 id 23) on its `Tag::Init` (§1.1) asks the daemon to decide what to send at
 send time rather than per PTY read. For such a client the daemon:
 
 - MUST NOT queue a visible frame per PTY read. It MUST hold at most one
-  unsent visible frame for the client, plus the history (`SCROLLBACK`) body
-  that rides immediately behind that frame.
+  unsent visible frame for the client. History depends on the client's
+  scrollback protocol:
+  - for a client on RFC 0009 v2 (RFC 0009 §5), history bodies are sent at
+    their own send opportunities — clocked by the client's in-flight row
+    window and the socket (an empty outgoing buffer), not by the visible
+    frame's floor — ONE body per opportunity, so the daemon holds at most
+    ONE unsent body of either kind. When a screen and a history body are
+    both due, the kind that did not go last goes, and the first such tie
+    goes to the screen (the live screen first);
+  - for an RFC 0002 client, the history (`SCROLLBACK`) body rides
+    immediately behind the visible frame, as before.
 - builds a fresh visible frame only at a *send opportunity*: the client's
   outgoing buffer is empty AND its last fresh visible frame is acknowledged
   (a `FrameAck` at or beyond it, or the §2 self-ack) or an
@@ -263,7 +273,8 @@ Each id is classified by scope:
   BOTH transports, it does NOT stream the session's scrolled-off lines into the
   outer terminal's native scrollback. The daemon is therefore the authoritative
   scrollback owner, and a client (local or remote) that wants history MUST sync
-  it via `SCROLLBACK` (RFC 0002) and present it itself — the reliable Unix
+  it via `SCROLLBACK` (RFC 0002) — or, a paced client, `SCROLLBACK2`
+  (RFC 0009 §5) — and present it itself — the reliable Unix
   transport does NOT grant outer-terminal-native scrollback for free. This is a
   deliberate convergence of local onto the remote model (FDR 0011 Limitations);
   outer-terminal-native scrollback integration on capable terminals, negotiated

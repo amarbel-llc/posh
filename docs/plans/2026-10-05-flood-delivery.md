@@ -381,6 +381,159 @@ where it differs** from this section. The user-facing record is FDR 0021.
 
 ---
 
+## Stage 3 as built (2026-10-06)
+
+Tasks 3.0–3.3 and 3.5 are implemented on branch `quiet-willow`
+(`0ca9f72..c950f8e`, plus this records commit); **Task 3.4 is HELD**. The
+Stage 3 task text below is kept as the historical plan and is **superseded
+where it differs** from this section. The user-facing record is FDR 0021;
+the wire contract is RFC 0009 §5 (new) and RFC 0008 §3.2 (amended).
+
+- **3.0 — ack-latency observability** (`0ca9f72`). `Pacing` keeps a send
+  log of `(frame number, queued at)` for its paced visible frames (16
+  entries, cleared on RESYNC); an ack that ADVANCES `acked_num` samples
+  `now − queued_at` of the newest logged frame at or below the acked number
+  and drops every entry at or below it, so each visible frame is sampled at
+  most once and an ack naming a scrollback slot N+1 times visible frame N.
+  A repeated or RESYNC ack is no sample; every ack stamps `last_ack_at`.
+  `AckLatency` keeps last / srtt (7/8) / min / max / count. Surfaces: the
+  backlog log lines and the `client disconnected` line carry `ack_ms=… ack_n=
+  ack_age_ms=`, and a `paced ack latency … new=` line is written at most
+  every `ACK_LOG_INTERVAL_MS` (10 s) while new samples arrive. Unpaced
+  clients record nothing. No stream changed (the ideal-reader table was
+  identical before and after). Deviations: the sample rule (the task text's
+  "the ack confirming the NEWEST frame, timed from `last_fresh`" never fires
+  under continuous output once the RTT exceeds `PACED_ACK_WAIT_MS` — the
+  regime the signal exists for; corrected in "Design choices"); so `Pacing`
+  is no longer `Copy`; the `Lagged(300)` flood test uses the 2 MiB flood
+  (256 KiB ends before one 300 ms ack can land) and measures srtt 301 ms.
+- **3.1 — `HistoryCursor`** (`53ccdd0`). `crates/posh/src/remote/history.rs`
+  holds the RFC 0009 send cursor `server_loop` kept as seven locals, with
+  `SB2_ROWS_PER_BODY`. `HistoryStart::{Fresh, Continue { epoch, rows }}` and
+  `anchor_abs`/`anchor_rel` let the daemon continue a viewport's epoch at
+  its count and never offer rows below that anchor. Exactness: `server_loop`
+  only ever opens `Fresh`, for which the extraction is character-for-character
+  the old logic (reviewed site by site), including the inactive-until-
+  advertised shape; ten unit tests. The `wedge_repro` witness keeps its
+  shape, but its `sb2_rows=` varies run to run with the induced loss (11,697
+  vs 11,504 on one tree), so it is not a byte witness. The daemon's v1
+  "keep in sync" comment lost its stale line reference.
+- **3.2 — the M2 bridge** (`35f080a`), as planned: `bridge_init_content`
+  adds the viewport's `CAP_SCROLLBACK2` entry beside `CAP_PACED` (never the
+  relay, ADR 0007); `bridge_client_message` forwards the entry as
+  `Tag::ClientCaps` only when its payload changed
+  (`SessionBridge::sb2_forwarded`) and keeps `content`'s copy current;
+  `rehome_bridge` clears the dedupe memory. Six tests.
+- **3.3 Part A — the daemon core** (`18c2785`). A paced viewport whose Init
+  carried a well-formed `CAP_SCROLLBACK2` gets a `HistoryCursor` in `Pacing`
+  (`open_history`, from the Init arm beside `sb_floor`) and v2 bodies from
+  `send_history_body`; v1 frames are unchanged for everyone else. One body
+  per send opportunity (`send_paced_frames`' coin over `paced_send_at` and
+  `history_send_at`); the 512-row window; resend from the ack after
+  `max(PACED_ACK_WAIT_MS, 2 × srtt)` (1 s before a sample), doubling per
+  resend without progress up to 8×; history pauses under the escape
+  overlay; the exit flush is screen-only. A body rides the newest visible
+  frame number (the producer does not advance) and is never a latency
+  sample. Deviations:
+  - `queue_frame`'s `activity_cap` became `frame_caps`, which also carries
+    the server `SCROLLBACK2` ack on every visible frame to a v2 viewport.
+  - **A session width change RE-ANCHORS the other viewports instead of
+    bumping their epochs** (review finding I2; `HistoryCursor::reanchor`):
+    a bump would wipe a desktop viewport's ring whenever a narrower one
+    attached under smallest-wins. Only a viewport's OWN size change bumps
+    its epoch. The test is
+    `a_viewports_own_resize_bumps_its_epoch_and_a_width_change_reanchors_the_others`
+    (renamed from the task text's "…bumps_all").
+  - **The viewport appends the tail of a partial overlap** instead of
+    discarding the body (`remote/client.rs`,
+    `scrollback2_partial_overlap_appends_only_the_tail`): a resend from a
+    lagging ack produces exactly that, which RFC 0009 §3 had said never
+    happens. RFC 0009 §3/§4 are amended (Task 3.5).
+  - The epoch byte skips 0 on wrap (255 → 1): a viewport advertises 0 to
+    mean it holds none (`bump_epoch`).
+  - Test adjustments: every `send_paced_frames` / `paced_poll_timeout` test
+    call gained its history argument; the source-swap keyframe test
+    (`a_source_swap_marks_a_paced_client_dirty_and_its_next_frame_is_full`)
+    drives the pass with `None` history, the overlay being up.
+- **3.3 Part B — the flood, addressed** (`c950f8e`). `FloodCase::v2`,
+  `paced_v2_flood_case`, a reference of every scrolled row, the
+  `FloodViewport` model, frames handed to it by `FloodLedger` at the step
+  they arrive, v2 acks on the cadence through `absorb_client_caps`, and an
+  event-driven tail (never-acked: a fixed 20 s; the whole tail bounded at
+  120 s). Six regression tests (`posh225_v2_*` and
+  `non_paced_and_v1_paced_streams_are_identical_beside_a_v2_client`).
+  Deviations:
+  - `FloodViewport` applies a partial overlap as the viewport now does: the
+    tail is appended, only the prefix counts as repeated (the task text
+    counted the whole body).
+  - `FloodRun::baseless_frames` (visible frames built with no acked base)
+    is the lost-base witness, not `full_frames`: under a flood `DumpDiff`
+    sends a `Full` whenever the diff is no net win, so every paced flood
+    frame is `Full` even at prompt acks.
+  - `print_flood_row` gained `nobase` and `v2 hbody max_hb uniq rep jmp
+    jumped mism` (the task text named five v2 columns).
+  - **History has no frame floor** (operator decision, 2026-10-06; see the
+    corrected "Design choices"). The first cut gated fresh bodies on
+    `PACED_FRAME_FLOOR_MS`, which capped history at 256 rows per 20 ms ≈
+    12,800 rows/s and lost 4,111 of 20,511 rows of a 40,000 rows/s flood to
+    eviction with PROMPT acks, where paced v1 lost none. Now history is
+    limited by the window and socket backpressure only; a fresh body is
+    capped at the room left in the window, so at most 512 rows are ever in
+    flight (the window is exact); and the first screen/history tie goes to
+    the screen (`Pacing::default` sets `last_was_history`; UX decision 3).
+    The floor stays for the screen. After: prompt acks deliver every row at
+    1 KiB and 4 KiB chunks, peak backlog 5–8 KB, bodies of about one chunk's
+    rows, one per loop iteration.
+  - The `Lagged(2500)` row cannot reach the visible-base cliff the "Facts"
+    predicted (≈ 2 s): the 2 MiB flood ends before a 2,500 ms ack lands. The
+    FDR says so rather than claiming no cliff exists.
+  - The commit narrows posh#240 rather than closing it (below).
+- **3.5 — records** (this commit): RFC 0009 §5 (the session-socket path;
+  §3's partial-overlap rule and §4's anchoring note amended; Covered
+  Requirements extended; posh#243 noted as open); RFC 0008 §3.2 (history
+  bodies at their own opportunities for a v2 client); FDR 0021
+  (Limitations, Diagnostics, code pointers, decision 12's seam); this
+  section. No man page: no lever exists until Task 3.4.
+- **Measured** (ideal-reader harness as Stage 2's, 2 MiB flood, 20,511
+  rows scrolled into a 10,000-row ring; the full v2 table is in FDR 0021;
+  every non-v2 row is identical to the Part A baseline):
+  - Prompt acks: every row delivered once at 1 KiB and 4 KiB chunks, peak
+    backlog 5,149 B / 8,476 B.
+  - RTT 50 ms at 4 KiB: 14,127 of 20,511 delivered; RTT 300 ms at 1 KiB:
+    12,400 — the window (≈ 512 rows per RTT) is the limiter Task 3.4 makes
+    dynamic. Every lost row is inside a forward jump; none is repeated or
+    differs from the session's.
+  - RTT 1,500 ms (256 KiB regression flood): every row delivered and acked,
+    one window re-sent before the first latency sample, no frame built
+    without an acked base (Stage 2's paced v1 acked 0 rows here).
+  - Never acked: the viewport holds exactly 512 rows; one window re-sent at
+    1, 2, 4 and 8 s (2,560 rows total), against Stage 2's one ring per
+    250 ms.
+  - Slow reader (1 KiB/ms): 14,111 delivered, 6,400 lost to eviction as
+    exact forward jumps; one ≤ 26.7 KB body queued at a time.
+- **Known limitations** (FDR 0021 Limitations): history throughput is one
+  static window per RTT until Task 3.4; a body lost under a later one is an
+  unrepairable forward jump indistinguishable from eviction (posh#243, with
+  Stage 4); rows scrolled while detached, and rows a width change
+  renumbered before they were sent, are not delivered (Stage 5 for the
+  former); unpaced and relayed viewports stay on v1 until Stage 7; the
+  slow-reader loss is larger than v1's ~4,300 and not yet analysed.
+- **posh#240 narrowed, not closed, by `c950f8e`:** a v2 viewport (paced,
+  the default remote path) gets each row at most once by address; an
+  unpaced or relayed viewport stays on v1 until Stage 7, and v2 still loses
+  rows to eviction when a flood outruns one window per RTT for longer than
+  the ring. Queue row 2 (posh#227) was already closed by the Stage 2 merge.
+- **Task 3.4 is HELD.** Its gate: the field `paced ack latency` series from
+  the session log — an idle session, a `nix gc` flood with this stage's
+  static window, and the same flood with history held off (Task 3.4's
+  "What the field data must show") — from which the operator answers open
+  question 3.
+- **Exit check: NOT yet done.** The Stage 3 exit check (end of Task 3.5)
+  needs this build on the remote host; its step (1) is also Task 3.4's
+  input.
+
+---
+
 ## Stage 0 — pin the failure
 
 ### Task 0.1: Commit the measurement tests
