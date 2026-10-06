@@ -2211,6 +2211,8 @@ bottom once Stage 7 is done, or sooner only if the operator re-orders it.
 | 12 | **posh#230** — build `ClientConn` test fixtures from one constructor | Stage 1 cleanup | Test maintenance; eight struct literals today. |
 | 13 | **posh#232** — a shared send/receive helper for `remote/server.rs`'s tests | Stage 1 cleanup | Test maintenance; ~a dozen copies of one loop. |
 
+| 14 | *(no issue)* — `relay.rs`: `content_caps` has no doc comment of its own; `forwarded_client_caps`'s doc (`:220-229`) is fused onto it, and `bridge_init_content` now points readers there | Task 2.2 review | Pre-existing; a one-line doc fix in a separate commit. Operator sequenced it here (2026-10-06). |
+
 Recorded elsewhere rather than filed: the `ClientConn::mirror_geometry()`
 accessor is a comment on **posh#210** (the `CAP_SESSION_SIZE` / RFC 0012
 implementation issue), since it is a prerequisite step of that work.

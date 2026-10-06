@@ -692,16 +692,18 @@ debug-verify-push-cmd: build-palette
 # whole suite up to RUNS times, stopping at the first failing run and printing
 # only its failures section — where a test's own diagnostics (e.g. the #203
 # descendant/PTY dump) land. "no failure in N runs" is the other outcome.
+# FILTER narrows each run to cargo's name filter (e.g. `session::daemon`) so a
+# flake confined to one module is chased without paying for the whole suite.
 #
-# rerun the full posh bin suite until a run fails (flake hunting)
+# rerun the posh bin suite (or a FILTER of it) until a run fails (flake hunting)
 [group("debug")]
-debug-cargo-flake runs="8":
+debug-cargo-flake runs="8" filter="":
     #!/usr/bin/env bash
     set -uo pipefail
     cd '{{ justfile_directory() }}'
     nix develop --command cargo test -p posh --bin posh --no-run -q 2>/dev/null
     for i in $(seq 1 {{ runs }}); do
-      out=$(nix develop --command cargo test -p posh --bin posh -q 2>&1)
+      out=$(nix develop --command cargo test -p posh --bin posh -q '{{ filter }}' 2>&1)
       if ! grep -q 'test result: ok' <<<"$out"; then
         echo ">> run $i FAILED"
         sed -n '/^failures:/,$p' <<<"$out"
