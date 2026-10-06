@@ -40,6 +40,7 @@ pub mod display {
 pub mod framesync {
     pub use posh_proto::framesync::*;
 }
+pub mod history;
 pub mod hostmetrics;
 /// Re-export shim: the RFC 0014 client-introspection struct, its
 /// `CLIENT_IDENT`/`CLIENT_STATE` codecs, and the §4.2 status-line renderer

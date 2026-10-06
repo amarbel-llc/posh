@@ -1016,7 +1016,7 @@ impl ClientConn {
         // ring; `want` (rows since the floor/ack) is capped to what the ring still
         // holds, since evicted older rows are gone by design.
         //
-        // mirror of server.rs:761-770 — keep in sync.
+        // mirror of `server_loop`'s v1 scrollback body (`remote/server.rs`) — keep in sync.
         let ring_len = term.primary_scrollback_len();
         let frame_sb_total = producer.current_sb_total();
         let grown = cur_sb_total.saturating_sub(frame_sb_total) as usize;
