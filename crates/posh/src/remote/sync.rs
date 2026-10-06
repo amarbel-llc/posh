@@ -546,10 +546,32 @@ impl InputOutbox {
 /// locally-available scrollback, not an error. A `Full` visible reset MUST
 /// NOT clear it (the ring is the durable local accumulation); a width
 /// resize MUST (RFC 0002 §4 — the caller re-accumulates at the new width).
+///
+/// The ring also records **not-received holes** (RFC 0009 §3.1, posh#225
+/// Stage 4): spans of history the server will never send this viewport,
+/// kept as a side list keyed by append number rather than as fake rows, so
+/// `len`/`row` keep meaning ring rows (the RFC 0002 path is untouched) and
+/// the `view_*` accessors interleave the holes for the scroll view.
 #[derive(Debug)]
 pub struct ScrollbackRing {
     rows: std::collections::VecDeque<Vec<u8>>,
     capacity: usize,
+    /// Rows ever appended: the number the next appended row gets. Ring row
+    /// `i` is row number `appended - len + i`.
+    appended: u64,
+    /// `(before, lines)`, oldest first: `lines` rows are missing immediately
+    /// before the row numbered `before` (`before == appended` is a tail hole).
+    holes: std::collections::VecDeque<(u64, u64)>,
+    /// Holes ever recorded (a merged mark adds none).
+    holes_added: u64,
+}
+
+/// One row of the scroll view's history (posh#225 Stage 4): a ring row, or
+/// a not-received hole drawn as one collapsed row (UX decision 8).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ViewRow<'a> {
+    Row(&'a [u8]),
+    NotReceived(u64),
 }
 
 impl ScrollbackRing {
@@ -557,6 +579,9 @@ impl ScrollbackRing {
         ScrollbackRing {
             rows: std::collections::VecDeque::new(),
             capacity: capacity.max(1),
+            appended: 0,
+            holes: std::collections::VecDeque::new(),
+            holes_added: 0,
         }
     }
 
@@ -564,39 +589,163 @@ impl ScrollbackRing {
     /// capacity bound. Each row is the self-contained `dump_scrollback_row`
     /// byte stream the server shipped (RFC 0002 §3: the client appends the
     /// bytes the body carried; it does not derive them from the visible
-    /// body).
+    /// body). A hole goes with the row after it.
     pub fn append(&mut self, rows: &[Vec<u8>]) {
         for row in rows {
             if self.rows.len() >= self.capacity {
                 self.rows.pop_front();
             }
             self.rows.push_back(row.clone());
+            self.appended += 1;
+        }
+        let first = self.first_number();
+        while self.holes.front().is_some_and(|&(before, _)| before < first) {
+            self.holes.pop_front();
         }
     }
 
-    pub fn clear(&mut self) {
-        self.rows.clear();
+    /// Record `lines` rows the server will never send, at the tail (before
+    /// the next appended row). A mark at the same tail position as the last
+    /// one merges into it; a zero mark is a no-op.
+    pub fn mark_not_received(&mut self, lines: u64) {
+        if lines == 0 {
+            return;
+        }
+        match self.holes.back_mut() {
+            Some((before, merged)) if *before == self.appended => *merged += lines,
+            _ => {
+                self.holes.push_back((self.appended, lines));
+                self.holes_added += 1;
+            }
+        }
     }
 
-    // The read side of the ring (`len`/`is_empty`/`row`) is the accumulated
-    // history the client's wheel scroll-view renders from. That renderer is
-    // FDR 0005's local viewport, deliberately out of this wire-contract
-    // change, so these are exercised by the conformance tests but not yet by
-    // a non-test caller.
-    #[allow(dead_code)]
+    /// Drop every row and hole; the counters (`appended`, `view_total`) keep
+    /// counting, so they stay monotonic.
+    pub fn clear(&mut self) {
+        self.rows.clear();
+        self.holes.clear();
+    }
+
     pub fn len(&self) -> usize {
         self.rows.len()
     }
 
-    #[allow(dead_code)]
+    #[cfg(test)]
     pub fn is_empty(&self) -> bool {
         self.rows.is_empty()
     }
 
     /// The `i`th retained row (0 = oldest still held), or `None` past the end.
-    #[allow(dead_code)]
     pub fn row(&self, i: usize) -> Option<&[u8]> {
         self.rows.get(i).map(Vec::as_slice)
+    }
+
+    /// Rows ever appended (monotonic across eviction and `clear`).
+    pub fn appended(&self) -> u64 {
+        self.appended
+    }
+
+    /// View rows ever added — rows plus holes (monotonic across eviction
+    /// and `clear`; a merged mark adds nothing).
+    #[allow(dead_code)] // posh#225 Task 4.3: the scroll view's memo key and anchor.
+    pub fn view_total(&self) -> u64 {
+        self.appended + self.holes_added
+    }
+
+    /// Ring rows plus holes held.
+    #[allow(dead_code)] // posh#225 Task 4.3: the scroll view draws holes.
+    pub fn view_len(&self) -> usize {
+        self.rows.len() + self.holes.len()
+    }
+
+    /// The `i`th view row (0 = oldest), holes interleaved where they sit,
+    /// or `None` past the end. O(log holes): the scroll view asks it per
+    /// visible row per frame (posh#225 Task 4.3).
+    #[allow(dead_code)] // posh#225 Task 4.3: the scroll view draws holes.
+    pub fn view_row(&self, i: usize) -> Option<ViewRow<'_>> {
+        let i = i as u64;
+        let first = self.first_number();
+        // Hole k sits at view index (before_k - first) + k: the ring rows
+        // ahead of it plus the k holes ahead of it. Strictly increasing in
+        // k (marks at one tail position merge), so binary-search for the
+        // holes ahead of view index i. Hand-rolled: `partition_point`'s
+        // predicate does not see the index k.
+        let view_index = |k: usize| self.holes[k].0 - first + k as u64;
+        let (mut lo, mut hi) = (0, self.holes.len());
+        while lo < hi {
+            let mid = lo + (hi - lo) / 2;
+            if view_index(mid) < i {
+                lo = mid + 1;
+            } else {
+                hi = mid;
+            }
+        }
+        if lo < self.holes.len() && view_index(lo) == i {
+            return Some(ViewRow::NotReceived(self.holes[lo].1));
+        }
+        self.row((i - lo as u64) as usize).map(ViewRow::Row)
+    }
+
+    fn first_number(&self) -> u64 {
+        self.appended - self.rows.len() as u64
+    }
+}
+
+/// The most v2 history rows a viewport holds past a gap the server can
+/// still fill (RFC 0009 §3.1): four full bodies. A body past the bound is
+/// discarded; the sender's go-back-N resend from the ack sends it again.
+pub const SB2_HELD_MAX_ROWS: usize = 4 * crate::remote::history::SB2_ROWS_PER_BODY as usize;
+
+/// v2 history bodies that arrived past a gap the server can still fill
+/// (RFC 0009 §3.1, posh#225 Stage 4): a reorder buffer keyed by row offset,
+/// drained in order once the count reaches each body.
+#[derive(Debug, Default)]
+pub struct HeldRows {
+    bodies: std::collections::BTreeMap<u64, Vec<Vec<u8>>>,
+    rows: usize,
+}
+
+impl HeldRows {
+    /// Hold a body at `row_offset`. A body at an offset already held keeps
+    /// the longer of the two. Returns `false`, holding nothing of it, when
+    /// it would take the buffer past [`SB2_HELD_MAX_ROWS`].
+    pub fn hold(&mut self, row_offset: u64, rows: &[Vec<u8>]) -> bool {
+        let existing = self.bodies.get(&row_offset).map_or(0, Vec::len);
+        if rows.len() <= existing {
+            return true;
+        }
+        let total = self.rows - existing + rows.len();
+        if total > SB2_HELD_MAX_ROWS {
+            return false;
+        }
+        self.bodies.insert(row_offset, rows.to_vec());
+        self.rows = total;
+        true
+    }
+
+    /// The lowest held offset.
+    pub fn first_offset(&self) -> Option<u64> {
+        self.bodies.keys().next().copied()
+    }
+
+    /// Remove and return the first held body that starts at or below `t`.
+    pub fn take_reachable(&mut self, t: u64) -> Option<(u64, Vec<Vec<u8>>)> {
+        let off = self.first_offset().filter(|&off| off <= t)?;
+        let rows = self.bodies.remove(&off)?;
+        self.rows -= rows.len();
+        Some((off, rows))
+    }
+
+    /// Rows held.
+    #[cfg(test)]
+    pub fn rows(&self) -> usize {
+        self.rows
+    }
+
+    pub fn clear(&mut self) {
+        self.bodies.clear();
+        self.rows = 0;
     }
 }
 
@@ -658,8 +807,7 @@ impl InputInbox {
 // tested ahead of its non-test callers (the caps wiring is item 2, the remote
 // endpoint item 3, the client proxy item 4). Until those land the public
 // surface here has only test callers, hence the `#[allow(dead_code)]` on each
-// item — the same pattern `ScrollbackRing` uses for its conformance-tested but
-// not-yet-wired read side.
+// item.
 
 /// Fixed record header: channel:u32 + kind:u8 + len:u32, big-endian to match
 /// the fragment header's framing precedent.
@@ -1782,6 +1930,200 @@ mod tests {
         assert_eq!(ring.row(3), None);
         ring.clear();
         assert!(ring.is_empty());
+    }
+
+    // ---- posh#225 Stage 4: not-received holes and held bodies ----
+
+    fn rows_of(names: &[&str]) -> Vec<Vec<u8>> {
+        names.iter().map(|n| n.as_bytes().to_vec()).collect()
+    }
+
+    fn view(ring: &ScrollbackRing) -> Vec<ViewRow<'_>> {
+        (0..ring.view_len()).map(|i| ring.view_row(i).expect("in range")).collect()
+    }
+
+    #[test]
+    fn a_hole_sits_between_the_rows_it_separates() {
+        let mut ring = ScrollbackRing::new(10);
+        ring.append(&rows_of(&["a", "b"]));
+        ring.mark_not_received(5);
+        ring.append(&rows_of(&["c"]));
+        assert_eq!(ring.view_len(), 4);
+        assert_eq!(
+            view(&ring),
+            vec![
+                ViewRow::Row(b"a"),
+                ViewRow::Row(b"b"),
+                ViewRow::NotReceived(5),
+                ViewRow::Row(b"c"),
+            ]
+        );
+        assert_eq!(ring.view_row(4), None);
+        assert_eq!(ring.len(), 3, "ring indices ignore holes");
+        assert_eq!(ring.row(2), Some(&b"c"[..]));
+    }
+
+    #[test]
+    fn marks_at_the_same_tail_position_merge() {
+        let mut ring = ScrollbackRing::new(10);
+        ring.append(&rows_of(&["a"]));
+        ring.mark_not_received(3);
+        ring.mark_not_received(4);
+        assert_eq!(view(&ring), vec![ViewRow::Row(b"a"), ViewRow::NotReceived(7)]);
+        ring.mark_not_received(0);
+        assert_eq!(ring.view_len(), 2, "a zero mark is a no-op");
+    }
+
+    #[test]
+    fn a_hole_is_evicted_with_the_row_after_it() {
+        let mut ring = ScrollbackRing::new(3);
+        ring.append(&rows_of(&["a"]));
+        ring.mark_not_received(2);
+        ring.append(&rows_of(&["b", "c", "d"]));
+        assert_eq!(
+            view(&ring),
+            vec![
+                ViewRow::NotReceived(2),
+                ViewRow::Row(b"b"),
+                ViewRow::Row(b"c"),
+                ViewRow::Row(b"d"),
+            ],
+            "the hole before b stays while b is held"
+        );
+        ring.append(&rows_of(&["e"]));
+        assert_eq!(
+            view(&ring),
+            vec![ViewRow::Row(b"c"), ViewRow::Row(b"d"), ViewRow::Row(b"e")],
+            "evicting b takes the hole with it"
+        );
+        ring.mark_not_received(9);
+        assert_eq!(ring.view_row(3), Some(ViewRow::NotReceived(9)), "a tail hole stays");
+        assert_eq!(ring.view_len(), 4);
+    }
+
+    #[test]
+    fn clear_drops_every_hole() {
+        let mut ring = ScrollbackRing::new(10);
+        ring.append(&rows_of(&["a"]));
+        ring.mark_not_received(2);
+        ring.append(&rows_of(&["b"]));
+        ring.mark_not_received(3);
+        ring.clear();
+        assert_eq!(ring.view_len(), 0);
+        assert_eq!(ring.view_row(0), None);
+        ring.append(&rows_of(&["z"]));
+        assert_eq!(view(&ring), vec![ViewRow::Row(b"z")]);
+    }
+
+    /// The linear walk `view_row` replaced: through the holes in order,
+    /// spending the ring rows ahead of each.
+    fn naive_view_row(ring: &ScrollbackRing, i: usize) -> Option<ViewRow<'_>> {
+        let first = ring.first_number();
+        let mut left = i as u64;
+        let mut next = first;
+        for &(before, lines) in &ring.holes {
+            let rows_before = before - next;
+            if left < rows_before {
+                break;
+            }
+            left -= rows_before;
+            if left == 0 {
+                return Some(ViewRow::NotReceived(lines));
+            }
+            left -= 1;
+            next = before;
+        }
+        ring.row((next - first + left) as usize).map(ViewRow::Row)
+    }
+
+    #[test]
+    fn view_row_locates_a_row_past_many_holes() {
+        // 50 holes of k+1 lines, each after 1..=3 rows; the 60-row ring
+        // evicts the oldest (and the holes ahead of them), so the hole
+        // deque is popped at the front and wraps.
+        let mut ring = ScrollbackRing::new(60);
+        let mut n = 0;
+        for k in 0..50u64 {
+            let rows = 1 + k % 3;
+            ring.append(&numbered(n, n + rows));
+            n += rows;
+            ring.mark_not_received(k + 1);
+        }
+        assert_eq!(ring.len(), 60);
+        assert!(ring.holes.len() > 25, "many holes held: {}", ring.holes.len());
+        for i in 0..ring.view_len() + 2 {
+            assert_eq!(ring.view_row(i), naive_view_row(&ring, i), "view row {i}");
+        }
+        // Spot checks: 99 rows, so row 39 is the oldest held — and the
+        // 20th hole (20 lines), marked after exactly 39 rows, sits just
+        // ahead of it and is still held; the view ends on the tail hole of
+        // 50 lines.
+        assert_eq!(n, 99);
+        assert_eq!(ring.view_row(0), Some(ViewRow::NotReceived(20)));
+        assert_eq!(ring.view_row(1), Some(ViewRow::Row(&numbered(39, 40)[0])));
+        let last = ring.view_len() - 1;
+        assert_eq!(ring.view_row(last), Some(ViewRow::NotReceived(50)));
+        assert_eq!(ring.view_row(last - 1), Some(ViewRow::Row(&numbered(n - 1, n)[0])));
+        assert_eq!(ring.view_row(last + 1), None);
+    }
+
+    #[test]
+    fn view_total_counts_every_row_and_hole_ever_added() {
+        let mut ring = ScrollbackRing::new(2);
+        assert_eq!((ring.appended(), ring.view_total()), (0, 0));
+        ring.append(&rows_of(&["a", "b", "c"]));
+        assert_eq!((ring.appended(), ring.view_total()), (3, 3), "eviction subtracts nothing");
+        ring.mark_not_received(4);
+        assert_eq!(ring.view_total(), 4);
+        ring.mark_not_received(1);
+        assert_eq!(ring.view_total(), 4, "a merged mark adds nothing");
+        ring.clear();
+        assert_eq!((ring.appended(), ring.view_total()), (3, 4), "clear keeps the counters");
+        ring.append(&rows_of(&["d"]));
+        assert_eq!((ring.appended(), ring.view_total()), (4, 5));
+    }
+
+    fn numbered(from: u64, to: u64) -> Vec<Vec<u8>> {
+        (from..to).map(|i| format!("row {i:03}").into_bytes()).collect()
+    }
+
+    #[test]
+    fn held_bodies_drain_in_row_order_from_the_count() {
+        let mut held = HeldRows::default();
+        assert!(held.hold(20, &numbered(20, 30)));
+        assert!(held.hold(10, &numbered(10, 20)));
+        assert_eq!(held.rows(), 20);
+        assert_eq!(held.first_offset(), Some(10));
+        assert_eq!(held.take_reachable(9), None, "nothing starts at or below 9");
+        assert_eq!(held.take_reachable(10), Some((10, numbered(10, 20))));
+        assert_eq!(held.take_reachable(20), Some((20, numbered(20, 30))));
+        assert_eq!(held.take_reachable(30), None);
+        assert_eq!((held.rows(), held.first_offset()), (0, None));
+    }
+
+    #[test]
+    fn a_body_at_the_same_offset_keeps_the_longer() {
+        let mut held = HeldRows::default();
+        assert!(held.hold(5, &numbered(5, 8)));
+        assert!(held.hold(5, &numbered(5, 7)));
+        assert_eq!(held.rows(), 3);
+        assert!(held.hold(5, &numbered(5, 9)));
+        assert_eq!(held.rows(), 4);
+        assert_eq!(held.take_reachable(5), Some((5, numbered(5, 9))));
+        held.hold(1, &numbered(1, 2));
+        held.clear();
+        assert_eq!((held.rows(), held.first_offset()), (0, None));
+    }
+
+    #[test]
+    fn held_rows_are_bounded() {
+        let mut held = HeldRows::default();
+        let max = SB2_HELD_MAX_ROWS as u64;
+        assert!(held.hold(100, &numbered(100, 100 + max - 1)));
+        assert!(!held.hold(5000, &numbered(5000, 5002)), "past the bound");
+        assert_eq!(held.rows(), SB2_HELD_MAX_ROWS - 1, "nothing of that body is held");
+        assert!(held.hold(6000, &numbered(6000, 6001)), "exactly at the bound");
+        assert_eq!(held.rows(), SB2_HELD_MAX_ROWS);
     }
 
     #[test]

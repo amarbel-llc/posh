@@ -471,7 +471,7 @@ impl ClientConn {
             .and_then(|c| caps::decode_scrollback2_client(&c.payload).ok())
         {
             if let Some(h) = self.history_mut() {
-                h.on_ack(entry.epoch, entry.acked_rows);
+                h.on_ack(entry.epoch, entry.acked_rows, now);
             }
         }
     }
@@ -8268,9 +8268,12 @@ mod tests {
         (c, peer)
     }
 
-    /// What the viewport's next message would forward: its cumulative ack.
+    /// What the viewport's next message would forward: its cumulative ack,
+    /// landing as of the cursor's last send — where these tests' clock
+    /// stands — so an advancing ack restarts the resend clock there.
     fn ack_history(c: &mut ClientConn, epoch: u8, rows: u64) {
-        c.absorb_client_caps(&[sb2_entry(epoch, rows)], 0, false);
+        let now = history_of(c).map_or(0, |h| h.last_send());
+        c.absorb_client_caps(&[sb2_entry(epoch, rows)], now, false);
     }
 
     /// `(epoch, row_offset, rows)` of every v2 body among `frames`.
@@ -8438,6 +8441,41 @@ mod tests {
         let (plain, opened) = (stream(false), stream(true));
         assert!(!plain.is_empty());
         assert!(plain == opened, "open_history changed a non-paced client's stream");
+    }
+
+    /// A viewport that cleared its count under an epoch the daemon never
+    /// bumped (its own resize whose size change never arrived) acks 0
+    /// again: the next history opportunity is due at once and opens epoch 2,
+    /// and every frame after it carries the new epoch and its extent.
+    #[test]
+    fn an_ack_back_to_zero_is_a_viewport_reset_answered_with_a_fresh_epoch() {
+        let mut term = v2_term(5, 24, 1000);
+        let (mut c, _peer) = paced_v2x_conn(&term);
+        scroll_rows(&mut term, 8);
+        assert_eq!(history_bodies(&pass_at_the_history_opportunity(&mut c, &term)), vec![(1, 0, 8)]);
+        c.write_buf.clear();
+        ack_history(&mut c, 1, 5);
+        let last = last_history_send(&c);
+        assert!(c.history_send_at(&term).is_some_and(|at| at > last), "rows 5..8 await the resend");
+
+        ack_history(&mut c, 1, 0);
+        assert_eq!(c.history_send_at(&term), Some(last), "a reset is due at once");
+        let frames = pass_at_the_history_opportunity(&mut c, &term);
+        assert_eq!(history_bodies(&frames), vec![(2, 0, 0)], "epoch 2, anchored at the total");
+        assert_eq!(sb2_epochs(&frames), vec![Some(2)]);
+        assert_eq!(extents(&frames), vec![extent(2, 0, 0)]);
+        assert_eq!(history_of(&c).and_then(|h| h.epoch()), Some(2));
+
+        c.write_buf.clear();
+        broadcast_output(std::slice::from_mut(&mut c), &term, b"x");
+        let frames = send_at_the_opportunity(&mut c, &term);
+        assert_eq!(sb2_epochs(&frames), vec![Some(2)], "a visible frame names the new epoch");
+        assert_eq!(extents(&frames), vec![extent(2, 0, 0)]);
+
+        scroll_rows(&mut term, 3);
+        c.write_buf.clear();
+        let frames = pass_at_the_history_opportunity(&mut c, &term);
+        assert_eq!(history_bodies(&frames), vec![(2, 0, 3)]);
     }
 
     #[test]
@@ -8906,14 +8944,13 @@ mod tests {
         assert_eq!(r.rows_unique, HISTORY_WINDOW_ROWS, "the first window and nothing beyond");
         assert_eq!((r.forward_jumps, r.rows_mismatched), (0, 0));
 
-        // A resend round starts with a body from the ack (row 0); its gap
-        // from the body before is the backed-off floor.
-        let gaps: Vec<u64> = r
-            .history_sends
-            .windows(2)
-            .filter(|w| w[1].1 == 0)
-            .map(|w| w[1].0 - w[0].0)
-            .collect();
+        // A resend round starts with a body from the ack (row 0); the gap
+        // between successive round starts is the backed-off floor, timed
+        // from the body that started the in-flight run — not from the fresh
+        // body that filled the window a few steps later (posh#225 Stage 4:
+        // `HistoryCursor::in_flight_since`).
+        let starts: Vec<u64> = r.history_sends.iter().filter(|s| s.1 == 0).map(|s| s.0).collect();
+        let gaps: Vec<u64> = starts.windows(2).map(|w| w[1] - w[0]).collect();
         let rounds = gaps.len() as u64;
         assert!(rounds >= 4, "resends at 1, 2, 4 and 8 s fit the tail; got gaps {gaps:?}");
         let backoff = |i: usize| HISTORY_RESEND_INITIAL_MS << i.min(HISTORY_RESEND_MAX_DOUBLINGS as usize);

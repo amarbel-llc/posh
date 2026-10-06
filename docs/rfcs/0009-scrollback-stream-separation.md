@@ -150,18 +150,24 @@ in particular its acknowledgements (section 4) — from a v2 body's
 ### 3. Client accumulation and the scrollback acknowledgement
 
 The client maintains a cumulative row total `T`: the number of scrollback
-rows it has accepted in the current epoch (including rows its ring has since
-evicted for capacity; `T` never decreases within an epoch and resets to zero
-on an epoch change, §1.1). On receiving a v2 body of its current epoch:
+rows it has accepted in the current epoch, or given up as not received
+(including rows its ring has since evicted for capacity; `T` never decreases
+within an epoch and resets to zero on an epoch change, §1.1). On receiving a
+v2 body of its current epoch:
 
 - `row_offset + appended <= T`: a retransmission already covered — the
   client MUST discard it (idempotency).
-- `row_offset >= T`: the client MUST append the rows to its ring in order
-  and set `T = row_offset + appended`. A **forward jump** (`row_offset >
-  T`) means the server's ring evicted rows the client never received; the
-  skipped rows are permanently lost to this client. The client MUST accept
-  the jump (the partial view is first-class, FDR 0005) and MAY render a
-  local gap indicator; it MUST NOT stall waiting for the gap to be filled.
+- `row_offset == T`: the client MUST append the rows to its ring in order
+  and set `T = row_offset + appended`.
+- `row_offset > T` (a **forward jump**): with no `SCROLLBACK2_EXTENT` (§3.1)
+  seen in the epoch, the client MUST accept the jump: it treats the skipped
+  rows as permanently lost to it, SHOULD label them as one not-received span
+  where they fall in its history, appends the body, and sets `T = row_offset
+  + appended`. It MUST NOT stall waiting for the gap to be filled (the
+  partial view is first-class, FDR 0005). With an extent seen in the epoch,
+  §3.1 applies instead. (Amended 2026-10-06, posh#225 Stage 4; posh#243:
+  this bullet read every jump as an eviction, and a body lost on a lossy
+  link was taken for one.)
 - `row_offset < T < row_offset + appended` (partial overlap): the rows
   below `T` are ones the client holds and the rest are new. A sender that
   resends from a lagging acknowledgement (one the client had already
@@ -174,9 +180,11 @@ on an epoch change, §1.1). On receiving a v2 body of its current epoch:
   to start exactly at `T`.)
 
 The client reports `T` as `acked_sb_rows` in its `SCROLLBACK2` capability
-entry on every message. RFC 0002 §3's remaining accumulation rules (the
-ring is partial and monotonic; a `Full` body MUST NOT clear it; local
-scroll-view behavior is out of scope) carry over unchanged.
+entry on every message; the acknowledgement stays cumulative, so it never
+passes a gap the client is holding open (§3.1). RFC 0002 §3's remaining
+accumulation rules (the ring is partial and monotonic; a `Full` body MUST
+NOT clear it; local scroll-view behavior is out of scope) carry over
+unchanged.
 
 #### 3.1 The extent (posh#243)
 
@@ -217,9 +225,71 @@ apart. A new RFC 0001 §3 registry entry is allocated:
   per message; a relay does not carry it (ADR 0007). A roaming server
   latches the request for the connection once any message carries it.
 
-This section so far specifies the server half. The client half — how a
-client that asked uses the extent — lands with the first client that asks
-(posh#225 Stage 4); no reference client sends the request yet.
+The client half (added 2026-10-06, posh#225 Stage 4) — how a client that
+asked uses the extent:
+
+- **The request.** A client that implements this section SHOULD request the
+  extent. The reference client sends the request on every message, beside
+  `CAP_PACED` and whether or not it is paced, so it is a standing request:
+  an M2 bridge forms the daemon Init from the first message it sees, which
+  may be the one sent across the client's own resize that omits
+  `SCROLLBACK2`.
+- **Adoption.** A client MUST adopt only an extent naming the epoch it is
+  accumulating in, after applying the same frame's `SCROLLBACK2` entry
+  (§1.1). It keeps the maximum of each field within the epoch. On an epoch
+  change, and on its own resize (§1.1), it MUST discard the extent and every
+  held body (below).
+- **Not received.** Rows from `T` up to `evicted_upto` will never be sent. When
+  `evicted_upto > T`, the client MUST advance `T` to the lower of
+  `evicted_upto` and the first held body's offset, and SHOULD label the
+  rows it passed as one not-received span. It MAY do so on the extent alone,
+  with no body in hand; the reference client does, so its acknowledgement
+  stops naming rows that cannot arrive. An extent can overtake a body still
+  in flight (datagram reordering, a bridge retransmit); the rows that body
+  carried below the floor then arrive after the span was marked and are
+  skipped as already covered (§3). That is a bounded cost of reordering —
+  rows the server also evicted — never a stall, and the ring stays
+  append-only.
+- **The hold rule.** A body of the epoch that, after the step above, still
+  starts past `T` lies past a gap the server can still fill. The client
+  MUST NOT advance `T`, or its acknowledgement, past the gap on account of
+  it. It MAY hold the body; a client that holds bodies MUST bound them, MUST
+  keep the longer of two held bodies at the same offset, and MUST discard
+  whole (never truncate) a body that would exceed the bound — the resend
+  sends it again. The reference bound is 1,024 rows (four bodies of 256,
+  §2).
+- **Draining.** After each append and each adoption the client repeats,
+  until neither applies: append every held body whose offset is at or below
+  `T`, under §3's rules (its rows below `T` are skipped); then apply the
+  not-received step. So a held gap that a later extent's floor passes
+  becomes not received, and the bodies held behind it drain in order.
+- **Sender obligation.** The only repair of a held gap is the sender's
+  resend from the acknowledgement. A server that sends the extent MUST
+  therefore resend from `acked_sb_rows` (§4) under §4's timing rule. Both
+  reference senders do.
+- **A reset under the same epoch.** A client that clears its count on its
+  own resize (§1.1) acknowledges `0` again; if the server never saw a size
+  change (the message carrying the intermediate size was lost, and the final
+  size equals the one it holds), it does not bump the epoch, and its next
+  bodies — at its own send cursor, far past the client's `T = 0` and above
+  the floor — would be held forever under the hold rule. A server MUST
+  therefore treat an acknowledgement of `0` rows in its current epoch,
+  received after that epoch's acknowledgement has advanced, as a client
+  reset and open a fresh epoch, exactly as the lost resize would have. A
+  fresh adoption always acknowledges `0` first, and a client never
+  acknowledges backwards otherwise, so the only false signal is a stale
+  `0` from that first round trip, reordered past a later acknowledgement
+  (the roaming transport delivers late datagrams inside its reorder
+  window; the session socket is ordered). That costs the client the ring
+  of an epoch it adopted one reorder window ago — a few seconds of rows at
+  most — against a stall that would otherwise last until the server's ring
+  evicted past its cursor. Both reference senders do.
+
+Rows the server holds and the client does not — `avail_rows − T`, which
+includes a held gap and the bodies behind it — are rows still arriving, not
+lost. How a client draws not-received spans and the arriving count, and how
+a scrolled view stays on the text being read while they change, is a
+rendering concern (FDR 0005, FDR 0021).
 
 ### 4. Sequencing invariants (the class-killer)
 
@@ -248,6 +318,19 @@ and implementations MUST keep them independent:
   visible frames. Scrollback delivery repeats on the server's send pacing
   until covered by `acked_sb_rows` — the same repeat-until-acked loop as
   the input channel's `input_base`.
+- A sender MUST NOT let fresh bodies postpone the resend of unacknowledged
+  rows indefinitely: the resend MUST come due a bounded time after the
+  acknowledgement last advanced or the last resend, whatever fresh bodies
+  went out since. The reference senders time it from the start of the
+  current in-flight run, restarted by each resend and each advancing
+  acknowledgement.
+
+  *Note (2026-10-06, posh#225 Stage 4).* A resend clocked from the last body
+  sent never comes due for a sender whose window never fills (the roaming
+  `server_loop`, which sends a fresh body every paced interval through a
+  flood), so a lost body stayed lost for the length of the flood. That was
+  harmless while a client accepted every jump; under §3.1's hold rule it
+  would freeze the acknowledgement at the gap.
 
 These invariants eliminate the posh#95/#117 mechanism by construction: no
 scrollback acknowledgement can assert visible delivery, so no visible frame
@@ -311,11 +394,20 @@ specify, with these differences:
 - **Annotation.** A v2 body's carrying `frame_num` is the newest visible
   frame number (§2), and the body takes no visible frame-sequence slot
   (§4).
+- **The extent.** The request is Init-persistent and the M2 bridge carries
+  it into the daemon Init (§3.1). A daemon carries the extent beside the
+  server `SCROLLBACK2` entry on every frame to a client that asked, and
+  repeats the last one it computed while history is paused (the escape
+  overlay). Its `evicted_upto` covers both eviction and re-anchoring, so the
+  rows a re-anchor or a stalled reader's eviction skips reach the client as
+  not received, while a body lost above the floor is held for the resend
+  (§3.1).
 
-**Open issue (posh#243).** A body lost on the wire while a later body is in
-flight reaches the client as a forward jump that the resend from the
-acknowledgement cannot repair and that the client cannot tell from an
-eviction; distinguishing them needs an eviction marker in this protocol.
+**posh#243 — resolved by §3.1 (posh#225 Stage 4, 2026-10-06).** A body lost
+on the wire while a later body was in flight reached the client as a
+forward jump it could not tell from an eviction. The extent's floor now
+tells them apart: a jump at or below it is not received, and one above it
+is held until the resend from the acknowledgement fills the gap.
 
 ## Security Considerations
 
@@ -331,6 +423,14 @@ eviction; distinguishing them needs an eviction marker in this protocol.
   `acked_sb_rows` induces bounded retransmission (the server resends at
   most its retained ring); a client overstating it merely denies itself
   history. Neither moves the trust boundary.
+- Both extent fields (§3.1) come from an authenticated peer. A fabricated
+  `evicted_upto` advances `T` over rows labelled not received — the same
+  power as a fabricated forward jump. A fabricated `avail_rows` only
+  inflates the count of rows shown as arriving. A fabricated jump above the
+  floor can make a client hold bodies, which the bound caps (the reference
+  client holds at most 1,024 rows); a client whose resend never comes keeps
+  acknowledging the gap's start and loses nothing it holds. The extent
+  request carries no data beyond its version byte.
 - The separation narrows the blast radius of the shared-sequence design:
   scrollback traffic can no longer influence visible-state recovery paths
   (resync, base selection), removing a lever an anomalous peer could pull
@@ -361,7 +461,17 @@ Tests MUST use `bats-emo` binary injection (`require_bin POSH posh`) once a
 | §3.1, the floor is the send floor | `remote::history::tests::the_extent_is_none_until_activated`, `the_extent_counts_the_rows_of_the_epoch`, `the_extent_floor_rises_as_the_ring_evicts`, `the_extent_floor_is_the_count_at_a_reanchor`, `a_continued_cursors_floor_is_the_viewports_count`, `the_extent_floor_never_falls_within_an_epoch`, `a_bump_resets_the_extent` | `evicted_upto` is where the next body starts (eviction, re-anchor, continued attach); non-decreasing within an epoch. |
 | §3.1/§5, the daemon reports it | `session::daemon::tests::a_v2_viewport_that_asks_gets_the_extent_on_every_frame`, `a_v2_viewport_that_does_not_ask_gets_no_extent`, `a_request_without_scrollback2_gets_no_extent`, `the_extent_floor_is_the_daemons_eviction_floor`, `the_extent_floor_is_the_count_at_a_session_resize`, `the_extent_freezes_while_the_overlay_is_up`, `a_resize_under_the_overlay_keeps_the_extent_in_the_frames_epoch`, `the_first_visible_frame_after_open_history_carries_the_extent`, `posh225_v2_extent_marks_every_flood_jump_as_evicted`, `posh225_v2_extent_counts_nothing_arriving_once_caught_up`, `posh225_v2_extent_without_acks_reports_rows_still_arriving` | Every frame carrying the server `SCROLLBACK2` entry, only to a client that asked; a body starts at its frame's floor; every flood jump is marked. |
 | §3.1/§5, the M2 bridge carries the request | `remote::server::tests::bridge_init_carries_the_viewports_extent_request`, `the_relay_never_carries_the_extent_request`, `the_bridge_does_not_forward_the_extent_request_per_message` | Init-only through the bridge; never the relay (ADR 0007). |
-| §4, the #95 leap is impossible end-to-end | `remote::client::tests::wedge_repro_server_loop_with_loss_and_titles` | The real `server_loop` under 35% induced loss with v2 negotiated: `reack=0`, `base_sum_mismatch=0`, and the harness asserts v2 engaged (epoch adopted, rows accumulated), so it cannot vacuously pass. |
+| §3/§3.1, not-received spans in the ring | `remote::sync::tests::a_hole_sits_between_the_rows_it_separates`, `marks_at_the_same_tail_position_merge`, `a_hole_is_evicted_with_the_row_after_it`, `clear_drops_every_hole`, `view_total_counts_every_row_and_hole_ever_added` | A gap is labelled once, where it falls, without occupying a ring row; adjacent marks merge; a label leaves with the row after it; an epoch clear drops every label. |
+| §3.1, held bodies | `remote::sync::tests::held_bodies_drain_in_row_order_from_the_count`, `a_body_at_the_same_offset_keeps_the_longer`, `held_rows_are_bounded` | Held bodies drain in row order from `T`; the longer body at an offset is kept; a body past the 1,024-row bound is held not at all. |
+| §3.1, the client's request | `remote::client::tests::outgoing_caps_requests_the_extent_with_scrollback2` | The request rides every message, including the resize message that omits id 10. |
+| §3, a jump with no extent | `remote::client::tests::without_an_extent_a_jump_is_accepted_and_labelled_not_received` | Accepted as before, `T` and the acknowledgement at the body's end; the gap labelled. |
+| §3.1, the floor and the hold rule | `remote::client::tests::a_jump_at_or_below_the_floor_is_not_received`, `a_jump_above_the_floor_is_held_and_not_acked_past`, `the_resend_fills_the_gap_and_drains_what_was_held`, `a_floor_that_passes_a_held_gap_makes_it_not_received`, `the_floor_alone_settles_a_gap_with_nothing_held`, `held_bodies_past_the_bound_are_discarded_for_the_resend` | A jump at or below `evicted_upto` is not received; one above it is held and the acknowledgement stays at the gap; the resend fills it and drains the held bodies; a later floor turns a held gap, or a gap with nothing held, into not received; a body past the bound is discarded for the resend. |
+| §3.1, adoption | `remote::client::tests::an_extent_of_another_epoch_is_ignored_and_a_new_epoch_clears_it`, `the_extent_only_moves_forward`, `an_own_resize_clears_the_extent_and_what_was_held` | Only the current epoch's extent is adopted; each field keeps its maximum; an epoch change or the client's own resize discards the extent and the held bodies. |
+| §3.1/§4, a lost body is repaired, not labelled | `remote::client::tests::a_cursor_and_a_viewport_repair_a_lost_body_without_a_hole` | The real send cursor and viewport: a dropped first body is held past, resent from the acknowledgement, and drained, leaving every row in order and no label; with eviction, exactly one not-received span of the evicted rows. |
+| §4, fresh bodies never postpone the resend | `remote::history::tests::a_fresh_body_does_not_postpone_the_resend`, `an_advancing_ack_restarts_the_resend_clock`, `a_resend_restarts_the_resend_clock` | The resend is timed from the start of the in-flight run, restarted only by a resend or an advancing acknowledgement. |
+| §3.1, a reset under the same epoch | `remote::history::tests::an_ack_back_to_zero_in_the_same_epoch_is_a_reset_and_bumps_the_epoch`, `session::daemon::tests::an_ack_back_to_zero_is_a_viewport_reset_answered_with_a_fresh_epoch`, `remote::client::tests::a_viewport_reset_under_the_same_epoch_gets_a_fresh_epoch_not_a_held_stall` | A fresh cursor's first `0` is no reset; a `0` after the acknowledgement advanced opens a fresh epoch at once (the daemon's next body and extent carry it); end to end, a viewport that cleared its count under an epoch the sender never bumped holds the stall signature (rows held, acknowledgement at 0) for one frame and then accumulates in the new epoch. |
+| §3.1, view rows past many holes | `remote::sync::tests::view_row_locates_a_row_past_many_holes` | The hole-aware row walk agrees with a linear walk across 50 holes on an evicting ring (O(log holes) per row, for the scroll view). |
+| §4, the #95 leap is impossible end-to-end; §3.1 under loss | `remote::client::tests::wedge_repro_server_loop_with_loss_and_titles` | The real `server_loop` under 35% induced loss with v2 negotiated: `reack=0`, `base_sum_mismatch=0`, and the harness asserts v2 engaged (epoch adopted, rows accumulated), so it cannot vacuously pass. Since posh#225 Stage 4 it also asserts the extent engaged and that no jump was accepted without one, so every lost body is held and repaired by the resend. |
 
 ## Compatibility
 
@@ -380,8 +490,14 @@ Tests MUST use `bats-emo` binary injection (`require_bin POSH posh`) once a
   operative scrollback specification and the two documents cross-reference.
 - **Registry allocations.** Capability ids `10` and `24` (§3.1, added
   2026-10-06) and body kind `7` are allocated within RFC 0001's registries
-  and follow its rules for unknown entries. A server that predates §3.1
-  ignores the request; a client that does not ask is sent no extent.
+  and follow its rules for unknown entries.
+- **The extent (§3.1, 2026-10-06).** A client that asks, against a server
+  that predates §3.1, sees no extent and keeps §3's jump rule (a jump is
+  lost, now labelled). A client that does not ask is sent no extent and its
+  stream is unchanged. The acknowledgement keeps its meaning (cumulative
+  `T`), and a client holds bodies only after an extent arrives, so only a
+  server that sends the extent is relied on to repair a held gap (§3.1,
+  §4).
 
 ## References
 

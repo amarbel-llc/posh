@@ -1919,7 +1919,8 @@ pub(crate) fn server_loop(
                         if let Some(c) = caps::find(&msg.caps, caps::CAP_SCROLLBACK2)
                             .and_then(|cap| caps::decode_scrollback2_client(&cap.payload).ok())
                         {
-                            sb2.on_client_entry(&c, term.primary_scrollback_total());
+                            // `last_heard` is this message's arrival time.
+                            sb2.on_client_entry(&c, term.primary_scrollback_total(), last_heard);
                         }
                         // RFC 0009 §3.1 (posh#225 Stage 4): a request for the
                         // v2 extent latches for the connection.

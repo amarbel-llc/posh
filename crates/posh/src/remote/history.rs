@@ -46,10 +46,31 @@ pub(crate) struct HistoryCursor {
     anchor_rel: u64,
     acked_rows: u64,
     sent_upto: u64,
+    /// When the last body (fresh or resend) went out; what a fresh body is
+    /// due at.
     last_send: u64,
+    /// The clock a resend is timed from: stamped when a send starts an
+    /// in-flight run (nothing was in flight before it), on every resend,
+    /// and on every advancing ack. A fresh body sent while rows are already
+    /// in flight does NOT restamp it — that is the whole point: a sender
+    /// whose window never fills (`server_loop`) sends a fresh body every
+    /// paced interval through a flood, and a resend clocked from the last
+    /// send would never come due (posh#225 Stage 4 finding).
+    in_flight_since: u64,
     /// Resend bodies since the ack last advanced (the caller's backoff
     /// exponent); zeroed with every new row space.
     resends: u32,
+    /// The viewport reset its count under this epoch ([`Self::on_ack`]): a
+    /// same-epoch ack of 0 rows after the ack had advanced. A fresh
+    /// adoption always starts at 0, so once the ack has advanced a 0 can
+    /// only come from a viewport that cleared its count — its own resize,
+    /// whose size change this cursor never saw (A→B→A with B's message
+    /// lost). Its rows past 0 would be held forever behind a count the ack
+    /// can never move backwards to; the cure is a fresh epoch, exactly what
+    /// the lost resize would have produced. The bump needs the terminal's
+    /// total, so it is applied by the next [`Self::next_body`] (which
+    /// [`Self::next_due`] makes due at once); every bump clears the flag.
+    reset_pending: bool,
     size: (u16, u16),
 }
 
@@ -65,7 +86,9 @@ impl HistoryCursor {
             acked_rows: 0,
             sent_upto: 0,
             last_send: 0,
+            in_flight_since: 0,
             resends: 0,
+            reset_pending: false,
             size,
         }
     }
@@ -88,25 +111,49 @@ impl HistoryCursor {
         self.anchor_rel = rows;
         self.acked_rows = rows;
         self.sent_upto = rows;
+        self.in_flight_since = 0;
+        self.reset_pending = false;
     }
 
     /// `server_loop`'s per-message `SCROLLBACK2` entry (RFC 0009 §1): the
     /// first advertisement opens a fresh epoch at the current monotonic
     /// total; every entry carries the viewport's cumulative ack, valid only
     /// when its epoch byte matches ours (a stale-epoch ack is ignored).
-    pub(crate) fn on_client_entry(&mut self, entry: &Scrollback2Client, total: u64) {
+    pub(crate) fn on_client_entry(&mut self, entry: &Scrollback2Client, total: u64, now: u64) {
         self.activate(HistoryStart::Fresh, total);
-        self.on_ack(entry.epoch, entry.acked_rows);
+        self.on_ack(entry.epoch, entry.acked_rows, now);
     }
 
-    /// A cumulative ack of `acked_rows` in `epoch`; ignored when inactive or
-    /// in another epoch, and never moves backwards. Returns whether it
-    /// advanced.
-    pub(crate) fn on_ack(&mut self, epoch: u8, acked_rows: u64) -> bool {
-        if !self.active || epoch != self.epoch || acked_rows <= self.acked_rows {
+    /// A cumulative ack of `acked_rows` in `epoch`, received at `now`;
+    /// ignored when inactive or in another epoch, and never moves
+    /// backwards. An advancing ack restarts the resend clock and the
+    /// backoff. Returns whether it advanced.
+    ///
+    /// One backwards ack is not ignored: 0 rows in this epoch after the ack
+    /// had advanced is a viewport reset (see `reset_pending`), recorded for
+    /// the next body to answer with a fresh epoch. The first ack of a fresh
+    /// adoption is 0 too, but then `acked_rows` is still 0 — not a reset.
+    /// Accepted cost: a stale 0 delivered after a later ack costs one
+    /// needless bump, and with it the viewport's ring of this epoch. The
+    /// mux path is an ordered stream, so it cannot happen there; the UDP
+    /// path (`server_loop`) delivers in-window reorders
+    /// (`Datagram::recv`, datagram.rs: only the timestamp echo, RTT, and
+    /// roaming address are gated on the newest sequence number), so it can,
+    /// but only for a 0 sent in the round trip between the viewport
+    /// adopting this epoch and acking its first row.
+    pub(crate) fn on_ack(&mut self, epoch: u8, acked_rows: u64, now: u64) -> bool {
+        if !self.active || epoch != self.epoch {
+            return false;
+        }
+        if acked_rows == 0 && self.acked_rows > 0 {
+            self.reset_pending = true;
+            return false;
+        }
+        if acked_rows <= self.acked_rows {
             return false;
         }
         self.acked_rows = acked_rows;
+        self.in_flight_since = now;
         self.resends = 0;
         true
     }
@@ -140,7 +187,9 @@ impl HistoryCursor {
         self.anchor_rel = 0;
         self.acked_rows = 0;
         self.sent_upto = 0;
+        self.in_flight_since = 0;
         self.resends = 0;
+        self.reset_pending = false;
     }
 
     /// Re-anchor the row space at the terminal's renumbered `total` without
@@ -173,24 +222,33 @@ impl HistoryCursor {
         self.anchor_rel + total.saturating_sub(self.anchor_abs)
     }
 
-    /// Rows are sent but unacked and the last body is at least `rto` old.
+    /// Rows are sent but unacked, and `rto` has passed since the in-flight
+    /// run started, the ack last advanced, or the last resend — whichever
+    /// is latest. Not since the last send: a fresh body never postpones it
+    /// (posh#225 Stage 4: `server_loop`'s window never fills, so it would
+    /// never resend during a flood).
     fn resend_due(&self, now: u64, rto: u64) -> bool {
-        self.in_flight() > 0 && now.saturating_sub(self.last_send) >= rto
+        self.in_flight() > 0 && now.saturating_sub(self.in_flight_since) >= rto
     }
 
     /// When the next body is due, for a viewport allowed `window` rows in
     /// flight: fresh rows with room in the window are due at once (the last
     /// send, never later than now); otherwise rows in flight are due their
-    /// resend at `rto` past the last send. `None` while inactive, or with
-    /// nothing fresh and nothing in flight.
+    /// resend at `rto` past the resend clock ([`Self::resend_due`]). A
+    /// pending viewport reset is due at once: its body opens the fresh
+    /// epoch. `None` while inactive, or with nothing fresh and nothing in
+    /// flight.
     pub(crate) fn next_due(&self, total: u64, rto: u64, window: u64) -> Option<u64> {
         if !self.active {
             return None;
         }
+        if self.reset_pending {
+            return Some(self.last_send);
+        }
         if self.avail(total) > self.next_fresh() && self.in_flight() < window {
             return Some(self.last_send);
         }
-        (self.in_flight() > 0).then(|| self.last_send + rto)
+        (self.in_flight() > 0).then(|| self.in_flight_since + rto)
     }
 
     /// A body is owed at `now` ([`Self::next_due`]).
@@ -228,6 +286,11 @@ impl HistoryCursor {
         self.last_send
     }
 
+    #[cfg(test)]
+    pub(crate) fn reset_pending(&self) -> bool {
+        self.reset_pending
+    }
+
     /// Rows available in this epoch at `term`, and the floor below which no
     /// body starts — the ring's eviction floor, never below `anchor_rel`
     /// (a re-anchor's count, a continued viewport's count). One computation
@@ -257,11 +320,22 @@ impl HistoryCursor {
     /// viewport accepts as permanently-lost history — nor below
     /// `anchor_rel`. A resend takes a whole body ([`SB2_ROWS_PER_BODY`]); a
     /// fresh body at most the room left in `window`. Advances the send
-    /// cursor and stamps `now` as the last send.
+    /// cursor and stamps `now` as the last send; restarts the resend clock
+    /// on a resend, or on a fresh body that starts an in-flight run — never
+    /// on a fresh body sent behind rows already in flight. A pending
+    /// viewport reset ([`Self::on_ack`]) first opens the next epoch at the
+    /// terminal's current total, so this body is that epoch's first.
     pub(crate) fn next_body(&mut self, term: &Terminal, now: u64, rto: u64, window: u64) -> (u8, FrameBody) {
+        if self.reset_pending {
+            self.bump_epoch(term.primary_scrollback_total());
+        }
         let ring_len = term.primary_scrollback_len() as u64;
         let (avail, floor_rel) = self.avail_and_floor(term);
-        let (cursor, cap) = if self.resend_due(now, rto) {
+        let resend = self.resend_due(now, rto);
+        if resend || self.in_flight() == 0 {
+            self.in_flight_since = now;
+        }
+        let (cursor, cap) = if resend {
             self.resends += 1;
             (self.acked_rows, SB2_ROWS_PER_BODY)
         } else {
@@ -392,7 +466,7 @@ mod tests {
         assert_eq!(rows, expected);
         assert_eq!(c.sent_upto(), 4);
         assert_eq!(c.next_due(total(&t), RTO, 4), Some(RTO), "the window is full");
-        c.on_ack(1, 4);
+        c.on_ack(1, 4, 0);
         assert_eq!(c.next_due(total(&t), RTO, 4), Some(0), "room again");
         let (_, row_offset, rows) = split(c.next_body(&t, 0, RTO, 4));
         assert_eq!(row_offset, 4);
@@ -429,7 +503,7 @@ mod tests {
         let (_, row_offset, rows) = split(c.next_body(&t, 0, RTO, 300));
         assert_eq!((row_offset, rows.len()), (256, 44));
         assert_eq!(c.next_due(total(&t), RTO, 300), Some(RTO), "full: only the resend is due");
-        c.on_ack(1, 256);
+        c.on_ack(1, 256, 1);
         let (_, row_offset, rows) = split(c.next_body(&t, 1, RTO, 300));
         assert_eq!((row_offset, rows.len()), (300, 256));
     }
@@ -438,12 +512,56 @@ mod tests {
     fn an_ack_moves_only_forward_and_only_in_its_epoch() {
         let t = term();
         let mut c = active(&t);
-        assert!(c.on_ack(1, 5));
+        assert!(c.on_ack(1, 5, 0));
         assert_eq!(c.acked_rows(), 5);
-        assert!(!c.on_ack(1, 3));
+        assert!(!c.on_ack(1, 3, 0));
         assert_eq!(c.acked_rows(), 5);
-        assert!(!c.on_ack(2, 9), "a stale-epoch ack is ignored");
+        assert!(!c.on_ack(2, 9, 0), "a stale-epoch ack is ignored");
         assert_eq!(c.acked_rows(), 5);
+    }
+
+    /// A viewport that cleared its count under an epoch this cursor never
+    /// bumped (its own resize A→B→A, B's message lost) acks 0 again; held
+    /// behind a count the ack can never move back to, it would stall until
+    /// the ring evicted past the old ack. The cure is a fresh epoch.
+    #[test]
+    fn an_ack_back_to_zero_in_the_same_epoch_is_a_reset_and_bumps_the_epoch() {
+        let mut t = term();
+        let mut fresh = active(&t);
+        assert!(!fresh.on_ack(1, 0, 0));
+        assert!(!fresh.reset_pending(), "a fresh adoption's first ack of 0 is no reset");
+        assert_eq!(fresh.next_due(total(&t), RTO, ANY), None);
+
+        let mut c = active(&t);
+        scroll(&mut t, 10);
+        let (_, row_offset, rows) = split(c.next_body(&t, 0, RTO, ANY));
+        assert_eq!((row_offset, rows.len()), (0, 10));
+        assert!(c.on_ack(1, 5, 0));
+        assert!(!c.on_ack(1, 0, 10), "a reset is not an advance");
+        assert!(c.reset_pending());
+        assert_eq!(c.acked_rows(), 5, "nothing moves until the bump");
+        assert_eq!(c.next_due(total(&t), RTO, ANY), Some(c.last_send()), "due at once");
+        assert!(c.wants(total(&t), 10, RTO, ANY));
+        let (epoch, row_offset, rows) = split(c.next_body(&t, 10, RTO, ANY));
+        assert_eq!(
+            (epoch, row_offset, rows.len()),
+            (2, 0, 0),
+            "the fresh epoch, anchored at the current total: an empty first body"
+        );
+        assert!(!c.reset_pending(), "the bump clears it");
+        assert_eq!(c.epoch(), Some(2));
+        assert_eq!(c.resends(), 0);
+        assert_eq!(c.next_due(total(&t), RTO, ANY), None, "nothing fresh, nothing in flight");
+
+        // The new epoch runs normally: its first ack of 0 is no reset.
+        assert!(!c.on_ack(1, 7, 11), "an old-epoch ack is ignored");
+        assert!(!c.on_ack(2, 0, 11));
+        assert!(!c.reset_pending());
+        scroll(&mut t, 3);
+        let (epoch, row_offset, rows) = split(c.next_body(&t, 12, RTO, ANY));
+        assert_eq!((epoch, row_offset, rows), (2, 0, newest_rows(&t, 3)));
+        assert!(c.on_ack(2, 3, 13));
+        assert_eq!(c.acked_rows(), 3);
     }
 
     #[test]
@@ -454,7 +572,7 @@ mod tests {
         let (_, row_offset, rows) = split(c.next_body(&t, 0, RTO, ANY));
         assert_eq!((row_offset, rows.len()), (0, 8));
         assert_eq!(c.last_send(), 0);
-        c.on_ack(1, 3);
+        c.on_ack(1, 3, 0);
         assert_eq!(c.in_flight(), 5);
         assert!(!c.resend_due(10, RTO));
         assert!(!c.wants(total(&t), 10, RTO, ANY), "caught up and not yet due");
@@ -467,9 +585,9 @@ mod tests {
         assert_eq!(c.resends(), 1, "a resend counts");
         split(c.next_body(&t, 200, RTO, ANY));
         assert_eq!(c.resends(), 2);
-        assert!(!c.on_ack(1, 3), "a repeated ack does not advance");
+        assert!(!c.on_ack(1, 3, 200), "a repeated ack does not advance");
         assert_eq!(c.resends(), 2, "nor reset the count");
-        assert!(c.on_ack(1, 5));
+        assert!(c.on_ack(1, 5, 200));
         assert_eq!(c.resends(), 0, "an advancing ack resets it");
     }
 
@@ -481,15 +599,65 @@ mod tests {
         while c.wants(total(&t), 0, RTO, ANY) {
             c.next_body(&t, 0, RTO, ANY);
         }
-        c.on_ack(1, 3);
+        c.on_ack(1, 3, 0);
         let (_, row_offset, rows) = split(c.next_body(&t, RTO, RTO, ANY));
         assert_eq!((row_offset, rows.len()), (3, 256), "the resend rewinds the cursor");
         assert_eq!(c.sent_upto(), 259);
         // The ack of the first window's bodies lands after the resend.
-        assert!(c.on_ack(1, 400));
+        assert!(c.on_ack(1, 400, RTO));
         assert_eq!(c.next_due(total(&t), RTO, ANY), Some(RTO), "rows past the ack: due");
         let (_, row_offset, rows) = split(c.next_body(&t, RTO + 1, RTO, ANY));
         assert_eq!((row_offset, rows), (400, newest_rows(&t, 200)), "fresh from the ack");
+    }
+
+    /// Body A (rows 0..8) at t=0, then fresh body B (rows 8..12) at RTO/2,
+    /// neither acked, over `server_loop`'s unbounded window.
+    fn two_bodies_in_flight() -> (Terminal, HistoryCursor) {
+        let mut t = term();
+        let mut c = active(&t);
+        scroll(&mut t, 8);
+        let (_, row_offset, rows) = split(c.next_body(&t, 0, RTO, ANY));
+        assert_eq!((row_offset, rows.len()), (0, 8));
+        scroll(&mut t, 4);
+        let (_, row_offset, rows) = split(c.next_body(&t, RTO / 2, RTO, ANY));
+        assert_eq!((row_offset, rows.len()), (8, 4));
+        (t, c)
+    }
+
+    /// posh#225 Stage 4: a sender whose window never fills keeps sending
+    /// fresh bodies through a flood; each must not postpone the resend.
+    #[test]
+    fn a_fresh_body_does_not_postpone_the_resend() {
+        let (t, mut c) = two_bodies_in_flight();
+        assert!(c.resend_due(RTO, RTO), "due RTO after the run started, not after B");
+        assert_eq!(c.next_due(total(&t), RTO, ANY), Some(RTO));
+        let (_, row_offset, rows) = split(c.next_body(&t, RTO, RTO, ANY));
+        assert_eq!(row_offset, c.acked_rows(), "the resend starts at the ack");
+        assert_eq!((row_offset, rows.len()), (0, 12));
+        assert_eq!(c.resends(), 1);
+    }
+
+    #[test]
+    fn an_advancing_ack_restarts_the_resend_clock() {
+        let (t, mut c) = two_bodies_in_flight();
+        assert!(c.on_ack(1, 8, RTO - 1));
+        assert!(!c.resend_due(RTO, RTO), "B is in flight, but the clock restarted");
+        assert_eq!(c.next_due(total(&t), RTO, ANY), Some(2 * RTO - 1));
+        assert!(c.resend_due(2 * RTO - 1, RTO));
+    }
+
+    #[test]
+    fn a_resend_restarts_the_resend_clock() {
+        let (mut t, mut c) = two_bodies_in_flight();
+        split(c.next_body(&t, RTO, RTO, ANY));
+        assert_eq!(c.resends(), 1);
+        // A fresh body after the resend does not restamp the clock either.
+        scroll(&mut t, 2);
+        let (_, row_offset, _) = split(c.next_body(&t, RTO + RTO / 2, RTO, ANY));
+        assert_eq!(row_offset, 12, "fresh");
+        assert!(!c.resend_due(2 * RTO - 1, RTO));
+        assert_eq!(c.next_due(total(&t), RTO, ANY), Some(2 * RTO));
+        assert!(c.resend_due(2 * RTO, RTO));
     }
 
     #[test]
@@ -515,7 +683,7 @@ mod tests {
         let mut c = active(&t);
         scroll(&mut t, 10);
         c.next_body(&t, 0, RTO, ANY);
-        c.on_ack(1, 4);
+        c.on_ack(1, 4, 0);
         split(c.next_body(&t, RTO, RTO, ANY));
         assert_eq!(c.resends(), 1);
         assert!(c.on_client_size((6, 20), total(&t)), "it bumped");
@@ -545,7 +713,7 @@ mod tests {
         let mut c = active(&t);
         scroll(&mut t, 10);
         c.next_body(&t, 0, RTO, 8);
-        c.on_ack(1, 4);
+        c.on_ack(1, 4, 0);
         assert_eq!(c.sent_upto(), 8);
         // A reflow renumbers the ring without moving the total; rows 8..10
         // were never sent, rows 4..8 are in flight.
@@ -586,7 +754,7 @@ mod tests {
         let mut c = active(&t);
         scroll(&mut t, 10);
         c.next_body(&t, 0, RTO, ANY);
-        c.on_ack(1, 4);
+        c.on_ack(1, 4, 0);
         c.bump_epoch(total(&t));
         assert_eq!(c.epoch(), Some(2));
         assert_eq!(c.avail(total(&t)), 0);
@@ -685,7 +853,7 @@ mod tests {
         let mut c = active(&t);
         scroll(&mut t, 10);
         c.next_body(&t, 0, RTO, 8);
-        c.on_ack(1, 4);
+        c.on_ack(1, 4, 0);
         t.resize(5, 30);
         c.reanchor(total(&t));
         assert_eq!(c.extent(&t).unwrap().evicted_upto, 10);

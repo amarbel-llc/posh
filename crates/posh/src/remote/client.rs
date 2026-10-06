@@ -1539,6 +1539,14 @@ struct ClientState {
     /// rows the ring has since evicted; reported as `acked_sb_rows` in every
     /// outgoing SCROLLBACK2 entry. Never advances `applied_num`.
     sb2_rows: u64,
+    /// RFC 0009 §3.1 (posh#225 Stage 4): the server's v2 extent in this
+    /// epoch, each field the maximum seen; `None` until a frame carries
+    /// one (an older server never sends it: a jump is then accepted and
+    /// labelled not received). Cleared with the epoch.
+    sb2_extent: Option<caps::Scrollback2Extent>,
+    /// Bodies past a gap the server can still fill: held, not appended
+    /// and not acked past until the resend arrives (RFC 0009 §3.1).
+    sb2_held: sync::HeldRows,
     /// What the physical tty currently shows.
     last_drawn: Snapshot,
     /// False when the outer terminal state is unknown (startup, resize,
@@ -1803,6 +1811,8 @@ fn client_loop(
         suppress_scrollback_once: false,
         sb2_epoch: None,
         sb2_rows: 0,
+        sb2_extent: None,
+        sb2_held: sync::HeldRows::default(),
         last_drawn: Snapshot::blank(rows, cols),
         initialized: false,
         last_wheel: false,
@@ -2078,19 +2088,7 @@ fn drive_client(
                 // posh#189: retained bases are dumps at the OLD size; a diff
                 // against one would rebuild a wrong-size screen.
                 st.base_history.clear();
-                // RFC 0002 §4: a width change rewraps the server's ring, so
-                // absolute row continuity ends. Drop the accumulated ring,
-                // discard the (not-yet-built) scroll view by virtue of the
-                // repaint, and stop advertising SCROLLBACK for the resize
-                // message so the server restarts appended-row counting afresh.
-                st.scrollback.clear();
-                st.scroll_offset = 0; // FDR 0005: a resize returns to the live view
-                st.suppress_scrollback_once = true;
-                // v2 (RFC 0009): expect a fresh epoch — the server, seeing our
-                // new size, bumps it; until its ack arrives, in-flight v2 bodies
-                // from the superseded row space are discarded (unknown epoch).
-                st.sb2_epoch = None;
-                st.sb2_rows = 0;
+                reset_history_for_own_resize(st);
                 send_now = true;
             }
         }
@@ -2652,6 +2650,25 @@ fn wheel_active(st: &ClientState) -> bool {
     scrollview::wheel_active(&st.server_term)
 }
 
+/// The history half of this viewport's own resize.
+fn reset_history_for_own_resize(st: &mut ClientState) {
+    // RFC 0002 §4: a width change rewraps the server's ring, so absolute row
+    // continuity ends. Drop the accumulated ring, discard the scroll view by
+    // virtue of the repaint, and stop advertising SCROLLBACK for the resize
+    // message so the server restarts appended-row counting afresh.
+    st.scrollback.clear();
+    st.scroll_offset = 0; // FDR 0005: a resize returns to the live view
+    st.suppress_scrollback_once = true;
+    // v2 (RFC 0009): expect a fresh epoch — the server, seeing our new size,
+    // bumps it; until its ack arrives, in-flight v2 bodies from the
+    // superseded row space are discarded (unknown epoch). The extent and
+    // the held bodies belong to the old row space too (§3.1).
+    st.sb2_epoch = None;
+    st.sb2_rows = 0;
+    st.sb2_extent = None;
+    st.sb2_held.clear();
+}
+
 /// Sets the scroll-view offset via the shared [`scrollview::set_scroll`],
 /// clamped to the ring depth. On a real change the shared helper invalidates the
 /// scroll memo; here we additionally invalidate the live-render memo (a remote
@@ -3141,8 +3158,25 @@ fn process_frame(st: &mut ClientState, frame: &ServerFrame) -> bool {
                 st.scroll_offset = 0;
                 st.sb2_rows = 0;
                 st.sb2_epoch = Some(epoch);
+                st.sb2_extent = None;
+                st.sb2_held.clear();
             }
         }
+    }
+    // RFC 0009 §3.1 (posh#225 Stage 4): the server's extent — how many rows
+    // it holds and the floor below which it will never resend. Adopted only
+    // for the epoch just settled above, and only forward (a reordered older
+    // frame cannot lower it); a floor past `T` settles the gap.
+    if let Some(x) = caps::find(&frame.caps, caps::CAP_SCROLLBACK2_EXTENT)
+        .and_then(|c| caps::decode_scrollback2_extent(&c.payload))
+        .filter(|x| st.sb2_epoch == Some(x.epoch))
+    {
+        let held = st.sb2_extent.get_or_insert(x);
+        held.avail_rows = held.avail_rows.max(x.avail_rows);
+        held.evicted_upto = held.evicted_upto.max(x.evicted_upto);
+        let mark = history_mark(st);
+        settle_history(st);
+        keep_history_anchor(st, mark);
     }
     // The escape-to-shell overlay is up (FDR 0008): the request was honored, so
     // drop the "opening shell…" notice (the request flag is already one-shot).
@@ -3184,6 +3218,76 @@ fn process_frame(st: &mut ClientState, frame: &ServerFrame) -> bool {
 fn clear_reack(st: &mut ClientState) {
     st.last_reack = None;
     st.forensic_captured = false;
+}
+
+/// RFC 0009 §3/§3.1: append a v2 body of the current epoch that is not
+/// fully covered. A jump past `T` with no extent seen is accepted as lost
+/// (labelled not received); with an extent, rows below its floor are lost
+/// (`settle_history`) and a body still past `T` is held for the resend.
+/// `process_frame` adopts the frame's extent (and settles) before applying
+/// its body, so whenever `sb2_extent` is `Some`, `T >= evicted_upto` and a
+/// body that reaches the hold branch is above the floor.
+fn apply_scrollback2_rows(st: &mut ClientState, row_offset: u64, rows: &[Vec<u8>]) {
+    if row_offset > st.sb2_rows {
+        if st.sb2_extent.is_some() {
+            // Past the bound the body is dropped: the go-back-N resend from
+            // our ack (which stays at the gap) sends it again.
+            st.sb2_held.hold(row_offset, rows);
+            settle_history(st);
+            return;
+        }
+        st.scrollback.mark_not_received(row_offset - st.sb2_rows);
+        st.sb2_rows = row_offset;
+    }
+    append_scrollback2_tail(st, row_offset, rows);
+    settle_history(st);
+}
+
+/// Append the part of a body at `row_offset <= T` past `T`, and advance
+/// `T` to its end. Partial overlap is routine — the session daemon resends
+/// from a lagging ack (posh#225 Stage 3) — so the rows below `T`, which
+/// this viewport holds (or labelled not received), are skipped.
+fn append_scrollback2_tail(st: &mut ClientState, row_offset: u64, rows: &[Vec<u8>]) {
+    let end = row_offset + rows.len() as u64;
+    if end <= st.sb2_rows {
+        return;
+    }
+    st.scrollback.append(&rows[(st.sb2_rows - row_offset) as usize..]);
+    st.sb2_rows = end;
+}
+
+/// Advance `T` over what is held from it and over what can no longer
+/// arrive: a gap below the extent's floor (up to the first held body) is
+/// not received. Stops at a gap the server can still fill (RFC 0009 §3.1).
+fn settle_history(st: &mut ClientState) {
+    loop {
+        if let Some((off, rows)) = st.sb2_held.take_reachable(st.sb2_rows) {
+            append_scrollback2_tail(st, off, &rows);
+            continue;
+        }
+        let floor = st.sb2_extent.map_or(0, |x| x.evicted_upto);
+        let gone_to = st.sb2_held.first_offset().map_or(floor, |o| o.min(floor));
+        if gone_to <= st.sb2_rows {
+            return;
+        }
+        st.scrollback.mark_not_received(gone_to - st.sb2_rows);
+        st.sb2_rows = gone_to;
+    }
+}
+
+/// Where the history tail stands, for [`keep_history_anchor`]: ring rows
+/// ever appended (posh#225 Task 4.3 switches both to view rows).
+fn history_mark(st: &ClientState) -> u64 {
+    st.scrollback.appended()
+}
+
+/// While scrolled, keep the window on the rows it shows: everything joins
+/// the history at the tail, so the offset grows by what joined since `mark`.
+fn keep_history_anchor(st: &mut ClientState, mark: u64) {
+    let grew = (history_mark(st) - mark) as usize;
+    if st.scroll_offset > 0 && grew > 0 {
+        set_scroll(st, st.scroll_offset + grew);
+    }
 }
 
 fn apply_frame(st: &mut ClientState, frame: &ServerFrame) -> bool {
@@ -3233,20 +3337,9 @@ fn apply_frame(st: &mut ClientState, frame: &ServerFrame) -> bool {
             st.stats.record_apply_dup();
             return true; // fully covered retransmission
         }
-        // Partial overlap: the rows below our count are ones we hold, the
-        // rest are new — append only the tail. The session daemon resends
-        // from a lagging ack (posh#225 Stage 3), so an overlap is routine,
-        // not reordering; discarding it would stall the stream until a
-        // resend happened to start exactly at our count.
-        let fresh = &rows[st.sb2_rows.saturating_sub(*row_offset) as usize..];
-        // In-order append, or a forward jump (server-ring eviction): the gap is
-        // permanently lost and the partial view is first-class (FDR 0005).
-        let grew = fresh.len();
-        st.scrollback.append(fresh);
-        if st.scroll_offset > 0 {
-            set_scroll(st, st.scroll_offset + grew);
-        }
-        st.sb2_rows = end;
+        let mark = history_mark(st);
+        apply_scrollback2_rows(st, *row_offset, rows);
+        keep_history_anchor(st, mark);
         st.stats.record_apply_advanced();
         return true;
     }
@@ -3845,6 +3938,11 @@ fn outgoing_caps(st: &mut ClientState) -> Vec<caps::Cap> {
     if st.paced {
         extra.push(caps::encode_paced());
     }
+    // posh#225 Stage 4 (RFC 0009 §3.1): ask for the v2 extent, so a forward
+    // jump can be told apart from a lost body. Init-persistent and every
+    // message for the same reason as CAP_PACED — including the
+    // resize-suppressed one, which may be the first a fresh M2 channel sees.
+    extra.push(caps::encode_scrollback2_extent_request());
     // Server transport-state piggyback (#6) + agent-endpoint diag (FDR 0004):
     // ask the server to attach its live state in a debug posture OR
     // when agent forwarding is active (so the agent-forwarding palette can show
@@ -5400,6 +5498,8 @@ mod tests {
             suppress_scrollback_once: false,
             sb2_epoch: None,
             sb2_rows: 0,
+            sb2_extent: None,
+            sb2_held: sync::HeldRows::default(),
             last_drawn: Snapshot::blank(rows, cols),
             initialized: false,
             last_wheel: false,
@@ -5520,6 +5620,9 @@ mod tests {
 
         let deadline = now_ms() + 8_000;
         let mut frames_applied = 0u64;
+        let mut rows_not_received = 0u64;
+        let mut jumps_unmarked = 0usize;
+        let mut held_drains = 0usize;
         while now_ms() < deadline {
             // Advertise the real caps so the server interleaves scrollback with
             // visible frames — historically (#95) the wedge ingredient: a v1
@@ -5587,8 +5690,28 @@ mod tests {
                         };
                         // The full frame path (not bare apply_frame): v2 epoch
                         // adoption rides the frame's SCROLLBACK2 ack cap.
+                        let pre_sb2 = (st.sb2_epoch, st.sb2_rows, st.scrollback.appended());
+                        let pre_held = st.sb2_held.rows();
                         process_frame(&mut st, &frame);
                         frames_applied += 1;
+                        if st.sb2_held.rows() < pre_held && st.sb2_epoch == pre_sb2.0 {
+                            held_drains += 1;
+                        }
+                        // posh#225 Stage 4: rows the count passed without
+                        // appending were labelled not received. With
+                        // server_loop's extent in hand that happens only at
+                        // its floor (§3.1); with none it is the legacy
+                        // accepted jump — a lost body taken for eviction,
+                        // the seam this stage removes. server_loop sends the
+                        // extent beside every id-10 entry, so none may occur.
+                        if st.sb2_epoch == pre_sb2.0 {
+                            let labelled =
+                                (st.sb2_rows - pre_sb2.1) - (st.scrollback.appended() - pre_sb2.2);
+                            rows_not_received += labelled;
+                            if labelled > 0 && st.sb2_extent.is_none() {
+                                jumps_unmarked += 1;
+                            }
+                        }
                         if st.stats.apply_snapshot().reack > before {
                             let ps = if let FrameBody::Diff { diff, .. } = &frame.body {
                                 if diff.len() >= 8 {
@@ -5676,10 +5799,22 @@ mod tests {
             st.sb2_rows > 0,
             "no v2 scrollback rows accepted despite a scrolling flood"
         );
+        // posh#225 Stage 4 (RFC 0009 §3.1): server_loop's half — it reports
+        // its extent to a viewport that asks, so under 35% loss a lost body
+        // is held for the resend, never accepted as a jump.
+        assert!(st.sb2_extent.is_some(), "the extent never engaged");
+        assert_eq!(
+            jumps_unmarked, 0,
+            "a forward jump was accepted with no extent in hand (loss taken for eviction)"
+        );
         eprintln!(
             "harness CLEAN: {frames_applied} frames applied, reack=0, \
-             base_sum_mismatch=0, sb2_rows={}",
-            st.sb2_rows
+             base_sum_mismatch=0, sb2_rows={}, held={}, holes={}, \
+             rows_not_received={rows_not_received}, held_drains={held_drains}, extent={:?}",
+            st.sb2_rows,
+            st.sb2_held.rows(),
+            st.scrollback.view_len() - st.scrollback.len(),
+            st.sb2_extent.map(|x| (x.avail_rows, x.evicted_upto)),
         );
     }
 
@@ -6517,6 +6652,412 @@ mod tests {
         process_frame(&mut st, &frame);
         assert_eq!(st.sb2_rows, 4, "the same epoch again must not reset");
         assert_eq!(st.scrollback.len(), 1);
+    }
+
+    // ---- posh#225 Stage 4: the viewport tells eviction from loss (RFC 0009 §3.1) ----
+
+    fn v2_rows(off: u64, n: u64) -> Vec<Vec<u8>> {
+        (off..off + n).map(|i| format!("row {i:03}").into_bytes()).collect()
+    }
+
+    fn v2_frame(caps: Vec<caps::Cap>, body: FrameBody) -> ServerFrame {
+        ServerFrame {
+            flags: 0,
+            caps,
+            frame_num: 1,
+            input_ack: 0,
+            echo_ack: 0,
+            body,
+        }
+    }
+
+    fn v2_body_of(epoch: u8, off: u64, n: u64) -> FrameBody {
+        FrameBody::Scrollback2 {
+            epoch,
+            row_offset: off,
+            rows: v2_rows(off, n),
+        }
+    }
+
+    /// A v2 body with no capability table (no epoch ack, no extent).
+    fn v2_body(epoch: u8, off: u64, n: u64) -> ServerFrame {
+        v2_frame(vec![], v2_body_of(epoch, off, n))
+    }
+
+    fn extent_caps(epoch: u8, avail_rows: u64, evicted_upto: u64) -> Vec<caps::Cap> {
+        vec![
+            caps::encode_scrollback2_ack(epoch),
+            caps::encode_scrollback2_extent(&caps::Scrollback2Extent {
+                epoch,
+                avail_rows,
+                evicted_upto,
+            }),
+        ]
+    }
+
+    /// An `Empty` frame carrying the id-10 epoch ack and the id-24 extent.
+    fn extent_frame(epoch: u8, avail: u64, floor: u64) -> ServerFrame {
+        v2_frame(extent_caps(epoch, avail, floor), FrameBody::Empty)
+    }
+
+    /// A v2 body carrying the epoch ack and the extent, as both senders send it.
+    fn body_with_extent(epoch: u8, off: u64, n: u64, avail: u64, floor: u64) -> ServerFrame {
+        v2_frame(extent_caps(epoch, avail, floor), v2_body_of(epoch, off, n))
+    }
+
+    /// A viewport holding v2 epoch 1 and nothing else.
+    fn v2_state() -> ClientState {
+        let mut st = test_state(5, 20);
+        st.sb2_epoch = Some(1);
+        st
+    }
+
+    /// The `acked_rows` the next outgoing message reports.
+    fn acked(st: &mut ClientState) -> u64 {
+        let caps = outgoing_caps(st);
+        let entry = caps::find(&caps, caps::CAP_SCROLLBACK2).expect("v2 advertised");
+        caps::decode_scrollback2_client(&entry.payload).unwrap().acked_rows
+    }
+
+    fn ring_rows(st: &ClientState) -> Vec<Vec<u8>> {
+        (0..st.scrollback.len())
+            .map(|i| st.scrollback.row(i).unwrap().to_vec())
+            .collect()
+    }
+
+    /// The not-received holes in view order.
+    fn holes(st: &ClientState) -> Vec<u64> {
+        (0..st.scrollback.view_len())
+            .filter_map(|i| match st.scrollback.view_row(i) {
+                Some(sync::ViewRow::NotReceived(n)) => Some(n),
+                _ => None,
+            })
+            .collect()
+    }
+
+    fn arriving(st: &ClientState) -> u64 {
+        st.sb2_extent.expect("an extent").avail_rows - st.sb2_rows
+    }
+
+    /// The request is Init-persistent (RFC 0009 §5): the M2 bridge forms the
+    /// daemon Init from the first message it sees, which may be the
+    /// resize-suppressed one, so it rides every message, unlike id 10.
+    #[test]
+    fn outgoing_caps_requests_the_extent_with_scrollback2() {
+        let mut st = test_state(5, 20);
+        let request = caps::encode_scrollback2_extent_request();
+        let c = outgoing_caps(&mut st);
+        assert!(caps::find(&c, caps::CAP_SCROLLBACK2).is_some());
+        assert_eq!(caps::find(&c, caps::CAP_SCROLLBACK2_EXTENT), Some(&request));
+        st.suppress_scrollback_once = true;
+        let c = outgoing_caps(&mut st);
+        assert!(caps::find(&c, caps::CAP_SCROLLBACK2).is_none(), "id 10 ceases for the resize");
+        assert_eq!(
+            caps::find(&c, caps::CAP_SCROLLBACK2_EXTENT),
+            Some(&request),
+            "the extent request does not"
+        );
+    }
+
+    #[test]
+    fn without_an_extent_a_jump_is_accepted_and_labelled_not_received() {
+        let mut st = v2_state();
+        process_frame(&mut st, &v2_body(1, 0, 2));
+        process_frame(&mut st, &v2_body(1, 10, 1));
+        assert_eq!(st.sb2_rows, 11);
+        assert_eq!(st.scrollback.len(), 3);
+        assert_eq!(st.scrollback.view_row(2), Some(sync::ViewRow::NotReceived(8)));
+        assert_eq!(st.scrollback.view_row(3), Some(sync::ViewRow::Row(b"row 010")));
+        assert_eq!(acked(&mut st), 11);
+    }
+
+    #[test]
+    fn a_jump_at_or_below_the_floor_is_not_received() {
+        let mut st = v2_state();
+        process_frame(&mut st, &v2_body(1, 0, 20));
+        process_frame(&mut st, &body_with_extent(1, 30, 10, 40, 30));
+        assert_eq!(holes(&st), vec![10]);
+        assert_eq!(st.scrollback.len(), 30, "the 10 rows past the floor are appended");
+        assert_eq!(st.scrollback.view_row(20), Some(sync::ViewRow::NotReceived(10)));
+        assert_eq!(st.sb2_rows, 40);
+        assert_eq!(acked(&mut st), 40);
+    }
+
+    /// Hold `30..40` past `T = 20` under an extent whose floor is 0.
+    fn held_at_twenty() -> ClientState {
+        let mut st = v2_state();
+        process_frame(&mut st, &extent_frame(1, 40, 0));
+        process_frame(&mut st, &v2_body(1, 0, 20));
+        process_frame(&mut st, &v2_body(1, 30, 10));
+        st
+    }
+
+    #[test]
+    fn a_jump_above_the_floor_is_held_and_not_acked_past() {
+        let mut st = held_at_twenty();
+        assert_eq!(st.sb2_rows, 20);
+        assert_eq!(st.scrollback.len(), 20);
+        assert_eq!(holes(&st), Vec::<u64>::new());
+        assert_eq!(st.sb2_held.rows(), 10);
+        assert_eq!(acked(&mut st), 20, "the ack stays at the gap's start");
+        assert_eq!(arriving(&st), 20, "the held gap is part of the arriving count");
+    }
+
+    #[test]
+    fn the_resend_fills_the_gap_and_drains_what_was_held() {
+        let mut st = held_at_twenty();
+        process_frame(&mut st, &v2_body(1, 20, 10));
+        assert_eq!(st.sb2_rows, 40);
+        assert_eq!(ring_rows(&st), v2_rows(0, 40), "rows 0..40 in order");
+        assert_eq!(holes(&st), Vec::<u64>::new());
+        assert_eq!(st.sb2_held.rows(), 0);
+        assert_eq!(acked(&mut st), 40);
+    }
+
+    #[test]
+    fn a_floor_that_passes_a_held_gap_makes_it_not_received() {
+        let mut st = held_at_twenty();
+        process_frame(&mut st, &extent_frame(1, 40, 30));
+        assert_eq!(holes(&st), vec![10]);
+        assert_eq!(st.sb2_rows, 40);
+        assert_eq!(st.sb2_held.rows(), 0);
+        let mut want = v2_rows(0, 20);
+        want.extend(v2_rows(30, 10));
+        assert_eq!(ring_rows(&st), want, "the held rows appended after the hole");
+        assert_eq!(st.scrollback.view_row(20), Some(sync::ViewRow::NotReceived(10)));
+    }
+
+    #[test]
+    fn the_floor_alone_settles_a_gap_with_nothing_held() {
+        let mut st = v2_state();
+        process_frame(&mut st, &extent_frame(1, 20, 0));
+        process_frame(&mut st, &v2_body(1, 0, 20));
+        process_frame(&mut st, &extent_frame(1, 60, 35));
+        assert_eq!(holes(&st), vec![15]);
+        assert_eq!(st.sb2_rows, 35);
+        assert_eq!(arriving(&st), 25);
+        assert_eq!(acked(&mut st), 35, "rows that can never arrive are acked past");
+    }
+
+    #[test]
+    fn an_extent_of_another_epoch_is_ignored_and_a_new_epoch_clears_it() {
+        let mut st = v2_state();
+        process_frame(&mut st, &v2_body(1, 0, 10));
+        process_frame(&mut st, &v2_body(1, 15, 5));
+        assert_eq!(holes(&st), vec![5], "a no-extent jump, labelled");
+        process_frame(&mut st, &extent_frame(1, 40, 0));
+        process_frame(&mut st, &v2_body(1, 30, 10));
+        assert_eq!((st.sb2_rows, st.sb2_held.rows()), (20, 10));
+        let x = st.sb2_extent;
+        let other = caps::encode_scrollback2_extent(&caps::Scrollback2Extent {
+            epoch: 2,
+            avail_rows: 90,
+            evicted_upto: 60,
+        });
+        process_frame(&mut st, &v2_frame(vec![other], FrameBody::Empty));
+        assert_eq!(st.sb2_extent, x, "an extent of another epoch is ignored");
+        assert_eq!((st.sb2_rows, st.sb2_held.rows()), (20, 10));
+        assert_eq!(holes(&st), vec![5]);
+
+        process_frame(&mut st, &v2_frame(vec![caps::encode_scrollback2_ack(2)], FrameBody::Empty));
+        assert_eq!(st.sb2_epoch, Some(2));
+        assert_eq!(st.sb2_extent, None);
+        assert_eq!(st.sb2_held.rows(), 0);
+        assert_eq!(st.scrollback.view_len(), 0, "the ring and its holes are cleared");
+        assert_eq!(st.sb2_rows, 0);
+    }
+
+    #[test]
+    fn the_extent_only_moves_forward() {
+        let mut st = v2_state();
+        process_frame(&mut st, &extent_frame(1, 50, 30));
+        process_frame(&mut st, &extent_frame(1, 40, 10));
+        let x = st.sb2_extent.unwrap();
+        assert_eq!((x.avail_rows, x.evicted_upto), (50, 30), "a reordered older extent");
+        process_frame(&mut st, &extent_frame(1, 45, 35));
+        let x = st.sb2_extent.unwrap();
+        assert_eq!((x.avail_rows, x.evicted_upto), (50, 35), "each field its own maximum");
+    }
+
+    #[test]
+    fn an_own_resize_clears_the_extent_and_what_was_held() {
+        let mut st = held_at_twenty();
+        process_frame(&mut st, &v2_body(1, 50, 1)); // nothing marks this either
+        reset_history_for_own_resize(&mut st);
+        assert_eq!(st.sb2_extent, None);
+        assert_eq!(st.sb2_held.rows(), 0);
+        assert_eq!((st.sb2_epoch, st.sb2_rows), (None, 0));
+        assert_eq!(st.scrollback.view_len(), 0);
+        assert!(st.suppress_scrollback_once);
+    }
+
+    #[test]
+    fn held_bodies_past_the_bound_are_discarded_for_the_resend() {
+        let mut st = v2_state();
+        process_frame(&mut st, &extent_frame(1, 5_000, 0));
+        let per = crate::remote::history::SB2_ROWS_PER_BODY;
+        // Four full bodies past a 10-row gap fill the buffer exactly.
+        for k in 0..4 {
+            process_frame(&mut st, &v2_body(1, 10 + k * per, per));
+        }
+        assert_eq!(st.sb2_held.rows(), sync::SB2_HELD_MAX_ROWS);
+        let past = 10 + 4 * per;
+        process_frame(&mut st, &v2_body(1, past, per));
+        assert_eq!(st.sb2_held.rows(), sync::SB2_HELD_MAX_ROWS, "the fifth is discarded");
+        assert_eq!(st.sb2_rows, 0);
+        // The resend fills the gap; the held four drain; the fifth is owed.
+        process_frame(&mut st, &v2_body(1, 0, 10));
+        assert_eq!(st.sb2_rows, past);
+        assert_eq!(st.sb2_held.rows(), 0);
+        assert_eq!(acked(&mut st), past, "the go-back-N resend starts at the discarded body");
+        process_frame(&mut st, &v2_body(1, past, per));
+        assert_eq!(st.sb2_rows, past + per);
+        assert_eq!(ring_rows(&st), v2_rows(0, past + per));
+        assert_eq!(holes(&st), Vec::<u64>::new());
+    }
+
+    /// The resend timeout of the end-to-end cursor tests.
+    const CURSOR_RTO: u64 = 100;
+
+    /// A 5x20 session terminal with a `ring`-row scrollback, its screen
+    /// filled so every further line scrolls one row, and a fresh cursor
+    /// (unbounded window, as in `server_loop`) opened at its total.
+    fn session_and_cursor(ring: usize) -> (Terminal, crate::remote::history::HistoryCursor) {
+        use crate::remote::history::{HistoryCursor, HistoryStart};
+        let mut term = Terminal::with_scrollback(5, 20, ring);
+        term.process(b"a\r\nb\r\nc\r\nd\r\n");
+        let mut cursor = HistoryCursor::new((5, 20));
+        cursor.activate(HistoryStart::Fresh, term.primary_scrollback_total());
+        (term, cursor)
+    }
+
+    /// Scroll `n` distinct rows into the session terminal's ring.
+    fn scroll_session(term: &mut Terminal, n: u64) {
+        let first = term.primary_scrollback_total();
+        for i in first..first + n {
+            term.process(format!("{i:04}\r\n").as_bytes());
+        }
+    }
+
+    /// The cursor's next body as `server_loop` frames it: id 10 (the epoch)
+    /// and the extent beside it.
+    fn cursor_frame(cursor: &mut crate::remote::history::HistoryCursor, term: &Terminal, now: u64) -> ServerFrame {
+        let (epoch, body) = cursor.next_body(term, now, CURSOR_RTO, u64::MAX);
+        let mut table = vec![caps::encode_scrollback2_ack(epoch)];
+        table.extend(cursor.extent(term).as_ref().map(caps::encode_scrollback2_extent));
+        v2_frame(table, body)
+    }
+
+    /// The real sender (`HistoryCursor`, unbounded window as in
+    /// `server_loop`) and this viewport over a link that drops the first
+    /// body: frames carry id 10 and the cursor's extent, as `server_loop`
+    /// builds them. Returns the viewport and the session terminal.
+    fn repair_after_losing_the_first_body(ring: usize, scrolled: u64) -> (ClientState, Terminal) {
+        use crate::remote::history::HistoryCursor;
+        const RTO: u64 = CURSOR_RTO;
+        let (mut term, mut cursor) = session_and_cursor(ring);
+        scroll_session(&mut term, scrolled);
+        let send = cursor_frame;
+        let mut st = test_state(5, 20);
+        let mut frames = Vec::new();
+        while cursor.wants(term.primary_scrollback_total(), 0, RTO, u64::MAX) {
+            frames.push(send(&mut cursor, &term, 0));
+        }
+        assert!(!frames.is_empty());
+        for frame in &frames[1..] {
+            process_frame(&mut st, frame);
+        }
+        let ack = |st: &mut ClientState, cursor: &mut HistoryCursor, now: u64| {
+            if let Some(epoch) = st.sb2_epoch {
+                cursor.on_ack(epoch, acked(st), now);
+            }
+        };
+        ack(&mut st, &mut cursor, 0);
+        assert!(cursor.wants(term.primary_scrollback_total(), RTO, RTO, u64::MAX), "a resend is due");
+        process_frame(&mut st, &send(&mut cursor, &term, RTO));
+        ack(&mut st, &mut cursor, RTO);
+        (st, term)
+    }
+
+    fn session_rows(term: &Terminal) -> Vec<Vec<u8>> {
+        (0..term.primary_scrollback_len())
+            .map(|i| term.dump_scrollback_row(i).unwrap())
+            .collect()
+    }
+
+    #[test]
+    fn a_cursor_and_a_viewport_repair_a_lost_body_without_a_hole() {
+        let (st, term) = repair_after_losing_the_first_body(1000, 600);
+        assert_eq!(st.sb2_rows, 600);
+        assert_eq!(st.sb2_held.rows(), 0);
+        assert_eq!(ring_rows(&st), session_rows(&term), "the 600 rows in order");
+        assert_eq!(holes(&st), Vec::<u64>::new(), "a lost body is not a hole");
+
+        let (st, term) = repair_after_losing_the_first_body(50, 200);
+        assert_eq!(st.sb2_rows, 200);
+        assert_eq!(holes(&st), vec![150], "eviction is exactly one hole");
+        assert_eq!(st.scrollback.view_row(0), Some(sync::ViewRow::NotReceived(150)));
+        assert_eq!(ring_rows(&st), session_rows(&term), "the 50 retained rows");
+
+        // Hold and eviction at once: the floor is 600, so the bodies start
+        // there (600..856, 856..900); the first is lost, the second held
+        // above the settled floor until the resend fills 600..856.
+        let (st, term) = repair_after_losing_the_first_body(300, 900);
+        assert_eq!(st.sb2_rows, 900);
+        assert_eq!(st.sb2_held.rows(), 0);
+        assert_eq!(holes(&st), vec![600], "eviction is exactly one hole, loss none");
+        assert_eq!(st.scrollback.view_row(0), Some(sync::ViewRow::NotReceived(600)));
+        assert_eq!(ring_rows(&st), session_rows(&term), "the 300 retained rows in order");
+    }
+
+    /// The viewport resized A→B→A and the message carrying B was lost, so
+    /// the sender never bumped: the viewport re-adopts the same epoch at
+    /// `T = 0` while the sender's ack stands at 20. Every body lands past
+    /// `T` and above the floor — held — and the ack of 0 cannot move the
+    /// sender's backwards, so without the reset rule the resend from 20
+    /// would be held again until the ring evicted past 20. The sender reads
+    /// the 0 as a reset and answers with a fresh epoch.
+    #[test]
+    fn a_viewport_reset_under_the_same_epoch_gets_a_fresh_epoch_not_a_held_stall() {
+        let (mut term, mut cursor) = session_and_cursor(1000);
+        let mut st = test_state(5, 20);
+        scroll_session(&mut term, 20);
+        process_frame(&mut st, &cursor_frame(&mut cursor, &term, 0));
+        assert_eq!((st.sb2_epoch, st.sb2_rows), (Some(1), 20));
+        assert!(cursor.on_ack(1, acked(&mut st), 0));
+
+        // The SIGWINCH path; the cursor hears of no size change.
+        reset_history_for_own_resize(&mut st);
+        let resize_msg = outgoing_caps(&mut st);
+        assert!(caps::find(&resize_msg, caps::CAP_SCROLLBACK2).is_none(), "suppressed for the resize");
+
+        scroll_session(&mut term, 5);
+        process_frame(&mut st, &cursor_frame(&mut cursor, &term, 10));
+        assert_eq!((st.sb2_epoch, st.sb2_rows), (Some(1), 0), "the same epoch, re-adopted at 0");
+        assert_eq!(st.sb2_held.rows(), 5, "the body at 20 is held: the stall's signature");
+        assert_eq!(acked(&mut st), 0);
+        assert!(!cursor.on_ack(1, acked(&mut st), 10), "a reset, not an advance");
+        assert!(cursor.reset_pending());
+
+        let total = term.primary_scrollback_total();
+        assert!(cursor.wants(total, 10, CURSOR_RTO, u64::MAX), "the fresh epoch is due at once");
+        process_frame(&mut st, &cursor_frame(&mut cursor, &term, 10));
+        assert_eq!(st.sb2_epoch, Some(2), "a fresh epoch, adopted");
+        assert_eq!(st.sb2_rows, 0);
+        assert_eq!(st.sb2_held.rows(), 0, "what was held belonged to the old row space");
+        assert_eq!(st.scrollback.view_len(), 0, "the ring is cleared");
+
+        for (now, n) in [(20, 3), (30, 4)] {
+            scroll_session(&mut term, n);
+            process_frame(&mut st, &cursor_frame(&mut cursor, &term, now));
+            let before = cursor.acked_rows();
+            assert!(cursor.on_ack(2, acked(&mut st), now), "the ack advances again");
+            assert_eq!(cursor.acked_rows(), before + n);
+        }
+        assert_eq!(st.sb2_rows, 7);
+        assert_eq!(st.sb2_held.rows(), 0);
+        assert_eq!(holes(&st), Vec::<u64>::new());
+        assert_eq!(ring_rows(&st), session_rows(&term)[term.primary_scrollback_len() - 7..].to_vec());
     }
 
     /// posh#225 Stage 2: with the gate on (`test_state`'s `paced: true`; the
