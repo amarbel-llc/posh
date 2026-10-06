@@ -500,6 +500,16 @@ _POSH_FRAMESYNC_
 	incremental escape-delta path; the default re-parses a full screen
 	dump each frame. See *posh-client*(1).
 
+_POSH_PACED_
+	Paced screen delivery for a remote (mux) attach, default on; _0_,
+	_false_, _off_ or _no_ turns it off. When on, the session daemon sends
+	the viewport at most one fresh screen per send opportunity instead of
+	one per PTY read, so under a flood the live screen jumps to the latest
+	state. Read per attach: takes effect on the next attach without
+	restarting the session. No effect on a local *posh attach* (unpaced
+	until a later stage) or a relayed viewport (_POSH_MUX_SESSIONS=0_). FDR
+	0021; see *posh-client*(1).
+
 _POSH_GRAB_MOUSE_
 	_on_/_off_ (default _off_): when on, the client grabs the wheel on
 	the outer terminal at a bare prompt and turns wheel up/down into

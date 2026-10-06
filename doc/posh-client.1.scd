@@ -194,6 +194,20 @@ _POSH_FRAMESYNC_
 	full-dump path for any client that does not request _morph_, so the wire
 	is unchanged by default.
 
+_POSH_PACED_
+	Paced screen delivery for a remote (mux) attach (FDR 0021, posh#225),
+	default on; _0_, _false_, _off_ or _no_ turns it off. When on, the
+	session daemon sends this viewport at most one fresh screen per send
+	opportunity — once the previous one is acknowledged (or an ack wait has
+	passed) — instead of one per PTY read, so under a flood the live screen
+	jumps to the latest state rather than replaying every intermediate one,
+	and the viewport is never dropped for falling behind. The program in the
+	session is never slowed. Read once per attach: a change takes effect on
+	the next attach, without restarting the session. No effect on a local
+	*posh attach* (unpaced until a later stage) or on a viewport reached
+	through the relay (_POSH_MUX_SESSIONS=0_). The *Ctrl-^* palette's *About /
+	transport info* lists it.
+
 _POSH_GRAB_MOUSE_
 	_on_/_off_ (default _off_): at a bare prompt the wheel scrolls the
 	session's primary-screen scrollback locally (FDR 0005) — instant,

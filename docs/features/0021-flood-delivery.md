@@ -22,8 +22,11 @@ is sent at most one screen at a time, and that screen is the newest.
 
 - **`POSH_PACED`** on the viewport (the remote client). Default on for a
   remote attach over the mux (M2); `0`, `false`, `off` or `no` turns it off.
-  Read once per attach. When on, the viewport advertises `CAP_PACED` (RFC 0001
-  id 23) and the M2 bridge carries it into the daemon's Init.
+  Read once per attach, so a change takes effect on the next attach without
+  restarting the session. When on, the viewport advertises `CAP_PACED`
+  (RFC 0001 id 23) on every message and the M2 bridge carries it into the
+  daemon's Init. The palette's About view lists `POSH_PACED` with the other
+  gates and its state for this attach.
 - **What the user sees:** during a flood the live screen jumps to the latest
   state rather than replaying every intermediate one, and at most one screen
   is in flight to the viewport. What the user sees and what their keystrokes
@@ -33,7 +36,7 @@ is sent at most one screen at a time, and that screen is the newest.
 - **Not paced:** a local `posh attach` (it does not advertise the capability
   yet — a later stage), and a viewport reached through the relay
   (`POSH_MUX_SESSIONS=0`): the relay does not forward `CAP_PACED` (ADR 0007).
-  Both get today's per-read delivery.
+  Both get today's per-read delivery whatever `POSH_PACED` says.
 
 The wire contract is RFC 0008 §3.2.
 
@@ -82,13 +85,32 @@ viewport). Settled for this stage, 2026-10-06:
 
 ## Limitations
 
+- **History during a flood needs RTT below ≈ 5 × `PACED_ACK_WAIT_MS`**
+  (≈ 1.25 s). The frame producer's 8-frame outstanding window holds four
+  visible+scrollback pairs, and a paced viewport is sent one pair per
+  `PACED_ACK_WAIT_MS` while acks are in flight, so an RTT above about
+  5 × `PACED_ACK_WAIT_MS` less one pace interval evicts a frame before its
+  ack lands: the v1 base is lost, every visible frame is a `Full`, and v1
+  history is withheld until the flood ends (measured: 0 rows acked at
+  1500 ms RTT, against 17,730 of 20,511 at 300 ms). The viewport stays
+  attached and the live screen keeps updating. Stage 3's addressed history
+  removes the dependence on the base.
 - **v1 history re-carry.** A paced viewport that never acks is re-sent up to
-  one ring of history every `PACED_ACK_WAIT_MS`. The cap is not at risk (at
-  most one visible frame and its scrollback frame are ever queued), but the
-  bandwidth is spent. A later stage replaces v1 history for paced viewports.
+  one ring of history every `PACED_ACK_WAIT_MS` (measured: a 1,045,177-byte
+  scrollback frame carrying the whole 10,000-row ring). This is bandwidth,
+  not backlog — at most one visible frame and its scrollback frame are ever
+  queued, so the cap is not at risk. Stage 3 replaces v1 history for paced
+  viewports.
+- **A slow reader loses rows to ring eviction.** While a ring-sized
+  scrollback frame drains to a slow reader, the ring keeps scrolling, and
+  rows evicted before the next scrollback frame are never shipped (measured
+  at 1 KiB/ms: ~4,300 of 20,511 rows). The live screen still ends on the last
+  screen. This is the existing eviction design; Stage 3's per-body cap
+  bounds the scrollback frame and with it the loss.
 - **A mismatched-geometry viewport** (wider, narrower or shorter than the
-  session) still gets ring-sized frames (`dump_vt`'s fallback) — but one at a
-  time.
+  session), or any viewport while an application has switched column mode
+  (DECCOLM), still gets ring-sized frames (`dump_vt`'s fallback) — but one at
+  a time.
 - **History is still lost across a reconnect** (a later stage).
 - **A viewport that is dropped is not told why** (posh#226); with pacing the
   drop is now a backstop, not the flood outcome.
@@ -97,11 +119,30 @@ viewport). Settled for this stage, 2026-10-06:
 
 | Lever | Current | Rationale | Change signal |
 |---|---|---|---|
-| `PACED_FRAME_FLOOR_MS` (`session/daemon.rs`) | 20 ms | `server_loop`'s send-interval floor (`SEND_INTERVAL_MIN`); ≤ 50 frames/s of encode work per viewport | measurement pending (posh#225 flood measurement, to be recorded here) |
-| `PACED_ACK_WAIT_MS` (`session/daemon.rs`) | 250 ms | `server_loop`'s send-interval ceiling (`SEND_INTERVAL_MAX`); bounds the stall a lost ack can cause | measurement pending, as above |
+| `PACED_FRAME_FLOOR_MS` (`session/daemon.rs`) | 20 ms | `server_loop`'s send-interval floor (`SEND_INTERVAL_MIN`); ≤ 50 frames/s of encode work per viewport | prompt acks: 26 visible frames for 512 chunks, peak backlog one frame pair (below); revisit if a measured flood shows encode cost or a frame rate the eye notices |
+| `PACED_ACK_WAIT_MS` (`session/daemon.rs`) | 250 ms | `server_loop`'s send-interval ceiling (`SEND_INTERVAL_MAX`); bounds the stall a lost ack can cause | never-acked: one visible frame per wait; it sets the history RTT cliff (≈ 5 × this, Limitations) — raise it if field RTTs approach the cliff |
 
-Both are tuned independently of `server_loop`'s clamp and change only with a
-measurement recorded in this table.
+Both start at `server_loop`'s send-interval clamp, are tuned independently of
+it, and change only with a measurement recorded here.
+
+**Measured** (2026-10-06, ideal-reader harness: 50x200, socket buffers
+pinned to 128 KiB, one write per chunk, 2 MiB flood, fake clock 1 ms per
+chunk, `--release`). Re-run with
+`just debug-cargo test --release -p posh --bin posh posh225_flood_backlog_ideal_reader_measurement -- --ignored --nocapture`.
+
+| Case | Visible frames | Peak backlog | History | Outcome |
+|---|---|---|---|---|
+| unpaced, 4 KiB chunks, prompt acks | 512 for 512 chunks | 9,369 B | — | — |
+| unpaced, never acked | one per chunk | crosses 16 MiB | — | dropped after 655,360 B fed (empty ring) / 651,264 B (full ring) |
+| paced, 4 KiB chunks, prompt acks | 26 for 512 chunks (≤ 1 per floor); at most 1 queued | 88,719 B (empty ring) / 92,352 B (full ring) = one 5,145 B visible frame + one ~800-row scrollback frame | 20,511 / 20,560 rows scrolled, all acked | ends on the last screen |
+| paced, never acked | 3 in 512 ms (4 KiB chunks), 10 in 2048 ms (1 KiB chunks): the first at the floor, then one per ack wait | 1,045,143–1,045,177 B = one scrollback frame carrying the whole 10,000-row ring | not acked (no acks) | never crosses the cap; ends on the last screen |
+| paced, 1 KiB chunks, RTT 50 ms | — | 58,405 B | 20,129 / 20,511 acked (empty ring) | ends on the last screen |
+| paced, 1 KiB chunks, RTT 300 ms | — | 527,217 B | 17,730 / 20,511 acked | ends on the last screen |
+| paced, 1 KiB chunks, RTT 1500 ms | every one a `Full` | 1,045,177 B (7 scrollback frames) | 0 acked: base lost (the RTT cliff) | still attached |
+| paced, slow reader (1 KiB/ms) | at most 1 queued | one ring-sized scrollback frame | ~4,300 of 20,511 rows never shipped (ring eviction) | ends on the last screen |
+
+Unpaced streams are byte-identical to before this feature, including beside a
+paced viewport on the same session.
 
 ## Rollback
 

@@ -271,6 +271,96 @@ where it differs** from this section.
 
 ---
 
+## Stage 2 as built (2026-10-06)
+
+Stage 2 is implemented on branch `quiet-willow` (`776b86d..db14c5c`). The
+Stage 2 task text below is kept as the historical plan and is **superseded
+where it differs** from this section. The user-facing record is FDR 0021.
+
+- **2.1 + 2.2 — `CAP_PACED` and the viewport** (`776b86d`, `ad7ab3c`; one
+  implementer took both). `CAP_PACED` is id 23 with its RFC 0001 row. The
+  roaming viewport advertises it on every message while `POSH_PACED` is
+  unset or on (`session::parse_paced_gate` / `paced_selected`, read once per
+  attach; `0`/`false`/`off`/`no` turn it off). The M2 bridge carries the
+  viewport's entry into the daemon Init (`bridge_init_content`); the relay
+  does not (ADR 0007), so a relayed viewport is unpaced, and the local
+  `posh attach` is unpaced until Stage 6. Deviation: the palette About view
+  lists `POSH_PACED` from the attach's own state (`st.paced`), not by
+  re-reading the environment.
+- **2.3 — the paced core** (`9a705b2`). A paced viewport gets at most ONE
+  fresh visible frame (plus its v1 scrollback frame behind it) per send
+  opportunity: `write_buf` empty AND (last fresh frame acked →
+  `PACED_FRAME_FLOOR_MS` = 20 ms after it was queued; else
+  `PACED_ACK_WAIT_MS` = 250 ms), built from the terminal as it is then. The
+  poll timeout is the nearest opportunity. Deviations: the per-read path
+  asks one helper, `ClientConn::takes_per_read_frames`, rather than testing
+  pacing at each site; the flush of a dirty paced viewport before `Exit`
+  moved into `daemon_loop`, ahead of `close_overlay`, so the last screen is
+  queued before the overlay is torn down.
+- **2.4 — every frame-owing event** (`602e949`). Attach replay, regeometry,
+  RESYNC, activity answer and source swap mark the viewport dirty and are
+  served at the next opportunity; only a RESYNC releases the ack wait.
+- **2.5 — flood harness, tests, measurement** (`1ca8b8b`, `db14c5c`; the
+  justfile's `debug-cargo-flake` FILTER is `2535deb`). Deviations from the
+  task text: the frame accounting is a `FloodLedger` rather than a shared
+  closure; a `FloodDrain::Trickle(n)` slow-reader drain was added; the
+  paced `Lagged` cadence is time-based (an RTT in ms on the fake clock)
+  rather than a chunk count, since chunk counts mean nothing once frames are
+  not per chunk; the idle tail is event-driven (it advances to the next
+  opportunity) rather than stepping a fixed `ms`. The `Lagged(5)` question
+  the task text left open is answered with an RTT sweep (below), and the
+  lost-base threshold is pinned at 5 × `PACED_ACK_WAIT_MS`.
+- **2.6 — the backstop says `paced=`** (`4d42b71`), as specified.
+- **2.7 — `session_frames=`** (`efab3c3`): the mux peer's SIGUSR2 line
+  counts visible frames forwarded, as specified.
+- **2.8 — records**: FDR 0021 (Tuning Levers, Limitations, Interface),
+  `POSH_PACED` in `posh-client(1)` and `posh(1)`, this section.
+- **Measured** (ideal-reader harness, 50x200, socket buffers pinned to
+  128 KiB, one write per chunk, 2 MiB flood, fake clock 1 ms per chunk,
+  `--release`; re-run with `just debug-cargo test --release -p posh --bin
+  posh posh225_flood_backlog_ideal_reader_measurement -- --ignored
+  --nocapture`; the full table is in FDR 0021):
+  - Unpaced is byte-identical to before (measured, including beside a paced
+    viewport). 4 KiB chunks, prompt acks: 512 visible frames for 512 chunks,
+    peak 9,369 B. Never acked: crosses 16 MiB after 655,360 B fed (empty
+    ring) / 651,264 B (full ring).
+  - Paced, 4 KiB chunks, prompt acks: 26 visible frames for 512 chunks,
+    peak 88,719 B (empty ring) / 92,352 B (full ring) — one 5,145 B visible
+    frame plus one ~800-row scrollback frame; at most one visible frame
+    queued; all 20,511 / 20,560 scrolled rows acked; ends on the last
+    screen.
+  - Paced, never acked: never crosses the cap; 3 visible frames in 512 ms
+    (4 KiB) / 10 in 2048 ms (1 KiB) — the first at the floor, then one per
+    ack wait; peak 1,045,143–1,045,177 B, one scrollback frame carrying the
+    whole 10,000-row ring; ends on the last screen.
+  - Paced RTT sweep (1 KiB chunks, 2048 ms flood): 50 ms → 20,129 / 20,511
+    rows acked, peak 58,405 B; 300 ms → 17,730 / 20,511, peak 527,217 B;
+    1500 ms → 0 acked, 7 scrollback frames, peak 1,045,177 B. The cliff: the
+    producer's 8-frame outstanding window holds four visible+scrollback
+    pairs at one pair per `PACED_ACK_WAIT_MS`, so an RTT above
+    5 × `PACED_ACK_WAIT_MS` less one pace (≈ 1.25 s) evicts a frame before
+    its ack lands, the base is lost, and v1 history stops for the flood
+    (every visible frame a `Full`). The viewport is never dropped. The task
+    text's expectation that a remote viewport leaves the lost-base regime
+    holds below the cliff only.
+  - Slow reader (1 KiB/ms): at most one visible frame queued, ends on the
+    last screen; ~4,300 of 20,511 rows never shipped — evicted from the ring
+    while a ~1 MB scrollback frame drained.
+- **Known limitations** (FDR 0021 Limitations): the RTT cliff above (Stage 3's
+  addressed history removes it); a never-acking viewport is re-sent up to a
+  ring of history per ack wait — bandwidth, not backlog (Stage 3); a slow
+  reader loses rows to ring eviction while a ring-sized scrollback frame
+  drains (Stage 3's per-body cap); a mismatched-geometry or DECCOLM viewport
+  still gets ring-sized visible frames, now one at a time (Stage 1's
+  limitation); history across a reconnect (Stage 5); a dropped viewport is
+  not told why (posh#226).
+- **posh#227** closes with this stage (decision 6, implemented here).
+- **Exit check: NOT yet done.** The field run — a `nix gc`-shaped flood on a
+  remote session, SIGUSR2 to the mux peer twice and `session_frames=`
+  compared, Ctrl-C mid-flood — needs this build deployed to the remote host.
+
+---
+
 ## Stage 0 — pin the failure
 
 ### Task 0.1: Commit the measurement tests
@@ -2198,7 +2288,7 @@ bottom once Stage 7 is done, or sooner only if the operator re-orders it.
 | # | Issue | Found | Note |
 |---|---|---|---|
 | 1 | **posh#226** — a viewport dropped by the backlog valve is never told why | field triage | Required by decision 6's backstop; independent of every stage. |
-| 2 | **posh#227** — drop policy for a healthy-but-outpaced client | UX grilling | Settled by decision 6 (recorded on the issue); close when Stage 2 lands — no separate work expected. |
+| 2 | **posh#227** — drop policy for a healthy-but-outpaced client | UX grilling | Settled by decision 6 (recorded on the issue); close when Stage 2 lands — no separate work expected. Closed by the Stage 2 merge. |
 | 3 | **posh#228** — `dump_vt`'s relative cursor anchor is moved by modes replayed after the flow (scroll region, origin mode, tab stops, kitty placements, DECCOLM) | Task 1.1 edge-case tests and review | Pre-existing; the mirror's cursor lands on the wrong row. Pinned by two `#[ignore]`d tests in `posh-term/src/dump.rs` (scroll region, tab stop); un-ignore both in the fix. Same-size viewports stop hitting it after Stage 1; other geometries still do. |
 | 4 | **posh#229** — `dump_vt` loses a line when a soft-wrapped row is followed by an empty row; the mirror draws the screen one row low | Task 1.1 code review | Pre-existing, and an ordinary shell state triggers it (wrap a command by one character, backspace). Pinned by an `#[ignore]`d test; un-ignore it in the fix. Same-size viewports stop hitting it after Stage 1; `posh history` (VT form) and other geometries still do. |
 | 5 | **posh#238** — one socket write per daemon iteration: measure whether a small send buffer (macOS 8 KiB) still out-produces a healthy reader after Stage 1 | Stage 1 review | Unverified. Stage 2 removes the platform dependence; close with the measurement either way. |
