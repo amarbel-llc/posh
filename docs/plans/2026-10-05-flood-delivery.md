@@ -1171,59 +1171,22 @@ bottom once Stage 7 is done, or sooner only if the operator re-orders it.
 | 2 | **posh#227** — drop policy for a healthy-but-outpaced client | UX grilling | Settled by decision 6 (recorded on the issue); close when Stage 2 lands — no separate work expected. |
 | 3 | **posh#228** — `dump_vt`'s relative cursor anchor is moved by modes replayed after the flow (scroll region, origin mode, tab stops, kitty placements, DECCOLM) | Task 1.1 edge-case tests and review | Pre-existing; the mirror's cursor lands on the wrong row. Pinned by two `#[ignore]`d tests in `posh-term/src/dump.rs` (scroll region, tab stop); un-ignore both in the fix. Same-size viewports stop hitting it after Stage 1; other geometries still do. |
 | 4 | **posh#229** — `dump_vt` loses a line when a soft-wrapped row is followed by an empty row; the mirror draws the screen one row low | Task 1.1 code review | Pre-existing, and an ordinary shell state triggers it (wrap a command by one character, backspace). Pinned by an `#[ignore]`d test; un-ignore it in the fix. Same-size viewports stop hitting it after Stage 1; `posh history` (VT form) and other geometries still do. |
+| 5 | **posh#238** — one socket write per daemon iteration: measure whether a small send buffer (macOS 8 KiB) still out-produces a healthy reader after Stage 1 | Stage 1 review | Unverified. Stage 2 removes the platform dependence; close with the measurement either way. |
+| 6 | **posh#233** — bound the frame dump at any geometry while the alternate screen is active | Stage 1 review | Unproven; equivalence tests first. Would close the mismatched-geometry gap for full-screen applications. |
+| 7 | **posh#235** — return a dump's shape with its bytes (one call, not `dump_vt_mirror` + `dump_vt_mirror_is_bounded`) | Stage 1 cleanup | Settle before promoting the provisional posh-term entries to the frozen list. |
+| 8 | **posh#236** — tighten the taller-mirror replay from `2 * mirror_rows` | Stage 1 cleanup | `2 * mirror_rows - rows` now; the exact height difference in the posh#229 fix. |
+| 9 | **posh#237** — `FrameProducer::encode_visible` clones its acked dump and snapshot per encode | Stage 1 cleanup | Pre-existing; still ring-sized for a viewport on the full dump. posh-proto API change. |
+| 10 | **posh#234** — `broadcast_output` clones the `Snapshot` for a producer-less client, then drops it | Stage 1 cleanup | Only matters with baseline and frame clients attached together. |
+| 11 | **posh#231** — can an orphaned zero-width spacer cell break the soft-wrap replay? | Stage 1 review | A reviewer's theoretical gap; not established that posh-term can produce the state. |
+| 12 | **posh#230** — build `ClientConn` test fixtures from one constructor | Stage 1 cleanup | Test maintenance; eight struct literals today. |
+| 13 | **posh#232** — a shared send/receive helper for `remote/server.rs`'s tests | Stage 1 cleanup | Test maintenance; ~a dozen copies of one loop. |
 
-Not yet filed, to be filed when confirmed:
+Recorded elsewhere rather than filed: the `ClientConn::mirror_geometry()`
+accessor is a comment on **posh#210** (the `CAP_SESSION_SIZE` / RFC 0012
+implementation issue), since it is a prerequisite step of that work.
 
-- **One socket write per daemon iteration** (`session/daemon.rs` write
-  section). On a host whose unix-socket send buffer is small (macOS
-  defaults to 8 KiB) the daemon may still out-produce a healthy reader
-  after Stage 1. Unverified; Stage 2 removes the dependence on any
-  platform. File only if a measurement on such a host shows it. The
-  posh#225 regression test now skips its capacity-dependent bounds on such
-  a host instead of failing (`macOS gap (posh#214)`), so a host like that is
-  not measured by the default gate.
-
-Candidates from the Stage 1 cleanup review (2026-10-05) — improvements, not
-bugs; none is filed. Promote one to an issue when it is about to be worked:
-
-- **`FrameProducer::encode_visible` clones its acked dump and snapshot on
-  every encode** (`posh-proto/src/framesync/producer.rs`). Predates
-  posh#225, which shrank the copy from ring-sized to screen-sized for
-  bounded viewports; it is still ring-sized for a viewport on the full
-  dump. A borrowing `Baseline` would remove it, at the cost of a posh-proto
-  API change.
-- **`broadcast_output` clones the `Snapshot` for a client with no
-  producer**, only to have `queue_frame` drop it (the call must stay: it
-  records the activity answer before checking for a producer). Matters only
-  when baseline and frame clients are attached together.
-- **Build `ClientConn` test fixtures from one constructor.** A new field
-  means editing eight hand-written struct literals in
-  `session/daemon.rs`'s tests; the final review says a `test_client_conn()`
-  constructor already exists there, so struct-update syntax over it would
-  do (not checked).
-- **Return a dump's shape with its bytes.** The daemon learns a dump's
-  shape from `dump_vt_mirror_is_bounded` and its bytes from
-  `dump_vt_mirror`, two calls that must be given the same terminal and
-  size. One call returning both would make a mismatch unrepresentable.
-- **Tighten the taller-mirror replay** from `2 * mirror_rows` rows to
-  `2 * mirror_rows - rows`, which the same argument already supports, or to
-  the exact height difference once posh#229 is fixed.
-- **A shared send/receive helper for `remote/server.rs`'s tests.** About a
-  dozen tests repeat the same ~25-line client loop.
-- **Bounding the dump at any geometry while the alternate screen is
-  active.** Replayed ring rows then only feed the hidden primary screen, and
-  the alternate grid is homed and absolutely anchored, so wider and shorter
-  mirrors of a full-screen application might be boundable too. Unproven;
-  needs its own equivalence tests.
-- **A reviewer's theoretical gap, unconfirmed:** the taller-mirror replay
-  assumes a soft-wrapped row prints exactly its full width. An orphaned
-  zero-width spacer cell would break that — in `dump_vt` as well. Not
-  established that posh-term can produce one.
-- **When RFC 0012 starts:** a `ClientConn::mirror_geometry()` accessor, so
-  "the size this client's mirror applies frames at" changes in one place
-  (it becomes the session's size for capable clients). Shrinking the
-  taller-mirror replay from `2 * mirror_rows` to the exact height
-  difference belongs to the posh#229 fix.
+All of rows 5–13 were filed 2026-10-06. The repo has no `triage` label, so
+none carries one.
 
 ## Follow-ups this plan does not do
 - **Pre-attach back-fill** (FDR 0005's deferred extension). Stage 3's

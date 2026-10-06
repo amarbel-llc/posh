@@ -135,7 +135,11 @@ full story lives; this list is not a tour of the system.
   `Terminal::process`, read via `screen()` / `dump_vt()` / `dump_text()`,
   drain query replies via `take_responses()`. `generation()` bumps on every
   visible change; `mid_escape()` marks escape-sequence boundaries. Callers
-  may ADD to `lib.rs`, never remove or change a signature.
+  may ADD to `lib.rs`, never remove or change a signature. The one
+  exception is the "Provisional API (not frozen)" section at the end of
+  that list: an entry there (today `dump_vt_mirror` and
+  `dump_vt_mirror_is_bounded`) may still change signature until it is moved
+  into the frozen list.
 - **Stream parsing (ADR-0003):** multi-byte structures (escape sequences,
   framed records) MUST be reassembled across read boundaries via a byte-fed
   state machine — never assume a `read()` delivers a whole sequence.
