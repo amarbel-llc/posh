@@ -564,6 +564,10 @@ pub struct ScrollbackRing {
     holes: std::collections::VecDeque<(u64, u64)>,
     /// Holes ever recorded (a merged mark adds none).
     holes_added: u64,
+    /// Lines ever marked not received, merged marks included: a hole's
+    /// label changes on a merge with no new view row, and the scroll view's
+    /// memo must still repaint ([`Self::view_revision`]).
+    lines_not_received: u64,
 }
 
 /// One row of the scroll view's history (posh#225 Stage 4): a ring row, or
@@ -582,6 +586,7 @@ impl ScrollbackRing {
             appended: 0,
             holes: std::collections::VecDeque::new(),
             holes_added: 0,
+            lines_not_received: 0,
         }
     }
 
@@ -611,6 +616,7 @@ impl ScrollbackRing {
         if lines == 0 {
             return;
         }
+        self.lines_not_received += lines;
         match self.holes.back_mut() {
             Some((before, merged)) if *before == self.appended => *merged += lines,
             _ => {
@@ -642,19 +648,26 @@ impl ScrollbackRing {
     }
 
     /// Rows ever appended (monotonic across eviction and `clear`).
+    #[cfg(test)]
     pub fn appended(&self) -> u64 {
         self.appended
     }
 
     /// View rows ever added — rows plus holes (monotonic across eviction
     /// and `clear`; a merged mark adds nothing).
-    #[allow(dead_code)] // posh#225 Task 4.3: the scroll view's memo key and anchor.
     pub fn view_total(&self) -> u64 {
         self.appended + self.holes_added
     }
 
+    /// Changes whenever what the scroll view would draw from this ring
+    /// changes — a row appended, a hole added, or a mark merged into the
+    /// tail hole (which relabels it without adding a view row). Monotonic;
+    /// a memo key, not a count of anything.
+    pub fn view_revision(&self) -> u64 {
+        self.view_total() + self.lines_not_received
+    }
+
     /// Ring rows plus holes held.
-    #[allow(dead_code)] // posh#225 Task 4.3: the scroll view draws holes.
     pub fn view_len(&self) -> usize {
         self.rows.len() + self.holes.len()
     }
@@ -662,7 +675,6 @@ impl ScrollbackRing {
     /// The `i`th view row (0 = oldest), holes interleaved where they sit,
     /// or `None` past the end. O(log holes): the scroll view asks it per
     /// visible row per frame (posh#225 Task 4.3).
-    #[allow(dead_code)] // posh#225 Task 4.3: the scroll view draws holes.
     pub fn view_row(&self, i: usize) -> Option<ViewRow<'_>> {
         let i = i as u64;
         let first = self.first_number();

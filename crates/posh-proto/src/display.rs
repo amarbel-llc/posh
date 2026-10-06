@@ -926,12 +926,36 @@ pub fn draw_bar_row(fb: &mut Snapshot, row: usize, text: &str) {
 /// Draws the scrollback scroll-view position indicator (FDR 0005) as a bold
 /// reverse-video bar across the top row: how far up the viewport sits and how
 /// to return to the live view. `lines_up` is the row distance above the live
-/// bottom.
-pub fn apply_scroll_indicator(fb: &mut Snapshot, lines_up: usize) {
-    let plural = if lines_up == 1 { "" } else { "s" };
-    let text =
-        format!("-- SCROLLBACK · {lines_up} line{plural} up · scroll down or press a key to resume --");
+/// bottom; `arriving` is how many history rows the server holds that have not
+/// reached this viewport yet (posh#225 Stage 4) — named only when non-zero,
+/// so a caught-up view keeps the plain text.
+pub fn apply_scroll_indicator(fb: &mut Snapshot, lines_up: usize, arriving: u64) {
+    let plural = |n: u64| if n == 1 { "" } else { "s" };
+    let up = format!("{lines_up} line{} up", plural(lines_up as u64));
+    let text = if arriving == 0 {
+        format!("-- SCROLLBACK · {up} · scroll down or press a key to resume --")
+    } else {
+        format!(
+            "-- SCROLLBACK · {up} · {} line{} still arriving · scroll down or press a key to resume --",
+            group_thousands(arriving),
+            plural(arriving)
+        )
+    };
     draw_top_bar(fb, &text);
+}
+
+/// `n` in decimal with a comma between each group of three digits
+/// (`12340` → `12,340`), for the line counts the scroll view names.
+pub fn group_thousands(n: u64) -> String {
+    let digits = n.to_string();
+    let mut out = String::with_capacity(digits.len() + digits.len() / 3);
+    for (i, d) in digits.chars().enumerate() {
+        if i > 0 && (digits.len() - i).is_multiple_of(3) {
+            out.push(',');
+        }
+        out.push(d);
+    }
+    out
 }
 
 #[cfg(test)]
@@ -942,6 +966,52 @@ mod tests {
         let mut t = Terminal::with_scrollback(rows, cols, 0);
         t.process(bytes);
         t
+    }
+
+    /// The scroll indicator's text for `(lines_up, arriving)` on a wide screen.
+    fn scroll_indicator_text(lines_up: usize, arriving: u64) -> String {
+        let mut fb = Snapshot::blank(3, 200);
+        apply_scroll_indicator(&mut fb, lines_up, arriving);
+        let text: String = fb.cells[0]
+            .iter()
+            .filter(|c| c.width > 0)
+            .map(|c| if c.ch == '\0' { ' ' } else { c.ch })
+            .collect();
+        text.trim_end().to_string()
+    }
+
+    #[test]
+    fn the_scroll_indicator_names_the_lines_still_arriving() {
+        assert_eq!(
+            scroll_indicator_text(2, 300),
+            "-- SCROLLBACK · 2 lines up · 300 lines still arriving · scroll down or press a key to resume --"
+        );
+        assert_eq!(
+            scroll_indicator_text(1, 1),
+            "-- SCROLLBACK · 1 line up · 1 line still arriving · scroll down or press a key to resume --"
+        );
+        assert!(scroll_indicator_text(12_345, 12_340).contains("· 12345 lines up · 12,340 lines still arriving ·"));
+    }
+
+    #[test]
+    fn the_scroll_indicator_is_unchanged_when_nothing_arrives() {
+        assert_eq!(
+            scroll_indicator_text(1, 0),
+            "-- SCROLLBACK · 1 line up · scroll down or press a key to resume --"
+        );
+        assert_eq!(
+            scroll_indicator_text(4, 0),
+            "-- SCROLLBACK · 4 lines up · scroll down or press a key to resume --"
+        );
+    }
+
+    #[test]
+    fn group_thousands_groups_by_three() {
+        assert_eq!(group_thousands(0), "0");
+        assert_eq!(group_thousands(999), "999");
+        assert_eq!(group_thousands(1_000), "1,000");
+        assert_eq!(group_thousands(12_340), "12,340");
+        assert_eq!(group_thousands(1_234_567), "1,234,567");
     }
 
     /// Renders the diff between two byte streams and verifies that a third

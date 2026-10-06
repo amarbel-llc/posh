@@ -1618,9 +1618,9 @@ struct ClientState {
     /// live bottom. 0 = live view; > 0 freezes the live view and renders a
     /// window of `scrollback` via `compose_scroll_frame`.
     scroll_offset: usize,
-    /// Idle fast-path key for the scroll view: (offset, ring len, generation)
-    /// at the last scroll compose. None forces the next scroll frame to repaint.
-    last_scroll_state: Option<(usize, usize, u64)>,
+    /// Idle fast-path key for the scroll view ([`scrollview::ScrollMemo`]) at
+    /// the last scroll compose. None forces the next scroll frame to repaint.
+    last_scroll_state: scrollview::ScrollMemo,
     /// Latest server-reported remote-PTY ECHO state (FLAG_ECHO). Gates
     /// optimistic local echo (FDR 0006); defaults off until the first frame.
     echo_on: bool,
@@ -2670,12 +2670,13 @@ fn reset_history_for_own_resize(st: &mut ClientState) {
 }
 
 /// Sets the scroll-view offset via the shared [`scrollview::set_scroll`],
-/// clamped to the ring depth. On a real change the shared helper invalidates the
-/// scroll memo; here we additionally invalidate the live-render memo (a remote
-/// client concern) so the next live render repaints on return to offset 0.
+/// clamped to the history view (ring rows, holes and the arriving row). On a
+/// real change the shared helper invalidates the scroll memo; here we
+/// additionally invalidate the live-render memo (a remote client concern) so
+/// the next live render repaints on return to offset 0.
 fn set_scroll(st: &mut ClientState, offset: usize) {
-    let ring_len = st.scrollback.len();
-    if scrollview::set_scroll(&mut st.scroll_offset, &mut st.last_scroll_state, ring_len, offset) {
+    let history_len = scrollview::history_view_len(&st.scrollback, history_arriving(st));
+    if scrollview::set_scroll(&mut st.scroll_offset, &mut st.last_scroll_state, history_len, offset) {
         st.last_render_state = (u64::MAX, u64::MAX);
     }
 }
@@ -2683,10 +2684,18 @@ fn set_scroll(st: &mut ClientState, offset: usize) {
 /// Applies wheel ticks to the scroll offset via the shared
 /// [`scrollview::scroll_by`]: + = up (into history), - = down (toward live).
 fn scroll_by(st: &mut ClientState, ticks: i32) {
-    let ring_len = st.scrollback.len();
-    if scrollview::scroll_by(&mut st.scroll_offset, &mut st.last_scroll_state, ring_len, ticks) {
+    let history_len = scrollview::history_view_len(&st.scrollback, history_arriving(st));
+    if scrollview::scroll_by(&mut st.scroll_offset, &mut st.last_scroll_state, history_len, ticks) {
         st.last_render_state = (u64::MAX, u64::MAX);
     }
+}
+
+/// History rows the server holds that have not reached this viewport yet —
+/// the extent's count past `T` (RFC 0009 §3.1, posh#225 Stage 4): held
+/// bodies and the gap below them, drawn as one arriving row. Zero without an
+/// extent.
+fn history_arriving(st: &ClientState) -> u64 {
+    st.sb2_extent.map_or(0, |x| x.avail_rows.saturating_sub(st.sb2_rows))
 }
 
 /// Whether local echo is safe to show right now: the remote PTY is echoing
@@ -3171,10 +3180,11 @@ fn process_frame(st: &mut ClientState, frame: &ServerFrame) -> bool {
         .and_then(|c| caps::decode_scrollback2_extent(&c.payload))
         .filter(|x| st.sb2_epoch == Some(x.epoch))
     {
+        // Marked before adopting: a raised extent can add the arriving row.
+        let mark = history_mark(st);
         let held = st.sb2_extent.get_or_insert(x);
         held.avail_rows = held.avail_rows.max(x.avail_rows);
         held.evicted_upto = held.evicted_upto.max(x.evicted_upto);
-        let mark = history_mark(st);
         settle_history(st);
         keep_history_anchor(st, mark);
     }
@@ -3275,18 +3285,23 @@ fn settle_history(st: &mut ClientState) {
     }
 }
 
-/// Where the history tail stands, for [`keep_history_anchor`]: ring rows
-/// ever appended (posh#225 Task 4.3 switches both to view rows).
+/// Where the history tail stands, for [`keep_history_anchor`], in view rows
+/// (the unit the offset counts): view rows ever added — monotonic across
+/// eviction, which happens at the far top — plus the arriving row while it
+/// is drawn.
 fn history_mark(st: &ClientState) -> u64 {
-    st.scrollback.appended()
+    st.scrollback.view_total() + u64::from(history_arriving(st) > 0)
 }
 
-/// While scrolled, keep the window on the rows it shows: everything joins
-/// the history at the tail, so the offset grows by what joined since `mark`.
+/// While scrolled, keep the window on the rows it shows: rows and holes join
+/// the history at the tail and the arriving row comes and goes there, so the
+/// offset moves by the signed change since `mark` — never below 1 while
+/// scrolled (offset 0 means live).
 fn keep_history_anchor(st: &mut ClientState, mark: u64) {
-    let grew = (history_mark(st) - mark) as usize;
-    if st.scroll_offset > 0 && grew > 0 {
-        set_scroll(st, st.scroll_offset + grew);
+    let delta = history_mark(st) as i64 - mark as i64;
+    if st.scroll_offset > 0 && delta != 0 {
+        let offset = (st.scroll_offset as i64 + delta).max(1) as usize;
+        set_scroll(st, offset);
     }
 }
 
@@ -3849,13 +3864,15 @@ fn compose_frame(st: &mut ClientState, now: u64) -> Vec<u8> {
 
 /// Builds the scroll-view escape stream (FDR 0005) via the shared
 /// [`scrollview::compose_scroll_frame`], threading this client's fields: the
-/// scroll offset + memo, the accumulated ring, the server model, the tty size,
+/// scroll offset + memo, the accumulated ring and the count of history rows
+/// still arriving ([`history_arriving`]), the server model, the tty size,
 /// and the render bookkeeping (`initialized`/`last_drawn`) it advances like any
 /// live frame. `scroll_opt` carries the palette scroll-shortcut toggle.
 fn compose_scroll_frame(st: &mut ClientState) -> Vec<u8> {
     scrollview::compose_scroll_frame(
         st.scroll_offset,
         &st.scrollback,
+        history_arriving(st),
         &st.server_term,
         st.rows,
         st.cols,
@@ -7221,6 +7238,112 @@ mod tests {
         );
         set_scroll(&mut st, 2); // offset changed → repaint
         assert!(!compose_scroll_frame(&mut st).is_empty());
+    }
+
+    // ---- posh#225 Task 4.3: the scroll view anchors across holes and arrivals ----
+
+    /// A 6x100 viewport holding v2 epoch 1, and the tty it draws onto (wide
+    /// enough for the whole scroll bar).
+    fn v2_scroll_state() -> (ClientState, Terminal) {
+        let mut st = test_state(6, 100);
+        st.sb2_epoch = Some(1);
+        (st, Terminal::with_scrollback(6, 100, 0))
+    }
+
+    /// Draw the scroll view onto `tty`; its rows, trimmed both ends.
+    fn scroll_view(st: &mut ClientState, tty: &mut Terminal) -> Vec<String> {
+        tty.process(&compose_scroll_frame(st));
+        let snap = Snapshot::from_term(tty);
+        (0..snap.cells.len())
+            .map(|r| row_text(&snap, r).trim().to_string())
+            .collect()
+    }
+
+    /// Scroll so the first history row under the bar (tty row 1) is view
+    /// row 5 — `row 005` while nothing below it is a hole.
+    fn scroll_to_view_row_five(st: &mut ClientState) {
+        let total = history_view_len(st) + st.rows as usize;
+        set_scroll(st, total - st.rows as usize - 4);
+    }
+
+    fn history_view_len(st: &ClientState) -> usize {
+        scrollview::history_view_len(&st.scrollback, history_arriving(st))
+    }
+
+    /// A v2 body of CRLF-terminated `row NNN` rows, as a server ships them
+    /// (`v2_body`'s bare rows would run together on screen).
+    fn drawn_body(off: u64, n: u64) -> ServerFrame {
+        let rows = (off..off + n).map(|i| format!("row {i:03}\r\n").into_bytes()).collect();
+        v2_frame(
+            vec![],
+            FrameBody::Scrollback2 {
+                epoch: 1,
+                row_offset: off,
+                rows,
+            },
+        )
+    }
+
+    #[test]
+    fn filling_a_held_gap_while_scrolled_up_keeps_the_text_being_read_still() {
+        let (mut st, mut tty) = v2_scroll_state();
+        process_frame(&mut st, &extent_frame(1, 40, 0));
+        process_frame(&mut st, &drawn_body(0, 20));
+        process_frame(&mut st, &drawn_body(30, 10)); // held past the gap
+        assert_eq!(history_arriving(&st), 20);
+        scroll_to_view_row_five(&mut st);
+        assert_eq!(scroll_view(&mut st, &mut tty)[1], "row 005");
+
+        process_frame(&mut st, &drawn_body(20, 10));
+        assert_eq!(st.scrollback.len(), 40, "the ring gained the gap and what was held");
+        assert_eq!(history_arriving(&st), 0, "the arriving row vanishes");
+        let view = scroll_view(&mut st, &mut tty);
+        assert_eq!(view[1], "row 005", "{view:?}");
+        assert!(view.iter().all(|r| !r.contains("···")), "{view:?}");
+    }
+
+    #[test]
+    fn a_hole_appearing_while_scrolled_up_keeps_the_text_still() {
+        let (mut st, mut tty) = v2_scroll_state();
+        process_frame(&mut st, &extent_frame(1, 40, 0));
+        process_frame(&mut st, &drawn_body(0, 20));
+        scroll_to_view_row_five(&mut st);
+        assert_eq!(scroll_view(&mut st, &mut tty)[1], "row 005");
+
+        process_frame(&mut st, &extent_frame(1, 40, 30)); // the floor passes T
+        assert_eq!(holes(&st), vec![10]);
+        assert_eq!(scroll_view(&mut st, &mut tty)[1], "row 005");
+    }
+
+    #[test]
+    fn the_arriving_count_falling_repaints_without_moving_the_view() {
+        let (mut st, mut tty) = v2_scroll_state();
+        process_frame(&mut st, &extent_frame(1, 40, 0));
+        process_frame(&mut st, &drawn_body(0, 20));
+        scroll_to_view_row_five(&mut st);
+        let view = scroll_view(&mut st, &mut tty);
+        assert_eq!(view[1], "row 005");
+        assert!(view[0].contains("· 20 lines still arriving"), "{view:?}");
+
+        process_frame(&mut st, &drawn_body(20, 5));
+        assert_eq!(history_arriving(&st), 15);
+        let view = scroll_view(&mut st, &mut tty);
+        assert_eq!(view[1], "row 005", "{view:?}");
+        assert!(view[0].contains("· 15 lines still arriving"), "{view:?}");
+    }
+
+    #[test]
+    fn the_wheel_reaches_the_oldest_row_past_holes_and_the_arriving_row() {
+        let (mut st, mut tty) = v2_scroll_state();
+        process_frame(&mut st, &extent_frame(1, 60, 10)); // rows 0..10: a hole
+        process_frame(&mut st, &drawn_body(10, 10));
+        process_frame(&mut st, &extent_frame(1, 60, 30)); // rows 20..30: a hole
+        assert_eq!(holes(&st), vec![10, 10]);
+        assert_eq!(history_arriving(&st), 30);
+        scroll_by(&mut st, 100);
+        assert_eq!(st.scroll_offset, history_view_len(&st), "the top of the view");
+        // View row 0 (the oldest hole) sits under the bar.
+        assert_eq!(scroll_view(&mut st, &mut tty)[1], "row 010", "the oldest ring row");
     }
 
     #[test]

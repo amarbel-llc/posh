@@ -497,8 +497,9 @@ struct FrameRenderer {
     /// rows; 0 = the live bottom (normal render). Driven by the wheel through
     /// `mouse_filter`; any keystroke returns it to 0.
     scroll_offset: usize,
-    /// Scroll-view render memo (`remote::scrollview`): skips a repaint while the
-    /// offset, ring length, and server generation are all unchanged.
+    /// Scroll-view render memo (`remote::scrollview`): skips a repaint while its
+    /// key (offset, view rows added, arriving count, server generation) is
+    /// unchanged.
     last_scroll_state: scrollview::ScrollMemo,
     /// Intercepts the outer terminal's wheel (SGR mouse) so it drives the local
     /// scroll-view instead of reaching the daemon. Persists across reads so a
@@ -914,6 +915,7 @@ impl FrameRenderer {
         scrollview::compose_scroll_frame(
             self.scroll_offset,
             &self.scrollback,
+            0, // the local daemon has no v2 history stream: nothing arrives
             &self.server_term,
             self.rows,
             self.cols,
@@ -924,18 +926,19 @@ impl FrameRenderer {
         )
     }
 
-    /// Sets the scroll offset (clamped to the ring) via the shared helper. The
+    /// Sets the scroll offset (clamped to the history view — the ring, which
+    /// locally never holds holes) via the shared helper. The
     /// local client keeps no separate live-render memo, so the shared helper's
     /// scroll-memo invalidation is all that is needed.
     fn set_scroll(&mut self, offset: usize) {
-        let ring_len = self.scrollback.len();
+        let history_len = scrollview::history_view_len(&self.scrollback, 0);
         // The local client keeps no additional live-render memo, so the shared
         // helper's own scroll-memo invalidation is all that is needed — the
         // `changed` bool is intentionally dropped.
         let _ = scrollview::set_scroll(
             &mut self.scroll_offset,
             &mut self.last_scroll_state,
-            ring_len,
+            history_len,
             offset,
         );
     }
@@ -950,13 +953,13 @@ impl FrameRenderer {
 
     /// Applies wheel ticks to the scroll offset (+ = up into history).
     fn scroll_by(&mut self, ticks: i32) {
-        let ring_len = self.scrollback.len();
+        let history_len = scrollview::history_view_len(&self.scrollback, 0);
         // No additional live-render memo locally, so the `changed` bool is
         // intentionally dropped (see `set_scroll`).
         let _ = scrollview::scroll_by(
             &mut self.scroll_offset,
             &mut self.last_scroll_state,
-            ring_len,
+            history_len,
             ticks,
         );
     }
