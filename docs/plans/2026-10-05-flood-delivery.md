@@ -3684,49 +3684,1029 @@ scrollback agree; (4) detach and re-attach: the viewport keeps its ring
 
 ## Stage 4 — holes the viewport draws
 
-Decisions 4, 8. Viewport-side only, plus one server-reported number.
+Expanded 2026-10-06 against HEAD `895f232`.
 
-### Task 4.1: The server reports how much history exists
-- A new capability (next free id) on frames to viewports that advertise
-  it: `{epoch, avail_rows: u64}` — the epoch-relative row count the server
-  holds. **Not** an extension of the `SCROLLBACK2` ack entry: its decoder
-  is exact-length (`caps.rs:558-562`) and an old viewport would stop
-  adopting epochs. RFC 0001 registry + RFC 0009 amendment.
-- Daemon and `server_loop` both emit it (shared via `HistoryCursor`).
+Decisions 4, 8, and 1's "a silent seam is never acceptable" (2 and 3
+constrain it). **posh#243 is folded in** (operator, 2026-10-06): a forward
+jump today means either "the session's ring evicted these rows" or "a body
+was lost on the wire while a later one was in flight", and the viewport
+cannot tell them apart. After this stage the sender reports the floor below
+which it will never send again, so the viewport labels only rows below that
+floor *not received*. It holds back a gap above the floor (it does not
+advance or acknowledge past the gap), and the sender's existing resend from
+the acknowledgement fills it. The scroll view draws each not-received span
+as one collapsed row where it belongs, one *arriving* row above the live
+screen while the server holds rows the viewport does not, and the top-bar
+count.
 
-### Task 4.2: `ScrollbackRing` records holes
-- Files: `remote/sync.rs:551-601`. A forward jump in the v2 append
-  (`remote/client.rs:3235-3238`) records a *not received* hole of
-  `row_offset − sb2_rows` lines at the current tail instead of appending
-  silently. Holes live beside the rows (a side list of `(index, lines)`),
-  not as fake rows: a hole is a view decoration (decision 8), and the ring
-  stays append-only.
-- Eviction from the viewport's own ring drops holes that scroll out.
-- Tests: jump recorded with the right count; duplicate/partial-overlap
-  branches unchanged; ring eviction removes old holes.
+**The model.** One number does both jobs: `HistoryCursor::next_body`
+already floors every body at `floor_rel = max(anchor_rel, avail −
+ring_len)`. That floor is the eviction floor, and also the re-anchor
+point after a session resize and the count a continued attach opened at.
+Rows below it in this epoch are never sent again. The sender publishes it
+with the row count it holds (`{epoch, avail_rows, evicted_upto}`) on every
+frame that carries its `SCROLLBACK2` entry. A gap at or below
+`evicted_upto` is not received. A gap above it is a lost body: the viewport
+keeps its count `T` at the gap's start, holds the bodies past it, and the
+resend from `T`, which both senders already do, repairs it. The viewport's
+arriving count is `avail_rows − T`. Everything is remote-viewport-side plus
+one daemon/server capability. The local `posh attach` is Stage 6. A viewport
+that does not ask for the extent, and every non-v2 client, gets
+byte-identical streams.
+
+### Facts re-verified at `895f232` (Stage 4 rests on these)
+
+Corrections to the task-level text that stood here are marked
+**corrected**.
+
+- **The exact-length decoder that forbids extending id 10 — corrected.**
+  The task text cited `caps.rs:558-562`. The decoder that matters is the
+  one an OLD viewport runs on the server's entry: `decode_scrollback2_ack`
+  (`posh-proto/src/caps.rs:587-592`) rejects any payload that is not
+  exactly `{0x02, epoch}`, so a longer server entry would stop an old
+  viewport adopting epochs. (`decode_scrollback2_client`, `:565-574`, is
+  exact-length too, but only the server reads it.) The id-10 encoders are at
+  `:551-583`. The forward-compatible shape to copy is `decode_paced`
+  (`:528-530`: the version byte, `0` is malformed, trailing bytes ignored)
+  and `decode_push_cmd_request` (`:512-515`). `CAP_PACED = 23`,
+  `PACED_VERSION` at `:179-190`; the paced caps tests are around `:1478`.
+  An entry payload is at most 255 bytes (the table's `len: u8`).
+- **Next free capability id: 24.** RFC 0001's table
+  (`docs/rfcs/0001-target-grammar-and-capability-table.md:235-258`)
+  allocates 0–23 (2 reserved for `TERM_FEATURES`, 6–8 retired) and lists
+  `24–223 Unassigned`. RFC 0012 names `CAP_SESSION_SIZE` without a number,
+  so it reserves nothing.
+- **`HistoryCursor`** (`crates/posh/src/remote/history.rs`): `next_body(&mut
+  self, term, now, rto, window) -> (u8, FrameBody)` (`:238-269`) computes
+  `avail`, `floor_rel = anchor_rel.max(avail − ring_len.min(avail))`
+  (`:242`), `start = cursor.max(floor_rel)`. The jump is silent: nothing
+  returns or records "evicted up to". `reanchor` (`:156-164`) sets
+  `anchor_rel = avail` at the resize, so the floor there is the count as
+  of the resize. `activate(Continue { rows })` sets `anchor_rel = rows`
+  (`:75-91`), so a continued cursor's floor is the viewport's own count
+  and labels nothing. `bump_epoch` zeroes everything (`:131-144`). `avail`
+  is public (`:172-174`). `in_flight` and `next_fresh` are private
+  (`:206-214`); `acked_rows`, `sent_upto` and `last_send` are
+  `#[cfg(test)]` (`:216-229`). There is no `extent`. **The floor is
+  non-decreasing within an epoch:** `avail` and `anchor_rel` only grow; a
+  ring that shrinks without the total moving (a height grow) or reflows (a
+  width change) is always followed by a `reanchor` (daemon
+  `reset_history_on_resize`, `session/daemon.rs:1787-1794`), which lifts
+  `anchor_rel` to `avail`. A viewport can therefore keep the maximum it
+  has seen, so a reordered UDP frame carrying an older extent does no
+  harm. *Unverified on `server_loop`:* it never re-anchors, only bumps on
+  a client resize. A session width change there IS a client resize (single
+  peer), so it bumps.
+- **The brief's "eviction jump vs re-anchor jump" distinction needs no
+  second number.** Both kinds of row are gone for good: re-anchored rows
+  are "never delivered and not resent" (RFC 0009 §5). So both are *not
+  received*, and `floor_rel` covers both.
+- **Daemon** (`crates/posh/src/session/daemon.rs`): `Pacing` `:333-360`
+  (no extent field); `absorb_client_caps` `:437-472`; `open_history`
+  `:480-502` (the cursor opens only from a well-formed id-10 Init entry);
+  `apply_init` `:545-581`, after which `self.caps` holds the Init table
+  (Init-persistent; a bare re-Init keeps it). `send_paced_frame`
+  `:768-787` builds through `build_frame_from(src)` and has NO session
+  terminal (src may be the overlay's). `send_history_body` `:839-860`
+  builds `caps: own_table(&[encode_scrollback2_ack(epoch)])` with the
+  session terminal in hand. `queue_frame` `:904`: `frame_caps`
+  `:917-941`, with the id-10 entry pushed at `:939-941`. It has ~30 test
+  callers, so its signature stays. `send_paced_frames(clients, src,
+  history: Option<&Terminal>, now)` `:1407-1419` is the one per-pass site
+  that has the session terminal (`None` under the escape overlay).
+  `flush_paced_frames` `:1438-1442` has only `src`.
+- **`server_loop`** (`crates/posh/src/remote/server.rs`): it reads the
+  per-message `SCROLLBACK2` entry at `:1907-1916`, applies the client size
+  at `:1921`, and recomputes `peer_wants_scrollback` per message at
+  `:1922-1929`. Every frame's caps are built at `:2314-2320` (`extras`,
+  the id-10 entry while `sb2.epoch()` is `Some`), with `term` in scope.
+- **The M2 bridge:** `bridge_init_content` (`server.rs:1172-1177`) adds
+  `CAP_PACED` and `CAP_SCROLLBACK2` to the relay's `content_caps`.
+  `bridge_client_message` (`:1179-1226`) forwards only the relay's list,
+  push-cmd, and a changed id-10 entry (`:1206-1217`). Daemon frames reach
+  the viewport with their caps intact (Stage 3's id-10 server entry rides
+  that way).
+- **The viewport** (`crates/posh/src/remote/client.rs`): `ClientState`'s
+  `scrollback`/`sb2_epoch`/`sb2_rows` are at `:1528-1541`, constructed at
+  `:1802-1805` and in `test_state` `:5383` (fields at `:5399-5402`). Its
+  own resize clears the ring and sets `sb2_epoch = None`, `sb2_rows = 0`
+  (`:2088-2093`). `process_frame` (`:3004`) adopts the epoch from the
+  id-10 entry at `:3133-3146` (clearing the ring and `scroll_offset` on a
+  change) BEFORE `apply_frame` (`:3174`). `apply_frame`'s v2 branch is at
+  `:3215-3252`: wrong epoch is stale, fully covered is a dup, a partial
+  overlap appends the tail, and a forward jump is appended silently with
+  `T = end` (`:3241-3249`). While scrolled it anchors with
+  `set_scroll(offset + grew)` (`:3246-3248`). `outgoing_caps` is at
+  `:3800-3847`: the id-10 entry in the not-suppressed block at
+  `:3814-3832`, `CAP_PACED` at `:3845`. The `set_scroll`/`scroll_by`
+  wrappers clamp to `st.scrollback.len()` (`:2659-2670`), and the compose
+  wrapper is at `:3762-3774`. `SCROLLBACK_RING_DEPTH = 10_000` (`:50`).
+  The task text's `:3235-3238` is stale — **corrected**.
+- **The tests that pin today's v2 apply:**
+  `scrollback2_apply_rules_never_touch_applied_num` (`:6421`; its forward
+  jump to 10 leaves `sb2_rows == 11` and `scrollback.len() == 5`, which
+  still holds when a hole is a side record and not a row),
+  `scrollback2_partial_overlap_appends_only_the_tail` (`:6470`),
+  `scrollback2_epoch_adoption_resets_ring_and_count` (`:6496`),
+  `outgoing_caps_advertises_v2_and_drops_v1_once_acked` (`:6543`), and
+  for the scroll view `append_while_scrolled_bumps_offset_to_freeze_viewport`
+  (`:6616`, v1), `scroll_frame_renders_history_window_with_indicator`
+  (`:6644`) and `scroll_frame_is_memoized_until_state_changes` (`:6670`).
+  The ONLY end-to-end test in which a v2 body can be lost is
+  `wedge_repro_server_loop_with_loss_and_titles` (the real `server_loop`,
+  35% induced loss; its v2 assertions are at `:5667-5683`).
+- **`ScrollbackRing`** (`remote/sync.rs:539-601`, not `:551-601`) is a
+  `VecDeque<Vec<u8>>` plus `capacity`, with `append` (evicts the front),
+  `clear`, and `len`/`is_empty`/`row(i)`. The three read-side methods carry
+  a stale `#[allow(dead_code)]` and comment ("not yet by a non-test
+  caller"): `scrollview.rs:103-120` reads them in production. It has no
+  absolute numbering; Stage 4 adds an append counter.
+- **The scroll view is shared with the local client**
+  (`remote/scrollview.rs`; `session/client.rs:913-960` calls
+  `compose_scroll_frame`, `set_scroll`, `scroll_by` and threads its own
+  `ScrollMemo`). `ScrollMemo = Option<(offset, ring_len, generation)>`
+  (`:30-32`). `compose_scroll_frame` (`:85-144`) replays rows through a
+  scratch terminal: ring rows by index, then `dump_visible_rows()`
+  (`:118-130`), and draws the bar with `apply_scroll_indicator(&mut snap,
+  offset)` (`:134`). *By reading, not reproduced:* once the ring is full
+  and the offset is clamped at its maximum, an append evicts the front row
+  without changing `(offset, ring_len, generation)`, so the memo skips a
+  repaint whose top row changed. A monotonic memo key fixes this as a side
+  effect (Task 4.3).
+- **The top bar** is `posh-proto/src/display.rs:926-935`
+  (`apply_scroll_indicator(fb, lines_up)`; its only caller is
+  `scrollview.rs:134`). It draws through `draw_top_bar`, which truncates at
+  the right edge (`:879-924`). `Cell` style has `dim`
+  (`posh-term/src/cell.rs:48`), so a row replayed with SGR 2 reads back
+  dim. No digit-grouping helper exists in `crates/` (`rg -i thousand`).
+- **The flood harness** (`daemon.rs` tests): `FloodRun` `:5942`, with v2
+  counters around `:6005`. `FloodCase` `:6021-6041` (`v2: bool`; 9
+  literals). `FloodViewport` `:6053-6118`: it models today's apply (jumps
+  counted at `:6103-6107`, `jump_ends`). `measure_flood` `:6238` (the v2
+  Init content at `:6249-6250`), `print_flood_row` `:6734`, the
+  measurement `:6835`, `paced_v2_flood_case` `:7684`, `sb2_entry` `:8114`,
+  `paced_v2_conn` `:8124`. The harness is **lossless**: every frame
+  reaches the model in order. So every forward jump in it is an eviction
+  or a re-anchor, and the harness can check that the extent marks every
+  jump but cannot exercise the hold rule.
+- **The detach seam stays unlabelled.** A continued attach opens at the
+  viewport's count (`HistoryStart::Continue`). Rows scrolled while it was
+  detached are not in the new row space at all, so no floor marks them.
+  Stage 5 (the resume position) closes this, not Stage 4.
+- **Records:** RFC 0009 §3 says a client "MUST NOT stall waiting for the
+  gap to be filled" (`:159-164`), and §5 ends with the posh#243 open issue
+  (`:272-275`). FDR 0021 Limitations has the posh#243 bullet (`:198-205`),
+  "silent until Stage 4" (`:174`), the slow-reader bullet (`:206-214`) and
+  "labelled by Stage 4" (`:219-223`). Its decisions run 1–14. FDR 0005 has
+  no hole notion, and its first-class "Incomplete/truncated view" is at
+  `:59-63`. `posh-client(1)` describes the scroll view under
+  `_POSH_GRAB_MOUSE_` (`doc/posh-client.1.scd:213-221`).
+- **Out of scope:** posh#245 (a height grow re-pushes rows under new
+  numbers). The extent cannot see it, because the numbers are genuinely
+  new. It needs a posh-term API addition (queue row 19). posh#247 (About
+  and `posh status` fields) is queued as row 22, sequenced with Task 7.1.
+
+### Design choices this expansion makes (the brief left them open)
+
+- **One new capability, id 24 `SCROLLBACK2_EXTENT`, both directions,
+  forward-compatible.** Client entry: `{version u8}` (`1`) — "report your
+  extent". Server entry: `{version u8 = 1, epoch u8, avail_rows u64 LE,
+  evicted_upto u64 LE}` — 18 bytes. Readers ignore trailing bytes, and a
+  payload that is too short or names version `0` is ignored. It is not an
+  extension of id 10, whose server-entry decoder an old viewport runs
+  exact-length.
+- **`evicted_upto` IS the send floor** (`floor_rel`). One computation is
+  shared by `next_body` and the new `HistoryCursor::extent(term)`, so the
+  marker and the jump cannot disagree. It needs no new cursor state. It
+  covers eviction, a re-anchor (RFC 0009 §5: those rows are gone) and a
+  continued attach (whose floor is the viewport's count, which labels
+  nothing). The viewport keeps the per-field maximum within an epoch.
+- **The extent rides every frame that carries the id-10 server entry, to a
+  viewport that asked.** `server_loop` sends it on every frame. The daemon
+  sends it on history bodies (computed from the session terminal at send
+  time) and on paced visible frames, from a per-client cache
+  (`Pacing.extent`) that `send_paced_frames` refreshes on every pass that
+  has the session terminal. It is frozen while the escape overlay is up,
+  when history pauses anyway, and the exit flush carries the cached one.
+  Why every frame and not "history bodies plus the first visible frame
+  after a change": the entry is 20 bytes. On a lossy link the arriving
+  count and the gap judgement both want the newest value on whichever frame
+  survives, and change-tracking would need its own repeat-until-acked
+  state. A cache field is used instead of a new `queue_frame` parameter
+  (≈ 30 test callers).
+- **The request is Init-persistent on the socket.** The M2 bridge adds the
+  viewport's entry in `bridge_init_content` beside `CAP_PACED`, never in
+  the relay (ADR 0007), and does not forward it per message: it never
+  changes, and a re-home re-Inits from `content`. `server_loop` latches it
+  for the connection once a message carries it.
+- **Task 4.1 is server-only.** No viewport asks until Task 4.2, so 4.1
+  changes no deployed stream: the whole measurement table is its witness.
+- **The hold rule (RFC 0009 §3.1, written in Task 4.2).** On a body of its
+  epoch with `row_offset > T`:
+  - With no extent seen this epoch (an old server, or a frame before any
+    extent): today's §3 behaviour, accept the jump. The only change is that
+    the gap is now *labelled* not received: `T`, the ring and the ack are
+    as today.
+  - With an extent: rows below `evicted_upto` in the gap are not received.
+    If the body still starts past `T`, the body is HELD, the count does not
+    advance, and the ack stays at the gap's start. The sender's resend from
+    the ack fills the gap at the tail, which is "in place", because nothing
+    after `T` is ever in the ring. The held bodies behind it then drain in
+    order.
+  - A later extent whose floor passes a held gap turns it into not
+    received and drains.
+  - A late body for rows already labelled not received is a dup or a
+    partial overlap by §3's existing rules (the sender never sends below
+    its floor, so this happens only on reorder).
+- **Buffer out-of-order bodies; do not drop them.** Held bodies go in a
+  `HeldRows` reorder buffer (`BTreeMap<u64, Vec<Vec<u8>>>`) bounded at
+  `SB2_HELD_MAX_ROWS = 4 × SB2_ROWS_PER_BODY = 1024` rows. A body past the
+  bound is discarded, and the go-back-N resend re-sends it. **The brief's
+  reason is corrected:** buffering does NOT avoid waiting a resend floor,
+  because the gap itself still waits one. It avoids re-sending everything
+  behind the gap. The daemon's resend from the ack carries at most 256
+  rows. `server_loop` (unbounded window, SRTT/2 pacing) has many bodies in
+  flight, so dropping would make every loss a go-back-N of all of them.
+  The cost is at most 1,024 rows.
+- **The viewport settles a gap the floor has passed even with no body in
+  hand.** On an extent with `evicted_upto > T`, it records `min(floor,
+  first held offset) − T` as not received and advances `T`, and therefore
+  its ack. Those rows will never be sent: without this the arriving count
+  would include rows that cannot arrive, and the label would wait for the
+  next body. Acking past `sent_upto` is safe for both senders: `next_fresh
+  = max(sent_upto, acked)` and `in_flight` saturates (`history.rs:206-214`).
+- **"Pending" is not a hole kind — a deviation from the brief.** The hold
+  rule keeps `T` at a pending gap's start, so the gap and every held row
+  past it are always beyond the last ring row, at the tail, where the
+  single *arriving* row already sits. Decision 8 names exactly two labels,
+  *arriving* and *not received*. A separate `··· N lines pending ···` row
+  would sit right beside `··· N lines arriving ···` and mean the same thing
+  to the reader. So `ScrollbackRing` records only not-received holes, and
+  a pending gap is part of the arriving count, `avail_rows − T`.
+- **Holes are a side list keyed by append number, not fake rows** (decision
+  8: a view decoration). `ScrollbackRing` gains `appended` (rows ever
+  appended) and `holes: VecDeque<(before, lines)>`, where `lines` rows are
+  missing immediately before the row numbered `before`. Two marks at the
+  same tail position merge. A hole is dropped when the row after it is
+  evicted (`before < appended − len`), and a tail hole stays. `len()`/`row()`
+  keep meaning ring rows, so the RFC 0002 path and every existing test are
+  untouched. New: `view_len()` (rows + holes), `view_row(i) -> ViewRow`
+  (`Row(&[u8])` | `NotReceived(u64)`), and `view_total()` (view rows ever
+  added, which is monotonic and keys the memo and the anchoring).
+- **Anchoring generalises `offset + grew`:** while scrolled, offset +=
+  Δ(`view_total` + the arriving row). Holes and rows only ever join at the
+  tail, and the arriving row toggles at the tail, so every insertion is
+  below the window's top. Front eviction moves nothing, as today. Task 4.2
+  keeps ring-row units (`appended` delta, because the view does not draw
+  holes yet), and Task 4.3 switches to view rows.
+- **Rendering stays bytes through the scratch terminal.** A hole row is
+  produced by ONE function, `scrollview::hole_row(label, cols)`: SGR 2
+  (dim), centred, truncated to `cols` so it never wraps, then CRLF like a
+  ring row. Its wording comes from ONE function, `hole_label(lines,
+  arriving)`, with digits grouped as decision 8 shows (`12,340`). The
+  look-alike treatment stays open (UX design, "Open, deliberately"). The
+  top-bar text is byte-identical when nothing is arriving.
+- **The shared scroll view takes the arriving count as a parameter.** The
+  local client passes `0`, and its ring never has holes, so its bytes do
+  not change (Stage 6 gives it v2).
+- **Records land with the code they describe** (`docs/README.md`): 4.1
+  adds RFC 0001 row 24 and RFC 0009 §3.1's server half; 4.2 adds §3.1's
+  client half, §3's jump bullet, §5 and the posh#243 note; 4.4 covers
+  FDR 0005, FDR 0021 and `posh-client(1)`. "Stage 4 as built" is written
+  after the stage, not now.
+- **`Closes #243` goes on Task 4.2's commit**, where the fix completes. 4.1
+  alone changes nothing a viewport does.
+- **No lever, no ENVIRONMENT entry.** The behaviour rides `POSH_PACED`
+  (no v2 without it) and the capability. One sentence in `posh-client(1)`.
+- **Witnesses:** every non-v2 row of
+  `posh225_flood_backlog_ideal_reader_measurement`, and every Stage 3 v2
+  row (a new `FloodCase::extent` is `false` for them), stay identical. The
+  new rows set it. The local client's scroll frame is pinned by a golden
+  test written BEFORE Task 4.3 touches the compose.
+
+### Task 4.1: The server reports its v2 extent (`CAP_SCROLLBACK2_EXTENT`, id 24)
+
+**Promotion criteria:** N/A — no viewport asks until Task 4.2; no
+deployed stream changes.
+
+**Files:**
+- Modify: `crates/posh-proto/src/caps.rs` — the constant and version after
+  `PACED_VERSION` (`:190`); the struct and codecs after
+  `decode_scrollback2_ack` (`:592`); tests after the paced tests (`~:1478`).
+- Modify: `crates/posh/src/remote/history.rs` — `extent` and a private
+  `avail_and_floor` shared with `next_body` (`:238-269`); tests.
+- Modify: `crates/posh/src/session/daemon.rs` — `Pacing.extent` (`:333-360`);
+  `ClientConn::wants_history_extent` / `note_history_extent`;
+  `queue_frame`'s caps (`:939-941`); `send_history_body` (`:848-852`);
+  `send_paced_frames` (`:1407-1419`); the flood harness (`FloodCase`,
+  `FloodViewport`, `FloodRun`, `measure_flood`, `print_flood_row`, the
+  measurement); tests in a `// ---- posh#225 Stage 4: the v2 extent ----`
+  block after the Stage 3 v2 block.
+- Modify: `crates/posh/src/remote/server.rs` — `bridge_init_content`
+  (`:1172-1177`) and its doc; `server_loop` (`:1907-1929`, `:2314-2320`);
+  tests beside `bridge_init_carries_the_viewports_scrollback2_entry`.
+- Modify: `docs/rfcs/0001-target-grammar-and-capability-table.md` — row 24;
+  `24–223` → `25–223`.
+- Modify: `docs/rfcs/0009-scrollback-stream-separation.md` — `#### 3.1 The
+  extent` (server half).
+- Do **not** modify `crates/posh/src/remote/relay.rs` (ADR 0007).
+
+**Step 1: Record the witness BEFORE touching code.** Run
+`just debug-cargo test --release -p posh --bin posh posh225_flood_backlog_ideal_reader_measurement -- --ignored --nocapture`
+and keep the table (scratchpad). Step 9 compares.
+
+**Step 2: caps — failing tests** (`posh-proto` `mod tests`):
+- `scrollback2_extent_roundtrips` — `encode_scrollback2_extent(&x)` has
+  id 24 and an 18-byte payload starting `[1, epoch]`;
+  `decode_scrollback2_extent` returns `x` (try `avail_rows = u64::MAX`,
+  `evicted_upto = 0`).
+- `scrollback2_extent_ignores_trailing_bytes_and_rejects_short_or_version_0`
+  — +3 trailing bytes decodes the same; 17 bytes → `None`; version byte
+  `0` → `None`; empty → `None`.
+- `the_extent_request_is_a_version_byte` —
+  `encode_scrollback2_extent_request()` is `{24, [1]}`;
+  `decode_scrollback2_extent_request(&[1, 9])` → `Some(1)`; `&[]` and
+  `&[0]` → `None`.
+- `the_scrollback2_ack_decoder_is_exact_length` — pins why id 24 exists:
+  `decode_scrollback2_ack(&[0x02, 1, 0])` is `Err`.
+
+Run `just debug-cargo test -p posh-proto extent` — expected: compile
+errors.
+
+**Step 3: caps — implement.**
+
+```rust
+/// Scrollback v2 extent (RFC 0009 §3.1; posh#225 Stage 4, posh#243). Client
+/// entry: a version byte ([`SCROLLBACK2_EXTENT_VERSION`]) asking the server
+/// to report its extent; Init-persistent on the session socket (an M2
+/// bridge carries it, a relay does not — ADR 0007). Server entry: version,
+/// epoch, the rows available in the epoch, and the row below which nothing
+/// in the epoch will be sent again — so a client can tell rows the server
+/// evicted (not received) from a body lost on the wire (held for the
+/// resend). Later versions append; readers ignore trailing bytes. Its own
+/// id because the id-10 server entry's decoder is exact-length: an old
+/// viewport would stop adopting epochs if that entry grew.
+pub const CAP_SCROLLBACK2_EXTENT: u8 = 24;
+/// The [`CAP_SCROLLBACK2_EXTENT`] payload version this build writes.
+pub const SCROLLBACK2_EXTENT_VERSION: u8 = 1;
+
+/// A server's [`CAP_SCROLLBACK2_EXTENT`] entry, decoded.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct Scrollback2Extent {
+    pub epoch: u8,
+    /// Rows the epoch's row space holds (the next row scrolled is this one).
+    pub avail_rows: u64,
+    /// No body of this epoch will start below this row again; rows below it
+    /// that a client lacks are permanently lost to it.
+    pub evicted_upto: u64,
+}
+
+pub fn encode_scrollback2_extent_request() -> Cap; // [SCROLLBACK2_EXTENT_VERSION]
+/// As `decode_paced`: the version, `None` for empty or version 0.
+pub fn decode_scrollback2_extent_request(payload: &[u8]) -> Option<u8>;
+pub fn encode_scrollback2_extent(x: &Scrollback2Extent) -> Cap; // [1, epoch, avail LE, floor LE]
+/// `None` for version 0 or fewer than 18 bytes; trailing bytes ignored.
+pub fn decode_scrollback2_extent(payload: &[u8]) -> Option<Scrollback2Extent>;
+```
+
+Run Step 2's command — expected PASS.
+
+**Step 4: `HistoryCursor::extent` — test-first** (`history.rs` `mod tests`,
+same fixtures):
+- `the_extent_is_none_until_activated`.
+- `the_extent_counts_the_rows_of_the_epoch` — fresh, scroll 10: `{epoch 1,
+  avail 10, evicted_upto 0}`.
+- `the_extent_floor_rises_as_the_ring_evicts` — ring 50, send 0..10, scroll
+  100: `evicted_upto == avail − 50`, and `next_body`'s `row_offset` equals
+  it (the marker and the jump agree).
+- `the_extent_floor_is_the_count_at_a_reanchor` — as
+  `reanchor_keeps_the_epoch_and_jumps_to_the_count_at_the_resize`: after
+  `reanchor`, `evicted_upto == 10`; the next body starts there.
+- `a_continued_cursors_floor_is_the_viewports_count` — `Continue { epoch 7,
+  rows 40 }` over a full ring: `evicted_upto == 40` (no false hole).
+- `the_extent_floor_never_falls_within_an_epoch` — record the floor across
+  scrolls, sends, a ring-evicting flood and a `reanchor` (shrink the
+  terminal's height between to change `ring_len`): non-decreasing.
+- `a_bump_resets_the_extent` — after `bump_epoch`: `{epoch 2, 0, 0}`.
+
+Implement:
+
+```rust
+    /// Rows available in this epoch at `term`, and the floor below which no
+    /// body starts — the ring's eviction floor, never below `anchor_rel`
+    /// (a re-anchor's count, a continued viewport's count). One computation
+    /// for `next_body` and `extent`, so the marker and the jump agree.
+    fn avail_and_floor(&self, term: &Terminal) -> (u64, u64) {
+        let avail = self.avail(term.primary_scrollback_total());
+        let ring_len = term.primary_scrollback_len() as u64;
+        (avail, self.anchor_rel.max(avail - ring_len.min(avail)))
+    }
+
+    /// What a viewport needs to tell eviction from loss (RFC 0009 §3.1,
+    /// posh#225 Stage 4): `None` while inactive.
+    pub(crate) fn extent(&self, term: &Terminal) -> Option<Scrollback2Extent> {
+        self.active.then(|| {
+            let (avail_rows, evicted_upto) = self.avail_and_floor(term);
+            Scrollback2Extent { epoch: self.epoch, avail_rows, evicted_upto }
+        })
+    }
+```
+
+`next_body` takes `(avail, floor_rel)` from `avail_and_floor` (it still
+reads `ring_len` for the index). Run
+`just debug-cargo test -p posh --bin posh remote::history` — expected PASS
+(every existing cursor test unchanged).
+
+**Step 5: Daemon — failing tests** (new block; helper
+`fn paced_v2x_conn(term) -> (ClientConn, UnixStream)` = `paced_v2_conn`
+whose Init also carries `encode_scrollback2_extent_request()`;
+`fn extents(frames) -> Vec<Option<Scrollback2Extent>>` decoding id 24 per
+frame):
+- `a_v2_viewport_that_asks_gets_the_extent_on_every_frame` — scroll 10, pass
+  at the visible opportunity, then the history opportunity: both frames
+  carry id 24 = `{1, 10, 0}`.
+- `a_v2_viewport_that_does_not_ask_gets_no_extent` — `paced_v2_conn`: no id
+  24 on any frame; each frame's caps are exactly `[id 0, id 10]` as before.
+- `a_request_without_scrollback2_gets_no_extent` — `paced_conn` with only
+  the request (no cursor): no id 24; a `lossy_conn` with it: none.
+- `the_extent_floor_is_the_daemons_eviction_floor` — 5x20, 50-row ring:
+  one body (0..10) acked, scroll 200 with no pass, then a pass: the body's
+  `row_offset` equals its own frame's `evicted_upto` (`avail − 50`).
+- `the_extent_floor_is_the_count_at_a_session_resize` — the
+  `a_session_height_grow_reanchors_the_other_viewports` setup: after
+  `reset_history_on_resize`, the next frame's `evicted_upto` is the
+  viewport's count as of the resize.
+- `the_extent_freezes_while_the_overlay_is_up` — scroll 5, pass with
+  `Some(&term)`, scroll 5 more, re-dirty, pass with `None`: the visible
+  frame carries the first extent (`avail 5`), not 10.
+
+Run `just debug-cargo test -p posh --bin posh extent` — expected: compile
+errors.
+
+**Step 6: Daemon — implement.**
+- `Pacing` gains `extent: Option<caps::Scrollback2Extent>`. Its doc: "the
+  v2 extent (RFC 0009 §3.1) as of the newest pass with the session
+  terminal; rides every frame to a viewport that asked; frozen under the
+  escape overlay".
+- `impl ClientConn`:
+
+  ```rust
+      /// This client's Init asked for the v2 extent (posh#225 Stage 4).
+      fn wants_history_extent(&self) -> bool {
+          caps::find(&self.caps, caps::CAP_SCROLLBACK2_EXTENT)
+              .and_then(|c| caps::decode_scrollback2_extent_request(&c.payload))
+              .is_some()
+      }
+
+      /// Refresh the cached extent from the session terminal.
+      fn note_history_extent(&mut self, term: &Terminal) {
+          let wants = self.wants_history_extent();
+          if let Some(p) = self.pacing.as_mut() {
+              p.extent = p.history.and_then(|h| h.extent(term)).filter(|_| wants);
+          }
+      }
+  ```
+- `send_paced_frames`: first line in the loop body, `if let Some(t) =
+  history { c.note_history_extent(t); }`.
+- `queue_frame`, after the id-10 push (`:939-941`): `if let Some(x) =
+  self.pacing.as_ref().and_then(|p| p.extent) {
+  frame_caps.push(caps::encode_scrollback2_extent(&x)); }`.
+- `send_history_body`: after `next_body`, call `note_history_extent(term)`
+  (borrow-wise: compute `let x = wants.then(|| h.extent(term)).flatten()`
+  inside, store it in `p.extent`), and build `caps: own_table(&[ack,
+  extent?])`.
+
+Run Step 5's command, then `just debug-cargo test -p posh --bin posh
+session::daemon` — expected PASS (every Stage 3 v2 test builds without
+the request).
+
+**Step 7: The M2 bridge and `server_loop`.** Tests (`server.rs`):
+- `bridge_init_carries_the_viewports_extent_request` — with it →
+  `bridge_init_content` holds it verbatim; without → no id 24.
+- `the_relay_never_carries_the_extent_request` — `relay::content_caps` and
+  `relay::forwarded_client_caps` of it are empty.
+- `the_bridge_does_not_forward_the_extent_request_per_message` — a
+  `ClientMessage` carrying id 10 + id 24: the `ClientCaps` record holds
+  id 10 only.
+
+Implement: `bridge_init_content` gains
+`content.extend(caps::find(client_caps, caps::CAP_SCROLLBACK2_EXTENT).cloned());`
+and its doc names it. In `server_loop`: `let mut peer_wants_extent =
+false;` beside `peer_wants_scrollback`. Per message (after `:1916`), set
+`peer_wants_extent |=
+caps::find(&msg.caps, caps::CAP_SCROLLBACK2_EXTENT).and_then(|c|
+caps::decode_scrollback2_extent_request(&c.payload)).is_some();`. In
+`extras` after the id-10 entry, `if peer_wants_extent { if let Some(x) =
+sb2.extent(&term) { extras.push(caps::encode_scrollback2_extent(&x)); } }`.
+*Unverified:* whether `run_scrollback_session` (the `server.rs` v1 test
+driver) can carry v2 entries. If it can, add
+`server_loop_sends_the_extent_only_when_asked`; if not, the `server_loop`
+half is covered by Task 4.2's `wedge_repro` assertion. Say which in the
+commit.
+
+Run `just debug-cargo test -p posh --bin posh remote::` — expected PASS.
+
+**Step 8: The flood harness** (no stream change for existing cases).
+- `FloodCase` gains `extent: bool`, `false` in all 9 literals. It needs
+  `v2`. When true, `measure_flood` adds the request to the Init content
+  (`:6249-6250`). A new `paced_v2x_flood_case(acks, prefill)`.
+- `FloodViewport` gains `extent: Option<Scrollback2Extent>`, adopted from
+  each frame of its epoch as a per-field maximum and cleared on an epoch
+  change, and `jumps_unmarked: usize`. In the jump branch (`:6103-6107`),
+  count it when `self.extent.is_none_or(|x| *row_offset > x.evicted_upto)`.
+  The model keeps today's jump accounting, so `rows_jumped`/`jump_ends`
+  are unchanged.
+- `FloodRun` gains `jumps_unmarked` and `rows_arriving: Option<u64>`
+  (`x.avail_rows − t.max(x.evicted_upto)` at the end; `None` without an
+  extent). `print_flood_row` gains `unmk arr` (`-` when not `extent`).
+- Tests:
+  - `posh225_v2_extent_marks_every_flood_jump_as_evicted` — 2 MiB,
+    `Trickle(1 KiB)` × `EveryNewest(1)`/`Lagged(50)`, and the ideal reader
+    at `Lagged(300)`, 1 KiB chunks, both prefills: `forward_jumps > 0`
+    (these cases outrun the window), `jumps_unmarked == 0`, and the end
+    extent's `avail_rows == rows_scrolled`.
+  - `posh225_v2_extent_counts_nothing_arriving_once_caught_up` — 256 KiB,
+    `EveryNewest(1)`/`Lagged(50)`/`Lagged(300)`: `rows_arriving == Some(0)`.
+  - `posh225_v2_extent_without_acks_reports_rows_still_arriving` — 256 KiB,
+    `Never`: `rows_arriving > Some(0)`.
+- Measurement: add `extent: true` rows for `EveryNewest(1)`, `Lagged(300)`
+  and the `Trickle(1 KiB)` row.
+
+Run `just debug-cargo test --release -p posh --bin posh posh225_v2_extent` —
+expected PASS. If a jump is unmarked, stop and report: the floor and the
+body disagree, which Step 4 should have caught.
+
+**Step 9: Witness.** Re-run Step 1's measurement. Every pre-existing row,
+non-v2 and Stage 3 v2 (`extent` false), must be identical.
+
+**Step 10: Records (server half).** RFC 0001 row:
+`| 24 | SCROLLBACK2_EXTENT | both | client: ≥ 1 byte; server: ≥ 18 bytes |
+…` — the scrollback v2 extent (RFC 0009 §3.1, allocated 2026-10-06). The
+client sends a version byte asking for it: Init-persistent on the session
+socket, carried by an M2 bridge, never a relay. The server sends `{version,
+epoch, avail_rows u64 LE, evicted_upto u64 LE}` on every frame carrying its
+`SCROLLBACK2` entry. Readers ignore trailing bytes. The `24–223` row
+becomes `25–223`. RFC 0009 gains `#### 3.1 The extent (posh#243)`: the
+payload, and that a server that received the request MUST carry its extent
+beside every `SCROLLBACK2` server entry (a session daemon MAY repeat the
+last one while history is paused). `evicted_upto` MUST be the row below
+which it will send no body in this epoch, and neither field decreases
+within an epoch. The client half lands with Task 4.2. Status stays
+`experimental`.
+
+**Step 11: Lint and commit.** `just lint-fmt`; `just lint-doc`;
+`just debug-cargo clippy -p posh --all-targets -- -D warnings` — clean.
+Commit message:
+`posh-proto/history/daemon/server: report the v2 extent — rows held and the floor below which nothing is resent (CAP_SCROLLBACK2_EXTENT, id 24; posh#225 Stage 4)`
+with a body: the floor is `next_body`'s, so marker and jump agree; every
+frame carrying the id-10 entry; Init-persistent via the M2 bridge, never
+the relay; no viewport asks yet (measurement table identical).
+
+### Task 4.2: The viewport tells eviction from loss — holes, held bodies, the extent
+
+**Promotion criteria:** N/A — default on with `POSH_PACED` (no v2
+without it); rollback is `POSH_PACED=0` (RFC 0002 history), next attach.
+
+**Files:**
+- Modify: `crates/posh/src/remote/sync.rs` — `ScrollbackRing` (`:539-601`):
+  `appended`, `holes`, `mark_not_received`, `view_len`, `view_row`,
+  `view_total`, `ViewRow`, the stale `#[allow(dead_code)]` + comment on
+  `len`/`is_empty`/`row` removed; a new `HeldRows` + `SB2_HELD_MAX_ROWS`
+  after it; tests beside the ring's (`~:1769`).
+- Modify: `crates/posh/src/remote/client.rs` — `ClientState` (`:1528-1541`)
+  gains `sb2_extent`, `sb2_held`; construction (`:1802-1805`, `:5399-5402`);
+  own-resize clear (`:2088-2093`); epoch adoption + extent adoption
+  (`:3133-3146`); the v2 branch of `apply_frame` (`:3215-3252`) →
+  `apply_scrollback2_rows` + `settle_history` + `keep_history_anchor`;
+  `outgoing_caps` (`:3821-3825`); `wedge_repro`'s assertions
+  (`:5667-5683`); tests after `scrollback2_epoch_adoption_resets_ring_and_count`
+  (`:6496`).
+- Modify: `docs/rfcs/0009-scrollback-stream-separation.md` — §3.1 client
+  half, §3's jump bullet, §5, the posh#243 note, Covered Requirements,
+  Compatibility, Security Considerations.
+
+**Step 1: The ring — failing tests** (`sync.rs` `mod tests`):
+- `a_hole_sits_between_the_rows_it_separates` — append a, b;
+  `mark_not_received(5)`; append c: `view_len() == 4`, `view_row` order `a,
+  b, NotReceived(5), c`; `len() == 3`, `row(2) == c` (ring indices ignore
+  holes).
+- `marks_at_the_same_tail_position_merge` — `mark(3)`, `mark(4)` →
+  `NotReceived(7)`, one view row; `mark(0)` is a no-op.
+- `a_hole_is_evicted_with_the_row_after_it` — capacity 3: a, hole, b, c, d
+  → the hole (before b) stays while b is held; one more append evicts b and
+  the hole with it. A tail hole with no row after it stays.
+- `clear_drops_every_hole`.
+- `view_total_counts_every_row_and_hole_ever_added` — monotonic across
+  eviction and `clear`, and a merged mark adds nothing.
+
+`HeldRows` tests:
+- `held_bodies_drain_in_row_order_from_the_count` — hold 20..30 then
+  10..20; `take_reachable(10)` → 10..20; `take_reachable(20)` → 20..30.
+- `a_body_at_the_same_offset_keeps_the_longer`.
+- `held_rows_are_bounded` — holding past `SB2_HELD_MAX_ROWS` returns
+  `false` and holds nothing of that body.
+
+Run `just debug-cargo test -p posh --bin posh remote::sync` — expected:
+compile errors. Implement:
+
+```rust
+/// One row of the scroll view's history (posh#225 Stage 4): a ring row, or
+/// a not-received hole drawn as one collapsed row (UX decision 8).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ViewRow<'a> {
+    Row(&'a [u8]),
+    NotReceived(u64),
+}
+```
+
+`ScrollbackRing` gains `appended: u64` (rows ever appended; the next
+row's number) and `holes: VecDeque<(u64, u64)>` (`(before, lines)`,
+oldest first) plus `holes_added: u64`. `append` increments `appended` and,
+after evicting, drops front holes with `before < appended − len`.
+`mark_not_received(lines)` merges into a tail hole at `before ==
+appended`, or pushes one. `view_row` walks the (few, one per jump) holes.
+`clear` keeps the counters. `HeldRows` (`BTreeMap<u64, Vec<Vec<u8>>>` +
+`rows`): `hold(row_offset, rows) -> bool`, `first_offset()`,
+`take_reachable(t) -> Option<(u64, Vec<Vec<u8>>)>` (the first body with
+offset ≤ `t`), `clear()`. `pub const SB2_HELD_MAX_ROWS: usize = 4 * 256;`
+(as a literal, since `SB2_ROWS_PER_BODY` is in `history.rs`; or import
+it). Run — expected PASS.
+
+**Step 2: The viewport — failing tests** (`client.rs`; helpers: `fn
+v2_body(epoch, off, n)` (rows `"row {i:03}"`), `fn extent_frame(epoch,
+avail, floor)` (an `Empty` body carrying id 10 + id 24), and `fn
+body_with_extent(…)`):
+- `outgoing_caps_requests_the_extent_with_scrollback2` — present beside id
+  10, and absent on the resize-suppressed message along with it.
+- `without_an_extent_a_jump_is_accepted_and_labelled_not_received` — the
+  legacy path: body 0..2, then 10..11: `sb2_rows == 11`, `scrollback.len()
+  == 3`, `view_row(2) == NotReceived(8)`; the ack (`outgoing_caps`) names 11.
+- `a_jump_at_or_below_the_floor_is_not_received` — extent `{avail 40,
+  floor 30}`, rows 0..20 received, then body 30..40: one `NotReceived(10)`, 10
+  rows appended, `T == 40`.
+- `a_jump_above_the_floor_is_held_and_not_acked_past` — extent `{avail 40,
+  floor 0}`, rows 0..20, body 30..40: `T == 20`, `scrollback.len() == 20`,
+  no hole, `sb2_held.rows() == 10`, the ack names 20.
+- `the_resend_fills_the_gap_and_drains_what_was_held` — then body 20..30:
+  `T == 40`, the ring holds rows 0..40 in order, no hole.
+- `a_floor_that_passes_a_held_gap_makes_it_not_received` — held 30..40 at
+  `T = 20`, then `extent_frame(avail 40, floor 30)`: `NotReceived(10)`, `T ==
+  40`, the held rows appended.
+- `the_floor_alone_settles_a_gap_with_nothing_held` — `T = 20`,
+  `extent_frame(avail 60, floor 35)`: `NotReceived(15)`, `T == 35`; the
+  arriving count is 25.
+- `an_extent_of_another_epoch_is_ignored_and_a_new_epoch_clears_it` — an id
+  24 with a stale epoch changes nothing; an id-10 epoch change clears
+  `sb2_extent`, `sb2_held` and (with the ring) the holes.
+- `the_extent_only_moves_forward` — a reordered older extent leaves both
+  fields at their maxima.
+- `an_own_resize_clears_the_extent_and_what_was_held`.
+- `held_bodies_past_the_bound_are_discarded_for_the_resend`.
+- `a_cursor_and_a_viewport_repair_a_lost_body_without_a_hole` — end-to-end
+  over the real sender: a `HistoryCursor` (`Fresh`) over a 5x20 terminal
+  with a 1000-row ring; scroll 600; drain `next_body` with an unbounded
+  window into frames built as `server_loop` builds them (id 10 + the
+  cursor's extent). Drop the FIRST body and `process_frame` the rest, then
+  `on_ack(epoch, st.sb2_rows)` from `outgoing_caps`. Advance `now` past
+  the RTO and deliver the resend. Result: `sb2_rows == 600`, the ring
+  holds the 600 rows in order, no hole. The same run with eviction (a
+  50-row ring, 200 rows scrolled before the first body) yields exactly
+  one `NotReceived(150)` and the 50 retained rows.
+
+Also keep `scrollback2_apply_rules_never_touch_applied_num`,
+`scrollback2_partial_overlap_appends_only_the_tail` and
+`scrollback2_epoch_adoption_resets_ring_and_count` **unchanged**: they
+must pass as written (the no-extent path).
+
+Run `just debug-cargo test -p posh --bin posh scrollback2` and
+`just debug-cargo test -p posh --bin posh extent` — expected: compile
+errors.
+
+**Step 3: The viewport — implement.**
+- `ClientState` fields:
+
+  ```rust
+      /// RFC 0009 §3.1 (posh#225 Stage 4): the server's v2 extent in this
+      /// epoch, each field the maximum seen; `None` until a frame carries
+      /// one (an older server never sends it: a jump is then accepted and
+      /// labelled not received). Cleared with the epoch.
+      sb2_extent: Option<caps::Scrollback2Extent>,
+      /// Bodies past a gap the server can still fill: held, not appended
+      /// and not acked past until the resend arrives (RFC 0009 §3.1).
+      sb2_held: sync::HeldRows,
+  ```
+- `process_frame`: in the epoch-change arm (`:3139-3144`) also `st.sb2_extent
+  = None; st.sb2_held.clear();`. Then, after it:
+
+  ```rust
+      // RFC 0009 §3.1 (posh#225 Stage 4): the server's extent — how many
+      // rows it holds and the floor below which it will never resend.
+      if let Some(x) = caps::find(&frame.caps, caps::CAP_SCROLLBACK2_EXTENT)
+          .and_then(|c| caps::decode_scrollback2_extent(&c.payload))
+          .filter(|x| st.sb2_epoch == Some(x.epoch))
+      {
+          let held = st.sb2_extent.get_or_insert(x);
+          held.avail_rows = held.avail_rows.max(x.avail_rows);
+          held.evicted_upto = held.evicted_upto.max(x.evicted_upto);
+          let mark = history_mark(st);
+          settle_history(st);
+          keep_history_anchor(st, mark);
+      }
+  ```
+- The own-resize block (`:2088-2093`) also clears both.
+- `apply_frame`'s v2 branch keeps the stale and dup arms. The rest
+  becomes `let mark = history_mark(st); apply_scrollback2_rows(st,
+  *row_offset, rows); keep_history_anchor(st, mark);` plus the stats call.
+
+  ```rust
+  /// RFC 0009 §3/§3.1: append a v2 body of the current epoch that is not
+  /// fully covered. A jump past `T` with no extent seen is accepted as
+  /// lost (labelled); with an extent, rows below its floor are lost and a
+  /// body still past `T` is held for the resend (`settle_history`).
+  fn apply_scrollback2_rows(st: &mut ClientState, row_offset: u64, rows: &[Vec<u8>]) {
+      if row_offset > st.sb2_rows {
+          if st.sb2_extent.is_none() {
+              st.scrollback.mark_not_received(row_offset - st.sb2_rows);
+              st.sb2_rows = row_offset;
+          } else {
+              st.sb2_held.hold(row_offset, rows);
+              settle_history(st);
+              return;
+          }
+      }
+      append_tail(st, row_offset, rows);
+      settle_history(st);
+  }
+
+  /// Advance `T` over what is held from it and over what can no longer
+  /// arrive: a gap below the extent's floor (up to the first held body) is
+  /// not received. Stops at a gap the server can still fill.
+  fn settle_history(st: &mut ClientState) {
+      loop {
+          if let Some((off, rows)) = st.sb2_held.take_reachable(st.sb2_rows) {
+              append_tail(st, off, &rows);
+              continue;
+          }
+          let floor = st.sb2_extent.map_or(0, |x| x.evicted_upto);
+          let gone_to = st.sb2_held.first_offset().map_or(floor, |o| o.min(floor));
+          if gone_to <= st.sb2_rows {
+              return;
+          }
+          st.scrollback.mark_not_received(gone_to - st.sb2_rows);
+          st.sb2_rows = gone_to;
+      }
+  }
+  ```
+
+  `append_tail(st, off, rows)` is today's partial-overlap slice (`:3241`)
+  plus `append` and `T = end` when `end > T`. `history_mark(st) -> u64` is
+  `st.scrollback.appended()` in this task, and `keep_history_anchor(st,
+  mark)` does `if st.scroll_offset > 0 { set_scroll(st, st.scroll_offset +
+  (now − mark)) }`, so today's anchoring by appended rows is unchanged.
+  Task 4.3 switches both to view rows.
+- `outgoing_caps`: in the not-suppressed block, after the id-10 entry:
+  `extra.push(caps::encode_scrollback2_extent_request());`.
+- `wedge_repro_server_loop_with_loss_and_titles`: assert
+  `st.sb2_extent.is_some()` ("the extent never engaged"), and print `held=`
+  and the hole count on the `harness CLEAN` line.
+
+Run Step 2's commands, then
+`just debug-cargo test -p posh --bin posh wedge_repro_server_loop_with_loss_and_titles -- --nocapture`
+and `just debug-cargo test -p posh --bin posh remote::` — expected PASS.
+If `wedge_repro`'s v2 rows now stall (no rows accepted), stop and report:
+a held gap is not being repaired by `server_loop`'s RTO resend.
+
+**Step 4: RFC 0009 (client half).**
+- §3: the forward-jump bullet becomes: "with no `SCROLLBACK2_EXTENT` seen
+  in the epoch, the client MUST accept the jump as before (and SHOULD
+  label the gap); otherwise §3.1 applies".
+- §3.1 gains the client rules:
+  - a client that understands the extent SHOULD request it;
+  - it keeps the maximum of each field within an epoch and discards both
+    on an epoch change;
+  - rows of a gap below `evicted_upto` are not received, and the client
+    MUST advance `T` past them (it MAY do so on the extent alone);
+  - a body that still starts past `T` MUST NOT advance `T` or the ack. The
+    client MAY hold it and MUST append it when the gap fills;
+  - a held gap the floor later passes becomes not received;
+  - the sender's resend from the ack is what fills a held gap, so a sender
+    that sends the extent MUST resend from the acknowledgement (both
+    reference senders do).
+- §3's "MUST NOT stall" sentence is scoped to the no-extent path.
+- §5 gains an extent bullet (Init-persistent request carried by the M2
+  bridge, every frame carrying id 10, cached and frozen while history is
+  paused).
+- The posh#243 open-issue paragraph becomes "Resolved by §3.1 (posh#225
+  Stage 4)".
+- Covered Requirements gains rows for Tasks 4.1–4.2's tests.
+- Compatibility: a new client with an old server keeps §3 (jump = lost,
+  now labelled); an old client never requests the extent and gets none.
+- Security Considerations: both fields come from an authenticated peer. A
+  fabricated `evicted_upto` is the same power as a fabricated forward jump
+  today; a fabricated `avail_rows` only inflates a displayed count; held
+  rows are bounded (`SB2_HELD_MAX_ROWS`).
+
+**Step 5: Lint and commit.** `just lint-fmt`; `just lint-doc`; clippy as
+above — clean. Commit message:
+`viewport: tell eviction from loss — hold a gap the server can refill, label the rest not received (posh#225 Stage 4)`
+with a body naming the hold rule, the settle-on-extent rule, the
+1,024-row reorder bound, the no-extent path labelled but otherwise
+unchanged, and:
+`Closes #243`.
 
 ### Task 4.3: The scroll view draws hole rows and the arriving count
-- Files: `remote/scrollview.rs:85-144` (the row loop at `:118-130`),
-  `posh-proto/src/display.rs:926-935` (`apply_scroll_indicator`).
-- One collapsed row per hole at its position: `··· N lines not received ···`.
-  The single *arriving* hole sits between the last history row and the
-  live screen while `avail_rows > sb2_rows`: `··· N lines arriving ···`,
-  and the top bar gains `· N lines still arriving`.
-- Anchoring: the view stays on the content being read when the arriving
-  hole shrinks or fills — extend the existing `set_scroll(offset + grew)`
-  rule and pin it with a test that fills a hole while scrolled up.
-- Visual treatment is an **open item** (look-alike transition or other):
-  ship a dim, centred row; leave the styling in one function.
-- Tests: `compose_scroll_frame` golden frames for (a) a not-received hole
-  mid-history, (b) an arriving hole above the live screen, (c) both, (d)
-  caught up — no hole, no bar suffix.
+
+**Promotion criteria:** N/A — display only.
+
+**Files:**
+- Modify: `crates/posh/src/remote/scrollview.rs` — `ScrollMemo` (`:30-32`),
+  `set_scroll`/`scroll_by` doc (the clamp is the history view length),
+  `compose_scroll_frame` (`:85-144`), new `history_view_len`, `hole_label`,
+  `hole_row`; tests.
+- Modify: `crates/posh-proto/src/display.rs` — `apply_scroll_indicator`
+  (`:926-935`) gains `arriving: u64`; new `group_thousands`; tests.
+- Modify: `crates/posh/src/remote/client.rs` — `set_scroll`/`scroll_by`
+  clamp (`:2659-2670`), `compose_scroll_frame` wrapper (`:3762-3774`, passes
+  the arriving count), `history_mark`/`keep_history_anchor` (view rows);
+  new `fn history_arriving(st) -> u64` (`sb2_extent.map_or(0, |x|
+  x.avail_rows.saturating_sub(st.sb2_rows))`); tests.
+- Modify: `crates/posh/src/session/client.rs` — `compose_scroll`,
+  `set_scroll`, `scroll_by` (`:913-960`) pass `0` / `history_view_len(..,
+  0)` (no behaviour change).
+
+**Step 1: Pin today's bytes BEFORE touching the compose.** Add
+`compose_without_holes_or_arriving_is_unchanged` to `scrollview.rs`
+tests: a 5x20 `Terminal`, a ring of four rows, offset 4, fresh memo and
+`initialized = false`. Run it once printing the bytes, paste them as the
+expected literal, and run again. It must pass before and after this task.
+It is the local client's witness.
+
+**Step 2: Failing tests** (`scrollview.rs`; helper `fn readback(bytes,
+rows, cols) -> Vec<(String, bool)>` (row text, all-dim)):
+- `a_hole_row_is_dim_centred_and_never_wraps` — `hole_row("12,340 lines
+  not received", 40)` replayed: one row, every non-blank cell dim, the
+  label centred between `···` marks; at `cols = 10` it is truncated to one
+  row, never wrapped.
+- `hole_labels_group_digits_and_agree_in_number` — `hole_label(1, false)
+  == "1 line not received"`, `hole_label(12_340, false) == "12,340 lines
+  not received"`, `hole_label(3_200, true) == "3,200 lines arriving"`.
+- `history_view_len_counts_holes_and_the_arriving_row`.
+- `compose_draws_a_not_received_hole_mid_history` — golden: ring `a, b,
+  hole 5, c, d`, a 6-row tty, scrolled to the top: rows read `[bar, a, b,
+  "··· 5 lines not received ···" (dim), c, d]`.
+- `compose_draws_the_arriving_row_above_the_live_screen` — ring `a, b`,
+  `arriving = 300`, offset 1: the row directly above the first visible
+  row reads `··· 300 lines arriving ···`, and the bar contains `· 300 lines
+  still arriving`.
+- `compose_draws_both`.
+- `compose_caught_up_draws_no_hole_and_no_suffix` — `arriving = 0`, no
+  holes: no `···` row, bar text exactly today's.
+- `the_memo_repaints_when_the_arriving_count_changes` — same offset, ring
+  and generation; arriving 300 → 200: the second compose is non-empty.
+
+`display.rs`:
+- `the_scroll_indicator_names_the_lines_still_arriving`.
+- `the_scroll_indicator_is_unchanged_when_nothing_arrives` (exact text).
+- `group_thousands_groups_by_three` (`0`, `999`, `1,000`, `12,340`,
+  `1,234,567`).
+
+`client.rs` (anchoring; a viewport with an extent, rows `"row NNN"`, a
+6-row tty; each test reads row 1, the first history row under the bar, of
+`compose_scroll_frame`'s readback before and after):
+- `filling_a_held_gap_while_scrolled_up_keeps_the_text_being_read_still` —
+  rows 0..20, held 30..40 (avail 40), scrolled so row 1 shows `row 005`;
+  deliver body 20..30: the ring gains 20 rows, the arriving row vanishes,
+  and row 1 still shows `row 005`.
+- `a_hole_appearing_while_scrolled_up_keeps_the_text_still` — an extent
+  whose floor passes `T` while scrolled: row 1 unchanged.
+- `the_arriving_count_falling_repaints_without_moving_the_view`.
+- `the_wheel_reaches_the_oldest_row_past_holes_and_the_arriving_row` —
+  `scroll_by` to the top shows the oldest ring row.
+
+The existing `scroll_offset_clamps_to_ring_and_returns_to_live_at_bottom`
+(`client.rs` and `scrollview.rs`), `append_while_scrolled_bumps_offset_to_freeze_viewport`,
+`scroll_frame_renders_history_window_with_indicator` and
+`scroll_frame_is_memoized_until_state_changes` must pass unchanged.
+`set_scroll_reports_change_and_invalidates_memo` (`scrollview.rs:447`)
+changes only its memo literals to the new tuple shape.
+
+Run `just debug-cargo test -p posh --bin posh scrollview`,
+`just debug-cargo test -p posh-proto scroll_indicator` — expected: compile
+errors.
+
+**Step 3: Implement.**
+- `ScrollMemo = Option<(usize, u64, u64, u64)>`: `(offset, view_total,
+  arriving, generation)` — monotonic, so an evicting append repaints.
+- ```rust
+  /// Rows of the scroll view above the live screen: the ring's rows and
+  /// not-received holes, plus one arriving row while rows are still
+  /// arriving (posh#225 Stage 4). The offset clamps to this.
+  pub(crate) fn history_view_len(scrollback: &ScrollbackRing, arriving: u64) -> usize {
+      scrollback.view_len() + usize::from(arriving > 0)
+  }
+
+  /// The words of a hole row (UX decision 8) — the one place they live.
+  pub(crate) fn hole_label(lines: u64, arriving: bool) -> String;
+
+  /// A hole row as ring-row bytes: dim, centred in `cols`, truncated so it
+  /// never wraps, CRLF-terminated. The one place a hole's look lives — the
+  /// visual treatment is an open item (flood-delivery UX design).
+  pub(crate) fn hole_row(label: &str, cols: u16) -> Vec<u8>;
+  ```
+- `compose_scroll_frame(scroll_offset, scrollback, arriving, server_term,
+  rows, cols, scroll_memo, initialized, last_drawn, scroll_opt)`: `sb_len`
+  becomes `history_view_len(scrollback, arriving)`. In the row loop, `i <
+  scrollback.view_len()` uses `view_row(i)` (`Row` → its bytes,
+  `NotReceived(n)` → `hole_row(&hole_label(n, false), cols)`); otherwise
+  `i < history`, which is the arriving row; otherwise the visible row. Rows
+  become a `Cow<[u8]>` (or an owned scratch) for the generated ones. The bar
+  is `apply_scroll_indicator(&mut snap, offset, arriving)`.
+- `apply_scroll_indicator(fb, lines_up, arriving)`: `arriving == 0` →
+  today's exact text; otherwise `-- SCROLLBACK · {lines_up} line(s) up ·
+  {group_thousands(arriving)} line(s) still arriving · scroll down or press
+  a key to resume --`. `lines_up` stays ungrouped, keeping the witness.
+- Remote client: the wrappers clamp to `history_view_len(&st.scrollback,
+  history_arriving(st))`. `history_mark` becomes `scrollback.view_total() +
+  u64::from(history_arriving(st) > 0)`, and `keep_history_anchor` adds the
+  signed delta, never below 1 while scrolled (offset 0 means live).
+- Local client: `compose_scroll_frame(.., 0, ..)` and clamps with
+  `history_view_len(&self.scrollback, 0)`.
+
+Run Step 2's commands, Step 1's witness, then
+`just debug-cargo test -p posh --bin posh remote::` and
+`just debug-cargo test -p posh --bin posh session::client` — expected
+PASS.
+
+**Step 4: Lint and commit.** `just lint-fmt`; clippy as above — clean.
+Commit message:
+`scrollview: draw not-received holes and the arriving count; the view stays on the text being read (posh#225 Stage 4)`
 
 ### Task 4.4: Records
-- FDR 0005: the Interface and Limitations sections gain holes and the
-  arriving count; "incomplete view" stops being silent.
 
-**Stage 4 exit check:** wheel up mid-flood on a throttled link: the bar
-counts down, the arriving row shrinks, the text being read does not move.
+**Files:**
+- Modify: `docs/features/0005-client-side-scrollback.md` (status stays
+  `experimental`):
+  - Interface: while scrolled, a span of history the viewport will never
+    receive is one dim `··· N lines not received ···` row where it belongs,
+    and while the server still holds rows the viewport has not received, an
+    `··· N lines arriving ···` row sits above the live screen and the top
+    bar adds `· N lines still arriving`, counting down. The text being read
+    does not move as rows land.
+  - The "Incomplete/truncated view" consequence (`:59-63`) gains: it is
+    labelled, not silent (a paced RFC 0009 v2 viewport; posh#225 Stage 4).
+  - Limitations: rows scrolled while detached are still an unlabelled seam
+    until Stage 5; the hole look is provisional; the local attach draws no
+    holes until Stage 6.
+- Modify: `docs/features/0021-flood-delivery.md`:
+  - Interface: holes and the arriving count; the extent.
+  - Decision 15: the extent is the send floor, on every frame carrying
+    the id-10 entry. Decision 16: the hold rule and the 1,024-row reorder
+    bound, with the brief's "pending" folded into "arriving" and why.
+  - Limitations: the posh#243 bullet (`:198-205`) becomes "a body lost on
+    the wire is held and repaired by the resend from the ack (RFC 0009
+    §3.1); only rows below the server's floor are drawn not received" —
+    the operator decision text goes. "silent until Stage 4" (`:174`) and
+    the slow-reader bullet now say each loss is drawn as one not-received
+    row. "labelled by Stage 4, not repaired" (`:223`) becomes "drawn as
+    not received". New: the detach seam stays unlabelled until Stage 5.
+  - Code pointers: `remote/history.rs` `extent`, `remote/sync.rs`
+    `ViewRow`/`HeldRows`, `remote/scrollview.rs` `hole_row`.
+- Modify: `doc/posh-client.1.scd` — under `_POSH_GRAB_MOUSE_`, after "with a
+  top status-bar indicator", one sentence: "History the viewport will never
+  receive is drawn as one dim *··· N lines not received ···* row where it
+  belongs, and while the session holds rows still on their way a *··· N
+  lines arriving ···* row sits above the live screen and the bar counts
+  them down." (`just lint-doc`: no line may start with `[`.)
+- RFC 0009 and RFC 0001 are already done (4.1, 4.2). Check that their
+  Covered Requirements name every test that landed.
+- This plan: "Stage 4 as built" is written after the stage, in the style of
+  Stage 3's, superseding this text where it differs.
+
+**Step 1:** `just lint-doc`; `just lint-fmt` — clean.
+
+**Step 2: Commit** — message:
+`docs: hole rows and the arriving count — FDR 0005, FDR 0021, posh-client(1) (posh#225 Stage 4)`
+
+**Step 3:** merge with `merge-this-session` (the pre-merge hook is the CI
+lane; do not run `just` first).
+
+**Stage 4 exit check** (needs this build on both ends, in a mux-attached,
+paced session):
+1. Mid-`nix gc`, on a link slow enough that history trails, wheel up. The
+   top bar shows `· N lines still arriving` and counts down. The `··· N
+   lines arriving ···` row sits directly above the live screen and
+   shrinks. The line under the bar does not move as rows land. *Unverified:*
+   how to throttle the link on demand (`tc netem` on the remote host, or a
+   genuinely slow network).
+2. After the flood, with more than a ring gone undelivered: exactly one
+   `··· N lines not received ···` row where the rows are missing, and
+   `posh history <host>:<session> | tail` agrees with the rows below it.
+3. On a lossy link that keeps up (the posh#243 case), no `not received` row
+   appears unless the session's ring evicted rows. The viewport's history
+   matches `posh history` row for row.
+4. Caught up: no arriving row, and the bar text is the pre-Stage-4 text.
+5. Detach and re-attach: as Stage 3 (rows scrolled while detached are an
+   unlabelled seam until Stage 5).
 
 ---
 
@@ -3873,10 +4853,11 @@ bottom once Stage 7 is done, or sooner only if the operator re-orders it.
 | 15 | **posh#239** — `the_daemon_loop_sends_a_resized_client_a_frame_for_its_new_geometry` fails intermittently with "capability payload/entry truncated" in `mirror_frames` | Stage 2 test runs | Root cause: a test-side race on raw pre-Init output. Test fixed; the production side (a connection received broadcast output before its Init) fixed and merged 2026-10-06 (`5be221b`). **Closed.** |
 | 16 | **posh#241** — `just lint-fmt` does not gate Rust formatting (`conformist.nix` is nixfmt + shfmt only); `remote/server.rs` fails `rustfmt --check` on master | Task 3.1 | Repo-level gap; decide rustfmt-in-conformist (one mechanical reformat commit) vs documenting the exclusion in AGENTS.md. |
 | 17 | **posh#242** — `switch_route_target` can pick a connection that never sent `Init` (a concurrent `posh list` probe) in the never-typed tie case | posh#239 review | One-line filter on `initialized()` + a test. Pre-existing. |
-| 18 | **posh#243** — RFC 0009 v2: a body lost on the wire while a later body is in flight becomes an unrepairable forward jump indistinguishable from eviction | Task 3.3 review | Inherited from `server_loop`; reachable on the default path since Stage 3. Operator kept the two-body window (2026-10-06). Proper fix: an eviction marker in RFC 0009, with Stage 4 (holes). |
+| 18 | **posh#243** — RFC 0009 v2: a body lost on the wire while a later body is in flight becomes an unrepairable forward jump indistinguishable from eviction | Task 3.3 review | Inherited from `server_loop`; reachable on the default path since Stage 3. Operator kept the two-body window (2026-10-06). Proper fix: an eviction marker in RFC 0009, with Stage 4 (holes). Folded into Stage 4 (operator, 2026-10-06): Tasks 4.1–4.2; closed by 4.2's commit. |
 | 19 | **posh#245** — a height grow pops ring rows back onto the grid without lowering `scrollback_total`; they are delivered again when they re-scroll | Stage 3 whole-stage review | Pre-existing, v1 too; multi-viewport sessions only. Needs a posh-term API addition (the popped count). |
 | 20 | **posh#246** — v2 measurement gaps: the slow-reader loss (6,400 vs v1's ~4,300) is unanalysed; the visible-base cliff past ~2 s RTT is unmeasurable in a 2 MiB flood | Task 3.3 Part B | Longer-flood harness case or field data; Task 3.4 may change the slow-reader number. |
 | 21 | **posh#244** — `history_resend_after`'s doubling duplicates `remote/agent.rs`'s private `backed_off` | Stage 3 simplify | Share one helper when either site is next touched (Task 3.4). |
+| 22 | **posh#247** — palette About / transport info and `posh status`: show the flood-delivery state (ack latency, v2 history, mux-peer frame count, mux daemon build) | operator, after the Stage 3 merge | Sequenced with Task 7.1 (`posh status` per-viewport fields, RFC 0014 §4.2 key order) per the operator (2026-10-06). Stage 4's extent and arriving count are candidate fields. |
 
 Recorded elsewhere rather than filed: the `ClientConn::mirror_geometry()`
 accessor is a comment on **posh#210** (the `CAP_SESSION_SIZE` / RFC 0012
