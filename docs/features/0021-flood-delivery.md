@@ -251,7 +251,11 @@ Settled for Stage 4 (holes the viewport draws), 2026-10-06:
   are drawn not received (posh#243). The repair rests on two sender fixes
   in the same stage: the resend is clocked from the start of the in-flight
   run, so fresh bodies no longer postpone it, and an ack back to 0 in the
-  same epoch opens a fresh epoch (RFC 0009 §4, §3.1).
+  same epoch opens a fresh epoch (RFC 0009 §4, §3.1). The held buffer
+  (`SB2_HELD_MAX_ROWS`) keeps what it holds and refuses the newcomer, so
+  under a full buffer the body nearest the gap can be the one refused;
+  that costs resend floors, never progress, because a resend starts at or
+  below the viewport's count and appends directly.
 - **An extent can overtake a body still in flight** (datagram reordering, a
   bridge retransmit): the viewport marks the rows below the floor not
   received, and when that body's rows arrive late they are skipped as

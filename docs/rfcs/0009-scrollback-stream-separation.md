@@ -257,7 +257,10 @@ asked uses the extent:
   keep the longer of two held bodies at the same offset, and MUST discard
   whole (never truncate) a body that would exceed the bound — the resend
   sends it again. The reference bound is 1,024 rows (four bodies of 256,
-  §2).
+  §2); the reference client keeps what it holds and refuses the newcomer
+  whatever its offset, so under a full buffer the body nearest `T` can be
+  the one refused — a cost in resend floors, never a stall, since a resend
+  starts at or below `T` and appends directly.
 - **Draining.** After each append and each adoption the client repeats,
   until neither applies: append every held body whose offset is at or below
   `T`, under §3's rules (its rows below `T` are skipped); then apply the
