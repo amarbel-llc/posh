@@ -1,6 +1,7 @@
 //! Per-session daemon: owns the PTY and broadcasts output to attached
 //! clients over a Unix socket (zmx daemonLoop port).
 
+use std::collections::VecDeque;
 use std::io::Write;
 use std::os::fd::{AsRawFd, RawFd};
 use std::os::unix::net::{UnixListener, UnixStream};
@@ -71,6 +72,9 @@ const PACED_FRAME_FLOOR_MS: u64 = 20;
 /// stalling its screen. Starts at `server_loop`'s send-interval ceiling
 /// (`SEND_INTERVAL_MAX`). A tuning value, as above.
 const PACED_ACK_WAIT_MS: u64 = 250;
+/// How often a paced viewport's `paced ack latency` log line may repeat
+/// (posh#225 Stage 3.0): the field series Task 3.4 is tuned from.
+const ACK_LOG_INTERVAL_MS: u64 = 10_000;
 
 /// Ensures the session exists, forking off a daemon when needed. Returns
 /// true when a new session was created. The daemon is a double-forked
@@ -311,7 +315,7 @@ enum RegeometryKeyframe {
 }
 
 /// A paced client's send-time state (posh#225, RFC 0008 §3.2).
-#[derive(Debug, Default, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Default, Clone, PartialEq, Eq)]
 struct Pacing {
     /// A visible frame is owed: output reached the broadcast source since
     /// the last paced frame, or an event (attach replay, regeometry,
@@ -322,6 +326,72 @@ struct Pacing {
     /// before the first, and after a RESYNC (the client gave up on what was
     /// outstanding): the next frame then waits only for an empty `write_buf`.
     last_fresh: Option<u64>,
+    /// `(frame number, queued at)` for each paced visible frame not yet
+    /// confirmed by an ack, oldest first, at most `SENT_FRAME_LOG_CAP`
+    /// (posh#225 Stage 3.0): what an ack's round trip is measured from.
+    /// Emptied on a RESYNC, with `last_fresh`.
+    sent_frames: VecDeque<(u64, u64)>,
+    /// Its frame-ack timing (posh#225 Stage 3.0): diagnostic only.
+    acks: AckLatency,
+}
+
+/// The most entries `Pacing::sent_frames` keeps: 16 unacked visible frames
+/// (scrollback slots are never logged). Unacked, they are sent one per
+/// `PACED_ACK_WAIT_MS`, so the log covers a round trip of about 4 s; past
+/// that the oldest is dropped before its ack lands, and acks stop sampling.
+const SENT_FRAME_LOG_CAP: usize = 16;
+
+/// A paced viewport's frame-ack timing (posh#225 Stage 3.0): the round trip
+/// of a paced visible frame — from when it was queued, through the bridge
+/// and the link, applied, to when its ack arrived — which is the only RTT
+/// the daemon can see. Each frame is sampled at most once — an ack that
+/// confirms several logged frames samples only the newest. Read by the history resend floor
+/// (Task 3.3) and the trickle (Task 3.4).
+#[derive(Debug, Default, Clone, Copy, PartialEq, Eq)]
+struct AckLatency {
+    /// When the newest `Tag::FrameAck` arrived, advancing or not.
+    last_ack_at: Option<u64>,
+    last_ms: Option<u64>,
+    /// Smoothed like TCP's SRTT: the first sample, then 7/8 old + 1/8 new.
+    srtt_ms: Option<u64>,
+    min_ms: Option<u64>,
+    max_ms: u64,
+    samples: u64,
+    /// `samples` at the last `paced ack latency` line, and when it was written.
+    logged_samples: u64,
+    logged_at: Option<u64>,
+}
+
+impl AckLatency {
+    fn record(&mut self, ms: u64) {
+        self.last_ms = Some(ms);
+        self.srtt_ms = Some(self.srtt_ms.map_or(ms, |s| (7 * s + ms) / 8));
+        self.min_ms = Some(self.min_ms.map_or(ms, |m| m.min(ms)));
+        self.max_ms = self.max_ms.max(ms);
+        self.samples += 1;
+    }
+
+    /// `ack_ms=<last>/<srtt>/<min>/<max> ack_n=<samples> ack_age_ms=<ms>`,
+    /// `none` where there is nothing yet.
+    fn log_fields(&self, now: u64) -> String {
+        let ms = match (self.last_ms, self.srtt_ms, self.min_ms) {
+            (Some(last), Some(srtt), Some(min)) => format!("{last}/{srtt}/{min}/{}", self.max_ms),
+            _ => "none".to_owned(),
+        };
+        let age = self
+            .last_ack_at
+            .map_or_else(|| "none".to_owned(), |at| now.saturating_sub(at).to_string());
+        format!("ack_ms={ms} ack_n={} ack_age_ms={age}", self.samples)
+    }
+
+    /// Whether a `paced ack latency` line is due at `now`: new samples since
+    /// the last one, which is at least `ACK_LOG_INTERVAL_MS` old.
+    fn log_due(&self, now: u64) -> bool {
+        self.samples > self.logged_samples
+            && self
+                .logged_at
+                .is_none_or(|at| now.saturating_sub(at) >= ACK_LOG_INTERVAL_MS)
+    }
 }
 
 impl ClientConn {
@@ -419,7 +489,7 @@ impl ClientConn {
                     let paced = caps::find(&advertised, caps::CAP_PACED)
                         .and_then(|c| caps::decode_paced(&c.payload))
                         .is_some();
-                    self.pacing = paced.then_some(self.pacing.unwrap_or_default());
+                    self.pacing = paced.then(|| self.pacing.take().unwrap_or_default());
                     // RFC 0014: a client's Init table may carry its identity
                     // and state (the local client always does; a relay carries
                     // its own identity here and the origin's via ClientCaps).
@@ -578,7 +648,7 @@ impl ClientConn {
             return None;
         }
         let producer = self.producer.as_ref()?;
-        let last_fresh = self.pacing.and_then(|p| p.last_fresh);
+        let last_fresh = self.pacing.as_ref().and_then(|p| p.last_fresh);
         Some(match last_fresh {
             None => 0,
             Some(at) if producer.acked_num() >= producer.last_visible_num() => at + PACED_FRAME_FLOOR_MS,
@@ -589,7 +659,7 @@ impl ClientConn {
     /// A paced client that owes a visible frame (`send_paced_frames` will
     /// build it).
     fn owes_paced_frame(&self) -> bool {
-        self.pacing.is_some_and(|p| p.dirty)
+        self.pacing.as_ref().is_some_and(|p| p.dirty)
     }
 
     /// For a paced client, record that a visible frame is owed and return
@@ -624,9 +694,16 @@ impl ClientConn {
             return;
         }
         self.maybe_queue_scrollback(src);
+        let sent = self.producer.as_ref().map(FrameProducer::last_visible_num);
         if let Some(p) = self.pacing.as_mut() {
             p.dirty = false;
             p.last_fresh = Some(now);
+            if let Some(num) = sent {
+                if p.sent_frames.len() == SENT_FRAME_LOG_CAP {
+                    p.sent_frames.pop_front();
+                }
+                p.sent_frames.push_back((num, now));
+            }
         }
     }
 
@@ -836,10 +913,47 @@ impl ClientConn {
             producer.drop_acked_base();
             if let Some(p) = self.pacing.as_mut() {
                 p.last_fresh = None;
+                p.sent_frames.clear();
             }
             return true;
         }
         false
+    }
+
+    /// Record a frame ack's arrival for a paced client (posh#225 Stage 3.0):
+    /// `acked_before` is the producer's `acked_num()` before the ack was
+    /// applied. An ack that ADVANCED it is a sample: the round trip of the
+    /// newest logged paced visible frame it confirms (an ack naming the
+    /// scrollback slot after visible frame N confirms N), measured from when
+    /// that frame was queued. Every logged frame it confirms is then
+    /// dropped, so a frame is sampled at most once. Not the NEWEST frame's
+    /// ack only: with an RTT past `PACED_ACK_WAIT_MS` and steady output a
+    /// newer frame is always queued before the ack lands, and that regime
+    /// is the one the signal is for. A repeated ack advances nothing, and a
+    /// RESYNC emptied the log in `apply_frame_ack`: neither is a sample.
+    fn note_frame_ack(&mut self, acked_before: Option<u64>, now: u64) {
+        let (Some(before), Some(producer)) = (acked_before, self.producer.as_ref()) else {
+            return;
+        };
+        let acked = producer.acked_num();
+        let Some(p) = self.pacing.as_mut() else {
+            return;
+        };
+        p.acks.last_ack_at = Some(now);
+        if acked <= before {
+            return;
+        }
+        let mut confirmed = None;
+        while let Some(&(num, queued_at)) = p.sent_frames.front() {
+            if num > acked {
+                break;
+            }
+            confirmed = Some(queued_at);
+            p.sent_frames.pop_front();
+        }
+        if let Some(queued_at) = confirmed {
+            p.acks.record(now.saturating_sub(queued_at));
+        }
     }
 
     /// Whether this client advertised `CAP_SCROLLBACK` (RFC 0002 §1) on its
@@ -957,16 +1071,40 @@ impl ClientConn {
 /// bursty, and `paced=` — a paced viewport holds at most one frame pair
 /// (RFC 0008 §3.2), so a paced client at the high-water mark or dropped is
 /// a posh bug, not a slow reader. Telling the viewport why it was dropped
-/// is posh#226.
+/// is posh#226. Then the ack latency (posh#225 Stage 3.0): `none` and 0 for
+/// a client that is not paced, which records none.
 fn backlog_log_fields(c: &ClientConn, now: u64) -> String {
     format!(
-        "fd={} backlog={} drained_total={} last_drain_age_ms={} paced={}",
+        "fd={} backlog={} drained_total={} last_drain_age_ms={} paced={} {}",
         c.stream.as_raw_fd(),
         c.write_buf.len(),
         c.bytes_drained,
         now.saturating_sub(c.last_drain_ms),
         u8::from(c.is_paced()),
+        c.pacing.as_ref().map_or_else(
+            || AckLatency::default().log_fields(now),
+            |p| p.acks.log_fields(now)
+        ),
     )
+}
+
+/// The throttled `paced ack latency` line for one client (posh#225 Stage
+/// 3.0), when one is due — `None` for a client that is not paced — and
+/// records that it was written. `new=` counts the samples since the last.
+fn ack_latency_log_line(c: &mut ClientConn, now: u64) -> Option<String> {
+    let acks = c.pacing.as_ref()?.acks;
+    if !acks.log_due(now) {
+        return None;
+    }
+    let line = format!(
+        "paced ack latency {} new={}",
+        backlog_log_fields(c, now),
+        acks.samples - acks.logged_samples
+    );
+    let p = c.pacing.as_mut()?;
+    p.acks.logged_samples = acks.samples;
+    p.acks.logged_at = Some(now);
+    Some(line)
 }
 
 /// Broadcasts a PTY-output chunk to every attached client: a posh-proto
@@ -1066,8 +1204,14 @@ fn broadcast_output(clients: &mut [ClientConn], term: &Terminal, bcast: &[u8]) {
 /// A paced client's recovering `Full` is instead its next paced frame
 /// (posh#225, RFC 0008 §3.2), and waits only for an empty buffer:
 /// `apply_frame_ack` released its ack wait.
-fn handle_frame_ack(c: &mut ClientConn, payload: &[u8], src: &Terminal) {
-    if c.apply_frame_ack(payload) {
+///
+/// `now` (the caller's clock) times a paced client's ack
+/// (`note_frame_ack`, posh#225 Stage 3.0); it changes no stream.
+fn handle_frame_ack(c: &mut ClientConn, payload: &[u8], src: &Terminal, now: u64) {
+    let acked_before = c.producer.as_ref().map(FrameProducer::acked_num);
+    let resync = c.apply_frame_ack(payload);
+    c.note_frame_ack(acked_before, now);
+    if resync {
         c.request_frame_from(src);
     }
 }
@@ -1752,6 +1896,11 @@ fn daemon_loop(
                     &format!("client backlog high-water {}", backlog_log_fields(c, now)),
                 );
             }
+            // A paced viewport's ack latency (posh#225 Stage 3.0): at most
+            // one line per `ACK_LOG_INTERVAL_MS`, and only with new samples.
+            if let Some(line) = ack_latency_log_line(c, now) {
+                util::log_write("info", &line);
+            }
         }
 
         // Drop stuck readers before building the pollfd set (so the fd<->client
@@ -2203,6 +2352,7 @@ fn daemon_loop(
                                     c,
                                     &frame.payload,
                                     active_source(overlay.as_ref().map(|o| &o.term), term),
+                                    util::now_ms(),
                                 ),
                                 // Output, Ack, Exit, Frame, and Switch are all
                                 // daemon->client only; ignore if received from
@@ -2314,11 +2464,13 @@ fn daemon_loop(
                 break;
             }
             if remove {
-                let fd = clients[i].stream.as_raw_fd();
+                // The backlog fields (`fd=` first) carry a paced viewport's
+                // final ack latency (posh#225 Stage 3.0).
+                let fields = backlog_log_fields(&clients[i], util::now_ms());
                 clients.remove(i);
                 util::log_write(
                     "info",
-                    &format!("client disconnected fd={fd} remaining={}", clients.len()),
+                    &format!("client disconnected {fields} remaining={}", clients.len()),
                 );
                 // The smallest client may have left; grow back (zmx issue #8).
                 resized = true;
@@ -4483,13 +4635,13 @@ mod tests {
 
         // Full #1 acked ⇒ base 1; the echo burst races ahead: #2 diffs vs 1.
         assert!(c.queue_frame(term.dump_vt(), Snapshot::from_term(&term), false, (rows, cols)));
-        handle_frame_ack(&mut c, &ipc::encode_frame_ack(1, 0), &term);
+        handle_frame_ack(&mut c, &ipc::encode_frame_ack(1, 0), &term, 0);
         term.process(b"echo burst ");
         broadcast_output(std::slice::from_mut(&mut c), &term, b"<raw ignored>");
 
         // The client's #95 resync request arrives; the screen is STATIC from
         // here on (the shell is idle at a prompt).
-        handle_frame_ack(&mut c, &ipc::encode_frame_ack(2, ipc::FRAME_ACK_RESYNC), &term);
+        handle_frame_ack(&mut c, &ipc::encode_frame_ack(2, ipc::FRAME_ACK_RESYNC), &term, 0);
 
         // The recovering Full must ALREADY be queued — no output will come to
         // trigger one, and nothing else retransmits (the bridge cleared its
@@ -5023,7 +5175,7 @@ mod tests {
         let (mut c, _peer) = lossy_conn(rows, cols, &[]);
         broadcast_to(&mut c, &term);
         c.write_buf.clear();
-        handle_frame_ack(&mut c, &ipc::encode_frame_ack(1, ipc::FRAME_ACK_RESYNC), &term);
+        handle_frame_ack(&mut c, &ipc::encode_frame_ack(1, ipc::FRAME_ACK_RESYNC), &term, 0);
         assert_eq!(only_full_body(&c.write_buf), term.dump_vt_mirror(rows, cols));
         assert_client_renders_as_full_replay(&c, &term);
     }
@@ -5132,7 +5284,7 @@ mod tests {
         let (mut c, _peer) = lossy_conn(rows, cols + 20, &[]);
         broadcast_to(&mut c, &term);
         assert!(!resize_like_the_loop(&mut c, &term, rows, cols), "it held a full dump");
-        handle_frame_ack(&mut c, &ipc::encode_frame_ack(1, ipc::FRAME_ACK_RESYNC), &term);
+        handle_frame_ack(&mut c, &ipc::encode_frame_ack(1, ipc::FRAME_ACK_RESYNC), &term, 0);
         assert_eq!(c.visible_shaped_for, Some((rows, cols)), "the resync keyframe was bounded");
         c.write_buf.clear();
         assert!(resize_like_the_loop(&mut c, &term, rows + 16, cols), "a bounded keyframe went stale");
@@ -5644,6 +5796,11 @@ mod tests {
         /// Paced runs only: whether the client, acking the last visible frame
         /// once the idle tail went quiet, holds the terminal's final screen.
         last_screen_delivered: Option<bool>,
+        /// Paced runs only: the client's ack latency at the end of the run
+        /// (posh#225 Stage 3.0). The cadence acks go through
+        /// `handle_frame_ack` on the harness clock; the attach and final
+        /// acks do not, so the t = 0 keyframe is never a sample.
+        ack_latency: Option<AckLatency>,
     }
 
     /// One flood run's knobs.
@@ -5820,7 +5977,7 @@ mod tests {
                 None => flood_ack_eligible(case.acks, run.chunks, &newest),
             };
             if let Some(n) = ledger.deliverable_ack(eligible) {
-                c.apply_frame_ack(&ipc::encode_frame_ack(n, 0));
+                handle_frame_ack(&mut c, &ipc::encode_frame_ack(n, 0), &term, now);
             }
 
             if let Some(ms) = case.pace {
@@ -5863,7 +6020,7 @@ mod tests {
                 step += 1;
                 let eligible = paced_ack_eligible(case.acks, step, &newest, &newest_avail, now, ms);
                 if let Some(n) = ledger.deliverable_ack(eligible) {
-                    c.apply_frame_ack(&ipc::encode_frame_ack(n, 0));
+                    handle_frame_ack(&mut c, &ipc::encode_frame_ack(n, 0), &term, now);
                 }
                 paced_flood_send_pass(&mut c, &term, now, &mut ledger, &mut run, &mut newest, false);
                 newest_avail.push(now + ms);
@@ -5892,6 +6049,7 @@ mod tests {
         }
         run.rows_scrolled = term.primary_scrollback_total() - c.sb_floor;
         run.rows_acked = c.acked_sb_total.max(c.sb_floor) - c.sb_floor;
+        run.ack_latency = c.pacing.as_ref().map(|p| p.acks);
         run
     }
 
@@ -6499,7 +6657,7 @@ mod tests {
         let now = util::now_ms();
         for (c, want) in [(&paced, "paced=1"), (&plain, "paced=0")] {
             let fields = backlog_log_fields(c, now);
-            assert!(fields.ends_with(want), "{fields}");
+            assert!(fields.contains(&format!(" {want} ")), "{fields}");
             for key in ["fd=", "backlog=", "drained_total=", "last_drain_age_ms="] {
                 assert!(fields.contains(key), "{fields} lacks {key}");
             }
@@ -6517,7 +6675,8 @@ mod tests {
             c.pacing,
             Some(Pacing {
                 dirty: true,
-                last_fresh: None
+                last_fresh: None,
+                ..Pacing::default()
             }),
             "a bare re-Init keeps the paced state"
         );
@@ -6597,6 +6756,7 @@ mod tests {
         a.pacing = Some(Pacing {
             dirty: true,
             last_fresh: Some(100),
+            ..Pacing::default()
         });
         let (mut b, _p3) = paced_conn(5, 24, &[]);
         assert!(b.build_frame_from(&term));
@@ -6604,6 +6764,7 @@ mod tests {
         b.pacing = Some(Pacing {
             dirty: true,
             last_fresh: Some(100),
+            ..Pacing::default()
         });
         let mut clients = vec![a, b];
         assert_eq!(paced_poll_timeout(&clients, now), 20);
@@ -6615,6 +6776,7 @@ mod tests {
         clients[0].pacing = Some(Pacing {
             dirty: true,
             last_fresh: Some(50),
+            ..Pacing::default()
         });
         assert_eq!(paced_poll_timeout(&clients, now), 0, "overdue: never negative");
     }
@@ -6644,13 +6806,7 @@ mod tests {
             Some(&term.dump_vt_mirror(rows, cols)[..]),
             "the latest screen, not an intermediate one"
         );
-        assert_eq!(
-            c.pacing,
-            Some(Pacing {
-                dirty: false,
-                last_fresh: Some(40)
-            })
-        );
+        assert_eq!(c.pacing.as_ref().map(|p| (p.dirty, p.last_fresh)), Some((false, Some(40))));
         assert_eq!(c.producer.as_ref().unwrap().last_visible_num(), num, "the producer names it");
         c.write_buf.clear();
         send_paced_frames(std::slice::from_mut(&mut c), &term, 40);
@@ -6794,7 +6950,7 @@ mod tests {
         let sent = c.producer.as_ref().unwrap().last_visible_num();
         c.write_buf.clear();
 
-        handle_frame_ack(&mut c, &ipc::encode_frame_ack(sent, ipc::FRAME_ACK_RESYNC), &term);
+        handle_frame_ack(&mut c, &ipc::encode_frame_ack(sent, ipc::FRAME_ACK_RESYNC), &term, 100);
         assert!(c.write_buf.is_empty(), "the recovering frame waits for the pass");
         assert_eq!(c.paced_send_at(), Some(0), "the RESYNC released the ack wait");
         send_paced_frames(std::slice::from_mut(&mut c), &term, 101);
@@ -7194,5 +7350,194 @@ mod tests {
         assert!(!alone.is_empty());
         assert_eq!(alone.len(), beside.len(), "the non-paced stream changed length");
         assert!(alone == beside, "the non-paced stream changed beside a paced client");
+    }
+
+    // ---- posh#225 Stage 3: ack latency ----
+
+    /// Feed `bytes` to `term`, mark the paced client dirty and run the send
+    /// pass at `now` (its buffer cleared first, as if the reader drained
+    /// it). Returns the visible frame that pass sent; panics when it sent
+    /// none, so a test cannot sample a frame that was never queued.
+    fn send_paced_screen_at(c: &mut ClientConn, term: &mut Terminal, bytes: &[u8], now: u64) -> u64 {
+        let before = c.producer.as_ref().unwrap().last_visible_num();
+        term.process(bytes);
+        broadcast_output(std::slice::from_mut(c), term, bytes);
+        c.write_buf.clear();
+        send_paced_frames(std::slice::from_mut(c), term, now);
+        let sent = c.producer.as_ref().unwrap().last_visible_num();
+        assert!(sent > before, "the send pass at t={now} sent no frame");
+        sent
+    }
+
+    fn acks_of(c: &ClientConn) -> AckLatency {
+        c.pacing.as_ref().expect("a paced client").acks
+    }
+
+    /// A paced client whose first frame, sent at 100, was acked at 340: one
+    /// 240 ms sample.
+    fn paced_conn_with_a_240ms_sample(term: &mut Terminal) -> (ClientConn, UnixStream) {
+        let (mut c, peer) = paced_conn(term.rows(), term.cols(), &[]);
+        let sent = send_paced_screen_at(&mut c, term, b"a line\r\n", 100);
+        handle_frame_ack(&mut c, &ipc::encode_frame_ack(sent, 0), term, 340);
+        (c, peer)
+    }
+
+    #[test]
+    fn a_paced_clients_ack_of_its_newest_frame_is_a_latency_sample() {
+        let mut term = Terminal::with_scrollback(24, 80, 100);
+        let (c, _peer) = paced_conn_with_a_240ms_sample(&mut term);
+        let acks = acks_of(&c);
+        assert_eq!(acks.last_ms, Some(240));
+        assert_eq!(acks.srtt_ms, Some(240));
+        assert_eq!(acks.min_ms, Some(240));
+        assert_eq!(acks.max_ms, 240);
+        assert_eq!(acks.samples, 1);
+        assert_eq!(acks.last_ack_at, Some(340));
+    }
+
+    #[test]
+    fn ack_latency_smooths_and_keeps_min_and_max() {
+        let mut term = Terminal::with_scrollback(24, 80, 100);
+        let (mut c, _peer) = paced_conn_with_a_240ms_sample(&mut term);
+        let sent = send_paced_screen_at(&mut c, &mut term, b"another\r\n", 360);
+        handle_frame_ack(&mut c, &ipc::encode_frame_ack(sent, 0), &term, 400);
+        let acks = acks_of(&c);
+        assert_eq!(acks.last_ms, Some(40));
+        assert_eq!(acks.srtt_ms, Some((7 * 240 + 40) / 8));
+        assert_eq!(acks.min_ms, Some(40));
+        assert_eq!(acks.max_ms, 240);
+        assert_eq!(acks.samples, 2);
+    }
+
+    /// With a newer frame already queued (an RTT past the ack wait), the ack
+    /// of the older one is still that frame's own round trip.
+    #[test]
+    fn an_ack_of_an_older_frame_samples_that_frames_own_round_trip() {
+        let mut term = Terminal::with_scrollback(24, 80, 100);
+        let (mut c, _peer) = paced_conn(24, 80, &[]);
+        let first = send_paced_screen_at(&mut c, &mut term, b"one\r\n", 100);
+        let second = send_paced_screen_at(&mut c, &mut term, b"two\r\n", 100 + PACED_ACK_WAIT_MS);
+        handle_frame_ack(&mut c, &ipc::encode_frame_ack(first, 0), &term, 400);
+        let acks = acks_of(&c);
+        assert_eq!(acks.last_ack_at, Some(400));
+        assert_eq!(acks.samples, 1);
+        assert_eq!(acks.last_ms, Some(300));
+
+        handle_frame_ack(&mut c, &ipc::encode_frame_ack(second, 0), &term, 700);
+        let acks = acks_of(&c);
+        assert_eq!(acks.last_ms, Some(350));
+        assert_eq!(acks.samples, 2);
+    }
+
+    /// A paced frame with history behind it is visible N plus scrollback
+    /// N+1; the viewport's ack names N+1, which confirms N: its sample.
+    #[test]
+    fn an_ack_of_the_scrollback_slot_samples_its_visible_frame() {
+        let (rows, cols) = (5u16, 24u16);
+        let mut term = Terminal::with_scrollback(rows, cols, 1000);
+        let scrollback = caps::Cap {
+            id: caps::CAP_SCROLLBACK,
+            payload: vec![0],
+        };
+        let (mut c, _peer) = paced_conn(rows, cols, &[scrollback]);
+        assert!(c.build_frame_from(&term));
+        c.apply_frame_ack(&ipc::encode_frame_ack(1, 0));
+        c.write_buf.clear();
+
+        scroll_off(&mut term, 14);
+        broadcast_output(std::slice::from_mut(&mut c), &term, b"x");
+        send_paced_frames(std::slice::from_mut(&mut c), &term, 100);
+        let frames = decode_server_frames(&c.write_buf);
+        assert_eq!(frames.len(), 2, "the visible frame, then its scrollback");
+        assert!(matches!(frames[1].body, FrameBody::Scrollback { .. }), "got {:?}", frames[1].body);
+        let visible = c.producer.as_ref().unwrap().last_visible_num();
+        let slot = frames[1].frame_num;
+        assert_eq!(slot, visible + 1);
+
+        handle_frame_ack(&mut c, &ipc::encode_frame_ack(slot, 0), &term, 340);
+        assert_eq!(acks_of(&c).last_ms, Some(240));
+        assert_eq!(acks_of(&c).samples, 1);
+        handle_frame_ack(&mut c, &ipc::encode_frame_ack(slot, 0), &term, 400);
+        assert_eq!(acks_of(&c).samples, 1, "a repeated ack of the slot adds no sample");
+    }
+
+    #[test]
+    fn a_repeated_or_resync_ack_is_no_sample() {
+        let mut term = Terminal::with_scrollback(24, 80, 100);
+        let (mut c, _peer) = paced_conn_with_a_240ms_sample(&mut term);
+        let acked = c.producer.as_ref().unwrap().acked_num();
+        handle_frame_ack(&mut c, &ipc::encode_frame_ack(acked, 0), &term, 360);
+        assert_eq!(acks_of(&c).samples, 1, "a repeated ack confirms nothing new");
+        assert_eq!(acks_of(&c).last_ack_at, Some(360), "but it did arrive");
+
+        let sent = send_paced_screen_at(&mut c, &mut term, b"another\r\n", 400);
+        handle_frame_ack(&mut c, &ipc::encode_frame_ack(sent, ipc::FRAME_ACK_RESYNC), &term, 450);
+        assert_eq!(acks_of(&c).samples, 1, "a RESYNC rejected the frame: no round trip");
+        assert_eq!(acks_of(&c).last_ack_at, Some(450));
+    }
+
+    #[test]
+    fn an_unpaced_client_records_no_ack_latency() {
+        let term = Terminal::with_scrollback(24, 80, 100);
+        let (mut c, _peer) = lossy_conn(24, 80, &[]);
+        assert!(c.request_frame_from(&term));
+        handle_frame_ack(&mut c, &ipc::encode_frame_ack(1, 0), &term, 340);
+        assert_eq!(c.pacing, None);
+    }
+
+    #[test]
+    fn backlog_log_fields_carry_the_ack_latency() {
+        let mut term = Terminal::with_scrollback(24, 80, 100);
+        let (fresh, _p) = paced_conn(24, 80, &[]);
+        let fields = backlog_log_fields(&fresh, 400);
+        assert!(fields.ends_with(" paced=1 ack_ms=none ack_n=0 ack_age_ms=none"), "{fields}");
+
+        let (sampled, _q) = paced_conn_with_a_240ms_sample(&mut term);
+        let fields = backlog_log_fields(&sampled, 400);
+        assert!(fields.ends_with(" paced=1 ack_ms=240/240/240/240 ack_n=1 ack_age_ms=60"), "{fields}");
+
+        let (plain, _r) = lossy_conn(24, 80, &[]);
+        let fields = backlog_log_fields(&plain, 400);
+        assert!(fields.ends_with(" paced=0 ack_ms=none ack_n=0 ack_age_ms=none"), "{fields}");
+    }
+
+    #[test]
+    fn the_ack_latency_line_is_due_once_per_interval_with_new_samples() {
+        let mut term = Terminal::with_scrollback(24, 80, 100);
+        let (mut idle, _p) = paced_conn(24, 80, &[]);
+        assert_eq!(ack_latency_log_line(&mut idle, 340), None, "no samples");
+
+        let (mut c, _q) = paced_conn_with_a_240ms_sample(&mut term);
+        let line = ack_latency_log_line(&mut c, 340).expect("the first sample is due");
+        assert!(line.starts_with("paced ack latency fd="), "{line}");
+        assert!(line.ends_with(" new=1"), "{line}");
+        assert_eq!(ack_latency_log_line(&mut c, 341), None, "no new sample");
+
+        let sent = send_paced_screen_at(&mut c, &mut term, b"another\r\n", 360);
+        handle_frame_ack(&mut c, &ipc::encode_frame_ack(sent, 0), &term, 400);
+        assert_eq!(ack_latency_log_line(&mut c, 400), None, "a new sample, but within the interval");
+        let line = ack_latency_log_line(&mut c, 340 + ACK_LOG_INTERVAL_MS).expect("the interval passed");
+        assert!(line.ends_with(" new=1"), "{line}");
+    }
+
+    /// The flood harness's `Lagged(300)` acks each frame 300 ms after it
+    /// reached the reader, one pace step after it was queued: the daemon's
+    /// measured round trip is that RTT plus the step (≈ 301 ms). Past the
+    /// ack wait, so each ack lands after a newer frame was queued — the
+    /// regime a newest-frame-only sample would never measure. The flood
+    /// must outlast one RTT for an ack to land at all: 2 MiB is 512 chunks
+    /// (~512 ms), where 256 KiB (~64 ms) ends before the first ack and its
+    /// tail exits without waiting for one.
+    #[test]
+    fn posh225_paced_flood_measures_the_round_trip_as_ack_latency() {
+        const KIB: usize = 1024;
+        let flood = newline_flood(2 * KIB * KIB);
+        let r = measure_flood(&flood, paced_flood_case(FloodAcks::Lagged(300), 0));
+        let acks = r.ack_latency.expect("a paced run reports its ack latency");
+        eprintln!("paced flood ack latency: {acks:?}");
+        assert!(acks.samples > 0, "no frame's round trip was sampled");
+        assert!(acks.min_ms >= Some(300), "min {:?}", acks.min_ms);
+        let srtt = acks.srtt_ms.expect("a sample");
+        assert!((300..=310).contains(&srtt), "srtt {srtt} ms ({acks:?})");
     }
 }

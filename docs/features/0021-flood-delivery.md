@@ -44,6 +44,17 @@ is sent at most one screen at a time, and that screen is the newest.
   yet — a later stage), and a viewport reached through the relay
   (`POSH_MUX_SESSIONS=0`): the relay does not forward `CAP_PACED` (ADR 0007).
   Both get today's per-read delivery whatever `POSH_PACED` says.
+- **Diagnostics:** the session daemon's log (`<base>/…/<session>.log`)
+  carries, per paced viewport, `paced ack latency fd=… paced=1
+  ack_ms=<last>/<srtt>/<min>/<max> ack_n= ack_age_ms= new=` at most every
+  10 s while its frames are acked, and the same `ack_ms`/`ack_n`/`ack_age_ms`
+  fields on its `client disconnected` line. `ack_ms` is the round trip of a
+  paced screen frame, from when the daemon queued it to when its ack
+  arrived (daemon → bridge → link → viewport → back); each frame is sampled
+  at most once — an ack that confirms several frames samples only the
+  newest — whether or not a newer frame was already in flight. `srtt` is smoothed like TCP's, `ack_age_ms` is the time
+  since the last ack of any kind, and `new=` counts samples since the
+  previous line (posh#225 Stage 3.0).
 
 The wire contract is RFC 0008 §3.2.
 

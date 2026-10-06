@@ -2255,12 +2255,21 @@ Corrections to the task-level text that stood here before are marked
 - **Ack latency is sampled in `handle_frame_ack`, not `apply_frame_ack`.**
   The plan said "stamped in `apply_frame_ack`", which has 34 call sites and
   no clock; `handle_frame_ack` is the daemon loop's one entry and has five
-  test callers, so it gains `now: u64`. A sample is `now − last_fresh` when
-  an ack moves `acked_num` from below the newest paced visible frame to at
-  or beyond it — exactly "the newest fresh frame's round trip", including
-  the bridge and the viewport's apply. Every ack (advancing or not) stamps
-  `last_ack_at`. Unpaced clients record nothing (the state lives in
-  `Pacing`), so their streams and literals are untouched.
+  test callers, so it gains `now: u64`. **Sample rule, corrected while
+  executing 3.0 (2026-10-06):** the expansion first said "the ack that
+  confirms the NEWEST paced frame, timed from `last_fresh`". That never
+  fires while output is continuous and the RTT exceeds
+  `PACED_ACK_WAIT_MS` — a newer frame is always queued before the ack
+  lands — which is exactly the slow-link regime the signal exists for
+  (the `Lagged(300)` flood test produced zero samples). The rule is now:
+  `Pacing` keeps a small send log of `(frame number, queued at)` for its
+  paced visible frames (capped at 16, cleared on RESYNC); an ack that
+  ADVANCES `acked_num` samples `now − queued_at` of the newest logged frame
+  at or below the acked number (so an ack naming a scrollback slot N+1
+  times visible frame N), and drops every entry at or below it, so each
+  frame is sampled at most once. A repeated or RESYNC ack is no sample.
+  Every ack stamps `last_ack_at`. Unpaced clients record nothing (the
+  state lives in `Pacing`), so their streams and literals are untouched.
 - **3.0's surfaces are log lines, not the status socket.** `posh status`
   client lines are the client's own record in RFC 0014 §4.2's fixed key
   order; adding daemon-measured keys means an RFC 0014 edit and four
@@ -2343,6 +2352,17 @@ Corrections to the task-level text that stood here before are marked
   screen (`server_loop` `:2042-2045`).
 
 ### Task 3.0: Ack-latency observability (no behaviour change)
+
+> **Superseded in part, 2026-10-06, while executing:** the sample rule in
+> this task's Steps 2–4 (time the ack that confirms the NEWEST frame from
+> `last_fresh`) never fires under continuous output at RTT >
+> `PACED_ACK_WAIT_MS`. The rule as built is the per-frame send log in
+> "Design choices" above (`Pacing.sent_frames`, each visible frame sampled
+> at most once); `Pacing` is therefore no longer `Copy`. The test
+> `an_ack_below_the_newest_frame_stamps_arrival_but_is_no_sample` became
+> `an_ack_of_an_older_frame_samples_that_frames_own_round_trip`, a
+> scrollback-slot test was added, and the flood test uses the 2 MiB flood
+> (256 KiB is shorter than one 300 ms RTT, so no ack could land).
 
 **Promotion criteria:** N/A — diagnostic only.
 
@@ -3038,7 +3058,7 @@ fn reset_history_on_resize(clients: &mut [ClientConn], term: &Terminal, cols_bef
 
 ```rust
     fn has_history(&self) -> bool {
-        self.pacing.is_some_and(|p| p.history.is_some())
+        self.pacing.as_ref().is_some_and(|p| p.history.is_some())
     }
 
     /// The v2 resend floor: twice the measured ack latency (never under the
@@ -3057,7 +3077,7 @@ fn reset_history_on_resize(clients: &mut [ClientConn], term: &Terminal, cols_bef
     /// resend deadline. `None` with bytes queued, or with nothing fresh and
     /// nothing in flight.
     fn history_send_at(&self, term: &Terminal) -> Option<u64> {
-        let h = self.pacing.and_then(|p| p.history)?;
+        let h = self.pacing.as_ref().and_then(|p| p.history)?;
         if !self.write_buf.is_empty() || self.producer.is_none() {
             return None;
         }
@@ -3094,11 +3114,12 @@ fn reset_history_on_resize(clients: &mut [ClientConn], term: &Terminal, cols_bef
     }
 ```
 
-(`HistoryCursor` is `Copy`, so `history_send_at` reads a copy; the
-mutating paths take `as_mut`.) In `send_paced_frame`: call
+(`HistoryCursor` is `Copy` but `Pacing` is not since 3.0's `VecDeque`, so
+`history_send_at` goes through `self.pacing.as_ref()` and the mutating
+paths take `as_mut`.) In `send_paced_frame`: call
 `maybe_queue_scrollback(src)` only when `!self.has_history()`, and set
 `p.last_was_history = false` beside `dirty = false`. In `queue_frame`,
-after building `activity_cap`: when `self.pacing.and_then(|p|
+after building `activity_cap`: when `self.pacing.as_ref().and_then(|p|
 p.history).and_then(|h| h.epoch())` is `Some(e)`, push
 `caps::encode_scrollback2_ack(e)` (a v2 viewport adopts the epoch from the
 first frame it gets — RFC 0009 §1.1).
