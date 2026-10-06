@@ -207,8 +207,10 @@ struct ClientConn {
     // analog of the roaming server's per-connection `sb_floor`/`acked_sb_total`.
     // `sb_floor` is the daemon terminal's monotonic scrollback total at which
     // this client's forward-only accumulation (re)started — set when frames are
-    // enabled (attach) and again on a resize (§4: a width change reflows, so
-    // counting restarts at the new width). `acked_sb_total` is the total the
+    // enabled (attach) and again when the SESSION WIDTH changes (§4's reflow:
+    // a height change only pushes or pops ring rows without renumbering them,
+    // so it is not a boundary; `reset_scrollback_floors_on_reflow`).
+    // `acked_sb_total` is the total the
     // client holds; on the reliable socket each scrollback frame is self-acked at
     // once, so it advances immediately (no separate `sb_high` is needed —
     // produced always equals acked here). A scrollback frame is emitted only when
@@ -1424,19 +1426,22 @@ fn apply_client_size(clients: &[ClientConn], pty_fd: RawFd, term: &mut Terminal)
     }
 }
 
-/// Scrollback resize reset (RFC 0002 §4), run after `apply_client_size` with
-/// the session width from before it: a WIDTH change reflows the terminal, so
+/// Scrollback reflow reset, run after `apply_client_size` with the session
+/// width from before it: a WIDTH change reflows the terminal (the case RFC
+/// 0002 §4 exists for — its text says "on a resize", but only a width change
+/// renumbers rows; a height change pushes or pops ring rows at the tail), so
 /// every framed client's appended-row counting restarts at the reflowed
 /// total. This is the session-socket stand-in for the UDP client's
 /// one-message CAP_SCROLLBACK suppression — socket caps are Init-only, so the
-/// restart is handled daemon-side. The matching client drops its ring on the
-/// same width change, so both sides go forward-only from here: no reflowed
-/// rows shipped against a stale floor, no mixed-width rows in the ring.
+/// restart is handled daemon-side. The matching client drops its ring on its
+/// own resize, so both sides go forward-only from here: no reflowed rows
+/// shipped against a stale floor, no mixed-width rows in the ring.
 ///
-/// Only a width change: the resize path also runs when a client attaches or
-/// leaves, or a height changes, and a paced client still holds every row
-/// scrolled since its last paced pair — a reset then would skip them while
-/// the viewport keeps its ring (posh#225).
+/// Only a width change: the resize path also runs when ANOTHER client
+/// attaches, leaves or changes height, and a paced client still holds every
+/// row scrolled since its last paced pair — a reset then would skip them
+/// while that viewport keeps its ring (posh#225). On the viewport's own
+/// height-only resize its ring is empty anyway, so shipping them is harmless.
 fn reset_scrollback_floors_on_reflow(clients: &mut [ClientConn], term: &Terminal, cols_before: u16) {
     if term.cols() == cols_before {
         return;

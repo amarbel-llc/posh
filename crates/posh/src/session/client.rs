@@ -620,9 +620,10 @@ impl FrameRenderer {
         self.last_scroll_state = None;
         // A width change reflows the old rows (RFC 0002 §4): drop the ring and
         // re-accumulate at the new width. The daemon restarts its per-client
-        // appended-row counting when it PROCESSES the matching `Tag::Resize`, so
-        // both sides go forward-only from that point — no mixed-width rows, no
-        // re-ship of old ones.
+        // appended-row counting when the SESSION WIDTH changes as it PROCESSES
+        // the matching `Tag::Resize` (a height-only change is not a boundary
+        // for it, posh#225), so both sides go forward-only from that point —
+        // no mixed-width rows, no re-ship of old ones.
         //
         // Note: a brief window exists between this ring-clear and the daemon
         // processing the matching `Tag::Resize`, during which in-flight
