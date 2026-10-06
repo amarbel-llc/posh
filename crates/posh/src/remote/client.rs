@@ -718,10 +718,11 @@ fn about_summary(st: &ClientState) -> String {
         None => "activity: (not reported; pre-#193 daemon, or not yet delivered)".to_string(),
     };
     format!(
-        "posh {}\n{remote}\n{remote_state}\n{activity}\nmode: {mode}\n{}\n{}\n{}\n{}\n{}",
+        "posh {}\n{remote}\n{remote_state}\n{activity}\nmode: {mode}\n{}\n{}\n{}\n{}\n{}\n{}",
         env!("POSH_BUILD"),
         gate("POSH_MUX", crate::remote::mux::mux_selected()),
         gate("POSH_MUX_SESSIONS", crate::remote::mux::mux_sessions_selected()),
+        gate("POSH_PACED", st.paced),
         gate("POSH_CHANNELS", crate::remote::sshwrap::channels_selected()),
         gate("POSH_CONGESTION", crate::remote::agent::congestion_selected()),
         gate("POSH_RELAY", relay_on),
@@ -1629,6 +1630,9 @@ struct ClientState {
     /// advertise `CAP_MORPH` and which `applier` we route visible-frame bodies
     /// through. Defaults to DumpDiff (today's behavior) when the env is unset.
     framesync: framesync::FrameSync,
+    /// Paced delivery (`POSH_PACED`, posh#225): whether every message
+    /// advertises `CAP_PACED`. Read once at construction.
+    paced: bool,
     /// Client-side codec that applies a received visible-frame body to
     /// `server_term`. DumpDiff reparses a fresh model; MorphDelta morphs the
     /// existing one in place (and falls back to a reparse for `Full` keyframes).
@@ -1830,6 +1834,7 @@ fn client_loop(
         scroll_opt: true,
         input_sent: VecDeque::new(),
         framesync,
+        paced: crate::session::paced_selected(),
         applier,
         stats,
         paint_pending: None,
@@ -3832,6 +3837,12 @@ fn outgoing_caps(st: &mut ClientState) -> Vec<caps::Cap> {
             payload: vec![],
         });
     }
+    // posh#225 Stage 2 (RFC 0008 §3.2): ask for send-time delivery. Every
+    // message, like SCROLLBACK2: the M2 bridge forms the daemon Init from
+    // the first message it sees on a channel.
+    if st.paced {
+        extra.push(caps::encode_paced());
+    }
     // Server transport-state piggyback (#6) + agent-endpoint diag (FDR 0004):
     // ask the server to attach its live state in a debug posture OR
     // when agent forwarding is active (so the agent-forwarding palette can show
@@ -4938,6 +4949,7 @@ mod tests {
         for gate in [
             "POSH_MUX=",
             "POSH_MUX_SESSIONS=",
+            "POSH_PACED=",
             "POSH_CHANNELS=",
             "POSH_CONGESTION=",
             "POSH_RELAY=",
@@ -4946,7 +4958,7 @@ mod tests {
         }
         // Every row names its source so "is my env var live?" is readable.
         assert!(
-            s.matches("(env=").count() + s.matches("(default)").count() >= 5,
+            s.matches("(env=").count() + s.matches("(default)").count() >= 6,
             "{s}"
         );
         // The remote section is present even before any ident arrives.
@@ -5419,6 +5431,7 @@ mod tests {
             scroll_opt: true,
             input_sent: VecDeque::new(),
             framesync: framesync::FrameSync::DumpDiff,
+            paced: true,
             applier: Box::new(framesync::DumpDiff),
             stats: Stats::new(),
             paint_pending: None,
@@ -6471,6 +6484,26 @@ mod tests {
         process_frame(&mut st, &frame);
         assert_eq!(st.sb2_rows, 4, "the same epoch again must not reset");
         assert_eq!(st.scrollback.len(), 1);
+    }
+
+    /// posh#225 Stage 2: with the gate on (`test_state`'s `paced: true`; the
+    /// env default is pinned by `paced_gate_is_on_unless_switched_off`) a
+    /// viewport advertises CAP_PACED on every message (the bridge forms the
+    /// daemon Init from whichever arrives first).
+    #[test]
+    fn outgoing_caps_advertises_paced_when_the_gate_is_on() {
+        let mut st = test_state(5, 20);
+        let caps = outgoing_caps(&mut st);
+        let entry = caps::find(&caps, caps::CAP_PACED).expect("paced advertised");
+        assert_eq!(caps::decode_paced(&entry.payload), Some(caps::PACED_VERSION));
+    }
+
+    /// `POSH_PACED=0`: today's delivery, nothing advertised.
+    #[test]
+    fn outgoing_caps_omits_paced_when_the_gate_is_off() {
+        let mut st = test_state(5, 20);
+        st.paced = false;
+        assert!(caps::find(&outgoing_caps(&mut st), caps::CAP_PACED).is_none());
     }
 
     #[test]

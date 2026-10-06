@@ -984,7 +984,7 @@ fn handle_session_instruction(
                 let target = target.clone();
                 let resume = *resume;
                 let (rows, cols) = (msg.rows.max(1), msg.cols.max(1));
-                let mut content = crate::remote::relay::content_caps(&msg.caps);
+                let mut content = bridge_init_content(&msg.caps);
                 // RFC 0014 §3: the bridge's own identity on Init; the
                 // riding client's entries follow as Tag::ClientCaps.
                 content.push(introspect::encode_client_ident(&introspect::Ident {
@@ -1132,6 +1132,18 @@ fn rehome_bridge(
         &b.content,
     )?;
     Ok(())
+}
+
+/// The client half of the daemon `Tag::Init` this bridge sends for a
+/// channel: the relay's content caps (RFC 0008 §4) plus what only the M2
+/// bridge carries (ADR 0007) — the viewport's `CAP_PACED` entry
+/// (posh#225, RFC 0008 §3.2), verbatim. The caller appends its own
+/// identity. Retained as `SessionBridge::content`, so a re-home re-Inits
+/// with the same negotiation.
+fn bridge_init_content(client_caps: &[caps::Cap]) -> Vec<caps::Cap> {
+    let mut content = crate::remote::relay::content_caps(client_caps);
+    content.extend(caps::find(client_caps, caps::CAP_PACED).cloned());
+    content
 }
 
 fn bridge_client_message(b: &mut SessionBridge, msg: &crate::remote::sync::ClientMessage) -> bool {
@@ -3066,6 +3078,44 @@ mod tests {
     fn the_relay_never_forwards_push_cmd() {
         let table = vec![caps::encode_push_cmd(), caps::encode_push_cmd_request(9)];
         assert!(crate::remote::relay::forwarded_client_caps(&table).is_empty());
+    }
+
+    /// posh#225 Stage 2, ADR 0007: the M2 bridge carries the viewport's
+    /// CAP_PACED into the daemon Init iff the viewport advertised it.
+    #[test]
+    fn bridge_init_carries_paced_iff_the_viewport_advertised_it() {
+        let with = bridge_init_content(&caps::own_table(&[caps::encode_paced()]));
+        assert_eq!(caps::find(&with, caps::CAP_PACED), Some(&caps::encode_paced()));
+        let without = bridge_init_content(&caps::own_table(&[]));
+        assert!(caps::find(&without, caps::CAP_PACED).is_none());
+    }
+
+    /// The relay never forwards it: a relayed viewport stays unpaced.
+    #[test]
+    fn the_relay_never_forwards_paced() {
+        let table = vec![caps::encode_paced()];
+        assert!(crate::remote::relay::content_caps(&table).is_empty());
+        assert!(crate::remote::relay::forwarded_client_caps(&table).is_empty());
+    }
+
+    /// FDR 0012 re-home re-Inits the new daemon with the same negotiation:
+    /// a paced viewport stays paced across a switch.
+    #[test]
+    fn rehome_bridge_keeps_paced_in_the_reinit() {
+        let (mut b, _peer) = test_bridge();
+        b.content = bridge_init_content(&[caps::encode_paced()]);
+        let mut connect = |_: &str| {
+            let (a, other) = std::os::unix::net::UnixStream::pair().unwrap();
+            std::mem::forget(other);
+            Ok(a)
+        };
+        rehome_bridge(&mut b, "work/s-1", &mut connect).unwrap();
+        let mut fb = crate::session::ipc::FrameBuffer::new();
+        fb.feed(&b.daemon.link.write);
+        let init = fb.next().unwrap().unwrap();
+        assert_eq!(init.tag, crate::session::ipc::Tag::Init);
+        let (table, _) = caps::decode_table(&init.payload[4..]).unwrap();
+        assert!(caps::find(&table, caps::CAP_PACED).is_some());
     }
 
     #[test]

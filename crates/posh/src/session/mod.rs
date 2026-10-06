@@ -19,6 +19,20 @@ use posh_proto::caps::SessionKind;
 use crate::util::{self, Error, Result};
 use ipc::{SessionInfo, Tag};
 
+/// The paced-delivery gate (posh#225, FDR 0021): whether a viewport
+/// advertises `CAP_PACED`. A default-on off-switch — the shared
+/// [`util::parse_default_on_gate`] shape, `POSH_PACED=0` the rollback, read
+/// by the viewport so it takes effect on its next attach without
+/// restarting the session. Pure, so tests need not touch the environment.
+pub fn parse_paced_gate(value: Option<&str>) -> bool {
+    util::parse_default_on_gate(value)
+}
+
+/// [`parse_paced_gate`] of `$POSH_PACED`. Read once per attach.
+pub fn paced_selected() -> bool {
+    parse_paced_gate(std::env::var("POSH_PACED").ok().as_deref())
+}
+
 /// sockaddr_un sun_path is 108 bytes on Linux including the NUL.
 const MAX_SOCKET_PATH: usize = 107;
 
@@ -998,6 +1012,19 @@ pub fn cmd_history(cfg: &Config, name: &str, vt: bool) -> Result<()> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// `POSH_PACED` is a default-on off-switch (decision 13: the remote path
+    /// ships on): unset, empty, `1` and anything unrecognised advertise;
+    /// the shared off spellings do not.
+    #[test]
+    fn paced_gate_is_on_unless_switched_off() {
+        for on in [None, Some(""), Some("1"), Some("yes"), Some("bogus")] {
+            assert!(parse_paced_gate(on), "{on:?}");
+        }
+        for off in ["0", "false", "off", "no", " OFF "] {
+            assert!(!parse_paced_gate(Some(off)), "{off:?}");
+        }
+    }
 
     #[test]
     fn json_list_shape_matches_zmx() {
