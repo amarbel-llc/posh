@@ -176,6 +176,18 @@ pub const CAP_PUSH_CMD: u8 = 21;
 /// per token; the token is seeded into the created session so a repeat that
 /// lands there after the re-home is ignored too.
 pub const CAP_PUSH_CMD_REQUEST: u8 = 22;
+/// Paced delivery (posh#225; RFC 0008 §3.2, FDR 0021). Client entry: "decide
+/// what to send me at send time". A session daemon then builds at most one
+/// fresh visible frame for this client per send opportunity — its outgoing
+/// buffer empty and its last fresh frame acked or a wait elapsed — from the
+/// terminal as it is then, instead of one per PTY read. Payload: a version
+/// byte ([`PACED_VERSION`]); later versions append fields a v1 reader
+/// ignores. Init-only on the session socket; an M2 bridge carries the
+/// viewport's entry into the daemon Init, a relay does not (ADR 0007), so a
+/// relayed viewport is unpaced. A server never sends it.
+pub const CAP_PACED: u8 = 23;
+/// The [`CAP_PACED`] payload version this build writes.
+pub const PACED_VERSION: u8 = 1;
 
 /// Why a session ended, as its daemon (or a standalone server) knew it.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -500,6 +512,21 @@ pub fn encode_push_cmd_request(token: u64) -> Cap {
 pub fn decode_push_cmd_request(payload: &[u8]) -> Option<u64> {
     let token = u64::from_be_bytes(payload.get(..8)?.try_into().ok()?);
     (token != 0).then_some(token)
+}
+
+/// This build's [`CAP_PACED`] entry.
+pub fn encode_paced() -> Cap {
+    Cap {
+        id: CAP_PACED,
+        payload: vec![PACED_VERSION],
+    }
+}
+
+/// The version of a [`CAP_PACED`] payload: `None` when it is empty or names
+/// version 0 (malformed: the entry is ignored and the client is unpaced).
+/// Bytes after the version byte belong to later versions and are ignored.
+pub fn decode_paced(payload: &[u8]) -> Option<u8> {
+    payload.first().copied().filter(|v| *v != 0)
 }
 
 /// Mask a received [`CAP_KITTY_KEYBOARD`] payload to the valid low-5-bit flag
@@ -1435,5 +1462,30 @@ mod tests {
     fn push_cmd_offer_is_an_empty_entry() {
         let cap = encode_push_cmd();
         assert_eq!((cap.id, cap.payload.len()), (CAP_PUSH_CMD, 0));
+    }
+
+    /// posh#225 Stage 2 takes the next free id after push-cmd's pair.
+    /// Pinned so a later allocation cannot silently collide with it.
+    #[test]
+    fn paced_id_is_the_next_free_after_push_cmd_request() {
+        assert_eq!(CAP_PACED, 23);
+    }
+
+    /// RFC 0008 §3.2: a version byte, nothing else in v1.
+    #[test]
+    fn paced_entry_carries_its_version() {
+        let cap = encode_paced();
+        assert_eq!((cap.id, cap.payload.clone()), (CAP_PACED, vec![PACED_VERSION]));
+        assert_eq!(decode_paced(&cap.payload), Some(PACED_VERSION));
+    }
+
+    /// Room to grow (Stage 3 appends the history ceiling): a reader takes
+    /// the version byte and ignores what follows; an empty payload or
+    /// version 0 is malformed, and a malformed entry means "not paced".
+    #[test]
+    fn paced_entry_tolerates_appended_fields_and_rejects_an_empty_one() {
+        assert_eq!(decode_paced(&[2, 0xaa, 0xbb]), Some(2));
+        assert_eq!(decode_paced(&[]), None);
+        assert_eq!(decode_paced(&[0]), None);
     }
 }
