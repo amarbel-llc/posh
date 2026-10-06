@@ -49,6 +49,19 @@ history neither re-carries the ring nor costs the screen its diff base.
   is kept and history resumes forward-only, as before (posh#225 Stage 3). A
   paced viewport that does not advertise it, and every unpaced one, keeps v1
   history unchanged.
+- **Holes and the arriving count (posh#225 Stage 4):** a v2 viewport asks
+  for the server's **extent** (`CAP_SCROLLBACK2_EXTENT`, RFC 0001 id 24) on
+  every message, and the server reports `{avail_rows, evicted_upto}` beside
+  the `SCROLLBACK2` entry on every frame: the rows its epoch holds, and the
+  floor below which it will send no body again. Rows the viewport lacks
+  below the floor will never arrive, and the scroll view draws each such
+  span as one dim `··· N lines not received ···` row where it belongs.
+  Rows it lacks above the floor (`avail_rows − T`) are on their way —
+  whether held behind a body lost on the wire, held past such a gap, or
+  not yet sent — and while there are any, an `··· N lines arriving ···` row
+  sits directly above the live screen and the top bar adds `· N lines
+  still arriving`, counting down. The text being read does not move as
+  rows land or holes appear (FDR 0005).
 - **Interactive cost:** typing faster than one round trip, each echo frame
   waits for the previous frame's ack (at least `PACED_FRAME_FLOOR_MS`, and
   `PACED_ACK_WAIT_MS` when an ack is lost) — one frame per RTT, as mosh
@@ -166,12 +179,50 @@ Settled for Stage 3 (addressed history), 2026-10-06:
 14. **History comes from the session terminal and pauses while the escape
     overlay is up**; it does not pause on the alternate screen.
 
+Settled for Stage 4 (holes the viewport draws), 2026-10-06:
+
+15. **The extent is the send floor, on every frame carrying the id-10
+    entry.** `evicted_upto` is the same floor the sender's next body is cut
+    at (`HistoryCursor::extent` shares the computation with `next_body`),
+    so the not-received label and the forward jump cannot disagree; it
+    covers ring eviction, a re-anchor (decision 12) and a continued attach
+    (decision 13, whose floor is the viewport's count and labels nothing).
+    The server sends it beside the `SCROLLBACK2` (id 10) entry on every
+    frame to a viewport that asked — `server_loop` on every frame, the
+    daemon on history bodies and on paced visible frames from a per-viewport
+    cache, frozen while the escape overlay is up (decision 14). Rejected:
+    history bodies plus the first visible frame after a change — the entry
+    is 20 bytes, a lossy link wants the newest value on whichever frame
+    survives, and change tracking would need its own repeat-until-acked
+    state. The request is Init-persistent on the socket and never crosses
+    the relay (ADR 0007). No lever: it rides `POSH_PACED` and the
+    capability.
+16. **A body past a gap the server can still fill is held, bounded at
+    1,024 rows** (`SB2_HELD_MAX_ROWS`, four bodies of `SB2_ROWS_PER_BODY`).
+    The viewport's count and acknowledgement stay at the gap; the sender's
+    resend from the ack fills it at the tail and the held bodies drain in
+    order; an extent whose floor passes the gap settles it as not received
+    (RFC 0009 §3.1). A body past the bound is discarded whole and re-sent.
+    Holding does not avoid waiting a resend floor — the gap waits one
+    either way — it avoids re-sending everything behind the gap, which for
+    `server_loop` (many bodies in flight) would make every loss a go-back-N
+    of all of them; the cost is at most 1,024 rows. Rejected: dropping
+    out-of-order bodies. The design brief's third label, "pending" (a gap
+    the server can still fill), is folded into "arriving": the hold rule
+    keeps such a gap and everything held past it at the tail, beside the
+    arriving row, and to the user rows the server holds that the viewport
+    lacks are arriving whether they sit in a held gap, behind it, or are
+    not yet sent — "pending" named an internal state, not a different
+    thing to read. The viewport therefore records only not-received holes,
+    and the arriving count is `avail_rows − T`.
+
 ## Limitations
 
 - **History flows at most one window per round trip** (`HISTORY_WINDOW_ROWS`
   = 512 rows per RTT, and no faster than the socket drains) for a v2
   viewport, so a flood that outruns that for longer than the ring loses its
-  oldest rows as forward jumps — silent until Stage 4 draws it. The window
+  oldest rows as forward jumps, each drawn as one not-received row
+  (Stage 4). The window
   is static until Task 3.4 (held for the field ack-latency data) sizes the
   history share by backpressure. Measured
   (2 MiB flood, 20,511 rows, 10,000-row ring): prompt acks deliver every
@@ -195,17 +246,21 @@ Settled for Stage 3 (addressed history), 2026-10-06:
   was sent 160–163 KB of history (1,536 rows); a paced v1 viewport
   that never acks is re-sent up to one ring every `PACED_ACK_WAIT_MS`
   (2.2–7.9 MB over the flood alone).
-- **A history body lost on the wire while a later body is in flight is
-  accepted by the viewport as a forward jump** and cannot be repaired by the
-  daemon's resend-from-ack (RFC 0009 has no eviction-vs-loss marker); with
-  several bodies in flight, a body lost under a flood becomes a hole Stage 4
-  will draw as "not received". Removing the hole needs one BODY in flight,
-  not merely a 256-row window: since bodies go without a floor they are
-  often smaller than 256 rows, so `HISTORY_WINDOW_ROWS = SB2_ROWS_PER_BODY`
-  alone no longer does it — an operator decision (posh#243).
+- **A body lost on the wire is held and repaired by the resend from the
+  ack** (RFC 0009 §3.1, decision 16); only rows below the server's floor
+  are drawn not received (posh#243). The repair rests on two sender fixes
+  in the same stage: the resend is clocked from the start of the in-flight
+  run, so fresh bodies no longer postpone it, and an ack back to 0 in the
+  same epoch opens a fresh epoch (RFC 0009 §4, §3.1).
+- **An extent can overtake a body still in flight** (datagram reordering, a
+  bridge retransmit): the viewport marks the rows below the floor not
+  received, and when that body's rows arrive late they are skipped as
+  already covered (RFC 0009 §3.1). A bounded cost of reordering — rows the
+  server had also evicted — never a stall; the ring stays append-only.
 - **A reader slower than the flood loses the rows the ring evicts before
   their turn**; for a v2 viewport each loss is a forward jump of exactly that
-  span, and the reader ends holding the whole retained ring. The live screen
+  span, drawn as one not-received row, and the reader ends holding the
+  whole retained ring. The live screen
   still ends on the last screen. Measured (1 KiB/ms reader, 4 KiB/ms
   flood): 14,111 of 20,511 rows delivered, 6,400 lost in 7 jumps (prompt
   acks); 13,007 delivered, 7,504 lost (50 ms RTT) — more than the ~4,300 a
@@ -218,9 +273,11 @@ Settled for Stage 3 (addressed history), 2026-10-06:
   a time.
 - **Rows scrolled while a viewport is detached are not delivered**: a
   reconnect keeps the viewport's ring and continues forward-only from the
-  attachment (decision 13); history across a reconnect is Stage 5. Rows a
+  attachment (decision 13); history across a reconnect is Stage 5, and
+  until then the detach seam stays unlabelled (a continued attach's floor
+  is the viewport's count, which labels nothing — decision 15). Rows a
   session width change or height grow left unsent become a forward jump
-  at the resize (decision 12) — labelled by Stage 4, not repaired.
+  at the resize (decision 12) — drawn as not received.
 - **An unpaced or relayed viewport stays on v1 (RFC 0002) history** — a
   local `posh attach` (Stage 6 moves it), a relayed one
   (`POSH_MUX_SESSIONS=0`), or one with `POSH_PACED=0` — with v1's re-carry
@@ -239,6 +296,7 @@ Settled for Stage 3 (addressed history), 2026-10-06:
 | `HISTORY_RESEND_INITIAL_MS` (`session/daemon.rs`) | 1000 ms (4 × `PACED_ACK_WAIT_MS`) | the v2 resend floor before any ack latency is measured: TCP's initial RTO; afterwards `max(PACED_ACK_WAIT_MS, 2 × srtt)` | at RTT 1,500 ms one window (512 rows) is re-sent spuriously before the first sample; none at ≤ 300 ms |
 | `HISTORY_RESEND_MAX_DOUBLINGS` (`session/daemon.rs`) | 3 | the resend floor doubles per resend without ack progress, so a never-acking viewport is re-sent one window per 1, 2, 4, 8, 8, … × the floor | never-acked: 160–163 KB of history over 2 MiB + 20 s, against 2.2–7.9 MB for v1 |
 | `SB2_ROWS_PER_BODY` (`remote/history.rs`, shared with `server_loop`) | 256 rows | RFC 0009 §2's per-body cap: bounds one body, and with it the backlog ahead of a screen | every v2 run's backlog peaks at one body (≤ 26,676 B); with prompt acks bodies are about one chunk's rows, and the peak backlog 5,132–8,476 B |
+| `SB2_HELD_MAX_ROWS` (`remote/sync.rs`, the viewport) | 1,024 rows (4 × `SB2_ROWS_PER_BODY`) | bodies held past a gap the server can still fill (decision 16): a body past it is discarded whole and re-sent by the resend from the ack, so the bound trades viewport memory against go-back-N | held bodies are routinely discarded for the resend under loss: raise it |
 
 The first two start at `server_loop`'s send-interval clamp, are tuned
 independently of it, and every lever here changes only with a measurement
@@ -306,7 +364,8 @@ modes, and an older viewport keeps working against a newer daemon.
 
 ## More Information
 
-- Wire: RFC 0008 §3.2; the capability id: RFC 0001 (id 23, `CAP_PACED`).
+- Wire: RFC 0008 §3.2; the capability ids: RFC 0001 (id 23, `CAP_PACED`;
+  id 24, `CAP_SCROLLBACK2_EXTENT`, RFC 0009 §3.1).
 - Relay exclusion: ADR 0007. Frame dumps: Stage 1 (RFC 0008 §2,
   `Terminal::dump_vt_mirror`).
 - Code: `session::daemon` (`Pacing`, `ClientConn::paced_send_at`,
@@ -314,7 +373,9 @@ modes, and an older viewport keeps working against a newer daemon.
   `flush_paced_frames`; v2: `ClientConn::open_history`, `history_send_at`,
   `send_history_body`, `reset_history_on_resize`), `remote::history`
   (`crates/posh/src/remote/history.rs`: `HistoryCursor`, `HistoryStart`,
-  `SB2_ROWS_PER_BODY`, shared with `server_loop`),
+  `SB2_ROWS_PER_BODY`, shared with `server_loop`; Stage 4: `extent`),
+  `remote::sync` (`ViewRow`, `HeldRows`, `SB2_HELD_MAX_ROWS`),
+  `remote::scrollview` (`hole_row`),
   `session::parse_paced_gate`, `remote::client::outgoing_caps`, the M2
   bridge's Init and ack forward in `remote::server` (`bridge_init_content`,
   `bridge_client_message`). The flood harness and its viewport model are

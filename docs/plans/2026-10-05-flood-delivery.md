@@ -565,6 +565,103 @@ the wire contract is RFC 0009 §5 (new) and RFC 0008 §3.2 (amended).
   needs this build on the remote host; its step (1) is also Task 3.4's
   input.
 
+## Stage 4 as built (2026-10-06)
+
+Tasks 4.1–4.4 are implemented on branch `quiet-willow` (`f0e5439`,
+`b909962`, `030e989`, plus this records commit), with **posh#243 folded in**
+(operator, 2026-10-06) and closed by `b909962`. The Stage 4 task text below
+is the historical plan and is **superseded where it differs** from this
+section. The user-facing record is FDR 0005 (Interface, Limitations) and
+FDR 0021 (decisions 15–16); the wire contract is RFC 0009 §3/§3.1/§4/§5 and
+RFC 0001 row 24.
+
+- **4.1 — the extent, server half** (`f0e5439`), as planned:
+  `CAP_SCROLLBACK2_EXTENT` (id 24; the client's request is a version byte,
+  the server's entry `{version, epoch, avail_rows, evicted_upto}`);
+  `HistoryCursor::extent` is the send floor `max(anchor_rel, avail −
+  ring_len)` shared with `next_body`; the daemon caches it per viewport
+  (`Pacing.extent`, refreshed on every send pass, after a history body, in
+  `open_history`, and after a bump or re-anchor) and pushes it only to a
+  viewport that asked (`wants_history_extent`); `server_loop` latches the
+  request. Deviation: the cache is refreshed inside
+  `reset_history_on_resize` and `open_history` too (review: under the
+  overlay or at the exit flush the cached entry could name an epoch the
+  cursor had already left).
+- **4.2 — holes, held bodies and the hold rule** (`b909962`). `ScrollbackRing`
+  carries holes as a side list (`ViewRow::{Row, NotReceived}`,
+  `mark_not_received` merging at the tail, `view_len`/`view_row`/
+  `view_total`; a hole is evicted with the row after it; `clear` keeps the
+  monotonic counters). `HeldRows` is a `BTreeMap` bounded in ROWS at
+  `SB2_HELD_MAX_ROWS = 4 × SB2_ROWS_PER_BODY` (a body that would exceed it
+  is discarded whole; the longer body at an offset is kept). The viewport
+  adopts an extent of its epoch keeping per-field maxima, settles (marks
+  `T..min(first_held, evicted_upto)`, drains reachable held bodies,
+  repeats), and holds a body past `T` that the floor does not cover; the ack
+  stays at the gap. The request is advertised on EVERY client message
+  beside `CAP_PACED`, paced or not (the plan's "absent with id 10 on the
+  suppressed resize message" was dropped: `server_loop` does v2 without
+  pacing). `wedge_repro` asserts the extent engaged and no jump was
+  accepted without one. Twelve viewport tests, eight ring/held tests.
+  **Two sender bugs the hold rule exposed, fixed in the same commit:**
+  - **The resend clock** (`HistoryCursor::in_flight_since`). The resend was
+    timed from `last_send`, which every FRESH body restamped, so a sender
+    whose window never fills (`server_loop`, window `u64::MAX`) never resent
+    a lost body during a sustained flood — the daemon's 512-row window had
+    masked it. The clock is now the start of the in-flight run, restarted by
+    each resend and each advancing ack (`on_ack` and `on_client_entry` take
+    `now`; `server_loop` passes `last_heard`). `wedge_repro` at 35% loss:
+    before, `sb2_rows=1683 held=600 holes=3 rows_not_received=441
+    held_drains=2 extent=(11683, 1683)` — `T` pinned to the eviction floor;
+    after, `sb2_rows=11906 held=0 holes=0 rows_not_received=0
+    held_drains=16 extent=(11938, 1938)`. The daemon's backoff test now
+    measures gaps between successive row-0 sends (RFC 0009 §4, new bullet).
+  - **A reset under the same epoch** (`HistoryCursor::reset_pending`). A
+    viewport that clears its count on its own resize under an epoch the
+    sender never bumped (the intermediate size lost on the roaming path,
+    the final size unchanged) re-adopted the epoch at `T = 0` and held the
+    sender's bodies at its old cursor forever. A same-epoch ack of 0 after
+    the ack has advanced is a reset: the sender bumps on its next body.
+    Accepted cost (verified against `Datagram::recv`, which delivers late
+    reorders inside its 64-packet window): a stale 0 from the first round
+    trip after adoption costs the viewport the ring of an epoch it adopted
+    one reorder window ago (RFC 0009 §3.1, "A reset under the same epoch").
+  - Also: `view_row` is O(log holes) (hole `k` sits at view index
+    `(before_k − first) + k`, monotone in `k`); the reordering cost (an
+    extent overtaking an in-flight body; the late rows below the floor are
+    skipped as covered) is recorded in RFC 0009 §3.1 and FDR 0021.
+- **4.3 — the scroll view** (`030e989`), as planned: `ScrollMemo` is
+  `(offset, view_total, arriving, generation)`; `history_view_len`,
+  `hole_label`, `hole_row` (dim, centred, truncated to the width, reset
+  before the CRLF — a test pins that the next row is not dim);
+  `apply_scroll_indicator(fb, lines_up, arriving)` with `group_thousands`;
+  `history_arriving(st) = avail_rows − T`; the local attach passes 0. The
+  witness `compose_without_holes_or_arriving_is_unchanged` pins today's
+  bytes (a 20-column bar, so the start of the bar text). Deviations:
+  - **The bar covers view row 0 at the top of history** — pre-existing: the
+    bar is drawn over the window's first row, so at maximum offset the
+    oldest view row sits under it. The plan's goldens assumed otherwise;
+    three tests were shaped around it (an extra oldest row under the bar;
+    offset 2 for the arriving-row golden; a view whose row 0 is a hole)
+    rather than changing the clamp, which the pinned clamp test keeps.
+    Queued as a UX papercut (posh#248, Queue row 23).
+  - **An ordering bug in `process_frame`:** `history_mark` was read AFTER
+    extent adoption, so a raised extent that first adds the arriving row
+    did not shift the anchor; the mark is taken before.
+  - `ScrollbackRing::appended` is `#[cfg(test)]` (its only production
+    caller was the old `history_mark`).
+  - Review fixes: the memo keys on `ScrollbackRing::view_revision` (a mark
+    merged into the tail hole relabels it with no new view row, so
+    `view_total` alone left the old count on screen); `hole_row` starts
+    from the default pen (a soft-wrapped ring row resets none).
+- **4.4 — records** (this commit): FDR 0005 Interface ("Missing history is
+  drawn, not hidden") and Limitations; FDR 0021 Interface, decisions 15–16,
+  Limitations (the posh#243 bullet rewritten, the reordering cost, the
+  detach seam), a `SB2_HELD_MAX_ROWS` lever row with no measurement yet;
+  `posh-client(1)` one sentence under `POSH_GRAB_MOUSE`.
+- **Exit check: NOT yet done.** The Stage 4 exit check (end of Task 4.4)
+  needs this build on both ends of a paced, mux-attached session; step (1)
+  needs a throttled link (unverified how).
+
 ---
 
 ## Stage 0 — pin the failure
@@ -4853,7 +4950,8 @@ bottom once Stage 7 is done, or sooner only if the operator re-orders it.
 | 15 | **posh#239** — `the_daemon_loop_sends_a_resized_client_a_frame_for_its_new_geometry` fails intermittently with "capability payload/entry truncated" in `mirror_frames` | Stage 2 test runs | Root cause: a test-side race on raw pre-Init output. Test fixed; the production side (a connection received broadcast output before its Init) fixed and merged 2026-10-06 (`5be221b`). **Closed.** |
 | 16 | **posh#241** — `just lint-fmt` does not gate Rust formatting (`conformist.nix` is nixfmt + shfmt only); `remote/server.rs` fails `rustfmt --check` on master | Task 3.1 | Repo-level gap; decide rustfmt-in-conformist (one mechanical reformat commit) vs documenting the exclusion in AGENTS.md. |
 | 17 | **posh#242** — `switch_route_target` can pick a connection that never sent `Init` (a concurrent `posh list` probe) in the never-typed tie case | posh#239 review | One-line filter on `initialized()` + a test. Pre-existing. |
-| 18 | **posh#243** — RFC 0009 v2: a body lost on the wire while a later body is in flight becomes an unrepairable forward jump indistinguishable from eviction | Task 3.3 review | Inherited from `server_loop`; reachable on the default path since Stage 3. Operator kept the two-body window (2026-10-06). Proper fix: an eviction marker in RFC 0009, with Stage 4 (holes). Folded into Stage 4 (operator, 2026-10-06): Tasks 4.1–4.2; closed by 4.2's commit. |
+| 18 | **posh#243** — RFC 0009 v2: a body lost on the wire while a later body is in flight becomes an unrepairable forward jump indistinguishable from eviction | Task 3.3 review | Inherited from `server_loop`; reachable on the default path since Stage 3. Operator kept the two-body window (2026-10-06). Proper fix: an eviction marker in RFC 0009, with Stage 4 (holes). Folded into Stage 4 (operator, 2026-10-06): Tasks 4.1–4.2; closed by 4.2's commit (`b909962`). **Closed.** |
+| 23 | **posh#248** — the scrollback bar covers view row 0 at the top of history: the oldest ring row is never readable | Task 4.3 | Pre-existing (the bar is drawn over the window's first row at every offset). Either clamp one row further or draw the bar in its own row. Operator sequenced it here (2026-10-06). |
 | 19 | **posh#245** — a height grow pops ring rows back onto the grid without lowering `scrollback_total`; they are delivered again when they re-scroll | Stage 3 whole-stage review | Pre-existing, v1 too; multi-viewport sessions only. Needs a posh-term API addition (the popped count). |
 | 20 | **posh#246** — v2 measurement gaps: the slow-reader loss (6,400 vs v1's ~4,300) is unanalysed; the visible-base cliff past ~2 s RTT is unmeasurable in a 2 MiB flood | Task 3.3 Part B | Longer-flood harness case or field data; Task 3.4 may change the slow-reader number. |
 | 21 | **posh#244** — `history_resend_after`'s doubling duplicates `remote/agent.rs`'s private `backed_off` | Stage 3 simplify | Share one helper when either site is next touched (Task 3.4). |

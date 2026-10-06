@@ -213,7 +213,11 @@ _POSH_PACED_
 _POSH_GRAB_MOUSE_
 	_on_/_off_ (default _off_): at a bare prompt the wheel scrolls the
 	session's primary-screen scrollback locally (FDR 0005) — instant,
-	frozen while scrolled, with a top status-bar indicator; any keystroke
+	frozen while scrolled, with a top status-bar indicator. History the
+	viewport will never receive is drawn as one dim
+	*··· N lines not received ···* row where it belongs, and while the
+	session holds rows still on their way a *··· N lines arriving ···* row
+	sits above the live screen and the bar counts them down. Any keystroke
 	or scrolling back to the bottom resumes the live view. When _on_, the
 	wheel is instead translated into arrow keys (the legacy cross-terminal
 	scroll normalization, posh#50). Both grab the wheel from the outer

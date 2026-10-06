@@ -60,7 +60,9 @@ framing, and they are the design:
   On a fresh attach the client's ring starts empty and grows as the
   session produces output; it is not required to back-fill the server's
   entire 10k-row ring. "Incomplete/truncated view" is a first-class
-  state, not an error.
+  state, not an error — and it is labelled, not silent: a paced RFC 0009
+  v2 viewport draws history it will never receive as a not-received row
+  where it belongs (posh#225 Stage 4; Interface below).
 - **Local history is write-once and never dropped on eviction-from-server.**
   Once a row has entered the client's ring it stays (subject to the
   client's own ring cap), even after the server has aged it out of the
@@ -95,6 +97,18 @@ From the user's seat, scrollback behaves as it would in a local terminal:
 - While scrolled up, the live view is **frozen** (as in tmux copy-mode
   and less): new session output accumulates into the ring but does not
   yank the viewport back to the bottom until the user returns to live.
+- **Missing history is drawn, not hidden** (a paced RFC 0009 v2 viewport,
+  posh#225 Stage 4). While scrolled, a span of history the viewport will
+  never receive — the server's ring evicted it before it was sent — is one
+  dim `··· N lines not received ···` row where those rows belong. While
+  the server still holds rows the viewport has not received (a body lost
+  on the wire and held for the resend, the bodies behind it, or rows not
+  yet sent), an `··· N lines arriving ···` row sits directly above the
+  live screen and the top bar adds `· N lines still arriving`, counting
+  down as they land. The text being read does not move as rows land or
+  holes appear: every insertion is below the top of the view. The
+  eviction-vs-loss distinction is RFC 0009 §3.1's extent; FDR 0021 has
+  the delivery side.
 
 ## Examples
 
@@ -140,6 +154,12 @@ From the user's seat, scrollback behaves as it would in a local terminal:
   not auto-follow until the user returns to the bottom.
 - **Alt-screen apps are unaffected.** vim/htop/less run on the alternate
   screen, which has no scrollback; their own scroll handling is untouched.
+- **Not every gap is labelled yet** (posh#225 Stage 4). Rows the session
+  scrolled while the viewport was detached are still an unlabelled seam
+  in the scroll view until Stage 5 (history across a reconnect). The
+  look of a hole row (dim, centred `···` text) is provisional. The local
+  `posh attach` draws no holes and no arriving count until Stage 6 moves
+  it to RFC 0009 v2; its ring has none to draw.
 
 ## The wire-shape constraint (specified in RFC 0002)
 
