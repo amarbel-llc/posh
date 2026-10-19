@@ -23,18 +23,15 @@
       inputs.utils.follows = "utils";
     };
 
-    # mephisto — the genetic-programming engine for the RFC 0007 evolutionary
-    # predictor pilot. PRIVATE repo, so a flake input (a fixed-output git+ssh
-    # fetch at evaluation time, authenticated by the user's SSH agent) rather
-    # than a cargo git dependency (which the sandboxed hermetic build cannot
-    # authenticate). flake = false: we consume the source tree (a root virtual
-    # workspace; the `mephisto` crate lives under v2-rust/), bridged into the
-    # rust build via a cargo [patch]. See docs/rfcs/0007.
-    # Pinned to the tuple-engine-features rev on the mephisto side of the
-    # evolution-algorithm update (Bred populations, recombinator/similarity/GC
-    # for tuple genomes); re-pin to a master rev once that branch merges.
-    mephisto = {
-      url = "git+ssh://git@github.com/amarbel-llc/mephisto?ref=refs/heads/claude/mephisto-evolution-algorithm-update-80fyge&rev=ea6dc8b072a74454b85fa9b51acb800ce3b1bae0";
+    # galapagos — the genetic-programming engine for the RFC 0007 evolutionary
+    # predictor pilot. PUBLIC repo, fetched anonymously over https at
+    # evaluation time. A flake input rather than a cargo git dependency so the
+    # sandboxed hermetic build needs no network and the rev pin lives in
+    # flake.lock. flake = false: we consume the source tree (a root virtual
+    # workspace; the `galapagos` crate lives under v2-rust/), vendored into the
+    # rust build as a path dep. See docs/rfcs/0007.
+    galapagos = {
+      url = "git+https://code.linenisgreat.com/galapagos?rev=f7510e77a527cd1d4de6753da84f017a442ac9ce";
       flake = false;
     };
 
@@ -78,7 +75,7 @@
       igloo,
       utils,
       conformist,
-      mephisto,
+      galapagos,
       purse-first,
       crap,
       ...
@@ -103,13 +100,13 @@
 
         # RFC 0007: the .#posh rust derivation builds with src = ./. and loads
         # the whole workspace manifest — which includes crates/posh's path-dep
-        # on the private `mephisto` crate. vendor/mephisto is gitignored
-        # (absent from src), so populate it from the `mephisto` flake input's
-        # store path before cargo runs (no network/creds in the sandbox). See
+        # on the `galapagos` crate. vendor/galapagos is gitignored
+        # (absent from src), so populate it from the `galapagos` flake input's
+        # store path before cargo runs (no network in the sandbox). See
         # docs/rfcs/0007.
-        mephistoVendorPostPatch = ''
+        galapagosVendorPostPatch = ''
           mkdir -p vendor
-          cp -r ${mephisto} vendor/mephisto
+          cp -r ${galapagos} vendor/galapagos
           chmod -R u+w vendor
         '';
 
@@ -145,7 +142,7 @@
           version = poshVersion;
 
           src = ./.;
-          # allowBuiltinFetchGit: mephisto now carries git-sourced cargo deps
+          # allowBuiltinFetchGit: galapagos carries git-sourced cargo deps
           # (hyphence, rust-crap — public repos), which importCargoLock fetches
           # via builtins.fetchGit from the lockfile's pinned revs, no per-dep
           # outputHashes to maintain.
@@ -154,10 +151,10 @@
             allowBuiltinFetchGit = true;
           };
 
-          # RFC 0007: vendor the private mephisto crate from the flake input
+          # RFC 0007: vendor the galapagos crate from the flake input
           # before cargo runs. The dev-loop gets
           # the same path via the devShell shellHook below.
-          postPatch = mephistoVendorPostPatch;
+          postPatch = galapagosVendorPostPatch;
 
           # Each crate's build.rs reads POSH_VERSION from the build env and
           # flows it into the crate (cargo:rustc-env=POSH_VERSION); runtime
@@ -457,13 +454,13 @@
             conformistEval.config.build.preCommit # `conformist-pre-commit`
             conformistEval.config.build.repair # `conformist-repair`
           ];
-          # RFC 0007: the dev-loop's mephisto source. The flake build populates
-          # vendor/mephisto from the store (postPatch above); for `just
+          # RFC 0007: the dev-loop's galapagos source. The flake build populates
+          # vendor/galapagos from the store (postPatch above); for `just
           # debug-cargo`, symlink it to the same pinned flake-input store path so
           # local builds use the locked rev (not an ambient sibling checkout).
           shellHook = ''
             mkdir -p vendor
-            ln -sfn ${mephisto} vendor/mephisto
+            ln -sfn ${galapagos} vendor/galapagos
           '';
         };
       }

@@ -137,6 +137,23 @@
         "type": "github"
       }
     },
+    "galapagos": {
+      "flake": false,
+      "locked": {
+        "lastModified": 1792374873,
+        "narHash": "sha256-l7fy1eBFYkECBbuabOzC70YM8JB+1jGeFw9Wa3krzJM=",
+        "ref": "refs/heads/master",
+        "rev": "f7510e77a527cd1d4de6753da84f017a442ac9ce",
+        "revCount": 6,
+        "type": "git",
+        "url": "https://code.linenisgreat.com/galapagos"
+      },
+      "original": {
+        "rev": "f7510e77a527cd1d4de6753da84f017a442ac9ce",
+        "type": "git",
+        "url": "https://code.linenisgreat.com/galapagos"
+      }
+    },
     "gomod2nix": {
       "inputs": {
         "flake-utils": [
@@ -180,24 +197,6 @@
       "original": {
         "type": "tarball",
         "url": "https://code.linenisgreat.com/igloo/archive/master.tar.gz"
-      }
-    },
-    "mephisto": {
-      "flake": false,
-      "locked": {
-        "lastModified": 1783119835,
-        "narHash": "sha256-gOvQjRi61GWMDG9iKPmxSPPxKoctE1Bt61SRPEnCgCY=",
-        "ref": "refs/heads/claude/mephisto-evolution-algorithm-update-80fyge",
-        "rev": "ea6dc8b072a74454b85fa9b51acb800ce3b1bae0",
-        "revCount": 367,
-        "type": "git",
-        "url": "ssh://git@github.com/amarbel-llc/mephisto"
-      },
-      "original": {
-        "ref": "refs/heads/claude/mephisto-evolution-algorithm-update-80fyge",
-        "rev": "ea6dc8b072a74454b85fa9b51acb800ce3b1bae0",
-        "type": "git",
-        "url": "ssh://git@github.com/amarbel-llc/mephisto"
       }
     },
     "nixpkgs-master": {
@@ -248,8 +247,8 @@
       "inputs": {
         "conformist": "conformist",
         "crap": "crap",
+        "galapagos": "galapagos",
         "igloo": "igloo",
-        "mephisto": "mephisto",
         "nixpkgs-master": "nixpkgs-master",
         "purse-first": "purse-first",
         "utils": "utils"

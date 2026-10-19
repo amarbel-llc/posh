@@ -293,19 +293,19 @@ it. Objective weights SHOULD be exposed as tunable parameters.
 
 ### 7. Online Evolution Loop
 
-The client drives mephisto's public single-generation API. The contract is:
+The client drives galapagos's public single-generation API. The contract is:
 
-- `mephisto::domain::initial_population(dom, cfg, rng) -> Vec<Bred>` — seed
+- `galapagos::domain::initial_population(dom, cfg, rng) -> Vec<Bred>` — seed
   once at session start when no persisted population is loaded. `Bred` pairs a
   genome with its engine-carried, self-adaptive `Recombinator` strategy
   (operator, mix, mate preference — mephisto #21): the reproductive strategy is
   itself under selection, so the species opts in via
   `Domain::uses_recombinator` and supplies the operator dispatch
   (`Domain::recombine`) plus an assortative-mating `Domain::similarity` signal.
-- `mephisto::domain::evaluate_population(dom, &pop) -> Vec<Scored>` — score and
+- `galapagos::domain::evaluate_population(dom, &pop) -> Vec<Scored>` — score and
   rank best-first; called per server-frame tick. This call MUST NOT consume
   randomness (it is reproducible).
-- `mephisto::domain::step(dom, cfg, rng, &scored) -> Vec<Bred>` — advance one
+- `galapagos::domain::step(dom, cfg, rng, &scored) -> Vec<Bred>` — advance one
   generation.
 - `Scored { genome, fitness, rank, recomb }` — `scored[0]` is the champion the
   client evaluates for display.
@@ -436,11 +436,12 @@ appears at a real `ECHO`-off prompt.
   introduced — `controller` and `scratch` (the from-scratch species); `adaptive`
   remains the default and the existing `adaptive`/`always`/`never`/
   `experimental`/`optimistic` values are unchanged (FDR 0006).
-- **mephisto dependency.** posh depends on the mephisto library crate
-  (`mephisto::domain`, `mephisto::rng`) at or above the commit that exposes the
-  single-generation API of §7. The dependency MUST pin a specific revision; a
-  mephisto change to the §7 API signatures is a breaking change requiring a
-  coordinated bump.
+- **galapagos dependency.** posh depends on the galapagos library crate
+  (`galapagos::domain`, `galapagos::rng`; formerly `mephisto`, renamed when the
+  engine was extracted to the public `galapagos` repo) at or above the commit
+  that exposes the single-generation API of §7. The dependency MUST pin a
+  specific revision; a galapagos change to the §7 API signatures is a breaking
+  change requiring a coordinated bump.
 - **Persisted-genome versioning** is handled by `metric_schema_version` (§8);
   adding metric terminals is a schema-version increment with a migration path or
   a cold-start fallback.
@@ -466,9 +467,9 @@ Normative:
 - [RFC 2119] Key words for use in RFCs to Indicate Requirement Levels.
 - [RFC 0001] Target Grammar and Capability Table (`docs/rfcs/0001-…`) — the
   per-frame capability channel server-forwarded metrics extend.
-- [mephisto domain API] `mephisto::domain::{initial_population,
+- [galapagos domain API] `galapagos::domain::{initial_population,
   evaluate_population, step, Bred, Scored, Recombinator}` and
-  `mephisto::rng::Rng`.
+  `galapagos::rng::Rng`.
 
 Informative:
 

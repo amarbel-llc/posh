@@ -1,7 +1,7 @@
-//! RFC 0007 §4.1: the evolved controller's mephisto `Domain`.
+//! RFC 0007 §4.1: the evolved controller's galapagos `Domain`.
 //!
 //! The genome is a 4-root GP tuple (one root per [`PolicyKnobs`] field) over the
-//! shared 48-leaf metric vector, via mephisto's `TupleBreeder`. We delegate the
+//! shared 48-leaf metric vector, via galapagos's `TupleBreeder`. We delegate the
 //! variation operators to the breeder and implement only `evaluate` + `rank`:
 //! `evaluate` replays a genome's policy over a recent live-outcome window and
 //! scores its show/flicker/suppress decisions; `rank` scalarizes (lower is
@@ -19,15 +19,15 @@
 
 use std::path::{Path, PathBuf};
 
-use mephisto::arena::NodeId;
-use mephisto::domain::{
+use galapagos::arena::NodeId;
+use galapagos::domain::{
     evaluate_population, initial_population, step, Bred, Domain, LoopConfig, Recombinator, XoverOp,
 };
-use mephisto::gene_pool::content_id;
-use mephisto::genome::{AlphabetWeights, ConstPolicy, MutParams, MutationWeights};
-use mephisto::persist::{load_population, save_population};
-use mephisto::rng::Rng;
-use mephisto::tuple::TupleBreeder;
+use galapagos::gene_pool::content_id;
+use galapagos::genome::{AlphabetWeights, ConstPolicy, MutParams, MutationWeights};
+use galapagos::persist::{load_population, save_population};
+use galapagos::rng::Rng;
+use galapagos::tuple::TupleBreeder;
 
 use crate::remote::display::Snapshot;
 

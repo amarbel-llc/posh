@@ -82,6 +82,14 @@ dependencies = [
 ]
 
 [[package]]
+name = "galapagos"
+version = "0.1.0"
+dependencies = [
+ "hyphence",
+ "rust-crap",
+]
+
+[[package]]
 name = "generic-array"
 version = "0.14.7"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -104,7 +112,7 @@ dependencies = [
 [[package]]
 name = "hyphence"
 version = "0.1.0"
-source = "git+https://github.com/amarbel-llc/hyphence.git?tag=v0.1.0#dda0483d9f3d1da3b96bbe616159720aca5d8a17"
+source = "git+https://code.linenisgreat.com/hyphence.git?tag=v0.1.0#dda0483d9f3d1da3b96bbe616159720aca5d8a17"
 
 [[package]]
 name = "inout"
@@ -134,14 +142,6 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "88904434abc2901f197fe8cc55f0445e7ded921dba5911dad2e2b39b48e663c4"
 
 [[package]]
-name = "mephisto"
-version = "0.1.0"
-dependencies = [
- "hyphence",
- "rust-crap",
-]
-
-[[package]]
 name = "opaque-debug"
 version = "0.3.1"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -164,8 +164,8 @@ name = "posh"
 version = "0.0.0"
 dependencies = [
  "aes-gcm",
+ "galapagos",
  "libc",
- "mephisto",
  "posh-build",
  "posh-proto",
  "posh-term",
