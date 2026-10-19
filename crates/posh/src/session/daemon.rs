@@ -5769,8 +5769,13 @@ mod tests {
         };
         // History probes until the flood is visibly running; each probe's
         // first record must be its reply.
+        // Paced and deadline-bound: probes are answered in microseconds, so an
+        // unpaced loop can burn all its attempts before a slow host has even
+        // exec'd the shell (observed on a 1.6GHz x86_64-darwin build sandbox).
         let mut flooding = false;
-        for _ in 0..50 {
+        let flood_deadline = std::time::Instant::now() + std::time::Duration::from_secs(20);
+        while std::time::Instant::now() < flood_deadline {
+            std::thread::sleep(std::time::Duration::from_millis(20));
             let mut probe = connect();
             ipc::send(probe.as_raw_fd(), Tag::History, &ipc::encode_history_format(false)).unwrap();
             read_until(&mut probe, &mut FrameBuffer::new(), &mut |rec| {

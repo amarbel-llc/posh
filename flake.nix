@@ -78,391 +78,404 @@
       galapagos,
       purse-first,
       crap,
+      nixpkgs-master,
       ...
     }:
-    utils.lib.eachDefaultSystem (
-      system:
-      let
-        pkgs = import igloo {
-          inherit system;
-          overlays = [ igloo.overlays.default ];
-        };
-        inherit (pkgs) lib;
-
-        # purse-first#185: the `mesa` List-Table NDJSON renderer binary that
-        # `posh list` shells out to (crates/posh/src/session/mesa.rs).
-        mesaBin = purse-first.packages.${system}.mesa;
-
-        # crap: the `crap-present` ndjson-crap viewport binary posh's
-        # connect-progress indicator (#1) drives as a subprocess to draw the
-        # establishing spinner (crates/posh/src/remote/connect_progress.rs).
-        crapPresentBin = crap.packages.${system}.crap-present;
-
-        # RFC 0007: the .#posh rust derivation builds with src = ./. and loads
-        # the whole workspace manifest — which includes crates/posh's path-dep
-        # on the `galapagos` crate. vendor/galapagos is gitignored
-        # (absent from src), so populate it from the `galapagos` flake input's
-        # store path before cargo runs (no network in the sandbox). See
-        # docs/rfcs/0007.
-        galapagosVendorPostPatch = ''
-          mkdir -p vendor
-          cp -r ${galapagos} vendor/galapagos
-          chmod -R u+w vendor
-        '';
-
-        # posh's single source of truth: version.env at the repo root
-        # (POSH_VERSION). Read here for the derivation `version` attr and
-        # passed into the build env so each crate's build.rs flows it into
-        # the crate (cargo:rustc-env=POSH_VERSION) without relying on the
-        # relative-path read. The Cargo manifests' package.version is an
-        # inert "0.0.0" placeholder that build.rs overrides at compile time,
-        # so there is nothing to keep in lockstep and no drift. See
-        # eng-versioning(7).
-        poshVersion = builtins.head (
-          builtins.match ".*POSH_VERSION=([^\n]+).*" (builtins.readFile ./version.env)
-        );
-
-        # Git revision embedded into `posh version` (github #63). The flake
-        # exposes shortRev on a clean tree and dirtyShortRev (a "<sha>-dirty"
-        # string) on a modified one; "unknown" when built from a non-git source.
-        # Passed into the build env so crates/posh/build.rs flows it into the
-        # binary (cargo:rustc-env=POSH_GIT_SHA). See eng-versioning(7).
-        poshGitSha = self.shortRev or self.dirtyShortRev or "unknown";
-
-        # The Rust workspace: the posh rewrite (crates/posh-term +
-        # crates/posh). `cargo test --workspace` runs in the sandboxed
-        # checkPhase, making this the hermetic Rust CI gate (github #33).
-        # The e2e tests drive ptys and loopback UDP — both available in the
-        # Linux sandbox.
-        # Version single source of truth: version.env (POSH_VERSION),
-        # read into poshVersion above. crates/posh/build.rs guards
-        # Cargo.toml's package.version against it.
-        posh = pkgs.rustPlatform.buildRustPackage {
-          pname = "posh";
-          version = poshVersion;
-
-          src = ./.;
-          # allowBuiltinFetchGit: galapagos carries git-sourced cargo deps
-          # (hyphence, rust-crap — public repos), which importCargoLock fetches
-          # via builtins.fetchGit from the lockfile's pinned revs, no per-dep
-          # outputHashes to maintain.
-          cargoLock = {
-            lockFile = ./Cargo.lock;
-            allowBuiltinFetchGit = true;
+    # Explicit list rather than eachDefaultSystem: the inherited systems flake
+    # (igloo/systems) dropped x86_64-darwin, so the default list no longer
+    # exposes Intel Macs. Building there needs the nixpkgs inputs overridden
+    # to nixos-26.05 (the last release supporting x86_64-darwin).
+    utils.lib.eachSystem
+      [
+        "x86_64-linux"
+        "aarch64-linux"
+        "aarch64-darwin"
+        "x86_64-darwin"
+      ]
+      (
+        system:
+        let
+          pkgs = import igloo {
+            inherit system;
+            nixpkgs = nixpkgs-master;
+            overlays = [ igloo.overlays.default ];
           };
+          inherit (pkgs) lib;
 
-          # RFC 0007: vendor the galapagos crate from the flake input
-          # before cargo runs. The dev-loop gets
-          # the same path via the devShell shellHook below.
-          postPatch = galapagosVendorPostPatch;
+          # purse-first#185: the `mesa` List-Table NDJSON renderer binary that
+          # `posh list` shells out to (crates/posh/src/session/mesa.rs).
+          mesaBin = purse-first.packages.${system}.mesa;
 
-          # Each crate's build.rs reads POSH_VERSION from the build env and
-          # flows it into the crate (cargo:rustc-env=POSH_VERSION); runtime
-          # reads env!("POSH_VERSION"). The nix `src` also carries version.env
-          # into the sandbox, but the env var makes the build independent of
-          # the relative-path read. See eng-versioning(7).
-          POSH_VERSION = poshVersion;
-          # Git rev for `posh version` (#63); the sandbox has no .git, so the
-          # flake supplies it and build.rs flows it in.
-          POSH_GIT_SHA = poshGitSha;
+          # crap: the `crap-present` ndjson-crap viewport binary posh's
+          # connect-progress indicator (#1) drives as a subprocess to draw the
+          # establishing spinner (crates/posh/src/remote/connect_progress.rs).
+          crapPresentBin = crap.packages.${system}.crap-present;
 
-          # scdoc compiles the hand-written man pages in doc/*.scd during
-          # postInstall; installShellFiles provides installShellCompletion.
-          # makeWrapper wraps the runtime `mesa` dep onto PATH (postInstall,
-          # below). mesaBin is ALSO on nativeBuildInputs (not just wrapped in)
-          # so it's on PATH for the sandboxed checkPhase too: `cargo test
-          # --workspace` runs the session_integration.rs test that spawns
-          # `posh list`, which shells out to `mesa` (purse-first#185). See
-          # eng-manpages(7) and doc/.
-          nativeBuildInputs = [
-            pkgs.scdoc
-            pkgs.installShellFiles
-            pkgs.makeWrapper
-            mesaBin
-          ];
-
-          doCheck = true;
-
-          # mosh-server parity: the ssh bootstrap runs `posh-server new` on
-          # the remote host, so the package provides that name too (same
-          # binary; `posh-server ...` == `posh server ...` via argv[0]).
-          #
-          # Man pages: compile every doc/*.scd into the matching man section,
-          # deriving the section from the filename suffix (posh.1.scd ->
-          # man1/posh.1). They land in this binary's own $out, so a consumer
-          # home-manager `programs.man` surfaces them with no extra wiring.
-          # See eng-manpages(7).
-          postInstall = ''
-            ln -s posh $out/bin/posh-server
-            # FDR 0015: the `ph` front-door is the same binary, routed by argv[0]
-            # (like posh-server); `bin/ph <target>` resolves start-vs-attach.
-            ln -s posh $out/bin/ph
-            # Shell completions are embedded in the binary (completions.rs,
-            # `posh completions <shell>`); install them into the vendor
-            # completion dirs so bash/zsh/fish auto-load them and
-            # `posh attach <Tab>` / the bare `posh <Tab>` target forms work
-            # without manual sourcing.
-            installShellCompletion --cmd posh \
-              --bash <($out/bin/posh completions bash) \
-              --zsh <($out/bin/posh completions zsh) \
-              --fish <($out/bin/posh completions fish)
-            # FDR 0015: the ph front-door completion (fish + bash).
-            installShellCompletion --cmd ph \
-              --bash <($out/bin/posh completions bash ph) \
-              --fish <($out/bin/posh completions fish ph)
-            for f in doc/*.scd; do
-              stem="$(basename "$f" .scd)"          # e.g. posh.1
-              section="''${stem##*.}"               # 1
-              name="''${stem%.*}"                   # posh
-              mkdir -p "$out/share/man/man''${section}"
-              scdoc < "$f" > "$out/share/man/man''${section}/''${name}.''${section}"
-            done
-
-            # purse-first#185: `posh list` shells out to `mesa` to render its
-            # default table (crates/posh/src/session/mesa.rs). Wrap the real
-            # binary so mesa is always reachable regardless of the ambient
-            # PATH, the way dagnabit wraps ast-grep onto its PATH. --suffix
-            # (not --prefix): a user-provided `mesa` on PATH wins over this
-            # pinned store path. posh-server/ph are symlinks to this same
-            # file, so they inherit the wrapped PATH too. crap-present rides the
-            # same wrap: the connect-progress indicator (#1) drives it as a
-            # subprocess (crates/posh/src/remote/connect_progress.rs).
-            wrapProgram $out/bin/posh \
-              --suffix PATH : ${
-                lib.makeBinPath [
-                  mesaBin
-                  crapPresentBin
-                ]
-              }
+          # RFC 0007: the .#posh rust derivation builds with src = ./. and loads
+          # the whole workspace manifest — which includes crates/posh's path-dep
+          # on the `galapagos` crate. vendor/galapagos is gitignored
+          # (absent from src), so populate it from the `galapagos` flake input's
+          # store path before cargo runs (no network in the sandbox). See
+          # docs/rfcs/0007.
+          galapagosVendorPostPatch = ''
+            mkdir -p vendor
+            cp -r ${galapagos} vendor/galapagos
+            chmod -R u+w vendor
           '';
 
-          meta = with lib; {
-            description = "Persistent, roaming terminal sessions: a combined Rust rewrite of zmx and mosh";
-            license = licenses.gpl3Plus;
-            mainProgram = "posh";
-            platforms = platforms.linux ++ platforms.darwin;
-          };
-        };
+          # posh's single source of truth: version.env at the repo root
+          # (POSH_VERSION). Read here for the derivation `version` attr and
+          # passed into the build env so each crate's build.rs flows it into
+          # the crate (cargo:rustc-env=POSH_VERSION) without relying on the
+          # relative-path read. The Cargo manifests' package.version is an
+          # inert "0.0.0" placeholder that build.rs overrides at compile time,
+          # so there is nothing to keep in lockstep and no drift. See
+          # eng-versioning(7).
+          poshVersion = builtins.head (
+            builtins.match ".*POSH_VERSION=([^\n]+).*" (builtins.readFile ./version.env)
+          );
 
-        # posht ("diff on a POSH"): the standalone interactive terminal-
-        # capability test (Go / Bubble Tea). Its own Go module under posht/,
-        # independent of the Rust workspace and the C++ tree, so sourcing the
-        # subtree keeps non-posht changes from rebuilding it. Pure Go, so the
-        # binary is static and needs nothing on a target beyond a UTF-8 locale
-        # — which is what lets `run-remote.sh` scp it to any host. Version
-        # single source of truth: version.env (POSH_VERSION, read into
-        # poshVersion above) + the git rev, flowed into the binary via
-        # -ldflags -X main.version / main.gitSHA (github #71). posht's own
-        # `var version`/`gitSHA` defaults are inert dev placeholders. See
-        # eng-versioning(7) and docs/posht.md.
-        posht = pkgs.buildGoModule {
-          pname = "posht";
-          version = poshVersion;
+          # Git revision embedded into `posh version` (github #63). The flake
+          # exposes shortRev on a clean tree and dirtyShortRev (a "<sha>-dirty"
+          # string) on a modified one; "unknown" when built from a non-git source.
+          # Passed into the build env so crates/posh/build.rs flows it into the
+          # binary (cargo:rustc-env=POSH_GIT_SHA). See eng-versioning(7).
+          poshGitSha = self.shortRev or self.dirtyShortRev or "unknown";
 
-          src = ./posht;
-          vendorHash = "sha256-mR/fqtqVw4VL8LcbRkoJ+TdICQPYKTn8XZEl8yqGjuQ=";
+          # The Rust workspace: the posh rewrite (crates/posh-term +
+          # crates/posh). `cargo test --workspace` runs in the sandboxed
+          # checkPhase, making this the hermetic Rust CI gate (github #33).
+          # The e2e tests drive ptys and loopback UDP — both available in the
+          # Linux sandbox.
+          # Version single source of truth: version.env (POSH_VERSION),
+          # read into poshVersion above. crates/posh/build.rs guards
+          # Cargo.toml's package.version against it.
+          posh = pkgs.rustPlatform.buildRustPackage {
+            pname = "posh";
+            version = poshVersion;
 
-          # Flow version.env + git rev into the Go binary (github #71). -X sets
-          # the package-level `version`/`gitSHA` vars; buildGoModule already runs
-          # `go test ./...` in checkPhase (doCheck defaults on), which gates the
-          # version-format test.
-          ldflags = [
-            "-X main.version=${poshVersion}"
-            "-X main.gitSHA=${poshGitSha}"
-          ];
+            src = ./.;
+            # allowBuiltinFetchGit: galapagos carries git-sourced cargo deps
+            # (hyphence, rust-crap — public repos), which importCargoLock fetches
+            # via builtins.fetchGit from the lockfile's pinned revs, no per-dep
+            # outputHashes to maintain.
+            cargoLock = {
+              lockFile = ./Cargo.lock;
+              allowBuiltinFetchGit = true;
+            };
 
-          meta = with lib; {
-            description = "Interactive terminal-capability test for posh (\"diff on a POSH\")";
-            license = licenses.gpl3Plus;
-            mainProgram = "posht";
-            platforms = platforms.linux ++ platforms.darwin;
-          };
-        };
+            # RFC 0007: vendor the galapagos crate from the flake input
+            # before cargo runs. The dev-loop gets
+            # the same path via the devShell shellHook below.
+            postPatch = galapagosVendorPostPatch;
 
-        # posh-palette: the command-palette renderer for the posh client — a
-        # bubbletea (v2) subprocess the client drives over the RFC 0005 JSON-RPC
-        # control channel (fd 3) and composites onto the session view. Its own
-        # Go module under posh-palette/, independent of the Rust workspace, so
-        # sourcing the subtree keeps non-palette changes from rebuilding it.
-        # Built exactly like posht: buildGoModule + version/rev flowed in via
-        # -ldflags -X main.version / main.gitSHA (github #71); buildGoModule's
-        # checkPhase runs `go test ./...`, gating the version-format and
-        # protocol tests. The client locates the binary next to itself, so
-        # poshToolset co-installs it in the same bin/. See eng-versioning(7).
-        posh-palette = pkgs.buildGoModule {
-          pname = "posh-palette";
-          version = poshVersion;
+            # Each crate's build.rs reads POSH_VERSION from the build env and
+            # flows it into the crate (cargo:rustc-env=POSH_VERSION); runtime
+            # reads env!("POSH_VERSION"). The nix `src` also carries version.env
+            # into the sandbox, but the env var makes the build independent of
+            # the relative-path read. See eng-versioning(7).
+            POSH_VERSION = poshVersion;
+            # Git rev for `posh version` (#63); the sandbox has no .git, so the
+            # flake supplies it and build.rs flows it in.
+            POSH_GIT_SHA = poshGitSha;
 
-          src = ./posh-palette;
-          vendorHash = "sha256-DwMz9dJy844NmDb9d711z4JnqwZtqociP/LZXBC2WJw=";
+            # scdoc compiles the hand-written man pages in doc/*.scd during
+            # postInstall; installShellFiles provides installShellCompletion.
+            # makeWrapper wraps the runtime `mesa` dep onto PATH (postInstall,
+            # below). mesaBin is ALSO on nativeBuildInputs (not just wrapped in)
+            # so it's on PATH for the sandboxed checkPhase too: `cargo test
+            # --workspace` runs the session_integration.rs test that spawns
+            # `posh list`, which shells out to `mesa` (purse-first#185). See
+            # eng-manpages(7) and doc/.
+            nativeBuildInputs = [
+              pkgs.scdoc
+              pkgs.installShellFiles
+              pkgs.makeWrapper
+              mesaBin
+            ];
 
-          ldflags = [
-            "-X main.version=${poshVersion}"
-            "-X main.gitSHA=${poshGitSha}"
-          ];
+            doCheck = true;
 
-          meta = with lib; {
-            description = "Command-palette renderer for the posh client (RFC 0005 control protocol)";
-            license = licenses.gpl3Plus;
-            mainProgram = "posh-palette";
-            platforms = platforms.linux ++ platforms.darwin;
-          };
-        };
+            # mosh-server parity: the ssh bootstrap runs `posh-server new` on
+            # the remote host, so the package provides that name too (same
+            # binary; `posh-server ...` == `posh server ...` via argv[0]).
+            #
+            # Man pages: compile every doc/*.scd into the matching man section,
+            # deriving the section from the filename suffix (posh.1.scd ->
+            # man1/posh.1). They land in this binary's own $out, so a consumer
+            # home-manager `programs.man` surfaces them with no extra wiring.
+            # See eng-manpages(7).
+            postInstall = ''
+              ln -s posh $out/bin/posh-server
+              # FDR 0015: the `ph` front-door is the same binary, routed by argv[0]
+              # (like posh-server); `bin/ph <target>` resolves start-vs-attach.
+              ln -s posh $out/bin/ph
+              # Shell completions are embedded in the binary (completions.rs,
+              # `posh completions <shell>`); install them into the vendor
+              # completion dirs so bash/zsh/fish auto-load them and
+              # `posh attach <Tab>` / the bare `posh <Tab>` target forms work
+              # without manual sourcing.
+              installShellCompletion --cmd posh \
+                --bash <($out/bin/posh completions bash) \
+                --zsh <($out/bin/posh completions zsh) \
+                --fish <($out/bin/posh completions fish)
+              # FDR 0015: the ph front-door completion (fish + bash).
+              installShellCompletion --cmd ph \
+                --bash <($out/bin/posh completions bash ph) \
+                --fish <($out/bin/posh completions fish ph)
+              for f in doc/*.scd; do
+                stem="$(basename "$f" .scd)"          # e.g. posh.1
+                section="''${stem##*.}"               # 1
+                name="''${stem%.*}"                   # posh
+                mkdir -p "$out/share/man/man''${section}"
+                scdoc < "$f" > "$out/share/man/man''${section}/''${name}.''${section}"
+              done
 
-        # The default output: the full posh toolset in one tree, so a bare
-        # `nix build` yields every posh-* build product rather than just the
-        # posh binary (github #73). `posh` already installs the posh /
-        # posh-server / poshterity binaries and the man pages; this adds posht
-        # (the Go TUI) and posh-palette (the command-palette renderer).
-        # posh-term is a library compiled into posh, not a standalone binary, so
-        # it has no entry here.
-        poshToolset = pkgs.symlinkJoin {
-          name = "posh-toolset-${poshVersion}";
-          paths = [
-            posh
-            posht
-            posh-palette
-          ];
-          meta = {
-            description = "The full posh toolset: posh, posh-server, poshterity, posht, and posh-palette";
-            mainProgram = "posh";
-            license = posh.meta.license;
-            platforms = posh.meta.platforms;
-          };
-        };
-
-        # poshterity exposed as its own runnable output, so `nix run
-        # .#poshterity` runs the recorder/replayer and `nix build .#poshterity`
-        # yields just that tool (github #73). It selects the single binary and
-        # its man page out of the already-built `posh` package rather than
-        # recompiling, so the binary has one source of truth and can never
-        # diverge from the one in `posh`/the default toolset. mainProgram makes
-        # `nix run` resolve to poshterity rather than posh.
-        poshterity =
-          pkgs.runCommand "poshterity-${poshVersion}"
-            {
-              meta = {
-                description = "Deterministic, step-ratcheted terminal recorder/replayer built on posh-term";
-                mainProgram = "poshterity";
-                inherit (posh.meta) license platforms;
-              };
-            }
-            ''
-              mkdir -p "$out/bin" "$out/share/man/man1"
-              ln -s ${posh}/bin/poshterity "$out/bin/poshterity"
-              ln -s ${posh}/share/man/man1/poshterity.1.gz "$out/share/man/man1/poshterity.1.gz"
+              # purse-first#185: `posh list` shells out to `mesa` to render its
+              # default table (crates/posh/src/session/mesa.rs). Wrap the real
+              # binary so mesa is always reachable regardless of the ambient
+              # PATH, the way dagnabit wraps ast-grep onto its PATH. --suffix
+              # (not --prefix): a user-provided `mesa` on PATH wins over this
+              # pinned store path. posh-server/ph are symlinks to this same
+              # file, so they inherit the wrapped PATH too. crap-present rides the
+              # same wrap: the connect-progress indicator (#1) drives it as a
+              # subprocess (crates/posh/src/remote/connect_progress.rs).
+              wrapProgram $out/bin/posh \
+                --suffix PATH : ${
+                  lib.makeBinPath [
+                    mesaBin
+                    crapPresentBin
+                  ]
+                }
             '';
 
-        # Tree-wide formatter + eng-convention linters under one runner:
-        # nixfmt + shfmt, plus the eng preset's
-        # eng-versioning / flake-* / justfile-* checks. The eng preset and
-        # posh's own formatters/excludes (./conformist.nix) are merged here.
-        # Exposed as `formatter.${system}` (`nix fmt`, repair mode), the
-        # read-only `checks.formatting` gate, and the store-pinned
-        # conformist-pre-commit / conformist-repair git hooks (each bakes this
-        # module's generated /nix/store config — there is no committed
-        # conformist.toml). See ./conformist.nix and conformist-nix(7).
-        conformistPkg = conformist.packages.${system}.default;
-        conformistEval = conformist.lib.evalModule pkgs {
-          imports = [
-            conformist.lib.presets.eng
-            ./conformist.nix
-          ];
-          package = conformistPkg;
-        };
+            meta = with lib; {
+              description = "Persistent, roaming terminal sessions: a combined Rust rewrite of zmx and mosh";
+              license = licenses.gpl3Plus;
+              mainProgram = "posh";
+              platforms = platforms.linux ++ platforms.darwin;
+            };
+          };
 
-        # Impure git-state lane: the eng-convention checks that need a live
-        # .git or host tools (agents-md's CLAUDE.md->AGENTS.md migration,
-        # git-remotes/git-default-branch, sweatfile's `spinclass validate`,
-        # gomod2nix — a no-op here, posh has no go.mod). They can't run in the
-        # sandboxed checks.formatting (which sees only a /nix/store copy), so
-        # this config drives a working-tree `conformist check` via
-        # `just lint-worktree`. See conformist-nix(7) and the eng-impure preset.
-        conformistImpureEval = conformist.lib.evalModule pkgs {
-          imports = [
-            conformist.lib.presets.eng-impure
-            # conformist #69: the first-class clippy linter (opt-in — not in the
-            # eng-impure preset roster). posh had no clippy gate before; this
-            # adopts it. check = `cargo clippy … -- -D warnings`, repair =
-            # `cargo clippy --fix`. The toolchain (cargo/clippy/rustc/gcc)
-            # defaults to `pkgs` (igloo), the same nixpkgs the .#posh build's
-            # rustc comes from, so there is no clippy-version findings delta.
-            { linters.clippy.enable = true; }
-          ];
-          package = conformistPkg;
-          projectRootFile = "flake.nix";
-        };
-      in
-      {
-        packages = {
-          # Default is the full toolset (github #73) so a bare `nix build`
-          # yields posh + posh-server + poshterity + posht. The individual
-          # products stay addressable.
-          default = poshToolset;
-          posh = posh;
-          poshterity = poshterity;
-          posht = posht;
-          posh-palette = posh-palette;
+          # posht ("diff on a POSH"): the standalone interactive terminal-
+          # capability test (Go / Bubble Tea). Its own Go module under posht/,
+          # independent of the Rust workspace and the C++ tree, so sourcing the
+          # subtree keeps non-posht changes from rebuilding it. Pure Go, so the
+          # binary is static and needs nothing on a target beyond a UTF-8 locale
+          # — which is what lets `run-remote.sh` scp it to any host. Version
+          # single source of truth: version.env (POSH_VERSION, read into
+          # poshVersion above) + the git rev, flowed into the binary via
+          # -ldflags -X main.version / main.gitSHA (github #71). posht's own
+          # `var version`/`gitSHA` defaults are inert dev placeholders. See
+          # eng-versioning(7) and docs/posht.md.
+          posht = pkgs.buildGoModule {
+            pname = "posht";
+            version = poshVersion;
 
-          # The store-pinned git hooks from this repo's pure-lane config
-          # (conformist#47/#51/#54): conformist-pre-commit runs `conformist
-          # --staged --exit-zero-on-fix`, conformist-repair runs `conformist
-          # --commit --amend --exit-zero-on-fix` (the build.repair sibling, both
-          # from the module's shared mkHookWrapper). On the devShell PATH under
-          # those names; the sweatfile's pre-commit / repair hooks name them.
-          # Unlike a bare `conformist`, every formatter's `command` is
-          # store-pinned in the baked config, so they CANNOT silent-skip file
-          # types the ambient PATH happens to lack (the conformist#51 trap).
-          conformist-pre-commit = conformistEval.config.build.preCommit;
-          conformist-repair = conformistEval.config.build.repair;
+            src = ./posht;
+            vendorHash = "sha256-mR/fqtqVw4VL8LcbRkoJ+TdICQPYKTn8XZEl8yqGjuQ=";
 
-          # The impure-lane config (eng-impure preset). `just lint-worktree`
-          # runs `conformist check` against the working tree with this config
-          # to exercise the git-state linters (agents-md, git-remotes,
-          # git-default-branch, sweatfile) that the sandboxed checks.formatting
-          # cannot. Not committed — built on demand.
-          conformist-impure-config = conformistImpureEval.config.build.configFile;
-        };
+            # Flow version.env + git rev into the Go binary (github #71). -X sets
+            # the package-level `version`/`gitSHA` vars; buildGoModule already runs
+            # `go test ./...` in checkPhase (doCheck defaults on), which gates the
+            # version-format test.
+            ldflags = [
+              "-X main.version=${poshVersion}"
+              "-X main.gitSHA=${poshGitSha}"
+            ];
 
-        checks = {
-          # Read-only formatting + eng-convention gate: builds in /nix/store
-          # off a source snapshot, runs `conformist check`, fails if any file
-          # would change or any eng linter (eng-versioning, flake-*,
-          # justfile-*) finds a violation. Driven by `just lint-fmt` and
-          # surfaced under `nix flake check`.
-          formatting = conformistEval.config.build.check self;
-        };
+            meta = with lib; {
+              description = "Interactive terminal-capability test for posh (\"diff on a POSH\")";
+              license = licenses.gpl3Plus;
+              mainProgram = "posht";
+              platforms = platforms.linux ++ platforms.darwin;
+            };
+          };
 
-        formatter = conformistEval.config.build.wrapper;
+          # posh-palette: the command-palette renderer for the posh client — a
+          # bubbletea (v2) subprocess the client drives over the RFC 0005 JSON-RPC
+          # control channel (fd 3) and composites onto the session view. Its own
+          # Go module under posh-palette/, independent of the Rust workspace, so
+          # sourcing the subtree keeps non-palette changes from rebuilding it.
+          # Built exactly like posht: buildGoModule + version/rev flowed in via
+          # -ldflags -X main.version / main.gitSHA (github #71); buildGoModule's
+          # checkPhase runs `go test ./...`, gating the version-format and
+          # protocol tests. The client locates the binary next to itself, so
+          # poshToolset co-installs it in the same bin/. See eng-versioning(7).
+          posh-palette = pkgs.buildGoModule {
+            pname = "posh-palette";
+            version = poshVersion;
 
-        devShells.default = pkgs.mkShell {
-          packages = [
-            pkgs.just
-            pkgs.cargo # Rust workspace dev-loop (just debug-cargo)
-            pkgs.rustc
-            pkgs.clippy # cargo clippy: the conformist #69 gate + dev-loop lint
-            pkgs.scdoc # compile/lint doc/*.scd man pages (just lint-doc)
-            pkgs.gum # terminal UI for the maintenance recipes (eng-versioning(7))
-            pkgs.tcpdump # live-session transport triage (debug-posh-* recipes)
-            mesaBin # `posh list`'s renderer (purse-first#185); dev-loop parity
-            # with the wrapped nix package for `just debug-cargo`/`debug-posh-*`.
-            crapPresentBin # connect-progress spinner viewport (#1); dev-loop
-            # parity for `just debug-posh-run` and a live attach.
-            conformistPkg # the raw conformist runner: `nix fmt`, lint-worktree
-            # The config-specific, toolchain-hermetic git hooks on PATH under
-            # the names the sweatfile references (conformist#47/#51/#54).
-            conformistEval.config.build.preCommit # `conformist-pre-commit`
-            conformistEval.config.build.repair # `conformist-repair`
-          ];
-          # RFC 0007: the dev-loop's galapagos source. The flake build populates
-          # vendor/galapagos from the store (postPatch above); for `just
-          # debug-cargo`, symlink it to the same pinned flake-input store path so
-          # local builds use the locked rev (not an ambient sibling checkout).
-          shellHook = ''
-            mkdir -p vendor
-            ln -sfn ${galapagos} vendor/galapagos
-          '';
-        };
-      }
-    );
+            src = ./posh-palette;
+            vendorHash = "sha256-DwMz9dJy844NmDb9d711z4JnqwZtqociP/LZXBC2WJw=";
+
+            ldflags = [
+              "-X main.version=${poshVersion}"
+              "-X main.gitSHA=${poshGitSha}"
+            ];
+
+            meta = with lib; {
+              description = "Command-palette renderer for the posh client (RFC 0005 control protocol)";
+              license = licenses.gpl3Plus;
+              mainProgram = "posh-palette";
+              platforms = platforms.linux ++ platforms.darwin;
+            };
+          };
+
+          # The default output: the full posh toolset in one tree, so a bare
+          # `nix build` yields every posh-* build product rather than just the
+          # posh binary (github #73). `posh` already installs the posh /
+          # posh-server / poshterity binaries and the man pages; this adds posht
+          # (the Go TUI) and posh-palette (the command-palette renderer).
+          # posh-term is a library compiled into posh, not a standalone binary, so
+          # it has no entry here.
+          poshToolset = pkgs.symlinkJoin {
+            name = "posh-toolset-${poshVersion}";
+            paths = [
+              posh
+              posht
+              posh-palette
+            ];
+            meta = {
+              description = "The full posh toolset: posh, posh-server, poshterity, posht, and posh-palette";
+              mainProgram = "posh";
+              license = posh.meta.license;
+              platforms = posh.meta.platforms;
+            };
+          };
+
+          # poshterity exposed as its own runnable output, so `nix run
+          # .#poshterity` runs the recorder/replayer and `nix build .#poshterity`
+          # yields just that tool (github #73). It selects the single binary and
+          # its man page out of the already-built `posh` package rather than
+          # recompiling, so the binary has one source of truth and can never
+          # diverge from the one in `posh`/the default toolset. mainProgram makes
+          # `nix run` resolve to poshterity rather than posh.
+          poshterity =
+            pkgs.runCommand "poshterity-${poshVersion}"
+              {
+                meta = {
+                  description = "Deterministic, step-ratcheted terminal recorder/replayer built on posh-term";
+                  mainProgram = "poshterity";
+                  inherit (posh.meta) license platforms;
+                };
+              }
+              ''
+                mkdir -p "$out/bin" "$out/share/man/man1"
+                ln -s ${posh}/bin/poshterity "$out/bin/poshterity"
+                ln -s ${posh}/share/man/man1/poshterity.1.gz "$out/share/man/man1/poshterity.1.gz"
+              '';
+
+          # Tree-wide formatter + eng-convention linters under one runner:
+          # nixfmt + shfmt, plus the eng preset's
+          # eng-versioning / flake-* / justfile-* checks. The eng preset and
+          # posh's own formatters/excludes (./conformist.nix) are merged here.
+          # Exposed as `formatter.${system}` (`nix fmt`, repair mode), the
+          # read-only `checks.formatting` gate, and the store-pinned
+          # conformist-pre-commit / conformist-repair git hooks (each bakes this
+          # module's generated /nix/store config — there is no committed
+          # conformist.toml). See ./conformist.nix and conformist-nix(7).
+          conformistPkg = conformist.packages.${system}.default;
+          conformistEval = conformist.lib.evalModule pkgs {
+            imports = [
+              conformist.lib.presets.eng
+              ./conformist.nix
+            ];
+            package = conformistPkg;
+          };
+
+          # Impure git-state lane: the eng-convention checks that need a live
+          # .git or host tools (agents-md's CLAUDE.md->AGENTS.md migration,
+          # git-remotes/git-default-branch, sweatfile's `spinclass validate`,
+          # gomod2nix — a no-op here, posh has no go.mod). They can't run in the
+          # sandboxed checks.formatting (which sees only a /nix/store copy), so
+          # this config drives a working-tree `conformist check` via
+          # `just lint-worktree`. See conformist-nix(7) and the eng-impure preset.
+          conformistImpureEval = conformist.lib.evalModule pkgs {
+            imports = [
+              conformist.lib.presets.eng-impure
+              # conformist #69: the first-class clippy linter (opt-in — not in the
+              # eng-impure preset roster). posh had no clippy gate before; this
+              # adopts it. check = `cargo clippy … -- -D warnings`, repair =
+              # `cargo clippy --fix`. The toolchain (cargo/clippy/rustc/gcc)
+              # defaults to `pkgs` (igloo), the same nixpkgs the .#posh build's
+              # rustc comes from, so there is no clippy-version findings delta.
+              { linters.clippy.enable = true; }
+            ];
+            package = conformistPkg;
+            projectRootFile = "flake.nix";
+          };
+        in
+        {
+          packages = {
+            # Default is the full toolset (github #73) so a bare `nix build`
+            # yields posh + posh-server + poshterity + posht. The individual
+            # products stay addressable.
+            default = poshToolset;
+            posh = posh;
+            poshterity = poshterity;
+            posht = posht;
+            posh-palette = posh-palette;
+
+            # The store-pinned git hooks from this repo's pure-lane config
+            # (conformist#47/#51/#54): conformist-pre-commit runs `conformist
+            # --staged --exit-zero-on-fix`, conformist-repair runs `conformist
+            # --commit --amend --exit-zero-on-fix` (the build.repair sibling, both
+            # from the module's shared mkHookWrapper). On the devShell PATH under
+            # those names; the sweatfile's pre-commit / repair hooks name them.
+            # Unlike a bare `conformist`, every formatter's `command` is
+            # store-pinned in the baked config, so they CANNOT silent-skip file
+            # types the ambient PATH happens to lack (the conformist#51 trap).
+            conformist-pre-commit = conformistEval.config.build.preCommit;
+            conformist-repair = conformistEval.config.build.repair;
+
+            # The impure-lane config (eng-impure preset). `just lint-worktree`
+            # runs `conformist check` against the working tree with this config
+            # to exercise the git-state linters (agents-md, git-remotes,
+            # git-default-branch, sweatfile) that the sandboxed checks.formatting
+            # cannot. Not committed — built on demand.
+            conformist-impure-config = conformistImpureEval.config.build.configFile;
+          };
+
+          checks = {
+            # Read-only formatting + eng-convention gate: builds in /nix/store
+            # off a source snapshot, runs `conformist check`, fails if any file
+            # would change or any eng linter (eng-versioning, flake-*,
+            # justfile-*) finds a violation. Driven by `just lint-fmt` and
+            # surfaced under `nix flake check`.
+            formatting = conformistEval.config.build.check self;
+          };
+
+          formatter = conformistEval.config.build.wrapper;
+
+          devShells.default = pkgs.mkShell {
+            packages = [
+              pkgs.just
+              pkgs.cargo # Rust workspace dev-loop (just debug-cargo)
+              pkgs.rustc
+              pkgs.clippy # cargo clippy: the conformist #69 gate + dev-loop lint
+              pkgs.scdoc # compile/lint doc/*.scd man pages (just lint-doc)
+              pkgs.gum # terminal UI for the maintenance recipes (eng-versioning(7))
+              pkgs.tcpdump # live-session transport triage (debug-posh-* recipes)
+              mesaBin # `posh list`'s renderer (purse-first#185); dev-loop parity
+              # with the wrapped nix package for `just debug-cargo`/`debug-posh-*`.
+              crapPresentBin # connect-progress spinner viewport (#1); dev-loop
+              # parity for `just debug-posh-run` and a live attach.
+              conformistPkg # the raw conformist runner: `nix fmt`, lint-worktree
+              # The config-specific, toolchain-hermetic git hooks on PATH under
+              # the names the sweatfile references (conformist#47/#51/#54).
+              conformistEval.config.build.preCommit # `conformist-pre-commit`
+              conformistEval.config.build.repair # `conformist-repair`
+            ];
+            # RFC 0007: the dev-loop's galapagos source. The flake build populates
+            # vendor/galapagos from the store (postPatch above); for `just
+            # debug-cargo`, symlink it to the same pinned flake-input store path so
+            # local builds use the locked rev (not an ambient sibling checkout).
+            shellHook = ''
+              mkdir -p vendor
+              ln -sfn ${galapagos} vendor/galapagos
+            '';
+          };
+        }
+      );
 }
