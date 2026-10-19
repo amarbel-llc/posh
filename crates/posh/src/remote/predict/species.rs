@@ -12,14 +12,14 @@
 //! behaves exactly like `adaptive` — the permanent floor the GP must beat
 //! before its output is ever shown.
 //!
-//! The mephisto genome plugs in behind the `*Program` seams. On mephisto's side
+//! The galapagos genome plugs in behind the `*Program` seams. On galapagos's side
 //! the genome is NOT a single-root DSP program: the controller needs four typed
 //! outputs and from-scratch a bounded cell list. See RFC 0007 §4 and the
 //! genome-shape note — the controller genome is a fixed tuple of single-root
 //! programs (one per knob); from-scratch's variable-length output is deferred.
 
 // Scaffold contract surface (RFC 0007 §4): the evolved-program seams and output
-// types are referenced once the mephisto genome is wired. Allow until then.
+// types are referenced once the galapagos genome is wired. Allow until then.
 #![allow(dead_code)]
 
 use crate::remote::display::Snapshot;

@@ -9,13 +9,13 @@ date: 2026-06-26
 
 This document specifies the interface between posh's predictive local-echo
 client and an evolved genetic-programming (GP) predictor supplied by the
-mephisto framework. It defines the *metric vector* — the numeric terminal set
+galapagos framework. It defines the *metric vector* — the numeric terminal set
 the evolved program consumes — its provenance and transport, the output
 contracts of the two predictor species (a policy *controller* and a
 *from-scratch* cell predictor), the inviolable echo-leak safety invariants, the
 fitness/rank contract, the schema-versioned persisted-genome format, and the
 online single-generation evolution loop. It is the contract both posh and
-mephisto build against; it does not specify mephisto's internal evolution
+galapagos build against; it does not specify galapagos's internal evolution
 mechanics.
 
 ## Introduction
@@ -41,7 +41,7 @@ Scope: this RFC specifies (1) the metric vector, (2) how each metric reaches the
 client-side predictor, (3) the two species' input/output type contracts, (4) the
 leak-safety invariants, (5) the fitness/rank contract, (6) the persisted-genome
 format, and (7) the online evolution loop integration. It does NOT specify
-mephisto's selection/crossover/mutation internals, which are mephisto's concern;
+galapagos's selection/crossover/mutation internals, which are galapagos's concern;
 it depends on them only through the public API named in §7.
 
 Background: FDR 0006 (optimistic local echo, the gate mechanism and the
@@ -228,8 +228,8 @@ reaches the display.
 
 #### 4.3 Genome representation (multi-output)
 
-A single mephisto GP program has one output root, but both species' outputs are
-multi-valued. The representation is mephisto-internal, but the contract this RFC
+A single galapagos GP program has one output root, but both species' outputs are
+multi-valued. The representation is galapagos-internal, but the contract this RFC
 fixes is:
 
 - **Controller** — the genome MUST realize the four `PolicyKnobs` fields as a
@@ -298,7 +298,7 @@ The client drives galapagos's public single-generation API. The contract is:
 - `galapagos::domain::initial_population(dom, cfg, rng) -> Vec<Bred>` — seed
   once at session start when no persisted population is loaded. `Bred` pairs a
   genome with its engine-carried, self-adaptive `Recombinator` strategy
-  (operator, mix, mate preference — mephisto #21): the reproductive strategy is
+  (operator, mix, mate preference): the reproductive strategy is
   itself under selection, so the species opts in via
   `Domain::uses_recombinator` and supplies the operator dispatch
   (`Domain::recombine`) plus an assortative-mating `Domain::similarity` signal.
@@ -315,7 +315,7 @@ champion = scored[0]; choose display (§7.1); step }`.
 
 Because the online loop is long-lived (a session ticks generations for hours),
 the client MUST bound the domain's append-only arena by periodically compacting
-it to the live set via `Domain::gc` (mephisto #33), on the `gc_interval`
+it to the live set via `Domain::gc`, on the `gc_interval`
 cadence `LoopConfig` declares. GC is trajectory-neutral — a faithful structural
 re-expression drawing no randomness — so it never changes the search, only the
 memory bound.
@@ -344,7 +344,7 @@ self-describing blob carrying:
 
 - a `metric_schema_version` integer naming the terminal set (§2) the genomes
   were evolved against;
-- the serialized genomes (via mephisto's `serialize`/`deserialize`).
+- the serialized genomes (via galapagos's `serialize`/`deserialize`).
 
 On load, if `metric_schema_version` does not match the running client's schema,
 the client MUST NOT feed the genomes to the evolved program directly; it MUST
@@ -366,7 +366,7 @@ Two persisted artifacts exist, on different lifecycles:
   document, so a crash never costs the champion lineage. Champions are the
   durable, inspectable artifacts of the evolution — user data — so they
   accumulate under `$XDG_DATA_HOME/posh/predict/champions/`, one file per
-  distinct champion, content-addressed (`<content-id>.hyph`, mephisto's
+  distinct champion, content-addressed (`<content-id>.hyph`, galapagos's
   `gene_pool::content_id` over the document bytes) so an unchanged champion
   re-saved — in this session or any later one — dedups to one file. Champion
   docs carry their own schema tag (the same `_vN` leaf-set guard as the

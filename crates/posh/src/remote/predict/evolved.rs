@@ -42,13 +42,13 @@ use super::{
 /// `_v{METRIC_SCHEMA_VERSION}` suffix guards the leaf-set the genome was evolved
 /// against. On load, a mismatch means cold-start (the leaf indices would mean
 /// something different).
-pub const CONTROLLER_SCHEMA: &str = "mephisto-population-controller-schema_v2";
+pub const CONTROLLER_SCHEMA: &str = "galapagos-population-controller-schema_v2";
 
 /// The schema tag for the periodically-persisted single-champion hyphence docs
 /// (RFC 0007 §8): the same leaf-set version guard as the population blob, but a
 /// one-genome document under `$XDG_DATA_HOME` — the durable, content-addressed
 /// record of every distinct champion this host's evolution has produced.
-pub const CHAMPION_SCHEMA: &str = "mephisto-champion-controller-schema_v2";
+pub const CHAMPION_SCHEMA: &str = "galapagos-champion-controller-schema_v2";
 
 /// One recorded keystroke outcome the controller's fitness scores against: the
 /// metric vector at that tick, whether the optimistic echo would have been
@@ -159,7 +159,7 @@ impl Domain for ControllerDomain {
         self.breeder.mutate(rng, g)
     }
 
-    /// Opt in to the engine's self-adaptive recombinator (mephisto #21): each
+    /// Opt in to the engine's self-adaptive recombinator: each
     /// individual carries its own crossover strategy (operator + mix + mate
     /// preference), inherited and mutated like a gene, so the reproductive
     /// strategy itself evolves alongside the policies.
@@ -181,13 +181,13 @@ impl Domain for ControllerDomain {
         self.breeder.recombine(rng, op, mix, a, b)
     }
 
-    /// Assortative mate-choice signal (mephisto #21 Stage 2): mean per-root
+    /// Assortative mate-choice signal (assortative mating): mean per-root
     /// Jaccard overlap of reachable node sets, 1.0 for identical tuples.
     fn similarity(&self, a: &Vec<NodeId>, b: &Vec<NodeId>) -> f64 {
         self.breeder.similarity(a, b)
     }
 
-    /// Arena GC (mephisto #33): re-express the live tuples in a fresh arena so a
+    /// Arena GC: re-express the live tuples in a fresh arena so a
     /// long-lived session's append-only arena stays bounded. Trajectory-neutral
     /// (a faithful structural copy, no rng); on the never-expected reintern
     /// failure the arena is left untouched and the live set returned unchanged.
@@ -273,7 +273,7 @@ fn loop_config() -> LoopConfig {
         local_opt_rate: 0.0,
         opaque_recombine_rate: 0.0,
         // A session ticks generations for hours; compact the arena every 64
-        // generations (mephisto #33; trajectory-neutral) so it stays bounded.
+        // generations (arena GC; trajectory-neutral) so it stays bounded.
         gc_interval: 64,
     }
 }
@@ -325,7 +325,7 @@ fn write_atomic(path: &Path, data: &[u8]) -> std::io::Result<()> {
 }
 
 /// Write one champion hyphence doc into `dir`, content-addressed by the doc's
-/// mephisto `content_id` (`<id>.hyph`), so re-saving an unchanged champion —
+/// galapagos `content_id` (`<id>.hyph`), so re-saving an unchanged champion —
 /// or the same champion re-evolved in a later session — dedups to one file.
 /// Returns the doc path, or `None` if the write failed (best-effort, like the
 /// population save).
@@ -339,7 +339,7 @@ fn write_champion_doc(dir: &Path, blob: &[u8]) -> Option<PathBuf> {
     Some(path)
 }
 
-/// Pair a genome with a fresh random recombinator strategy (mephisto #21).
+/// Pair a genome with a fresh random recombinator strategy.
 /// Loaded/backfilled individuals carry genomes only, so each draws a new
 /// strategy: the engine re-adapts it quickly, and randomizing preserves
 /// strategy diversity across sessions.
@@ -362,7 +362,7 @@ fn bred_random(genome: Vec<NodeId>, rng: &mut Rng) -> Bred<ControllerDomain> {
 pub struct ControllerPredictor {
     domain: ControllerDomain,
     /// The engine-held population: each individual is a genome plus its
-    /// self-adaptive recombinator strategy (mephisto #21).
+    /// self-adaptive recombinator strategy.
     population: Vec<Bred<ControllerDomain>>,
     cfg: LoopConfig,
     rng: Rng,
@@ -498,7 +498,7 @@ impl ControllerPredictor {
             if self.frames.is_multiple_of(STEP_EVERY_N_FRAMES) {
                 self.population = step(&mut self.domain, &self.cfg, &mut self.rng, &scored);
                 self.generations += 1;
-                // Arena GC (mephisto #33): a session ticks generations for
+                // Arena GC: a session ticks generations for
                 // hours; compact the append-only arena to the live set on the
                 // same cadence contract `evolve` applies in the batch lane.
                 if self.cfg.gc_interval > 0
@@ -761,7 +761,7 @@ mod tests {
 
         // RFC 0007 §8: a blob saved under a different schema is recognized as
         // such (the caller cold-starts instead of feeding stale leaf wiring).
-        let stale = save_population(&dom, "mephisto-population-controller-schema_v999", &pop);
+        let stale = save_population(&dom, "galapagos-population-controller-schema_v999", &pop);
         let l2 = load_population(&mut dom, &stale).expect("loads");
         assert_ne!(l2.schema, CONTROLLER_SCHEMA);
     }
@@ -769,7 +769,7 @@ mod tests {
     #[test]
     fn gc_preserves_the_champion_policy_and_bounds_the_arena() {
         // The online-lane GC must be trajectory-neutral: the champion's policy
-        // outputs are identical before and after compaction (mephisto #33).
+        // outputs are identical before and after compaction.
         let mut dom = ControllerDomain::new();
         let mut rng = Rng::new(11);
         // Grow the arena with discarded material, keeping one live genome.

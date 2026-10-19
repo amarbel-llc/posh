@@ -20,7 +20,7 @@
 
 // Scaffold contract surface (RFC 0007 §2/§3): the transport / server-forwarded /
 // host terminals and the gatherer entry points are referenced once the full
-// metric bus and the mephisto genome are wired. Allow until then.
+// metric bus and the galapagos genome are wired. Allow until then.
 #![allow(dead_code)]
 
 use posh_term::{Color, UnderlineStyle};
