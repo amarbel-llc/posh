@@ -2021,6 +2021,8 @@ pub(crate) struct SessionStatus<'a> {
     pub(crate) activity: &'a str,
     /// ADR 0008's answer, omitted when the writer cannot resolve one.
     pub(crate) cwd: Option<&'a super::cwd::Resolved>,
+    /// FDR 0022: the `confine*=` tail, present only when confinement is on.
+    pub(crate) confine: Option<&'a str>,
 }
 
 /// The RFC 0014 §4.2 status response: the session line, then one client line
@@ -2041,6 +2043,10 @@ pub(crate) fn status_response(s: &SessionStatus<'_>, records: &[introspect::Clie
     );
     if let Some(c) = s.cwd {
         out.push_str(&format!(" cwd={:?} cwd_source={}", c.dir, c.source.as_str()));
+    }
+    if let Some(f) = s.confine {
+        out.push(' ');
+        out.push_str(f);
     }
     out.push('\n');
     for r in records {
@@ -2094,6 +2100,11 @@ fn daemon_loop(
     // RFC 0016 §4.1: push-cmd tokens already served, seeded with the one
     // that created this session (if one did).
     let mut served_pushes: Vec<u64> = seed.into_iter().collect();
+    // FDR 0022: who may attach. `None` (the default) ⇒ every peer is a client.
+    let mut confine = super::confine::Confine::from_env();
+    if let Some(c) = &confine {
+        util::log_write("info", &format!("confinement on: {}", c.status_field()));
+    }
 
     // Why the loop ended (posh#194): reported to attached clients as the
     // `Tag::ExitCause` record ahead of `Tag::Exit`.
@@ -2256,6 +2267,7 @@ fn daemon_loop(
                     alt_screen: term.is_alt_screen(),
                     activity: &activity,
                     cwd: Some(&now_cwd),
+                    confine: confine.as_ref().map(|c| c.status_field()).as_deref(),
                 },
                 &records,
             );
@@ -2263,7 +2275,22 @@ fn daemon_loop(
         }
 
         if fds[0].revents & libc::POLLIN != 0 {
-            if let Ok((stream, _)) = listener.accept() {
+            // FDR 0022: refuse an agent-scope peer before it is a client — no
+            // input, no replay, no kill. Dropping the stream is the refusal;
+            // the count and reason surface in `posh status`.
+            let admitted = listener.accept().ok().and_then(|(stream, _)| {
+                let Some(c) = confine.as_mut() else {
+                    return Some(stream);
+                };
+                match c.admit(stream.as_raw_fd()) {
+                    super::confine::Verdict::Allow => Some(stream),
+                    super::confine::Verdict::Deny(why) => {
+                        util::log_write("warn", &format!("attach refused: {why}"));
+                        None
+                    }
+                }
+            });
+            if let Some(stream) = admitted {
                 let _ = stream.set_nonblocking(true);
                 util::log_write(
                     "info",
@@ -2956,6 +2983,7 @@ mod tests {
                 alt_screen: false,
                 activity: "fish · ~/x",
                 cwd: None,
+                confine: None,
             },
             &[reported, old],
         );
@@ -2970,6 +2998,34 @@ mod tests {
         }
         assert_eq!(lines.next().unwrap(), "client build=unknown echo=unknown");
         assert!(lines.next().is_none());
+    }
+
+    /// FDR 0022: with confinement on, the session line says so and counts the
+    /// refusals; with it off the line is byte-identical to before.
+    #[test]
+    fn status_response_reports_confinement_only_when_on() {
+        let status = |confine| SessionStatus {
+            name: "w1",
+            group: "default",
+            daemon_pid: 42,
+            frames: true,
+            echo_flag: false,
+            alt_screen: false,
+            activity: "",
+            cwd: None,
+            confine,
+        };
+        let off = status_response(&status(None), &[]);
+        assert!(!off.contains("confine"), "{off}");
+        let c = super::super::confine::Confine::from_parts(Some("1"), Some("/agent"), None).unwrap();
+        let field = c.status_field();
+        let on = status_response(&status(Some(&field)), &[]);
+        assert!(
+            on.lines().next().unwrap().ends_with(
+                " activity=\"\" confine=on confine_deny=1 confine_allow=0 confine_refused=0"
+            ),
+            "{on}"
+        );
     }
 
     /// ADR 0008: the session line ends with where the session IS and which
@@ -2990,6 +3046,7 @@ mod tests {
                 alt_screen: false,
                 activity: "",
                 cwd: Some(&now),
+                confine: None,
             },
             &[],
         );

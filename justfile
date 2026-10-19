@@ -1141,6 +1141,51 @@ debug-posh-procs:
     echo "$out" | grep -i posh | grep -v -e 'debug-posh' -e 'grep -i' \
       || echo "(no posh processes for uid $(id -u))"
 
+# Probe session confinement (the spinclass FDR 0034 scope question) in a
+# THROWAWAY session under its own POSH_DIR — never the operator's live one.
+# From a tty-less, setsid'd, stdin-closed process of the same uid it (1) writes
+# to the session over the session socket with `posh run` and checks the
+# command ran in the shell (writable-attach), (2) reports the session
+# socket's and the pty slave's owner/mode, and (3) tries a direct write to the
+# pty slave. Exit 0 and "WRITABLE ATTACH: yes" means same-uid input is
+# accepted; a confined build must answer "no" to (1). `posh` overridable.
+# With confined=1 (FDR 0022) the session is started with POSH_CONFINE=1 and the
+# "agent" step runs in a transient `systemd-run --user --scope` unit, whose
+# cgroup (under app.slice) the daemon is told to deny; expect "no" and a
+# nonzero confine_refused in the status line. Use a posh built from the
+# worktree (target/debug/posh) — an older installed posh predates the switch.
+#
+# probe whether a tty-less same-uid process can write to a posh session
+[group("debug")]
+debug-confinement-probe posh="posh" confined="0":
+    #!/usr/bin/env bash
+    set -euo pipefail
+    # Short dir under the runtime dir: a unix socket path must fit in SUN_LEN.
+    d=$(mktemp -d -p "${XDG_RUNTIME_DIR:-/tmp}" pc.XXXXXX); trap 'POSH_DIR="$d" {{ posh }} kill probe >/dev/null 2>&1 || true; rm -rf "$d"' EXIT
+    export POSH_DIR="$d"
+    agent=(setsid --wait)
+    if [ "{{ confined }}" = 1 ]; then
+      export POSH_CONFINE=1
+      export POSH_CONFINE_DENY_CGROUP="/user.slice/user-$(id -u).slice/user@$(id -u).service/app.slice"
+      agent=(systemd-run --user --scope --quiet --collect --)
+    fi
+    {{ posh }} start --detach probe -- sh -c 'echo $$ >'"$d"'/shell.pid; exec sh' >/dev/null
+    for _ in $(seq 50); do [ -s "$d/shell.pid" ] && break; sleep 0.1; done
+    sp=$(cat "$d/shell.pid")
+    echo "== socket dir / session socket =="
+    ls -ld "$d" "$d"/*/ 2>/dev/null; find "$d" -type s -exec ls -l {} +
+    echo "== pty slave of the session shell =="
+    pty=$(readlink "/proc/$sp/fd/0"); echo "$pty"; ls -l "$pty"
+    echo "== (1) tty-less posh run =="
+    "${agent[@]}" sh -c "{{ posh }} run probe -- 'touch $d/MARK-run' </dev/null >/dev/null 2>&1" || true
+    for _ in $(seq 30); do [ -e "$d/MARK-run" ] && break; sleep 0.1; done
+    [ -e "$d/MARK-run" ] && echo "WRITABLE ATTACH: yes (posh run reached the pty)" || echo "WRITABLE ATTACH: no"
+    echo "== session status =="
+    {{ posh }} status probe | head -1 || true
+    grep -h 'attach refused' "$d"/default/probe.log || echo "(no 'attach refused' in the daemon log)"
+    echo "== (3) direct write to the pty slave =="
+    ( printf 'touch %s/MARK-slave\n' "$d" > "$pty" ) 2>&1 && echo "slave write: opened+wrote (display-side spoof; input goes to terminal master, not the shell)" || echo "slave write: refused"
+
 # Map posh sockets to pids: the mosh-style UDP transport listeners (one live
 # server per remote client) and any local session-daemon unix sockets. Then
 # list the socket-dir candidates (POSH_DIR | XDG_RUNTIME_DIR/posh/<group> |

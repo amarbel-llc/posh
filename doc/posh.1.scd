@@ -518,6 +518,24 @@ _POSH_GRAB_MOUSE_
 	the outer terminal's click-to-select while active; apps that grab
 	the mouse themselves are unaffected.
 
+_POSH_CONFINE_
+	_1_ turns on session confinement (default off, FDR 0022) for the sessions
+	this process creates: the session daemon asks the kernel who connected
+	(_SO_PEERCRED_, then the peer's cgroup) and refuses a peer that sits in
+	an agent scope before it can write the PTY, see the screen or kill the
+	session. The refusal is counted in *status* (_confine_refused=_) and
+	logged. A peer whose cgroup cannot be determined is refused. Linux only.
+
+_POSH_CONFINE_DENY_CGROUP_
+	Colon-separated cgroup-v2 path prefixes (e.g.
+	_/user.slice/user-1000.slice/user@1000.service/clown.slice_) that are
+	agent scope; a peer inside one is refused. Matches by path segment.
+
+_POSH_CONFINE_ALLOW_CGROUP_
+	Optional, colon-separated. When set, a peer must be inside one of these
+	cgroups; the deny list still wins. Stronger than deny alone against an
+	agent that can start a unit elsewhere through the user manager.
+
 _POSH_RELAY_
 	Remote *host:session* bootstrap selection (default on): the
 	single-model frame relay, in which *posh-server* forwards the session

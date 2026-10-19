@@ -1577,6 +1577,8 @@ pub(crate) fn server_loop(
                     activity: &activity,
                     // Architecture A is bug-fix-only (ADR 0007): no cascade.
                     cwd: None,
+                    // No session socket here, so nothing to confine (FDR 0022).
+                    confine: None,
                 },
                 &[client_record.record_now(now_ms())],
             );
