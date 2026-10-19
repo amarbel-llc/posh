@@ -105,11 +105,11 @@
         ]
       },
       "locked": {
-        "lastModified": 1792150635,
-        "narHash": "sha256-WCNGOzMBprrqIZrLAROR3RbnB92IjxRZ49XQwCX8Dt4=",
-        "rev": "bb0f64179fcca490bdba2401a21ee1ed5579f5d5",
+        "lastModified": 1792433510,
+        "narHash": "sha256-ZA+Y9fvE9U5us2shdE9FkbcvM4trQSKynTgLz079Qvk=",
+        "rev": "223ccc030746092994d6a1a0386c818761e4904c",
         "type": "tarball",
-        "url": "https://code.linenisgreat.com/crap/archive/bb0f64179fcca490bdba2401a21ee1ed5579f5d5.tar.gz"
+        "url": "https://code.linenisgreat.com/crap/archive/223ccc030746092994d6a1a0386c818761e4904c.tar.gz"
       },
       "original": {
         "type": "tarball",
@@ -188,11 +188,11 @@
         "treefmt-nix": "treefmt-nix"
       },
       "locked": {
-        "lastModified": 1792147037,
-        "narHash": "sha256-2d2ZuPN9uOMk5O6XUYntNW07dVg5ei6RfQ+TKc0Bs3c=",
-        "rev": "9f763e32eae424af4b0c8b95af977bccc76feaf0",
+        "lastModified": 1792433537,
+        "narHash": "sha256-kqyG9EabEWp9jJqlzUraXha5nxkRbJE0u2TOgEhVIJ4=",
+        "rev": "1bff83b280fe88b2f4f3189f4bc85dca6e4763de",
         "type": "tarball",
-        "url": "https://code.linenisgreat.com/igloo/archive/9f763e32eae424af4b0c8b95af977bccc76feaf0.tar.gz"
+        "url": "https://code.linenisgreat.com/igloo/archive/1bff83b280fe88b2f4f3189f4bc85dca6e4763de.tar.gz"
       },
       "original": {
         "type": "tarball",
@@ -232,11 +232,11 @@
         ]
       },
       "locked": {
-        "lastModified": 1792147970,
-        "narHash": "sha256-0BYVa82vGQBfWECahcWgA+tCY+baMrT3IWs1u41ed0g=",
-        "rev": "5f4578506429b1bf7c29ceab7dceb83e7b85f80e",
+        "lastModified": 1792433503,
+        "narHash": "sha256-dfvVUl6gc3Fit7mbD0xD3u+it4DxRFLCZB63Jzg19Tw=",
+        "rev": "0be1505d730e694d53edf31e2ca32ecc38226c17",
         "type": "tarball",
-        "url": "https://code.linenisgreat.com/purse-first/archive/5f4578506429b1bf7c29ceab7dceb83e7b85f80e.tar.gz"
+        "url": "https://code.linenisgreat.com/purse-first/archive/0be1505d730e694d53edf31e2ca32ecc38226c17.tar.gz"
       },
       "original": {
         "type": "tarball",
