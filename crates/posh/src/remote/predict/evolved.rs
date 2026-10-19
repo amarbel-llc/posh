@@ -44,6 +44,16 @@ use super::{
 /// something different).
 pub const CONTROLLER_SCHEMA: &str = "galapagos-population-controller-schema_v2";
 
+/// The tag populations were saved under before the engine was renamed from
+/// mephisto to galapagos. Same leaf-set version (`_v2`), so such blobs are
+/// still valid on load; saves always use `CONTROLLER_SCHEMA`.
+const LEGACY_CONTROLLER_SCHEMA: &str = "mephisto-population-controller-schema_v2";
+
+/// Whether a loaded population's schema tag matches the current leaf set.
+fn controller_schema_accepted(schema: &str) -> bool {
+    schema == CONTROLLER_SCHEMA || schema == LEGACY_CONTROLLER_SCHEMA
+}
+
 /// The schema tag for the periodically-persisted single-champion hyphence docs
 /// (RFC 0007 §8): the same leaf-set version guard as the population blob, but a
 /// one-genome document under `$XDG_DATA_HOME` — the durable, content-addressed
@@ -417,7 +427,7 @@ impl ControllerPredictor {
             .and_then(|p| std::fs::read(p).ok())
             .and_then(|bytes| {
                 let l = load_population(&mut domain, &bytes).ok()?;
-                (l.schema == CONTROLLER_SCHEMA && !l.genomes.is_empty()).then_some(l.genomes)
+                (controller_schema_accepted(&l.schema) && !l.genomes.is_empty()).then_some(l.genomes)
             });
         // The persisted blob carries genomes only; loaded individuals draw a
         // fresh random recombinator strategy (see `bred_random`).
@@ -764,6 +774,23 @@ mod tests {
         let stale = save_population(&dom, "galapagos-population-controller-schema_v999", &pop);
         let l2 = load_population(&mut dom, &stale).expect("loads");
         assert_ne!(l2.schema, CONTROLLER_SCHEMA);
+        assert!(!controller_schema_accepted(&l2.schema));
+    }
+
+    #[test]
+    fn legacy_mephisto_population_tag_is_still_accepted() {
+        let mut dom = ControllerDomain::new();
+        let cfg = loop_config();
+        let mut rng = Rng::new(5);
+        let pop: Vec<Vec<NodeId>> = initial_population(&mut dom, &cfg, &mut rng)
+            .into_iter()
+            .map(|b| b.genome)
+            .collect();
+        let blob = save_population(&dom, "mephisto-population-controller-schema_v2", &pop);
+        let loaded = load_population(&mut dom, &blob).expect("loads");
+        assert!(controller_schema_accepted(&loaded.schema));
+        assert_eq!(loaded.genomes.len(), pop.len());
+        assert!(controller_schema_accepted(CONTROLLER_SCHEMA));
     }
 
     #[test]
