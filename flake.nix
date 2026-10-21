@@ -31,7 +31,7 @@
     # workspace; the `galapagos` crate lives under v2-rust/), vendored into the
     # rust build as a path dep. See docs/rfcs/0007.
     galapagos = {
-      url = "git+https://code.linenisgreat.com/galapagos?rev=f7510e77a527cd1d4de6753da84f017a442ac9ce";
+      url = "https://code.linenisgreat.com/galapagos/archive/f7510e77a527cd1d4de6753da84f017a442ac9ce.tar.gz";
       flake = false;
     };
 
