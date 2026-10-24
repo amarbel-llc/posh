@@ -470,6 +470,101 @@ debug-ph-picker-smoke: build-palette
     cat "$dir/stderr.log" || true
     tmux kill-session -t posh-phpick 2>/dev/null || true
 
+# PROTOTYPE app-presented modal demo (docs/plans/2026-10-24-app-modals-for-restart.md):
+# in a throwaway POSH_DIR, start a session `demo` (an "agent" printing a line a
+# second), attach a viewer to it in a detached tmux pane with the FRESH
+# renderer, raise a countdown with `posh modal demo`, and capture the pane at
+# each step. SCENARIO picks the walk (secs = the countdown length):
+#   cancel    banner, Ctrl-^ opens the countdown, Enter on "Cancel restart"
+#             (focus starts on the safest button): modal exits 10 (cancelled)
+#   esc       Ctrl-^ then Esc: on_dismiss=cancel, so Esc cancels: exits 10
+#   hide      like esc but --on-dismiss hide: Esc only hides the view, the
+#             banner stays and the daemon's clock times out: exits 0 (proceed)
+#   timeout   nobody answers: the daemon's clock ends it: exits 0 (proceed)
+#   probe     `posh modal --probe` before and after the viewer leaves
+#   noviewer  no viewer attached: exits 0 at once, outcome no-viewer
+#   manual    set the session up and PRINT the two commands to try it
+#             yourself in a real terminal (no tmux, no cleanup)
+# Exit codes: 0 proceed, 10 cancelled, 11 busy, 12 invalid. What this cannot
+# judge is the look and feel: that is the operator's call.
+#
+# raise a restart countdown on a throwaway session and capture what a viewer sees
+[group("debug")]
+debug-modal-demo scenario="cancel" secs="30": build-palette
+    #!/usr/bin/env bash
+    set -uo pipefail
+    root="{{ justfile_directory() }}"
+    dir="$root/.tmp/modaldemo"
+    sock="$dir/posh"
+    case "$sock" in "$root"/.tmp/*/posh) : ;; *) echo "refusing: POSH_DIR '$sock' not under .tmp"; exit 1 ;; esac
+    tmux -L posh-modaldemo kill-server 2>/dev/null || true
+    rm -rf "$dir"; mkdir -p "$sock"; chmod 700 "$dir" "$sock"
+    nix develop --command cargo build -p posh || exit 1
+    P="$root/target/debug/posh"
+    pal="$root/result-posh-palette/bin/posh-palette"
+    export POSH_DIR="$sock" POSH_GROUP=default POSH_PALETTE="$pal"
+    unset POSH_SESSION
+    "$P" attach --detach demo -- sh -c 'while :; do echo "agent working $(date +%T)"; sleep 1; done' >/dev/null
+    TM=(tmux -L posh-modaldemo)
+    cap() { echo "== $1 =="; "${TM[@]}" capture-pane -p -t s 2>/dev/null; echo; }
+    key() { "${TM[@]}" send-keys -t s "$@"; }
+    attach() {
+      "${TM[@]}" new-session -d -s s -x 100 -y 20 \
+        "env POSH_DIR='$sock' POSH_GROUP=default POSH_PALETTE='$pal' '$P' attach demo; echo VIEWER_EXITED_\$?; sleep 120"
+      sleep 2
+    }
+    finish() { "$P" kill demo >/dev/null 2>&1; "${TM[@]}" kill-server 2>/dev/null; }
+    case "{{ scenario }}" in
+      manual)
+        echo "session ready. In one terminal:"
+        echo "  env POSH_DIR='$sock' POSH_GROUP=default POSH_PALETTE='$pal' '$P' attach demo"
+        echo "then in another:"
+        echo "  env POSH_DIR='$sock' POSH_GROUP=default '$P' modal demo --timeout {{ secs }}; echo exit=\$?"
+        echo "(Ctrl-^ in the viewer reviews the countdown; clean up: POSH_DIR='$sock' POSH_GROUP=default '$P' kill demo)"
+        exit 0 ;;
+      noviewer)
+        echo "== no viewer attached =="
+        t0=$(date +%s); "$P" modal demo --timeout {{ secs }}; echo "exit=$? after $(( $(date +%s) - t0 ))s"
+        finish; exit 0 ;;
+      probe)
+        echo "== probe, no viewer =="; "$P" modal --probe demo; echo "exit=$?"
+        attach
+        echo "== probe, one viewer attached =="; "$P" modal --probe demo; echo "exit=$?"
+        finish; exit 0 ;;
+    esac
+    attach
+    cap "the session before the countdown"
+    flags=""
+    [ "{{ scenario }}" = hide ] && flags="--on-dismiss hide"
+    "$P" modal demo --timeout {{ secs }} --title "Restarting agent" $flags >"$dir/modal.out" 2>&1 &
+    mp=$!
+    sleep 2
+    cap "banner only (expect a reverse-video bar on row 1 with the seconds left)"
+    case "{{ scenario }}" in
+      cancel)
+        key C-^; sleep 1
+        cap "after Ctrl-^ (expect the countdown view: time, bar, [Cancel restart] [Restart now])"
+        key Enter; sleep 1
+        cap "after Enter on Cancel restart (expect the banner and view gone)" ;;
+      esc)
+        key C-^; sleep 1
+        cap "after Ctrl-^"
+        key Escape; sleep 1
+        cap "after Esc (on_dismiss=cancel: expect the banner gone)" ;;
+      hide)
+        key C-^; sleep 1
+        cap "after Ctrl-^"
+        key Escape; sleep 2
+        cap "after Esc with --on-dismiss hide (expect the view gone, the banner STILL counting)" ;;
+      timeout)
+        sleep $(( {{ secs }} + 2 ))
+        cap "after the daemon's clock ran out (expect the banner gone)" ;;
+    esac
+    wait $mp; code=$?
+    echo "== posh modal output =="; cat "$dir/modal.out"; echo "== exit code: $code =="
+    echo "== daemon log (modal lines) =="; grep -h modal "$sock"/default/demo.log 2>/dev/null || true
+    finish
+
 # Verify the FDR 0019 interactive establish modal end to end in an isolated tmux
 # pane, with NO remote: a stub `ssh` first on PATH plays the bootstrap — it
 # answers `ssh -G` (the dial resolver), raises a host-key-style prompt on its

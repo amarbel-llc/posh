@@ -149,11 +149,16 @@ type showParams struct {
 	// Stack belongs to the "notice" view (RFC 0005 §3.6): the viewport's
 	// session stack, most recently entered first.
 	Stack []entry `json:"stack,omitempty"`
+	// RemainingMs and TotalMs belong to the "countdown" view (countdown.go):
+	// the time left as the client last heard it from the daemon, and the full
+	// length (for the bar). Its buttons ride in Commands, its text in Body.
+	RemainingMs int64 `json:"remaining_ms,omitempty"`
+	TotalMs     int64 `json:"total_ms,omitempty"`
 }
 
 // knownView reports whether a ui.show view name is one this renderer draws.
 func knownView(v string) bool {
-	return v == "palette" || v == "dialog" || v == "picker" || v == "notice"
+	return v == "palette" || v == "dialog" || v == "picker" || v == "notice" || v == "countdown"
 }
 
 // bubbletea messages produced from control input.
@@ -204,10 +209,13 @@ const (
 	viewDialog
 	viewPicker
 	viewNotice
+	viewCountdown
 )
 
 type keymap struct {
 	up, down, sel, cancel, copyKey, dismiss key.Binding
+	// left and right move the countdown's button focus.
+	left, right key.Binding
 }
 
 type model struct {
@@ -235,6 +243,12 @@ type model struct {
 	// Notice view (RFC 0005 §3.6): the session stack to draw, in the order
 	// given — never filtered, never sorted.
 	stack []entry
+	// Countdown view (countdown.go): the focused button (an index into
+	// `commands`, which carries the buttons) and the daemon's remaining/total
+	// time as the client last reported it.
+	focus       int
+	remainingMs int64
+	totalMs     int64
 }
 
 func newModel(c *conn) model {
@@ -252,6 +266,8 @@ func newModel(c *conn) model {
 			cancel:  key.NewBinding(key.WithKeys("esc")),
 			copyKey: key.NewBinding(key.WithKeys("y", "c")),
 			dismiss: key.NewBinding(key.WithKeys("esc", "q", "enter")),
+			left:    key.NewBinding(key.WithKeys("left", "shift+tab")),
+			right:   key.NewBinding(key.WithKeys("right", "tab")),
 		},
 	}
 }
@@ -316,8 +332,26 @@ func (m model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 			// land in a textinput this view never draws.
 			m.description = ""
 			m.input.Blur()
+		case "countdown":
+			m.view = viewCountdown
+			m.title = msg.Title
+			if m.title == "" {
+				m.title = "Countdown"
+			}
+			m.body = msg.Body
+			m.commands = msg.Commands
+			m.focus = 0 // the caller orders buttons safest first
+			m.remainingMs, m.totalMs = msg.RemainingMs, msg.TotalMs
+			// No filter input: blur so a stray keystroke cannot land in it.
+			m.description = ""
+			m.input.Blur()
 		default:
 			m.view = viewNone
+		}
+		return m, nil
+	case updateMsg:
+		if m.view == viewCountdown {
+			m.remainingMs = msg.RemainingMs
 		}
 		return m, nil
 	case hideMsg:
@@ -348,6 +382,8 @@ func (m model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 				m.view = viewNone
 			}
 			return m, nil
+		case viewCountdown:
+			return m.onCountdownKey(msg)
 		case viewPalette, viewPicker:
 			// fall through to the shared list key handling below
 		default:
@@ -467,6 +503,8 @@ func (m model) View() tea.View {
 		return tea.NewView(m.pickerView())
 	case viewNotice:
 		return tea.NewView(m.noticeView())
+	case viewCountdown:
+		return tea.NewView(m.countdownView())
 	}
 	return tea.NewView("")
 }
@@ -754,6 +792,12 @@ func readControl(c *conn, r *os.File, p *tea.Program) {
 			}
 			c.respond(m.ID, json.RawMessage(`{}`))
 			p.Send(showMsg(sp))
+		case "ui.update":
+			// A notification (countdown.go): new remaining time, focus kept.
+			var up updateParams
+			if json.Unmarshal(m.Params, &up) == nil {
+				p.Send(updateMsg{RemainingMs: up.RemainingMs})
+			}
 		case "ui.hide":
 			c.respond(m.ID, json.RawMessage(`{}`))
 			p.Send(hideMsg{})

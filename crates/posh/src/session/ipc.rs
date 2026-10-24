@@ -65,6 +65,9 @@ pub enum Tag {
     /// rather than a longer `Exit` payload so a client that predates it keeps
     /// decoding the 4-byte exit status; such a client skips this tag.
     ExitCause = 18,
+    /// PROTOTYPE app-presented modal (`session/modal.rs`): a JSON object with
+    /// an `op`, in every direction (request/probe/result/show/clear/choose).
+    Modal = 19,
 }
 
 impl Tag {
@@ -89,6 +92,7 @@ impl Tag {
             16 => Tag::SwitchRequest,
             17 => Tag::Switch,
             18 => Tag::ExitCause,
+            19 => Tag::Modal,
             _ => return None,
         })
     }

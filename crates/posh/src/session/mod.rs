@@ -8,6 +8,7 @@ pub mod cwd;
 pub mod daemon;
 pub mod ipc;
 pub(crate) mod mesa;
+pub(crate) mod modal;
 
 use std::io::Read;
 use std::os::unix::fs::{DirBuilderExt, FileTypeExt, MetadataExt};
@@ -921,6 +922,39 @@ pub fn cmd_run(cfg: &Config, name: &str, args: &[String]) -> Result<()> {
     wait_for_frame(&probe.stream, Tag::Ack, "ack")?;
     println!("command sent");
     Ok(())
+}
+
+/// PROTOTYPE `posh modal [SESSION] [--probe] [--timeout SECS] …`
+/// (`modal::parse_cli`): ask the session's daemon to raise a countdown on its
+/// attached viewports and wait for the daemon's single `result`. Prints the
+/// reply as one JSON line and returns the exit code (`modal::exit_code`).
+/// With no SESSION it addresses the enclosing session, `$POSH_SESSION` in
+/// `$POSH_GROUP`. Like every daemon verb it is refused from an agent-scope
+/// cgroup when `POSH_CONFINE` is on (FDR 0022).
+pub fn cmd_modal(default_group: &str, args: &[String]) -> Result<i32> {
+    let cli = modal::parse_cli(args, std::process::id()).map_err(Error::Msg)?;
+    let (name, group) = match cli.session {
+        Some(n) => (n, default_group.to_string()),
+        None => (
+            std::env::var("POSH_SESSION").map_err(|_| {
+                Error::from("POSH_SESSION env var not found: name a session, or run inside one")
+            })?,
+            std::env::var("POSH_GROUP").unwrap_or_else(|_| default_group.to_string()),
+        ),
+    };
+    let cfg = Config::new(&group)?;
+    let path = cfg.socket_path(&name)?;
+    if !session_socket_exists(&path) {
+        return Err(Error::Msg(format!("session does not exist session_name={name}")));
+    }
+    let probe = probe_session(&path).map_err(|e| Error::Msg(format!("session unresponsive: {e}")))?;
+    ipc::send(std::os::fd::AsRawFd::as_raw_fd(&probe.stream), Tag::Modal, &cli.payload)?;
+    probe.stream.set_read_timeout(Some(Duration::from_millis(cli.wait_ms)))?;
+    let frame = wait_for_frame(&probe.stream, Tag::Modal, "modal reply")?;
+    let reply: serde_json::Value = serde_json::from_slice(&frame.payload)
+        .map_err(|e| Error::Msg(format!("bad modal reply: {e}")))?;
+    println!("{reply}");
+    Ok(modal::exit_code(&reply))
 }
 
 // ---------------------------------------------------------------------------

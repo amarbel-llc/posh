@@ -244,6 +244,31 @@ impl Palette {
         self.show(json!({ "view": "notice", "title": title, "stack": stack }));
     }
 
+    /// PROTOTYPE app-presented modal (`session/modal.rs`): summon the
+    /// `countdown` view — title, body, the daemon's remaining/total time, and
+    /// `commands` as its buttons (each issues its action on Enter). A renderer
+    /// that predates the view answers an error, surfaced as
+    /// [`PaletteEvent::ViewRejected`]; the caller then keeps only the banner.
+    /// Recorded as a `palette` overlay (the RFC 0014 §6 kinds are unchanged).
+    pub fn show_countdown(&mut self, title: &str, body: &str, commands: Value, remaining_ms: u64, total_ms: u64) {
+        self.show(json!({
+            "view": "countdown", "title": title, "body": body, "commands": commands,
+            "remaining_ms": remaining_ms, "total_ms": total_ms,
+        }));
+    }
+
+    /// New remaining time for the countdown on screen (`ui.update`, a
+    /// notification): the renderer keeps its button focus.
+    pub fn update_countdown(&mut self, remaining_ms: u64) {
+        self.send_notification("ui.update", json!({ "remaining_ms": remaining_ms }));
+    }
+
+    /// Take the current view down without a selection (`ui.hide`).
+    pub fn hide(&mut self) {
+        self.send_request("ui.hide", json!({}));
+        self.set_visible(None);
+    }
+
     /// Drain the renderer PTY into the emulated screen. Returns whether the
     /// screen changed (the caller should recomposite).
     pub fn pump(&mut self) -> bool {
@@ -835,6 +860,101 @@ mod tests {
         assert!(matches!(p.poll_events(), PaletteEvent::Cancelled));
         assert!(!p.is_open());
         unsafe { libc::close(peer) };
+    }
+
+    fn read_ctrl_line(peer: RawFd) -> Value {
+        let mut buf = [0u8; 1024];
+        let n = unsafe { libc::read(peer, buf.as_mut_ptr() as *mut libc::c_void, buf.len()) };
+        serde_json::from_str(std::str::from_utf8(&buf[..n.max(0) as usize]).unwrap().trim()).unwrap()
+    }
+
+    // PROTOTYPE countdown: show carries the buttons and the daemon's times;
+    // update is a notification (no id) that changes only the remaining time;
+    // hide is a request and takes the overlay record down.
+    #[test]
+    fn countdown_show_update_and_hide_speak_the_countdown_protocol() {
+        let (mut p, peer) = palette_with_ctrl();
+        let buttons = json!([{ "name": "Cancel restart", "action": { "method": "app.modal.choose", "params": { "id": "r1", "button": "cancel" } } }]);
+        p.show_countdown("Restarting agent", "soon", buttons, 26_400, 30_000);
+        assert!(p.is_open());
+        let v = read_ctrl_line(peer);
+        assert_eq!(v["method"], "ui.show");
+        assert_eq!(v["params"]["view"], "countdown");
+        assert_eq!(v["params"]["remaining_ms"], 26_400);
+        assert_eq!(v["params"]["total_ms"], 30_000);
+        assert_eq!(v["params"]["commands"][0]["action"]["params"]["button"], "cancel");
+
+        p.update_countdown(25_400);
+        let v = read_ctrl_line(peer);
+        assert_eq!(v["method"], "ui.update");
+        assert!(v.get("id").is_none(), "an update is a notification");
+        assert_eq!(v["params"]["remaining_ms"], 25_400);
+        assert!(p.is_open(), "an update does not close the view");
+
+        p.hide();
+        let v = read_ctrl_line(peer);
+        assert_eq!(v["method"], "ui.hide");
+        assert!(!p.is_open());
+        unsafe { libc::close(peer) };
+    }
+
+    // The REAL renderer draws the countdown, takes a time update without
+    // losing focus, and answers Enter with the focused button's action. Skipped
+    // without the binary, like the other real_binary tests.
+    #[test]
+    fn real_binary_countdown_round_trip() {
+        if palette_binary().is_none() {
+            eprintln!("skip: posh-palette not found (set POSH_PALETTE to run)");
+            return;
+        }
+        let mut p = Palette::spawn(24, 100).expect("spawn + handshake");
+        let buttons = json!([
+            { "name": "Cancel restart", "action": { "method": "app.modal.choose", "params": { "id": "r1", "button": "cancel" } } },
+            { "name": "Restart now", "action": { "method": "app.modal.choose", "params": { "id": "r1", "button": "now" } } },
+        ]);
+        p.show_countdown("Restarting agent", "The agent restarts soon.", buttons, 26_400, 30_000);
+        let pump_until = |p: &mut Palette, want: &str| -> Result<(), String> {
+            let deadline = Instant::now() + Duration::from_secs(3);
+            while Instant::now() < deadline {
+                if p.rterm.dump_text().contains(want) {
+                    return Ok(());
+                }
+                poll_readable(p.master, Duration::from_millis(50));
+                p.pump();
+                poll_readable(p.ctrl, Duration::from_millis(50));
+                if matches!(p.poll_events(), PaletteEvent::ViewRejected) {
+                    return Err("rejected".into());
+                }
+            }
+            Err(format!("never drew {want:?}:\n{}", p.rterm.dump_text()))
+        };
+        if pump_until(&mut p, "Cancel restart") == Err("rejected".into()) {
+            eprintln!("skip: this posh-palette predates the countdown view");
+            p.shutdown();
+            return;
+        }
+        let text = p.rterm.dump_text();
+        assert!(text.contains("27s"), "26.4 s left reads 27s:\n{text}");
+        assert!(text.contains("Restart now"), "{text}");
+
+        p.update_countdown(4_200);
+        pump_until(&mut p, "5s").expect("the update redraws the time");
+        p.forward_input(b"\x1b[C"); // Right: focus the second button
+        p.forward_input(b"\r");
+        let deadline = Instant::now() + Duration::from_secs(3);
+        let mut action = None;
+        while Instant::now() < deadline && action.is_none() {
+            poll_readable(p.ctrl, Duration::from_millis(50));
+            if let PaletteEvent::Action { method, params } = p.poll_events() {
+                action = Some((method, params));
+            }
+            poll_readable(p.master, Duration::from_millis(10));
+            p.pump();
+        }
+        let (method, params) = action.expect("Enter issues the focused button's action");
+        assert_eq!(method, "app.modal.choose");
+        assert_eq!(params["button"], "now", "the update kept the focus that Right moved");
+        p.shutdown();
     }
 
     // The REAL renderer draws a picker as an aligned table and answers a

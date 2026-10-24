@@ -540,6 +540,10 @@ struct FrameRenderer {
     /// RFC 0016 §2: the daemon offered push-cmd on this attach, so the
     /// palette shows *Push shell* instead of *Shell out*.
     push_offered: bool,
+    /// PROTOTYPE app-presented modal (`session/modal.rs`): the countdown's
+    /// banner line, drawn over the top row of every live compose while a
+    /// daemon-owned modal runs. `None` = no modal.
+    modal_banner: Option<String>,
     rows: u16,
     cols: u16,
 }
@@ -591,6 +595,7 @@ impl FrameRenderer {
             activity: None,
             kind: SessionKind::Unknown,
             push_offered: false,
+            modal_banner: None,
             rows,
             cols,
             stats: Stats::new(),
@@ -882,6 +887,10 @@ impl FrameRenderer {
                 next.title = t;
             }
         }
+        // PROTOTYPE modal: banner first — a bar over row 0 until the modal ends.
+        if let Some(banner) = &self.modal_banner {
+            display::draw_bar_row(&mut next, 0, banner);
+        }
         if let Some(rterm) = palette {
             composite_palette(&mut next, rterm, self.rows, self.cols);
         }
@@ -1096,6 +1105,28 @@ fn open_local_palette(
     true
 }
 
+/// PROTOTYPE modal: open the `countdown` view for the running modal instead of
+/// the command list (`Ctrl-^` while a modal runs). Same shape as
+/// [`open_local_palette`]; false if the renderer can't be spawned, leaving the
+/// banner as the only surface.
+fn open_modal_view(
+    palette: &mut Option<Palette>,
+    fr: &mut FrameRenderer,
+    stdout_buf: &mut Vec<u8>,
+    rows: u16,
+    cols: u16,
+    m: &super::modal::View,
+) -> bool {
+    let Some(p) = Palette::summon(palette, rows, cols) else {
+        return false;
+    };
+    p.show_countdown(&m.title, &m.body, m.commands(), m.remaining_ms, m.total_ms);
+    fr.set_scroll(0);
+    fr.invalidate();
+    stdout_buf.extend_from_slice(&fr.recompose(p.screen()));
+    true
+}
+
 /// The tty-side effect a dispatched palette action still needs applied after it
 /// returns. `client.suspend` can't run inside [`dispatch_local_action`] (it needs
 /// the loop's `RawMode` and blocks in `SIGSTOP`), so it is surfaced here and run
@@ -1146,6 +1177,17 @@ fn dispatch_local_action(method: &str, params: &Value, sock_write_buf: &mut Vec<
                 crate::remote::crypto::random_token(),
             )]);
             ipc::append_frame(sock_write_buf, Tag::ClientCaps, &table);
+            LocalAction::None
+        }
+        "app.modal.choose" => {
+            // PROTOTYPE modal: the user picked a countdown button; the daemon
+            // arbitrates (first valid answer wins) and `clear`s every viewer.
+            if let (Some(id), Some(button)) = (
+                params.get("id").and_then(Value::as_str),
+                params.get("button").and_then(Value::as_str),
+            ) {
+                ipc::append_frame(sock_write_buf, Tag::Modal, &super::modal::choose_payload(id, button));
+            }
             LocalAction::None
         }
         "client.suspend" => LocalAction::Suspend,
@@ -1342,6 +1384,9 @@ fn client_loop(
     });
     // RFC 0016 §2: this viewport can push-cmd; the daemon offers it back once.
     extra_caps.push(caps::encode_push_cmd());
+    // PROTOTYPE app-presented modal: this viewport renders the daemon's
+    // countdown (banner, then the `countdown` view on Ctrl-^).
+    extra_caps.push(caps::Cap { id: caps::CAP_APP_MODAL, payload: vec![] });
     // Advertise CAP_COALESCE only when opted in (posh#137, `POSH_COALESCE=1`):
     // coalescing bounds the daemon's per-client `write_buf` so an output burst
     // can't grow it past MAX_CLIENT_BACKLOG and get us dropped (the
@@ -1420,6 +1465,11 @@ fn client_loop(
     // on a renderer spawn.
     let mut notice_up: Option<crate::picker::PopNotice> = None;
     let mut notice_raised = false;
+    // PROTOTYPE app-presented modal (`session/modal.rs`): the daemon's running
+    // countdown as last shown, and whether its `countdown` view is up in the
+    // renderer (so a cancel/choose/clear knows what it is closing).
+    let mut modal: Option<super::modal::View> = None;
+    let mut modal_view_open = false;
 
     // Whether we ack applied frames to drive the daemon's coalescing (posh#137).
     // Mirrors whether we advertised CAP_COALESCE (`POSH_COALESCE`, default off):
@@ -1592,7 +1642,15 @@ fn client_loop(
                                 .as_mut()
                                 .expect("Palette event only fires with a live renderer");
                             let (rows, cols) = frame_size;
-                            if open_local_palette(&mut palette, fr, &mut stdout_buf, rows, cols, coalesce_on, coalesce) {
+                            // PROTOTYPE modal: with a countdown running the chord
+                            // reviews it instead of listing commands.
+                            let opened = if let Some(m) = modal.as_ref() {
+                                open_modal_view(&mut palette, fr, &mut stdout_buf, rows, cols, m)
+                            } else {
+                                open_local_palette(&mut palette, fr, &mut stdout_buf, rows, cols, coalesce_on, coalesce)
+                            };
+                            modal_view_open = opened && modal.is_some();
+                            if opened {
                                 if !tail.is_empty() {
                                     if let Some(p) = palette.as_ref() {
                                         p.forward_input(tail);
@@ -1696,6 +1754,51 @@ fn client_loop(
                             Tag::ExitCause => {
                                 exit_cause = caps::decode_exit_cause(&frame.payload);
                             }
+                            // PROTOTYPE modal: the daemon's countdown. `show`
+                            // (every second) refreshes the banner and, if the
+                            // countdown view is up, its time; `clear` ends both.
+                            Tag::Modal => match super::modal::parse_notice(&frame.payload) {
+                                Some(super::modal::Notice::Show(v)) => {
+                                    if let Some(fr) = frame_renderer.as_mut() {
+                                        fr.modal_banner = Some(v.banner());
+                                        if modal_view_open {
+                                            if let Some(p) = palette.as_mut() {
+                                                p.update_countdown(v.remaining_ms);
+                                            }
+                                        }
+                                        let screen = palette
+                                            .as_ref()
+                                            .filter(|p| p.is_open())
+                                            .and_then(Palette::screen);
+                                        stdout_buf.extend_from_slice(&fr.recompose(screen));
+                                    }
+                                    modal = Some(v);
+                                }
+                                Some(super::modal::Notice::Clear(id))
+                                    if modal.as_ref().is_some_and(|m| m.id == id) =>
+                                {
+                                    modal = None;
+                                    if modal_view_open {
+                                        modal_view_open = false;
+                                        if let Some(p) = palette.as_mut() {
+                                            p.hide();
+                                        }
+                                    }
+                                    if let Some(fr) = frame_renderer.as_mut() {
+                                        fr.modal_banner = None;
+                                        fr.invalidate();
+                                        let screen = palette
+                                            .as_ref()
+                                            .filter(|p| p.is_open())
+                                            .and_then(Palette::screen);
+                                        stdout_buf.extend_from_slice(&fr.recompose(screen));
+                                    }
+                                }
+                                // A stale `clear` (another modal's) or an op this
+                                // viewer does not know.
+                                Some(super::modal::Notice::Clear(_)) => {}
+                                None => {}
+                            },
                             Tag::Switch => {
                                 // FDR 0012 (RFC 0008 §3.1): the daemon picked
                                 // THIS viewport to re-home. Flush pending
@@ -1754,6 +1857,9 @@ fn client_loop(
                         notice_up = None;
                         let queued = sock_write_buf.len();
                         let action = dispatch_local_action(&method, &params, &mut sock_write_buf);
+                        if method == "app.modal.choose" {
+                            modal_view_open = false; // the renderer closed it on selection
+                        }
                         // A detach queued by the palette (Detach, a switch,
                         // Back) is ours: the socket ending afterwards is a
                         // quit, not a lost session.
@@ -1812,6 +1918,24 @@ fn client_loop(
                     // A dismissed pop notice is done with; a refused one goes
                     // back to the caller, to be printed after restore.
                     Some(event @ (PaletteEvent::Cancelled | PaletteEvent::ViewRejected)) => {
+                        // PROTOTYPE modal: Esc on the countdown view takes the
+                        // request's `on_dismiss` button (the restart's safe
+                        // default is cancel); with none, it only hides the view
+                        // and the daemon's clock runs on.
+                        if modal_view_open {
+                            modal_view_open = false;
+                            if matches!(event, PaletteEvent::Cancelled) {
+                                if let Some((id, button)) =
+                                    modal.as_ref().and_then(|m| Some((m.id.clone(), m.on_dismiss.clone()?)))
+                                {
+                                    ipc::append_frame(
+                                        &mut sock_write_buf,
+                                        Tag::Modal,
+                                        &super::modal::choose_payload(&id, &button),
+                                    );
+                                }
+                            }
+                        }
                         if let Some(n) = notice_up.take() {
                             if matches!(event, PaletteEvent::ViewRejected) {
                                 *pop_notice = Some(n);
@@ -2988,6 +3112,37 @@ mod tests {
             LocalAction::Suspend
         ));
         assert!(buf.is_empty(), "suspend queues no wire frame");
+    }
+
+    /// PROTOTYPE modal: choosing a countdown button queues exactly one
+    /// `Tag::Modal` `choose` for the daemon (which arbitrates); a malformed
+    /// action queues nothing.
+    #[test]
+    fn dispatch_modal_choose_queues_a_choose_for_the_daemon() {
+        let mut buf = Vec::new();
+        assert!(matches!(
+            dispatch_local_action("app.modal.choose", &json!({"id": "r1", "button": "cancel"}), &mut buf),
+            LocalAction::None
+        ));
+        assert_eq!(buf, ipc::encode_frame(Tag::Modal, &crate::session::modal::choose_payload("r1", "cancel")));
+        let mut none = Vec::new();
+        dispatch_local_action("app.modal.choose", &json!({"id": "r1"}), &mut none);
+        assert!(none.is_empty(), "no button, nothing to send");
+    }
+
+    /// PROTOTYPE modal: while a modal runs the banner is drawn on the top row of
+    /// every live compose, and it is gone again once cleared.
+    #[test]
+    fn the_modal_banner_is_drawn_on_the_live_compose_until_cleared() {
+        let mut fr = FrameRenderer::new(6, 60);
+        fr.modal_banner = Some(" Restarting agent - 27s left - Ctrl-^ to review ".into());
+        let drawn = String::from_utf8_lossy(&fr.recompose(None)).into_owned();
+        assert!(drawn.contains("Restarting agent"), "banner painted: {drawn:?}");
+        assert!(drawn.contains("27s left"), "{drawn:?}");
+        fr.modal_banner = None;
+        let cleared = String::from_utf8_lossy(&fr.recompose(None)).into_owned();
+        assert!(!cleared.contains("Restarting"), "banner no longer repainted: {cleared:?}");
+        assert!(!cleared.is_empty(), "but the bar's cells are repainted blank");
     }
 
     /// An unknown method (the renderer already closed the palette) is inert.

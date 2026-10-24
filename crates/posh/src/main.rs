@@ -308,6 +308,15 @@ fn run_once() -> Result<()> {
             session::cmd_detach(&Config::new(&group)?, args.first().map(|s| s.as_str()))
         }
         "detach-all" | "da" => session::cmd_detach_all(&Config::new(&group)?),
+        // PROTOTYPE app-presented modal (session/modal.rs): exit 0 = proceed
+        // (timeout / restart now / no viewer), 10 = cancelled, 11 busy, 12 invalid.
+        "modal" => {
+            let code = session::cmd_modal(&group, args)?;
+            if code != 0 {
+                std::process::exit(code);
+            }
+            Ok(())
+        }
         "run" | "r" => {
             let name = args
                 .first()

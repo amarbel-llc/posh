@@ -1719,6 +1719,101 @@ fn daemon_cwd(child_pid: libc::pid_t, term: &Terminal, start: &str) -> super::cw
     })
 }
 
+/// The nearer of two poll timeouts, where `-1` means "block" (no deadline).
+fn merge_poll_timeouts(a: i32, b: i32) -> i32 {
+    match (a, b) {
+        (-1, x) | (x, -1) => x,
+        (x, y) => x.min(y),
+    }
+}
+
+/// PROTOTYPE modal: a connection that carried `CAP_APP_MODAL` on its Init can
+/// render a modal; a requester (`posh modal`) never does.
+fn modal_capable(c: &ClientConn) -> bool {
+    caps::find(&c.caps, caps::CAP_APP_MODAL).is_some()
+}
+
+/// PROTOTYPE modal: end the running modal with `res` — `clear` to the viewers,
+/// the single `result` to the requester (if it is still connected).
+fn modal_resolve(clients: &mut [ClientConn], modal: &mut Option<super::modal::Run>, res: super::modal::Resolution) {
+    use super::modal;
+    let Some(run) = modal.take() else { return };
+    util::log_write(
+        "info",
+        &format!("modal {}: {} button={:?}", run.spec.id, res.kind, res.button),
+    );
+    let clear = modal::clear_payload(&run.spec.id);
+    for c in clients.iter_mut().filter(|c| modal_capable(c)) {
+        c.queue(Tag::Modal, &clear);
+    }
+    let result = modal::result_payload(&run.spec.id, &res);
+    if let Some(c) = clients.iter_mut().find(|c| c.stream.as_raw_fd() == run.requester) {
+        c.queue(Tag::Modal, &result);
+    }
+}
+
+/// PROTOTYPE modal: handle one `Tag::Modal` payload from `clients[from]` — a
+/// viewer's `choose`, or a requester's `request` / `probe`.
+fn modal_handle(
+    clients: &mut [ClientConn],
+    from: usize,
+    payload: &[u8],
+    modal: &mut Option<super::modal::Run>,
+    now: u64,
+) {
+    use super::modal::{self, Request};
+    if let Some((id, button)) = modal::parse_choose(payload) {
+        if let Some(res) = modal.as_ref().and_then(|m| m.choose(&id, &button)) {
+            modal_resolve(clients, modal, res);
+        }
+        return;
+    }
+    let capable = clients.iter().enumerate().filter(|(j, c)| *j != from && modal_capable(c)).count();
+    let attached = clients.len().saturating_sub(1);
+    match modal::parse_request(payload) {
+        Err(reason) => clients[from].queue(Tag::Modal, &modal::refusal_payload("", "invalid", &reason)),
+        Ok(Request::Probe) => {
+            let active = modal.as_ref().map(|m| m.spec.id.as_str());
+            clients[from].queue(Tag::Modal, &modal::probe_payload(active, capable, attached));
+        }
+        Ok(Request::Start(spec)) => {
+            if let Some(running) = modal.as_ref() {
+                let reason = format!("modal {} is running", running.spec.id);
+                clients[from].queue(Tag::Modal, &modal::refusal_payload(&spec.id, "busy", &reason));
+            } else if capable == 0 {
+                let res = modal::Resolution { kind: "no-viewer", button: None };
+                clients[from].queue(Tag::Modal, &modal::result_payload(&spec.id, &res));
+            } else {
+                util::log_write("info", &format!("modal {}: started for {capable} viewer(s)", spec.id));
+                let fd = clients[from].stream.as_raw_fd();
+                *modal = Some(modal::Run::start(spec, fd, now));
+                modal_drive(clients, modal, now);
+            }
+        }
+    }
+}
+
+/// PROTOTYPE modal: advance the daemon's clock — re-`show`, time out, or (no
+/// viewer left who could answer) resolve `no-viewer` so the caller proceeds.
+fn modal_drive(clients: &mut [ClientConn], modal: &mut Option<super::modal::Run>, now: u64) {
+    use super::modal::{Resolution, Tick};
+    let Some(run) = modal.as_mut() else { return };
+    if !clients.iter().any(modal_capable) {
+        modal_resolve(clients, modal, Resolution { kind: "no-viewer", button: None });
+        return;
+    }
+    match run.tick(now) {
+        Tick::Idle => {}
+        Tick::Show => {
+            let show = run.show_payload(now);
+            for c in clients.iter_mut().filter(|c| modal_capable(c)) {
+                c.queue(Tag::Modal, &show);
+            }
+        }
+        Tick::Resolved(res) => modal_resolve(clients, modal, res),
+    }
+}
+
 /// RFC 0016 §4.1: the token of a push-cmd request in `table` that this daemon
 /// has not served yet, recording it in `served` (which keeps the 64 most
 /// recent). `None` for no request, a malformed one, or a repeat.
@@ -2100,6 +2195,9 @@ fn daemon_loop(
     // RFC 0016 §4.1: push-cmd tokens already served, seeded with the one
     // that created this session (if one did).
     let mut served_pushes: Vec<u64> = seed.into_iter().collect();
+    // PROTOTYPE app-presented modal (`session/modal.rs`): at most one, owned
+    // here so the daemon's clock decides it whatever the viewers do.
+    let mut modal: Option<super::modal::Run> = None;
     // FDR 0022: who may attach. `None` (the default) ⇒ every peer is a client.
     let mut confine = super::confine::Confine::from_env();
     if let Some(c) = &confine {
@@ -2193,7 +2291,11 @@ fn daemon_loop(
         // Block until an fd is ready or the nearest paced send opportunity
         // (posh#225): `-1` while no paced client owes a frame or a history
         // body (history pauses while the escape overlay is up).
-        match util::poll(&mut fds, paced_poll_timeout(clients, overlay.is_none().then_some(&*term), now)) {
+        let poll_timeout = merge_poll_timeouts(
+            paced_poll_timeout(clients, overlay.is_none().then_some(&*term), now),
+            modal.as_ref().map_or(-1, |m| m.wake_in_ms(now)),
+        );
+        match util::poll(&mut fds, poll_timeout) {
             Ok(_) => {}
             Err(e) if e.kind() == std::io::ErrorKind::Interrupted => continue,
             Err(e) => {
@@ -2241,6 +2343,9 @@ fn daemon_loop(
                 c.activity_now = activity.clone();
             }
         }
+
+        // PROTOTYPE modal: the daemon's clock — re-show, or time out.
+        modal_drive(clients, &mut modal, util::now_ms());
 
         // New client connections.
         if fds[0].revents & err_events != 0 {
@@ -2460,6 +2565,7 @@ fn daemon_loop(
             let mut open_shell = false;
             let mut switch_req: Option<Vec<u8>> = None;
             let mut push_for: Option<u64> = None;
+            let mut modal_msgs: Vec<Vec<u8>> = Vec::new();
             let total_clients = clients.len();
             {
                 let c = &mut clients[i];
@@ -2621,6 +2727,9 @@ fn daemon_loop(
                                     active_source(overlay.as_ref().map(|o| &o.term), term),
                                     util::now_ms(),
                                 ),
+                                // PROTOTYPE modal: handled after this per-client
+                                // borrow (it addresses other clients).
+                                Tag::Modal => modal_msgs.push(frame.payload.clone()),
                                 // Output, Ack, Exit, Frame, and Switch are all
                                 // daemon->client only; ignore if received from
                                 // a client.
@@ -2725,6 +2834,9 @@ fn daemon_loop(
                     Err(e) => util::log_write("error", &format!("push-cmd: create failed: {e}")),
                 }
             }
+            for payload in modal_msgs {
+                modal_handle(clients, i, &payload, &mut modal, util::now_ms());
+            }
             if detach_all {
                 util::log_write("info", &format!("detach all clients={}", clients.len()));
                 clients.clear();
@@ -2734,6 +2846,11 @@ fn daemon_loop(
                 // The backlog fields (`fd=` first) carry a paced viewport's
                 // final ack latency (posh#225 Stage 3.0).
                 let fields = backlog_log_fields(&clients[i], util::now_ms());
+                // PROTOTYPE modal: a gone requester must not keep an fd the
+                // kernel may hand to the next connection.
+                if let Some(m) = modal.as_mut().filter(|m| m.requester == clients[i].stream.as_raw_fd()) {
+                    m.requester = -1;
+                }
                 clients.remove(i);
                 util::log_write(
                     "info",

@@ -201,6 +201,11 @@ pub const PACED_VERSION: u8 = 1;
 pub const CAP_SCROLLBACK2_EXTENT: u8 = 24;
 /// The [`CAP_SCROLLBACK2_EXTENT`] payload version this build writes.
 pub const SCROLLBACK2_EXTENT_VERSION: u8 = 1;
+/// PROTOTYPE (not registered in RFC 0001; id 25 is provisional): the viewport
+/// can render an app-presented modal (`Tag::Modal`, `session/modal.rs`).
+/// Client entry, empty payload, Init-persistent on the session socket; the
+/// daemon sends `show` only to a connection that carried it.
+pub const CAP_APP_MODAL: u8 = 25;
 
 /// Why a session ended, as its daemon (or a standalone server) knew it.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
