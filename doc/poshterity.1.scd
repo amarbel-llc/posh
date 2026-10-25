@@ -6,11 +6,13 @@ poshterity - deterministic, step-ratcheted terminal recorder/replayer
 
 # SYNOPSIS
 
-*poshterity record* [*--out* _FILE_] [*--via* _posh_|_ssh_ *--host* _HOST_] *--* _cmd_ [_args_]...
+*poshterity record* [*--out* _FILE_] [*--size* _COLSxROWS_] [*--end-on-eof*] [*--mark-fifo* _PATH_] [*--via* _posh_|_ssh_ *--host* _HOST_] *--* _cmd_ [_args_]...
 
 *poshterity replay* _file_ [*--to-marker* _NAME_] [*--dump* _text_|_vt_|_flat_]
 
 *poshterity step* _file_ (*--by* _unit_ [*--n* _N_] | *--to-marker* _NAME_) [*--frame-gap* _SECS_] [*--dump* _..._]
+
+*poshterity seek* _file_ [*--contains* _TEXT_]... [*--lacks* _TEXT_]... [*--from-write* _N_] [*--dump* _text_|_vt_|_flat_]
 
 *poshterity bless* _file_ *--golden* _path_ [*--at* _MARKER_] [*--kind* _grid_|_vt_|_flat_]
 
@@ -32,19 +34,44 @@ The recording format, *.castx*, is a strict superset of the asciinema
 poshterity, and any *.castx* plays in *asciinema*. The format contract is
 specified in RFC 0003.
 
-The replay surface (*replay*, *step*, *bless*, *assert*, *version*) is
+The replay surface (*replay*, *step*, *seek*, *bless*, *assert*, *version*) is
 also reachable on the *posh* binary as *posh rec* _..._ — the two share
 one implementation. *record* is *not* available that way: it needs a PTY
 and lives only in the standalone *poshterity* binary.
 
 # SUBCOMMANDS
 
-*record* [*--out* _FILE_] [*--via* _posh_|_ssh_ *--host* _HOST_] *--* _cmd_ [_args_]...
+*record* [*--out* _FILE_] [*--size* _COLSxROWS_] [*--end-on-eof*] [*--mark-fifo* _PATH_] [*--via* _posh_|_ssh_ *--host* _HOST_] *--* _cmd_ [_args_]...
 	Spawn _cmd_ under a PTY and tee its output both to the terminal and
 	to a *.castx* recording (default _--out recording.castx_). With
 	*--via*/*--host* the command is run over a remote transport (a posh
 	roaming session, or *ssh -t*), for capturing a recording through the
 	full remote pipeline; the two flags are all-or-nothing.
+
+	*--size* fixes the PTY and the recording header at _COLSxROWS_
+	whatever the terminal is (the default is the terminal's size, else
+	80x24); terminal resizes are then not passed to the child.
+
+	*--end-on-eof* ends the recording when poshterity's own stdin ends:
+	the child is hung up (SIGHUP) and the file finalized. For a scripted,
+	piped session whose program would otherwise run on.
+
+	*--mark-fifo* creates a fifo at _PATH_ (it must not exist); each line
+	written to it becomes a named marker (an *m* event) stamped when it is
+	read, so a driving script can say "the modal was raised" and
+	*replay*/*step*/*assert* can stop *--to-marker*/*--at* it. The fifo is
+	removed when recording ends.
+
+*seek* _file_ [*--contains* _TEXT_]... [*--lacks* _TEXT_]... [*--from-write* _N_] [*--dump* _..._]
+	Replay the recording write by write, in one pass, and stop at the
+	first write whose screen text contains every *--contains* _TEXT_ and
+	none of the *--lacks* _TEXT_ (at least one is required; *--from-write*
+	starts after write _N_, default 1). The matching screen is printed on
+	stdout and _write N_ on stderr; no match exits non-zero. _N_ is the
+	index _step --by write --n N_ reaches. The chunking of a recording
+	varies from run to run, so seek by content and never by a fixed
+	index: this is the "the screen shows X" assertion that *assert* (which
+	compares goldens) does not give.
 
 *replay* _file_ [*--to-marker* _NAME_] [*--dump* _text_|_vt_|_flat_]
 	Feed the whole recording through the emulator and print the final

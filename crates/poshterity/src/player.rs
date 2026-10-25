@@ -66,6 +66,26 @@ pub struct StepPos {
 
 const DEFAULT_FRAME_GAP: f64 = 0.1;
 
+/// A query over the screen text after each write, for [`Player::seek`]: every
+/// `contains` string must appear in the screen's text and no `lacks` string
+/// may. `from_write` is the first write index considered (`0` and `1` both
+/// mean "after the first write": the blank screen before any output never
+/// matches).
+#[derive(Debug, Default, Clone, PartialEq, Eq)]
+pub struct Seek {
+    pub contains: Vec<String>,
+    pub lacks: Vec<String>,
+    pub from_write: usize,
+}
+
+impl Seek {
+    /// Whether `screen_text` satisfies the query.
+    pub fn holds(&self, screen_text: &str) -> bool {
+        self.contains.iter().all(|s| screen_text.contains(s.as_str()))
+            && !self.lacks.iter().any(|s| screen_text.contains(s.as_str()))
+    }
+}
+
 /// A deterministic, step-ratcheted replay.
 pub struct Player {
     term: Terminal,
@@ -208,6 +228,37 @@ impl Player {
         }
         self.flush_trailing_resizes();
         true
+    }
+
+    /// How many `o` writes have been fed so far: the `N` that
+    /// `step --by write --n N` reaches, so indices agree between the two.
+    pub fn write_index(&self) -> usize {
+        if self.at_end() {
+            return self.writes.len();
+        }
+        self.writes.iter().take_while(|&&w| w < self.cursor).count()
+    }
+
+    /// Advance write by write until the screen satisfies `q`, one pass over
+    /// the recording (not a replay per candidate). Returns the write index
+    /// the player now sits at, or `None` if the stream ended first (the
+    /// player is then at the end). The write index of a hit depends on how
+    /// the recorder happened to chunk output, so a caller asserting "the
+    /// banner appeared" should seek by content, never by a fixed index.
+    pub fn seek(&mut self, q: &Seek) -> Option<usize> {
+        let from = q.from_write.max(1);
+        let to_skip = from.saturating_sub(self.write_index());
+        if to_skip > 0 {
+            self.step(Granularity::Write, to_skip);
+        }
+        loop {
+            if self.write_index() >= from && q.holds(&self.term.dump_text()) {
+                return Some(self.write_index());
+            }
+            if self.step(Granularity::Write, 1) == 0 {
+                return None;
+            }
+        }
     }
 
     /// Advance to the next `m` marker named `name` (at or ahead of the cursor).
@@ -447,6 +498,63 @@ mod tests {
         }
         assert_eq!((p.terminal().cols(), p.terminal().rows()), (10, 4));
         assert!(row0(&p).contains('Z'));
+    }
+
+    // --- seek: find the first write whose screen matches ------------------
+
+    fn seek(contains: &[&str], lacks: &[&str], from: usize) -> Seek {
+        Seek {
+            contains: contains.iter().map(|s| s.to_string()).collect(),
+            lacks: lacks.iter().map(|s| s.to_string()).collect(),
+            from_write: from,
+        }
+    }
+
+    #[test]
+    fn seek_finds_the_first_write_whose_screen_matches() {
+        let mut p = Player::from_source(FIXTURE).unwrap();
+        // write 1 = "hi", write 2 adds "X": the first screen with "hiX".
+        assert_eq!(p.seek(&seek(&["hiX"], &[], 0)), Some(2));
+        assert_eq!(p.write_index(), 2, "the player stays at the match");
+        assert_eq!(row0(&p), "hiX");
+    }
+
+    #[test]
+    fn seek_all_contains_and_no_lacks_must_hold_together() {
+        let mut p = Player::from_source(FIXTURE).unwrap();
+        // "hi" is on screen from write 1; "Y" arrives with write 3.
+        assert_eq!(p.seek(&seek(&["hi"], &["Y"], 0)), Some(1));
+        let mut p = Player::from_source(FIXTURE).unwrap();
+        assert_eq!(p.seek(&seek(&["hi", "Y"], &[], 0)), Some(3));
+        let mut p = Player::from_source(FIXTURE).unwrap();
+        assert_eq!(p.seek(&seek(&["hi"], &["X"], 2)), None, "X is there from write 2 on");
+    }
+
+    #[test]
+    fn seek_from_write_skips_earlier_matches() {
+        let mut p = Player::from_source(FIXTURE).unwrap();
+        assert_eq!(p.seek(&seek(&["hi"], &[], 3)), Some(3));
+        // Zero means "from the first write": the blank screen before any
+        // output is not a match for a `lacks`-only query.
+        let mut p = Player::from_source(FIXTURE).unwrap();
+        assert_eq!(p.seek(&seek(&[], &["nope"], 0)), Some(1));
+    }
+
+    #[test]
+    fn seek_returns_none_at_end_of_stream() {
+        let mut p = Player::from_source(FIXTURE).unwrap();
+        assert_eq!(p.seek(&seek(&["never"], &[], 0)), None);
+        assert!(p.at_end());
+    }
+
+    #[test]
+    fn write_index_counts_writes_consumed() {
+        let mut p = Player::from_source(FIXTURE).unwrap();
+        assert_eq!(p.write_index(), 0);
+        p.step(Granularity::Write, 3);
+        assert_eq!(p.write_index(), 3);
+        p.step_to_end();
+        assert_eq!(p.write_index(), 4);
     }
 
     #[test]

@@ -287,6 +287,16 @@ impl<W: std::io::Write> Recorder<W> {
         self.write_line(time, EventCode::Input, &data)
     }
 
+    /// Record a named marker as an `m` event: a position in the stream that
+    /// `step --to-marker`, `replay --to-marker` and `assert --at` can stop at.
+    /// Held incomplete output is flushed first so the marker lands after every
+    /// byte recorded before it.
+    pub fn marker(&mut self, time: f64, name: &str) -> std::io::Result<()> {
+        self.last_time = time;
+        self.flush_held(time)?;
+        self.write_line(time, EventCode::Marker, name)
+    }
+
     /// Flush any held incomplete output (lossily) and the underlying writer.
     pub fn finish(&mut self) -> std::io::Result<()> {
         let time = self.last_time;
@@ -534,6 +544,26 @@ mod tests {
                 (EventCode::Output, "after".to_string()),
             ]
         );
+    }
+
+    #[test]
+    fn recorder_marker_lands_after_everything_recorded_before_it() {
+        let doc = record_doc(&header_24x80(), |rec| {
+            rec.output(0.0, b"before").unwrap();
+            rec.output(0.1, &[0xC3]).unwrap(); // half a char, held
+            rec.marker(0.2, "mid").unwrap(); // flushes the held byte first
+            rec.output(0.3, b"after").unwrap();
+        });
+        let codes: Vec<(EventCode, String)> =
+            events_of(&doc).into_iter().map(|e| (e.code, e.data)).collect();
+        assert_eq!(codes[0], (EventCode::Output, "before".to_string()));
+        let at = codes.iter().position(|(c, _)| *c == EventCode::Marker).expect("a marker event");
+        assert_eq!(codes[at].1, "mid");
+        assert!(
+            codes[..at].iter().filter(|(c, _)| *c == EventCode::Output).count() >= 2,
+            "the held byte is flushed before the marker: {codes:?}"
+        );
+        assert_eq!(codes.last().unwrap(), &(EventCode::Output, "after".to_string()));
     }
 
     #[test]

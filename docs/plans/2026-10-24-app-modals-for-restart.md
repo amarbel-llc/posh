@@ -405,7 +405,18 @@ the alt-screen exit; 7. no "screen contains" assertion, and wall-clock text
 defeats goldens; 8. styles (the reverse-video banner) unasserted, untried;
 9. stdin EOF does not end a recording.
 
+Status (2026-10-25): gaps 1, 2, 3, 5, 7 and 9 are addressed in poshterity —
+`record --mark-fifo`, `seek --contains/--lacks` (one pass, content-based, so
+write indices no longer matter), `record --size`, and `record --end-on-eof` —
+each with tests; `debug-modal-record` now uses them. Still open: 4 (expect-style
+wait-for-screen input), 6 (the alt-screen-exit final screen is worked around by
+`seek`, not fixed), 8 (styles: `seek --dump vt` is available but unasserted).
+
 ### Product finding from the recording
+
+The banner outliving the closed view is timing-dependent: 1 write in two runs,
+0 in another, so it is a race between the client's choose and the daemon's
+clear arriving in the same read, not a fixed extra frame.
 
 After a choice the view closes one write before the daemon's `clear` removes the
 banner (one extra frame with the banner and no view). Observed for cancel and

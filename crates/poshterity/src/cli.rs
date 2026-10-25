@@ -8,7 +8,7 @@
 
 use crate::castx::{EventCode, Reader};
 use crate::golden::{self, GoldenKind};
-use crate::player::{Granularity, Player};
+use crate::player::{Granularity, Player, Seek};
 use crate::Replay;
 use posh_proto::display::{new_frame, Snapshot};
 use std::io::Write;
@@ -42,9 +42,18 @@ usage:
   poshterity render <file> --raw [--size COLSxROWS] [--bytes N]
   poshterity step <file> (--by byte|escape|write|change|frame|marker [--n N]
                         | --to-marker NAME) [--frame-gap SECS] [--dump ...]
+  poshterity seek <file> [--contains TEXT]... [--lacks TEXT]... [--from-write N]
+                  [--dump text|vt|flat]
   poshterity bless <file> --golden <path> [--at MARKER] [--kind grid|vt|flat]
   poshterity assert <file> --golden <path> [--at MARKER] [--kind ...]
                   [--check-emu-rev]
+
+`seek` replays the recording write by write in ONE pass and stops at the first
+write whose screen text contains every --contains TEXT and none of the --lacks
+TEXT (at least one is required; --from-write N starts after write N, default 1).
+It prints that screen on stdout and `write N` on stderr, and exits non-zero when
+no write matches. N is the same index `step --by write --n N` reaches. How a
+recorder chunks output varies run to run, so seek by content, never by index.
 
 Replay a .castx / asciinema .cast v2 recording through the in-process
 posh-term emulator. `replay` prints the final screen; `step` advances by
@@ -73,6 +82,7 @@ pub fn run(args: &[String]) -> Result<(), String> {
         Some("replay") => run_replay(&args[1..]),
         Some("render") => run_render(&args[1..]),
         Some("step") => run_step(&args[1..]),
+        Some("seek") => run_seek(&args[1..]),
         Some("bless") => run_bless(&args[1..]),
         Some("assert") => run_assert(&args[1..]),
         Some("help" | "-h" | "--help") => {
@@ -331,6 +341,66 @@ fn run_step(args: &[String]) -> Result<(), String> {
     let out = dump_terminal(player.terminal(), dump);
     std::io::stdout()
         .write_all(&out)
+        .map_err(|e| format!("write: {e}"))
+}
+
+fn run_seek(args: &[String]) -> Result<(), String> {
+    let mut file: Option<&str> = None;
+    let mut q = Seek::default();
+    let mut dump = Dump::Text;
+    let mut i = 0;
+    while i < args.len() {
+        match args[i].as_str() {
+            "--contains" => {
+                q.contains.push(args.get(i + 1).ok_or("--contains requires a value")?.clone());
+                i += 2;
+            }
+            "--lacks" => {
+                q.lacks.push(args.get(i + 1).ok_or("--lacks requires a value")?.clone());
+                i += 2;
+            }
+            "--from-write" => {
+                q.from_write = args
+                    .get(i + 1)
+                    .ok_or("--from-write requires a value")?
+                    .parse()
+                    .map_err(|_| "--from-write expects a non-negative integer")?;
+                i += 2;
+            }
+            "--dump" => {
+                dump = Dump::parse(args.get(i + 1).ok_or("--dump requires a value")?)?;
+                i += 2;
+            }
+            flag if flag.starts_with('-') => {
+                return Err(format!("unknown flag {flag:?}\n\n{USAGE}"));
+            }
+            positional => {
+                if file.is_some() {
+                    return Err(format!("unexpected extra argument {positional:?}"));
+                }
+                file = Some(positional);
+                i += 1;
+            }
+        }
+    }
+    let path = file.ok_or_else(|| format!("seek requires a <file>\n\n{USAGE}"))?;
+    if q.contains.is_empty() && q.lacks.is_empty() {
+        return Err("seek requires at least one --contains or --lacks".into());
+    }
+    let src = std::fs::read_to_string(path).map_err(|e| format!("{path}: {e}"))?;
+    let mut player = Player::from_source(&src)?;
+    let Some(n) = player.seek(&q) else {
+        return Err(format!(
+            "no write from {} on has a screen with {:?} present and {:?} absent",
+            q.from_write.max(1),
+            q.contains,
+            q.lacks
+        ));
+    };
+    let pos = player.position();
+    eprintln!("poshterity: write {n} · byte {} · t {:.3}", pos.byte_offset, pos.time);
+    std::io::stdout()
+        .write_all(&dump_terminal(player.terminal(), dump))
         .map_err(|e| format!("write: {e}"))
 }
 

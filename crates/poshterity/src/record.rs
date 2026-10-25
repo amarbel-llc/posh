@@ -18,10 +18,19 @@ const STDIN_FD: RawFd = 0;
 const STDOUT_FD: RawFd = 1;
 
 const USAGE: &str = "\
-usage: poshterity record [--out FILE] [--via posh|ssh --host HOST] -- <cmd> [args...]
+usage: poshterity record [--out FILE] [--size COLSxROWS] [--end-on-eof]
+                         [--mark-fifo PATH] [--via posh|ssh --host HOST] -- <cmd> [args...]
 
 Spawn <cmd> under a PTY, tee its output to the terminal and to a .castx
 recording (default --out recording.castx). Replay it with `poshterity replay`.
+
+  --size COLSxROWS   fix the PTY and the header at this size (default: the
+                     terminal's, else 24x80); terminal resizes are then ignored.
+  --end-on-eof       when poshterity's own stdin ends, hang the child up and
+                     finish the recording (for a piped, scripted session).
+  --mark-fifo PATH   create a fifo at PATH; every line written to it becomes a
+                     named marker in the recording (replay/step/assert can stop
+                     at it). The fifo is removed when recording ends.
 
 With --via/--host the command is run over a remote transport, for capturing a
 remote session's client-side rendering (diff a posh vs ssh recording to localize
@@ -42,11 +51,17 @@ enum Via {
 
 /// Run `poshterity record`. Returns the child's exit code on success.
 pub fn run(args: &[String]) -> Result<i32, String> {
-    let (out_path, command) = parse_args(args)?;
+    let Opts { out: out_path, command, size, end_on_eof, mark_fifo } = parse_args(args)?;
 
-    // The recording's size is the current terminal's; falls back to 24x80 when
-    // stdout is not a tty (e.g. redirected — also how the integration test runs).
-    let (rows, cols) = term_size(STDOUT_FD);
+    // The recording's size is --size, else the current terminal's (24x80 when
+    // stdout is not a tty, e.g. redirected — also how the integration test runs).
+    let (rows, cols) = match size {
+        Some((cols, rows)) => (rows, cols),
+        None => term_size(STDOUT_FD),
+    };
+
+    // Created before the child so the path exists the moment recording starts.
+    let marks = mark_fifo.as_deref().map(MarkFifo::create).transpose()?;
 
     let file = std::fs::File::create(&out_path).map_err(|e| format!("{out_path}: {e}"))?;
     let mut rec = Recorder::new(std::io::BufWriter::new(file));
@@ -68,12 +83,27 @@ pub fn run(args: &[String]) -> Result<i32, String> {
 
     let pty = spawn(&command, rows, cols).map_err(|e| format!("spawn {}: {e}", command[0]))?;
     let start = Instant::now();
-    let code = tee_loop(&mut rec, pty.master, start);
+    let tee = Tee { fixed_size: size.is_some(), end_on_eof, marks: marks.as_ref() };
+    let ended = tee_loop(&mut rec, pty.master, start, &tee);
+    let code = 0;
 
+    if ended == Ended::StdinEof {
+        // --end-on-eof: hang the terminal up. Closing the master sends the
+        // child's session SIGHUP; the explicit kill covers a child that is not
+        // the foreground process group.
+        // SAFETY: closing our own master fd; kill(2) on our own child.
+        unsafe {
+            libc::close(pty.master);
+            libc::kill(pty.pid, libc::SIGHUP);
+        }
+    }
     let status = wait_child(pty.pid);
-    // SAFETY: closing our own master fd once the loop is done.
-    unsafe { libc::close(pty.master) };
+    if ended != Ended::StdinEof {
+        // SAFETY: closing our own master fd once the loop is done.
+        unsafe { libc::close(pty.master) };
+    }
     let _ = rec.finish();
+    drop(marks); // removes the fifo
     drop(raw); // restore the terminal before printing
 
     eprintln!("poshterity: recorded → {out_path}");
@@ -81,10 +111,33 @@ pub fn run(args: &[String]) -> Result<i32, String> {
     Ok(if status >= 0 { status } else { code })
 }
 
-fn parse_args(args: &[String]) -> Result<(String, Vec<String>), String> {
+/// Parsed `record` arguments.
+#[derive(Debug, PartialEq, Eq)]
+struct Opts {
+    out: String,
+    /// The command to spawn, already wrapped for `--via`.
+    command: Vec<String>,
+    /// `--size COLSxROWS`: the PTY and the header, whatever the terminal is.
+    size: Option<(u16, u16)>,
+    /// `--end-on-eof`: hang up the child when poshterity's stdin ends.
+    end_on_eof: bool,
+    /// `--mark-fifo PATH`: each line written to this fifo becomes a marker.
+    mark_fifo: Option<String>,
+}
+
+fn parse_size(s: &str) -> Option<(u16, u16)> {
+    let (w, h) = s.split_once('x')?;
+    let (w, h): (u16, u16) = (w.trim().parse().ok()?, h.trim().parse().ok()?);
+    (w > 0 && h > 0).then_some((w, h))
+}
+
+fn parse_args(args: &[String]) -> Result<Opts, String> {
     let mut out_path = "recording.castx".to_string();
     let mut via: Option<Via> = None;
     let mut host: Option<String> = None;
+    let mut size: Option<(u16, u16)> = None;
+    let mut end_on_eof = false;
+    let mut mark_fifo: Option<String> = None;
     let mut i = 0;
     while i < args.len() {
         match args[i].as_str() {
@@ -93,6 +146,21 @@ fn parse_args(args: &[String]) -> Result<(String, Vec<String>), String> {
                     .get(i + 1)
                     .ok_or("--out requires a value")?
                     .clone();
+                i += 2;
+            }
+            "--size" => {
+                let v = args.get(i + 1).ok_or("--size requires COLSxROWS")?;
+                size = Some(parse_size(v).ok_or_else(|| {
+                    format!("--size expects COLSxROWS with both > 0, e.g. 100x30, got {v:?}")
+                })?);
+                i += 2;
+            }
+            "--end-on-eof" => {
+                end_on_eof = true;
+                i += 1;
+            }
+            "--mark-fifo" => {
+                mark_fifo = Some(args.get(i + 1).ok_or("--mark-fifo requires a path")?.clone());
                 i += 2;
             }
             "--via" => {
@@ -115,7 +183,13 @@ fn parse_args(args: &[String]) -> Result<(String, Vec<String>), String> {
                 if command.is_empty() {
                     return Err(format!("record requires a command after `--`\n\n{USAGE}"));
                 }
-                return Ok((out_path, wrap_transport(via, host, command)?));
+                return Ok(Opts {
+                    out: out_path,
+                    command: wrap_transport(via, host, command)?,
+                    size,
+                    end_on_eof,
+                    mark_fifo,
+                });
             }
             other => return Err(format!("unexpected argument {other:?}\n\n{USAGE}")),
         }
@@ -151,13 +225,88 @@ fn wrap_transport(
     }
 }
 
+/// Why [`tee_loop`] returned.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum Ended {
+    /// The child closed its side of the PTY (it exited).
+    ChildClosed,
+    /// stdin reached EOF and `--end-on-eof` asked to stop there.
+    StdinEof,
+}
+
+/// What the tee loop does beyond copying bytes.
+struct Tee<'a> {
+    /// `--size` was given: terminal resizes do not reach the child.
+    fixed_size: bool,
+    end_on_eof: bool,
+    marks: Option<&'a MarkFifo>,
+}
+
+/// A fifo whose lines become `m` marker events (`--mark-fifo`). Opened
+/// read-write so the fifo always has a writer (ours) and never reports EOF as
+/// outside writers come and go; removed on drop.
+struct MarkFifo {
+    fd: RawFd,
+    path: std::path::PathBuf,
+    pending: std::cell::RefCell<Vec<u8>>,
+}
+
+impl MarkFifo {
+    fn create(path: &str) -> Result<MarkFifo, String> {
+        use std::os::unix::ffi::OsStrExt;
+        let cpath = std::ffi::CString::new(std::path::Path::new(path).as_os_str().as_bytes())
+            .map_err(|_| format!("{path}: path contains a NUL"))?;
+        // SAFETY: cpath is a valid NUL-terminated path for both calls.
+        let fd = unsafe {
+            if libc::mkfifo(cpath.as_ptr(), 0o600) != 0 {
+                return Err(format!("{path}: {}", std::io::Error::last_os_error()));
+            }
+            libc::open(cpath.as_ptr(), libc::O_RDWR | libc::O_NONBLOCK | libc::O_CLOEXEC)
+        };
+        if fd < 0 {
+            let e = std::io::Error::last_os_error();
+            let _ = std::fs::remove_file(path);
+            return Err(format!("{path}: {e}"));
+        }
+        Ok(MarkFifo { fd, path: path.into(), pending: Default::default() })
+    }
+
+    /// Read what is available and return the complete, non-empty lines.
+    fn lines(&self) -> Vec<String> {
+        let mut buf = [0u8; 1024];
+        let mut pending = self.pending.borrow_mut();
+        // Non-blocking: take what is there. WouldBlock/EOF end the read.
+        while let Ok(n @ 1..) = read_fd(self.fd, &mut buf) {
+            pending.extend_from_slice(&buf[..n]);
+        }
+        let mut out = Vec::new();
+        while let Some(nl) = pending.iter().position(|&b| b == b'\n') {
+            let line: Vec<u8> = pending.drain(..=nl).collect();
+            let text = String::from_utf8_lossy(&line[..line.len() - 1]).trim().to_string();
+            if !text.is_empty() {
+                out.push(text);
+            }
+        }
+        out
+    }
+}
+
+impl Drop for MarkFifo {
+    fn drop(&mut self) {
+        // SAFETY: closing the fd we opened.
+        unsafe { libc::close(self.fd) };
+        let _ = std::fs::remove_file(&self.path);
+    }
+}
+
 /// Copy bytes between the local terminal and the PTY master until the child's
-/// output ends, recording output (`o`), input (`i`), and resizes (`r`).
-fn tee_loop(rec: &mut Recorder<impl std::io::Write>, master: RawFd, start: Instant) -> i32 {
+/// output ends, recording output (`o`), input (`i`), resizes (`r`) and the
+/// markers arriving on `tee.marks` (`m`).
+fn tee_loop(rec: &mut Recorder<impl std::io::Write>, master: RawFd, start: Instant, tee: &Tee) -> Ended {
     let mut buf = [0u8; 4096];
     let mut stdin_open = true;
     loop {
-        if SIGWINCH.swap(false, Ordering::AcqRel) {
+        if SIGWINCH.swap(false, Ordering::AcqRel) && !tee.fixed_size {
             let (rows, cols) = term_size(STDOUT_FD);
             set_term_size(master, rows, cols);
             let _ = rec.resize(start.elapsed().as_secs_f64(), cols, rows);
@@ -171,6 +320,11 @@ fn tee_loop(rec: &mut Recorder<impl std::io::Write>, master: RawFd, start: Insta
             },
             libc::pollfd {
                 fd: master,
+                events: libc::POLLIN,
+                revents: 0,
+            },
+            libc::pollfd {
+                fd: tee.marks.map_or(-1, |m| m.fd),
                 events: libc::POLLIN,
                 revents: 0,
             },
@@ -198,10 +352,25 @@ fn tee_loop(rec: &mut Recorder<impl std::io::Write>, master: RawFd, start: Insta
             }
         }
 
+        // Marker lines -> `m` events, stamped when they are read.
+        if let Some(marks) = tee.marks.filter(|_| fds[2].revents & libc::POLLIN != 0) {
+            for name in marks.lines() {
+                let _ = rec.marker(start.elapsed().as_secs_f64(), &name);
+            }
+        }
+
         // stdin -> PTY master + record as input.
         if stdin_open && fds[0].revents & (libc::POLLIN | libc::POLLHUP) != 0 {
             match read_fd(STDIN_FD, &mut buf) {
-                Ok(0) => stdin_open = false, // EOF: stop forwarding, keep teeing
+                Ok(0) => {
+                    // EOF: stop forwarding. With --end-on-eof that ends the
+                    // recording (the caller hangs the child up); otherwise keep
+                    // teeing until the child exits.
+                    if tee.end_on_eof {
+                        return Ended::StdinEof;
+                    }
+                    stdin_open = false;
+                }
                 Ok(k) => {
                     write_all(master, &buf[..k]);
                     let _ = rec.input(start.elapsed().as_secs_f64(), &buf[..k]);
@@ -211,7 +380,7 @@ fn tee_loop(rec: &mut Recorder<impl std::io::Write>, master: RawFd, start: Insta
             }
         }
     }
-    0
+    Ended::ChildClosed
 }
 
 // --- PTY + window size (mirrors crates/posh/src/pty.rs) ---------------------
@@ -412,26 +581,44 @@ mod tests {
 
     #[test]
     fn no_via_passes_the_command_through() {
-        let (out, cmd) = parse_args(&argv(&["--", "echo", "hi"])).unwrap();
-        assert_eq!(out, "recording.castx");
-        assert_eq!(cmd, argv(&["echo", "hi"]));
+        let o = parse_args(&argv(&["--", "echo", "hi"])).unwrap();
+        assert_eq!(o.out, "recording.castx");
+        assert_eq!(o.command, argv(&["echo", "hi"]));
+        assert_eq!((o.size, o.end_on_eof, o.mark_fifo), (None, false, None));
     }
 
     #[test]
     fn via_posh_wraps_as_a_roaming_shell() {
-        let (out, cmd) = parse_args(&argv(&[
+        let o = parse_args(&argv(&[
             "--out", "r.castx", "--via", "posh", "--host", "box", "--", "posht", "--altscroll",
         ]))
         .unwrap();
-        assert_eq!(out, "r.castx");
-        assert_eq!(cmd, argv(&["posh", "box", "--", "posht", "--altscroll"]));
+        assert_eq!(o.out, "r.castx");
+        assert_eq!(o.command, argv(&["posh", "box", "--", "posht", "--altscroll"]));
     }
 
     #[test]
     fn via_ssh_wraps_with_a_tty_and_no_dashdash() {
-        let (_out, cmd) =
-            parse_args(&argv(&["--via", "ssh", "--host", "user@box", "--", "posht"])).unwrap();
-        assert_eq!(cmd, argv(&["ssh", "-t", "user@box", "posht"]));
+        let o = parse_args(&argv(&["--via", "ssh", "--host", "user@box", "--", "posht"])).unwrap();
+        assert_eq!(o.command, argv(&["ssh", "-t", "user@box", "posht"]));
+    }
+
+    #[test]
+    fn size_end_on_eof_and_mark_fifo_are_parsed() {
+        let o = parse_args(&argv(&[
+            "--size", "100x30", "--end-on-eof", "--mark-fifo", "/tmp/m.fifo", "--", "sh",
+        ]))
+        .unwrap();
+        assert_eq!(o.size, Some((100, 30)), "COLSxROWS");
+        assert!(o.end_on_eof);
+        assert_eq!(o.mark_fifo.as_deref(), Some("/tmp/m.fifo"));
+    }
+
+    #[test]
+    fn bad_size_is_a_usage_error() {
+        for bad in ["100", "x30", "0x30", "100x0", "axb"] {
+            assert!(parse_args(&argv(&["--size", bad, "--", "sh"])).is_err(), "{bad}");
+        }
     }
 
     #[test]
