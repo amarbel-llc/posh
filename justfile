@@ -502,7 +502,7 @@ debug-modal-demo scenario="cancel" secs="30": build-palette
     nix develop --command cargo build -p posh || exit 1
     P="$root/target/debug/posh"
     pal="$root/result-posh-palette/bin/posh-palette"
-    export POSH_DIR="$sock" POSH_GROUP=default POSH_PALETTE="$pal"
+    export POSH_DIR="$sock" POSH_GROUP=default POSH_PALETTE="$pal" POSH_APP_MODAL=1
     unset POSH_SESSION
     "$P" attach --detach demo -- sh -c 'while :; do echo "agent working $(date +%T)"; sleep 1; done' >/dev/null
     TM=(tmux -L posh-modaldemo)
@@ -510,14 +510,14 @@ debug-modal-demo scenario="cancel" secs="30": build-palette
     key() { "${TM[@]}" send-keys -t s "$@"; }
     attach() {
       "${TM[@]}" new-session -d -s s -x 100 -y 20 \
-        "env POSH_DIR='$sock' POSH_GROUP=default POSH_PALETTE='$pal' '$P' attach demo; echo VIEWER_EXITED_\$?; sleep 120"
+        "env POSH_DIR='$sock' POSH_GROUP=default POSH_PALETTE='$pal' POSH_APP_MODAL=1 '$P' attach demo; echo VIEWER_EXITED_\$?; sleep 120"
       sleep 2
     }
     finish() { "$P" kill demo >/dev/null 2>&1; "${TM[@]}" kill-server 2>/dev/null; }
     case "{{ scenario }}" in
       manual)
         echo "session ready. In one terminal:"
-        echo "  env POSH_DIR='$sock' POSH_GROUP=default POSH_PALETTE='$pal' '$P' attach demo"
+        echo "  env POSH_DIR='$sock' POSH_GROUP=default POSH_PALETTE='$pal' POSH_APP_MODAL=1 '$P' attach demo"
         echo "then in another:"
         echo "  env POSH_DIR='$sock' POSH_GROUP=default '$P' modal demo --timeout {{ secs }}; echo exit=\$?"
         echo "(Ctrl-^ in the viewer reviews the countdown; clean up: POSH_DIR='$sock' POSH_GROUP=default '$P' kill demo)"
@@ -606,7 +606,7 @@ debug-modal-try secs="30" dismiss="cancel": build-palette
     rm -rf "$dir"; mkdir -p "$sock"; chmod 700 "$dir" "$sock"
     nix develop --command cargo build -p posh || exit 1
     P="$root/target/debug/posh"
-    export POSH_DIR="$sock" POSH_GROUP=default POSH_PALETTE="$root/result-posh-palette/bin/posh-palette"
+    export POSH_DIR="$sock" POSH_GROUP=default POSH_PALETTE="$root/result-posh-palette/bin/posh-palette" POSH_APP_MODAL=1
     unset POSH_SESSION
     "$P" attach --detach demo -- sh -c 'while :; do echo "agent working $(date +%T)"; sleep 1; done' >/dev/null
     ( sleep 3
@@ -643,7 +643,7 @@ debug-modal-record scenario="cancel" secs="30": build-palette
     rm -rf "$dir"; mkdir -p "$sock"; chmod 700 "$dir" "$sock"
     nix develop --command cargo build -p posh -p poshterity || exit 1
     P="$root/target/debug/posh"; PT="$root/target/debug/poshterity"
-    export POSH_DIR="$sock" POSH_GROUP=default POSH_PALETTE="$root/result-posh-palette/bin/posh-palette"
+    export POSH_DIR="$sock" POSH_GROUP=default POSH_PALETTE="$root/result-posh-palette/bin/posh-palette" POSH_APP_MODAL=1
     unset POSH_SESSION
     "$P" attach --detach demo -- sh -c 'while :; do echo "agent working $(date +%T)"; sleep 1; done' >/dev/null
     F="$dir/viewer.castx"

@@ -1752,6 +1752,17 @@ fn modal_resolve(clients: &mut [ClientConn], modal: &mut Option<super::modal::Ru
     }
 }
 
+/// PROTOTYPE modal, gate off: answer a requester `disabled` (a viewer's
+/// `choose` and anything unparseable get no reply).
+fn modal_refuse_disabled(client: &mut ClientConn, payload: &[u8]) {
+    use super::modal::{self, Request};
+    match modal::parse_request(payload) {
+        Ok(Request::Probe) => client.queue(Tag::Modal, &modal::disabled_probe_payload()),
+        Ok(Request::Start(spec)) => client.queue(Tag::Modal, &modal::disabled_payload(&spec.id)),
+        Err(_) => {}
+    }
+}
+
 /// PROTOTYPE modal: handle one `Tag::Modal` payload from `clients[from]` — a
 /// viewer's `choose`, or a requester's `request` / `probe`.
 fn modal_handle(
@@ -2198,6 +2209,12 @@ fn daemon_loop(
     // PROTOTYPE app-presented modal (`session/modal.rs`): at most one, owned
     // here so the daemon's clock decides it whatever the viewers do.
     let mut modal: Option<super::modal::Run> = None;
+    // Opt-in (`POSH_APP_MODAL=1` in the environment this daemon was created
+    // with); off, every request is answered `disabled` and nothing else changes.
+    let modal_on = super::modal::enabled();
+    if modal_on {
+        util::log_write("info", "app modal enabled (POSH_APP_MODAL)");
+    }
     // FDR 0022: who may attach. `None` (the default) ⇒ every peer is a client.
     let mut confine = super::confine::Confine::from_env();
     if let Some(c) = &confine {
@@ -2835,7 +2852,11 @@ fn daemon_loop(
                 }
             }
             for payload in modal_msgs {
-                modal_handle(clients, i, &payload, &mut modal, util::now_ms());
+                if modal_on {
+                    modal_handle(clients, i, &payload, &mut modal, util::now_ms());
+                } else {
+                    modal_refuse_disabled(&mut clients[i], &payload);
+                }
             }
             if detach_all {
                 util::log_write("info", &format!("detach all clients={}", clients.len()));

@@ -1386,7 +1386,10 @@ fn client_loop(
     extra_caps.push(caps::encode_push_cmd());
     // PROTOTYPE app-presented modal: this viewport renders the daemon's
     // countdown (banner, then the `countdown` view on Ctrl-^).
-    extra_caps.push(caps::Cap { id: caps::CAP_APP_MODAL, payload: vec![] });
+    // Opt-in: only with POSH_APP_MODAL=1, so an ordinary attach is unchanged.
+    if super::modal::enabled() {
+        extra_caps.push(caps::Cap { id: caps::CAP_APP_MODAL, payload: vec![] });
+    }
     // Advertise CAP_COALESCE only when opted in (posh#137, `POSH_COALESCE=1`):
     // coalescing bounds the daemon's per-client `write_buf` so an output burst
     // can't grow it past MAX_CLIENT_BACKLOG and get us dropped (the

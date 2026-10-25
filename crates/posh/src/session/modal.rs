@@ -7,6 +7,28 @@
 //! every rule is unit-testable. Design:
 //! `docs/plans/2026-10-24-app-modals-for-restart.md`.
 //!
+//! # Opt-in, and how to remove it
+//!
+//! Off unless `POSH_APP_MODAL=1` (see [`parse_gate`]): a daemon without it
+//! answers `disabled`, and a viewer without it does not advertise
+//! `CAP_APP_MODAL`, so an ordinary session is unchanged. To delete the whole
+//! prototype, remove these and let the compiler find the rest:
+//!
+//! - this file and `tests/modal_integration.rs` (and `mod modal;` in `mod.rs`);
+//! - `Tag::Modal` (`ipc.rs`) and `CAP_APP_MODAL` (`posh-proto/src/caps.rs`);
+//! - `daemon.rs`: the `modal` state and `modal_on`, `modal_*` / `merge_poll_timeouts`
+//!   helpers, the `Tag::Modal` arm, the poll-timeout merge, the requester reset;
+//! - `client.rs`: `modal_banner`, `open_modal_view`, the `modal` / `modal_view_open`
+//!   state and its three hooks (receive, `Ctrl-^`, palette events), the
+//!   `app.modal.choose` dispatch arm, the cap advertisement;
+//! - `remote/palette.rs`: `show_countdown` / `update_countdown` / `hide` + tests;
+//! - `session/mod.rs` `cmd_modal` and the `modal` arm in `main.rs`;
+//! - `posh-palette/countdown.go`, `countdown_test.go` and the `countdown` /
+//!   `ui.update` cases in `main.go`;
+//! - the `debug-modal-*` recipes in the justfile.
+//!
+//! `rg 'PROTOTYPE|Tag::Modal|CAP_APP_MODAL|app\.modal|modal_'` lists every site.
+//!
 //! Wire: every message is one `Tag::Modal` frame whose payload is a JSON
 //! object with an `op`:
 //!
@@ -23,6 +45,36 @@
 use std::os::fd::RawFd;
 
 use serde_json::{json, Value};
+
+/// The opt-IN gate `POSH_APP_MODAL`: `1`, `true`, `on` or `yes` (trimmed,
+/// case-insensitive) turn the feature on; anything else, unset included,
+/// leaves it off. Read by the session DAEMON (from the environment of the
+/// process that created the session) and by each local VIEWER at attach. Off,
+/// the daemon answers every request `disabled`, and a viewer does not
+/// advertise `CAP_APP_MODAL`, so nothing about a session changes.
+pub fn parse_gate(value: Option<&str>) -> bool {
+    matches!(
+        value.map(|v| v.trim().to_ascii_lowercase()).as_deref(),
+        Some("1" | "true" | "on" | "yes")
+    )
+}
+
+/// [`parse_gate`] of `$POSH_APP_MODAL`.
+pub fn enabled() -> bool {
+    parse_gate(std::env::var("POSH_APP_MODAL").ok().as_deref())
+}
+
+/// The `result` a daemon with the gate off gives a request.
+pub fn disabled_payload(id: &str) -> Vec<u8> {
+    refusal_payload(id, "disabled", "the daemon runs without POSH_APP_MODAL=1")
+}
+
+/// The `probe` answer of a daemon with the gate off.
+pub fn disabled_probe_payload() -> Vec<u8> {
+    json!({"op": "probe", "modal": "disabled", "active": Value::Null, "capable": 0, "attached": 0})
+        .to_string()
+        .into_bytes()
+}
 
 /// How often the daemon re-sends `show` (the viewport displays the remaining
 /// time the daemon names, never its own clock).
@@ -398,14 +450,18 @@ pub fn parse_cli(args: &[String], pid: u32) -> Result<CliArgs, String> {
 
 /// The process exit code for a daemon reply: `0` proceed (a timeout, "restart
 /// now", or no viewer to ask), `10` the user cancelled, `11` busy, `12`
-/// invalid. Probes exit `0`.
+/// invalid, `13` the feature is off in that daemon (so the caller can tell
+/// "nobody was asked" from "nobody objected"). Probes exit `0`, or `13` when
+/// disabled.
 pub fn exit_code(reply: &Value) -> i32 {
     match reply.get("op").and_then(Value::as_str) {
+        Some("probe") if reply["modal"] == "disabled" => 13,
         Some("probe") => 0,
         _ => match (reply["outcome"].as_str(), reply["button"].as_str()) {
             (Some("button"), Some(CANCEL_BUTTON)) => 10,
             (Some("busy"), _) => 11,
             (Some("invalid"), _) => 12,
+            (Some("disabled"), _) => 13,
             _ => 0,
         },
     }
@@ -417,6 +473,26 @@ mod tests {
 
     fn argv(a: &[&str]) -> Vec<String> {
         a.iter().map(|s| s.to_string()).collect()
+    }
+
+    #[test]
+    fn the_gate_is_opt_in_and_strict() {
+        for on in ["1", "true", "ON", " yes "] {
+            assert!(parse_gate(Some(on)), "{on:?}");
+        }
+        for off in [None, Some(""), Some("0"), Some("maybe"), Some("2"), Some("false")] {
+            assert!(!parse_gate(off), "{off:?}");
+        }
+    }
+
+    #[test]
+    fn a_disabled_daemon_answers_with_its_own_outcome_and_exit_code() {
+        let v: Value = serde_json::from_slice(&disabled_payload("r1")).unwrap();
+        assert_eq!((v["outcome"].as_str(), v["id"].as_str()), (Some("disabled"), Some("r1")));
+        assert_eq!(exit_code(&v), 13, "not 0: the caller must not read it as 'proceed'");
+        let p: Value = serde_json::from_slice(&disabled_probe_payload()).unwrap();
+        assert_eq!(p["modal"], "disabled");
+        assert_eq!(exit_code(&p), 13);
     }
 
     #[test]

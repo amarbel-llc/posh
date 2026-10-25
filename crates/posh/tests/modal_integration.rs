@@ -78,10 +78,24 @@ struct Fixture {
 }
 
 impl Fixture {
+    /// A session whose daemon has the feature gate on (`POSH_APP_MODAL=1`).
     fn new(prefix: &str) -> Fixture {
+        Fixture::with_gate(prefix, Some("1"))
+    }
+
+    fn with_gate(prefix: &str, gate: Option<&str>) -> Fixture {
         let dir = test_dir(prefix);
         std::fs::create_dir_all(&dir).unwrap();
-        let out = posh(&dir, &["attach", "--detach", "m", "sleep", "300"]);
+        let mut cmd = Command::new(env!("CARGO_BIN_EXE_posh"));
+        cmd.args(["attach", "--detach", "m", "sleep", "300"])
+            .env("POSH_DIR", &dir)
+            .env_remove("POSH_SESSION")
+            .env_remove("POSH_GROUP")
+            .env_remove("POSH_APP_MODAL");
+        if let Some(g) = gate {
+            cmd.env("POSH_APP_MODAL", g);
+        }
+        let out = cmd.output().expect("run posh");
         assert!(out.status.success(), "attach --detach failed: {out:?}");
         let sock = dir.join("default").join("m");
         wait_for(|| UnixStream::connect(&sock).is_ok(), "the session's socket");
@@ -124,6 +138,30 @@ fn request(id: &str, timeout_ms: u64, on_dismiss: Value) -> Vec<u8> {
     })
     .to_string()
     .into_bytes()
+}
+
+#[test]
+fn without_the_gate_the_daemon_refuses_and_a_viewer_is_never_shown_anything() {
+    // The feature is opt-in (POSH_APP_MODAL on the DAEMON): off, a request is
+    // answered `disabled` at once and nothing reaches a viewer.
+    let fx = Fixture::with_gate("posh-modal-off", None);
+    let mut viewer = fx.viewer();
+    let mut req = fx.conn();
+    send(&mut req, TAG_MODAL, &request("r1", 30_000, json!("cancel")));
+    let r = next_op(&mut req, "result");
+    assert_eq!((r["outcome"].as_str(), r["id"].as_str()), (Some("disabled"), Some("r1")));
+    send(&mut req, TAG_MODAL, br#"{"op":"probe"}"#);
+    assert_eq!(next_op(&mut req, "probe")["modal"], "disabled", "a probe says so too");
+    viewer.set_read_timeout(Some(Duration::from_millis(600))).unwrap();
+    assert!(next_modal(&mut viewer).is_none(), "the viewer saw no modal traffic");
+}
+
+#[test]
+fn an_unrecognized_gate_value_leaves_the_feature_off() {
+    let fx = Fixture::with_gate("posh-modal-maybe", Some("maybe"));
+    let mut req = fx.conn();
+    send(&mut req, TAG_MODAL, &request("r1", 30_000, json!("cancel")));
+    assert_eq!(next_op(&mut req, "result")["outcome"], "disabled");
 }
 
 #[test]
