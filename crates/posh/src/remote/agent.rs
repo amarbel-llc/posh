@@ -1846,16 +1846,19 @@ pub struct AgentNotice {
     host: String,
 }
 
+/// `POSH_AGENT_NOTICE` as the shared off-switch (posh#154): the notice is on
+/// unless the value is one of the explicit off spellings.
+fn notice_silenced(value: Option<&str>) -> bool {
+    !crate::util::parse_default_on_gate(value)
+}
+
 impl AgentNotice {
-    /// Builds the limiter for `host` from the environment: `POSH_AGENT_NOTICE=no`
-    /// (or `0`) silences it; anything else (including unset) leaves it enabled —
-    /// the FDR ships it on in v1.
+    /// Builds the limiter for `host` from the environment: `POSH_AGENT_NOTICE`
+    /// `no`/`0`/`false`/`off` (trimmed, case-insensitive) silences it; anything
+    /// else (including unset) leaves it enabled — the FDR ships it on in v1.
     #[allow(dead_code)] // wired into the client loop alongside this type
     pub fn from_env(host: &str) -> AgentNotice {
-        let silenced = matches!(
-            std::env::var("POSH_AGENT_NOTICE").ok().as_deref(),
-            Some("no") | Some("0")
-        );
+        let silenced = notice_silenced(std::env::var("POSH_AGENT_NOTICE").ok().as_deref());
         AgentNotice {
             silenced,
             last_shown: None,
@@ -2069,6 +2072,18 @@ fn endpoint_pid(dir: &Path, stem: &str) -> Option<i32> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// posh#154: the notice gate uses the shared off-switch spellings (it used
+    /// to honour only `no` and `0`, untrimmed and case-sensitive).
+    #[test]
+    fn the_agent_notice_is_silenced_by_every_shared_off_spelling_and_only_those() {
+        for off in ["no", "0", "false", "off", " OFF ", "No"] {
+            assert!(notice_silenced(Some(off)), "{off:?} silences the notice");
+        }
+        for on in [None, Some(""), Some("1"), Some("yes"), Some("maybe")] {
+            assert!(!notice_silenced(on), "{on:?} leaves the notice on");
+        }
+    }
 
     /// A private 0700 base dir with a SHORT path, so the unix sockets bound
     /// under `<base>/agent/srv-<pid>.sock` stay within SUN_LEN (~104). The

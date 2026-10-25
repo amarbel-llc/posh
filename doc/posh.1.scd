@@ -571,8 +571,8 @@ _POSH_RELAY_
 	Remote *host:session* bootstrap selection (default on): the
 	single-model frame relay, in which *posh-server* forwards the session
 	daemon's frames directly instead of running an inner *posh attach* in a
-	second terminal (RFC 0008). _0_ forces the legacy inner-attach
-	bootstrap. A relay bootstrap also auto-falls-back to the legacy path
+	second terminal (RFC 0008). _0_, _false_, _off_ or _no_ (trimmed,
+	case-insensitive) forces the legacy inner-attach bootstrap. A relay bootstrap also auto-falls-back to the legacy path
 	against a daemon that does not emit frames, so both interoperate with
 	no flag day.
 
@@ -682,7 +682,8 @@ _POSH_AGENT_NOTICE_
 	When agent forwarding is active, a rate-limited banner (at most one
 	per minute) reports when the remote host opens a connection to your
 	forwarded agent — the ambient signal that it is being used. Enabled
-	by default; set to *no* or *0* to silence it.
+	by default; set to *no*, *0*, *false* or *off* (trimmed,
+	case-insensitive) to silence it.
 
 _POSH_SERVER_NETWORK_TMOUT_
 	Server exits after N seconds without client contact (0 = never,

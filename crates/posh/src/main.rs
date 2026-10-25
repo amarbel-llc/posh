@@ -1489,7 +1489,13 @@ fn cmd_ssh_session(
 /// legacy Architecture-A inner-`posh attach` composition (RFC 0008 §3
 /// client-side rollback). Any other value (or unset) keeps the relay.
 fn relay_enabled() -> bool {
-    std::env::var("POSH_RELAY").as_deref() != Ok("0")
+    relay_gate(std::env::var("POSH_RELAY").ok().as_deref())
+}
+
+/// `POSH_RELAY` as a pure default-on gate (posh#154): `0`/`false`/`off`/`no`,
+/// trimmed and case-insensitive, select the legacy composition.
+fn relay_gate(value: Option<&str>) -> bool {
+    util::parse_default_on_gate(value)
 }
 
 /// The `posh-server new` tail for the foreground `host:session` bootstrap, chosen
@@ -2273,6 +2279,18 @@ OTHER
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// posh#154: `POSH_RELAY` takes the shared off spellings (it used to honour
+    /// only an exact `0`); unset, empty and anything else keep the relay.
+    #[test]
+    fn the_relay_gate_takes_every_shared_off_spelling_and_defaults_on() {
+        for off in ["0", "false", "off", "no", " OFF "] {
+            assert!(!relay_gate(Some(off)), "{off:?} selects the legacy composition");
+        }
+        for on in [None, Some(""), Some("1"), Some("relay"), Some("maybe")] {
+            assert!(relay_gate(on), "{on:?} keeps the relay");
+        }
+    }
 
     /// The build identity is composed exactly once (in `posh_build`), so the
     /// composed `POSH_BUILD` every surface renders and the two parts the wire
