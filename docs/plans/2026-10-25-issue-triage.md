@@ -19,7 +19,7 @@ reviewer read the head, the tail and the comments. Those rows say so.
 |---|---|---|
 | 175 | S / low | `docs/features/0011` lines 92, 95, 136, 137, 190 name `--workers` and `posh list --format json`; `main.rs:1878` has only `--json`/`-j`. Cheap fix: edit the doc to match the CLI. |
 | 207 | S / low | `doc/posh.1.scd` has no `version` entry. `posh version` output format not verified. |
-| 149 | S / none | `remote/diag.rs:427,458,491,558` hold `100.85.205.39:60006`; swap for a `192.0.2.x` address. |
+| 149 | S / none | `remote/diag.rs:427,458,491,558` held a real-looking tailnet address in test fixtures; swapped for `192.0.2.7` (documentation range). Done. |
 | 92 | S / none | Palette "Reset & resync" is absent from the command-palette FDR (0009); RFC 0006 documents `CLIENT_FLAG_RESYNC`. Docs only. |
 | 68 | S / low | No FDR for `POSH_DEBUG_LOG`; docs-only. The issue allows "too small for an FDR". |
 | 88 | S / low | `zz-pocs/charm-tui-poc` still exists and nothing outside it references it. Check the justfile and flake for its recipes before deleting. |

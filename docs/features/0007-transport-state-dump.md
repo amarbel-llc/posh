@@ -73,7 +73,7 @@ Implementation: `remote/diag.rs`; documented under SIGNALS in `posh-server`(1)
 A wedged server that has not heard from its client in 40s and has a frame the
 client never acked — a stalled delivery, peer still nominally pinned:
 
-    role=server pid=648244 peer_active=1 has_remote=1 remote=100.85.205.39:51234 \
+    role=server pid=648244 peer_active=1 has_remote=1 remote=192.0.2.7:51234 \
       last_heard_age_ms=40231 last_send_age_ms=57 current_num=918 acked_num=915 \
       unacked=3 outstanding=3 srtt=114ms rto=350ms send_interval=57ms ... pty_open=1
 

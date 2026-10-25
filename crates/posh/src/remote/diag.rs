@@ -424,7 +424,7 @@ mod tests {
         ServerState {
             peer_active: true,
             has_remote: true,
-            remote: Some("100.85.205.39:60006".parse().unwrap()),
+            remote: Some("192.0.2.7:60006".parse().unwrap()),
             last_heard_age_ms: 1234,
             last_send_age_ms: Some(57),
             current_num: 42,
@@ -455,7 +455,7 @@ mod tests {
             "role=server",
             "peer_active=1",
             "has_remote=1",
-            "remote=100.85.205.39:60006",
+            "remote=192.0.2.7:60006",
             "last_heard_age_ms=1234",
             "last_send_age_ms=57",
             "current_num=42",
@@ -488,7 +488,7 @@ mod tests {
     #[test]
     fn client_format_carries_transport_fields() {
         let line = ClientState {
-            remote: Some("100.85.205.39:60006".parse().unwrap()),
+            remote: Some("192.0.2.7:60006".parse().unwrap()),
             last_send_age_ms: Some(20),
             last_heard_age_ms: 1234,
             applied_num: 41,
@@ -555,7 +555,7 @@ mod tests {
         }
         for key in [
             "role=client",
-            "remote=100.85.205.39:60006",
+            "remote=192.0.2.7:60006",
             "last_send_age_ms=20",
             "applied_num=41",
             "outbox_base=7",
