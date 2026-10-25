@@ -7168,6 +7168,54 @@ mod tests {
         }
     }
 
+    /// posh#225, the case Stage 1 documents as NOT fixed: a viewport wider and
+    /// taller than the session (the larger of two differently-sized viewports
+    /// on one session) is built `dump_vt_mirror`'s "any other geometry" frame,
+    /// which is `dump_vt`'s bytes, ring included. Under a flood each visible
+    /// frame is then about the size of the ring, so the same 16 MiB backlog
+    /// drop reaches a healthy viewport. Red today, hence `#[ignore]`; remove
+    /// the attribute with the fix (a frame bounded at any viewport geometry:
+    /// posh#233, or paced delivery for the local attach: Stage 6).
+    #[test]
+    #[ignore = "posh#225: a wider-than-session viewport still gets ring-sized frames"]
+    fn posh225_a_viewport_larger_than_the_session_keeps_visible_frames_screen_sized() {
+        const KIB: usize = 1024;
+        let (rows, cols) = (24u16, 80u16);
+        let mut term = Terminal::with_scrollback(rows, cols, SCROLLBACK);
+        for i in 0..SCROLLBACK + 200 {
+            term.process(format!("{i:08} pre-attach history row, padded out to ~100 bytes ................\r\n").as_bytes());
+        }
+        // The larger viewport: 40x132 against a 24x80 session.
+        let content = [
+            caps::Cap { id: caps::CAP_SCROLLBACK, payload: vec![0] },
+            caps::Cap { id: caps::CAP_BASE_SUM, payload: vec![] },
+        ];
+        let (mut c, _peer) = lossy_conn(40, 132, &content);
+        c.sb_floor = term.primary_scrollback_total();
+        assert!(c.request_frame_from(&term));
+        c.apply_frame_ack(&ipc::encode_frame_ack(1, 0));
+        c.write_buf.clear();
+
+        let flood = newline_flood(256 * KIB);
+        let mut largest_chunk_queue = 0usize;
+        for piece in flood.chunks(4 * KIB) {
+            term.process(piece);
+            let before = c.write_buf.len();
+            broadcast_output(std::slice::from_mut(&mut c), &term, piece);
+            largest_chunk_queue = largest_chunk_queue.max(c.write_buf.len() - before);
+            // A prompt reader: everything queued is delivered and the newest
+            // visible frame acked, so any backlog is the daemon's own doing.
+            let newest = c.producer.as_ref().unwrap().last_visible_num();
+            c.write_buf.clear();
+            c.apply_frame_ack(&ipc::encode_frame_ack(newest, 0));
+        }
+        assert!(
+            largest_chunk_queue < 64 * KIB,
+            "one 4 KiB chunk queued {largest_chunk_queue} bytes for a larger-than-session viewport — \
+             its visible frame is carrying the scrollback ring"
+        );
+    }
+
     /// posh#225 harness self-check: the SAME helpers
     /// [`posh225_full_ring_flood_keeps_visible_frames_screen_sized`] uses, run
     /// against a short flood into an EMPTY ring. It guards the empty-ring path
