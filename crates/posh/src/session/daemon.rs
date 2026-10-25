@@ -3449,6 +3449,12 @@ mod tests {
         // A connected pair gives the struct a real fd without a daemon; only
         // the parse-side fields (rows/cols/caps) are exercised here.
         let (stream, _peer) = UnixStream::pair().unwrap();
+        conn_on(stream)
+    }
+
+    /// A never-Inited connection over `stream` with every field at its zero
+    /// value; the one place a test builds a `ClientConn` literal (posh#230).
+    fn conn_on(stream: UnixStream) -> ClientConn {
         ClientConn {
             stream,
             read_buf: FrameBuffer::new(),
@@ -3580,41 +3586,7 @@ mod tests {
     /// The peer end is returned so the socket stays open for the test's lifetime.
     fn frame_capable_conn(rows: u16, cols: u16) -> (ClientConn, UnixStream) {
         let (stream, peer) = UnixStream::pair().unwrap();
-        let mut c = ClientConn {
-            stream,
-            read_buf: FrameBuffer::new(),
-            write_buf: Vec::new(),
-            rows: 0,
-            cols: 0,
-            caps: Vec::new(),
-            producer: None,
-            lossy: false,
-            coalesce: false,
-            coalesce_off: false,
-            pending_frame_start: None,
-            sb_floor: 0,
-            acked_sb_total: 0,
-            bytes_drained: 0,
-            last_drain_ms: 0,
-            hiwater_mb: 0,
-            echo_flag: 0,
-            overlay_flag: 0,
-            record: introspect::ClientRecord::default(),
-            record_at: 0,
-            attach_pid: None,
-            last_input_ms: 0,
-            wants_activity: false,
-            activity_now: None,
-            activity_sent: None,
-            kind: SessionKind::Unknown,
-            kind_sent: false,
-            wants_push_cmd: false,
-            push_offered: false,
-            visible_shaped_for: None,
-            regeometry_keyframe: None,
-            pacing: None,
-            init_applied: false,
-        };
+        let mut c = conn_on(stream);
         let mut init = ipc::encode_resize(rows, cols).to_vec();
         init.extend_from_slice(&caps::encode_table(&caps::own_table(&[])));
         c.apply_init(&init, 0);
@@ -3625,41 +3597,7 @@ mod tests {
     /// A frame client advertising `CAP_KITTY_KEYBOARD` with `flags` (RFC 0010).
     fn kitty_frame_conn(rows: u16, cols: u16, flags: u8) -> (ClientConn, UnixStream) {
         let (stream, peer) = UnixStream::pair().unwrap();
-        let mut c = ClientConn {
-            stream,
-            read_buf: FrameBuffer::new(),
-            write_buf: Vec::new(),
-            rows: 0,
-            cols: 0,
-            caps: Vec::new(),
-            producer: None,
-            lossy: false,
-            coalesce: false,
-            coalesce_off: false,
-            pending_frame_start: None,
-            sb_floor: 0,
-            acked_sb_total: 0,
-            bytes_drained: 0,
-            last_drain_ms: 0,
-            hiwater_mb: 0,
-            echo_flag: 0,
-            overlay_flag: 0,
-            record: introspect::ClientRecord::default(),
-            record_at: 0,
-            attach_pid: None,
-            last_input_ms: 0,
-            wants_activity: false,
-            activity_now: None,
-            activity_sent: None,
-            kind: SessionKind::Unknown,
-            kind_sent: false,
-            wants_push_cmd: false,
-            push_offered: false,
-            visible_shaped_for: None,
-            regeometry_keyframe: None,
-            pacing: None,
-            init_applied: false,
-        };
+        let mut c = conn_on(stream);
         let mut init = ipc::encode_resize(rows, cols).to_vec();
         init.extend_from_slice(&caps::encode_table(&caps::own_table(&[caps::Cap {
             id: caps::CAP_KITTY_KEYBOARD,
@@ -4260,41 +4198,7 @@ mod tests {
     /// §1), so it both frames the screen AND wants scrolled-off rows synced.
     fn scrollback_capable_conn(rows: u16, cols: u16) -> (ClientConn, UnixStream) {
         let (stream, peer) = UnixStream::pair().unwrap();
-        let mut c = ClientConn {
-            stream,
-            read_buf: FrameBuffer::new(),
-            write_buf: Vec::new(),
-            rows: 0,
-            cols: 0,
-            caps: Vec::new(),
-            producer: None,
-            lossy: false,
-            coalesce: false,
-            coalesce_off: false,
-            pending_frame_start: None,
-            sb_floor: 0,
-            acked_sb_total: 0,
-            bytes_drained: 0,
-            last_drain_ms: 0,
-            hiwater_mb: 0,
-            echo_flag: 0,
-            overlay_flag: 0,
-            record: introspect::ClientRecord::default(),
-            record_at: 0,
-            attach_pid: None,
-            last_input_ms: 0,
-            wants_activity: false,
-            activity_now: None,
-            activity_sent: None,
-            kind: SessionKind::Unknown,
-            kind_sent: false,
-            wants_push_cmd: false,
-            push_offered: false,
-            visible_shaped_for: None,
-            regeometry_keyframe: None,
-            pacing: None,
-            init_applied: false,
-        };
+        let mut c = conn_on(stream);
         let mut init = ipc::encode_resize(rows, cols).to_vec();
         init.extend_from_slice(&caps::encode_table(&caps::own_table(&[caps::Cap {
             id: caps::CAP_SCROLLBACK,
@@ -4547,41 +4451,7 @@ mod tests {
     /// NOT self-acked — its base advances only on `apply_frame_ack`.
     fn lossy_conn(rows: u16, cols: u16, extra: &[caps::Cap]) -> (ClientConn, UnixStream) {
         let (stream, peer) = UnixStream::pair().unwrap();
-        let mut c = ClientConn {
-            stream,
-            read_buf: FrameBuffer::new(),
-            write_buf: Vec::new(),
-            rows: 0,
-            cols: 0,
-            caps: Vec::new(),
-            producer: None,
-            lossy: false,
-            coalesce: false,
-            coalesce_off: false,
-            pending_frame_start: None,
-            sb_floor: 0,
-            acked_sb_total: 0,
-            bytes_drained: 0,
-            last_drain_ms: 0,
-            hiwater_mb: 0,
-            echo_flag: 0,
-            overlay_flag: 0,
-            record: introspect::ClientRecord::default(),
-            record_at: 0,
-            attach_pid: None,
-            last_input_ms: 0,
-            wants_activity: false,
-            activity_now: None,
-            activity_sent: None,
-            kind: SessionKind::Unknown,
-            kind_sent: false,
-            wants_push_cmd: false,
-            push_offered: false,
-            visible_shaped_for: None,
-            regeometry_keyframe: None,
-            pacing: None,
-            init_applied: false,
-        };
+        let mut c = conn_on(stream);
         let mut table = vec![caps::Cap {
             id: caps::CAP_LOSSY,
             payload: vec![],
@@ -5187,41 +5057,7 @@ mod tests {
     /// base_sum) and its queued visible frames coalesce in `write_buf`.
     fn coalesce_conn(rows: u16, cols: u16) -> (ClientConn, UnixStream) {
         let (stream, peer) = UnixStream::pair().unwrap();
-        let mut c = ClientConn {
-            stream,
-            read_buf: FrameBuffer::new(),
-            write_buf: Vec::new(),
-            rows: 0,
-            cols: 0,
-            caps: Vec::new(),
-            producer: None,
-            lossy: false,
-            coalesce: false,
-            coalesce_off: false,
-            pending_frame_start: None,
-            sb_floor: 0,
-            acked_sb_total: 0,
-            bytes_drained: 0,
-            last_drain_ms: 0,
-            hiwater_mb: 0,
-            echo_flag: 0,
-            overlay_flag: 0,
-            record: introspect::ClientRecord::default(),
-            record_at: 0,
-            attach_pid: None,
-            last_input_ms: 0,
-            wants_activity: false,
-            activity_now: None,
-            activity_sent: None,
-            kind: SessionKind::Unknown,
-            kind_sent: false,
-            wants_push_cmd: false,
-            push_offered: false,
-            visible_shaped_for: None,
-            regeometry_keyframe: None,
-            pacing: None,
-            init_applied: false,
-        };
+        let mut c = conn_on(stream);
         let mut init = ipc::encode_resize(rows, cols).to_vec();
         init.extend_from_slice(&caps::encode_table(&caps::own_table(&[caps::Cap {
             id: caps::CAP_COALESCE,
@@ -5398,41 +5234,7 @@ mod tests {
     /// coalescing client's base advances solely on its own `Tag::FrameAck`.
     fn coalesce_scrollback_conn(rows: u16, cols: u16) -> (ClientConn, UnixStream) {
         let (stream, peer) = UnixStream::pair().unwrap();
-        let mut c = ClientConn {
-            stream,
-            read_buf: FrameBuffer::new(),
-            write_buf: Vec::new(),
-            rows: 0,
-            cols: 0,
-            caps: Vec::new(),
-            producer: None,
-            lossy: false,
-            coalesce: false,
-            coalesce_off: false,
-            pending_frame_start: None,
-            sb_floor: 0,
-            acked_sb_total: 0,
-            bytes_drained: 0,
-            last_drain_ms: 0,
-            hiwater_mb: 0,
-            echo_flag: 0,
-            overlay_flag: 0,
-            record: introspect::ClientRecord::default(),
-            record_at: 0,
-            attach_pid: None,
-            last_input_ms: 0,
-            wants_activity: false,
-            activity_now: None,
-            activity_sent: None,
-            kind: SessionKind::Unknown,
-            kind_sent: false,
-            wants_push_cmd: false,
-            push_offered: false,
-            visible_shaped_for: None,
-            regeometry_keyframe: None,
-            pacing: None,
-            init_applied: false,
-        };
+        let mut c = conn_on(stream);
         let mut init = ipc::encode_resize(rows, cols).to_vec();
         init.extend_from_slice(&caps::encode_table(&caps::own_table(&[
             caps::Cap { id: caps::CAP_COALESCE, payload: vec![] },
