@@ -1860,6 +1860,8 @@ fn create_pushed_session(group: &str, cwd: &str, token: u64) -> Result<String> {
 /// exactly one viewport). The requester's own connection is excluded; ties
 /// and the never-typed case fall to the LATEST-attached candidate (highest
 /// index — accept order). `None` when no other connection is attached.
+/// A connection that never sent `Init` (a one-shot `posh list` probe) is not
+/// a viewport and is skipped (posh#242).
 /// Deliberately unfiltered by frame capability: the most-recent-input
 /// connection IS the issuing viewport, and re-routing to a "more capable"
 /// other viewport would switch the wrong screen — an old client that skips
@@ -1868,7 +1870,7 @@ fn create_pushed_session(group: &str, cwd: &str, token: u64) -> Result<String> {
 fn switch_route_target(clients: &[ClientConn], requester: usize) -> Option<usize> {
     let mut best: Option<(u64, usize)> = None;
     for (j, c) in clients.iter().enumerate() {
-        if j == requester {
+        if j == requester || !c.initialized() {
             continue;
         }
         let key = (c.last_input_ms, j);
@@ -3672,9 +3674,9 @@ mod tests {
 
     #[test]
     fn switch_routes_to_most_recent_input_excluding_requester() {
-        let mut a = test_client_conn();
+        let mut a = baseline_conn();
         a.last_input_ms = 100;
-        let mut b = test_client_conn();
+        let mut b = baseline_conn();
         b.last_input_ms = 200;
         let requester = test_client_conn(); // never typed (it only requested)
         let clients = vec![a, b, requester];
@@ -3688,12 +3690,27 @@ mod tests {
     fn switch_falls_back_to_latest_attached_and_none_when_alone() {
         // Nobody has typed: the latest-attached candidate (highest index)
         // wins — accept order, the freshest viewport.
-        let clients = vec![test_client_conn(), test_client_conn(), test_client_conn()];
+        let clients = vec![baseline_conn(), baseline_conn(), baseline_conn()];
         assert_eq!(switch_route_target(&clients, 0), Some(2));
         assert_eq!(switch_route_target(&clients, 2), Some(1));
         // Only the requester is connected: nothing to route to.
-        let lone = vec![test_client_conn()];
+        let lone = vec![baseline_conn()];
         assert_eq!(switch_route_target(&lone, 0), None);
+    }
+
+    /// posh#242: a one-shot connection that never sent `Init` (a concurrent
+    /// `posh list` probe) is not a viewport, so the never-typed tie must not
+    /// route the switch to it even when it sits at a higher index.
+    #[test]
+    fn switch_never_routes_to_a_connection_that_never_sent_init() {
+        let viewer = baseline_conn(); // attached and idle: has not typed
+        let probe = test_client_conn(); // Tag::Info only: never Inited
+        let requester = test_client_conn();
+        let clients = vec![viewer, probe, requester];
+        assert_eq!(switch_route_target(&clients, 2), Some(0));
+        // With no Inited candidate at all, the switch is the specified no-op.
+        let only_probe = vec![test_client_conn(), test_client_conn()];
+        assert_eq!(switch_route_target(&only_probe, 1), None);
     }
 
     // ---- RFC 0010: terminal query passthrough / kitty keyboard negotiation ----
