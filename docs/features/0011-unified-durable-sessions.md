@@ -92,7 +92,7 @@ dropping the client to a shell.
 sessions and **hides remotely-spawned detached workers by default**; `--workers`
 includes them (mirroring spinclass's `running-detached` filtering). Output
 modes mirror `sc list`: tab-separated plain text for non-TTY/pipes, a styled
-lipgloss table on an interactive TTY, `--format json`, and a live-refreshing
+lipgloss table on an interactive TTY, `--json`, and a live-refreshing
 `--watch` view. Columns: session URI, status, activity (frontmost title/process,
 RFC 0013 §5), last-activity, cwd, description.
 
@@ -134,7 +134,7 @@ List, with and without workers:
 
     $ posh list                        # human sessions, styled table on a TTY
     $ posh list --workers              # also the detached fleet workers
-    $ posh list --format json | jq .   # machine-clean, no TTY styling
+    $ posh list --json | jq .          # machine-clean, no TTY styling
 
 ## Limitations
 
