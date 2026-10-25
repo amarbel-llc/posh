@@ -190,6 +190,27 @@ fn with_no_viewer_the_caller_gets_no_viewer_at_once() {
     assert!(t.elapsed() < Duration::from_secs(2), "proceeds at once, never waits for nobody");
 }
 
+/// An attached viewer that does not advertise `CAP_APP_MODAL` (an old or
+/// not-opted-in client) cannot show a countdown, so it counts as no viewer:
+/// the caller proceeds at once and the viewer is shown nothing.
+#[test]
+fn an_attached_viewer_without_the_capability_is_no_viewer_and_sees_nothing() {
+    let fx = Fixture::new("posh-modal-legacy");
+    let mut legacy = fx.conn();
+    let mut init = Vec::new();
+    init.extend_from_slice(&24u16.to_le_bytes());
+    init.extend_from_slice(&80u16.to_le_bytes());
+    send(&mut legacy, TAG_INIT, &init);
+    legacy.set_read_timeout(Some(Duration::from_millis(800))).unwrap();
+    let mut req = fx.conn();
+    let t = Instant::now();
+    send(&mut req, TAG_MODAL, &request("r1", 30_000, json!("cancel")));
+    let r = next_op(&mut req, "result");
+    assert_eq!(r["outcome"], "no-viewer");
+    assert!(t.elapsed() < Duration::from_secs(2), "proceeds at once");
+    assert!(next_modal(&mut legacy).is_none(), "the incapable viewer is shown no modal traffic");
+}
+
 #[test]
 fn a_viewer_sees_the_countdown_and_the_daemons_clock_times_it_out() {
     let fx = Fixture::new("posh-modal-timeout");
