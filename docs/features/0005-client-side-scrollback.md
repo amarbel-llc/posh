@@ -215,8 +215,8 @@ contract.
 - Builds on FDR 0002 (terminal takeover/restore — why the outer
   scrollbar shows the takeover screen, not the session) and the
   `POSH_GRAB_MOUSE` wheel-intercept predicate (ADR 0002).
-- Sync internals: `crates/posh/src/remote/sync.rs` (`FrameBody`,
-  `make_diff`), `crates/posh/src/remote/client.rs` (`apply_frame`,
+- Sync internals: `crates/posh-proto/src/frame.rs` (`FrameBody`; `remote/sync.rs`
+  re-exports it), `crates/posh/src/remote/client.rs` (`apply_frame`,
   `render`, `server_term`), `crates/posh-term/src/dump.rs` (`dump_vt`
   top-anchored serialization), `crates/posh-term/src/screen.rs`
   (per-`Screen` scrollback ring; primary has depth, alt has zero).

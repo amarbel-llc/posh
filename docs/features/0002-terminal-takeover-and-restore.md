@@ -32,7 +32,7 @@ for their whole lifetime and return to the primary screen on the way out:
   `SIGCONT`) re-enters the alt screen and replays.
 - `posh <host>` / `posh <host>:<session>` / `posh client`: the remote
   client does the same around the connection (mosh's smcup/rmcup
-  behavior), including around the `Ctrl-^ Ctrl-Z` suspend, so the
+  behavior), including around the palette's *Suspend client* command (FDR 0009), so the
   `[posh is suspended.]` notice and the exit message land on the user's
   own shell screen.
 

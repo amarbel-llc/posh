@@ -57,11 +57,14 @@ is the create-or-attach front-door over them; `posh <target>` remains sugar for
     posh attach box:dev          attach session dev on box (errors if absent)
     posh start box: / posh start :   create a new auto-id session (host / local)
     posh attach :dev / dev       attach local session dev
-    posh attach box:             host-only -> TTY picker scoped to box's sessions
-    posh attach user@box:        same, explicit user
-    posh attach :                local host -> picker scoped to local sessions
-    posh attach                  no target -> picker over local + remote sessions
+    ph box:                      host-only -> TTY picker scoped to box's sessions
+    ph user@box:                 same, explicit user
+    ph                           no target -> picker over local + remote sessions
     posh start --ephemeral       opt into a non-durable throwaway shell
+
+(Originally `posh attach box:` / `posh attach :` / bare `posh attach` opened the
+pickers; `posh attach` now requires a name, and the pickers are `ph` and
+`ph host:`, FDR 0015/0016.)
 
 The strict `posh` verbs never guess: `start` only creates, `attach` only
 attaches. The create-or-attach ergonomic (resolve the target, dispatch to
@@ -75,8 +78,8 @@ not a TTY the picker never launches** — it errors with the candidate list so
 scripts and command substitution stay deterministic.
 
 **Everything is durable.** The nameless ephemeral roaming shell is removed; a
-bare host (`posh box`) opens the host-scoped picker rather than spawning a
-throwaway shell. `--ephemeral` is the explicit, documented opt-out (no daemon,
+bare host (`posh box`) no longer spawns a throwaway shell: it errors with the
+host's session list (the host-scoped picker is `ph box:`). `--ephemeral` is the explicit, documented opt-out (no daemon,
 dies with the transport) and the rollback anchor.
 
 **A terse front-door and an explicit create verb.** `ph` (FDR 0015) is the
@@ -89,16 +92,18 @@ its wire-reconnect survival, so a mux-wire blip stalls and reattaches rather tha
 dropping the client to a shell.
 
 **`posh list` is unified and spinclass-styled.** It lists local and remote
-sessions and **hides remotely-spawned detached workers by default**; `--workers`
-includes them (mirroring spinclass's `running-detached` filtering). Output
-modes mirror `sc list`: tab-separated plain text for non-TTY/pipes, a styled
-lipgloss table on an interactive TTY, `--json`, and a live-refreshing
-`--watch` view. Columns: session URI, status, activity (frontmost title/process,
-RFC 0013 §5), last-activity, cwd, description.
+sessions and, on a terminal, leaves system sessions out of the table unless
+`--include-system-sessions` is given (the originally specified `--workers` flag
+does not exist; see `posh(1)`, posh#175). Output modes mirror
+`sc list`: tab-separated plain text for non-TTY/pipes, a styled table on an
+interactive TTY, `--json`, and a live-refreshing `--watch` view. The table
+columns are NAME, STATUS, CWD and ACTIVITY (frontmost title/process, RFC 0013
+§5).
 
-**Sessions carry a settable description.** A short label (spinclass parity)
-shown in both `list` and the picker, so an attach target reads as "deploy
-headscale" rather than an opaque name.
+**Sessions carry a settable description** — *not implemented*: no description
+field or setter exists in the CLI today; rows are labelled by the activity label.
+The intent (spinclass parity: an attach target that reads as "deploy headscale"
+rather than an opaque name) stands as a future lever.
 
 **Reachability is symmetric and already-uniform underneath.** Because a
 remotely-created session is a real daemon on its host, `posh list` *there* and
@@ -133,7 +138,7 @@ Spawn a spinclass/clown worker remotely, reattach later through one interface:
 List, with and without workers:
 
     $ posh list                        # human sessions, styled table on a TTY
-    $ posh list --workers              # also the detached fleet workers
+    $ posh list --include-system-sessions   # also system sessions in the table
     $ posh list --json | jq .          # machine-clean, no TTY styling
 
 ## Limitations
@@ -187,7 +192,7 @@ List, with and without workers:
 | Lever | Current | Rationale | Change signal |
 |---|---|---|---|
 | idle-reap timeout for abandoned durable shells | off | durable-by-default is the whole point; tmux/zmx also never auto-reap | default-shell sprawl across hosts becomes real clutter |
-| `posh list` default worker filter | hide `detached` | a human list shouldn't drown in fleet workers | users routinely want workers and forget `--workers` |
+| `posh list` default filter (table) | hide system sessions (`--include-system-sessions` shows them); the originally specified detached-worker filter and `--workers` flag do not exist (posh#175) | a human list shouldn't drown in fleet workers | users routinely want the hidden rows and forget the flag |
 | picker prior art | spinclass `sessionpick` / `clown resume` | proven TTY-gated filterable list, local+remote rows | picker UX needs diverge from spinclass's |
 
 ## More Information

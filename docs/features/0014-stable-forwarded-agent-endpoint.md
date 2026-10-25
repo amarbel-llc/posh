@@ -467,8 +467,9 @@ self-heal is pending a live capture of the third line in the wild.
   channels; §8 defers the two-client-host policy back here.
 - **github #54** — the phase-2 connection mux. Status RESOLVED (2026-07-20): it
   is closed as a *decision*, never implemented — its own closing note says "next
-  step before code: write the phase-2 design doc," and no design doc or mux
-  module exists in the tree. It was therefore not a workstream to wait for, which
+  step before code: write the phase-2 design doc," and at the time (2026-07-20)
+  no design doc or mux module existed in the tree (`remote/mux.rs` has since
+  landed and is default-on). It was therefore not a workstream to wait for, which
   is what unblocked the sequencing decision above. #54 remains the owner of the
   mux *daemon* (process model, lifetime, local IPC); RFC 0011 owns the wire and
   does not wait on it.

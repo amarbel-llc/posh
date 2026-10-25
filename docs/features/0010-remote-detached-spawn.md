@@ -38,8 +38,8 @@ A leading `--detach` on the remote namespace form requests a detached spawn:
 It creates-or-ensures the session on the host (running `command`, default
 `$SHELL`) and returns promptly, **without** attaching or standing up the
 roaming transport. Concretely it execs the inner
-`posh [-g GROUP] start SESSION --detach [command...]` *directly* over ssh —
-no `posh-server new`, no UDP client — so the remote `posh start --detach`
+`posh [-g GROUP] attach SESSION --detach [command...]` *directly* over ssh —
+no `posh-server new`, no UDP client — so the remote `posh attach --detach`
 double-forks a session daemon on the host and exits, and the ssh call returns
 with that command's exit status. The session keeps running as a daemon on the
 host; a later foreground `posh host:[group/]session` (no `--detach`) attaches

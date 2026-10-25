@@ -194,7 +194,7 @@ discipline:
   that bypasses the current nesting guard and is one escape hatch for
   intentional nesting.
 - The current nesting guard: `crates/posh/src/session/client.rs`
-  (`cmd_attach`, the `$POSH_SESSION` check that today hard-errors and would
-  instead trigger the collapse offer).
+  (`cmd_attach`, the `$POSH_SESSION` check; it no longer hard-errors: it
+  performs the in-place switch, `switch_in_place`).
 - clown's multiplexer defaults and the `start`/`resume`/`spawn` templates that
   produce the nesting: clown's `default-clownfile` (`multiplexer = "posh"`).

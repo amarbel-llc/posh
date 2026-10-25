@@ -234,7 +234,10 @@ Session line:
 
     session=<name> group=<group> daemon=<version>+<sha> pid=<u32> \
       frames=<on|off> echo_flag=<0|1> alt_screen=<0|1> clients=<n> \
-      activity="<label>" [cwd="<dir>" cwd_source=<src>]
+      activity="<label>" [cwd="<dir>" cwd_source=<src>] [confine=on ...]
+
+A trailing `confine=on confine_deny=<n> confine_allow=<n> confine_refused=<n>`
+tail is present only when session confinement is on (FDR 0022).
 
 `cwd`/`cwd_source` (added 2026-09-23, ADR 0008) are where the session is now
 and which cascade step said so: `<src>` is one of `kernel`, `osc7`, `start`,
@@ -286,6 +289,11 @@ i.e. inside an enclosing session — the attaching client MUST read the enclosin
 session's status socket (§4.1) and attach its **client lines** to its own
 `Tag::Init` as one `CAP_CLIENT_UPSTREAM` entry (id 18), so the inner daemon can
 show what the enclosing session is viewed through.
+
+Implementation status: specified, not yet implemented. Id 18 exists as a
+constant and the relay forwards the entry unchanged, but no client sends it and
+the status response does not yet render `upstream=<n>`/`upstream=stale`/
+`upstream=truncated` (`posh-proto/src/caps.rs`, `remote/relay.rs`).
 
 #### 5.1 `CAP_CLIENT_UPSTREAM` (id 18) payload
 
@@ -362,7 +370,7 @@ Unknown keys and unknown record kinds MUST be ignored.
 
     viewport pid=<pid> current=<target|-> kind=<kind> anonymous_create=<0|1>
     stack depth=<n> target=<target> kind=<kind>
-    overlay kind=<palette|picker|leave> over=<target|->
+    overlay kind=<palette|picker|notice> over=<target|->
 
 Exactly one `viewport` line, first; then one `stack` line per FDR 0016 stack
 entry, bottom first, `depth` counting from 1 (the entry *Back* would return

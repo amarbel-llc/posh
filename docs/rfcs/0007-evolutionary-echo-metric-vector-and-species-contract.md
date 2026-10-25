@@ -103,7 +103,7 @@ screen-state block, read client-side from the displayed `Snapshot`):
 | `send_interval_ms` | f64 | ms | client | server frame cadence |
 | `retransmit_rate` | f64 | 1/s | server-forwarded | server retransmits/sec over the sample window (`CAP_METRICS` v2) |
 | `outstanding` | f64 | frames | client | unacked frames in flight |
-| `bw_up_bps` | f64 | bit/s | client | upstream bandwidth estimate |
+| `bw_up_bps` | f64 | bit/s | client | upstream bandwidth estimate (reserved: always `NaN`, no estimator yet — `predict/metric.rs`) |
 | `fps` | f64 | 1/s | client | derived from loop-iter cadence |
 | `loop_busy_frac` | f64 | ratio | client | busy/(busy+idle) headroom |
 | `apply_us` | f64 | µs | client | recent frame-apply cost |

@@ -216,8 +216,8 @@ agent:
   sharing one NAT/firewall hole and one roaming state. The transport
   has ample capacity for agent-sized traffic.
 - **Phase 2 (connection mux, the ControlMaster analog) is out of scope
-  here** — scoped at decision level in the plan and tracked as github
-  #54. The phase-1 agent stream is channel-addressed from day one
+  here** — it shipped as FDR 0014 (`remote/mux.rs`, default-on), and was
+  tracked as github #54. The phase-1 agent stream is channel-addressed from day one
   specifically so it rides a future mux channel unchanged.
 
 ## Tuning Levers

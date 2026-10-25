@@ -31,12 +31,12 @@ The mosh surface posh mirrors today (audited against the vendored
 | `mosh user@host` | `posh user@host` | ssh bootstrap, `POSH CONNECT <port> <key>` |
 | `mosh-server new -p P[:P2]` | `posh-server new -p P[:P2]` | default UDP range 60001:60999 |
 | `MOSH_KEY` | `POSH_KEY` | key in env, never argv |
-| `MOSH_PREDICTION_DISPLAY` | `POSH_PREDICTION` | always/never/adaptive/experimental |
+| `MOSH_PREDICTION_DISPLAY` | `POSH_PREDICTION_MODEL` (`POSH_PREDICTION` is a deprecated alias) | always/never/adaptive/experimental, plus optimistic (FDR 0006) |
 | `MOSH_PREDICTION_OVERWRITE` | `POSH_PREDICTION_OVERWRITE` | |
 | `MOSH_SERVER_NETWORK_TMOUT` / `_SIGNAL_TMOUT` | `POSH_SERVER_*_TMOUT` | + SIGUSR1 |
 | `--no-init` / `MOSH_NO_TERM_INIT` | `--no-init` / `POSH_NO_TERM_INIT` | FDR 0002 |
 | smcup/rmcup via terminfo | same, built-in term(5) reader | FDR 0002 |
-| Ctrl-^ quit sequence, Ctrl-^ Ctrl-Z suspend | same | escape key not yet configurable |
+| Ctrl-^ quit sequence, Ctrl-^ Ctrl-Z suspend | `Ctrl-^` opens the command palette (FDR 0009); *Suspend client* and *Quit session* are palette commands, `Ctrl-^ .` quits only when the renderer cannot open | escape key not yet configurable |
 | `-4`/`-6` | `-4`/`-6` (auto ≈ prefer-inet) | `all`/`prefer-inet6` missing |
 | locale forwarding (`-l NAME=VALUE`) | env-prefix on the remote command | equivalent mechanism |
 | `MOSH IP` from `$SSH_CONNECTION` | `POSH IP` | the `remote` discovery mode only |

@@ -165,8 +165,7 @@ security analysis before any sender uses it.
 ## Registry
 
 This document requests capability ids **21** (`PUSH_CMD`) and **22**
-(`PUSH_CMD_REQUEST`). RFC 0001's registry gains their rows, in place, in the
-commit that implements them.
+(`PUSH_CMD_REQUEST`). RFC 0001's registry carries their rows (ids 21 and 22).
 
 ## References
 

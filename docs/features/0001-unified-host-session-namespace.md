@@ -27,9 +27,12 @@ works.
 One scp-style namespace covers everything attachable. A bare first
 argument resolves per RFC 0001's total grammar:
 
-    posh dev                  # local session, attach-or-create (unchanged)
+    posh dev                  # attach an existing local session (strict since FDR 0015
+                              # Phase B; `ph dev` / `posh start` create)
     posh :dev                 # explicit local; :grp/dev addresses group grp
-    posh box                  # plain roaming remote shell (unchanged)
+    posh box                  # errors with the host's session list (FDR 0011);
+                              # `start --ephemeral box` is the throwaway shell,
+                              # `ph box:` the picker
     posh box:dev              # session dev on box: attach-or-create,
                               # transported over roaming UDP
     posh user@box:grp/dev     # full form
@@ -55,8 +58,8 @@ Behavioral contract:
   `posh box:dev; echo $?` reports its shell-style code, negotiated over
   the wire via the EXIT_STATUS capability (RFC 0001 §3) so mixed-version
   peers degrade to today's behavior instead of breaking.
-- Explicit forms (`posh attach`, `posh ssh`) remain available and
-  unchanged — they are both the escape hatches for names the grammar
+- Explicit forms (`posh attach`; `posh ssh` was retired in favour of
+  `posh start --ephemeral`) remain available — they are both the escape hatches for names the grammar
   cannot express (sessions containing `/` or `:`) and the permanent
   rollback path.
 
@@ -85,7 +88,9 @@ Remote listing and completion:
 
 ## Limitations
 
-- **v1 is transport composition** (architecture A): each roaming client
+- **v1 is transport composition** (architecture A; the single-model relay,
+  architecture B, is now the default and `POSH_RELAY=0` rolls back to A): each
+  roaming client
   re-models the terminal twice (session daemon's model feeds a pty that
   the transport server re-models). Interactively invisible, but it is
   deliberate overhead. Natural progressions, in order:
@@ -100,7 +105,8 @@ Remote listing and completion:
     Only worth it if B's proxy hop ever matters.
 - Session names containing `/` or `:` are not addressable in namespace
   form; use `posh attach` (documented in RFC 0001 §1).
-- `box:` is a plain remote shell, not a "default session" — by design,
+- `box:` is not a "default session" (since FDR 0011 it is the host-scoped
+  picker, `ph box:`) — by design,
   so the grammar has no special cases.
 - Group-qualified completion (`box:grp/<Tab>`) is deferred; remote
   listing crosses only the default group in v1.

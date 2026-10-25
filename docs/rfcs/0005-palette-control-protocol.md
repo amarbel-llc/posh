@@ -335,6 +335,16 @@ methods it does not implement.
 | `session.switch` | `{"target": <string>}`                  | Switch the viewport to the named session (an RFC 0001 target: `[user@]host:[group/]session`, `:[group/]session`, or a bare local name) — FDR 0016. The client ends its attach with a switch outcome and its front door re-attaches to `target`. `{"target": "<host>:+"}` (or `":+"`) creates a new auto-id session there first. The session being LEFT is always kept running and pushed onto the front door's session stack, so *Back* returns to it; a transition never kills. Invalid target → `-32602`. |
 | `session.pop`    | `{}`                                    | *Back* (FDR 0016, stacked switching): switch the viewport to the session it most recently switched AWAY from — the top of the front door's session stack. The target is never named by the renderer (the client resolves it from the stack). With an empty stack the client reports "nothing to go back to" and stays. The palette's *Back to …* command carries this action and is offered only while the stack has a top. |
 
+Implementation note (current roaming client, `remote/palette.rs`,
+`remote/client.rs`): every action request is acknowledged with `{}` before it is
+dispatched, so the `-32601`/`-32602` replies above are not yet sent — an
+unknown method or invalid params is ignored client-side. The client also
+implements further client-local methods not registered here (the
+`session.forensics`, `session.debuginfo`, `session.linkinfo`,
+`session.predictinfo`, `session.agentinfo` and `session.aboutinfo` dialogs,
+`shell.push` per RFC 0016, and the `render.scroll_opt` diagnostic), which §7's
+"superset" rule allows.
+
 Per posh#87, these methods are the client's shared control surface: a converged
 client core implements them once and the same palette drives every transport.
 `echo.set` is the one capability that is transport-conditional (prediction

@@ -21,7 +21,8 @@ re-confirms. This proposes the opposite model: write the echo to the screen
 ## Interface
 
 `POSH_PREDICTION` gains a new value, `optimistic`, alongside the existing
-`adaptive` (default), `always`, `never`, and `experimental`.
+`always` (the default today, see posh-client(1)), `adaptive`, `never`, and
+`experimental`.
 
 In `optimistic` mode:
 
@@ -71,7 +72,8 @@ user feels, and `optimistic` is the one model that removes it while keeping
 the ECHO-off / alt-screen gates (mosh's `experimental` shows tentative
 cells but has no ECHO gate).
 
-So the client now runs the A/B itself: with the model left on its default,
+So the client now runs the A/B itself: with the model set to `adaptive`
+(the default `always` never escalates),
 `predict::EchoEscalation` switches the session to `optimistic` once the
 wire's SRTT has held above 150 ms for 3 s, and back to `adaptive` after it
 has held under 80 ms for 15 s (hysteresis + asymmetric holds so a jittery
@@ -180,7 +182,7 @@ against a screen that contains the echo it claims.
 - **Cursor-only.** Optimistic echo handles printable insert/overwrite and cursor
   advance. It does not predict the *result* of Enter, control keys, or escape
   sequences — those wait for the paint, same as `adaptive`.
-- **Opt-in, not a replacement.** `adaptive` remains the default; `optimistic` is
+- **Opt-in, not a replacement.** `adaptive` is no longer the default (`always` is); `optimistic` is
   selected explicitly until the A/B and promotion criteria settle.
 
 ## Predictor / renderer split (2026-08-25)

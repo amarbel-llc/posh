@@ -134,11 +134,11 @@ same candidate sources.
 
 ## Limitations
 
-- **The TUI modes are blocked on FDR 0016.** Bare `ph` and `ph <host>:` open the
+- **The TUI modes ride FDR 0016.** Bare `ph` and `ph <host>:` open the
   cross-host / host-scoped picker, which is the same surface FDR 0016 grows out
-  of the command palette. Until FDR 0016 lands, those two forms MAY error with
-  the candidate list (the FDR 0011 non-TTY discipline) rather than launching a
-  chooser. The direct-grammar forms (`:+`, `:<session>`, bare-local) and
+  of the command palette; FDR 0016 has landed, so on a terminal they open it, and
+  off a terminal they error with the candidate list (the FDR 0011 non-TTY
+  discipline). The direct-grammar forms (`:+`, `:<session>`, bare-local) and
   completion ship first and stand alone.
 - **`posh ssh` is retired (decided).** Dropping bare `posh <host>` (FDR 0011)
   removes the ephemeral roaming shell, and the explicit `posh ssh <host>`
@@ -156,7 +156,7 @@ same candidate sources.
 |---|---|---|---|
 | remote session-name completion source | out-of-band cache | interactive completion must never block on a slow endpoint | a fast local endpoint makes live query imperceptible and users hit staleness often |
 | host completion source set | ssh config + tailscale + mux (union) | covers the reachable set without a config file | a host the user reaches by another means is routinely missing |
-| bare `ph`/`ph host:` before FDR 0016 | error with candidates | non-TTY discipline, no half-built picker | the direct-grammar-only cut ships and the picker is wanted immediately |
+| bare `ph`/`ph host:` before FDR 0016 (historical: the picker now exists; off a TTY they still error with candidates) | error with candidates | non-TTY discipline, no half-built picker | the direct-grammar-only cut ships and the picker is wanted immediately |
 
 ## More Information
 
