@@ -522,6 +522,20 @@ debug-modal-demo scenario="cancel" secs="30": build-palette
         echo "  env POSH_DIR='$sock' POSH_GROUP=default '$P' modal demo --timeout {{ secs }}; echo exit=\$?"
         echo "(Ctrl-^ in the viewer reviews the countdown; clean up: POSH_DIR='$sock' POSH_GROUP=default '$P' kill demo)"
         exit 0 ;;
+      try)
+        # Self-test of debug-modal-try: run it in a tmux pane (a real tty), wait
+        # for the banner, then press Ctrl-^ and Enter like a user would.
+        "${TM[@]}" new-session -d -s s -x 100 -y 24 -c "$root" \
+          "just debug-modal-try {{ secs }} cancel; echo TRY_EXITED_\$?; sleep 120"
+        for _ in $(seq 1 90); do
+          "${TM[@]}" capture-pane -p -t s 2>/dev/null | grep -q 'left - Ctrl-^' && break; sleep 1
+        done
+        cap "debug-modal-try in a pane (expect the banner on row 1)"
+        key C-^; sleep 1
+        cap "after Ctrl-^ (expect the countdown view)"
+        key Enter; sleep 4
+        cap "after Enter on Cancel restart (expect the banner gone and the recipe's report)"
+        finish; exit 0 ;;
       noviewer)
         echo "== no viewer attached =="
         t0=$(date +%s); "$P" modal demo --timeout {{ secs }}; echo "exit=$? after $(( $(date +%s) - t0 ))s"
@@ -564,6 +578,47 @@ debug-modal-demo scenario="cancel" secs="30": build-palette
     echo "== posh modal output =="; cat "$dir/modal.out"; echo "== exit code: $code =="
     echo "== daemon log (modal lines) =="; grep -h modal "$sock"/default/demo.log 2>/dev/null || true
     finish
+
+# PROTOTYPE app-presented modal, INTERACTIVE: run this in the terminal you want
+# to test. It starts a throwaway session `demo` (an "agent" printing a line a
+# second), schedules `posh modal` (SECS long) to fire 3 seconds after the setup,
+# and attaches YOUR terminal to the session in the foreground. Then try it:
+#   - the bar on row 1 counts down (the first output line is hidden under it)
+#   - Ctrl-^ (Ctrl-Shift-6 on a US keyboard) opens the countdown view
+#   - Left/Right move focus, Enter chooses, Esc takes the request's on_dismiss
+#     (cancel by default; `dismiss=hide` makes Esc only hide the view)
+#   - Ctrl-\ detaches (the modal then ends with no viewer and the restart proceeds)
+# When the attach ends it prints what `posh modal` returned (exit 10 = you
+# cancelled, 0 = it proceeded) and kills the throwaway session. Needs a tty (it
+# refuses without one); the scripted equivalents are debug-modal-demo and
+# debug-modal-record.
+#
+# try the restart countdown by hand in this terminal
+[group("debug")]
+debug-modal-try secs="30" dismiss="cancel": build-palette
+    #!/usr/bin/env bash
+    set -uo pipefail
+    [ -t 0 ] && [ -t 1 ] || { echo "debug-modal-try needs an interactive terminal (stdin and stdout must be ttys)"; exit 1; }
+    root="{{ justfile_directory() }}"
+    dir="$root/.tmp/modaltry"
+    sock="$dir/posh"
+    case "$sock" in "$root"/.tmp/*/posh) : ;; *) echo "refusing: POSH_DIR '$sock' not under .tmp"; exit 1 ;; esac
+    rm -rf "$dir"; mkdir -p "$sock"; chmod 700 "$dir" "$sock"
+    nix develop --command cargo build -p posh || exit 1
+    P="$root/target/debug/posh"
+    export POSH_DIR="$sock" POSH_GROUP=default POSH_PALETTE="$root/result-posh-palette/bin/posh-palette"
+    unset POSH_SESSION
+    "$P" attach --detach demo -- sh -c 'while :; do echo "agent working $(date +%T)"; sleep 1; done' >/dev/null
+    ( sleep 3
+      "$P" modal demo --timeout {{ secs }} --title "Restarting agent" --on-dismiss {{ dismiss }} >"$dir/modal.out" 2>&1
+      echo $? >"$dir/modal.code" ) &
+    bg=$!
+    "$P" attach demo
+    # The attach ended (detach, or the modal's session was killed): report.
+    sleep 1; kill $bg 2>/dev/null; wait $bg 2>/dev/null
+    echo "== posh modal returned =="; cat "$dir/modal.out" 2>/dev/null || echo "(not raised: you left before it fired)"
+    echo "== exit code: $(cat "$dir/modal.code" 2>/dev/null || echo n/a) (10 = cancelled, 0 = proceeded) =="
+    "$P" kill demo >/dev/null 2>&1
 
 # PROTOTYPE app-presented modal, RECORDED with poshterity instead of tmux: the
 # viewer (`posh attach demo`) runs under `poshterity record` on a fixed 24x80
