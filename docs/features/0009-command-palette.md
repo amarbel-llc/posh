@@ -78,10 +78,14 @@ Point at an explicit renderer build:
 
 ## Limitations
 
-- **Roaming client only.** The session-attach client (`session/client.rs`) has no
-  palette; its escape key is still `Ctrl-\` (detach). Converging the two client
-  input loops onto a shared core — so the palette works in both — is tracked:
-  amarbel-llc/posh#87.
+- **Session-attach client: frames-on sessions only.** The session-attach client
+  (`session/client.rs`) opens the palette on `Ctrl-^` only once it has a
+  `FrameRenderer`, i.e. on a frames-on session (the `CAP_PROTOCOL_VERSION`
+  client). A session that never builds a renderer forwards `Ctrl-^` to the shell
+  as an ordinary byte, and `Ctrl-\` still detaches. The two client input loops
+  are not yet a shared core: amarbel-llc/posh#87. The same key also opens the
+  experimental `countdown` view while an app modal runs (opt-in, FDR-less
+  prototype; `session/modal.rs`).
 - **Suspend and shell-out lost their direct chords.** They are palette commands
   now, not `Ctrl-^ Ctrl-Z` / `Ctrl-^ s`. The only hardcoded chord left is the
   emergency `Ctrl-^ .` (plus `Ctrl-^ ^` literal), and only when the renderer
