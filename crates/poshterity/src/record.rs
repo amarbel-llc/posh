@@ -15,8 +15,9 @@ use std::time::Instant;
 use poshterity::castx::{Header, Poshterity, Recorder};
 use poshterity::script::{self, Action, Outcome};
 
-/// How long to keep recording after the last script step runs, so the effect of
-/// the final `send` (the program's echo/redraw) lands in the recording.
+/// How long to keep recording after the last script step runs, or after
+/// stdin's EOF under `--end-on-eof`, so the effect of the final input (the
+/// program's echo/redraw) lands in the recording before the hang-up.
 const SCRIPT_SETTLE_SECS: f64 = 0.25;
 
 const STDIN_FD: RawFd = 0;
@@ -115,6 +116,18 @@ pub fn run(args: &[String]) -> Result<i32, String> {
     let tee = Tee { fixed_size: size.is_some(), end_on_eof, marks: marks.as_ref() };
     let ended = tee_loop(&mut rec, pty.master, start, &tee, script.as_mut(), &mut failure);
     let code = 0;
+
+    // A script the child outlived (it exited first) did not do its job: say so
+    // rather than exit with the child's status.
+    if failure.is_none() && ended == Ended::ChildClosed {
+        if let Some(s) = script.as_ref().filter(|s| s.done_at.is_none()) {
+            failure = Some(format!(
+                "the child exited before the script finished (stopped at: {})\nthe last screen:\n{}",
+                s.runner.current().map_or("?".to_string(), |st| st.describe()),
+                s.live.dump_text()
+            ));
+        }
+    }
 
     let hang_up = ended != Ended::ChildClosed;
     if hang_up {
@@ -427,6 +440,8 @@ fn tee_loop(
 ) -> Ended {
     let mut buf = [0u8; 4096];
     let mut stdin_open = true;
+    // --end-on-eof: when stdin ended; the loop runs on for the settle period.
+    let mut eof_at: Option<f64> = None;
     loop {
         if SIGWINCH.swap(false, Ordering::AcqRel) && !tee.fixed_size {
             let (rows, cols) = term_size(STDOUT_FD);
@@ -446,6 +461,13 @@ fn tee_loop(
                 return ended;
             }
             poll_ms = s.poll_timeout_ms(now);
+        }
+        if let Some(t) = eof_at {
+            if now - t >= SCRIPT_SETTLE_SECS {
+                return Ended::StdinEof;
+            }
+            let remain = ((t + SCRIPT_SETTLE_SECS - now).max(0.0) * 1000.0).ceil() as i32;
+            poll_ms = if poll_ms < 0 { remain } else { poll_ms.min(remain) };
         }
 
         let mut fds = [
@@ -504,10 +526,11 @@ fn tee_loop(
             match read_fd(STDIN_FD, &mut buf) {
                 Ok(0) => {
                     // EOF: stop forwarding. With --end-on-eof that ends the
-                    // recording (the caller hangs the child up); otherwise keep
-                    // teeing until the child exits.
+                    // recording after a settle period (the caller then hangs
+                    // the child up); otherwise keep teeing until the child
+                    // exits.
                     if tee.end_on_eof {
-                        return Ended::StdinEof;
+                        eof_at = Some(start.elapsed().as_secs_f64());
                     }
                     stdin_open = false;
                 }

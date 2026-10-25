@@ -107,6 +107,49 @@ fn record_script_that_times_out_fails_loudly_and_keeps_the_recording() {
 }
 
 #[test]
+fn record_script_that_the_child_outlives_fails_instead_of_exiting_zero() {
+    let out = temp("early", "castx");
+    let script = temp("early", "txt");
+    std::fs::write(&script, "wait-for Ready\nsend q\n").unwrap();
+    let result = Command::new(env!("CARGO_BIN_EXE_poshterity"))
+        .args([
+            "record", "--script", script.to_str().unwrap(), "--out", out.to_str().unwrap(),
+            "--", "sh", "-c", "echo bye",
+        ])
+        .stdin(Stdio::null())
+        .stdout(Stdio::null())
+        .output()
+        .expect("run poshterity");
+    let err = String::from_utf8_lossy(&result.stderr).into_owned();
+    assert_eq!(result.status.code(), Some(3), "the script did not finish, so this is not a success: {err}");
+    assert!(err.contains("exited before the script finished") && err.contains("Ready"), "{err}");
+    let _ = std::fs::remove_file(&out);
+    let _ = std::fs::remove_file(&script);
+}
+
+#[test]
+fn record_end_on_eof_lets_the_last_input_take_effect_before_hanging_up() {
+    let out = temp("settle", "castx");
+    let mut child = Command::new(env!("CARGO_BIN_EXE_poshterity"))
+        .args(["record", "--end-on-eof", "--size", "60x6", "--out", out.to_str().unwrap(), "--", "sh"])
+        .stdin(Stdio::piped())
+        .stdout(Stdio::null())
+        .stderr(Stdio::null())
+        .spawn()
+        .expect("spawn poshterity");
+    std::thread::sleep(Duration::from_millis(300)); // let the shell start
+    {
+        let mut stdin = child.stdin.take().unwrap();
+        stdin.write_all(b"echo settled-ok\r").unwrap();
+    } // EOF right after the last byte: a finite pipe, no trailing sleep
+    wait_within(&mut child, Duration::from_secs(10));
+    let doc = std::fs::read_to_string(&out).unwrap();
+    let _ = std::fs::remove_file(&out);
+    let text = String::from_utf8(replay_source(&doc, Dump::Text).unwrap()).unwrap();
+    assert!(text.matches("settled-ok").count() >= 2, "the typed line AND its output were recorded: {text:?}");
+}
+
+#[test]
 fn record_end_on_eof_stops_a_child_that_would_run_on() {
     let out = temp("eof", "castx");
     let mut child = Command::new(env!("CARGO_BIN_EXE_poshterity"))

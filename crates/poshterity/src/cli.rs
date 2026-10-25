@@ -164,6 +164,9 @@ fn run_replay(args: &[String]) -> Result<(), String> {
         }
     }
     let path = file.ok_or_else(|| format!("replay requires a <file>\n\n{USAGE}"))?;
+    if before_alt_exit && (to_marker.is_some() || raw) {
+        return Err("--before-alt-exit cannot be combined with --to-marker or --raw".into());
+    }
 
     // Raw mode: a bare byte stream (e.g. a script(1) capture of a client's
     // STDOUT), no .castx header and so no markers and no embedded dimensions.
@@ -189,9 +192,6 @@ fn run_replay(args: &[String]) -> Result<(), String> {
         return Err("--bytes only applies to --raw".into());
     }
 
-    if before_alt_exit && (to_marker.is_some() || raw) {
-        return Err("--before-alt-exit cannot be combined with --to-marker or --raw".into());
-    }
     let src = std::fs::read_to_string(path).map_err(|e| format!("{path}: {e}"))?;
     if before_alt_exit {
         let mut player = Player::from_source(&src)?;

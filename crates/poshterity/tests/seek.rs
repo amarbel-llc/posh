@@ -91,6 +91,8 @@ fn replay_before_alt_exit_shows_what_the_program_left_behind() {
     assert!(ok && last.contains("drawn"), "{last:?}");
     let (ok, _, err) = run(&["--before-alt-exit", "--to-marker", "x"]);
     assert!(!ok && err.contains("--before-alt-exit"), "exclusive with --to-marker: {err:?}");
+    let (ok, out, err) = run(&["--raw", "--before-alt-exit"]);
+    assert!(!ok && err.contains("--before-alt-exit"), "not silently ignored with --raw: {out:?} {err:?}");
     let _ = std::fs::remove_file(&f);
 }
 

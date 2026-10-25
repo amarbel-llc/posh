@@ -83,6 +83,10 @@ pub const TICK_MS: u64 = 1_000;
 /// The countdown length when a request names none.
 pub const DEFAULT_TIMEOUT_MS: u64 = 30_000;
 
+/// The longest countdown a request may ask for (a day): bounds the deadline
+/// arithmetic and what a stuck requester can leave on viewers' screens.
+pub const MAX_TIMEOUT_MS: u64 = 24 * 60 * 60 * 1000;
+
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct Button {
     pub id: String,
@@ -152,8 +156,8 @@ pub fn parse_request(payload: &[u8]) -> Result<Request, String> {
         }
     }
     let timeout_ms = v.get("timeout_ms").and_then(Value::as_u64).unwrap_or(DEFAULT_TIMEOUT_MS);
-    if timeout_ms == 0 {
-        return Err("timeout_ms must be > 0".into());
+    if timeout_ms == 0 || timeout_ms > MAX_TIMEOUT_MS {
+        return Err(format!("timeout_ms must be 1..={MAX_TIMEOUT_MS}"));
     }
     Ok(Request::Start(Spec {
         id,
@@ -223,7 +227,7 @@ pub struct Run {
 impl Run {
     /// Start `spec` at `now`. The first `show` is due immediately.
     pub fn start(spec: Spec, requester: RawFd, now: u64) -> Run {
-        let deadline_ms = now + spec.timeout_ms;
+        let deadline_ms = now.saturating_add(spec.timeout_ms);
         Run { spec, requester, deadline_ms, next_show_ms: now }
     }
 
@@ -412,8 +416,8 @@ pub fn parse_cli(args: &[String], pid: u32) -> Result<CliArgs, String> {
                 timeout_s = value("--timeout")?
                     .parse::<u64>()
                     .ok()
-                    .filter(|s| *s > 0)
-                    .ok_or("--timeout wants whole seconds > 0")?
+                    .filter(|s| (1..=MAX_TIMEOUT_MS / 1000).contains(s))
+                    .ok_or("--timeout wants whole seconds, 1..=86400")?
             }
             "--on-dismiss" => {
                 on_dismiss = match value("--on-dismiss")?.as_str() {
@@ -473,6 +477,19 @@ mod tests {
 
     fn argv(a: &[&str]) -> Vec<String> {
         a.iter().map(|s| s.to_string()).collect()
+    }
+
+    #[test]
+    fn an_absurd_timeout_is_refused_and_a_late_clock_cannot_overflow() {
+        assert!(parse_request(&req(json!({"timeout_ms": MAX_TIMEOUT_MS}))).is_ok());
+        assert!(parse_request(&req(json!({"timeout_ms": MAX_TIMEOUT_MS + 1}))).is_err());
+        assert!(parse_request(&req(json!({"timeout_ms": u64::MAX}))).is_err());
+        assert!(parse_cli(&argv(&["--timeout", "86400"]), 1).is_ok());
+        assert!(parse_cli(&argv(&["--timeout", "86401"]), 1).is_err());
+        assert!(parse_cli(&argv(&["--timeout", "18446744073709551"]), 1).is_err());
+        // Even with a clock near the top of u64 the deadline saturates.
+        let run = Run::start(spec(), 7, u64::MAX - 5);
+        assert_eq!(run.remaining_ms(u64::MAX - 5), 5, "saturated, not wrapped to a tiny value");
     }
 
     #[test]

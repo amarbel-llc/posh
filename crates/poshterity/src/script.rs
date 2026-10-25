@@ -193,6 +193,11 @@ impl Runner {
         (actions, Outcome::Done)
     }
 
+    /// The step the runner is on (or stopped at); `None` once every step has run.
+    pub fn current(&self) -> Option<&Step> {
+        self.steps.get(self.next)
+    }
+
     /// Seconds from `now` until this runner next needs attention without any
     /// new output (a sleep ending, a wait timing out); `None` when idle.
     pub fn next_wake(&self, now: f64) -> Option<f64> {
@@ -302,6 +307,16 @@ mod tests {
         assert_eq!(r.advance(0.0, &mut screen("")).1, Outcome::Pending);
         // the screen shows it at the very instant the deadline passes: still ok
         assert_eq!(r.advance(5.0, &mut screen("ok")).1, Outcome::Done);
+    }
+
+    #[test]
+    fn current_names_the_step_it_is_on() {
+        let mut r = Runner::new(parse("send a\nwait-for ready").unwrap());
+        assert!(matches!(r.current(), Some(Step::Send(_))));
+        let _ = r.advance(0.0, &mut screen(""));
+        assert!(matches!(r.current(), Some(Step::WaitFor { .. })), "{:?}", r.current());
+        let _ = r.advance(1.0, &mut screen("ready"));
+        assert_eq!(r.current(), None);
     }
 
     #[test]

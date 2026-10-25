@@ -909,6 +909,17 @@ impl FrameRenderer {
         bytes
     }
 
+    /// PROTOTYPE modal: a recompose for a banner change, which must not paint
+    /// the live screen over the scroll-view the user is reading (the banner is
+    /// hidden by the scroll-view's own status bar anyway). Empty while scrolled
+    /// back; the next live frame or scroll repaint picks the banner state up.
+    fn recompose_unless_scrolled(&mut self, palette: Option<&Terminal>) -> Vec<u8> {
+        if self.scroll_offset > 0 {
+            return Vec::new();
+        }
+        self.recompose(palette)
+    }
+
     /// Re-run the live compose for a palette-activity repaint (the renderer
     /// pumped, or the palette opened/closed) that isn't driven by an incoming
     /// `Tag::Frame`. Threads the palette overlay, or `None` to clear it. The local
@@ -1773,7 +1784,7 @@ fn client_loop(
                                             .as_ref()
                                             .filter(|p| p.is_open())
                                             .and_then(Palette::screen);
-                                        stdout_buf.extend_from_slice(&fr.recompose(screen));
+                                        stdout_buf.extend_from_slice(&fr.recompose_unless_scrolled(screen));
                                     }
                                     modal = Some(v);
                                 }
@@ -1794,7 +1805,7 @@ fn client_loop(
                                             .as_ref()
                                             .filter(|p| p.is_open())
                                             .and_then(Palette::screen);
-                                        stdout_buf.extend_from_slice(&fr.recompose(screen));
+                                        stdout_buf.extend_from_slice(&fr.recompose_unless_scrolled(screen));
                                     }
                                 }
                                 // A stale `clear` (another modal's) or an op this
@@ -3146,6 +3157,20 @@ mod tests {
         let cleared = String::from_utf8_lossy(&fr.recompose(None)).into_owned();
         assert!(!cleared.contains("Restarting"), "banner no longer repainted: {cleared:?}");
         assert!(!cleared.is_empty(), "but the bar's cells are repainted blank");
+    }
+
+    /// PROTOTYPE modal: a banner tick while the user reads scroll-back must not
+    /// paint the live screen over the history view.
+    #[test]
+    fn a_banner_tick_does_not_repaint_over_the_scroll_view() {
+        let mut fr = FrameRenderer::new(6, 60);
+        fr.modal_banner = Some(" Restarting agent - 27s left - Ctrl-^ to review ".into());
+        assert!(!fr.recompose_unless_scrolled(None).is_empty(), "live: it repaints");
+        fr.scroll_offset = 3;
+        assert!(fr.recompose_unless_scrolled(None).is_empty(), "scrolled back: it leaves the view alone");
+        fr.scroll_offset = 0;
+        fr.modal_banner = Some(" Restarting agent - 26s left - Ctrl-^ to review ".into());
+        assert!(!fr.recompose_unless_scrolled(None).is_empty(), "back at the bottom: it repaints again");
     }
 
     /// An unknown method (the renderer already closed the palette) is inert.
