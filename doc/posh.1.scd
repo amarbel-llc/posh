@@ -294,6 +294,24 @@ Local persistence over Unix sockets.
 *detach-all* (alias: *da*)
 	Detach all clients from all sessions in the group.
 
+*modal* [_name_] [*--timeout* _SECS_] [*--title* _TEXT_] [*--body* _TEXT_] [*--on-dismiss* _cancel_|_hide_] [*--id* _ID_]
+*modal* *--probe* [_name_]
+	EXPERIMENTAL, opt-in: off unless the session's daemon was created
+	with *POSH_APP_MODAL=1*, and the attached viewer was started with it
+	too. Ask the session's daemon to raise a restart countdown on its
+	attached local viewers and wait for the single answer, printed as one
+	JSON line (_name_ defaults to _$POSH_SESSION_). Each viewer shows a
+	banner on row 1; *Ctrl-^* opens the countdown view with
+	_Cancel restart_ and _Restart now_. The daemon owns the clock
+	(default 30 s), the first answer wins, one modal runs at a time, and
+	with no capable viewer attached it answers _no-viewer_ at once.
+	_Esc_ takes *--on-dismiss* (default _cancel_; _hide_ only hides the
+	view). *--probe* reports how many viewers could show one. Exit status:
+	0 proceed (timeout, _Restart now_, no viewer), 10 cancelled, 11 busy,
+	12 invalid request, 13 not enabled in that daemon. Like every daemon
+	command it is refused from an agent-scope cgroup when *POSH_CONFINE*
+	is on. Roaming and relayed viewers are never offered it.
+
 *status* [_name_] [*--viewport* [_pid_]] (alias: *st*)
 	Print the session's status response (RFC 0014 §4.2): a session
 	line — daemon build, pid, frames gate, the PTY's ECHO flag, alt-screen,
@@ -525,6 +543,14 @@ _POSH_CONFINE_
 	an agent scope before it can write the PTY, see the screen or kill the
 	session. The refusal is counted in *status* (_confine_refused=_) and
 	logged. A peer whose cgroup cannot be determined is refused. Linux only.
+
+_POSH_APP_MODAL_
+	_1_, _true_, _on_ or _yes_ turns on the experimental app-presented
+	restart countdown (see *modal*; default off, anything else is off). The
+	session daemon reads it from the environment of the process that
+	created the session (off: every *modal* request is answered _disabled_,
+	exit 13), and a local *posh attach* viewer reads it at attach (off: it
+	does not offer to show one). Nothing else about a session changes.
 
 _POSH_CONFINE_DENY_CGROUP_
 	Colon-separated cgroup-v2 path prefixes (e.g.
