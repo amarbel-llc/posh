@@ -373,6 +373,11 @@ Local persistence over Unix sockets.
 	(session names for *attach* and the bare target position,
 	remote _host_*:* sessions, ssh hosts) without manual sourcing.
 
+*version* (aliases: *v*, *-V*, *--version*)
+	Print the build identity as _posh_ _VERSION_*+*_SHA_ on one line
+	and exit 0. The _VERSION_ alone does not identify a build; the
+	_SHA_ suffix is SemVer build metadata (equality, no ordering).
+
 *mux* *ls* [*--raw*]
 	The mux endpoints on this host as a table (the same styled
 	*mesa* table as *list*; plain tab-separated lines when piped),
