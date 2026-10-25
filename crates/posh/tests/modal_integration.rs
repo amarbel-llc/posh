@@ -157,6 +157,26 @@ fn without_the_gate_the_daemon_refuses_and_a_viewer_is_never_shown_anything() {
 }
 
 #[test]
+fn a_session_that_never_calls_modal_carries_no_modal_traffic_gate_off_or_on() {
+    // Inertness proof for the fleet bump: nobody runs `posh modal`, so a viewer
+    // that advertises the capability must see no `Tag::Modal` frame, whether
+    // or not the daemon has the gate. The viewer still gets its normal frames
+    // (the first read below proves the connection is live, not just quiet).
+    for (prefix, gate) in [("posh-modal-idle-off", None), ("posh-modal-idle-on", Some("1"))] {
+        let fx = Fixture::with_gate(prefix, gate);
+        let mut viewer = fx.viewer();
+        viewer.set_read_timeout(Some(Duration::from_millis(800))).unwrap();
+        let mut header = [0u8; 5];
+        viewer.read_exact(&mut header).expect("the viewer is served its normal first frame");
+        assert_ne!(header[0], TAG_MODAL, "{prefix}: the first frame is not a modal");
+        let len = u32::from_le_bytes(header[1..5].try_into().unwrap()) as usize;
+        let mut payload = vec![0u8; len];
+        viewer.read_exact(&mut payload).unwrap();
+        assert!(next_modal(&mut viewer).is_none(), "{prefix}: no modal traffic without a request");
+    }
+}
+
+#[test]
 fn an_unrecognized_gate_value_leaves_the_feature_off() {
     let fx = Fixture::with_gate("posh-modal-maybe", Some("maybe"));
     let mut req = fx.conn();
