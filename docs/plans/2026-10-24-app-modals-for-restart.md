@@ -405,12 +405,15 @@ the alt-screen exit; 7. no "screen contains" assertion, and wall-clock text
 defeats goldens; 8. styles (the reverse-video banner) unasserted, untried;
 9. stdin EOF does not end a recording.
 
-Status (2026-10-25): gaps 1, 2, 3, 5, 7 and 9 are addressed in poshterity —
-`record --mark-fifo`, `seek --contains/--lacks` (one pass, content-based, so
-write indices no longer matter), `record --size`, and `record --end-on-eof` —
-each with tests; `debug-modal-record` now uses them. Still open: 4 (expect-style
-wait-for-screen input), 6 (the alt-screen-exit final screen is worked around by
-`seek`, not fixed), 8 (styles: `seek --dump vt` is available but unasserted).
+Status (2026-10-25): all nine gaps are addressed in poshterity, each with tests:
+`record --mark-fifo` (1), `seek --contains/--lacks` (2, 3, 7: one pass,
+content-based, so write indices no longer matter), `record --size` (5),
+`record --end-on-eof` (9), `record --script` (4: an expect-style driver whose
+`wait-for`/`wait-lacks`/`send`/`sleep`/`mark` steps watch the program's live
+screen), `replay --before-alt-exit` (6) and `seek --styled TEXT=attrs` (8).
+`debug-modal-record` uses `--script`, `--size`, `seek --contains/--lacks/--styled`
+and has no sleeps: it also waits for the viewer to probe as capable
+(`posh modal --probe`) before raising the modal, instead of guessing a delay.
 
 ### Product finding from the recording
 

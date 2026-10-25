@@ -13,13 +13,19 @@ use std::sync::atomic::{AtomicBool, Ordering};
 use std::time::Instant;
 
 use poshterity::castx::{Header, Poshterity, Recorder};
+use poshterity::script::{self, Action, Outcome};
+
+/// How long to keep recording after the last script step runs, so the effect of
+/// the final `send` (the program's echo/redraw) lands in the recording.
+const SCRIPT_SETTLE_SECS: f64 = 0.25;
 
 const STDIN_FD: RawFd = 0;
 const STDOUT_FD: RawFd = 1;
 
 const USAGE: &str = "\
 usage: poshterity record [--out FILE] [--size COLSxROWS] [--end-on-eof]
-                         [--mark-fifo PATH] [--via posh|ssh --host HOST] -- <cmd> [args...]
+                         [--mark-fifo PATH] [--script FILE]
+                         [--via posh|ssh --host HOST] -- <cmd> [args...]
 
 Spawn <cmd> under a PTY, tee its output to the terminal and to a .castx
 recording (default --out recording.castx). Replay it with `poshterity replay`.
@@ -31,6 +37,14 @@ recording (default --out recording.castx). Replay it with `poshterity replay`.
   --mark-fifo PATH   create a fifo at PATH; every line written to it becomes a
                      named marker in the recording (replay/step/assert can stop
                      at it). The fifo is removed when recording ends.
+  --script FILE      drive the program expect-style: wait for its live screen
+                     to show (or stop showing) text before sending keys.
+                     Steps, one per line: wait-for [--timeout S] TEXT,
+                     wait-lacks [--timeout S] TEXT, send TEXT (\\r \\n \\t \\e
+                     \\\\ \\xHH), sleep S, mark NAME. The recording ends when the
+                     script does; a wait that times out exits 3 and prints the
+                     screen it was looking at. End a script with a wait-for on
+                     the last effect you want recorded.
 
 With --via/--host the command is run over a remote transport, for capturing a
 remote session's client-side rendering (diff a posh vs ssh recording to localize
@@ -51,7 +65,8 @@ enum Via {
 
 /// Run `poshterity record`. Returns the child's exit code on success.
 pub fn run(args: &[String]) -> Result<i32, String> {
-    let Opts { out: out_path, command, size, end_on_eof, mark_fifo } = parse_args(args)?;
+    let Opts { out: out_path, command, size, end_on_eof, mark_fifo, script: script_path } =
+        parse_args(args)?;
 
     // The recording's size is --size, else the current terminal's (24x80 when
     // stdout is not a tty, e.g. redirected — also how the integration test runs).
@@ -62,6 +77,20 @@ pub fn run(args: &[String]) -> Result<i32, String> {
 
     // Created before the child so the path exists the moment recording starts.
     let marks = mark_fifo.as_deref().map(MarkFifo::create).transpose()?;
+
+    // Parsed before anything is spawned so a bad script fails without a child.
+    let mut script = match script_path.as_deref() {
+        Some(p) => {
+            let src = std::fs::read_to_string(p).map_err(|e| format!("{p}: {e}"))?;
+            Some(ScriptState {
+                runner: script::Runner::new(script::parse(&src).map_err(|e| format!("{p}: {e}"))?),
+                live: posh_term::Terminal::new(rows, cols),
+                done_at: None,
+            })
+        }
+        None => None,
+    };
+    let mut failure: Option<String> = None;
 
     let file = std::fs::File::create(&out_path).map_err(|e| format!("{out_path}: {e}"))?;
     let mut rec = Recorder::new(std::io::BufWriter::new(file));
@@ -84,13 +113,14 @@ pub fn run(args: &[String]) -> Result<i32, String> {
     let pty = spawn(&command, rows, cols).map_err(|e| format!("spawn {}: {e}", command[0]))?;
     let start = Instant::now();
     let tee = Tee { fixed_size: size.is_some(), end_on_eof, marks: marks.as_ref() };
-    let ended = tee_loop(&mut rec, pty.master, start, &tee);
+    let ended = tee_loop(&mut rec, pty.master, start, &tee, script.as_mut(), &mut failure);
     let code = 0;
 
-    if ended == Ended::StdinEof {
-        // --end-on-eof: hang the terminal up. Closing the master sends the
-        // child's session SIGHUP; the explicit kill covers a child that is not
-        // the foreground process group.
+    let hang_up = ended != Ended::ChildClosed;
+    if hang_up {
+        // stdin EOF (--end-on-eof) or the end of a --script: hang the terminal
+        // up. Closing the master sends the child's session SIGHUP; the explicit
+        // kill covers a child that is not the foreground process group.
         // SAFETY: closing our own master fd; kill(2) on our own child.
         unsafe {
             libc::close(pty.master);
@@ -98,7 +128,7 @@ pub fn run(args: &[String]) -> Result<i32, String> {
         }
     }
     let status = wait_child(pty.pid);
-    if ended != Ended::StdinEof {
+    if !hang_up {
         // SAFETY: closing our own master fd once the loop is done.
         unsafe { libc::close(pty.master) };
     }
@@ -107,8 +137,19 @@ pub fn run(args: &[String]) -> Result<i32, String> {
     drop(raw); // restore the terminal before printing
 
     eprintln!("poshterity: recorded → {out_path}");
-    // Prefer the child's real exit status; fall back to the loop's view.
-    Ok(if status >= 0 { status } else { code })
+    if let Some(why) = failure {
+        eprintln!("poshterity: {why}");
+        return Ok(3);
+    }
+    // Prefer the child's real exit status; fall back to the loop's view. A
+    // child we hung up reports the signal, not a failure of the recording.
+    Ok(if hang_up {
+        0
+    } else if status >= 0 {
+        status
+    } else {
+        code
+    })
 }
 
 /// Parsed `record` arguments.
@@ -123,6 +164,8 @@ struct Opts {
     end_on_eof: bool,
     /// `--mark-fifo PATH`: each line written to this fifo becomes a marker.
     mark_fifo: Option<String>,
+    /// `--script FILE`: expect-style driver (see `poshterity::script`).
+    script: Option<String>,
 }
 
 fn parse_size(s: &str) -> Option<(u16, u16)> {
@@ -138,6 +181,7 @@ fn parse_args(args: &[String]) -> Result<Opts, String> {
     let mut size: Option<(u16, u16)> = None;
     let mut end_on_eof = false;
     let mut mark_fifo: Option<String> = None;
+    let mut script: Option<String> = None;
     let mut i = 0;
     while i < args.len() {
         match args[i].as_str() {
@@ -161,6 +205,10 @@ fn parse_args(args: &[String]) -> Result<Opts, String> {
             }
             "--mark-fifo" => {
                 mark_fifo = Some(args.get(i + 1).ok_or("--mark-fifo requires a path")?.clone());
+                i += 2;
+            }
+            "--script" => {
+                script = Some(args.get(i + 1).ok_or("--script requires a file")?.clone());
                 i += 2;
             }
             "--via" => {
@@ -189,6 +237,7 @@ fn parse_args(args: &[String]) -> Result<Opts, String> {
                     size,
                     end_on_eof,
                     mark_fifo,
+                    script,
                 });
             }
             other => return Err(format!("unexpected argument {other:?}\n\n{USAGE}")),
@@ -232,6 +281,72 @@ enum Ended {
     ChildClosed,
     /// stdin reached EOF and `--end-on-eof` asked to stop there.
     StdinEof,
+    /// The `--script` ran to its end (and settled), or timed out (see the
+    /// `failure` out-parameter of [`tee_loop`]).
+    ScriptOver,
+}
+
+/// `--script` state: the step runner plus a LIVE emulator fed the child's
+/// output, which is the screen `wait-for`/`wait-lacks` look at.
+struct ScriptState {
+    runner: script::Runner,
+    live: posh_term::Terminal,
+    /// When the last step ran (the settle period counts from here).
+    done_at: Option<f64>,
+}
+
+impl ScriptState {
+    /// Run what can run at `now` (seconds into the recording). `Some` when the
+    /// script is over: finished and settled, or timed out (then `failure` says
+    /// why, with the screen).
+    fn drive(
+        &mut self,
+        rec: &mut Recorder<impl std::io::Write>,
+        master: RawFd,
+        now: f64,
+        failure: &mut Option<String>,
+    ) -> Option<Ended> {
+        let ScriptState { runner, live, done_at } = self;
+        if done_at.is_none() {
+            let (actions, outcome) = runner.advance(now, &mut || live.dump_text());
+            for a in actions {
+                match a {
+                    Action::Send(bytes) => {
+                        write_all(master, &bytes);
+                        let _ = rec.input(now, &bytes);
+                    }
+                    Action::Mark(name) => {
+                        let _ = rec.marker(now, &name);
+                    }
+                }
+            }
+            match outcome {
+                Outcome::Pending => {}
+                Outcome::Done => *done_at = Some(now),
+                Outcome::TimedOut { what } => {
+                    *failure = Some(format!(
+                        "script step timed out: {what}\nthe screen it was waiting on:\n{}",
+                        live.dump_text()
+                    ));
+                    return Some(Ended::ScriptOver);
+                }
+            }
+        }
+        match *done_at {
+            Some(t) if now - t >= SCRIPT_SETTLE_SECS => Some(Ended::ScriptOver),
+            _ => None,
+        }
+    }
+
+    /// Milliseconds the poll may sleep before the script needs attention again
+    /// (`-1`: until some fd is ready).
+    fn poll_timeout_ms(&self, now: f64) -> i32 {
+        let secs = match self.done_at {
+            Some(t) => Some((t + SCRIPT_SETTLE_SECS - now).max(0.0)),
+            None => self.runner.next_wake(now),
+        };
+        secs.map_or(-1, |s| (s * 1000.0).ceil().min(i32::MAX as f64) as i32)
+    }
 }
 
 /// What the tee loop does beyond copying bytes.
@@ -302,7 +417,14 @@ impl Drop for MarkFifo {
 /// Copy bytes between the local terminal and the PTY master until the child's
 /// output ends, recording output (`o`), input (`i`), resizes (`r`) and the
 /// markers arriving on `tee.marks` (`m`).
-fn tee_loop(rec: &mut Recorder<impl std::io::Write>, master: RawFd, start: Instant, tee: &Tee) -> Ended {
+fn tee_loop(
+    rec: &mut Recorder<impl std::io::Write>,
+    master: RawFd,
+    start: Instant,
+    tee: &Tee,
+    mut script: Option<&mut ScriptState>,
+    failure: &mut Option<String>,
+) -> Ended {
     let mut buf = [0u8; 4096];
     let mut stdin_open = true;
     loop {
@@ -310,6 +432,20 @@ fn tee_loop(rec: &mut Recorder<impl std::io::Write>, master: RawFd, start: Insta
             let (rows, cols) = term_size(STDOUT_FD);
             set_term_size(master, rows, cols);
             let _ = rec.resize(start.elapsed().as_secs_f64(), cols, rows);
+            if let Some(s) = script.as_deref_mut() {
+                s.live.resize(rows, cols);
+            }
+        }
+
+        // The script runs before every poll (so deadlines are armed) and after
+        // every wake (so new output can satisfy a wait).
+        let now = start.elapsed().as_secs_f64();
+        let mut poll_ms = -1;
+        if let Some(s) = script.as_deref_mut() {
+            if let Some(ended) = s.drive(rec, master, now, failure) {
+                return ended;
+            }
+            poll_ms = s.poll_timeout_ms(now);
         }
 
         let mut fds = [
@@ -330,7 +466,7 @@ fn tee_loop(rec: &mut Recorder<impl std::io::Write>, master: RawFd, start: Insta
             },
         ];
         // SAFETY: fds is a valid, sized array for the duration of the call.
-        let n = unsafe { libc::poll(fds.as_mut_ptr(), fds.len() as libc::nfds_t, -1) };
+        let n = unsafe { libc::poll(fds.as_mut_ptr(), fds.len() as libc::nfds_t, poll_ms) };
         if n < 0 {
             let e = std::io::Error::last_os_error();
             if e.kind() == std::io::ErrorKind::Interrupted {
@@ -346,6 +482,10 @@ fn tee_loop(rec: &mut Recorder<impl std::io::Write>, master: RawFd, start: Insta
                 Ok(k) => {
                     write_all(STDOUT_FD, &buf[..k]);
                     let _ = rec.output(start.elapsed().as_secs_f64(), &buf[..k]);
+                    if let Some(s) = script.as_deref_mut() {
+                        s.live.process(&buf[..k]);
+                        let _ = s.live.take_responses(); // a replay never answers queries
+                    }
                 }
                 Err(ref e) if e.kind() == std::io::ErrorKind::WouldBlock => {}
                 Err(_) => break, // EIO once the slave is gone

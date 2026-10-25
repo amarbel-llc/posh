@@ -47,6 +47,66 @@ fn record_size_fixes_the_pty_and_the_header_whatever_stdout_is() {
 }
 
 #[test]
+fn record_script_waits_for_the_screen_before_sending_keys() {
+    let out = temp("script", "castx");
+    let script = temp("script", "txt");
+    std::fs::write(
+        &script,
+        "# drive a prompt: wait for it, answer it, wait for the reply\n\
+         wait-for ready>\n\
+         send hello\\r\n\
+         wait-for got:hello\n\
+         mark answered\n",
+    )
+    .unwrap();
+    let started = Instant::now();
+    let mut child = Command::new(env!("CARGO_BIN_EXE_poshterity"))
+        .args([
+            "record", "--size", "40x5", "--script", script.to_str().unwrap(),
+            "--out", out.to_str().unwrap(), "--",
+            // slow to print the prompt, then a program that would run on
+            "sh", "-c", "sleep 0.6; printf 'ready>'; read x; echo; echo got:$x; sleep 60",
+        ])
+        .stdin(Stdio::null())
+        .stdout(Stdio::null())
+        .stderr(Stdio::null())
+        .spawn()
+        .expect("spawn poshterity");
+    wait_within(&mut child, Duration::from_secs(20));
+    assert!(started.elapsed() < Duration::from_secs(15), "the script ended the recording, not `sleep 60`");
+    let doc = std::fs::read_to_string(&out).unwrap();
+    let _ = std::fs::remove_file(&out);
+    let _ = std::fs::remove_file(&script);
+    assert!(doc.contains("\"m\",\"answered\""), "the mark step is recorded: {doc:?}");
+    let mut player = poshterity::player::Player::from_source(&doc).unwrap();
+    assert!(player.step_to_marker("answered"));
+    let text = player.terminal().dump_text();
+    assert!(text.contains("got:hello"), "the keys went in after the prompt: {text:?}");
+}
+
+#[test]
+fn record_script_that_times_out_fails_loudly_and_keeps_the_recording() {
+    let out = temp("timeout", "castx");
+    let script = temp("timeout", "txt");
+    std::fs::write(&script, "wait-for --timeout 0.5 never-appears\n").unwrap();
+    let result = Command::new(env!("CARGO_BIN_EXE_poshterity"))
+        .args([
+            "record", "--script", script.to_str().unwrap(), "--out", out.to_str().unwrap(),
+            "--", "sh", "-c", "echo something else; sleep 60",
+        ])
+        .stdin(Stdio::null())
+        .stdout(Stdio::null())
+        .output()
+        .expect("run poshterity");
+    let err = String::from_utf8_lossy(&result.stderr).into_owned();
+    assert_eq!(result.status.code(), Some(3), "a timed-out script exits 3: {err}");
+    assert!(err.contains("never-appears") && err.contains("something else"), "names the wait and shows the screen: {err}");
+    assert!(std::fs::metadata(&out).is_ok_and(|m| m.len() > 0), "the recording is kept for diagnosis");
+    let _ = std::fs::remove_file(&out);
+    let _ = std::fs::remove_file(&script);
+}
+
+#[test]
 fn record_end_on_eof_stops_a_child_that_would_run_on() {
     let out = temp("eof", "castx");
     let mut child = Command::new(env!("CARGO_BIN_EXE_poshterity"))

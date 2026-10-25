@@ -621,9 +621,10 @@ debug-modal-try secs="30" dismiss="cancel": build-palette
     "$P" kill demo >/dev/null 2>&1
 
 # PROTOTYPE app-presented modal, RECORDED with poshterity instead of tmux: the
-# viewer (`posh attach demo`) runs under `poshterity record` on a fixed 24x80
-# PTY, scripted keystrokes arrive on its stdin through a pipe, and the checks
-# replay the .castx through posh-term (no terminal, no sleeps in the check).
+# viewer (`posh attach demo`) runs under `poshterity record` on a fixed 80x24
+# PTY, an expect-style `--script` types the keys once the viewer's live screen
+# shows what each one reacts to, and the checks replay the .castx through
+# posh-term with `poshterity seek` (no terminal, no sleeps anywhere in it).
 # SCENARIO as in debug-modal-demo (cancel, esc, hide, timeout). It prints PASS /
 # FAIL per check and exits non-zero on any FAIL; the .castx stays in
 # .tmp/modalrec/ for `poshterity step <file> --by write --dump text`.
@@ -647,22 +648,30 @@ debug-modal-record scenario="cancel" secs="30": build-palette
     "$P" attach --detach demo -- sh -c 'while :; do echo "agent working $(date +%T)"; sleep 1; done' >/dev/null
     F="$dir/viewer.castx"
     flags=""; [ "{{ scenario }}" = hide ] && flags="--on-dismiss hide"
+    # The driver is an expect-style poshterity script: each key waits for the
+    # viewer's LIVE screen to show what it is reacting to (no sleeps). Ctrl-^ is
+    # \x1e, Enter \r, Esc \e. It ends when the last wait is satisfied.
+    S="$dir/driver.script"
+    B='left - Ctrl-^ to review'
     case "{{ scenario }}" in
-      cancel)  keys='sleep 3; printf "\036"; sleep 2; printf "\r"; sleep 2'; want=10 ;;
-      esc)     keys='sleep 3; printf "\036"; sleep 2; printf "\033"; sleep 2'; want=10 ;;
-      hide)    keys='sleep 3; printf "\036"; sleep 2; printf "\033"; sleep {{ secs }}'; want=0 ;;
-      timeout) keys='sleep $(( {{ secs }} + 3 ))'; want=0 ;;
+      cancel)  printf 'wait-for %s\nsend \\x1e\nwait-for Time left\nsend \\r\nwait-lacks Time left\nwait-lacks %s\n' "$B" "$B" >"$S"; want=10 ;;
+      esc)     printf 'wait-for %s\nsend \\x1e\nwait-for Time left\nsend \\e\nwait-lacks Time left\nwait-lacks %s\n' "$B" "$B" >"$S"; want=10 ;;
+      hide)    printf 'wait-for %s\nsend \\x1e\nwait-for Time left\nsend \\e\nwait-lacks Time left\nwait-lacks --timeout %s %s\n' "$B" $(( {{ secs }} + 5 )) "$B" >"$S"; want=0 ;;
+      timeout) printf 'wait-for %s\nwait-lacks --timeout %s %s\n' "$B" $(( {{ secs }} + 5 )) "$B" >"$S"; want=0 ;;
       *) echo "scenario must be cancel|esc|hide|timeout"; exit 64 ;;
     esac
-    # --size pins the PTY (no more "24x80 because stdout is not a tty"); the
-    # recording ends when the keystroke script does (--end-on-eof hangs the
-    # viewer up), so nothing has to kill the session to finish it.
-    ( eval "$keys" ) | "$PT" record --size 80x24 --end-on-eof --out "$F" -- "$P" attach demo >/dev/null 2>"$dir/record.err" &
+    # --size pins the PTY; --script drives the viewer and ends the recording
+    # (hanging the viewer up) when its last step is satisfied.
+    "$PT" record --size 80x24 --script "$S" --out "$F" -- "$P" attach demo </dev/null >/dev/null 2>"$dir/record.err" &
     rp=$!
-    sleep 2
+    # Raise the modal once the viewer is attached (it counts as capable), not
+    # after a guessed sleep.
+    for _ in $(seq 1 40); do
+      "$P" modal --probe demo 2>/dev/null | grep -q '"capable":1' && break; sleep 0.25
+    done
     "$P" modal demo --timeout {{ secs }} --title "Restarting agent" $flags >"$dir/modal.out" 2>&1
     code=$?
-    wait $rp
+    wait $rp; drv=$?
     "$P" kill demo >/dev/null 2>&1
     echo "modal exit=$code (want $want); recording: $F ($(wc -c <"$F") bytes)"
     # Replay helpers, one `poshterity seek` process each (it replays the
@@ -673,11 +682,13 @@ debug-modal-record scenario="cancel" secs="30": build-palette
     fail=0
     check() { if [ "$2" = ok ]; then echo "PASS  $1"; else echo "FAIL  $1"; fail=1; fi; }
     [ "$code" = "$want" ] && check "modal exit code is $want" ok || check "modal exit code is $want (got $code)" bad
-    B='left - Ctrl-^ to review'
+    if [ "$drv" = 0 ]; then check "driver script ran to its end" ok; else check "driver script ran to its end (exit $drv)" bad; cat "$dir/record.err"; fi
     b=$(where --contains "$B")
     [ -n "$b" ] && check "banner appears (write $b)" ok || check "banner appears" bad
     if [ -n "$b" ]; then
       [ "$(screen_where --contains "$B" | head -1 | grep -c 'Restarting agent')" = 1 ] && check "banner is on row 1" ok || check "banner is on row 1" bad
+      # the bar is reverse video (a text dump alone cannot say so)
+      [ -n "$(where --styled 'Restarting agent=inverse,bold' --contains "$B")" ] && check "banner is a bold reverse-video bar" ok || check "banner is a bold reverse-video bar" bad
     fi
     case "{{ scenario }}" in
       cancel|esc|hide)

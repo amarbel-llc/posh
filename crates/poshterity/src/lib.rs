@@ -27,6 +27,8 @@ pub mod framereplay;
 pub mod golden;
 pub mod json;
 pub mod player;
+pub mod script;
+pub mod styled;
 
 // Re-exported so callers of the assertion helpers (which take/return these
 // posh-term types) don't need a separate posh-term dependency.

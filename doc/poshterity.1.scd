@@ -6,13 +6,13 @@ poshterity - deterministic, step-ratcheted terminal recorder/replayer
 
 # SYNOPSIS
 
-*poshterity record* [*--out* _FILE_] [*--size* _COLSxROWS_] [*--end-on-eof*] [*--mark-fifo* _PATH_] [*--via* _posh_|_ssh_ *--host* _HOST_] *--* _cmd_ [_args_]...
+*poshterity record* [*--out* _FILE_] [*--size* _COLSxROWS_] [*--end-on-eof*] [*--mark-fifo* _PATH_] [*--script* _FILE_] [*--via* _posh_|_ssh_ *--host* _HOST_] *--* _cmd_ [_args_]...
 
-*poshterity replay* _file_ [*--to-marker* _NAME_] [*--dump* _text_|_vt_|_flat_]
+*poshterity replay* _file_ [*--to-marker* _NAME_ | *--before-alt-exit*] [*--dump* _text_|_vt_|_flat_]
 
 *poshterity step* _file_ (*--by* _unit_ [*--n* _N_] | *--to-marker* _NAME_) [*--frame-gap* _SECS_] [*--dump* _..._]
 
-*poshterity seek* _file_ [*--contains* _TEXT_]... [*--lacks* _TEXT_]... [*--from-write* _N_] [*--dump* _text_|_vt_|_flat_]
+*poshterity seek* _file_ [*--contains* _TEXT_]... [*--lacks* _TEXT_]... [*--styled* _TEXT=attr,..._]... [*--from-write* _N_] [*--dump* _text_|_vt_|_flat_]
 
 *poshterity bless* _file_ *--golden* _path_ [*--at* _MARKER_] [*--kind* _grid_|_vt_|_flat_]
 
@@ -62,20 +62,57 @@ and lives only in the standalone *poshterity* binary.
 	*replay*/*step*/*assert* can stop *--to-marker*/*--at* it. The fifo is
 	removed when recording ends.
 
-*seek* _file_ [*--contains* _TEXT_]... [*--lacks* _TEXT_]... [*--from-write* _N_] [*--dump* _..._]
+	*--script* _FILE_ drives the program expect-style: a step waits for the
+	program's *live* screen to show, or stop showing, some text before the
+	next keys are sent, so a scripted session does not race the program with
+	sleeps. One step per line (blank lines and lines starting with _#_ are
+	ignored):
+
+	*wait-for* [*--timeout* _S_] _TEXT_
+		Wait until the screen contains _TEXT_ (the rest of the line,
+		taken literally). Default timeout 10 s.
+
+	*wait-lacks* [*--timeout* _S_] _TEXT_
+		Wait until the screen no longer contains _TEXT_.
+
+	*send* _TEXT_
+		Type _TEXT_ into the program. Escapes: _\\r_ _\\n_ _\\t_ _\\e_ _\\\\_
+		and _\\xHH_ (Ctrl-^ is _\\x1e_).
+
+	*sleep* _S_
+		Pause _S_ seconds.
+
+	*mark* _NAME_
+		Record a marker, as *--mark-fifo* does.
+
+	The recording ends (the program is hung up) a moment after the last step
+	runs, so end a script with a *wait-for* on the last effect worth
+	recording. A wait that times out exits with status 3, prints the step and
+	the screen it was looking at on stderr, and keeps the recording for
+	diagnosis. Keys the script sends are recorded as *i* events.
+
+*seek* _file_ [*--contains* _TEXT_]... [*--lacks* _TEXT_]... [*--styled* _TEXT=attr,..._]... [*--from-write* _N_] [*--dump* _..._]
 	Replay the recording write by write, in one pass, and stop at the
 	first write whose screen text contains every *--contains* _TEXT_ and
-	none of the *--lacks* _TEXT_ (at least one is required; *--from-write*
-	starts after write _N_, default 1). The matching screen is printed on
+	none of the *--lacks* _TEXT_, and shows every *--styled* _TEXT=attrs_
+	(_TEXT_ on screen with all the cells it covers carrying all the
+	attributes: _bold dim italic underline inverse blink strike fg:N bg:N_,
+	_N_ a 0-255 palette index or _default_; a reverse-video bar is
+	_bar=inverse_). At least one condition is required; *--from-write*
+	starts after write _N_, default 1. The matching screen is printed on
 	stdout and _write N_ on stderr; no match exits non-zero. _N_ is the
 	index _step --by write --n N_ reaches. The chunking of a recording
 	varies from run to run, so seek by content and never by a fixed
 	index: this is the "the screen shows X" assertion that *assert* (which
 	compares goldens) does not give.
 
-*replay* _file_ [*--to-marker* _NAME_] [*--dump* _text_|_vt_|_flat_]
+*replay* _file_ [*--to-marker* _NAME_ | *--before-alt-exit*] [*--dump* _text_|_vt_|_flat_]
 	Feed the whole recording through the emulator and print the final
 	screen. *--to-marker* stops at the first marker named _NAME_.
+	*--before-alt-exit* stops just before the last alternate-screen exit,
+	so a full-screen program's last screen is shown instead of the
+	primary screen it hands back when it quits (an error if the recording
+	never leaves the alternate screen).
 	*--dump* selects the rendering: _text_ (plain, default), _vt_ (a full
 	escape-stream reconstruction), or _flat_ (single active grid).
 

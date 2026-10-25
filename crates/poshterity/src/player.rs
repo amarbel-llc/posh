@@ -16,6 +16,7 @@
 use posh_term::Terminal;
 
 use crate::castx::{EventCode, Reader};
+use crate::styled::StyledText;
 
 /// A unit of replay advance. See the module docs for the signal behind each.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -75,14 +76,18 @@ const DEFAULT_FRAME_GAP: f64 = 0.1;
 pub struct Seek {
     pub contains: Vec<String>,
     pub lacks: Vec<String>,
+    /// Text that must be on screen drawn with given attributes (`--styled`).
+    pub styled: Vec<StyledText>,
     pub from_write: usize,
 }
 
 impl Seek {
-    /// Whether `screen_text` satisfies the query.
-    pub fn holds(&self, screen_text: &str) -> bool {
-        self.contains.iter().all(|s| screen_text.contains(s.as_str()))
-            && !self.lacks.iter().any(|s| screen_text.contains(s.as_str()))
+    /// Whether the terminal's screen satisfies the query.
+    pub fn holds(&self, term: &Terminal) -> bool {
+        let text = term.dump_text();
+        self.contains.iter().all(|s| text.contains(s.as_str()))
+            && !self.lacks.iter().any(|s| text.contains(s.as_str()))
+            && self.styled.iter().all(|s| s.holds(term))
     }
 }
 
@@ -252,12 +257,33 @@ impl Player {
             self.step(Granularity::Write, to_skip);
         }
         loop {
-            if self.write_index() >= from && q.holds(&self.term.dump_text()) {
+            if self.write_index() >= from && q.holds(&self.term) {
                 return Some(self.write_index());
             }
             if self.step(Granularity::Write, 1) == 0 {
                 return None;
             }
+        }
+    }
+
+    /// Advance to just BEFORE the last alternate-screen exit in the recording
+    /// (`CSI ? 1049 l`, `? 1047 l` or `? 47 l`), so the screen is what the
+    /// program last drew rather than the primary screen it hands back on exit.
+    /// Returns false (the player has not moved) if the recording never leaves
+    /// the alternate screen at or ahead of the cursor.
+    pub fn step_to_before_alt_exit(&mut self) -> bool {
+        const EXITS: [&[u8]; 3] = [b"\x1b[?1049l", b"\x1b[?1047l", b"\x1b[?47l"];
+        let last = EXITS
+            .iter()
+            .filter_map(|pat| self.flat.windows(pat.len()).rposition(|w| w == *pat))
+            .max()
+            .filter(|&at| at >= self.cursor);
+        match last {
+            Some(at) => {
+                self.feed_until(at);
+                true
+            }
+            None => false,
         }
     }
 
@@ -500,6 +526,33 @@ mod tests {
         assert!(row0(&p).contains('Z'));
     }
 
+    // header 20x3: enter the alt screen, draw, leave it, then a line on the
+    // primary screen. A finished full-screen program ends this way.
+    const ALT_FIXTURE: &str = "{\"version\":2,\"width\":20,\"height\":3}\n\
+                               [0.0,\"o\",\"\\u001b[?1049hhello\"]\n\
+                               [0.1,\"o\",\"\\u001b[?1049lback\"]\n";
+
+    #[test]
+    fn step_to_before_alt_exit_shows_the_last_screen_the_program_drew() {
+        let mut p = Player::from_source(ALT_FIXTURE).unwrap();
+        assert!(p.step_to_before_alt_exit());
+        assert_eq!(row0(&p), "hello", "the alt screen, just before it is left");
+        p.step_to_end();
+        assert_eq!(row0(&p), "back", "the primary screen after the exit");
+    }
+
+    #[test]
+    fn step_to_before_alt_exit_uses_the_last_exit_and_reports_none() {
+        const TWICE: &str = "{\"version\":2,\"width\":20,\"height\":3}\n\
+                             [0.0,\"o\",\"\\u001b[?1049hone\\u001b[?1049l\"]\n\
+                             [0.1,\"o\",\"\\u001b[?1049htwo\\u001b[?1049l\"]\n";
+        let mut p = Player::from_source(TWICE).unwrap();
+        assert!(p.step_to_before_alt_exit());
+        assert_eq!(row0(&p), "two", "the LAST exit, not the first");
+        let mut p = Player::from_source(FIXTURE).unwrap();
+        assert!(!p.step_to_before_alt_exit(), "no alternate screen in the recording");
+    }
+
     // --- seek: find the first write whose screen matches ------------------
 
     fn seek(contains: &[&str], lacks: &[&str], from: usize) -> Seek {
@@ -507,7 +560,22 @@ mod tests {
             contains: contains.iter().map(|s| s.to_string()).collect(),
             lacks: lacks.iter().map(|s| s.to_string()).collect(),
             from_write: from,
+            ..Seek::default()
         }
+    }
+
+    #[test]
+    fn seek_styled_finds_the_write_where_the_text_gets_its_style() {
+        // "hi" plain, then the same cells restyled inverse by a later write.
+        const SRC: &str = "{\"version\":2,\"width\":20,\"height\":3}\n\
+                           [0.0,\"o\",\"hi\"]\n\
+                           [0.1,\"o\",\"\\u001b[1G\\u001b[7mhi\\u001b[0m\"]\n";
+        let mut p = Player::from_source(SRC).unwrap();
+        let q = Seek {
+            styled: vec![StyledText::parse("hi=inverse").unwrap()],
+            ..Seek::default()
+        };
+        assert_eq!(p.seek(&q), Some(2), "plain after write 1, inverse after write 2");
     }
 
     #[test]

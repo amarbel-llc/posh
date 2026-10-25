@@ -9,6 +9,7 @@
 use crate::castx::{EventCode, Reader};
 use crate::golden::{self, GoldenKind};
 use crate::player::{Granularity, Player, Seek};
+use crate::styled::StyledText;
 use crate::Replay;
 use posh_proto::display::{new_frame, Snapshot};
 use std::io::Write;
@@ -37,12 +38,13 @@ impl Dump {
 
 const USAGE: &str = "\
 usage:
-  poshterity replay <file> [--to-marker NAME] [--dump text|vt|flat]
+  poshterity replay <file> [--to-marker NAME | --before-alt-exit] [--dump text|vt|flat]
   poshterity replay <file> --raw [--size COLSxROWS] [--dump text|vt|flat]
   poshterity render <file> --raw [--size COLSxROWS] [--bytes N]
   poshterity step <file> (--by byte|escape|write|change|frame|marker [--n N]
                         | --to-marker NAME) [--frame-gap SECS] [--dump ...]
-  poshterity seek <file> [--contains TEXT]... [--lacks TEXT]... [--from-write N]
+  poshterity seek <file> [--contains TEXT]... [--lacks TEXT]...
+                  [--styled TEXT=attr[,attr]...]... [--from-write N]
                   [--dump text|vt|flat]
   poshterity bless <file> --golden <path> [--at MARKER] [--kind grid|vt|flat]
   poshterity assert <file> --golden <path> [--at MARKER] [--kind ...]
@@ -50,7 +52,10 @@ usage:
 
 `seek` replays the recording write by write in ONE pass and stops at the first
 write whose screen text contains every --contains TEXT and none of the --lacks
-TEXT (at least one is required; --from-write N starts after write N, default 1).
+TEXT, and every --styled TEXT=attrs is on screen with all its cells carrying all
+the attrs (bold dim italic underline inverse blink strike fg:N bg:N; N is a
+0-255 palette index or `default`). At least one condition is required;
+--from-write N starts after write N, default 1.
 It prints that screen on stdout and `write N` on stderr, and exits non-zero when
 no write matches. N is the same index `step --by write --n N` reaches. How a
 recorder chunks output varies run to run, so seek by content, never by index.
@@ -109,6 +114,7 @@ fn run_replay(args: &[String]) -> Result<(), String> {
     let mut file: Option<&str> = None;
     let mut dump = Dump::Text;
     let mut to_marker: Option<&str> = None;
+    let mut before_alt_exit = false;
     let mut raw = false;
     let mut size: Option<(u16, u16)> = None;
     let mut max_bytes: Option<usize> = None;
@@ -122,6 +128,10 @@ fn run_replay(args: &[String]) -> Result<(), String> {
             "--to-marker" => {
                 to_marker = Some(args.get(i + 1).ok_or("--to-marker requires a value")?);
                 i += 2;
+            }
+            "--before-alt-exit" => {
+                before_alt_exit = true;
+                i += 1;
             }
             "--raw" => {
                 raw = true;
@@ -179,7 +189,19 @@ fn run_replay(args: &[String]) -> Result<(), String> {
         return Err("--bytes only applies to --raw".into());
     }
 
+    if before_alt_exit && (to_marker.is_some() || raw) {
+        return Err("--before-alt-exit cannot be combined with --to-marker or --raw".into());
+    }
     let src = std::fs::read_to_string(path).map_err(|e| format!("{path}: {e}"))?;
+    if before_alt_exit {
+        let mut player = Player::from_source(&src)?;
+        if !player.step_to_before_alt_exit() {
+            return Err("the recording never leaves the alternate screen".into());
+        }
+        return std::io::stdout()
+            .write_all(&dump_terminal(player.terminal(), dump))
+            .map_err(|e| format!("write: {e}"));
+    }
     let out = match to_marker {
         // Stop at a named marker instead of feeding the whole stream.
         Some(name) => {
@@ -359,6 +381,10 @@ fn run_seek(args: &[String]) -> Result<(), String> {
                 q.lacks.push(args.get(i + 1).ok_or("--lacks requires a value")?.clone());
                 i += 2;
             }
+            "--styled" => {
+                q.styled.push(StyledText::parse(args.get(i + 1).ok_or("--styled requires TEXT=attr[,attr]...")?)?);
+                i += 2;
+            }
             "--from-write" => {
                 q.from_write = args
                     .get(i + 1)
@@ -384,17 +410,18 @@ fn run_seek(args: &[String]) -> Result<(), String> {
         }
     }
     let path = file.ok_or_else(|| format!("seek requires a <file>\n\n{USAGE}"))?;
-    if q.contains.is_empty() && q.lacks.is_empty() {
-        return Err("seek requires at least one --contains or --lacks".into());
+    if q.contains.is_empty() && q.lacks.is_empty() && q.styled.is_empty() {
+        return Err("seek requires at least one --contains, --lacks or --styled".into());
     }
     let src = std::fs::read_to_string(path).map_err(|e| format!("{path}: {e}"))?;
     let mut player = Player::from_source(&src)?;
     let Some(n) = player.seek(&q) else {
         return Err(format!(
-            "no write from {} on has a screen with {:?} present and {:?} absent",
+            "no write from {} on has a screen with {:?} present, {:?} absent and {:?} styled",
             q.from_write.max(1),
             q.contains,
-            q.lacks
+            q.lacks,
+            q.styled
         ));
     };
     let pos = player.position();

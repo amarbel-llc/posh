@@ -67,6 +67,52 @@ fn seek_that_never_matches_fails_and_says_what_it_wanted() {
     let _ = std::fs::remove_file(&f);
 }
 
+// A full-screen program: draws on the alternate screen, then leaves it.
+const ALT: &str = "{\"version\":2,\"width\":20,\"height\":3}\n\
+                   [0.0,\"o\",\"\\u001b[?1049hdrawn\"]\n\
+                   [0.1,\"o\",\"\\u001b[?1049l\"]\n";
+
+#[test]
+fn replay_before_alt_exit_shows_what_the_program_left_behind() {
+    let f = std::env::temp_dir().join(format!("poshterity-alt-{}.castx", std::process::id()));
+    std::fs::write(&f, ALT).unwrap();
+    let run = |args: &[&str]| {
+        let out = Command::new(env!("CARGO_BIN_EXE_poshterity"))
+            .args(["replay"])
+            .arg(&f)
+            .args(args)
+            .output()
+            .unwrap();
+        (out.status.success(), String::from_utf8(out.stdout).unwrap(), String::from_utf8(out.stderr).unwrap())
+    };
+    let (ok, final_screen, _) = run(&[]);
+    assert!(ok && !final_screen.contains("drawn"), "the plain replay ends on the primary screen: {final_screen:?}");
+    let (ok, last, _) = run(&["--before-alt-exit"]);
+    assert!(ok && last.contains("drawn"), "{last:?}");
+    let (ok, _, err) = run(&["--before-alt-exit", "--to-marker", "x"]);
+    assert!(!ok && err.contains("--before-alt-exit"), "exclusive with --to-marker: {err:?}");
+    let _ = std::fs::remove_file(&f);
+}
+
+#[test]
+fn seek_styled_asserts_attributes_not_just_text() {
+    let f = std::env::temp_dir().join(format!("poshterity-styled-{}.castx", std::process::id()));
+    // a reverse-video bar on row 1, then plain output below it
+    std::fs::write(
+        &f,
+        "{\"version\":2,\"width\":20,\"height\":3}\n\
+         [0.0,\"o\",\"\\u001b[7m bar \\u001b[0m\\r\\nbody\"]\n",
+    )
+    .unwrap();
+    let r = seek(&f, &["--styled", "bar=inverse"]);
+    assert!(r.ok && r.stderr.contains("write 1"), "{} / {}", r.stderr, r.stdout);
+    let r = seek(&f, &["--styled", "body=inverse"]);
+    assert!(!r.ok, "plain text is not inverse");
+    let r = seek(&f, &["--styled", "bar=sparkly"]);
+    assert!(!r.ok && r.stderr.contains("sparkly"), "{:?}", r.stderr);
+    let _ = std::fs::remove_file(&f);
+}
+
 #[test]
 fn seek_needs_a_condition() {
     let f = fixture("bare");
