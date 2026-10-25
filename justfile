@@ -565,6 +565,108 @@ debug-modal-demo scenario="cancel" secs="30": build-palette
     echo "== daemon log (modal lines) =="; grep -h modal "$sock"/default/demo.log 2>/dev/null || true
     finish
 
+# PROTOTYPE app-presented modal, RECORDED with poshterity instead of tmux: the
+# viewer (`posh attach demo`) runs under `poshterity record` on a fixed 24x80
+# PTY, scripted keystrokes arrive on its stdin through a pipe, and the checks
+# replay the .castx through posh-term (no terminal, no sleeps in the check).
+# SCENARIO as in debug-modal-demo (cancel, esc, hide, timeout). It prints PASS /
+# FAIL per check and exits non-zero on any FAIL; the .castx stays in
+# .tmp/modalrec/ for `poshterity step <file> --by write --dump text`.
+# Known shortcomings of this approach are listed in the design note
+# (docs/plans/2026-10-24-app-modals-for-restart.md, "poshterity shortcomings").
+#
+# record a restart countdown viewer with poshterity and assert on the replay
+[group("debug")]
+debug-modal-record scenario="cancel" secs="30": build-palette
+    #!/usr/bin/env bash
+    set -uo pipefail
+    root="{{ justfile_directory() }}"
+    dir="$root/.tmp/modalrec"
+    sock="$dir/posh"
+    case "$sock" in "$root"/.tmp/*/posh) : ;; *) echo "refusing: POSH_DIR '$sock' not under .tmp"; exit 1 ;; esac
+    rm -rf "$dir"; mkdir -p "$sock"; chmod 700 "$dir" "$sock"
+    nix develop --command cargo build -p posh -p poshterity || exit 1
+    P="$root/target/debug/posh"; PT="$root/target/debug/poshterity"
+    export POSH_DIR="$sock" POSH_GROUP=default POSH_PALETTE="$root/result-posh-palette/bin/posh-palette"
+    unset POSH_SESSION
+    "$P" attach --detach demo -- sh -c 'while :; do echo "agent working $(date +%T)"; sleep 1; done' >/dev/null
+    F="$dir/viewer.castx"
+    flags=""; [ "{{ scenario }}" = hide ] && flags="--on-dismiss hide"
+    case "{{ scenario }}" in
+      cancel)  keys='sleep 3; printf "\036"; sleep 2; printf "\r"; sleep 2'; want=10 ;;
+      esc)     keys='sleep 3; printf "\036"; sleep 2; printf "\033"; sleep 2'; want=10 ;;
+      hide)    keys='sleep 3; printf "\036"; sleep 2; printf "\033"; sleep {{ secs }}'; want=0 ;;
+      timeout) keys='sleep $(( {{ secs }} + 3 ))'; want=0 ;;
+      *) echo "scenario must be cancel|esc|hide|timeout"; exit 64 ;;
+    esac
+    ( eval "$keys" ) | "$PT" record --out "$F" -- "$P" attach demo >/dev/null 2>"$dir/record.err" &
+    rp=$!
+    sleep 2
+    "$P" modal demo --timeout {{ secs }} --title "Restarting agent" $flags >"$dir/modal.out" 2>&1
+    code=$?
+    sleep 1
+    "$P" kill demo >/dev/null 2>&1
+    wait $rp
+    echo "modal exit=$code (want $want); recording: $F ($(wc -c <"$F") bytes)"
+    # Replay helpers: the screen after the first N output writes.
+    screen() { "$PT" step "$F" --by write --n "$1" --dump text 2>/dev/null; }
+    # First N whose screen satisfies `grep -q PATTERN` (searching N >= FROM), or empty.
+    first() {
+      local pat="$1" from="${2:-1}" n
+      for n in $(seq "$from" 400); do
+        if screen "$n" | grep -q -- "$pat"; then echo "$n"; return; fi
+      done
+    }
+    fail=0
+    check() { if [ "$2" = ok ]; then echo "PASS  $1"; else echo "FAIL  $1"; fail=1; fi; }
+    [ "$code" = "$want" ] && check "modal exit code is $want" ok || check "modal exit code is $want (got $code)" bad
+    b=$(first 'left - Ctrl-^ to review')
+    [ -n "$b" ] && check "banner appears (write $b)" ok || check "banner appears" bad
+    if [ -n "$b" ]; then
+      [ "$(screen "$b" | head -1 | grep -c 'Restarting agent')" = 1 ] && check "banner is on row 1" ok || check "banner is on row 1" bad
+    fi
+    case "{{ scenario }}" in
+      cancel|esc|hide)
+        v=$(first 'Time left')
+        [ -n "$v" ] && check "countdown view opens on Ctrl-^ (write $v)" ok || check "countdown view opens on Ctrl-^" bad
+        if [ -n "$v" ]; then
+          screen "$v" | grep -q 'Cancel restart' && screen "$v" | grep -q 'Restart now' && check "view shows both buttons" ok || check "view shows both buttons" bad
+          # first screen after the view in which it is gone
+          g=""
+          for n in $(seq "$v" 400); do
+            s=$(screen "$n"); echo "$s" | grep -q 'Time left' || { g="$n"; break; }
+          done
+          [ -n "$g" ] && check "view closes (write $g)" ok || check "view closes" bad
+          if [ -n "$g" ]; then
+            if [ "{{ scenario }}" = hide ]; then
+              screen "$g" | grep -q 'left - Ctrl-^' && check "Esc with on_dismiss=hide leaves the banner counting" ok || check "banner stays after hide" bad
+            else
+              # The view closes the moment the user chooses; the banner goes with
+              # the daemon's `clear`, one round trip later. Find that screen and
+              # report how many writes the banner outlived the view.
+              c=""
+              for n in $(seq "$g" 400); do
+                s=$(screen "$n"); echo "$s" | grep -q 'agent working' || continue
+                echo "$s" | grep -q 'left - Ctrl-^' || { c="$n"; break; }
+              done
+              [ -n "$c" ] && check "banner gone once the modal is answered (write $c)" ok || check "banner gone once the modal is answered" bad
+              [ -n "$c" ] && echo "INFO  banner outlived the closed view by $(( c - g )) write(s) (view closed at write $g)"
+            fi
+          fi
+        fi ;;
+      timeout)
+        # the banner must be gone from some later screen that still shows the session
+        gone=""
+        for n in $(seq "${b:-1}" 400); do
+          s=$(screen "$n"); echo "$s" | grep -q 'agent working' || continue
+          echo "$s" | grep -q 'left - Ctrl-^' || { gone="$n"; break; }
+        done
+        [ -n "$gone" ] && check "banner gone after the daemon's clock ran out (write $gone)" ok || check "banner gone after timeout" bad ;;
+    esac
+    echo "-- screen with the countdown view (first match) --"
+    [ -n "${v:-}" ] && screen "$v"
+    exit $fail
+
 # Verify the FDR 0019 interactive establish modal end to end in an isolated tmux
 # pane, with NO remote: a stub `ssh` first on PATH plays the bootstrap — it
 # answers `ssh -G` (the dial resolver), raises a host-key-style prompt on its

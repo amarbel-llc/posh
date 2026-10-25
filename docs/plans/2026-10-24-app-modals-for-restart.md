@@ -384,6 +384,34 @@ No change to the transport, mux channel kinds, `SessionResume`, or posh-term.
 - Still open: Q4 (concurrent modals), Q9 (refactor-first vs extract-as-you-go),
   and the unverified items in §5 (items 1's flicker part no longer blocks).
 
+## Prototype status (2026-10-25)
+
+Branch `proto-app-modal-countdown`, unmerged. Demo and checks:
+
+- `just debug-modal-demo <scenario>`: scripted tmux walkthrough (captures are
+  text only and timing-dependent), plus `manual` for trying it by hand.
+- `just debug-modal-record <scenario>`: the same walks recorded with
+  `poshterity record` and asserted on the replay; PASS/FAIL per check. Observed
+  passing for cancel, esc, hide, timeout.
+
+### poshterity shortcomings, sequenced as work (posh#255)
+
+Found while driving a scripted viewer; in the order to fix them. 1. markers
+cannot be recorded; 2. write indices are unstable run to run, so checks scan by
+pattern; 3. `step` replays from the start every call (hundreds of processes per
+scan); 4. scripted input is `sleep`-based, no wait-for-screen; 5. no size flag
+(24x80 only because stdout is not a tty); 6. the final screen is the one after
+the alt-screen exit; 7. no "screen contains" assertion, and wall-clock text
+defeats goldens; 8. styles (the reverse-video banner) unasserted, untried;
+9. stdin EOF does not end a recording.
+
+### Product finding from the recording
+
+After a choice the view closes one write before the daemon's `clear` removes the
+banner (one extra frame with the banner and no view). Observed for cancel and
+esc. Not decided whether it needs fixing: an optimistic client-side clear would
+be wrong if another viewer's answer won.
+
 ## Sources
 
 Man pages: posh(1) SESSION COMMANDS/REMOTE COMMANDS (output was truncated by
