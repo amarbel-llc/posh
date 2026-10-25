@@ -130,6 +130,19 @@ reviewer read the head, the tail and the comments. Those rows say so.
 
 **Probably stale, not verified:** #42 (TERM/COLORTERM forwarding exists at `sshwrap.rs:365-387` with a test at `:1612-1650`, but Bubble Tea backgrounds were not seen to render) and #41 (`remote/agent.rs` exists and FDR 0014 is `stable`, but not every point of the issue was checked). Confirm with a manual repro before closing.
 
+## Progress (later on 2026-10-25)
+
+Done and closed: #42, #41 (closed as addressed, with the caveats in their
+closing comments), #255 (landed at `81010ef`), #207, #149, #242, #92, #230,
+#175 (docs now match the CLI). Partly done: #154 (`POSH_RELAY` and
+`POSH_AGENT_NOTICE` only; the `POSH_WEDGE_*` gates still do not trim or
+case-fold). Decided against for now: #254 (the four panel-width copies have
+different policies; the issue says to wait for a second modal kind) and #234
+(legacy clients only; about 40 call sites). #225 gained a red test for the case
+Stage 1 documents as unfixed (`posh225_a_viewport_larger_than_the_session_...`,
+`#[ignore]`d; one 4 KiB chunk queues 906,363 bytes for a 40x132 viewport on a
+24x80 session).
+
 ## Order of work for (a)
 
 Doc and fixture fixes first (#175, #207, #149, #92, #68), then small
