@@ -40,6 +40,11 @@ client's behavior (backend) and reusing mature TUI prior art.
     one-shot wire flag (`CLIENT_FLAG_LOG_ON`/`_OFF`); the server applies it
     idempotently and reports its state back per frame (`FLAG_SERVER_LOG`), so the
     label reflects the real server state, not just intent.
+  - **Reset & resync (force redraw)** — ask the server for a fresh Full keyframe
+    (`session.resync`): sets the one-shot `CLIENT_FLAG_RESYNC` (RFC 0006), shows a
+    sticky "resyncing…" banner, and clears it once the Full applies. The manual way
+    out of a wedged or corrupt-looking screen (posh#92). Roaming client
+    (`remote/client.rs`).
   - **Shell out (server)** — open the server-side escape-to-shell overlay in the
     session cwd (`shell.open`; FDR 0008's `CLIENT_FLAG_ESCAPE`).
   - **Suspend client** — job-control `SIGSTOP` the client (`client.suspend`); the
@@ -112,7 +117,8 @@ Point at an explicit renderer build:
 
 - Wire contract: RFC 0005 (`docs/rfcs/0005-palette-control-protocol.md`) — the
   NDJSON JSON-RPC 2.0 control protocol, including the §7 client method registry
-  (`echo.set`, `logging.set`, `shell.open`, `client.suspend`, `app.quit`).
+  (`echo.set`, `logging.set`, `shell.open`, `client.suspend`, `app.quit`,
+  `session.resync`, among others).
 - Hosting + compositing live in `remote/client.rs` (`open_palette`,
   `dispatch_palette_action`, `composite_palette`, the poll-loop palette fds); the
   renderer host is `remote/palette.rs`; the PTY + fd-3 spawn is
