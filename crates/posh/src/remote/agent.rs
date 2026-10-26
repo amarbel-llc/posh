@@ -1118,7 +1118,7 @@ const BACKOFF_SHIFT_MAX: u32 = 3;
 /// The §9.2 backed-off retransmission interval for a channel `streak`
 /// consecutive unacked RTOs deep. Pure so the pacing tests pin it directly.
 fn backed_off(rto: u64, streak: u32) -> u64 {
-    rto.saturating_mul(1u64 << streak.min(BACKOFF_SHIFT_MAX))
+    crate::util::backoff(rto, streak, BACKOFF_SHIFT_MAX)
 }
 
 /// RFC 0011 §9.2 (posh#155): the per-connection AIMD bound on aggregate

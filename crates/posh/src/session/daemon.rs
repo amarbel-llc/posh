@@ -841,7 +841,7 @@ impl ClientConn {
             .srtt_ms
             .map_or(HISTORY_RESEND_INITIAL_MS, |s| (2 * s).max(PACED_ACK_WAIT_MS));
         let resends = p.history.map_or(0, |h| h.resends());
-        base << resends.min(HISTORY_RESEND_MAX_DOUBLINGS)
+        util::backoff(base, resends.try_into().unwrap_or(u32::MAX), HISTORY_RESEND_MAX_DOUBLINGS)
     }
 
     /// When this client may next be sent a history body from `term` — the

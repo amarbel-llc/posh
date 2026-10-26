@@ -103,6 +103,14 @@ pub fn parse_default_on_gate(value: Option<&str>) -> bool {
     )
 }
 
+/// `base` doubled once per `streak` step, at most `max_doublings` times (and
+/// saturating, never wrapping): the one exponential-backoff helper shared by
+/// the agent channels' retransmission interval and the v2 history resend
+/// floor (posh#244). Each caller keeps its own base and cap.
+pub fn backoff(base: u64, streak: u32, max_doublings: u32) -> u64 {
+    base.saturating_mul(1u64 << streak.min(max_doublings).min(63))
+}
+
 // ---------------------------------------------------------------------------
 // Session-name percent-encoding (zmx semantics: only bytes that are unsafe in
 // a single filename component are escaped).
@@ -682,6 +690,18 @@ pub fn log_write(level: &str, msg: &str) {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// posh#244: doubled per streak step, capped at `max_doublings`, never wraps.
+    #[test]
+    fn backoff_doubles_per_step_up_to_the_cap_and_saturates() {
+        assert_eq!(backoff(250, 0, 3), 250);
+        assert_eq!(backoff(250, 1, 3), 500);
+        assert_eq!(backoff(250, 3, 3), 2000);
+        assert_eq!(backoff(250, 9, 3), 2000, "capped at 8x");
+        assert_eq!(backoff(250, 5, 0), 250, "a zero cap never backs off");
+        assert_eq!(backoff(u64::MAX, 3, 3), u64::MAX, "saturates instead of wrapping");
+        assert_eq!(backoff(1, u32::MAX, u32::MAX), 1 << 63, "an absurd cap is clamped to the shift width");
+    }
 
     #[test]
     fn encode_passes_safe_names_through() {
