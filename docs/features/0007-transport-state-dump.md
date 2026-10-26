@@ -119,6 +119,15 @@ the same order as the prediction timer, and only while enabled.
 
 ## More Information
 
+- `POSH_DEBUG_LOG` itself (the opt-in, file-only periodic performance log for the
+  roaming transport, client and server, forwarded over the ssh bootstrap so the
+  bare `host:session` form logs both ends) has no FDR of its own, deliberately
+  (posh#68): it is a diagnostics knob, not a user-facing feature, and its
+  metric set, sink rules (file-only because the client owns the alt-screen and
+  the server detaches to `/dev/null`; 5 MB rotation) and limitations are
+  documented where they are read: `posh(1)`, `posh-client(1)` and
+  `posh-server(1)` ENVIRONMENT. This FDR covers the on-demand dump that shares
+  its sink.
 - The signal plumbing mirrors the existing `SIGUSR1` path (`util.rs`:
   `install_sigusr2_handler` / `SIGUSR2_RECEIVED` / `take_flag`); handlers only
   set an `AtomicBool`, and the dump runs in normal loop context, so the file I/O
