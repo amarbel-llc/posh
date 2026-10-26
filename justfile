@@ -2370,6 +2370,33 @@ debug-posh-list-table:
     target/debug/posh attach --detach beta -- sleep 60 >/dev/null
     script -qec "$PWD/target/debug/posh list" /dev/null
 
+# Show exactly which escape sequences `posh list` writes under a fake TTY for a
+# given environment, e.g. `just debug-posh-list-env "NO_COLOR=1"` or
+# `just debug-posh-list-env "TERM=dumb"` (posh#124: dumb = plain, no escapes at
+# all; NO_COLOR = same layout, no colour). Prints the table through `cat -v` so
+# ESC shows as ^[, then counts escape bytes and colour SGRs. Isolated POSH_DIR.
+#
+# show the escape sequences posh list writes under a fake TTY for an env
+[group("debug")]
+debug-posh-list-env env="":
+    #!/usr/bin/env bash
+    set -euo pipefail
+    cd '{{ justfile_directory() }}'
+    nix develop --command cargo build -q -p posh
+    dir=$(mktemp -d)
+    trap 'POSH_DIR=$dir target/debug/posh kill alpha 2>/dev/null || true; POSH_DIR=$dir target/debug/posh kill beta 2>/dev/null || true; rm -rf "$dir"' EXIT
+    export POSH_DIR=$dir
+    target/debug/posh attach --detach alpha -- sleep 60 >/dev/null
+    target/debug/posh attach --detach beta -- sleep 60 >/dev/null
+    out=$(mktemp)
+    # shellcheck disable=SC2086
+    env -u NO_COLOR {{ env }} script -qec "$PWD/target/debug/posh list" /dev/null > "$out"
+    echo ">> env: {{ env }}"
+    cat -v "$out"
+    echo ">> escape bytes: $(tr -cd '\033' < "$out" | wc -c)"
+    echo ">> colour SGRs (30-37/38/39/40-49/90-97/100-107): $(grep -aoE $'\033\\[(3[0-9]|4[0-9]|9[0-7]|10[0-7])[;m]' "$out" | wc -l)"
+    rm -f "$out"
+
 # Run the INSTALLED posh's `list` against the real socket dir under a fake TTY
 # (util-linux `script`), so the tty-gated mux + remote-endpoints sections
 # (RFC 0013 §4) print headlessly. The agent dev-loop check for "which peers is

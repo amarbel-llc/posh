@@ -250,8 +250,12 @@ Local persistence over Unix sockets.
 	for scripts: NAME, STATUS, PID, CLIENTS, KIND (_anonymous_, _named_,
 	_system_, or empty for a daemon that predates the kind), CWD, STARTED
 	IN, ACTIVITY, ECHO, BUILD (the daemon's _<version>+<sha>_, empty for
-	a daemon without a status socket) — system sessions included. The mux endpoints have
-	their own table, *mux ls*. *--short* prints names only; *--json*
+	a daemon without a status socket) — system sessions included. On a
+	terminal, _NO_COLOR_ (honoured by *mesa*) keeps the same table and drops
+	only the colour; _TERM=dumb_ gets the plain tab-separated output above,
+	with no escape sequences at all, even though stdout is a terminal (with
+	both set, _TERM=dumb_ wins). The mux endpoints have
+	their own table, *mux ls*, which follows the same rules. *--short* prints names only; *--json*
 	prints a machine-readable array, each row carrying a _kind_ field
 	(_anonymous_, _named_, or _system_; omitted when unknown), _cwd_ (the
 	start directory) and _cwd_now_ (the current one; omitted when

@@ -262,14 +262,42 @@ pub(super) fn render(
     socket_dir: &Path,
     include_system: bool,
 ) -> Result<()> {
-    let styled = crate::util::is_tty(libc::STDOUT_FILENO);
+    let styled = table_is_styled(
+        crate::util::is_tty(libc::STDOUT_FILENO),
+        std::env::var("TERM").ok().as_deref(),
+    );
     pipe(&build_ndjson(shown(sessions, styled, include_system), current, home, socket_dir, styled))
+}
+
+/// `TERM=dumb`: a terminal that handles neither colour nor the box-drawing
+/// table (posh#124). Such a terminal gets the plain TAB-separated lines and no
+/// escape sequences at all, even though stdout is a tty.
+fn term_is_dumb(term: Option<&str>) -> bool {
+    term == Some("dumb")
+}
+
+/// Whether the terminal (porcelain) table is drawn: stdout is a tty and the
+/// terminal is not `dumb`. `NO_COLOR` is deliberately not an input: it keeps
+/// the styled layout and only drops colour, which `mesa` does itself.
+fn table_is_styled(stdout_is_tty: bool, term: Option<&str>) -> bool {
+    stdout_is_tty && !term_is_dumb(term)
+}
+
+/// Extra arguments for `mesa`: `--plain` on a `dumb` terminal, so mesa does not
+/// style (or query the terminal) just because stdout happens to be a tty.
+fn mesa_args(term: Option<&str>) -> &'static [&'static str] {
+    if term_is_dumb(term) {
+        &["--plain"]
+    } else {
+        &[]
+    }
 }
 
 /// Pipes a complete RFC 0003 NDJSON stream to `mesa` — the one child-process
 /// seam every posh table (`list`, `mux ls`) renders through.
 pub(crate) fn pipe(ndjson: &str) -> Result<()> {
     let mut child = Command::new("mesa")
+        .args(mesa_args(std::env::var("TERM").ok().as_deref()))
         .stdin(Stdio::piped())
         .stdout(Stdio::inherit())
         .stderr(Stdio::inherit())
@@ -338,6 +366,42 @@ mod tests {
             kind: None,
             ..Default::default()
         }
+    }
+
+    /// posh#124, `TERM=dumb`: even on a tty, the plain table and `mesa --plain`
+    /// (no escape sequences at all). Any other terminal keeps the styled table.
+    #[test]
+    fn a_dumb_terminal_gets_the_plain_table_and_mesa_plain() {
+        assert!(!table_is_styled(true, Some("dumb")), "tty + dumb is plain");
+        assert_eq!(mesa_args(Some("dumb")), ["--plain"]);
+        for term in [Some("xterm-256color"), Some("xterm-kitty"), Some("linux"), None] {
+            assert!(table_is_styled(true, term), "{term:?} on a tty is styled");
+            assert!(mesa_args(term).is_empty(), "{term:?} adds no mesa argument");
+        }
+    }
+
+    /// Off a tty the table is plain whatever `TERM` says (the pipe shape is
+    /// unchanged by posh#124).
+    #[test]
+    fn a_pipe_is_plain_whatever_term_says() {
+        for term in [Some("dumb"), Some("xterm-256color"), None] {
+            assert!(!table_is_styled(false, term), "{term:?} on a pipe is plain");
+        }
+    }
+
+    /// posh#124, `NO_COLOR`: the layout is kept (the same styled table, with no
+    /// extra mesa argument) and only colour goes, which mesa does itself —
+    /// observed with `just debug-posh-list-env NO_COLOR=1` (box drawing intact,
+    /// no colour SGRs). posh must not change the table shape or the mesa
+    /// arguments for it; with both set, `TERM=dumb` wins and the output is plain.
+    #[test]
+    fn no_color_changes_nothing_posh_decides_and_dumb_wins_when_both_are_set() {
+        // `table_is_styled` and `mesa_args` take no NO_COLOR input by design.
+        assert!(table_is_styled(true, Some("xterm-256color")));
+        assert!(mesa_args(Some("xterm-256color")).is_empty());
+        // Both set: `NO_COLOR` + `TERM=dumb` is the dumb path.
+        assert!(!table_is_styled(true, Some("dumb")));
+        assert_eq!(mesa_args(Some("dumb")), ["--plain"]);
     }
 
     fn parse_lines(ndjson: &str) -> Vec<Value> {
