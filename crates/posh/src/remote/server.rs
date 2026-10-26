@@ -1384,10 +1384,8 @@ pub(crate) fn server_loop(
     // with POSH_WEDGE_CAPTURE=0 (or off/false/no) if it ever misbehaves in prod.
     // `dirty_since` marks when the model went dirty-without-frame (0 = in sync);
     // `wedge_captured` bounds it to one capture per episode.
-    let wedge_watchdog = !matches!(
-        std::env::var("POSH_WEDGE_CAPTURE").as_deref(),
-        Ok("0") | Ok("off") | Ok("false") | Ok("no")
-    );
+    let wedge_watchdog =
+        crate::util::parse_default_on_gate(std::env::var("POSH_WEDGE_CAPTURE").ok().as_deref());
     let mut dirty_since: u64 = 0;
     let mut wedge_captured = false;
     let mut last_send: u64 = 0;

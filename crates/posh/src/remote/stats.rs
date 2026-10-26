@@ -435,10 +435,7 @@ impl Stats {
         // An explicit ON value is remembered separately as the debug-posture
         // signal for CAP_DIAG (want_server_diag), which must NOT default on.
         let watchdog_env = std::env::var("POSH_WEDGE_WATCHDOG").ok();
-        let off = matches!(
-            watchdog_env.as_deref(),
-            Some("0") | Some("off") | Some("false") | Some("no")
-        );
+        let off = !util::parse_default_on_gate(watchdog_env.as_deref());
         let now = now_ms();
         Stats {
             enabled,
