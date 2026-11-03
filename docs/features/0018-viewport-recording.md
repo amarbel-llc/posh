@@ -27,12 +27,20 @@ demand, from inside any session it is already in.
   command (`Ctrl-^`, then select it — FDR 0009). A state-reflecting toggle:
   "Start recording" when off, "Stop recording" while a recording is live.
 - **Output:** a poshterity `.castx` (RFC 0003 — asciinema `.cast` v2 superset)
-  under the diagnostic-sink directory (`$POSH_DIR` / the socket dir, the same
-  scheme as the debug log and the SIGUSR2 dump), named
-  `posh-record-<pid>-<unixtime>.castx`. On start and stop the path is presented
-  in a copyable, dismissable dialog — the same panel as *About / transport
-  info* (`show_debug_info` → `show_dialog`), whose *Copy* puts the path on the
-  clipboard via OSC 52 — rather than a fleeting banner.
+  under the diagnostic-sink directory (the socket dir, the same scheme as the
+  debug log and the SIGUSR2 dump), named `posh-record-<pid>-<unixtime>.castx`.
+  The file is written by the **client** process, on the **client's host** —
+  the machine whose terminal is attached, which in a remote attach is not the
+  host the session runs on — and `<pid>` is that client's pid. The directory
+  is resolved from the client's environment: `$POSH_DIR`, else
+  `$XDG_RUNTIME_DIR/posh`, else `$TMPDIR/posh-<uid>`, else `/tmp/posh-<uid>`.
+  On start and stop the path is presented in a copyable, dismissable dialog —
+  the same panel as *About / transport info* (`show_dialog`), whose *Copy*
+  puts the path on the clipboard via OSC 52 — rather than a fleeting banner.
+  The dialog title names the client host (`recording started on <host>` /
+  `recording saved on <host>`, posh#256); the body is the bare path, so *Copy*
+  yields exactly it. Without a renderer the banner fallback carries both, and
+  the event, host and path are written to the client debug log (`record`).
 - **Captured:** the client VIEWPORT — the composed tty output (`o` events, the
   predictions and their walk-back included), the user's raw keystrokes (`i`
   events), and terminal resizes (`r` events). The header carries the emulator

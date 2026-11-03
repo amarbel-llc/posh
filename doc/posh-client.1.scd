@@ -102,11 +102,18 @@ standing.
 	sends a literal *Ctrl-^* to the remote.
 
 	*Start recording* (FDR 0018) tees the client viewport — its output, your
-	keystrokes, and resizes — to a poshterity _.castx_ under the diagnostic-sink
-	directory (_POSH_DIR_ / the socket dir), replayable with *poshterity step* /
-	*replay*; on start and stop it presents the path in a copyable, dismissable
-	dialog (the same panel as *About / transport info*, whose *Copy* puts the
-	path on the clipboard via OSC 52). It captures keystrokes and the screen
+	keystrokes, and resizes — to a poshterity _.castx_ named
+	_posh-record-<pid>-<unixtime>.castx_, replayable with *poshterity step* /
+	*replay*. The file is written by this client, on the *client's* host (the
+	machine your terminal is on, not the host a remote session runs on), and
+	_<pid>_ is the client's pid. Its directory is resolved from the client's
+	environment: _$POSH_DIR_, else _$XDG_RUNTIME_DIR/posh_, else
+	_$TMPDIR/posh-<uid>_, else _/tmp/posh-<uid>_. On start and stop it presents
+	the path in a copyable, dismissable dialog (the same panel as *About /
+	transport info*, whose *Copy* puts the path on the clipboard via OSC 52)
+	titled _recording started on <host>_ / _recording saved on <host>_, naming
+	the client host; the dialog body is the bare path. The event, host and path
+	are also written to the client debug log. It captures keystrokes and the screen
 	VERBATIM, so anything secret typed while recording is written to the file —
 	record deliberately, and *Stop recording* when done.
 

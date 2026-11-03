@@ -287,6 +287,22 @@ pub fn record_path() -> PathBuf {
     sink_base().join(format!("posh-record-{}-{ts}.castx", std::process::id()))
 }
 
+/// This host's name as `gethostname(2)` reports it, for notices that point at
+/// a file in the sink dir: the dir is resolved from the client's environment,
+/// so the file is on the client's host, which need not be the session's
+/// (posh#256). `"unknown host"` when the call fails or the name is empty.
+pub fn client_hostname() -> String {
+    let mut buf = [0u8; 256];
+    // SAFETY: the buffer is valid for its whole length; gethostname writes at
+    // most that many bytes and the slice below stops at the first NUL.
+    let rc = unsafe { libc::gethostname(buf.as_mut_ptr().cast(), buf.len()) };
+    let len = buf.iter().position(|&b| b == 0).unwrap_or(buf.len());
+    match String::from_utf8_lossy(&buf[..len]) {
+        name if rc == 0 && !name.is_empty() => name.into_owned(),
+        _ => "unknown host".to_string(),
+    }
+}
+
 /// Enable debug logging at runtime to the default per-pid sink (if not already
 /// active), returning the sink path. The runtime counterpart of `POSH_DEBUG_LOG`
 /// for the `Ctrl-^ d` toggle; mirrors `dump`'s lazy-open + path scheme.

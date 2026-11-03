@@ -906,6 +906,28 @@ fn show_debug_info(st: &mut ClientState, title: &str, body: &str, now: u64) {
     }
 }
 
+/// The recording notice's title: `event` ("started" / "saved") on `host`.
+fn recording_title(event: &str, host: &str) -> String {
+    format!("recording {event} on {host}")
+}
+
+/// Present a recording's path (FDR 0018) in the copyable, dismissable
+/// About-style dialog (#99 `show_dialog` + OSC 52 *Copy*), not a fleeting
+/// banner. The file is in THIS process's sink dir, so on the client's host —
+/// not necessarily the session's (posh#256) — and the title names it. The
+/// body is the BARE path so *Copy* yields exactly it; the banner fallback,
+/// having no title, carries both. Also written to the debug log.
+fn show_recording_path(st: &mut ClientState, event: &str, path: &std::path::Path, now: u64) {
+    let host = diag::client_hostname();
+    let title = recording_title(event, &host);
+    util::log_write("record", &format!("{event} host={host} path={}", path.display()));
+    if let Some(p) = st.palette.as_mut() {
+        p.show_dialog(&title, &path.display().to_string());
+    } else {
+        st.notify.set_message(&format!("{title}: {}", path.display()), false, now);
+    }
+}
+
 /// RFC 0016 §5: how long a push-cmd request waits for its re-home.
 const PUSH_ANSWER_MS: u64 = 10_000;
 
@@ -1034,12 +1056,7 @@ fn dispatch_palette_action(
                     match ViewportRecorder::start(path.clone(), st.rows, st.cols) {
                         Some(rec) => {
                             st.record = Some(rec);
-                            // Present the path in the copyable, dismissable
-                            // About-style dialog (#99 `show_dialog` + OSC 52
-                            // *Copy*), not a fleeting banner that scrolls past
-                            // before it can be read or copied. The body is the
-                            // BARE path so *Copy* yields exactly it.
-                            show_debug_info(st, "recording started", &path.display().to_string(), now);
+                            show_recording_path(st, "started", &path, now);
                         }
                         None => st.notify.set_message(
                             &format!("recording: could not open {}", path.display()),
@@ -1051,7 +1068,7 @@ fn dispatch_palette_action(
             } else if let Some(rec) = st.record.take() {
                 let path = rec.path.clone();
                 drop(rec); // Drop finalizes the .castx (flush held UTF-8 + writer)
-                show_debug_info(st, "recording saved", &path.display().to_string(), now);
+                show_recording_path(st, "saved", &path, now);
             }
             false
         }
@@ -4363,6 +4380,36 @@ mod tests {
         dispatch_palette_action(&mut st, &raw, "record.set", &json!({ "enabled": false }), 0);
         assert!(st.record.is_none(), "recording stopped");
         assert!(path.exists(), "the .castx was written to {}", path.display());
+        let _ = std::fs::remove_file(&path);
+    }
+
+    /// posh#256: the recording is written on the CLIENT's host (the sink dir is
+    /// resolved from this process's environment), which need not be the host
+    /// the session runs on — so the start/stop notice names that host. The
+    /// dialog title carries it; the body stays the bare path so *Copy* yields
+    /// exactly the path.
+    #[test]
+    fn recording_notices_name_the_client_host() {
+        assert_eq!(recording_title("started", "flic"), "recording started on flic");
+        assert_eq!(recording_title("saved", "flic"), "recording saved on flic");
+
+        // Without a renderer the notice degrades to the banner, which must
+        // still say which host holds the file.
+        let raw = pty_raw_mode();
+        let mut st = test_state(6, 40);
+        let host = diag::client_hostname();
+        assert!(!host.is_empty());
+        dispatch_palette_action(&mut st, &raw, "record.set", &json!({ "enabled": true }), 0);
+        let path = st.record.as_ref().expect("recording started").path.clone();
+        assert_eq!(
+            st.notify.message(),
+            format!("recording started on {host}: {}", path.display())
+        );
+        dispatch_palette_action(&mut st, &raw, "record.set", &json!({ "enabled": false }), 0);
+        assert_eq!(
+            st.notify.message(),
+            format!("recording saved on {host}: {}", path.display())
+        );
         let _ = std::fs::remove_file(&path);
     }
 
