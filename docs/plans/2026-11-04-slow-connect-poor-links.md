@@ -195,6 +195,41 @@ in every row of the table above.
   seed the RTO from the bootstrap), 4 (carry the client's first message in
   the OPEN, which is an RFC 0011/0015 change).
 
+## Before/after on the picker path (`just debug-netem-picker`)
+
+**The ssh cost in this table is MODELED, not measured.** The stub `ssh`
+sleeps 8 × RTT for a fresh login and 2 × RTT when its argv carries a
+`ControlPath` whose stub-tracked master is still inside its 60 s
+`ControlPersist`. Only the UDP leg (endpoint wire, session OPEN, frames)
+crosses the netem-impaired loopback for real. So the table shows what
+`POSH_SSH_SHARE` buys **if** a fresh OpenSSH login costs about 8 round trips
+and a reused master about 2. That assumption still needs the operator's real
+run (script below) to confirm.
+
+Each attempt: `ph 127.0.0.1:` with a pre-created session `bench`. The
+recipe presses Enter on the first row the moment the picker is drawn.
+"list" is start → picker drawn; "connect" is Enter → first screen. COLD is
+a fresh `POSH_DIR` (no endpoint, no master); WARM is the same directory
+right after (endpoint and master both lingering). Two runs per cell, total
+ms shown as run1 / run2. Built from 6a30dc3. before = `POSH_SSH_SHARE=0`,
+after = default.
+
+| RTT / loss | cold before | cold after | warm before | warm after |
+|---|---|---|---|---|
+| 300 ms / 0% | 5634 / 5606 | 3811 / 3812 | 3141 / 3136 | 1362 / 1329 |
+| 800 ms / 0% | 14593 / 14592 | 9836 / 9837 | 8128 / 8134 | 3378 / 3337 |
+| 300 ms / 20% | 5675 / 5851 | 4970 / 6750 | 4244 / 6752 | 1301 / 1359 |
+| 800 ms / 20% | 20046 / 14848 | 9814 / 10077 | 8112 / 13099 | 4368 / 4320 |
+
+ssh logins per attempt: cold before 2 fresh, cold after 1 fresh + 1
+shared; warm before 1 fresh, warm after 1 shared, as the stub logged in
+every attempt. The lossless cells show the saving exactly: 6 × RTT, the
+fresh-minus-shared login cost, once on a cold connect (300 ms: −1.8 s;
+800 ms: −4.8 s) and once on a warm one (−1.8 s / −4.8 s). In the 20% cells
+the UDP-leg stalls of items 2-4 (0.6-6 s) still add on top and dominate the
+spread (for example 300/20 cold-after run 2: 6750 ms, with a 4.3 s connect
+phase). Those are the follow-up items, not changed here.
+
 ## Operator timing script (one real `ph flic:` before and after)
 
 `scripts/posh-ph-flic-timing.bash` times ONE real `ph <host>:` on a real
