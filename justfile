@@ -895,6 +895,128 @@ debug-netem-connect rtt_ms="0" loss_pct="0" mux="1" runs="2" jitter_ms="0":
     env NETEM_T="$T" RTT='{{ rtt_ms }}' JIT='{{ jitter_ms }}' LOSS='{{ loss_pct }}' MUX='{{ mux }}' RUNS='{{ runs }}' \
       unshare --user --map-root-user --net --pid --fork --mount-proc bash "$T/inner.sh"
 
+# The `ph host:` PICKER path under the same isolation as debug-netem-connect
+# (private user+net+pid namespace, netem only on its own lo, refused unless
+# `ip -o link` shows lo alone): a session `bench` is pre-created, then
+# `ph 127.0.0.1:` runs, the picker's list probe completes, the recipe presses
+# Enter on the first row (bench) the moment the picker is drawn, and the
+# first screen is detected by the session's READY_MARK. Reports per attempt:
+# total ms, list phase (start to picker drawn), connect phase (Enter to first
+# screen), and how many ssh logins were FRESH vs SHARED.
+#
+# The ssh leg is MODELED, not measured: the stub `ssh` parses posh's argv and
+# sleeps login_rtts x rtt_ms for a fresh login, or slave_rtts x rtt_ms when
+# the argv carries a ControlPath whose (stub-tracked) master is still within
+# its 60 s ControlPersist — the cost difference POSH_SSH_SHARE exists to buy.
+# netem still impairs the real UDP leg. share=0 sets POSH_SSH_SHARE=0 (the
+# old behaviour); share=1 is the default. COLD = fresh POSH_DIR (no endpoint,
+# no master); WARM = the same dir right after (endpoint and master lingering).
+# Needs the palette renderer (build-palette). Not a hermetic test; the
+# before/after evidence for docs/plans/2026-11-04-slow-connect-poor-links.md.
+#
+# time the ph host: picker path (modeled ssh, netem UDP) in a private netns
+[group("debug")]
+debug-netem-picker rtt_ms="300" loss_pct="0" share="1" runs="2" login_rtts="8" slave_rtts="2": build-palette
+    #!/usr/bin/env bash
+    set -uo pipefail
+    root="{{ justfile_directory() }}"
+    nix develop --command cargo build -q -p posh || exit 1
+    T="$(mktemp -d /tmp/posh-netem.XXXXXX)"
+    trap 'rm -rf "$T"' EXIT
+    mkdir -p "$T/bin" "$T/masters"
+    ln -sfn "$root/target/debug/posh" "$T/bin/posh"
+    ln -sfn "$root/target/debug/posh" "$T/bin/posh-server"
+    ln -sfn "$root/target/debug/posh" "$T/ph"
+    cat >"$T/bin/ssh" <<'STUB'
+    #!/usr/bin/env bash
+    # Modeled ssh: `-G` answers the dial resolver; otherwise parse options,
+    # charge a fresh-login or shared-master cost, run the command locally.
+    if [ "$1" = "-G" ]; then echo "hostname $3"; exit 0; fi
+    cpath=""
+    while [ $# -gt 0 ]; do
+      case "$1" in
+        -o) case "$2" in ControlPath=*) cpath="${2#ControlPath=}" ;; esac; shift 2 ;;
+        -p|-l|-i|-F|-J) shift 2 ;;
+        -*) shift ;;
+        *) break ;;
+      esac
+    done
+    target="$1"; shift
+    [ "${1:-}" = "--" ] && shift
+    kind=fresh; cost=$((NETEM_RTT * NETEM_LOGIN_RTTS))
+    if [ -n "$cpath" ]; then
+      m="$NETEM_T/masters/$(printf '%s' "${cpath%/%C}/$target" | tr '/' '_')"
+      now="$(date +%s)"
+      if [ -f "$m" ] && [ $((now - $(cat "$m"))) -lt 60 ]; then kind=shared; cost=$((NETEM_RTT * NETEM_SLAVE_RTTS)); fi
+      echo "$now" >"$m"
+    fi
+    echo "$(date +%s%3N) ssh-stub $kind (${cost} ms modeled): $*" >>"$NETEM_T/ssh.log"
+    sleep "$(awk -v c="$cost" 'BEGIN{printf "%.3f", c/1000}')"
+    eval "$*"; rc=$?
+    echo "$(date +%s%3N) ssh-stub end rc=$rc" >>"$NETEM_T/ssh.log"
+    exit $rc
+    STUB
+    printf '#!/bin/sh\necho READY_MARK\nexec /bin/sh\n' >"$T/bin/marksh"
+    chmod +x "$T/bin/ssh" "$T/bin/marksh"
+    cat >"$T/inner.sh" <<'INNER'
+    set -uo pipefail
+    ip link set lo up
+    links="$(ip -o link show | awk -F': ' '{print $2}' | tr '\n' ' ')"
+    if [ "$links" != "lo " ]; then echo "refusing: not an isolated netns (links: $links)"; exit 1; fi
+    echo "netns links: $links"
+    half=$((NETEM_RTT / 2)); args=()
+    [ "$half" -gt 0 ] && args+=(delay "${half}ms")
+    [ "$LOSS" != 0 ] && args+=(loss "${LOSS}%")
+    if [ "${#args[@]}" -gt 0 ]; then
+      tc qdisc add dev lo root netem "${args[@]}" || { echo "netem unavailable"; exit 2; }
+    fi
+    echo "qdisc: $(tc qdisc show dev lo)"
+    export TMUX_TMPDIR="$NETEM_T"
+    TM=(tmux -L posh-netem-picker)
+    iso="env -u POSH_SESSION -u POSH_KEY -u TMUX -u SSH_CONNECTION -u SSH_CLIENT -u SSH_TTY PATH='$NETEM_T/bin':\"\$PATH\" SHELL='$NETEM_T/bin/marksh' POSH_GROUP=default POSH_SSH_SHARE='$SHARE' POSH_PALETTE='$PAL' NETEM_T='$NETEM_T' NETEM_RTT='$NETEM_RTT' NETEM_LOGIN_RTTS='$NETEM_LOGIN_RTTS' NETEM_SLAVE_RTTS='$NETEM_SLAVE_RTTS'"
+    attempt() { # $1 = label, $2 = POSH_DIR
+      local d="$2" a="$NETEM_T/$1"; mkdir -p "$a"
+      : >"$NETEM_T/ssh.log"
+      "${TM[@]}" kill-server 2>/dev/null
+      local t0 tp="" t1="" now
+      t0="$(date +%s%3N)"
+      "${TM[@]}" new-session -d -s s -x 100 -y 30 \
+        "$iso POSH_DIR='$d' POSH_DEBUG_LOG='$a/posh.log' '$NETEM_T/ph' 127.0.0.1: 2>'$a/stderr.log'; echo PH_EXITED_\$?; sleep 600"
+      while :; do
+        now="$(date +%s%3N)"
+        scr="$("${TM[@]}" capture-pane -p -t s 2>/dev/null)"
+        if [ -z "$tp" ] && grep -q 'create new session' <<<"$scr"; then tp="$now"; "${TM[@]}" send-keys -t s Enter; fi
+        if [ -n "$tp" ] && grep -q READY_MARK <<<"$scr"; then t1="$now"; break; fi
+        grep -q PH_EXITED_ <<<"$scr" && break
+        [ $((now - t0)) -gt 120000 ] && break
+        sleep 0.02
+      done
+      fresh="$(grep -c 'ssh-stub fresh' "$NETEM_T/ssh.log")"; shared="$(grep -c 'ssh-stub shared' "$NETEM_T/ssh.log")"
+      if [ -n "$t1" ]; then
+        echo "== $1: total $((t1 - t0)) ms = list $((tp - t0)) ms + connect $((t1 - tp)) ms; ssh logins fresh=$fresh shared=$shared"
+      else
+        echo "== $1: NO first screen (picker at ${tp:-never}); ssh logins fresh=$fresh shared=$shared"
+        "${TM[@]}" capture-pane -p -t s | grep -v '^$' | sed 's/^/  | /'
+      fi
+      cut -c1-170 "$NETEM_T/ssh.log" | sed 's/^/  /'
+      [ -s "$a/stderr.log" ] && grep -v '^$' "$a/stderr.log" | sed 's/^/  stderr: /' | cut -c1-200
+      "${TM[@]}" kill-server 2>/dev/null
+      sleep 1
+    }
+    for r in $(seq 1 "$RUNS"); do
+      d="$NETEM_T/r$r"; mkdir -p "$d"; chmod 700 "$d"
+      env -u POSH_SESSION -u POSH_KEY POSH_DIR="$d" SHELL="$NETEM_T/bin/marksh" "$NETEM_T/bin/posh" attach --detach bench >/dev/null 2>&1
+      rm -f "$NETEM_T"/masters/*
+      attempt "run$r-cold" "$d"
+      attempt "run$r-warm" "$d"
+    done
+    INNER
+    echo ">> picker path: rtt={{ rtt_ms }}ms loss={{ loss_pct }}% share={{ share }} runs={{ runs }} (ssh modeled: fresh={{ login_rtts }} RTT, shared={{ slave_rtts }} RTT)"
+    env NETEM_T="$T" NETEM_RTT='{{ rtt_ms }}' LOSS='{{ loss_pct }}' SHARE='{{ share }}' RUNS='{{ runs }}' \
+      NETEM_LOGIN_RTTS='{{ login_rtts }}' NETEM_SLAVE_RTTS='{{ slave_rtts }}' \
+      PAL="$root/result-posh-palette/bin/posh-palette" \
+      unshare --user --map-root-user --net --pid --fork --mount-proc bash "$T/inner.sh"
+
 # Provoke the FDR 0016 stacked-switch flow end-to-end in a detached tmux pane, to
 # see whether the two reported symptoms reproduce: (1) after a keep-switch a->b,
 # does b's palette offer "Back to a"? (2) does exiting b auto-pop back to a?

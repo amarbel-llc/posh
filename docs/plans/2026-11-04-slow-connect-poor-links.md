@@ -195,6 +195,44 @@ in every row of the table above.
   seed the RTO from the bootstrap), 4 (carry the client's first message in
   the OPEN, which is an RFC 0011/0015 change).
 
+## Operator timing script (one real `ph flic:` before and after)
+
+`scripts/posh-ph-flic-timing.bash` times ONE real `ph <host>:` on a real
+link and real ssh, which the netem recipes cannot do. It puts a logging
+`ssh` wrapper first on PATH (each ssh start/end, in epoch ms), sets
+`POSH_DEBUG_LOG`, runs `ph <host>:`, and afterwards collects the local mux
+endpoint's log lines for the run. It writes everything to
+`~/posh-timing/<UTC stamp>-<before|after>-<host>/`. That directory holds
+`summary.txt`, a ready-to-relay summary: the ssh invocation count, the
+ssh start/end stamps, the session open/confirm and any fallback, and the
+first client stats line with frames received (the first frame lands at or
+before it). The script prints that file's path; it cannot send chat itself.
+
+What the operator does, on the CLIENT machine on the bad link (not on flic):
+
+1. Install a build that contains `POSH_SSH_SHARE` (commit 7c032c5 or
+   later). Either deploy it the usual way, or build it locally from a
+   checkout (`nix build .#posh`, giving `result/bin/ph`) and set
+   `POSH_PH=$PWD/result/bin/ph`. flic itself needs no update: the change is
+   client-side only, and the remote command is unchanged.
+2. Copy the script (`install -m 755 scripts/posh-ph-flic-timing.bash
+   ~/bin/`).
+3. **Before:** `posh-ph-flic-timing.bash before flic`. This sets
+   `POSH_SSH_SHARE=0`, which restores the old behaviour with the same
+   binary. Choose a session as soon as the picker appears, wait for its
+   screen, then detach (Ctrl-^, Detach).
+4. Wait more than 60 s so that neither the mux endpoint nor an ssh master
+   lingers (`posh mux ls` should not list flic). Otherwise the next run is
+   warm, not cold.
+5. **After:** `posh-ph-flic-timing.bash after flic`. Same steps.
+6. Send both `summary.txt` paths to the coordinator.
+
+What to compare: on a cold run there are two non-`-G` ssh starts either
+way (the list, then the endpoint bootstrap). After the fix, the second
+should take only a couple of round trips, because it rides the master the
+first one left. Also compare the time from the first ssh start to the
+session confirm.
+
 ## Proposed code changes (each to be done test-first later)
 
 1. **`ph host:` should not open a second ssh to list.** Serve `list --json`
