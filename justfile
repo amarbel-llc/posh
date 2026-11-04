@@ -1017,6 +1017,27 @@ debug-netem-picker rtt_ms="300" loss_pct="0" share="1" runs="2" login_rtts="8" s
       PAL="$root/result-posh-palette/bin/posh-palette" \
       unshare --user --map-root-user --net --pid --fork --mount-proc bash "$T/inner.sh"
 
+# Print the OpenSSH ssh_config(5) paragraphs that POSH_SSH_SHARE relies on
+# (ControlMaster, ControlPath, ControlPersist, ServerAliveInterval,
+# ServerAliveCountMax), from the man output of the ssh on PATH. Use when
+# reasoning about shared-master failure modes: ssh_config(5) is not on the
+# agent's MANPATH. Read-only; no network.
+#
+# print the ssh_config(5) connection-sharing paragraphs of the installed OpenSSH
+[group("debug")]
+debug-ssh-config-sharing-doc:
+    #!/usr/bin/env bash
+    set -euo pipefail
+    ssh_bin="$(readlink -f "$(command -v ssh)")"
+    drv="$(nix-store --query --deriver "$ssh_bin")"
+    man_out="$(nix derivation show "$drv" 2>/dev/null | jq -r '.. | objects | select((.outputs? | type) == "object") | .outputs.man.path? // empty' | head -n1)"
+    case "$man_out" in /nix/store/*) : ;; *) man_out="/nix/store/$man_out" ;; esac
+    page="$man_out/share/man/man5/ssh_config.5.gz"
+    [ -f "$page" ] || nix-store --realise "$man_out" >/dev/null
+    "$(command -v ssh)" -V
+    MANWIDTH=100 man -l "$page" 2>/dev/null | col -b |
+      awk '/^     (ControlMaster|ControlPath|ControlPersist|ServerAliveCountMax|ServerAliveInterval)$/ {p=1} /^     [A-Z][A-Za-z]+$/ && !/Control|ServerAlive/ {p=0} p'
+
 # Provoke the FDR 0016 stacked-switch flow end-to-end in a detached tmux pane, to
 # see whether the two reported symptoms reproduce: (1) after a keep-switch a->b,
 # does b's palette offer "Back to a"? (2) does exiting b auto-pop back to a?
