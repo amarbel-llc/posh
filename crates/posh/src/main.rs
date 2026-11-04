@@ -1366,6 +1366,7 @@ fn cmd_ssh_session(
             real_ssh_agent_forward: None,
             channels: remote::sshwrap::channels_selected(),
             connect_timeout_secs: None,
+            control_path: None,
             agent_export: false,
         };
         return remote::sshwrap::run_detached(&dest, &inner, &opts);
@@ -1470,6 +1471,7 @@ fn cmd_ssh_session(
         real_ssh_agent_forward: None,
         channels: remote::sshwrap::channels_selected(),
         connect_timeout_secs: None,
+        control_path: None,
         // posh#161: the endpoint owns forwarding ⇒ the session still gets
         // agent/sock, and the bootstrap ssh runs -a (see the field's doc).
         // Keyed on the endpoint FORWARDING an agent, not merely existing: a
@@ -1601,12 +1603,16 @@ fn effective_remote_group<'a>(
 /// must never hang on a prompt; an interactive caller runs without it so a
 /// first contact can accept the host key (posh#182: the tailnet-IP fallback
 /// dials an address ssh has never seen, and batch mode could only fail it).
+/// `control` (`POSH_SSH_SHARE`) makes the probe start — or reuse — the
+/// posh-owned ssh master the endpoint bootstrap then rides.
 fn remote_list_argv(
     dest: &remote::sshwrap::SshDest,
     group: &str,
     format_flag: &str,
     batch: bool,
+    control: Option<&std::path::Path>,
 ) -> Vec<String> {
+    let _ = control;
     remote::sshwrap::remote_posh_argv(
         dest,
         batch_ssh_opts(batch),
@@ -1633,7 +1639,15 @@ fn remote_list_output(
         util::log_write("info", &dest.describe());
     }
     let batch = !util::is_tty(0);
-    let argv = remote_list_argv(&dest, group, format_flag, batch);
+    // Only an interactive probe (the `ph host:` picker, a typed `posh list
+    // host:`) leaves a shared master behind for the attach that follows; a
+    // completion or script never starts a background ssh.
+    let control = if batch {
+        None
+    } else {
+        remote::sshwrap::shared_control_path()
+    };
+    let argv = remote_list_argv(&dest, group, format_flag, batch, control.as_deref());
     let out = std::process::Command::new(&argv[0])
         .args(&argv[1..])
         .output()
@@ -1863,6 +1877,7 @@ fn cmd_ssh(args: &[String], forward: &remote::agent::ForwardFlag) -> Result<()> 
         real_ssh_agent_forward: resolve_real_ssh_agent_forward(real_ssh_agent_forward, mux_owned),
         channels: remote::sshwrap::channels_selected(),
         connect_timeout_secs: None,
+        control_path: None,
         agent_export: mux_owned,
     };
     // The server tail is caller-owned now (RFC 0008 §3): a bare host runs
@@ -2324,18 +2339,24 @@ mod tests {
         // from pre-#66.
         let dest = remote::sshwrap::SshDest::verbatim("user@box");
         assert_eq!(
-            remote_list_argv(&dest, "default", "--short", true),
+            remote_list_argv(&dest, "default", "--short", true, None),
             ["ssh", "-o", "BatchMode=yes", "user@box", "posh", "list", "--short"]
                 .map(String::from)
         );
         assert_eq!(
-            remote_list_argv(&remote::sshwrap::SshDest::verbatim("box"), "default", "--short", true)[3],
+            remote_list_argv(
+                &remote::sshwrap::SshDest::verbatim("box"),
+                "default",
+                "--short",
+                true,
+                None
+            )[3],
             "box"
         );
         // The table listing fetches the remote's rich shape with the same
         // wire, only the format flag differing.
         assert_eq!(
-            remote_list_argv(&dest, "default", "--json", true).last().unwrap(),
+            remote_list_argv(&dest, "default", "--json", true, None).last().unwrap(),
             "--json"
         );
         // Interactive (posh#182): no BatchMode, so a first contact can
@@ -2348,9 +2369,46 @@ mod tests {
             host_key_alias: Some("flac".into()),
         };
         assert_eq!(
-            remote_list_argv(&aliased, "default", "--short", false),
+            remote_list_argv(&aliased, "default", "--short", false, None),
             ["ssh", "-o", "HostKeyAlias=flac", "100.96.0.8", "posh", "list", "--short"]
                 .map(String::from)
+        );
+    }
+
+    #[test]
+    fn remote_list_starts_the_shared_master_when_given_a_control_path() {
+        // POSH_SSH_SHARE (the default): the interactive probe behind the
+        // `ph host:` picker starts — or reuses — the posh-owned ssh master,
+        // so the endpoint bootstrap after the choice rides the same
+        // authenticated connection instead of a second fresh login. The
+        // control options sit with the other options, before the target.
+        let dest = remote::sshwrap::SshDest::verbatim("box");
+        assert_eq!(
+            remote_list_argv(
+                &dest,
+                "default",
+                "--json",
+                false,
+                Some(std::path::Path::new("/run/u/posh/ssh/%C"))
+            ),
+            [
+                "ssh",
+                "-o",
+                "ControlMaster=auto",
+                "-o",
+                "ControlPath=/run/u/posh/ssh/%C",
+                "-o",
+                "ControlPersist=60",
+                "-o",
+                "ServerAliveInterval=15",
+                "-o",
+                "ServerAliveCountMax=2",
+                "box",
+                "posh",
+                "list",
+                "--json",
+            ]
+            .map(String::from)
         );
     }
 
@@ -2364,7 +2422,8 @@ mod tests {
                 &remote::sshwrap::SshDest::verbatim("user@box"),
                 "spinclass",
                 "--short",
-                true
+                true,
+                None
             ),
             [
                 "ssh",

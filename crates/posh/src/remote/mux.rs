@@ -1216,8 +1216,25 @@ fn mux_ssh_options(
         real_ssh_agent_forward: Some(false), // -a: no sshd-forwarded competitor
         channels: true, // RFC 0011 §6: selected on the bootstrap invocation
         connect_timeout_secs: Some(MUX_BOOTSTRAP_CONNECT_TIMEOUT_SECS),
+        control_path: None, // a reconnect never rides a possibly-stale master
         agent_export: false, // no session here to export into
     }
+}
+
+/// The COLD SEED's bootstrap options: [`mux_ssh_options`] plus the
+/// `POSH_SSH_SHARE` control path, so the foreground endpoint bootstrap after
+/// a `ph host:` choice rides the ssh master the picker's list probe left
+/// (one fresh login instead of two). Only the seed shares: a detached
+/// daemon's (re)establish keeps [`mux_ssh_options`] and its own fresh
+/// connection, because a reconnect usually follows a network change that
+/// may have stranded any master.
+fn seed_ssh_options(
+    family: Family,
+    port_range: Option<String>,
+    control_path: Option<PathBuf>,
+) -> crate::remote::sshwrap::SshOptions {
+    let _ = control_path;
+    mux_ssh_options(family, port_range)
 }
 
 /// Ensure the mux daemon for `key` toward ssh destination `dest`
@@ -1291,7 +1308,11 @@ pub fn seed_cold_endpoint(
     if UnixStream::connect(mux_socket_path(&key)?).is_ok() {
         return Ok(None);
     }
-    let opts = mux_ssh_options(family, port_range.map(str::to_string));
+    let opts = seed_ssh_options(
+        family,
+        port_range.map(str::to_string),
+        crate::remote::sshwrap::shared_control_path(),
+    );
     let (host, port, key) =
         crate::remote::sshwrap::bootstrap(dest, &agent_tail(), &opts, Some(takeover))?;
     // The ssh phase retired the progress modal; the spawn + hello that follow
@@ -5791,6 +5812,7 @@ mod tests {
             real_ssh_agent_forward: None,
             channels: false,
             connect_timeout_secs: None,
+            control_path: None,
             agent_export: false,
         }
     }
@@ -5817,6 +5839,45 @@ mod tests {
         assert!(opts.channels, "agent channels exist only enveloped");
         assert_eq!(opts.agent_source, None, "the agent verb IS forwarding; no -A");
         assert!(!opts.agent_export, "no session to export into");
+        // A detached (re)establish never rides a shared master: a reconnect
+        // usually follows a network change that may have stranded it.
+        assert_eq!(opts.control_path, None);
+    }
+
+    #[test]
+    fn cold_seed_rides_the_shared_ssh_master_but_reconnect_does_not() {
+        // POSH_SSH_SHARE: the foreground cold seed after a `ph host:` choice
+        // carries the control path, so its ssh reuses the master the
+        // picker's list probe left instead of a second fresh login; every
+        // other mux bootstrap property is the daemon's own.
+        let control = PathBuf::from("/run/u/posh/ssh/%C");
+        let seed = seed_ssh_options(Family::Auto, None, Some(control.clone()));
+        assert_eq!(seed.control_path, Some(control));
+        assert_eq!(
+            crate::remote::sshwrap::ssh_args(&seed),
+            vec![
+                "-a",
+                "-o",
+                "ConnectTimeout=10",
+                "-o",
+                "ControlMaster=auto",
+                "-o",
+                "ControlPath=/run/u/posh/ssh/%C",
+                "-o",
+                "ControlPersist=60",
+                "-o",
+                "ServerAliveInterval=15",
+                "-o",
+                "ServerAliveCountMax=2",
+            ]
+        );
+        // Sharing off (POSH_SSH_SHARE=0 resolves to no control path): the
+        // seed is byte-identical to the daemon's own bootstrap.
+        let unshared = seed_ssh_options(Family::Auto, None, None);
+        assert_eq!(
+            crate::remote::sshwrap::ssh_args(&unshared),
+            crate::remote::sshwrap::ssh_args(&mux_ssh_options(Family::Auto, None))
+        );
     }
 
     #[test]

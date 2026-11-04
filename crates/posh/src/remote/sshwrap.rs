@@ -58,6 +58,16 @@ pub struct SshOptions {
     /// per-destination endpoint for every invocation behind it (a pre-mux
     /// hang cost only its own invocation).
     pub connect_timeout_secs: Option<u32>,
+    /// OpenSSH connection sharing for this ssh (`POSH_SSH_SHARE`): the
+    /// `ControlPath` (`<base>/ssh/%C`) of the master a short-lived control
+    /// ssh — the `ph host:` picker's remote `posh list` — leaves behind, so
+    /// the endpoint bootstrap that follows rides that already-authenticated
+    /// connection instead of paying a second fresh TCP + ssh login (about
+    /// 7-9 round trips; docs/plans/2026-11-04-slow-connect-poor-links.md).
+    /// `None` keeps the argv byte-identical to before (the user's own ssh
+    /// config then decides), which is every path but the cold seed and the
+    /// interactive list probe.
+    pub control_path: Option<std::path::PathBuf>,
     /// posh#161: the per-destination mux endpoint (FDR 0014 M1) owns
     /// forwarding for this invocation, so `agent_source` is `None` (no `-A`
     /// rides to posh-server) — yet the session must still be born with
@@ -666,7 +676,83 @@ pub(crate) fn ssh_args(opts: &SshOptions) -> Vec<String> {
         args.push("-o".to_string());
         args.push(format!("ConnectTimeout={secs}"));
     }
+    if let Some(path) = &opts.control_path {
+        args.extend(control_args(path));
+    }
     args
+}
+
+/// The env gate for OpenSSH connection sharing between the `ph host:`
+/// picker's list ssh and the endpoint bootstrap ssh that follows it.
+/// Default ON; `POSH_SSH_SHARE=0` (or `false`/`off`/`no`) restores one fresh
+/// ssh login per spawn and leaves control options to the user's ssh config.
+pub const SSH_SHARE_ENV: &str = "POSH_SSH_SHARE";
+
+/// How long a posh-started ssh master outlives its last client
+/// (`ControlPersist`, seconds): long enough to carry the picker's list ssh
+/// into the bootstrap after the user chooses, and the next `ph host:` soon
+/// after; short, so a master stranded by a roam is not reused for long.
+pub const SSH_SHARE_PERSIST_SECS: u32 = 60;
+
+/// Keepalive on a posh-started master (`ServerAliveInterval` seconds ×
+/// `ServerAliveCountMax`): a master whose TCP died under a network change
+/// exits within about 30 s instead of holding its control socket open for
+/// slaves to hang on.
+pub const SSH_SHARE_ALIVE_SECS: u32 = 15;
+pub const SSH_SHARE_ALIVE_COUNT: u32 = 2;
+
+/// [`SSH_SHARE_ENV`] as a pure default-on gate, unit-testable without
+/// touching the process environment.
+pub(crate) fn ssh_share_gate(value: Option<&str>) -> bool {
+    let _ = value;
+    todo!("posh: ssh connection sharing gate")
+}
+
+/// Whether this invocation shares one ssh connection between its control
+/// ssh spawns ([`SSH_SHARE_ENV`]).
+pub fn ssh_share_selected() -> bool {
+    ssh_share_gate(std::env::var(SSH_SHARE_ENV).ok().as_deref())
+}
+
+/// The `ControlPath` under a socket base: `<base>/ssh/%C`. `%C` is ssh's own
+/// hash of local host, remote host, port and user, so one master serves
+/// exactly one destination and the path stays short (unix socket limit).
+pub fn ssh_control_path_in(base: &std::path::Path) -> std::path::PathBuf {
+    let _ = base;
+    todo!("posh: ssh control path")
+}
+
+/// The ssh options that make an ssh share (or start) the posh-owned master
+/// at `path`.
+pub(crate) fn control_args(path: &std::path::Path) -> Vec<String> {
+    let _ = path;
+    todo!("posh: ssh control options")
+}
+
+/// The control path for this invocation when sharing is selected, with its
+/// `<base>/ssh/` directory created private; `None` when the gate is off or
+/// the directory cannot be made (the spawn then simply does not share).
+pub fn shared_control_path() -> Option<std::path::PathBuf> {
+    if !ssh_share_selected() {
+        return None;
+    }
+    let base = crate::session::socket_base_from_env();
+    // The same hardening as `<base>/mux/` and `<base>/agent/` (github #7):
+    // a real, self-owned base and a private, self-owned leaf, never a
+    // symlink — a control socket is a live authenticated login.
+    crate::session::validate_session_dir(&base, util::uid(), false).ok()?;
+    let path = ssh_control_path_in(&base);
+    let dir = path.parent()?;
+    {
+        use std::os::unix::fs::DirBuilderExt;
+        std::fs::DirBuilder::new()
+            .recursive(true)
+            .mode(0o700)
+            .create(dir)
+            .ok()?;
+    }
+    crate::session::validate_session_dir(dir, util::uid(), true).ok()?;
+    Some(path)
 }
 
 /// The complete bootstrap command line, `ssh` first: the [`ssh_args`] flags,
@@ -1122,6 +1208,7 @@ mod tests {
             real_ssh_agent_forward: None,
             channels: false,
             connect_timeout_secs: Some(10),
+            control_path: None,
             agent_export: true,
         };
         let dest = SshDest {
@@ -1267,6 +1354,7 @@ mod tests {
             real_ssh_agent_forward: None,
             channels: false,
             connect_timeout_secs: None,
+            control_path: None,
             agent_export: false,
         };
         // New contract (RFC 0008 §3): the caller owns the `--`; the legacy tail
@@ -1316,6 +1404,7 @@ mod tests {
             real_ssh_agent_forward: None,
             channels: false,
             connect_timeout_secs: None,
+            control_path: None,
             agent_export: false,
         };
         let locale = vec![("LANG".to_string(), "en_US.UTF-8".to_string())];
@@ -1338,6 +1427,7 @@ mod tests {
                 real_ssh_agent_forward: None,
                 channels: false,
                 connect_timeout_secs: None,
+                control_path: None,
                 agent_export: false,
             },
             &[],
@@ -1360,6 +1450,7 @@ mod tests {
             real_ssh_agent_forward: None,
             channels: false,
             connect_timeout_secs: None,
+            control_path: None,
             agent_export: false,
         };
         let tail: Vec<String> = ["relay", "-g", "grp", "dev", "--", "htop"]
@@ -1382,6 +1473,7 @@ mod tests {
             real_ssh_agent_forward: None,
             channels: false,
             connect_timeout_secs: None,
+            control_path: None,
             agent_export: false,
         };
         let tail: Vec<String> = ["relay", "dev"].iter().map(|s| s.to_string()).collect();
@@ -1399,6 +1491,7 @@ mod tests {
             real_ssh_agent_forward: None,
             channels: false,
             connect_timeout_secs: None,
+            control_path: None,
             agent_export: false,
         };
         let tail: Vec<String> = ["relay", "-g", "grp", "dev"]
@@ -1425,6 +1518,7 @@ mod tests {
             real_ssh_agent_forward: None,
             channels: false,
             connect_timeout_secs: None,
+            control_path: None,
             agent_export: false,
         };
         let cmd = remote_command(&opts, &[], &[]);
@@ -1439,6 +1533,7 @@ mod tests {
             real_ssh_agent_forward: None,
             channels: false,
             connect_timeout_secs: None,
+            control_path: None,
             agent_export: false,
         };
         assert_eq!(remote_command(&off, &[], &[]), "posh-server new");
@@ -1456,6 +1551,7 @@ mod tests {
             real_ssh_agent_forward: None,
             channels: true,
             connect_timeout_secs: None,
+            control_path: None,
             agent_export: false,
         };
         let cmd = remote_command(&on, &[], &[]);
@@ -1469,6 +1565,7 @@ mod tests {
             real_ssh_agent_forward: None,
             channels: false,
             connect_timeout_secs: None,
+            control_path: None,
             agent_export: false,
         };
         let cmd = remote_command(&off, &[], &[]);
@@ -1490,6 +1587,7 @@ mod tests {
             real_ssh_agent_forward: None,
             channels: false,
             connect_timeout_secs: None,
+            control_path: None,
             agent_export: true,
         };
         let locale = vec![("LANG".to_string(), "C.UTF-8".to_string())];
@@ -1537,6 +1635,7 @@ mod tests {
             real_ssh_agent_forward: None,
             channels: false,
             connect_timeout_secs: None,
+            control_path: None,
             agent_export: false,
         };
         assert_eq!(ssh_args(&session), Vec::<String>::new());
@@ -1551,6 +1650,7 @@ mod tests {
             real_ssh_agent_forward: None,
             channels: true,
             connect_timeout_secs: Some(10),
+            control_path: None,
             agent_export: false,
         };
         assert_eq!(ssh_args(&mux), vec!["-4", "-o", "ConnectTimeout=10"]);
@@ -1563,9 +1663,77 @@ mod tests {
             real_ssh_agent_forward: Some(true),
             channels: false,
             connect_timeout_secs: None,
+            control_path: None,
             agent_export: false,
         };
         assert_eq!(ssh_args(&flags_only), vec!["-6", "-A"]);
+    }
+
+    #[test]
+    fn ssh_argv_shares_the_connection_only_when_a_control_path_is_set() {
+        // A control path (the cold endpoint seed after the picker's list
+        // ssh) makes this ssh share — or start — the posh-owned master, with
+        // a bounded persist and a keepalive so a master stranded by a roam
+        // dies instead of hanging its slaves. After every other flag.
+        let shared = SshOptions {
+            family: Family::Inet,
+            port_range: None,
+            agent_source: None,
+            real_ssh_agent_forward: Some(false),
+            channels: true,
+            connect_timeout_secs: Some(10),
+            control_path: Some(std::path::PathBuf::from("/run/u/posh/ssh/%C")),
+            agent_export: false,
+        };
+        assert_eq!(
+            ssh_args(&shared),
+            vec![
+                "-4",
+                "-a",
+                "-o",
+                "ConnectTimeout=10",
+                "-o",
+                "ControlMaster=auto",
+                "-o",
+                "ControlPath=/run/u/posh/ssh/%C",
+                "-o",
+                "ControlPersist=60",
+                "-o",
+                "ServerAliveInterval=15",
+                "-o",
+                "ServerAliveCountMax=2",
+            ]
+        );
+        // None: no control option at all — the user's ssh config decides,
+        // byte-identical to before the field existed.
+        let unshared = SshOptions {
+            control_path: None,
+            ..shared
+        };
+        assert_eq!(ssh_args(&unshared), vec!["-4", "-a", "-o", "ConnectTimeout=10"]);
+    }
+
+    #[test]
+    fn ssh_control_path_is_one_short_socket_per_destination_under_the_base() {
+        // `%C` is ssh's hash of (local host, remote host, port, user): one
+        // master per destination, and a fixed-length leaf that keeps the
+        // socket path under the unix limit.
+        assert_eq!(
+            ssh_control_path_in(std::path::Path::new("/run/user/1000/posh")),
+            std::path::PathBuf::from("/run/user/1000/posh/ssh/%C")
+        );
+    }
+
+    #[test]
+    fn ssh_share_gate_is_default_on_with_the_usual_off_spellings() {
+        // POSH_SSH_SHARE: unset or anything else = share (the new default);
+        // 0/false/off/no (trimmed, any case) restore one fresh login per ssh.
+        assert!(ssh_share_gate(None));
+        assert!(ssh_share_gate(Some("1")));
+        assert!(ssh_share_gate(Some("yes")));
+        for off in ["0", "false", "off", "no", " OFF "] {
+            assert!(!ssh_share_gate(Some(off)), "{off:?} must opt out");
+        }
     }
 
     #[test]
@@ -1619,6 +1787,7 @@ mod tests {
             real_ssh_agent_forward: None,
             channels: false,
             connect_timeout_secs: None,
+            control_path: None,
             agent_export: false,
         };
         let env = vec![
