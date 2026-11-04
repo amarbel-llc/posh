@@ -682,6 +682,30 @@ _POSH_MUX_PERSIST_
 	freshly spawned endpoint always waits a short spawn grace for its
 	first invocation to register, even at *0*.
 
+_POSH_SSH_SHARE_
+	Share one ssh login between the control ssh connections of one
+	front-door use, default ON. The interactive remote *posh list*
+	behind *ph host:* (and a typed *posh list host:*) runs with
+	_-o ControlMaster=auto_, _ControlPath=<base>/ssh/%C_,
+	_ControlPersist=60_ and a keepalive (_ServerAliveInterval=15_,
+	_ServerAliveCountMax=2_), and the cold mux-endpoint bootstrap that
+	follows the picker's choice rides that same connection — a cold
+	*ph host:* then pays one fresh ssh login instead of two, and another
+	*ph host:* within a minute pays none. The master lingers 60 seconds
+	after its last use and dies within about 30 seconds if its TCP
+	connection is lost. A non-interactive list (completion, scripts)
+	never starts one, and a detached endpoint's reconnect never rides
+	one. These options override any _ControlMaster_/_ControlPath_ in your
+	ssh config for those two connections. _POSH_SSH_SHARE=0_ (or
+	*false*, *off*, *no*) restores one fresh ssh login per connection
+	and leaves connection sharing to your ssh config.
+
+_POSH_CONNECT_TMOUT_
+	Seconds to wait for the first frame of a connection (default *15*;
+	*0* waits forever). On a mux session channel, a timeout falls back
+	to a per-invocation connection — a second ssh bootstrap — so raise
+	it on a link that is slow but alive. See *posh-client*(1).
+
 _POSH_AGENT_NOTICE_
 	When agent forwarding is active, a rate-limited banner (at most one
 	per minute) reports when the remote host opens a connection to your

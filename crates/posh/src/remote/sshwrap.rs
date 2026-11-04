@@ -704,8 +704,7 @@ pub const SSH_SHARE_ALIVE_COUNT: u32 = 2;
 /// [`SSH_SHARE_ENV`] as a pure default-on gate, unit-testable without
 /// touching the process environment.
 pub(crate) fn ssh_share_gate(value: Option<&str>) -> bool {
-    let _ = value;
-    todo!("posh: ssh connection sharing gate")
+    util::parse_default_on_gate(value)
 }
 
 /// Whether this invocation shares one ssh connection between its control
@@ -718,15 +717,22 @@ pub fn ssh_share_selected() -> bool {
 /// hash of local host, remote host, port and user, so one master serves
 /// exactly one destination and the path stays short (unix socket limit).
 pub fn ssh_control_path_in(base: &std::path::Path) -> std::path::PathBuf {
-    let _ = base;
-    todo!("posh: ssh control path")
+    base.join("ssh").join("%C")
 }
 
 /// The ssh options that make an ssh share (or start) the posh-owned master
 /// at `path`.
 pub(crate) fn control_args(path: &std::path::Path) -> Vec<String> {
-    let _ = path;
-    todo!("posh: ssh control options")
+    [
+        "ControlMaster=auto".to_string(),
+        format!("ControlPath={}", path.display()),
+        format!("ControlPersist={SSH_SHARE_PERSIST_SECS}"),
+        format!("ServerAliveInterval={SSH_SHARE_ALIVE_SECS}"),
+        format!("ServerAliveCountMax={SSH_SHARE_ALIVE_COUNT}"),
+    ]
+    .into_iter()
+    .flat_map(|opt| ["-o".to_string(), opt])
+    .collect()
 }
 
 /// The control path for this invocation when sharing is selected, with its

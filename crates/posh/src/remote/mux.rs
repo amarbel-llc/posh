@@ -1233,8 +1233,10 @@ fn seed_ssh_options(
     port_range: Option<String>,
     control_path: Option<PathBuf>,
 ) -> crate::remote::sshwrap::SshOptions {
-    let _ = control_path;
-    mux_ssh_options(family, port_range)
+    crate::remote::sshwrap::SshOptions {
+        control_path,
+        ..mux_ssh_options(family, port_range)
+    }
 }
 
 /// Ensure the mux daemon for `key` toward ssh destination `dest`

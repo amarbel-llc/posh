@@ -125,6 +125,16 @@ _POSH_KEY_
 	immediately clears the variable, so the key never appears in the
 	process's argv (which is world-readable via *ps*(1)). Required.
 
+_POSH_CONNECT_TMOUT_
+	Seconds the client waits for the first frame before it gives up on
+	a connection (default *15*; *0* waits forever). On a per-invocation
+	UDP connection the client then exits with *Timed out waiting for
+	server on UDP port N*. On a mux session channel the front door
+	instead falls back to a per-invocation connection, which runs a
+	second ssh bootstrap with its own window — so on a link that is
+	slow but alive, a larger value avoids paying for that second
+	bootstrap (docs/plans/2026-11-04-slow-connect-poor-links.md).
+
 _POSH_PREDICTION_MODEL_
 	Local-echo prediction model: _always_ (default), _never_,
 	_adaptive_, _experimental_, or _optimistic_. The first four are the

@@ -176,6 +176,25 @@ in every row of the table above.
 - `POSH_MUX_SESSIONS=0` / `POSH_MUX=0` do **not** help: they force a fresh
   ssh bootstrap on every connect.
 
+## Follow-up status
+
+- **Item 1 is addressed by `POSH_SSH_SHARE`** (default on; `posh(1)`
+  ENVIRONMENT, FDR 0015 Tuning Levers). The picker's interactive list probe
+  starts a posh-owned OpenSSH master at `<base>/ssh/%C` (`ControlPersist=60`,
+  `ServerAliveInterval=15`, `ServerAliveCountMax=2`), and the cold endpoint
+  seed after the choice rides it (`sshwrap.rs` `control_args` /
+  `shared_control_path`, `mux.rs` `seed_ssh_options`, `main.rs`
+  `remote_list_output`). A cold `ph host:` pays one fresh login instead of
+  two, and a repeat within 60 s pays none. Remaining: the warm-endpoint list
+  still costs one ssh session (about 2 RTT over the master), and listing
+  over the mux itself would need a wire change (see
+  `2026-11-04-control-channel-options.md`). `POSH_SSH_SHARE=0` restores the
+  old behaviour.
+- Items 2-4 are not changed and remain the ranked follow-up, in this order:
+  2 (no fallback after progress), 3 (resend the first message on the RTO;
+  seed the RTO from the bootstrap), 4 (carry the client's first message in
+  the OPEN, which is an RFC 0011/0015 change).
+
 ## Proposed code changes (each to be done test-first later)
 
 1. **`ph host:` should not open a second ssh to list.** Serve `list --json`

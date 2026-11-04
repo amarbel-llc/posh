@@ -155,6 +155,7 @@ same candidate sources.
 | Lever | Current | Rationale | Change signal |
 |---|---|---|---|
 | remote session-name completion source | out-of-band cache | interactive completion must never block on a slow endpoint | a fast local endpoint makes live query imperceptible and users hit staleness often |
+| ssh logins per cold `ph host:` (`POSH_SSH_SHARE`, 2026-11-04) | one: the picker's interactive list probe starts a posh-owned OpenSSH master (`<base>/ssh/%C`, persist 60 s, keepalive 15 s × 2) and the cold endpoint seed after the choice rides it; `=0` restores two fresh logins | each fresh login is ~7-9 round trips, paid serially before the first frame (docs/plans/2026-11-04-slow-connect-poor-links.md) | slaves hang on a master stranded by a roam, or a user's own ControlMaster setup conflicts |
 | host completion source set | ssh config + tailscale + mux (union) | covers the reachable set without a config file | a host the user reaches by another means is routinely missing |
 | bare `ph`/`ph host:` before FDR 0016 (historical: the picker now exists; off a TTY they still error with candidates) | error with candidates | non-TTY discipline, no half-built picker | the direct-grammar-only cut ships and the picker is wanted immediately |
 

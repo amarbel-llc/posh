@@ -1612,10 +1612,14 @@ fn remote_list_argv(
     batch: bool,
     control: Option<&std::path::Path>,
 ) -> Vec<String> {
-    let _ = control;
+    let mut ssh_opts: Vec<String> = batch_ssh_opts(batch).iter().map(|s| s.to_string()).collect();
+    if let Some(path) = control {
+        ssh_opts.extend(remote::sshwrap::control_args(path));
+    }
+    let ssh_opts: Vec<&str> = ssh_opts.iter().map(String::as_str).collect();
     remote::sshwrap::remote_posh_argv(
         dest,
-        batch_ssh_opts(batch),
+        &ssh_opts,
         &[],
         group,
         &["list".to_string(), format_flag.to_string()],
