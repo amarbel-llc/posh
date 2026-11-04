@@ -790,6 +790,111 @@ debug-verify-establish-modal mux="0": build-palette
     "${TM[@]}" kill-server 2>/dev/null || true
     env POSH_DIR="$sock" "$P" kill dev >/dev/null 2>&1 || true
 
+# Time a `ph host:session` connect over an EMULATED poor link, entirely inside
+# an unprivileged user+net+pid namespace (`unshare -rn --pid`): the namespace
+# has only its own loopback, a netem qdisc on THAT lo adds delay/jitter/loss
+# (rtt_ms is the round trip: each direction gets rtt_ms/2; loss_pct applies to
+# every packet in each direction), and the whole posh pair runs on 127.0.0.1
+# inside it. The host's real interfaces are never touched: the inner script
+# refuses to add netem unless `ip -o link` shows lo alone. The pid namespace
+# means every daemon the run starts (session daemon, mux endpoint, posh-server)
+# dies with it — nothing outlives the recipe, and no outside process is seen.
+#
+# The ssh leg is NOT reproduced: a stub `ssh` first on PATH answers `ssh -G`
+# (the dial resolver) and runs the remote command locally, logging when each
+# bootstrap starts and ends. SSH_CONNECTION is unset in the pane: inherited
+# from an operator's own ssh login it would make the "remote" posh-server
+# report that login's address as POSH IP, unreachable inside the netns. So the numbers are posh's OWN establishment cost
+# (endpoint/relay bootstrap process, UDP handshake, session OPEN, first frame)
+# on the impaired link, with a real fresh ssh connection's ~7-9 round trips
+# (TCP, banner, KEX, auth, channel, exec) to be ADDED per ssh invocation.
+# The session shell is a marker script (prints READY_MARK, then sh), so the
+# first screen is detected by polling the tmux pane for the marker.
+#
+# Each run does a COLD attempt (fresh POSH_DIR: no mux endpoint, no session)
+# then a WARM one (pane killed, so the client is gone but the endpoint lingers
+# and the session survives). mux=1 is the default M2 path (POSH_MUX and
+# POSH_MUX_SESSIONS on); mux=0 is the per-invocation relay path. Output per
+# attempt: total ms to the first screen, then every ssh-stub and debug-log line
+# re-stamped as +ms from the attempt start (the mux daemon's own log included),
+# then the captured stderr (mux fallback warnings land there). Exit 2 means
+# netem/namespaces are unavailable here. Not a hermetic test; a measurement aid
+# for docs/plans/2026-11-04-slow-connect-poor-links.md.
+#
+# time ph host:session establishment over a netem-impaired loopback in a private netns
+[group("debug")]
+debug-netem-connect rtt_ms="0" loss_pct="0" mux="1" runs="2" jitter_ms="0":
+    #!/usr/bin/env bash
+    set -uo pipefail
+    root="{{ justfile_directory() }}"
+    nix develop --command cargo build -q -p posh || exit 1
+    T="$(mktemp -d /tmp/posh-netem.XXXXXX)"
+    trap 'rm -rf "$T"' EXIT
+    mkdir -p "$T/bin"
+    ln -sfn "$root/target/debug/posh" "$T/bin/posh"
+    ln -sfn "$root/target/debug/posh" "$T/bin/posh-server"
+    ln -sfn "$root/target/debug/posh" "$T/ph"
+    {
+      echo '#!/bin/sh'
+      echo 'if [ "$1" = "-G" ]; then echo "hostname $3"; exit 0; fi'
+      echo 'for last; do :; done'
+      echo 'echo "$(date +%s%3N) ssh-stub start: $last" >>"$NETEM_T/ssh.log"'
+      echo 'eval "$last"; rc=$?'
+      echo 'echo "$(date +%s%3N) ssh-stub end rc=$rc" >>"$NETEM_T/ssh.log"'
+      echo 'exit $rc'
+    } >"$T/bin/ssh"
+    printf '#!/bin/sh\necho READY_MARK\nexec /bin/sh\n' >"$T/bin/marksh"
+    chmod +x "$T/bin/ssh" "$T/bin/marksh"
+    cat >"$T/inner.sh" <<'INNER'
+    set -uo pipefail
+    ip link set lo up
+    links="$(ip -o link show | awk -F': ' '{print $2}' | tr '\n' ' ')"
+    if [ "$links" != "lo " ]; then echo "refusing: not an isolated netns (links: $links)"; exit 1; fi
+    echo "netns links: $links"
+    half=$((RTT / 2)); hj=$((JIT / 2)); args=()
+    if [ "$half" -gt 0 ]; then args+=(delay "${half}ms"); [ "$hj" -gt 0 ] && args+=("${hj}ms"); fi
+    [ "$LOSS" != 0 ] && args+=(loss "${LOSS}%")
+    if [ "${#args[@]}" -gt 0 ]; then
+      tc qdisc add dev lo root netem "${args[@]}" || { echo "netem unavailable"; exit 2; }
+    fi
+    echo "qdisc: $(tc qdisc show dev lo)"
+    export TMUX_TMPDIR="$NETEM_T"
+    TM=(tmux -L posh-netem)
+    rel() { awk -v t0="$1" '{ts=$1; gsub(/[^0-9]/,"",ts); if (ts=="") next; $1=""; printf "  +%6d ms %s\n", ts - t0, $0}'; }
+    attempt() { # $1 = label, $2 = POSH_DIR
+      local d="$2" a="$NETEM_T/$1"; mkdir -p "$a"
+      : >"$NETEM_T/ssh.log"
+      "${TM[@]}" kill-server 2>/dev/null
+      local t0; t0="$(date +%s%3N)"
+      "${TM[@]}" new-session -d -s s -x 100 -y 30 \
+        "env -u POSH_SESSION -u POSH_KEY -u TMUX -u SSH_CONNECTION -u SSH_CLIENT -u SSH_TTY PATH='$NETEM_T/bin':\"\$PATH\" SHELL='$NETEM_T/bin/marksh' \
+          POSH_DIR='$d' POSH_GROUP=default POSH_MUX='$MUX' POSH_MUX_SESSIONS='$MUX' \
+          POSH_DEBUG_LOG='$a/posh.log' NETEM_T='$NETEM_T' '$NETEM_T/ph' 127.0.0.1:bench 2>'$a/stderr.log'; \
+          echo PH_EXITED_\$?; sleep 600"
+      local t1="" now
+      while :; do
+        now="$(date +%s%3N)"
+        if "${TM[@]}" capture-pane -p -t s 2>/dev/null | grep -q READY_MARK; then t1="$now"; break; fi
+        if "${TM[@]}" capture-pane -p -t s 2>/dev/null | grep -q PH_EXITED_; then break; fi
+        [ $((now - t0)) -gt 90000 ] && break
+        sleep 0.02
+      done
+      if [ -n "$t1" ]; then echo "== $1: first screen after $((t1 - t0)) ms"; else echo "== $1: NO first screen (exited or >90 s)"; "${TM[@]}" capture-pane -p -t s | sed 's/^/  | /'; fi
+      cat "$NETEM_T/ssh.log" "$a/posh.log" "$d"/mux/*.log 2>/dev/null | sed 's/^\[\([0-9]*\)\]/\1/' | sort -s -n -k1,1 | rel "$t0" | cut -c1-180
+      [ -s "$a/stderr.log" ] && sed 's/^/  stderr: /' "$a/stderr.log" | cut -c1-200
+      "${TM[@]}" kill-server 2>/dev/null
+      sleep 1
+    }
+    for r in $(seq 1 "$RUNS"); do
+      d="$NETEM_T/r$r"; mkdir -p "$d"; chmod 700 "$d"
+      attempt "run$r-cold" "$d"
+      attempt "run$r-warm" "$d"
+    done
+    INNER
+    echo ">> rtt={{ rtt_ms }}ms jitter={{ jitter_ms }}ms loss={{ loss_pct }}% mux={{ mux }} runs={{ runs }}"
+    env NETEM_T="$T" RTT='{{ rtt_ms }}' JIT='{{ jitter_ms }}' LOSS='{{ loss_pct }}' MUX='{{ mux }}' RUNS='{{ runs }}' \
+      unshare --user --map-root-user --net --pid --fork --mount-proc bash "$T/inner.sh"
+
 # Provoke the FDR 0016 stacked-switch flow end-to-end in a detached tmux pane, to
 # see whether the two reported symptoms reproduce: (1) after a keep-switch a->b,
 # does b's palette offer "Back to a"? (2) does exiting b auto-pop back to a?
