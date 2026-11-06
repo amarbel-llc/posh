@@ -37,6 +37,9 @@ client's behavior (backend) and reusing mature TUI prior art.
     (`session.switch`, a re-dial through the front door). Both clients.
   - **Echo: adaptive / optimistic / always / never** — set the predictive-echo
     model live (`echo.set`), overriding `$POSH_PREDICTION_MODEL` for the session.
+  - **Render: lookalike / underline / dim** — set the prediction render style
+    live (`render.set`, posh#192), overriding `$POSH_PREDICTION_RENDER` for the
+    session. Roaming client only, like the `Echo:` entries.
   - **Enable / Disable client debug logging** — toggle this client's debug
     logging (`logging.set`); the imperative label reflects the live state and the
     banner shows the log path.

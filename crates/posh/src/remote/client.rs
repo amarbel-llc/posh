@@ -186,16 +186,30 @@ fn apply_debug_banner(st: &mut ClientState, next: &mut Snapshot, now: u64) {
 /// so stale predicted cells clear; banners the new model. Backs the palette's
 /// `echo.set` action.
 fn apply_echo_model(st: &mut ClientState, next: PredictionModel, now: u64) {
-    let (predict, renderer) = predict::build(next, st.predict_render, st.predict_overwrite);
-    st.predict = predict;
-    st.renderer = renderer;
     st.predict_model = next;
     st.stats.set_gp_active(is_gp_species(next));
+    rebuild_prediction(st, &format!("echo: {}", next.name()), now);
+}
+
+/// The render-style twin of [`apply_echo_model`] (posh#192): same in-place
+/// rebuild, model untouched. Backs the palette's `render.set` action.
+fn apply_render_style(st: &mut ClientState, next: RenderStyle, now: u64) {
+    st.predict_render = next;
+    rebuild_prediction(st, &format!("render: {}", next.name()), now);
+}
+
+/// Rebuilds the predictor/renderer pair from `st.predict_model` and
+/// `st.predict_render`, forces a clean repaint, and banners `status`.
+fn rebuild_prediction(st: &mut ClientState, status: &str, now: u64) {
+    let (predict, renderer) =
+        predict::build(st.predict_model, st.predict_render, st.predict_overwrite);
+    st.predict = predict;
+    st.renderer = renderer;
     st.initialized = false;
     // A sticky notice (the wedge-forensics banner, up until a keystroke)
     // outranks this 1 s status line; set_message would clobber it.
     if !st.notify.message_is_sticky() {
-        st.notify.set_message(&format!("echo: {}", next.name()), false, now);
+        st.notify.set_message(status, false, now);
     }
 }
 
@@ -363,6 +377,10 @@ fn palette_commands(
         // display, §7.1); pick any other Echo entry to turn it back off.
         json!({ "name": "Echo: controller (evolved GP)", "action": { "method": "echo.set", "params": { "model": "controller" } } }),
         json!({ "name": "Echo: from-scratch (evolved GP)", "action": { "method": "echo.set", "params": { "model": "scratch" } } }),
+        // posh#192: the prediction render style, independent of the model.
+        json!({ "name": "Render: lookalike", "action": { "method": "render.set", "params": { "style": "lookalike" } } }),
+        json!({ "name": "Render: underline", "action": { "method": "render.set", "params": { "style": "replace" } } }),
+        json!({ "name": "Render: dim", "action": { "method": "render.set", "params": { "style": "dim" } } }),
         json!({ "name": client_log_name, "action": { "method": "logging.set", "params": { "enabled": client_log_enabled } } }),
         json!({ "name": server_log_name, "action": { "method": "logging.set", "params": { "scope": "server", "enabled": server_log_enabled } } }),
         json!({ "name": scroll_opt_name, "action": { "method": "render.scroll_opt", "params": { "enabled": scroll_opt_enabled } } }),
@@ -981,6 +999,17 @@ fn dispatch_palette_action(
                 // anything else is a palette pin, reported as such.
                 st.echo_pinned_palette = model != PredictionModel::Adaptive;
                 apply_echo_model(st, model, now);
+            }
+            false
+        }
+        "render.set" => {
+            if let Some(style) = params
+                .get("style")
+                .and_then(Value::as_str)
+                .filter(|s| !s.is_empty())
+                .and_then(|s| RenderStyle::parse(Some(s)).ok())
+            {
+                apply_render_style(st, style, now);
             }
             false
         }
@@ -5051,7 +5080,7 @@ mod tests {
         assert!(off.iter().any(|n| n == "Hide live debug banner"), "{off:?}");
         // FDR 0016: the switcher leads the list.
         assert_eq!(names.first().copied(), Some("Switch session…"), "{names:?}");
-        assert_eq!(arr.len(), 22, "expected 22 commands, got {names:?}");
+        assert_eq!(arr.len(), 25, "expected 25 commands, got {names:?}");
     }
 
     #[test]
@@ -5907,6 +5936,39 @@ mod tests {
         assert_eq!(st.predict_model, PredictionModel::Optimistic);
         assert!(st.notify.message().contains("optimistic"), "banner names the new model");
         assert!(!st.initialized, "swapping the predictor forces a clean repaint");
+    }
+
+    #[test]
+    fn dispatch_render_set_swaps_render_style_and_keeps_the_model() {
+        // posh#192: the palette's `Render:` entries switch the prediction
+        // render style in place through the same rebuild `echo.set` uses.
+        let raw = pty_raw_mode();
+        let mut st = test_state(3, 30);
+        st.predict_model = PredictionModel::Optimistic;
+        st.predict_render = RenderStyle::Lookalike;
+        st.initialized = true;
+
+        let send = dispatch_palette_action(&mut st, &raw, "render.set", &json!({ "style": "dim" }), 0);
+        assert!(!send, "render.set is client-local, no prompt send");
+        assert_eq!(st.predict_render, RenderStyle::Dim);
+        assert_eq!(st.predict_model, PredictionModel::Optimistic, "model untouched");
+        assert!(st.notify.message().contains("dim"), "banner names the style");
+        assert!(!st.initialized, "swapping the renderer forces a clean repaint");
+
+        // An unknown style is ignored, like an unknown echo model.
+        dispatch_palette_action(&mut st, &raw, "render.set", &json!({ "style": "sparkly" }), 0);
+        assert_eq!(st.predict_render, RenderStyle::Dim);
+
+        // The palette offers one entry per style.
+        let cmds = palette_commands(false, true, false, false, false, &no_stack());
+        let styles: Vec<&str> = cmds
+            .as_array()
+            .unwrap()
+            .iter()
+            .filter(|c| c["action"]["method"] == "render.set")
+            .filter_map(|c| c["action"]["params"]["style"].as_str())
+            .collect();
+        assert_eq!(styles, ["lookalike", "replace", "dim"]);
     }
 
     #[test]

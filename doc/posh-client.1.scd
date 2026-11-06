@@ -185,7 +185,8 @@ _POSH_PREDICTION_RENDER_
 	nothing is painted while the remote PTY has ECHO off or the alternate
 	screen is active — except under the _always_ model, which opts out of the
 	gate to paint every keystroke immediately (correcting on the next frame),
-	accepting a transient echo of secret input.
+	accepting a transient echo of secret input. The palette's *Render:*
+	entries switch the style live for the session.
 
 _POSH_PREDICTION_SHOW_
 	When the renderer paints what the model holds: _always_ (default) paints

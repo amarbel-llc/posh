@@ -324,6 +324,7 @@ methods it does not implement.
 | method           | params                                  | effect                                       |
 |------------------|-----------------------------------------|----------------------------------------------|
 | `echo.set`       | `{"model": <string>}`                   | Set predictive-echo model. `model` ∈ `adaptive`, `optimistic`, `always`, `never`. Invalid → `-32602`. On a client without prediction (local attach), `-32601`. |
+| `render.set`     | `{"style": <string>}`                   | Set the predictive-echo render style (posh#192), independent of the model: `style` ∈ `lookalike`, `replace` (underline), `dim`; the predictor/renderer pair is rebuilt in place, overriding `$POSH_PREDICTION_RENDER` for the session. Invalid → `-32602`. Transport-conditional like `echo.set`: on a client without prediction (local attach), `-32601`. |
 | `logging.set`    | `{"enabled": <bool>, "scope"?: <string>}` | Enable/disable debug logging. `scope` ∈ `client` (default) or `server`. `client` is applied in-process; `server` requests the toggle over the transport (the client reports the resulting state from the next frame). `result` MAY carry `{"path": <string>}`. |
 | `debug.banner`   | `{"enabled": <bool>}`                   | Show/hide the client's live debug banner (FDR 0007): reverse-video rows under the connection banner carrying the transport, echo, time-to-paint, and loop gauges, refreshed in-process. Client-local; nothing is sent. |
 | `record.set`     | `{"enabled": <bool>}`                   | Start/stop recording the client VIEWPORT — its tty output, the user's input keystrokes, and resizes — to a poshterity `.castx` (RFC 0003) for frame-by-frame replay (FDR 0018). Client-local; nothing is sent. `result` MAY carry `{"path": <string>}`. |
@@ -347,9 +348,9 @@ implements further client-local methods not registered here (the
 
 Per posh#87, these methods are the client's shared control surface: a converged
 client core implements them once and the same palette drives every transport.
-`echo.set` is the one capability that is transport-conditional (prediction
-exists only over a network), which the registry models as a `-32601` on clients
-that lack it rather than as a separate protocol.
+`echo.set` and `render.set` are the capabilities that are transport-conditional
+(prediction exists only over a network), which the registry models as a
+`-32601` on clients that lack them rather than as a separate protocol.
 
 ### 8. Lifecycle
 
