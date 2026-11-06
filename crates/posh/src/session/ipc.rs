@@ -227,22 +227,60 @@ pub fn decode_frame_ack(payload: &[u8]) -> Option<(u64, u8)> {
     Some((acked_frame, payload[8]))
 }
 
+/// A tag space framed with this module's 5-byte header (tag byte + u32 LE
+/// length): the session IPC's [`Tag`], and the mux socket's own `MuxTag`
+/// (posh#153). The header codec is shared; a tag space supplies only its
+/// tag decode and its payload bound.
+pub trait FrameTag: Copy {
+    /// Largest payload a header may announce; a larger one is an error, so a
+    /// peer cannot drive unbounded buffering by claiming a huge length.
+    const MAX_LEN: usize;
+    /// Names the protocol in the oversize error ("frame", "mux frame").
+    const LABEL: &'static str;
+    /// The tag for a header's tag byte; `None` skips the frame (forward
+    /// compatibility).
+    fn from_tag_byte(b: u8) -> Option<Self>;
+}
+
+impl FrameTag for Tag {
+    const MAX_LEN: usize = MAX_FRAME_LEN;
+    const LABEL: &'static str = "frame";
+    fn from_tag_byte(b: u8) -> Option<Tag> {
+        Tag::from_u8(b)
+    }
+}
+
 #[derive(Debug, Clone, PartialEq, Eq)]
-pub struct Frame {
-    pub tag: Tag,
+pub struct TaggedFrame<T> {
+    pub tag: T,
     pub payload: Vec<u8>,
 }
 
-/// Reassembles frames from a (typically non-blocking) stream socket.
-#[derive(Default)]
-pub struct FrameBuffer {
+pub type Frame = TaggedFrame<Tag>;
+
+/// Reassembles frames of one [`FrameTag`] space from a (typically
+/// non-blocking) stream socket.
+pub struct TaggedFrameBuffer<T> {
     buf: Vec<u8>,
     head: usize,
+    tags: std::marker::PhantomData<T>,
 }
 
-impl FrameBuffer {
-    pub fn new() -> FrameBuffer {
-        FrameBuffer::default()
+pub type FrameBuffer = TaggedFrameBuffer<Tag>;
+
+impl<T> Default for TaggedFrameBuffer<T> {
+    fn default() -> Self {
+        TaggedFrameBuffer {
+            buf: Vec::new(),
+            head: 0,
+            tags: std::marker::PhantomData,
+        }
+    }
+}
+
+impl<T: FrameTag> TaggedFrameBuffer<T> {
+    pub fn new() -> Self {
+        Self::default()
     }
 
     pub fn feed(&mut self, data: &[u8]) {
@@ -261,18 +299,19 @@ impl FrameBuffer {
     }
 
     /// Returns the next complete frame, skipping frames with unknown tags.
-    /// Errors if a header announces a payload over [`MAX_FRAME_LEN`], so a
-    /// peer cannot drive unbounded buffering by claiming a huge length.
-    pub fn next(&mut self) -> util::Result<Option<Frame>> {
+    /// Errors if a header announces a payload over [`FrameTag::MAX_LEN`].
+    pub fn next(&mut self) -> util::Result<Option<TaggedFrame<T>>> {
         loop {
             let avail = &self.buf[self.head..];
             if avail.len() < HEADER_LEN {
                 return Ok(None);
             }
             let len = u32::from_le_bytes([avail[1], avail[2], avail[3], avail[4]]) as usize;
-            if len > MAX_FRAME_LEN {
+            if len > T::MAX_LEN {
                 return Err(util::Error::Msg(format!(
-                    "frame length {len} exceeds maximum {MAX_FRAME_LEN}"
+                    "{} length {len} exceeds maximum {}",
+                    T::LABEL,
+                    T::MAX_LEN
                 )));
             }
             if avail.len() < HEADER_LEN + len {
@@ -281,8 +320,8 @@ impl FrameBuffer {
             let tag_byte = avail[0];
             let payload = avail[HEADER_LEN..HEADER_LEN + len].to_vec();
             self.head += HEADER_LEN + len;
-            if let Some(tag) = Tag::from_u8(tag_byte) {
-                return Ok(Some(Frame { tag, payload }));
+            if let Some(tag) = T::from_tag_byte(tag_byte) {
+                return Ok(Some(TaggedFrame { tag, payload }));
             }
         }
     }

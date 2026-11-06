@@ -368,55 +368,21 @@ pub fn encode_mux_frame(tag: MuxTag, payload: &[u8]) -> Vec<u8> {
     out
 }
 
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub struct MuxFrame {
-    pub tag: MuxTag,
-    pub payload: Vec<u8>,
-}
-
-/// Reassembles mux frames from a (typically non-blocking) stream socket —
-/// the `session/ipc::FrameBuffer` shape over the mux tag space, with the
-/// tighter [`MUX_MAX_FRAME_LEN`] bound. Unknown tags are skipped (forward
-/// compatibility); an oversize length errors so the conn is dropped.
-#[derive(Default)]
-pub struct MuxFrameBuffer {
-    buf: Vec<u8>,
-    head: usize,
-}
-
-impl MuxFrameBuffer {
-    pub fn feed(&mut self, data: &[u8]) {
-        if self.head > 0 {
-            self.buf.drain(..self.head);
-            self.head = 0;
-        }
-        self.buf.extend_from_slice(data);
-    }
-
-    pub fn next(&mut self) -> Result<Option<MuxFrame>> {
-        loop {
-            let avail = &self.buf[self.head..];
-            if avail.len() < 5 {
-                return Ok(None);
-            }
-            let len = u32::from_le_bytes([avail[1], avail[2], avail[3], avail[4]]) as usize;
-            if len > MUX_MAX_FRAME_LEN {
-                return Err(util::Error::Msg(format!(
-                    "mux frame length {len} exceeds maximum {MUX_MAX_FRAME_LEN}"
-                )));
-            }
-            if avail.len() < 5 + len {
-                return Ok(None);
-            }
-            let tag_byte = avail[0];
-            let payload = avail[5..5 + len].to_vec();
-            self.head += 5 + len;
-            if let Some(tag) = MuxTag::from_u8(tag_byte) {
-                return Ok(Some(MuxFrame { tag, payload }));
-            }
-        }
+/// The mux tag space shares the session IPC's frame header and reassembler
+/// (posh#153), with the tighter [`MUX_MAX_FRAME_LEN`] bound. Unknown tags are
+/// skipped (forward compatibility); an oversize length errors so the conn is
+/// dropped.
+impl crate::session::ipc::FrameTag for MuxTag {
+    const MAX_LEN: usize = MUX_MAX_FRAME_LEN;
+    const LABEL: &'static str = "mux frame";
+    fn from_tag_byte(b: u8) -> Option<MuxTag> {
+        MuxTag::from_u8(b)
     }
 }
+
+pub type MuxFrame = crate::session::ipc::TaggedFrame<MuxTag>;
+
+pub type MuxFrameBuffer = crate::session::ipc::TaggedFrameBuffer<MuxTag>;
 
 /// `MuxTag::Hello` payload: `pid: u32 LE` + the sender's protocol stamp
 /// (UTF-8, to end of payload).
