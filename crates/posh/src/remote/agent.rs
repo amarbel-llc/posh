@@ -2558,6 +2558,22 @@ mod tests {
         std::fs::remove_dir_all(&base).ok();
     }
 
+    /// Polls `read_channels` until the records gathered so far satisfy `done`,
+    /// or a 2 s deadline passes. Loopback delivery is not instant under a
+    /// loaded parallel `cargo test`, so a fixed sleep flakes (posh#112).
+    fn read_channels_until(
+        ep: &mut AgentEndpoint,
+        done: impl Fn(&[AgentRecord]) -> bool,
+    ) -> Vec<AgentRecord> {
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(2);
+        let mut records = Vec::new();
+        while !done(&records) && std::time::Instant::now() < deadline {
+            records.extend(ep.read_channels());
+            std::thread::sleep(std::time::Duration::from_millis(1));
+        }
+        records
+    }
+
     #[test]
     fn channel_open_data_close_lifecycle() {
         let base = temp_base();
@@ -2572,9 +2588,14 @@ mod tests {
 
         // Client -> server bytes surface as a Data record.
         client.write_all(b"ssh-agent-request").unwrap();
-        // Give the kernel a moment to deliver on the loopback socket.
-        std::thread::sleep(std::time::Duration::from_millis(20));
-        let data = ep.read_channels();
+        let data_len = |records: &[AgentRecord]| -> usize {
+            records
+                .iter()
+                .filter(|r| r.kind == RecordKind::Data)
+                .map(|r| r.payload.len())
+                .sum()
+        };
+        let data = read_channels_until(&mut ep, |r| data_len(r) >= b"ssh-agent-request".len());
         let joined: Vec<u8> = data
             .iter()
             .filter(|r| r.kind == RecordKind::Data)
@@ -2594,8 +2615,8 @@ mod tests {
 
         // Client closes -> a Close record, and the channel is reaped.
         drop(client);
-        std::thread::sleep(std::time::Duration::from_millis(20));
-        let closes = ep.read_channels();
+        let closes =
+            read_channels_until(&mut ep, |r| r.iter().any(|r| r.kind == RecordKind::Close));
         assert!(closes.iter().any(|r| r.kind == RecordKind::Close));
         assert_eq!(ep.live_channel_count(), 0);
 
