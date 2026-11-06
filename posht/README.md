@@ -22,6 +22,8 @@ go build .          # fast dev-loop; needs Go ≥ 1.25 (the toolchain auto-fetch
 ./posht -o report.md # also write the markdown report to a file
 ./posht --auto      # non-interactive: render the static tests to stdout at a
                     # fixed width and exit (deterministic; for recording diffs)
+./posht --walk      # the same tests, one alt-screen page each, held --hold
+                    # (default 1.5s) apiece (deterministic; for diffing over posh)
 ```
 
 `--auto` skips the interactive walk and renders the selected static capability
@@ -31,6 +33,12 @@ and terminals, recording it over posh vs plain ssh (`just debug-record-posht
 posh|ssh <host> --auto`) gives two frame-aligned `.castx` to diff — isolating
 posh's transport/render from the content. Interactive tests (mouse, keys,
 resize, …) are skipped; they need live input.
+
+Over posh, use `--walk` instead: posh's alt-screen takeover keeps no
+scrollback, so `--auto`'s scrolling dump never shows. `--walk` gives each test
+its own alt-screen page and holds it long enough for posh to sync a frame, so
+`just debug-record-posht posh|ssh <host> --walk` captures can be stepped page
+by page and diffed per test.
 
 Run it three ways and diff the reports: directly in your terminal
 (baseline), inside a local posh session (emulator + replay), and on a

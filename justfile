@@ -1502,8 +1502,11 @@ debug-verify-escape cmd="" esckey="":
 # Run it in the terminal you want to test (e.g. kitty); the session is teed
 # live AND recorded by poshterity. Quit posht normally to finalize the file.
 # Usage: just debug-record-posht posh box   /   just debug-record-posht ssh box
-# Then diff the two .castx (e.g. `poshterity` replay/dump). Debug-only; the
-# hermetic gate is build-rust/build-go.
+# Then diff the two .castx (e.g. `poshterity` replay/dump). For a
+# deterministic, unattended capture pass `--walk`: one alt-screen page per
+# static test, each held long enough for posh to sync it, so the captures
+# step page by page (`poshterity step <file> --by frame`) and diff per test.
+# Debug-only; the hermetic gate is build-rust/build-go.
 #
 # record an interactive posht session over posh or ssh to a .castx
 [group("debug")]

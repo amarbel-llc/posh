@@ -16,6 +16,7 @@ import (
 	"os"
 	"path/filepath"
 	"strings"
+	"time"
 
 	tea "github.com/charmbracelet/bubbletea"
 )
@@ -44,6 +45,10 @@ func main() {
 	auto := flag.Bool("auto", false, "non-interactively render the selected static "+
 		"capability tests to stdout at a fixed width, then exit (deterministic — for "+
 		"posh-vs-ssh recording diffs)")
+	walk := flag.Bool("walk", false, "non-interactively walk the selected static capability "+
+		"tests one alt-screen page each at a fixed width, holding each page for --hold, "+
+		"then exit (deterministic — for posh-vs-ssh diffs page by page)")
+	hold := flag.Duration("hold", walkHold, "how long --walk holds each page")
 	out := flag.String("o", "", "also write the markdown report to this file")
 	jsonOut := flag.String("json", "", "JSON receipt destination: a file path, \"-\" for stdout, "+
 		"or omit for the default ~/.local/log/posht/<datetime>-<term>.json")
@@ -72,6 +77,12 @@ func main() {
 	// a reproducible byte stream to record over posh vs ssh and diff.
 	if *auto {
 		autoRun(tests, autoWidth, os.Stdout)
+		return
+	}
+	// --walk: the same pages, one per alt-screen page with a fixed hold, so a
+	// posh session (whose takeover keeps no scrollback) syncs every one.
+	if *walk {
+		walkRun(tests, autoWidth, *hold, os.Stdout, time.Sleep)
 		return
 	}
 

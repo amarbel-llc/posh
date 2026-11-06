@@ -92,6 +92,8 @@ posht --json -        # machine-readable JSON receipt to stdout
 posht --json out.json # JSON receipt to a named file (prints the path)
 posht --auto          # non-interactive: render the static tests to stdout at a
                       # fixed 80-col width, then exit (deterministic)
+posht --walk          # the same tests, one alt-screen page each, held for
+                      # --hold (default 1.5s) before the next (deterministic)
 ```
 
 `--auto` skips the interactive walk entirely and renders the selected *static*
@@ -102,6 +104,15 @@ posh vs plain ssh (the `debug-record-posht` recipe with `--auto`) yields two
 frame-aligned recordings to diff, isolating posh's transport/render from the
 content. Interactive/stateful tests (mouse, keys, resize, cursor, …) are
 skipped — they need live input and can't self-drive deterministically.
+
+`--auto` does not compose with a posh session: posh takes the outer terminal's
+alt screen over, with no scrollback, so the scrolling dump is lost, and the
+sub-second exit leaves posh sampling a blank frame. `--walk` renders the same
+tests as one alt-screen page each — clear, render the test from home, hold for
+`--hold`, advance — and leaves the alt screen after the last. Each page fits
+one 24-row screen, so nothing scrolls off, and the hold gives posh time to sync
+the page. Recorded over posh and over ssh (`debug-record-posht` with
+`--walk`), each capture can be stepped page by page and diffed per test.
 
 A JSON receipt is always produced. By default it is written to
 `~/.local/log/posht/<datetime>-<terminal>.json` and the **path** is printed to
