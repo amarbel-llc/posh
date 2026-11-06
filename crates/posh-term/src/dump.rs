@@ -264,16 +264,17 @@ impl Terminal {
     ///
     /// - at this height, no scrollback is replayed: the grid is drawn from
     ///   home exactly as when the ring is empty;
-    /// - taller, the newest `2 * mirror_rows` scrollback rows are replayed —
-    ///   deliberately more than the `mirror_rows - self.rows()` the mirror
-    ///   shows. The flow can make fewer lines than rows: a soft-wrapped row
-    ///   followed by an empty unwrapped one shares a line with it (the empty
-    ///   row emits nothing to autowrap onto). Each lost line needs such a
-    ///   pair, so the replay makes at least half as many lines as rows and
-    ///   certainly overfills the mirror; the overflow scrolls off its top and
-    ///   the flow lands at the bottom exactly as `dump_vt`'s does. When the
-    ///   ring holds fewer than `2 * mirror_rows` rows, all of them are
-    ///   replayed, which is `dump_vt`'s bytes.
+    /// - taller, the newest `2 * mirror_rows - self.rows()` scrollback rows
+    ///   are replayed — deliberately more than the `mirror_rows - self.rows()`
+    ///   the mirror shows. The flow can make fewer lines than rows: a
+    ///   soft-wrapped row followed by an empty unwrapped one shares a line
+    ///   with it (the empty row emits nothing to autowrap onto). Each lost
+    ///   line needs such a pair, so the flow — those ring rows plus the
+    ///   grid's own, `2 * mirror_rows` rows in all — makes at least
+    ///   `mirror_rows` lines and certainly fills the mirror; any overflow
+    ///   scrolls off its top and the flow lands at the bottom exactly as
+    ///   `dump_vt`'s does. When the ring holds fewer rows than that, all of
+    ///   them are replayed, which is `dump_vt`'s bytes.
     ///
     /// Either way the dump's size follows the screen instead of the ring —
     /// posh#225, where a 10,000-row ring made every frame ~1 MiB.
@@ -311,7 +312,8 @@ impl Terminal {
         } else if mirror_rows == self.rows() {
             0
         } else {
-            2 * usize::from(mirror_rows)
+            // Taller (bounded), so this cannot underflow.
+            2 * usize::from(mirror_rows) - usize::from(self.rows())
         };
         self.dump_vt_tail(tail)
     }
@@ -1392,8 +1394,36 @@ mod cursor_mismatch_tests {
         assert!(taller.len() < 65_536, "taller-mirror dump was {} bytes", taller.len());
     }
 
-    /// A taller mirror whose over-provisioned replay (`2 * mirror_rows`)
-    /// exceeds what the ring holds: replay what exists, which is all of it.
+    /// A taller mirror replays exactly `2 * mirror_rows - rows` ring rows:
+    /// with the grid's own rows that makes `2 * mirror_rows` rows of flow,
+    /// the least that is certain to fill the mirror (posh#236).
+    #[test]
+    fn mirror_dump_replays_twice_the_mirror_height_less_the_grid() {
+        let t = scrolled(24, 80, 1000, 500);
+        for rows in bounded_heights(&t).into_iter().skip(1) {
+            let tail = 2 * usize::from(rows) - usize::from(t.rows());
+            assert!(t.dump_vt_mirror(rows, 80) == t.dump_vt_tail(tail), "rows={rows}");
+        }
+    }
+
+    /// The worst case for the tight bound: every replayed row is half of a
+    /// soft-wrapped-then-empty pair (posh#229), ring and grid alike, so the
+    /// flow makes only half as many lines as rows. `2 * mirror_rows` rows of
+    /// flow still make `mirror_rows` lines and land at the bottom.
+    #[test]
+    fn mirror_dump_renders_only_empty_continuations_like_the_full_dump() {
+        let mut t = scrolled(24, 80, 1000, 500);
+        for _ in 0..100 {
+            t.process(b"\r\n");
+            t.process(&[b'a'; 81]);
+            t.process(b"\x08 \x08");
+        }
+        assert!(t.screen().row(22).unwrap().wrapped(), "test setup: the grid is all pairs");
+        assert_mirror_renders_like_full(&t, &bounded_heights(&t)[1..]);
+    }
+
+    /// A taller mirror whose replay (`2 * mirror_rows - rows`) exceeds what
+    /// the ring holds: replay what exists, which is all of it.
     #[test]
     fn mirror_dump_clamps_to_the_rows_the_ring_holds() {
         let t = scrolled(24, 80, 1000, 30); // only a handful of rows have scrolled off
@@ -1487,8 +1517,8 @@ mod cursor_mismatch_tests {
     /// margin, and a cursor left mid-line.
     #[test]
     fn mirror_dump_renders_rich_content_like_the_full_dump() {
-        // Deep enough that even the tallest mirror's `2 * mirror_rows` replay
-        // is a strict subset of the ring.
+        // Deep enough that even the tallest mirror's `2 * mirror_rows - rows`
+        // replay is a strict subset of the ring.
         let mut t = Terminal::with_scrollback(24, 80, 1000);
         for i in 0..300 {
             t.process(
@@ -1674,7 +1704,7 @@ mod cursor_mismatch_tests {
     }
 
     /// The empty continuation on taller mirrors. The flow is one line short in
-    /// BOTH dumps; replaying `2 * mirror_rows` rows overfills the mirror, so
+    /// BOTH dumps; replaying `2 * mirror_rows - rows` rows fills the mirror, so
     /// the bounded flow lands at the bottom exactly as the full one does.
     /// (Replaying exactly the height difference did not: it left the mirror
     /// top-aligned over a blank bottom row.)
