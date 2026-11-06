@@ -435,6 +435,38 @@ fn sgr_colon_forms() {
 }
 
 #[test]
+fn rgb_sgr_split_at_every_byte_boundary_leaks_no_params() {
+    // posh#86 probe: a truecolor SGR split across two reads at any byte, or
+    // fed one byte at a time, must be consumed whole -- never print its
+    // `153;153;153m` tail as text (ADR-0003).
+    for (seq, fg) in [
+        (&b"\x1b[38;2;153;153;153m"[..], true),
+        (&b"\x1b[48;2;153;153;153m"[..], false),
+    ] {
+        let check = |t: &Terminal, how: &str| {
+            let text = t.dump_text();
+            assert_eq!(text.trim_end(), "x", "{how}: params leaked: {text:?}");
+            let s = t.screen().cell(0, 0).unwrap().style;
+            let got = if fg { s.fg } else { s.bg };
+            assert_eq!(got, Color::Rgb(153, 153, 153), "{how}");
+        };
+        for at in 1..seq.len() {
+            let mut t = term();
+            t.process(&seq[..at]);
+            t.process(&seq[at..]);
+            t.process(b"x");
+            check(&t, &format!("split at {at}"));
+        }
+        let mut t = term();
+        for b in seq {
+            t.process(&[*b]);
+        }
+        t.process(b"x");
+        check(&t, "byte by byte");
+    }
+}
+
+#[test]
 fn sgr_params_emits_semicolon_color_form() {
     // The renderer serializes cells back to the client through sgr_params;
     // 256-color and truecolor must use the universally-accepted semicolon
