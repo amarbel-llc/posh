@@ -94,10 +94,25 @@ pub fn sgr_params(style: &Style) -> String {
 
 /// Pen state tracked while emitting cells, for minimal transitions.
 /// `style.protected` mirrors the target's DECSCA state, which is toggled
-/// with `CSI " q` (SGR emissions never change it).
+/// with `CSI " q` (SGR emissions never change it). `after_wrap` is set
+/// while the last row emitted was soft-wrapped, i.e. the target sits in
+/// pending-wrap waiting for the next row's first cell to autowrap onto it.
 struct EmitState {
     style: Style,
     hyperlink: u32,
+    after_wrap: bool,
+}
+
+impl EmitState {
+    /// The state of a target that has just been reset: default pen, no open
+    /// hyperlink, not mid-wrap.
+    fn fresh() -> Self {
+        EmitState {
+            style: Style::default(),
+            hyperlink: 0,
+            after_wrap: false,
+        }
+    }
 }
 
 /// Resets the target's **rendering** state to defaults, so a replay onto a
@@ -230,10 +245,7 @@ impl Terminal {
     pub fn dump_scrollback_row(&self, i: usize) -> Option<Vec<u8>> {
         let row = self.primary.scrollback_row(i)?;
         let mut out = String::new();
-        let mut st = EmitState {
-            style: Style::default(),
-            hyperlink: 0,
-        };
+        let mut st = EmitState::fresh();
         self.emit_terminated_row(&mut out, row, &mut st);
         Some(out.into_bytes())
     }
@@ -265,10 +277,7 @@ impl Terminal {
             .filter_map(|r| grid.row(r))
             .map(|row| {
                 let mut out = String::new();
-                let mut st = EmitState {
-                    style: Style::default(),
-                    hyperlink: 0,
-                };
+                let mut st = EmitState::fresh();
                 self.emit_terminated_row(&mut out, row, &mut st);
                 out.into_bytes()
             })
@@ -311,15 +320,14 @@ impl Terminal {
     ///   home exactly as when the ring is empty;
     /// - taller, the newest `2 * mirror_rows - self.rows()` scrollback rows
     ///   are replayed — deliberately more than the `mirror_rows - self.rows()`
-    ///   the mirror shows. The flow can make fewer lines than rows: a
-    ///   soft-wrapped row followed by an empty unwrapped one shares a line
-    ///   with it (the empty row emits nothing to autowrap onto). Each lost
-    ///   line needs such a pair, so the flow — those ring rows plus the
-    ///   grid's own, `2 * mirror_rows` rows in all — makes at least
-    ///   `mirror_rows` lines and certainly fills the mirror; any overflow
-    ///   scrolls off its top and the flow lands at the bottom exactly as
-    ///   `dump_vt`'s does. When the ring holds fewer rows than that, all of
-    ///   them are replayed, which is `dump_vt`'s bytes.
+    ///   the mirror shows. The margin dates from when the flow could make
+    ///   fewer lines than rows, a soft-wrapped row followed by an empty
+    ///   unwrapped one sharing a line (posh#229, since fixed: the flow now
+    ///   makes a line per row). Either way the flow — those ring rows plus
+    ///   the grid's own, `2 * mirror_rows` rows in all — fills the mirror;
+    ///   any overflow scrolls off its top and the flow lands at the bottom
+    ///   exactly as `dump_vt`'s does. When the ring holds fewer rows than
+    ///   that, all of them are replayed, which is `dump_vt`'s bytes.
     ///
     /// Either way the dump's size follows the screen instead of the ring —
     /// posh#225, where a 10,000-row ring made every frame ~1 MiB.
@@ -336,17 +344,6 @@ impl Terminal {
     /// back the same way; that case is not separately demonstrated.) Session
     /// geometry on the frame (RFC 0012) would make every mirror session-sized
     /// and retire the fallback.
-    ///
-    /// Known divergence at the same geometry, where the homed branch taken
-    /// here is right and `dump_vt` is not: a soft-wrapped row — in the grid,
-    /// or the newest ring row — followed by an empty unwrapped grid row loses
-    /// a line in `dump_vt`'s flow: rows at or above the pair land one row
-    /// low, rows below it are placed correctly (posh#229). So when the
-    /// wrapped head is the newest ring row and grid row 0 is its empty
-    /// continuation, only row 0 differs: it shows the head's text instead of
-    /// blank. The homed branch keeps the text and cursor but, as always,
-    /// drops a grid head's soft-wrap flag, which nothing can regenerate by
-    /// replay.
     ///
     /// The returned [`MirrorDump`] carries the shape with the bytes: a
     /// bounded dump is shaped for that mirror size, while the fallback renders
@@ -375,10 +372,7 @@ impl Terminal {
     /// `max_scrollback_rows` rows of the ring; `usize::MAX` is `dump_vt`. Only
     /// [`Terminal::dump_vt_mirror`]'s geometry rule makes a bound safe — the
     /// `a_row_tail_cannot_reproduce_*` tests show where a bare row-difference
-    /// count fails. It also falls short on a same-width TALLER mirror when the
-    /// flow loses lines (posh#229), which is why `dump_vt_mirror`
-    /// over-provisions: see
-    /// `a_row_tail_cannot_reproduce_a_taller_mirror_with_an_empty_continuation`.
+    /// count fails.
     fn dump_vt_tail(&self, max_scrollback_rows: usize) -> Vec<u8> {
         self.dump_vt_impl(false, max_scrollback_rows)
     }
@@ -404,10 +398,7 @@ impl Terminal {
 
     fn dump_vt_impl(&self, flat: bool, max_scrollback_rows: usize) -> Vec<u8> {
         let mut out = String::new();
-        let mut st = EmitState {
-            style: Style::default(),
-            hyperlink: 0,
-        };
+        let mut st = EmitState::fresh();
 
         self.dump_colors(&mut out);
         if !self.title.is_empty() && self.title == self.icon_title {
@@ -453,8 +444,8 @@ impl Terminal {
         // as ONE continuous flow: every soft-wrapped row — including the
         // last scrollback row, whose seam continues into grid row 0 —
         // regenerates its wrap flag by actually autowrapping on the
-        // target (except when the next row prints nothing: nothing
-        // autowraps, and the pair shares a line — posh#229), and the grid
+        // target (when the next row prints nothing, `emit_row` prints a
+        // space for it to autowrap onto — posh#229), and the grid
         // rows printed at the bottom push each scrollback line up into the
         // target's ring (no padding or homing needed). The pen drops to
         // default before each scroll-opening newline because, on a real
@@ -548,10 +539,7 @@ impl Terminal {
     /// insert, autowrap) are emitted.
     pub fn dump_screen_switch(&self) -> Vec<u8> {
         let mut out = String::new();
-        let mut st = EmitState {
-            style: Style::default(),
-            hyperlink: 0,
-        };
+        let mut st = EmitState::fresh();
         // Hide the cursor for the repaint, and normalize the target to a
         // drawable state: full-screen region, absolute addressing, ASCII
         // G0 shifted in, replace mode, autowrap on (draw_grid regenerates
@@ -712,6 +700,7 @@ impl Terminal {
     /// bug). Self-enforcing the precondition makes that bug class unreachable.
     fn draw_grid(&self, out: &mut String, grid: &Screen, st: &mut EmitState) {
         out.push_str("\x1b[H");
+        st.after_wrap = false;
         for r in 0..grid.rows() {
             let row = grid.row(r).unwrap();
             self.emit_row(out, row, st);
@@ -724,6 +713,13 @@ impl Terminal {
     /// Emits one row's cells with minimal SGR/hyperlink transitions.
     /// Wrapped rows print every cell (they are full width by
     /// construction); otherwise trailing skippable cells are dropped.
+    ///
+    /// A row that prints nothing right after a soft-wrapped one still prints
+    /// one default-pen space: the wrapped row left the target in pending-wrap,
+    /// and with nothing to autowrap onto, the `\r\n` ending this row would
+    /// cancel the wrap and put both rows on ONE line, displacing every row
+    /// after them (posh#229). The space is a skippable cell, as the row's own
+    /// are, and autowrapping onto it regenerates the head's wrap flag too.
     fn emit_row(&self, out: &mut String, row: &Row, st: &mut EmitState) {
         if let Some(mark) = row.mark() {
             let m = match mark {
@@ -744,6 +740,11 @@ impl Terminal {
                 .map(|i| i + 1)
                 .unwrap_or(0)
         };
+        if end == 0 && st.after_wrap {
+            self.reset_pen(out, st);
+            out.push(' ');
+        }
+        st.after_wrap = row.wrapped();
         for cell in &cells[..end] {
             if cell.width == 0 {
                 continue; // wide spacer
@@ -1488,8 +1489,8 @@ mod cursor_mismatch_tests {
     }
 
     /// A taller mirror replays exactly `2 * mirror_rows - rows` ring rows:
-    /// with the grid's own rows that makes `2 * mirror_rows` rows of flow,
-    /// the least that is certain to fill the mirror (posh#236).
+    /// with the grid's own rows that makes `2 * mirror_rows` rows of flow
+    /// (posh#236).
     #[test]
     fn mirror_dump_replays_twice_the_mirror_height_less_the_grid() {
         let t = scrolled(24, 80, 1000, 500);
@@ -1499,10 +1500,9 @@ mod cursor_mismatch_tests {
         }
     }
 
-    /// The worst case for the tight bound: every replayed row is half of a
-    /// soft-wrapped-then-empty pair (posh#229), ring and grid alike, so the
-    /// flow makes only half as many lines as rows. `2 * mirror_rows` rows of
-    /// flow still make `mirror_rows` lines and land at the bottom.
+    /// Every replayed row half of a soft-wrapped-then-empty pair, ring and
+    /// grid alike: the case that, before posh#229, made the flow only half
+    /// as many lines as rows.
     #[test]
     fn mirror_dump_renders_only_empty_continuations_like_the_full_dump() {
         let mut t = scrolled(24, 80, 1000, 500);
@@ -1590,19 +1590,18 @@ mod cursor_mismatch_tests {
         assert_eq!(backgrounds(&row_tail), backgrounds(&full));
     }
 
-    /// Why `dump_vt_mirror` over-provisions a TALLER same-width mirror: an
-    /// empty continuation costs the flow a line (posh#229), so a row tail of
-    /// exactly `mirror_rows - rows` leaves the mirror one line short. It does
-    /// not scroll, and sits top-aligned over a blank bottom row while
-    /// `dump_vt`'s flow lands at the bottom.
+    /// An empty continuation no longer costs the flow a line (posh#229), so a
+    /// row tail of exactly `mirror_rows - rows` fills a TALLER same-width
+    /// mirror and lands where `dump_vt`'s flow does — the pair on its own two
+    /// rows at the bottom.
     #[test]
-    fn a_row_tail_cannot_reproduce_a_taller_mirror_with_an_empty_continuation() {
+    fn a_row_tail_reproduces_a_taller_mirror_with_an_empty_continuation() {
         let t = empty_continuation_session();
         let row_tail = rows_text(&mirror(32, 80, &t.dump_vt_tail(8)));
         let full = rows_text(&mirror(32, 80, &t.dump_vt()));
         let wrapped = "a".repeat(80);
-        assert_eq!(full[30..], ["prompt$", wrapped.as_str()]);
-        assert_eq!(row_tail[29..], ["prompt$", wrapped.as_str(), ""]);
+        assert_eq!(full[29..], ["prompt$", wrapped.as_str(), ""]);
+        assert_eq!(row_tail, full);
     }
 
     /// Soft wraps (one straddling the scrollback/grid seam, one inside the
@@ -1755,9 +1754,8 @@ mod cursor_mismatch_tests {
 
     /// A command that wrapped by one character and was backspaced over: the
     /// head is a soft-wrapped grid row (22) followed by an EMPTY unwrapped
-    /// row (23) holding the cursor. In a replay flow that pair shares a line
-    /// — the empty row emits nothing to autowrap onto — so the flow makes one
-    /// line fewer than it has rows (posh#229).
+    /// row (23) holding the cursor. The empty row has nothing of its own to
+    /// autowrap onto; replayed naively the pair shares a line (posh#229).
     fn empty_continuation_session() -> Terminal {
         let mut t = scrolled(24, 80, 1000, 500);
         t.process(b"\r\n");
@@ -1769,41 +1767,46 @@ mod cursor_mismatch_tests {
         t
     }
 
-    /// The empty continuation at the source geometry. Equality with `dump_vt`
-    /// is deliberately NOT asserted: `dump_vt`'s flow loses a line on the pair
-    /// and lands the rows at or above it one row low — here every grid row,
-    /// because this fixture's pair is the bottom rows 22/23 — while the homed
-    /// grid places from the top and is faithful in text and cursor (posh#229).
+    /// The empty continuation at the source geometry: the homed grid is
+    /// faithful in text and cursor, and the space it prints onto the empty
+    /// row regenerates the head's soft-wrap flag (posh#229).
     #[test]
     fn mirror_dump_reproduces_an_empty_continuation_at_the_same_geometry() {
         let t = empty_continuation_session();
         let m = mirror(24, 80, t.dump_vt_mirror(24, 80).bytes());
         assert_eq!(m.cursor(), t.cursor());
         assert_eq!(rows_text(&m), rows_text(&t));
-        // The one known difference: a soft-wrap flag whose continuation row
-        // prints nothing cannot be regenerated by replaying rows — nothing
-        // autowraps onto the empty row. The homed grid has always lost it
-        // whenever the ring is empty; it does not change what is displayed.
-        // posh#229 is the same root cause in the flow branch, where it costs
-        // a whole line.
         assert!(t.screen().row(22).unwrap().wrapped());
-        assert!(!m.screen().row(22).unwrap().wrapped());
+        assert!(m.screen().row(22).unwrap().wrapped());
     }
 
-    /// The empty continuation on taller mirrors. The flow is one line short in
-    /// BOTH dumps; replaying `2 * mirror_rows - rows` rows fills the mirror, so
-    /// the bounded flow lands at the bottom exactly as the full one does.
-    /// (Replaying exactly the height difference did not: it left the mirror
-    /// top-aligned over a blank bottom row.)
+    /// The pair in the MIDDLE of the grid, rows below it: the homed grid
+    /// draws through it, so a pair sharing a line there landed every row
+    /// below it one row high (posh#229).
+    #[test]
+    fn mirror_dump_reproduces_a_mid_grid_empty_continuation_at_the_same_geometry() {
+        let mut t = empty_continuation_session();
+        t.process(b"\r\n");
+        for i in 0..5 {
+            t.process(format!("below {i}\r\n").as_bytes());
+        }
+        t.process(b"prompt$ ");
+        assert!(t.screen().row(16).unwrap().wrapped(), "test setup: the head is mid-grid");
+        assert_eq!(rows_text(&t)[17], "", "test setup: the continuation follows it");
+        let m = mirror(24, 80, t.dump_vt_mirror(24, 80).bytes());
+        assert_eq!(m.cursor(), t.cursor());
+        assert_eq!(rows_text(&m), rows_text(&t));
+    }
+
+    /// The empty continuation on taller mirrors: bounded == full.
     #[test]
     fn mirror_dump_renders_an_empty_continuation_like_the_full_dump_on_a_taller_mirror() {
         let t = empty_continuation_session();
         assert_mirror_renders_like_full(&t, &bounded_heights(&t)[1..]);
     }
 
-    /// Empty-continuation pairs INSIDE the replayed ring window, each losing
-    /// a line in both flows: over-provisioning must still land the bounded
-    /// flow exactly where the full one lands.
+    /// Empty-continuation pairs INSIDE the replayed ring window: the bounded
+    /// flow still lands exactly where the full one lands.
     #[test]
     fn mirror_dump_renders_empty_continuations_in_the_ring_like_the_full_dump() {
         let mut t = scrolled(24, 80, 1000, 500);
@@ -1818,10 +1821,10 @@ mod cursor_mismatch_tests {
         assert_mirror_renders_like_full(&t, &bounded_heights(&t)[1..]);
     }
 
-    /// The correct behaviour `dump_vt` should have with an empty
-    /// continuation in the grid.
+    /// `dump_vt` keeps every row with an empty continuation in the grid: the
+    /// pair no longer shares a line in the flow, which used to land the whole
+    /// grid one row low here (posh#229).
     #[test]
-    #[ignore = "posh#229: dump_vt's flow loses a line on a wrapped row followed by an empty one"]
     fn full_dump_reproduces_an_empty_continuation_at_the_same_height() {
         let t = empty_continuation_session();
         let m = mirror(24, 80, &t.dump_vt());
@@ -1866,11 +1869,9 @@ mod cursor_mismatch_tests {
         assert_mirror_renders_like_full(&t, &bounded_heights(&t)[1..]);
     }
 
-    /// The correct behaviour `dump_vt` should have for the seam variant: grid
-    /// row 0 stays blank. (Rows below the pair are placed correctly; only
-    /// row 0, which shares the head's line, differs.)
+    /// `dump_vt` for the seam variant: grid row 0 stays blank instead of
+    /// sharing the newest ring row's line and showing its text (posh#229).
     #[test]
-    #[ignore = "posh#229: dump_vt's flow loses a line on a wrapped row followed by an empty one"]
     fn full_dump_reproduces_a_seam_empty_continuation_at_the_same_height() {
         let t = seam_empty_continuation_session();
         let m = mirror(24, 80, &t.dump_vt());
