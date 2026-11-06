@@ -174,12 +174,21 @@ agent:
   |---|---|---|
   | `SSH_AGENTC_SIGN_REQUEST` | `<host> SIGNED with your forwarded ssh key` | **none — every signature is announced** |
   | `SSH_AGENTC_REQUEST_IDENTITIES` | `<host> listed your forwarded ssh keys` | one per minute |
+  | `SSH_AGENTC_ADD_IDENTITY`, `_ADD_ID_CONSTRAINED` | `<host> ADDED a key to your ssh agent` | **none** |
+  | `SSH_AGENTC_REMOVE_IDENTITY` | `<host> REMOVED a key from your ssh agent` | **none** |
+  | `SSH_AGENTC_REMOVE_ALL_IDENTITIES` | `<host> REMOVED ALL keys from your ssh agent` | **none** |
+  | `SSH_AGENTC_ADD_SMARTCARD_KEY`, `_CONSTRAINED` | `<host> ADDED smartcard keys to your ssh agent` | **none** |
+  | `SSH_AGENTC_REMOVE_SMARTCARD_KEY` | `<host> REMOVED smartcard keys from your ssh agent` | **none** |
+  | `SSH_AGENTC_LOCK` / `_UNLOCK` | `<host> LOCKED` / `UNLOCKED your ssh agent` | **none** |
+  | `SSH_AGENTC_EXTENSION` | `<host> sent an ssh-agent extension request — this may modify your agent` | **none** |
   | anything else | `<host> made an unrecognised ssh-agent request (type N) — this may modify your agent` | **none** |
 
-  The unrecognised case is announced rather than folded in with listings
-  because the request types posh does not name include ones that *mutate*
-  the local agent — add/remove identity, remove-all, lock/unlock. Calling a
-  key deletion "listed your keys" would understate it as a passive read.
+  Everything but a listing is announced, never folded in with listings,
+  because those request types *mutate* the local agent (or, for an
+  extension or an unnamed type, may). Calling a key deletion "listed your
+  keys" would understate it as a passive read, and since posh#148 the
+  mutating types are named (numbers per draft-miller-ssh-agent) so a wipe
+  reads as one rather than as "type 19".
   Announcing every one is affordable precisely because ordinary traffic is
   only listings and signatures, so it is rare by construction; and if it
   stops being rare, that is itself worth seeing.

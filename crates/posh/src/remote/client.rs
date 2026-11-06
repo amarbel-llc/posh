@@ -2982,8 +2982,9 @@ fn handle_agent_instruction(
 fn surface_agent_ops(st: &mut ClientState, mut ops: Vec<crate::remote::agent::AgentOp>) {
     ops.sort_by_key(|op| match op {
         crate::remote::agent::AgentOp::ListKeys => 0,
-        crate::remote::agent::AgentOp::Other(_) => 1,
         crate::remote::agent::AgentOp::Sign => 2,
+        // Mutations, extensions, and unnamed types: between the two.
+        _ => 1,
     });
     for op in ops {
         if let Some(notice) = st.agent_notice.as_mut() {

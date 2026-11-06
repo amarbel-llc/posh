@@ -1759,6 +1759,19 @@ const AGENTC_REQUEST_IDENTITIES: u8 = 11;
 /// `SSH_AGENTC_SIGN_REQUEST` — the private key is actually being USED. This is
 /// the event worth interrupting the user for.
 const AGENTC_SIGN_REQUEST: u8 = 13;
+// The request types that change the user's local agent (posh#148), numbered
+// per draft-miller-ssh-agent §5.1. The `_CONSTRAINED` adds differ only in
+// carrying lifetime/confirm constraints, so each shares its plain twin's op.
+const AGENTC_ADD_IDENTITY: u8 = 17;
+const AGENTC_REMOVE_IDENTITY: u8 = 18;
+const AGENTC_REMOVE_ALL_IDENTITIES: u8 = 19;
+const AGENTC_ADD_SMARTCARD_KEY: u8 = 20;
+const AGENTC_REMOVE_SMARTCARD_KEY: u8 = 21;
+const AGENTC_LOCK: u8 = 22;
+const AGENTC_UNLOCK: u8 = 23;
+const AGENTC_ADD_ID_CONSTRAINED: u8 = 25;
+const AGENTC_ADD_SMARTCARD_KEY_CONSTRAINED: u8 = 26;
+const AGENTC_EXTENSION: u8 = 27;
 /// Bytes needed to classify: the 4-byte length prefix plus the type byte.
 const AGENT_REQUEST_HEADER: usize = 5;
 
@@ -1769,8 +1782,44 @@ pub enum AgentOp {
     ListKeys,
     /// Sign with a private key — a real use of the user's credential.
     Sign,
-    /// Anything else in the agent protocol (add/remove/lock/extension).
+    /// Add a private key (constrained or not).
+    AddKey,
+    /// Remove one key.
+    RemoveKey,
+    /// Remove every key — the agent is left empty.
+    RemoveAllKeys,
+    /// Add keys from a smartcard/PKCS#11 provider (constrained or not).
+    AddSmartcardKey,
+    /// Remove a smartcard/PKCS#11 provider's keys.
+    RemoveSmartcardKey,
+    /// Lock the agent with a passphrase.
+    Lock,
+    /// Unlock a locked agent.
+    Unlock,
+    /// A vendor extension (`name@domain`); may do anything.
+    Extension,
+    /// Any request type posh does not name.
     Other(u8),
+}
+
+impl AgentOp {
+    fn classify(kind: u8) -> AgentOp {
+        match kind {
+            AGENTC_REQUEST_IDENTITIES => AgentOp::ListKeys,
+            AGENTC_SIGN_REQUEST => AgentOp::Sign,
+            AGENTC_ADD_IDENTITY | AGENTC_ADD_ID_CONSTRAINED => AgentOp::AddKey,
+            AGENTC_REMOVE_IDENTITY => AgentOp::RemoveKey,
+            AGENTC_REMOVE_ALL_IDENTITIES => AgentOp::RemoveAllKeys,
+            AGENTC_ADD_SMARTCARD_KEY | AGENTC_ADD_SMARTCARD_KEY_CONSTRAINED => {
+                AgentOp::AddSmartcardKey
+            }
+            AGENTC_REMOVE_SMARTCARD_KEY => AgentOp::RemoveSmartcardKey,
+            AGENTC_LOCK => AgentOp::Lock,
+            AGENTC_UNLOCK => AgentOp::Unlock,
+            AGENTC_EXTENSION => AgentOp::Extension,
+            other => AgentOp::Other(other),
+        }
+    }
 }
 
 /// Classifies EVERY request on one agent channel.
@@ -1825,11 +1874,7 @@ impl OpSniffer {
             // `len` covers the type byte plus the body; a zero length is
             // malformed, and saturating keeps it from wrapping into a huge skip.
             self.skip = (len as u64).saturating_sub(1);
-            out.push(match kind {
-                AGENTC_REQUEST_IDENTITIES => AgentOp::ListKeys,
-                AGENTC_SIGN_REQUEST => AgentOp::Sign,
-                other => AgentOp::Other(other),
-            });
+            out.push(AgentOp::classify(kind));
         }
         out
     }
@@ -1895,22 +1940,36 @@ impl AgentNotice {
         if self.silenced {
             return None;
         }
+        let host = &self.host;
         match op {
             // Never rate-limited: each signature is a distinct use of a key. If
             // something signs in a loop, the user especially wants to know.
-            AgentOp::Sign => Some(format!("{} SIGNED with your forwarded ssh key", self.host)),
-            // Also never rate-limited, and never described as a listing. The
-            // request types posh does not name include ones that MUTATE the
-            // local agent — add/remove identity, remove-all, lock/unlock — which
-            // are more notable than a listing, not less. Reporting them as "listed
-            // your keys" would understate a key deletion. Announcing every one is
-            // affordable precisely because ordinary traffic is only listings and
-            // signatures, so this is rare by construction; and if it stops being
-            // rare, that is itself worth seeing.
+            AgentOp::Sign => Some(format!("{host} SIGNED with your forwarded ssh key")),
+            // Also never rate-limited, and never described as a listing: these
+            // MUTATE the local agent (or, for an extension or an unnamed type,
+            // may), which is more notable than a listing, not less. Announcing
+            // every one is affordable precisely because ordinary traffic is only
+            // listings and signatures, so this is rare by construction; and if
+            // it stops being rare, that is itself worth seeing.
+            AgentOp::AddKey => Some(format!("{host} ADDED a key to your ssh agent")),
+            AgentOp::RemoveKey => Some(format!("{host} REMOVED a key from your ssh agent")),
+            AgentOp::RemoveAllKeys => {
+                Some(format!("{host} REMOVED ALL keys from your ssh agent"))
+            }
+            AgentOp::AddSmartcardKey => {
+                Some(format!("{host} ADDED smartcard keys to your ssh agent"))
+            }
+            AgentOp::RemoveSmartcardKey => {
+                Some(format!("{host} REMOVED smartcard keys from your ssh agent"))
+            }
+            AgentOp::Lock => Some(format!("{host} LOCKED your ssh agent")),
+            AgentOp::Unlock => Some(format!("{host} UNLOCKED your ssh agent")),
+            AgentOp::Extension => Some(format!(
+                "{host} sent an ssh-agent extension request — this may modify your agent"
+            )),
             AgentOp::Other(kind) => Some(format!(
-                "{} made an unrecognised ssh-agent request (type {kind}) — \
-                 this may modify your agent",
-                self.host
+                "{host} made an unrecognised ssh-agent request (type {kind}) — \
+                 this may modify your agent"
             )),
             AgentOp::ListKeys => {
                 let due = match self.last_shown {
@@ -4083,17 +4142,65 @@ mod tests {
     fn an_unrecognised_request_is_not_reported_as_a_listing() {
         let mut n = AgentNotice::new(false, "box");
         let msg = n
-            .on_request(AgentOp::Other(19), 0)
+            .on_request(AgentOp::Other(200), 0)
             .expect("an unrecognised request is always announced");
         assert!(
             !msg.contains("listed"),
             "must not claim it was a listing: {msg}"
         );
-        assert!(msg.contains("19"), "names the type so it can be looked up: {msg}");
+        assert!(msg.contains("200"), "names the type so it can be looked up: {msg}");
         assert!(msg.contains("box"), "names the host: {msg}");
         // Not rate-limited: a possible agent mutation is not something to drop
         // on the floor because a listing happened in the same minute.
-        assert!(n.on_request(AgentOp::Other(19), 1).is_some());
+        assert!(n.on_request(AgentOp::Other(200), 1).is_some());
+    }
+
+    // posh#148: the mutating request types are named, so a remote clearing
+    // the agent reads as exactly that rather than "type 19". Numbers per
+    // draft-miller-ssh-agent §5.1 (OpenSSH authfd.h agrees).
+    #[test]
+    fn op_sniffer_names_the_mutating_request_types() {
+        let classify = |t: u8| OpSniffer::new().push(&[0, 0, 0, 1, t]);
+        for (kind, op) in [
+            (17, AgentOp::AddKey),
+            (25, AgentOp::AddKey),
+            (18, AgentOp::RemoveKey),
+            (19, AgentOp::RemoveAllKeys),
+            (20, AgentOp::AddSmartcardKey),
+            (26, AgentOp::AddSmartcardKey),
+            (21, AgentOp::RemoveSmartcardKey),
+            (22, AgentOp::Lock),
+            (23, AgentOp::Unlock),
+            (27, AgentOp::Extension),
+        ] {
+            assert_eq!(classify(kind), vec![op], "type {kind}");
+        }
+    }
+
+    #[test]
+    fn mutating_requests_get_distinct_never_rate_limited_notices() {
+        let mut n = AgentNotice::new(false, "box");
+        let ops = [
+            AgentOp::AddKey,
+            AgentOp::RemoveKey,
+            AgentOp::RemoveAllKeys,
+            AgentOp::AddSmartcardKey,
+            AgentOp::RemoveSmartcardKey,
+            AgentOp::Lock,
+            AgentOp::Unlock,
+            AgentOp::Extension,
+        ];
+        let mut seen = std::collections::HashSet::new();
+        for op in ops {
+            let msg = n.on_request(op, 0).expect("always announced");
+            assert!(msg.contains("box"), "names the host: {msg}");
+            assert!(!msg.contains("listed"), "{op:?}: {msg}");
+            assert!(!msg.contains("unrecognised"), "{op:?} is named: {msg}");
+            assert!(n.on_request(op, 1).is_some(), "{op:?} is not rate-limited");
+            assert!(seen.insert(msg.clone()), "{op:?} shares a notice: {msg}");
+        }
+        let wipe = n.on_request(AgentOp::RemoveAllKeys, 2).unwrap();
+        assert!(wipe.contains("ALL"), "a wipe reads as one: {wipe}");
     }
 
     // Per ADR-0003 the 5-byte header may arrive split across records.
