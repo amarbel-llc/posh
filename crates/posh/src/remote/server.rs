@@ -3334,6 +3334,78 @@ mod tests {
         );
     }
 
+    /// The client end of a loopback transport test (posh#232): fragments and
+    /// sends wire instructions, and drains the socket into reassembled
+    /// ones. `enveloped` seals every `ClientMessage` onto the session channel
+    /// and opens every `ServerFrame` off it (RFC 0011).
+    struct LoopbackPeer {
+        conn: Connection,
+        fragmenter: Fragmenter,
+        assembly: FragmentAssembly,
+        enveloped: bool,
+    }
+
+    impl LoopbackPeer {
+        fn connect(port: u16, key: &Key, enveloped: bool) -> Self {
+            let addr = format!("127.0.0.1:{port}").parse().unwrap();
+            LoopbackPeer {
+                conn: Connection::client(addr, key).unwrap(),
+                fragmenter: Fragmenter::new(),
+                assembly: FragmentAssembly::new(),
+                enveloped,
+            }
+        }
+
+        /// Fragments `wire` verbatim (no sealing) and sends every fragment.
+        fn send_wire(&mut self, wire: &[u8]) -> Result<()> {
+            for frag in self.fragmenter.make_fragments(wire, sync::FRAGMENT_CONTENTS_MAX) {
+                self.conn.send(&frag.to_bytes())?;
+            }
+            Ok(())
+        }
+
+        fn send(&mut self, msg: &ClientMessage) -> Result<()> {
+            let encoded = msg.encode();
+            let wire = channel::seal_instruction(self.enveloped, &encoded);
+            self.send_wire(&wire)
+        }
+
+        /// Every instruction reassembled from what the socket holds now;
+        /// returns once it runs dry.
+        fn recv_instructions(&mut self) -> Vec<Vec<u8>> {
+            let mut out = Vec::new();
+            loop {
+                match self.conn.recv() {
+                    Ok(Some(payload)) => {
+                        let Ok(frag) = sync::Fragment::from_bytes(&payload) else {
+                            continue;
+                        };
+                        if let Some(assembled) = self.assembly.add(frag) {
+                            out.push(assembled);
+                        }
+                    }
+                    Ok(None) => continue,
+                    Err(_) => break, // WouldBlock (dry), or a socket error
+                }
+            }
+            out
+        }
+
+        /// [`Self::recv_instructions`], decoded as `ServerFrame`s (opened
+        /// off the session channel when enveloped); undecodable ones are
+        /// skipped.
+        fn recv_frames(&mut self) -> Vec<ServerFrame> {
+            let enveloped = self.enveloped;
+            self.recv_instructions()
+                .iter()
+                .filter_map(|assembled| {
+                    let message = channel::open_instruction(enveloped, assembled)?;
+                    ServerFrame::decode(message).ok()
+                })
+                .collect()
+        }
+    }
+
     /// Drives a real server_loop over loopback UDP: the PTY runs a shell
     /// that reads one line and exits, so a single test covers input
     /// delivery+ack, the echo ack, frame flow, and the shutdown handshake.
@@ -3346,10 +3418,7 @@ mod tests {
         util::set_nonblocking(child.master).unwrap();
         let server = std::thread::spawn(move || server_loop(server_conn, child, 24, 80, None, false));
 
-        let addr = format!("127.0.0.1:{port}").parse().unwrap();
-        let mut conn = Connection::client(addr, &key).unwrap();
-        let mut fragmenter = Fragmenter::new();
-        let mut assembly = FragmentAssembly::new();
+        let mut peer = LoopbackPeer::connect(port, &key, false);
         let mut outbox = InputOutbox::new();
         outbox.push(b"hello\n");
 
@@ -3368,35 +3437,17 @@ mod tests {
                 input_base: outbox.base(),
                 input: outbox.pending().to_vec(),
             };
-            for frag in fragmenter.make_fragments(&msg.encode(), sync::FRAGMENT_CONTENTS_MAX) {
-                conn.send(&frag.to_bytes()).unwrap();
-            }
+            peer.send(&msg).unwrap();
             if saw_shutdown && acked_frame > 0 && echo_acked == 6 {
                 break; // shutdown frame acked in the message just sent
             }
             std::thread::sleep(std::time::Duration::from_millis(50));
-            loop {
-                match conn.recv() {
-                    Ok(Some(payload)) => {
-                        let Ok(frag) = sync::Fragment::from_bytes(&payload) else {
-                            continue;
-                        };
-                        let Some(assembled) = assembly.add(frag) else {
-                            continue;
-                        };
-                        let Ok(frame) = ServerFrame::decode(&assembled) else {
-                            continue;
-                        };
-                        acked_frame = acked_frame.max(frame.frame_num);
-                        input_acked = input_acked.max(frame.input_ack);
-                        echo_acked = echo_acked.max(frame.echo_ack);
-                        if frame.flags & sync::FLAG_SHUTDOWN != 0 {
-                            saw_shutdown = true;
-                        }
-                    }
-                    Ok(None) => continue,
-                    Err(e) if e.kind() == std::io::ErrorKind::WouldBlock => break,
-                    Err(_) => break,
+            for frame in peer.recv_frames() {
+                acked_frame = acked_frame.max(frame.frame_num);
+                input_acked = input_acked.max(frame.input_ack);
+                echo_acked = echo_acked.max(frame.echo_ack);
+                if frame.flags & sync::FLAG_SHUTDOWN != 0 {
+                    saw_shutdown = true;
                 }
             }
         }
@@ -3421,7 +3472,6 @@ mod tests {
         preamble_wire: &[Vec<u8>],
         agent: Option<crate::remote::agent::AgentEndpoint>,
     ) -> (bool, u64, u64, Vec<u8>) {
-        use crate::remote::channel;
         let key = Key::random();
         let (server_conn, port) = Connection::server((62100, 62199), &key, Family::Inet).unwrap();
         let cmd: Vec<String> = vec!["/bin/sh".into(), "-c".into(), "read x; exit 0".into()];
@@ -3430,17 +3480,12 @@ mod tests {
         let server =
             std::thread::spawn(move || server_loop(server_conn, child, 24, 80, agent, true));
 
-        let addr = format!("127.0.0.1:{port}").parse().unwrap();
-        let mut conn = Connection::client(addr, &key).unwrap();
-        let mut fragmenter = Fragmenter::new();
-        let mut assembly = FragmentAssembly::new();
+        let mut peer = LoopbackPeer::connect(port, &key, true);
         let mut outbox = InputOutbox::new();
         outbox.push(b"hello\n");
 
         for wire in preamble_wire {
-            for frag in fragmenter.make_fragments(wire, sync::FRAGMENT_CONTENTS_MAX) {
-                conn.send(&frag.to_bytes()).unwrap();
-            }
+            peer.send_wire(wire).unwrap();
         }
 
         let mut acked_frame = 0u64;
@@ -3459,45 +3504,22 @@ mod tests {
                 input_base: outbox.base(),
                 input: outbox.pending().to_vec(),
             };
-            let encoded = msg.encode();
-            let wire = channel::seal_instruction(true, &encoded);
-            for frag in fragmenter.make_fragments(&wire, sync::FRAGMENT_CONTENTS_MAX) {
-                conn.send(&frag.to_bytes()).unwrap();
-            }
+            peer.send(&msg).unwrap();
             if saw_shutdown && acked_frame > 0 && echo_acked == 6 {
                 break; // shutdown frame acked in the message just sent
             }
             std::thread::sleep(std::time::Duration::from_millis(50));
-            loop {
-                match conn.recv() {
-                    Ok(Some(payload)) => {
-                        let Ok(frag) = sync::Fragment::from_bytes(&payload) else {
-                            continue;
-                        };
-                        let Some(assembled) = assembly.add(frag) else {
-                            continue;
-                        };
-                        let Some(message) = channel::open_instruction(true, &assembled) else {
-                            continue;
-                        };
-                        let Ok(frame) = ServerFrame::decode(message) else {
-                            continue;
-                        };
-                        for cap in &frame.caps {
-                            if !seen_cap_ids.contains(&cap.id) {
-                                seen_cap_ids.push(cap.id);
-                            }
-                        }
-                        acked_frame = acked_frame.max(frame.frame_num);
-                        input_acked = input_acked.max(frame.input_ack);
-                        echo_acked = echo_acked.max(frame.echo_ack);
-                        if frame.flags & sync::FLAG_SHUTDOWN != 0 {
-                            saw_shutdown = true;
-                        }
+            for frame in peer.recv_frames() {
+                for cap in &frame.caps {
+                    if !seen_cap_ids.contains(&cap.id) {
+                        seen_cap_ids.push(cap.id);
                     }
-                    Ok(None) => continue,
-                    Err(e) if e.kind() == std::io::ErrorKind::WouldBlock => break,
-                    Err(_) => break,
+                }
+                acked_frame = acked_frame.max(frame.frame_num);
+                input_acked = input_acked.max(frame.input_ack);
+                echo_acked = echo_acked.max(frame.echo_ack);
+                if frame.flags & sync::FLAG_SHUTDOWN != 0 {
+                    saw_shutdown = true;
                 }
             }
         }
@@ -3608,10 +3630,7 @@ mod tests {
         util::set_nonblocking(child.master).unwrap();
         let server = std::thread::spawn(move || server_loop(server_conn, child, 24, 80, None, false));
 
-        let addr = format!("127.0.0.1:{port}").parse().unwrap();
-        let mut conn = Connection::client(addr, &key).unwrap();
-        let mut fragmenter = Fragmenter::new();
-        let mut assembly = FragmentAssembly::new();
+        let mut peer = LoopbackPeer::connect(port, &key, false);
 
         let mut acked_frame = 0u64;
         let mut saw_shutdown = false;
@@ -3626,33 +3645,15 @@ mod tests {
                 input_base: 0,
                 input: Vec::new(),
             };
-            for frag in fragmenter.make_fragments(&msg.encode(), sync::FRAGMENT_CONTENTS_MAX) {
-                conn.send(&frag.to_bytes()).unwrap();
-            }
+            peer.send(&msg).unwrap();
             if saw_shutdown && acked_frame > 0 {
                 break;
             }
             std::thread::sleep(std::time::Duration::from_millis(50));
-            loop {
-                match conn.recv() {
-                    Ok(Some(payload)) => {
-                        let Ok(frag) = sync::Fragment::from_bytes(&payload) else {
-                            continue;
-                        };
-                        let Some(assembled) = assembly.add(frag) else {
-                            continue;
-                        };
-                        let Ok(frame) = ServerFrame::decode(&assembled) else {
-                            continue;
-                        };
-                        acked_frame = acked_frame.max(frame.frame_num);
-                        if frame.flags & sync::FLAG_SHUTDOWN != 0 {
-                            saw_shutdown = true;
-                        }
-                    }
-                    Ok(None) => continue,
-                    Err(e) if e.kind() == std::io::ErrorKind::WouldBlock => break,
-                    Err(_) => break,
+            for frame in peer.recv_frames() {
+                acked_frame = acked_frame.max(frame.frame_num);
+                if frame.flags & sync::FLAG_SHUTDOWN != 0 {
+                    saw_shutdown = true;
                 }
             }
         }
@@ -3731,10 +3732,7 @@ mod tests {
         util::set_nonblocking(child.master).unwrap();
         let server = std::thread::spawn(move || server_loop(server_conn, child, 24, 80, None, false));
 
-        let addr = format!("127.0.0.1:{port}").parse().unwrap();
-        let mut conn = Connection::client(addr, &key).unwrap();
-        let mut fragmenter = Fragmenter::new();
-        let mut assembly = FragmentAssembly::new();
+        let mut peer = LoopbackPeer::connect(port, &key, false);
         let mut outbox = InputOutbox::new();
 
         let mut acked_frame = 0u64;
@@ -3761,38 +3759,20 @@ mod tests {
                 input_base: outbox.base(),
                 input: outbox.pending().to_vec(),
             };
-            for frag in fragmenter.make_fragments(&msg.encode(), sync::FRAGMENT_CONTENTS_MAX) {
-                conn.send(&frag.to_bytes()).unwrap();
-            }
+            peer.send(&msg).unwrap();
             if saw_shutdown && acked_frame > 0 {
                 break;
             }
             std::thread::sleep(std::time::Duration::from_millis(50));
-            loop {
-                match conn.recv() {
-                    Ok(Some(payload)) => {
-                        let Ok(frag) = sync::Fragment::from_bytes(&payload) else {
-                            continue;
-                        };
-                        let Some(assembled) = assembly.add(frag) else {
-                            continue;
-                        };
-                        let Ok(frame) = ServerFrame::decode(&assembled) else {
-                            continue;
-                        };
-                        acked_frame = acked_frame.max(frame.frame_num);
-                        if frame.flags & sync::FLAG_OVERLAY != 0 {
-                            saw_overlay = true;
-                        } else if saw_overlay {
-                            overlay_cleared = true; // overlay shell exited
-                        }
-                        if frame.flags & sync::FLAG_SHUTDOWN != 0 {
-                            saw_shutdown = true;
-                        }
-                    }
-                    Ok(None) => continue,
-                    Err(e) if e.kind() == std::io::ErrorKind::WouldBlock => break,
-                    Err(_) => break,
+            for frame in peer.recv_frames() {
+                acked_frame = acked_frame.max(frame.frame_num);
+                if frame.flags & sync::FLAG_OVERLAY != 0 {
+                    saw_overlay = true;
+                } else if saw_overlay {
+                    overlay_cleared = true; // overlay shell exited
+                }
+                if frame.flags & sync::FLAG_SHUTDOWN != 0 {
+                    saw_shutdown = true;
                 }
             }
             // Once the overlay is up, send its shell `exit`; once it has closed,
@@ -3830,10 +3810,7 @@ mod tests {
         util::set_nonblocking(child.master).unwrap();
         let server = std::thread::spawn(move || server_loop(server_conn, child, 24, 80, None, false));
 
-        let addr = format!("127.0.0.1:{port}").parse().unwrap();
-        let mut conn = Connection::client(addr, &key).unwrap();
-        let mut fragmenter = Fragmenter::new();
-        let mut assembly = FragmentAssembly::new();
+        let mut peer = LoopbackPeer::connect(port, &key, false);
 
         let mut acked = 0u64;
         let mut saw_log_on = false;
@@ -3860,38 +3837,20 @@ mod tests {
                 input_base: 0,
                 input: vec![],
             };
-            for frag in fragmenter.make_fragments(&msg.encode(), sync::FRAGMENT_CONTENTS_MAX) {
-                conn.send(&frag.to_bytes()).unwrap();
-            }
+            peer.send(&msg).unwrap();
             if saw_shutdown && acked > 0 {
                 break;
             }
             std::thread::sleep(std::time::Duration::from_millis(50));
-            loop {
-                match conn.recv() {
-                    Ok(Some(payload)) => {
-                        let Ok(frag) = sync::Fragment::from_bytes(&payload) else {
-                            continue;
-                        };
-                        let Some(assembled) = assembly.add(frag) else {
-                            continue;
-                        };
-                        let Ok(frame) = ServerFrame::decode(&assembled) else {
-                            continue;
-                        };
-                        acked = acked.max(frame.frame_num);
-                        if frame.flags & sync::FLAG_SERVER_LOG != 0 {
-                            saw_log_on = true;
-                        } else if saw_log_on {
-                            saw_log_off = true; // cleared after having been on
-                        }
-                        if frame.flags & sync::FLAG_SHUTDOWN != 0 {
-                            saw_shutdown = true;
-                        }
-                    }
-                    Ok(None) => continue,
-                    Err(e) if e.kind() == std::io::ErrorKind::WouldBlock => break,
-                    Err(_) => break,
+            for frame in peer.recv_frames() {
+                acked = acked.max(frame.frame_num);
+                if frame.flags & sync::FLAG_SERVER_LOG != 0 {
+                    saw_log_on = true;
+                } else if saw_log_on {
+                    saw_log_off = true; // cleared after having been on
+                }
+                if frame.flags & sync::FLAG_SHUTDOWN != 0 {
+                    saw_shutdown = true;
                 }
             }
             if saw_log_off {
@@ -3931,10 +3890,7 @@ mod tests {
         util::set_nonblocking(child.master).unwrap();
         let server = std::thread::spawn(move || server_loop(server_conn, child, 24, 80, None, false));
 
-        let addr = format!("127.0.0.1:{port}").parse().unwrap();
-        let mut conn = Connection::client(addr, &key).unwrap();
-        let mut fragmenter = Fragmenter::new();
-        let mut assembly = FragmentAssembly::new();
+        let mut peer = LoopbackPeer::connect(port, &key, false);
 
         let mut acked = 0u64;
         let mut resync_at: Option<u64> = None;
@@ -3966,38 +3922,20 @@ mod tests {
                 input_base: 0,
                 input: vec![],
             };
-            for frag in fragmenter.make_fragments(&msg.encode(), sync::FRAGMENT_CONTENTS_MAX) {
-                conn.send(&frag.to_bytes()).unwrap();
-            }
+            peer.send(&msg).unwrap();
             if saw_shutdown {
                 break;
             }
             std::thread::sleep(std::time::Duration::from_millis(50));
-            loop {
-                match conn.recv() {
-                    Ok(Some(payload)) => {
-                        let Ok(frag) = sync::Fragment::from_bytes(&payload) else {
-                            continue;
-                        };
-                        let Some(assembled) = assembly.add(frag) else {
-                            continue;
-                        };
-                        let Ok(frame) = ServerFrame::decode(&assembled) else {
-                            continue;
-                        };
-                        acked = acked.max(frame.frame_num);
-                        if let Some(at) = resync_at {
-                            if frame.frame_num > at && matches!(frame.body, FrameBody::Full(_)) {
-                                saw_resync_full = true;
-                            }
-                        }
-                        if frame.flags & sync::FLAG_SHUTDOWN != 0 {
-                            saw_shutdown = true;
-                        }
+            for frame in peer.recv_frames() {
+                acked = acked.max(frame.frame_num);
+                if let Some(at) = resync_at {
+                    if frame.frame_num > at && matches!(frame.body, FrameBody::Full(_)) {
+                        saw_resync_full = true;
                     }
-                    Ok(None) => continue,
-                    Err(e) if e.kind() == std::io::ErrorKind::WouldBlock => break,
-                    Err(_) => break,
+                }
+                if frame.flags & sync::FLAG_SHUTDOWN != 0 {
+                    saw_shutdown = true;
                 }
             }
         }
@@ -4031,10 +3969,7 @@ mod tests {
         util::set_nonblocking(child.master).unwrap();
         let server = std::thread::spawn(move || server_loop(server_conn, child, 24, 80, None, false));
 
-        let addr = format!("127.0.0.1:{port}").parse().unwrap();
-        let mut conn = Connection::client(addr, &key).unwrap();
-        let mut fragmenter = Fragmenter::new();
-        let mut assembly = FragmentAssembly::new();
+        let mut peer = LoopbackPeer::connect(port, &key, false);
         let mirror_row0 = |dump: &[u8], rows: u16| {
             let mut mirror = Terminal::new(rows, 80);
             mirror.process(dump);
@@ -4083,79 +4018,60 @@ mod tests {
                 input_base: 0,
                 input: vec![],
             };
-            for frag in fragmenter.make_fragments(&msg.encode(), sync::FRAGMENT_CONTENTS_MAX) {
-                conn.send(&frag.to_bytes()).unwrap();
-            }
+            peer.send(&msg).unwrap();
             if saw_shutdown {
                 break;
             }
             std::thread::sleep(std::time::Duration::from_millis(50));
-            loop {
-                match conn.recv() {
-                    Ok(Some(payload)) => {
-                        let Ok(frag) = sync::Fragment::from_bytes(&payload) else {
-                            continue;
-                        };
-                        let Some(assembled) = assembly.add(frag) else {
-                            continue;
-                        };
-                        let Ok(frame) = ServerFrame::decode(&assembled) else {
-                            continue;
-                        };
-                        if frame.flags & sync::FLAG_SHUTDOWN != 0 {
-                            saw_shutdown = true;
-                        }
-                        let applied = match &frame.body {
-                            FrameBody::Full(b) => {
-                                largest_visible = largest_visible.max(b.len());
-                                Some(b.clone())
-                            }
-                            FrameBody::Diff { base, diff, .. } => {
-                                largest_visible = largest_visible.max(diff.len());
-                                held.as_ref()
-                                    .filter(|h| h.0 == *base)
-                                    .and_then(|h| sync::apply_diff(&h.1, diff))
-                            }
-                            _ => None,
-                        };
-                        let Some(dump) = applied else {
-                            continue;
-                        };
-                        if held.as_ref().is_some_and(|h| h.0 >= frame.frame_num) {
-                            continue; // a retransmission of an applied frame
-                        }
-                        let num = frame.frame_num;
-                        if resync_at.is_some_and(|at| num > at)
-                            && matches!(frame.body, FrameBody::Full(_))
-                        {
-                            saw_resync_full = true;
-                        }
-                        // A 24-row frame the server built before it read the
-                        // resize can still be numbered past resize_at: wait
-                        // for the 40-row one rather than judging the first.
-                        if resize_at.is_some_and(|at| num > at) && !resized_ok {
-                            let row0 = mirror_row0(&dump, 40);
-                            resized_ok = row0.starts_with("line 2961 ");
-                            last_resized_row0 = Some(row0);
-                        }
-                        if !flood_done {
-                            // Settled, not merely started: a frame cut from a
-                            // read that split the last line would let its tail
-                            // dirty the screen again after the RESYNC.
-                            let mut mirror = Terminal::new(24, 80);
-                            mirror.process(&dump);
-                            let row = |r| mirror.screen().row(r).unwrap().text(true);
-                            let cursor = mirror.cursor();
-                            flood_done = row(22) == "line 2999 the quick brown fox jumps over"
-                                && row(23).is_empty()
-                                && (cursor.row, cursor.col) == (23, 0);
-                        }
-                        held = Some((num, dump));
-                    }
-                    Ok(None) => continue,
-                    Err(e) if e.kind() == std::io::ErrorKind::WouldBlock => break,
-                    Err(_) => break,
+            for frame in peer.recv_frames() {
+                if frame.flags & sync::FLAG_SHUTDOWN != 0 {
+                    saw_shutdown = true;
                 }
+                let applied = match &frame.body {
+                    FrameBody::Full(b) => {
+                        largest_visible = largest_visible.max(b.len());
+                        Some(b.clone())
+                    }
+                    FrameBody::Diff { base, diff, .. } => {
+                        largest_visible = largest_visible.max(diff.len());
+                        held.as_ref()
+                            .filter(|h| h.0 == *base)
+                            .and_then(|h| sync::apply_diff(&h.1, diff))
+                    }
+                    _ => None,
+                };
+                let Some(dump) = applied else {
+                    continue;
+                };
+                if held.as_ref().is_some_and(|h| h.0 >= frame.frame_num) {
+                    continue; // a retransmission of an applied frame
+                }
+                let num = frame.frame_num;
+                if resync_at.is_some_and(|at| num > at) && matches!(frame.body, FrameBody::Full(_))
+                {
+                    saw_resync_full = true;
+                }
+                // A 24-row frame the server built before it read the resize
+                // can still be numbered past resize_at: wait for the 40-row
+                // one rather than judging the first.
+                if resize_at.is_some_and(|at| num > at) && !resized_ok {
+                    let row0 = mirror_row0(&dump, 40);
+                    resized_ok = row0.starts_with("line 2961 ");
+                    last_resized_row0 = Some(row0);
+                }
+                if !flood_done {
+                    // Settled, not merely started: a frame cut from a read
+                    // that split the last line would let its tail dirty the
+                    // screen again after the RESYNC.
+                    let mut mirror = Terminal::new(24, 80);
+                    mirror.process(&dump);
+                    let row = |r| mirror.screen().row(r).unwrap().text(true);
+                    let cursor = mirror.cursor();
+                    flood_done = row(22) == "line 2999 the quick brown fox jumps over"
+                        && row(23).is_empty()
+                        && (cursor.row, cursor.col) == (23, 0);
+                }
+                held = Some((num, dump));
             }
         }
         assert!(flood_done, "the flood never reached the screen");
@@ -4192,40 +4108,20 @@ mod tests {
         util::set_nonblocking(child.master).unwrap();
         let server = std::thread::spawn(move || server_loop(server_conn, child, 24, 80, None, false));
 
-        let addr = format!("127.0.0.1:{port}").parse().unwrap();
-        let mut conn = Connection::client(addr, &key).unwrap();
-        let mut fragmenter = Fragmenter::new();
-        let mut assembly = FragmentAssembly::new();
+        let mut peer = LoopbackPeer::connect(port, &key, false);
 
-        let recv_frames = |conn: &mut Connection,
-                               assembly: &mut FragmentAssembly,
-                               nums: &mut std::collections::HashSet<u64>,
-                               saw_shutdown: &mut bool|
+        let recv_frames = |peer: &mut LoopbackPeer,
+                           nums: &mut std::collections::HashSet<u64>,
+                           saw_shutdown: &mut bool|
          -> u64 {
             let mut highest = 0u64;
-            loop {
-                match conn.recv() {
-                    Ok(Some(payload)) => {
-                        let Ok(frag) = sync::Fragment::from_bytes(&payload) else {
-                            continue;
-                        };
-                        let Some(assembled) = assembly.add(frag) else {
-                            continue;
-                        };
-                        let Ok(frame) = ServerFrame::decode(&assembled) else {
-                            continue;
-                        };
-                        if !matches!(frame.body, FrameBody::Empty) {
-                            nums.insert(frame.frame_num);
-                        }
-                        highest = highest.max(frame.frame_num);
-                        if frame.flags & sync::FLAG_SHUTDOWN != 0 {
-                            *saw_shutdown = true;
-                        }
-                    }
-                    Ok(None) => continue,
-                    Err(e) if e.kind() == std::io::ErrorKind::WouldBlock => break,
-                    Err(_) => break,
+            for frame in peer.recv_frames() {
+                if !matches!(frame.body, FrameBody::Empty) {
+                    nums.insert(frame.frame_num);
+                }
+                highest = highest.max(frame.frame_num);
+                if frame.flags & sync::FLAG_SHUTDOWN != 0 {
+                    *saw_shutdown = true;
                 }
             }
             highest
@@ -4243,20 +4139,13 @@ mod tests {
             input_base: 0,
             input: Vec::new(),
         };
-        for frag in fragmenter.make_fragments(&hello.encode(), sync::FRAGMENT_CONTENTS_MAX) {
-            conn.send(&frag.to_bytes()).unwrap();
-        }
+        peer.send(&hello).unwrap();
         let mut nums = std::collections::HashSet::new();
         let mut saw_shutdown = false;
         let mut highest = 0u64;
         let start = now_ms();
         while now_ms().saturating_sub(start) < 600 {
-            highest = highest.max(recv_frames(
-                &mut conn,
-                &mut assembly,
-                &mut nums,
-                &mut saw_shutdown,
-            ));
+            highest = highest.max(recv_frames(&mut peer, &mut nums, &mut saw_shutdown));
             std::thread::sleep(std::time::Duration::from_millis(5));
         }
         assert!(!nums.is_empty(), "no frames arrived at all");
@@ -4278,19 +4167,12 @@ mod tests {
                 input_base: 0,
                 input: Vec::new(),
             };
-            for frag in fragmenter.make_fragments(&msg.encode(), sync::FRAGMENT_CONTENTS_MAX) {
-                conn.send(&frag.to_bytes()).unwrap();
-            }
+            peer.send(&msg).unwrap();
             if saw_shutdown && highest > 0 {
                 break;
             }
             std::thread::sleep(std::time::Duration::from_millis(50));
-            highest = highest.max(recv_frames(
-                &mut conn,
-                &mut assembly,
-                &mut nums,
-                &mut saw_shutdown,
-            ));
+            highest = highest.max(recv_frames(&mut peer, &mut nums, &mut saw_shutdown));
         }
         assert!(saw_shutdown, "server never confirmed the client shutdown");
         server.join().unwrap();
@@ -4354,10 +4236,7 @@ mod tests {
         util::set_nonblocking(child.master).unwrap();
         let server = std::thread::spawn(move || server_loop(server_conn, child, 24, 80, None, false));
 
-        let addr = format!("127.0.0.1:{port}").parse().unwrap();
-        let mut conn = Connection::client(addr, &key).unwrap();
-        let mut fragmenter = Fragmenter::new();
-        let mut assembly = FragmentAssembly::new();
+        let mut peer = LoopbackPeer::connect(port, &key, false);
         let mut outbox = InputOutbox::new();
         let cap = caps::Cap {
             id: caps::CAP_SCROLLBACK,
@@ -4412,80 +4291,59 @@ mod tests {
                 input_base: outbox.base(),
                 input: outbox.pending().to_vec(),
             };
-            for frag in fragmenter.make_fragments(&msg.encode(), sync::FRAGMENT_CONTENTS_MAX) {
-                let _ = conn.send(&frag.to_bytes());
-            }
+            let _ = peer.send(&msg);
             if saw_shutdown {
                 break; // the send above acked the shutdown frame
             }
 
             // Block (bounded) until the server reacts, then drain everything.
             let prev_applied = applied_num;
-            let mut fds = [util::pollfd(conn.raw_fd(), libc::POLLIN)];
+            let mut fds = [util::pollfd(peer.conn.raw_fd(), libc::POLLIN)];
             let _ = util::poll(&mut fds, 200);
-            loop {
-                match conn.recv() {
-                    Ok(Some(payload)) => {
-                        let Ok(frag) = sync::Fragment::from_bytes(&payload) else {
-                            continue;
-                        };
-                        let Some(assembled) = assembly.add(frag) else {
-                            continue;
-                        };
-                        let Ok(frame) = ServerFrame::decode(&assembled) else {
-                            continue;
-                        };
-                        outbox.ack(frame.input_ack);
-                        if frame.flags & sync::FLAG_SHUTDOWN != 0 {
-                            saw_shutdown = true;
+            for frame in peer.recv_frames() {
+                outbox.ack(frame.input_ack);
+                if frame.flags & sync::FLAG_SHUTDOWN != 0 {
+                    saw_shutdown = true;
+                }
+                if frame.frame_num < applied_num {
+                    continue; // stale (includes retransmits of a dropped frame)
+                }
+                match &frame.body {
+                    FrameBody::Scrollback { base, rows } => {
+                        if frame.frame_num == applied_num || *base != applied_num {
+                            continue; // duplicate, or not anchored at our state
                         }
-                        if frame.frame_num < applied_num {
-                            continue; // stale (includes retransmits of a dropped frame)
+                        if drop_target == Some(frame.frame_num) {
+                            continue; // a retransmission of the frame we "lost"
                         }
-                        match &frame.body {
-                            FrameBody::Scrollback { base, rows } => {
-                                if frame.frame_num == applied_num || *base != applied_num {
-                                    continue; // duplicate, or not anchored at our state
-                                }
-                                if drop_target == Some(frame.frame_num) {
-                                    continue; // a retransmission of the frame we "lost"
-                                }
-                                if lose_second_sb_frame && drop_target.is_none() && sb_applied == 1
-                                {
-                                    // Lose exactly the second scrollback frame.
-                                    drop_target = Some(frame.frame_num);
-                                    continue;
-                                }
-                                sb_bodies += 1;
-                                sb_rows += rows.len();
-                                for r in rows {
-                                    if let Some(n) = row_line_number(r) {
-                                        accumulated.insert(n);
-                                    }
-                                }
-                                sb_applied += 1;
-                                applied_num = frame.frame_num;
+                        if lose_second_sb_frame && drop_target.is_none() && sb_applied == 1 {
+                            // Lose exactly the second scrollback frame.
+                            drop_target = Some(frame.frame_num);
+                            continue;
+                        }
+                        sb_bodies += 1;
+                        sb_rows += rows.len();
+                        for r in rows {
+                            if let Some(n) = row_line_number(r) {
+                                accumulated.insert(n);
                             }
-                            // Morph never arrives here (this harness's client
-                            // does not advertise CAP_MORPH), but the match must
-                            // be total; treat it as the visible-frame case.
-                            FrameBody::Full(_)
-                            | FrameBody::Diff { .. }
-                            | FrameBody::Morph { .. } => {
-                                if frame.frame_num != applied_num {
-                                    saw_visible = true;
-                                    applied_num = frame.frame_num;
-                                }
-                            }
-                            FrameBody::Empty => {}
-                            // This harness's client advertises v1 SCROLLBACK
-                            // only, so the server never emits v2 bodies here.
-                            FrameBody::Scrollback2 { .. } => {}
+                        }
+                        sb_applied += 1;
+                        applied_num = frame.frame_num;
+                    }
+                    // Morph never arrives here (this harness's client does not
+                    // advertise CAP_MORPH), but the match must be total; treat
+                    // it as the visible-frame case.
+                    FrameBody::Full(_) | FrameBody::Diff { .. } | FrameBody::Morph { .. } => {
+                        if frame.frame_num != applied_num {
+                            saw_visible = true;
+                            applied_num = frame.frame_num;
                         }
                     }
-                    Ok(None) => continue,
-                    Err(e) if e.kind() == std::io::ErrorKind::WouldBlock => break,
-                    Err(_) => break,
+                    FrameBody::Empty => {}
+                    // This harness's client advertises v1 SCROLLBACK only, so
+                    // the server never emits v2 bodies here.
+                    FrameBody::Scrollback2 { .. } => {}
                 }
             }
             if applied_num > prev_applied {
@@ -4596,6 +4454,31 @@ mod tests {
     // --- The agent-only server loop (M1 Task 2 of
     // docs/plans/2026-07-28-mux-endpoint-m1-impl.md) ---
 
+    /// One service pass of a test pump's agent side: route every `agent`
+    /// channel instruction the socket holds through the client mux to the
+    /// local agent proxy, then send what the proxy and mux have queued.
+    fn pump_agent_instructions(
+        peer: &mut LoopbackPeer,
+        mux_c: &mut crate::remote::agent::AgentChannelMux,
+        proxy: &mut crate::remote::agent::AgentClient,
+    ) {
+        for assembled in peer.recv_instructions() {
+            let Some((chan, message)) = channel::open_any_instruction(true, &assembled) else {
+                continue;
+            };
+            if chan.kind() != channel::KIND_AGENT {
+                continue;
+            }
+            let recs = mux_c.on_instruction(chan, message);
+            let replies = proxy.apply_records(&recs);
+            mux_c.queue_records(&replies);
+        }
+        mux_c.queue_records(&proxy.read_channels());
+        for (id, wire) in mux_c.outgoing(now_ms(), 50) {
+            send_on_channel(&mut peer.conn, &mut peer.fragmenter, id, &wire, true);
+        }
+    }
+
     /// Drives a real [`agent_only_loop`] over loopback UDP with a mux-named
     /// endpoint. Note the direction: the CONSUMER connects to the remote
     /// `agent/sock` — the server accepts unix connects and opens `agent`
@@ -4614,7 +4497,6 @@ mod tests {
         port_range: (u16, u16),
     ) -> Vec<u8> {
         use crate::remote::agent::{AgentChannelMux, AgentClient, AgentEndpoint};
-        use crate::remote::channel;
         use std::io::{Read, Write};
         use std::os::unix::net::{UnixListener, UnixStream};
         use std::sync::atomic::{AtomicBool, Ordering};
@@ -4662,10 +4544,7 @@ mod tests {
             let done = done.clone();
             let source = fake_agent_sock.clone();
             std::thread::spawn(move || {
-                let addr = format!("127.0.0.1:{port}").parse().unwrap();
-                let mut conn = Connection::client(addr, &key).unwrap();
-                let mut fragmenter = Fragmenter::new();
-                let mut assembly = FragmentAssembly::new();
+                let mut peer = LoopbackPeer::connect(port, &key, true);
                 let mut proxy = AgentClient::new(source);
                 let mut mux_c = AgentChannelMux::new_client();
                 while !done.load(Ordering::Relaxed) {
@@ -4678,34 +4557,8 @@ mod tests {
                         input_base: 0,
                         input: Vec::new(),
                     };
-                    let encoded = msg.encode();
-                    let wire = channel::seal_instruction(true, &encoded);
-                    for frag in fragmenter.make_fragments(&wire, sync::FRAGMENT_CONTENTS_MAX) {
-                        let _ = conn.send(&frag.to_bytes());
-                    }
-                    while let Ok(Some(payload)) = conn.recv() {
-                        let Ok(frag) = sync::Fragment::from_bytes(&payload) else {
-                            continue;
-                        };
-                        let Some(assembled) = assembly.add(frag) else {
-                            continue;
-                        };
-                        let Some((chan, message)) =
-                            channel::open_any_instruction(true, &assembled)
-                        else {
-                            continue;
-                        };
-                        if chan.kind() != channel::KIND_AGENT {
-                            continue;
-                        }
-                        let recs = mux_c.on_instruction(chan, message);
-                        let replies = proxy.apply_records(&recs);
-                        mux_c.queue_records(&replies);
-                    }
-                    mux_c.queue_records(&proxy.read_channels());
-                    for (id, wire) in mux_c.outgoing(now_ms(), 50) {
-                        send_on_channel(&mut conn, &mut fragmenter, id, &wire, true);
-                    }
+                    let _ = peer.send(&msg);
+                    pump_agent_instructions(&mut peer, &mut mux_c, &mut proxy);
                     std::thread::sleep(std::time::Duration::from_millis(5));
                 }
             })
@@ -4757,7 +4610,6 @@ mod tests {
     #[test]
     fn agent_serving_loop_recovers_after_peer_silence_without_a_new_session() {
         use crate::remote::agent::{AgentChannelMux, AgentClient, AgentEndpoint};
-        use crate::remote::channel;
         use std::io::{Read, Write};
         use std::os::unix::net::{UnixListener, UnixStream};
         use std::sync::atomic::{AtomicBool, Ordering};
@@ -4827,10 +4679,7 @@ mod tests {
             let paused = paused.clone();
             let source = fake_agent_sock.clone();
             std::thread::spawn(move || {
-                let addr = format!("127.0.0.1:{port}").parse().unwrap();
-                let mut conn = Connection::client(addr, &key).unwrap();
-                let mut fragmenter = Fragmenter::new();
-                let mut assembly = FragmentAssembly::new();
+                let mut peer = LoopbackPeer::connect(port, &key, true);
                 let mut proxy = AgentClient::new(source);
                 let mut mux_c = AgentChannelMux::new_client();
                 while !done.load(Ordering::Relaxed) {
@@ -4849,34 +4698,8 @@ mod tests {
                         input_base: 0,
                         input: Vec::new(),
                     };
-                    let encoded = msg.encode();
-                    let wire = channel::seal_instruction(true, &encoded);
-                    for frag in fragmenter.make_fragments(&wire, sync::FRAGMENT_CONTENTS_MAX) {
-                        let _ = conn.send(&frag.to_bytes());
-                    }
-                    while let Ok(Some(payload)) = conn.recv() {
-                        let Ok(frag) = sync::Fragment::from_bytes(&payload) else {
-                            continue;
-                        };
-                        let Some(assembled) = assembly.add(frag) else {
-                            continue;
-                        };
-                        let Some((chan, message)) =
-                            channel::open_any_instruction(true, &assembled)
-                        else {
-                            continue;
-                        };
-                        if chan.kind() != channel::KIND_AGENT {
-                            continue;
-                        }
-                        let recs = mux_c.on_instruction(chan, message);
-                        let replies = proxy.apply_records(&recs);
-                        mux_c.queue_records(&replies);
-                    }
-                    mux_c.queue_records(&proxy.read_channels());
-                    for (id, wire) in mux_c.outgoing(now_ms(), 50) {
-                        send_on_channel(&mut conn, &mut fragmenter, id, &wire, true);
-                    }
+                    let _ = peer.send(&msg);
+                    pump_agent_instructions(&mut peer, &mut mux_c, &mut proxy);
                     std::thread::sleep(std::time::Duration::from_millis(5));
                 }
             })
@@ -5817,10 +5640,7 @@ mod tests {
         use crate::remote::sync::AgentStream;
         use std::sync::atomic::Ordering;
 
-        let addr = format!("127.0.0.1:{port}").parse().unwrap();
-        let mut conn = Connection::client(addr, &key).unwrap();
-        let mut fragmenter = Fragmenter::new();
-        let mut assembly = FragmentAssembly::new();
+        let mut peer = LoopbackPeer::connect(port, &key, false);
         let mut proxy = AgentClient::new(source_sock);
         let mut stream = AgentStream::new();
         let mut agent_seen = false;
@@ -5831,7 +5651,7 @@ mod tests {
             // datagram, and the cumulative agent stream rides the new path.
             if let Some(r) = &roam {
                 if r.swap(false, Ordering::Relaxed) {
-                    let _ = conn.roam_rebind();
+                    let _ = peer.conn.roam_rebind();
                 }
             }
             // Advertise AGENT_FORWARD every message; emit DATA/ACK once the
@@ -5853,20 +5673,9 @@ mod tests {
                 input_base: 0,
                 input: Vec::new(),
             };
-            for frag in fragmenter.make_fragments(&msg.encode(), sync::FRAGMENT_CONTENTS_MAX) {
-                let _ = conn.send(&frag.to_bytes());
-            }
+            let _ = peer.send(&msg);
             // Drain inbound frames; consume the server's agent caps.
-            while let Ok(Some(payload)) = conn.recv() {
-                let Ok(frag) = sync::Fragment::from_bytes(&payload) else {
-                    continue;
-                };
-                let Some(assembled) = assembly.add(frag) else {
-                    continue;
-                };
-                let Ok(frame) = ServerFrame::decode(&assembled) else {
-                    continue;
-                };
+            for frame in peer.recv_frames() {
                 if caps::find(&frame.caps, caps::CAP_AGENT_FORWARD).is_some() {
                     agent_seen = true;
                 }
