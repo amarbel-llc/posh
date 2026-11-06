@@ -19,7 +19,7 @@
 
 use std::env;
 use std::fs;
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 
 /// Flow `POSH_VERSION`, `POSH_GIT_SHA`, and the composed `POSH_BUILD`
 /// (`<version>+<sha>`) into the consuming crate. Call from each crate's
@@ -90,6 +90,7 @@ fn flow_git_sha() -> String {
 /// `$POSH_GIT_SHA` instead, so this never runs there).
 fn git_describe() -> Option<String> {
     use std::process::Command;
+    rerun_if_git_state_changed();
     let rev = Command::new("git")
         .args(["rev-parse", "--short=12", "HEAD"])
         .output()
@@ -107,6 +108,57 @@ fn git_describe() -> Option<String> {
         }
     }
     Some(sha)
+}
+
+/// Re-run the build script when the git state [`git_describe`] reads moves
+/// (posh#219): without this an incremental dev build keeps stamping the sha
+/// from whenever build.rs last ran. git itself resolves the directories, so a
+/// worktree (whose `.git` is a `gitdir:` file) watches its own gitdir for
+/// HEAD and the index and the common dir for refs.
+fn rerun_if_git_state_changed() {
+    use std::process::Command;
+    let Ok(out) = Command::new("git")
+        .args([
+            "rev-parse",
+            "--path-format=absolute",
+            "--git-dir",
+            "--git-common-dir",
+        ])
+        .output()
+    else {
+        return;
+    };
+    if !out.status.success() {
+        return;
+    }
+    let Ok(stdout) = String::from_utf8(out.stdout) else {
+        return;
+    };
+    let mut lines = stdout.lines();
+    let (Some(git_dir), Some(common_dir)) = (lines.next(), lines.next()) else {
+        return;
+    };
+    let git_dir = PathBuf::from(git_dir);
+    let head = fs::read_to_string(git_dir.join("HEAD")).unwrap_or_default();
+    // Only existing paths: cargo re-runs on every build for a missing one,
+    // and a branch's loose ref is absent once `git gc` packs it.
+    for path in git_state_watch_paths(&git_dir, Path::new(common_dir), &head) {
+        if path.exists() {
+            println!("cargo:rerun-if-changed={}", path.display());
+        }
+    }
+}
+
+/// The files whose change moves `git rev-parse HEAD` or the `-dirty` bit:
+/// HEAD and the index in the (per-worktree) git dir, and — when HEAD is a
+/// symbolic ref — that ref, loose or packed, in the common dir.
+fn git_state_watch_paths(git_dir: &Path, common_dir: &Path, head: &str) -> Vec<PathBuf> {
+    let mut paths = vec![git_dir.join("HEAD"), git_dir.join("index")];
+    if let Some(reference) = head.trim().strip_prefix("ref: ") {
+        paths.push(common_dir.join(reference.trim()));
+        paths.push(common_dir.join("packed-refs"));
+    }
+    paths
 }
 
 /// Hand-rolled parse (no regex crate dependency in the build script): the first
@@ -134,7 +186,32 @@ fn parse_posh_version(content: &str) -> Option<String> {
 
 #[cfg(test)]
 mod tests {
-    use super::parse_posh_version;
+    use super::{git_state_watch_paths, parse_posh_version};
+    use std::path::{Path, PathBuf};
+
+    #[test]
+    fn worktree_watches_own_head_and_index_but_common_refs() {
+        let git_dir = Path::new("/r/.git/worktrees/wt");
+        let common = Path::new("/r/.git");
+        assert_eq!(
+            git_state_watch_paths(git_dir, common, "ref: refs/heads/wt\n"),
+            vec![
+                PathBuf::from("/r/.git/worktrees/wt/HEAD"),
+                PathBuf::from("/r/.git/worktrees/wt/index"),
+                PathBuf::from("/r/.git/refs/heads/wt"),
+                PathBuf::from("/r/.git/packed-refs"),
+            ]
+        );
+    }
+
+    #[test]
+    fn detached_head_watches_no_ref() {
+        let dir = Path::new("/r/.git");
+        assert_eq!(
+            git_state_watch_paths(dir, dir, "6f0bd4e0000000000000000000000000000000\n"),
+            vec![PathBuf::from("/r/.git/HEAD"), PathBuf::from("/r/.git/index")]
+        );
+    }
 
     #[test]
     fn parses_export_prefixed_line() {
