@@ -55,6 +55,42 @@ Close after one live check:
 - **#189**: the fleet shows `base_history=` absorbing RESYNCs (`2923b5d`).
 - **#159**: close once the M2 promotion date is recorded in the design-doc header (candidate 4).
 
+### Close list (prepared, not run)
+
+The comments to post when the operator confirms. Every cited sha was
+re-checked on 2026-11-06 with `git log -1 <sha>`.
+
+Fixed by a named commit:
+
+| # | close comment |
+|---|---|
+| 256 | Fixed by 500215e: recording notices now name the client host the `.castx` is written on. |
+| 187 | Fixed by 91a55db: the SessionResume cursor carries input across a mux reconnect (RFC 0015). |
+| 188 | Fixed on M2 by 35f080a, which carries SCROLLBACK2 through the bridge. The relay half is superseded: ADR 0007 makes the relay do-not-extend. |
+| 170 | Fixed by 2f5308c: bare `posh attach` is strict (Phase B). The zsh `ph` completion is left over for a separate issue. |
+| 161 | Fixed for foreground sessions by fa1794f (stable-path export + bootstrap `-a`), with 92bc0a5 and 6a0ae1f. #165 tracks the detached case. |
+| 160 | Fixed by 5b719ac (mephisto replaced by public galapagos) and dfe4f10. |
+| 152 | Fixed by 582fd16: repoint-on-release (shape c), now permanent under FDR 0014. |
+| 117 | Fixed by daf7976, d328c89 and 7980bb4. The RFC 0009/0002 status bookkeeping moves to #188's successor. |
+| 113 | Fixed by 5e9d7fc (hermetic `start_server`); duplicate of #111. #249 is a different failure and stays open. |
+| 90 | Fixed by 90763f9 (client RESYNC on apply-stall); the daemon variant was fixed under #157. |
+| 83 | Fixed by daf7976, d328c89 and 7980bb4: diagnosed as the #117 wedge class. |
+| 75 | Fixed by f7e50c7 (posh-proto plus `poshterity/src/framereplay.rs`); the follow-up #102 was won't-do. |
+| 28 | Fixed by ca510e4 (DECSET 1007), with the FDR 0005 wheel intercept. A quick kitty check is prudent before closing. |
+
+Done or stale, closed on evidence rather than one commit:
+
+| # | close comment |
+|---|---|
+| 56 | Done: phases 1-4 are closed and poshterity ships `castx`, `record`, `player`, `assert` and `golden`; phase 5 (#61) is stale. |
+| 55 | Done: FDR 0004 records phase 1 as landed, and FDR 0014 (stable endpoint) is `stable`. |
+| 61 | Stale: the migration target `zz-mosh` was removed by ADR 0009; the `.castx` RFC exists as RFC 0003. |
+| 84 | Stale: `conformist.toml` is no longer committed; `conformist.nix` is the single source. |
+| 2 | Stale: the `make check` lane went away with `zz-mosh` (ADR 0009). |
+| 3 | Not posh: over plain ssh this is kitty's behaviour. Inside posh sessions it is handled by the FDR 0005 wheel intercept. |
+| 40 | Solved by `POSH_SERVER_CMD`; reopen if a `--server` flag alias is wanted. |
+| 34 | The campaign is complete; its residuals are tracked in #36, and #2 and #3 are closed above. |
+
 ## 2. Retitle, narrow, merge, relabel
 
 - **#174**: narrow to items 4-6 plus the perf evaluation. `683cc6a` did items 1-3 and 7.
