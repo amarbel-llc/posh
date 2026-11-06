@@ -240,6 +240,15 @@ that process, and its bootstrap now runs `-a` too), and `server::run`
 seeds the process env as the relay always did, so the FDR 0008 overlay
 shell inherits the same value.
 
+The detached spawn (`posh host:session --detach`, FDR 0010) followed on
+2026-11-06 (posh#165): `sshwrap::run_detached` always asks for the export
+and so runs `-a`, and the inner `posh attach` reads and scrubs the prefix
+and seeds `SSH_AUTH_SOCK` before the daemon forks, so a worker no longer
+inherits the spawn ssh's forwarded socket, which dies with that ssh. It has
+no handshake, so a remote predating this simply has no agent, which is no
+worse than the dead socket. Pinned by
+`remote::sshwrap::tests::detached_ssh_argv_carries_dash_a_and_agent_export_prefix`.
+
 Review-surfaced limits, recorded rather than engineered away: (1) the
 mixed-version window — a remote with the `agent` verb but predating the
 export (built between the 2026-08-04 promotion and this fix) ignores the

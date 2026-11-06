@@ -983,29 +983,16 @@ pub fn run(
 /// which double-forks a session daemon on the host and exits. A later
 /// foreground `posh host:group/session` attaches to that same daemon session
 /// through a fresh, disposable transport pair. Agent forwarding (FDR 0004)
-/// rides that later foreground connection, not the spawn — so no `-A` here.
+/// rides that later foreground connection, not the spawn — so no `-A` here;
+/// with `opts.agent_export` the session is instead born pointing at the
+/// stable `agent/sock` that connection's endpoint claims (posh#165).
 pub fn run_detached(target: &str, inner: &[String], opts: &SshOptions) -> Result<()> {
-    let remote_cmd = env_prefixed_command(&forwarded_env_vars(), inner);
-
     let dest = SshDest::resolve(target);
     if let Some(notice) = dest.notice() {
         eprintln!("{notice}");
     }
-    let mut ssh = Command::new("ssh");
-    match opts.family {
-        Family::Inet => {
-            ssh.arg("-4");
-        }
-        Family::Inet6 => {
-            ssh.arg("-6");
-        }
-        Family::Auto => {}
-    }
-    ssh.args(dest.ssh_args());
-    let status = ssh
-        .arg(dest.target())
-        .arg("--")
-        .arg(&remote_cmd)
+    let status = Command::new("ssh")
+        .args(detached_ssh_argv(&dest, inner, opts, &forwarded_env_vars()))
         .stdin(Stdio::inherit()) // keep the tty for auth prompts
         .stdout(Stdio::inherit()) // pass through `posh attach --detach`'s status line
         .stderr(Stdio::inherit())
@@ -1018,6 +1005,28 @@ pub fn run_detached(target: &str, inner: &[String], opts: &SshOptions) -> Result
         )));
     }
     Ok(())
+}
+
+/// The ssh argv (after `ssh`) for [`run_detached`]: [`ssh_args`]' flags —
+/// so an export request runs `-a`, as the foreground bootstrap does — then
+/// the target and the env-prefixed inner command, the `POSH_AGENT_EXPORT`
+/// prefix after the forwarded vars exactly as [`remote_command`] orders it.
+pub(crate) fn detached_ssh_argv(
+    dest: &SshDest,
+    inner: &[String],
+    opts: &SshOptions,
+    env_vars: &[(String, String)],
+) -> Vec<String> {
+    let mut env = env_vars.to_vec();
+    if opts.agent_export {
+        env.push((AGENT_EXPORT_ENV.to_string(), "1".to_string()));
+    }
+    let mut argv = ssh_args(opts);
+    argv.extend(dest.ssh_args());
+    argv.push(dest.target());
+    argv.push("--".to_string());
+    argv.push(env_prefixed_command(&env, inner));
+    argv
 }
 
 /// Builds a remote command string for a plain `posh ...` spawn over ssh:
@@ -1399,6 +1408,44 @@ mod tests {
             .map(|s| s.to_string())
             .collect();
         assert_eq!(env_prefixed_command(&[], &bare), "'posh' 'attach' 'w' '--detach'");
+    }
+
+    #[test]
+    fn detached_ssh_argv_carries_dash_a_and_agent_export_prefix() {
+        // posh#165: the detached spawn is born with the stable agent path
+        // like the foreground bootstrap — `-a` so no sshd-forwarded socket
+        // (dead once this ssh exits) lands in the worker's env, and the
+        // POSH_AGENT_EXPORT prefix after the forwarded vars.
+        let opts = SshOptions {
+            family: Family::Inet,
+            port_range: None,
+            agent_source: None,
+            real_ssh_agent_forward: None,
+            channels: false,
+            connect_timeout_secs: None,
+            control_path: None,
+            agent_export: true,
+        };
+        let inner: Vec<String> = ["posh", "attach", "w", "--detach"]
+            .iter()
+            .map(|s| s.to_string())
+            .collect();
+        let env = vec![("LANG".to_string(), "C.UTF-8".to_string())];
+        assert_eq!(
+            detached_ssh_argv(&SshDest::verbatim("me@box"), &inner, &opts, &env),
+            vec![
+                "-4",
+                "-a",
+                "me@box",
+                "--",
+                "LANG='C.UTF-8' POSH_AGENT_EXPORT='1' 'posh' 'attach' 'w' '--detach'",
+            ]
+        );
+        let plain = SshOptions { agent_export: false, family: Family::Auto, ..opts };
+        assert_eq!(
+            detached_ssh_argv(&SshDest::verbatim("box"), &inner, &plain, &[]),
+            vec!["box", "--", "'posh' 'attach' 'w' '--detach'"]
+        );
     }
 
     #[test]

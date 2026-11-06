@@ -460,6 +460,15 @@ fn cmd_attach(
             forward_flag,
         );
     }
+    // posh#165: a detached remote spawn asks for the stable agent path the
+    // way the roaming bootstrap does (`cmd_server`). Read and scrubbed here;
+    // a session CREATED below inherits SSH_AUTH_SOCK from this process at
+    // the daemon's fork, exactly as the relay seeds it.
+    let agent_export = remote::sshwrap::agent_export_requested();
+    std::env::remove_var(remote::sshwrap::AGENT_EXPORT_ENV);
+    if let Some((var, value)) = remote::agent::session_auth_env(None, agent_export) {
+        std::env::set_var(var, value);
+    }
     session::client::cmd_attach(
         &Config::new(group)?,
         name,
@@ -1357,7 +1366,9 @@ fn cmd_ssh_session(
         // Detached spawn (#67): no transport, so no agent endpoint — execute
         // the inner `posh attach --detach` directly over ssh and return. This
         // path is untouched by the relay bootstrap (there is no transport to
-        // relay); it always uses the inner-attach argv.
+        // relay); it always uses the inner-attach argv. posh#165: it always
+        // asks for the stable agent-path export (and so runs `-a`) — the
+        // foreground attach that follows brings the endpoint claiming it.
         let inner = remote_session_argv(group, &session, true, command);
         let opts = remote::sshwrap::SshOptions {
             family: Family::Auto,
@@ -1367,7 +1378,7 @@ fn cmd_ssh_session(
             channels: remote::sshwrap::channels_selected(),
             connect_timeout_secs: None,
             control_path: None,
-            agent_export: false,
+            agent_export: true,
         };
         return remote::sshwrap::run_detached(&dest, &inner, &opts);
     }
