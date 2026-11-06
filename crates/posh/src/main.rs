@@ -2032,13 +2032,15 @@ fn mux_establish_failed(e: &Error) -> bool {
 
 /// The M2 fallback warning, durable for the soak (#156): greppable in the
 /// debug log when a sink is armed (`grep mux-fallback`), alongside the
-/// stderr line the user sees at attach time.
+/// stderr line the user sees at attach time. The reason is also noted for
+/// the fallen-back connection's palette About (posh#168).
 fn warn_mux_fallback(e: &Error) {
     let msg = format!(
         "mux session unavailable ({e}); falling back to a per-invocation connection"
     );
     util::log_write("mux-fallback", &msg);
     eprintln!("posh: {msg}");
+    remote::client::note_mux_fallback(e.to_string());
 }
 
 /// Resolves the local agent socket to forward (FDR 0004) from the CLI flag plus

@@ -683,6 +683,18 @@ fn wedge_debug_summary(st: &ClientState, now: u64) -> String {
 /// signal).
 const STATE_REQUEST_WINDOW_MS: u64 = 10_000;
 
+/// posh#168: the About line that makes an M2 mismatch explicit — the gates
+/// asked for a mux session channel (`requested`) but this connection is a
+/// per-invocation one — with the recorded fallback reason, or the note that
+/// this invocation never tried. `None` when there is no mismatch.
+fn mux_sessions_mismatch(requested: bool, st: &ClientState) -> Option<String> {
+    if !requested || matches!(st.wire, Wire::Mux(_)) {
+        return None;
+    }
+    let reason = st.mux_fallback.as_deref().unwrap_or("not attempted by this invocation");
+    Some(format!("mux sessions: requested but riding UDP ({reason})"))
+}
+
 fn about_summary(st: &ClientState) -> String {
     let gate = |name: &str, resolved: bool| {
         let src = match std::env::var(name) {
@@ -695,6 +707,13 @@ fn about_summary(st: &ClientState) -> String {
         Wire::Udp(_) if st.enveloped => "per-invocation connection (enveloped)",
         Wire::Udp(_) => "per-invocation connection (baseline)",
         Wire::Mux(_) => "mux session channel (shared connection)",
+    };
+    // M2 rides only when both gates are on (`cmd_ssh_session`).
+    let mux_sessions_requested =
+        crate::remote::mux::mux_selected() && crate::remote::mux::mux_sessions_selected();
+    let mode = match mux_sessions_mismatch(mux_sessions_requested, st) {
+        Some(mismatch) => format!("{mode}\n{mismatch}"),
+        None => mode.to_string(),
     };
     // POSH_RELAY's parser lives in main.rs (`relay_enabled`; only "0"
     // disables — posh#154 tracks the cross-gate normalization).
@@ -1808,6 +1827,21 @@ struct ClientState {
     state_sent: Option<(ClientIntrospection, u64)>,
     /// Wall-clock start of this client process, the `CLIENT_IDENT` anchor.
     start_unix_ms: u64,
+    /// posh#168: why this invocation's M2 session channel fell back to a
+    /// per-invocation connection (`note_mux_fallback`), so About can say so
+    /// after the attach-time warning has scrolled away. `None` when no
+    /// fallback happened.
+    mux_fallback: Option<String>,
+}
+
+/// The M2 fallback reason for this process, noted by the attach path before
+/// the per-invocation connection's `ClientState` exists (posh#168).
+static MUX_FALLBACK_REASON: std::sync::OnceLock<String> = std::sync::OnceLock::new();
+
+/// Records why the M2 session channel fell back (posh#168); the first
+/// fallback of the invocation is the one kept.
+pub fn note_mux_fallback(reason: String) {
+    let _ = MUX_FALLBACK_REASON.set(reason);
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -1934,6 +1968,7 @@ fn client_loop(
         ident_sent_at: 0,
         state_sent: None,
         start_unix_ms: unix_now_ms(),
+        mux_fallback: MUX_FALLBACK_REASON.get().cloned(),
     };
     // RFC 0007: collect the compute-timing terminals when a GP species is the
     // startup model, independent of POSH_DEBUG_LOG.
@@ -5179,6 +5214,28 @@ mod tests {
         assert_eq!(st.state_request_until, STATE_REQUEST_WINDOW_MS);
     }
 
+    /// posh#168: gate on but riding UDP is called out with the recorded
+    /// fallback reason; with the gate off there is no mismatch to report.
+    #[test]
+    fn about_summary_flags_a_mux_session_fallback_with_its_reason() {
+        let mut st = test_state(24, 80);
+        let reason = "mux session closed before establishing: refused";
+        st.mux_fallback = Some(reason.to_string());
+        assert_eq!(
+            mux_sessions_mismatch(true, &st),
+            Some(format!("mux sessions: requested but riding UDP ({reason})")),
+        );
+        assert_eq!(mux_sessions_mismatch(false, &st), None);
+        st.mux_fallback = None;
+        assert_eq!(
+            mux_sessions_mismatch(true, &st).as_deref(),
+            Some("mux sessions: requested but riding UDP (not attempted by this invocation)"),
+        );
+        st.mux_fallback = Some(reason.to_string());
+        let requested = crate::remote::mux::mux_selected() && crate::remote::mux::mux_sessions_selected();
+        assert_eq!(about_summary(&st).contains(reason), requested, "{}", about_summary(&st));
+    }
+
     #[test]
     fn introspection_requests_ride_until_satisfied_and_on_demand() {
         let mut st = test_state(24, 80);
@@ -5672,6 +5729,7 @@ mod tests {
             ident_sent_at: 0,
             state_sent: None,
             start_unix_ms: 0,
+            mux_fallback: None,
         }
     }
 
