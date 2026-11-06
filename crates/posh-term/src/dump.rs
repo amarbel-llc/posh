@@ -337,20 +337,16 @@ impl Terminal {
     /// geometry on the frame (RFC 0012) would make every mirror session-sized
     /// and retire the fallback.
     ///
-    /// Known divergences at the same geometry, where the homed branch taken
-    /// here is right and `dump_vt` is not:
-    /// - `dump_vt`'s replay branch anchors the cursor relative to the end of
-    ///   its flow, but the modes and graphics replayed in between can move
-    ///   the cursor first (DECSTBM, DECOM, tab stops, kitty placements,
-    ///   DECCOLM) (posh#228);
-    /// - a soft-wrapped row — in the grid, or the newest ring row — followed
-    ///   by an empty unwrapped grid row loses a line in `dump_vt`'s flow:
-    ///   rows at or above the pair land one row low, rows below it are placed
-    ///   correctly (posh#229). So when the wrapped head is the newest ring
-    ///   row and grid row 0 is its empty continuation, only row 0 differs: it
-    ///   shows the head's text instead of blank. The homed branch keeps the
-    ///   text and cursor but, as always, drops a grid head's soft-wrap flag,
-    ///   which nothing can regenerate by replay.
+    /// Known divergence at the same geometry, where the homed branch taken
+    /// here is right and `dump_vt` is not: a soft-wrapped row — in the grid,
+    /// or the newest ring row — followed by an empty unwrapped grid row loses
+    /// a line in `dump_vt`'s flow: rows at or above the pair land one row
+    /// low, rows below it are placed correctly (posh#229). So when the
+    /// wrapped head is the newest ring row and grid row 0 is its empty
+    /// continuation, only row 0 differs: it shows the head's text instead of
+    /// blank. The homed branch keeps the text and cursor but, as always,
+    /// drops a grid head's soft-wrap flag, which nothing can regenerate by
+    /// replay.
     ///
     /// The returned [`MirrorDump`] carries the shape with the bytes: a
     /// bounded dump is shaped for that mirror size, while the fallback renders
@@ -481,6 +477,15 @@ impl Terminal {
             CursorAnchor::Absolute
         };
         if replay > 0 {
+            if cursor_anchor == CursorAnchor::Relative && self.modes.origin {
+                // DECOM goes on BEFORE the flow so that the DECSC saving the
+                // flow-anchored cursor below saves it too: the DECRC in
+                // `dump_cursor` restores origin mode with the position, and
+                // setting DECOM after it would home the cursor again. With the
+                // full-screen region still in force, origin mode changes
+                // nothing the flow or the relative move does.
+                out.push_str("\x1b[?6h");
+            }
             for i in (sb_len - replay)..sb_len {
                 let row = self.primary.scrollback_row(i).unwrap();
                 self.emit_terminated_row(&mut out, row, &mut st);
@@ -495,6 +500,9 @@ impl Terminal {
             }
         } else {
             self.draw_grid(&mut out, &self.primary, &mut st);
+        }
+        if cursor_anchor == CursorAnchor::Relative {
+            self.save_flow_anchored_cursor(&mut out);
         }
 
         if self.alt_active {
@@ -560,19 +568,7 @@ impl Terminal {
         if self.modes.origin {
             out.push_str("\x1b[?6h");
         }
-        match self.cursor.g0 {
-            Charset::DecSpecial => out.push_str("\x1b(0"),
-            Charset::Uk => out.push_str("\x1b(A"),
-            Charset::Ascii => {}
-        }
-        match self.cursor.g1 {
-            Charset::DecSpecial => out.push_str("\x1b)0"),
-            Charset::Uk => out.push_str("\x1b)A"),
-            Charset::Ascii => {}
-        }
-        if self.cursor.shift == 1 {
-            out.push('\x0e');
-        }
+        self.dump_charsets(&mut out);
         if self.modes.insert {
             out.push_str("\x1b[4h");
         }
@@ -826,19 +822,7 @@ impl Terminal {
             out.push_str("\x1b[?6h");
         }
         self.dump_tabs(out);
-        match self.cursor.g0 {
-            Charset::DecSpecial => out.push_str("\x1b(0"),
-            Charset::Uk => out.push_str("\x1b(A"),
-            Charset::Ascii => {}
-        }
-        match self.cursor.g1 {
-            Charset::DecSpecial => out.push_str("\x1b)0"),
-            Charset::Uk => out.push_str("\x1b)A"),
-            Charset::Ascii => {}
-        }
-        if self.cursor.shift == 1 {
-            out.push('\x0e');
-        }
+        self.dump_charsets(out);
         if self.modes.cursor_keys {
             out.push_str("\x1b[?1h");
         }
@@ -888,6 +872,23 @@ impl Terminal {
         }
     }
 
+    /// Designates G0/G1 and shifts G1 in when the cursor state has them so.
+    fn dump_charsets(&self, out: &mut String) {
+        match self.cursor.g0 {
+            Charset::DecSpecial => out.push_str("\x1b(0"),
+            Charset::Uk => out.push_str("\x1b(A"),
+            Charset::Ascii => {}
+        }
+        match self.cursor.g1 {
+            Charset::DecSpecial => out.push_str("\x1b)0"),
+            Charset::Uk => out.push_str("\x1b)A"),
+            Charset::Ascii => {}
+        }
+        if self.cursor.shift == 1 {
+            out.push('\x0e');
+        }
+    }
+
     /// Re-creates non-default tab stops: clear all, then HTS at each.
     fn dump_tabs(&self, out: &mut String) {
         if self.tabs.iter().enumerate().all(|(i, &t)| t == (i % 8 == 0)) {
@@ -901,10 +902,58 @@ impl Terminal {
         }
     }
 
+    /// Moves the target cursor from the end of the scrollback flow to the
+    /// source cursor's cell, then saves it (DECSC) for the DECRC in
+    /// [`Terminal::dump_cursor`]'s `Relative` anchor.
+    ///
+    /// The flow left the cursor at the end of the last grid row (row `rows-1`
+    /// in the target, wherever the flow landed it), so a move up to the
+    /// cursor's grid row and to its column is height-independent: the replay
+    /// is consistent whether the target is the source height or taller. The
+    /// move has to happen HERE, straight after the flow, because what is
+    /// replayed between the flow and `dump_cursor` moves the cursor first —
+    /// DECSTBM, DECOM and DECCOLM home it, the tab-stop replay and kitty
+    /// placements emit absolute CUPs — and once a scroll region is set a CUU
+    /// from below its top margin stops at that margin (posh#228). Origin mode
+    /// does not affect a CUU/CHA the way it affects an absolute CUP, so the
+    /// region top is intentionally not applied. The save takes the target's
+    /// primary DECSC slot, which this path never replayed from the source.
+    fn save_flow_anchored_cursor(&self, out: &mut String) {
+        let up = (self.rows().saturating_sub(1)).saturating_sub(self.cursor.row);
+        let print_col = self.cursor_print_col();
+        out.push('\r');
+        if up > 0 {
+            let _ = write!(out, "\x1b[{up}A");
+        }
+        if print_col > 0 {
+            let _ = write!(out, "\x1b[{}G", print_col + 1);
+        }
+        out.push_str("\x1b7");
+    }
+
+    /// The column the cursor is replayed at. When a wide glyph armed
+    /// pending-wrap, the cursor sits on the width-0 spacer in the last column;
+    /// the glyph that re-arms the wrap is the wide head one column to the
+    /// left, so aim there.
+    fn cursor_print_col(&self) -> u16 {
+        let wide_pending = self.cursor.pending_wrap
+            && self.cursor.col > 0
+            && self
+                .scr()
+                .cell(self.cursor.row, self.cursor.col)
+                .is_some_and(|cell| cell.width == 0);
+        if wide_pending {
+            self.cursor.col - 1
+        } else {
+            self.cursor.col
+        }
+    }
+
     /// `CursorAnchor::Absolute` positions the cursor with an absolute CUP —
     /// correct for every path that homes (`\x1b[H`) and redraws the grid from the
     /// top, so the target row is height-independent by construction. `Relative`
-    /// positions it relative to the BOTTOM of the just-flowed content — for the
+    /// restores (DECRC) the position [`Terminal::save_flow_anchored_cursor`]
+    /// placed relative to the BOTTOM of the just-flowed content — for the
     /// scrollback-flow path, where the grid was replayed as a continuous
     /// newline flow that lands at the target terminal's bottom regardless of its
     /// height. An absolute CUP there assumes the SOURCE height and lands the
@@ -912,6 +961,15 @@ impl Terminal {
     /// bug); the relative move anchors to where the flow actually left the
     /// content, so it is correct at any replay height.
     fn dump_cursor(&self, out: &mut String, st: &mut EmitState, anchor: CursorAnchor) {
+        if anchor == CursorAnchor::Relative {
+            // DECRC also restores the pen, hyperlink and charsets saved with
+            // the position. The pen and hyperlink are the ones `st` still
+            // tracks (nothing since the save emitted any), so the restore
+            // below stays a correct diff; the charsets were default at the
+            // save and are replayed again here.
+            out.push_str("\x1b8");
+            self.dump_charsets(out);
+        }
         if self.cursor_style_raw != 0 {
             let _ = write!(out, "\x1b[{} q", self.cursor_style_raw);
         }
@@ -935,46 +993,14 @@ impl Terminal {
         } else {
             0
         };
-        // When a wide glyph armed pending-wrap, the cursor sits on the
-        // width-0 spacer in the last column; the glyph that re-arms the wrap
-        // is the wide head one column to the left, so aim the CUP there.
-        let wide_pending = self.cursor.pending_wrap
-            && self.cursor.col > 0
-            && self
-                .scr()
-                .cell(self.cursor.row, self.cursor.col)
-                .is_some_and(|cell| cell.width == 0);
-        let print_col = if wide_pending {
-            self.cursor.col - 1
-        } else {
-            self.cursor.col
-        };
-        match anchor {
-            CursorAnchor::Absolute => {
-                let _ = write!(
-                    out,
-                    "\x1b[{};{}H",
-                    self.cursor.row.saturating_sub(top) + 1,
-                    print_col + 1
-                );
-            }
-            CursorAnchor::Relative => {
-                // The flow left the cursor at the end of the last grid row
-                // (row `rows-1` in the target, wherever the flow landed it).
-                // Move up to the cursor's grid row and to its column — both
-                // height-independent, so the replay is consistent whether the
-                // target is the source height or taller. Origin mode does not
-                // affect a CUU/CHA the way it affects an absolute CUP, so `top`
-                // is intentionally not applied here.
-                let up = (self.rows().saturating_sub(1)).saturating_sub(self.cursor.row);
-                out.push('\r');
-                if up > 0 {
-                    let _ = write!(out, "\x1b[{up}A");
-                }
-                if print_col > 0 {
-                    let _ = write!(out, "\x1b[{}G", print_col + 1);
-                }
-            }
+        let print_col = self.cursor_print_col();
+        if anchor == CursorAnchor::Absolute {
+            let _ = write!(
+                out,
+                "\x1b[{};{}H",
+                self.cursor.row.saturating_sub(top) + 1,
+                print_col + 1
+            );
         }
         if self.cursor.pending_wrap {
             // Re-print the final cell (a width-1 cell, or a width-2 head whose
@@ -1678,11 +1704,8 @@ mod cursor_mismatch_tests {
         assert_eq!(m.dump_vt_flat(), t.dump_vt_flat());
     }
 
-    /// Scroll region + origin mode at the source geometry. Equality with
-    /// `dump_vt` is deliberately NOT asserted: `dump_vt`'s replay branch
-    /// anchors the cursor relative to the end of its flow, but the modes
-    /// replayed in between move the cursor first — here DECSTBM and DECOM
-    /// home it (posh#228).
+    /// Scroll region + origin mode at the source geometry: the homed branch
+    /// reproduces the source.
     #[test]
     fn mirror_dump_reproduces_a_scroll_region_at_the_same_geometry() {
         assert_same_geometry_mirror_reproduces_source(&region_session());
@@ -1690,44 +1713,41 @@ mod cursor_mismatch_tests {
 
     /// Scroll region + origin mode on taller mirrors: the bounded and the full
     /// dump both take the scrollback-replay branch, so this pins that the
-    /// bound preserves `dump_vt`'s behaviour. Both currently inherit
-    /// posh#228's misplaced cursor; fixing posh#228 in the shared branch
-    /// should keep this green.
+    /// bound preserves `dump_vt`'s behaviour.
     #[test]
     fn mirror_dump_renders_a_scroll_region_like_the_full_dump_on_a_taller_mirror() {
         let t = region_session();
         assert_mirror_renders_like_full(&t, &bounded_heights(&t)[1..]);
     }
 
-    /// The correct behaviour `dump_vt` should have under a scroll region: the
-    /// replayed cursor lands where the source's is.
+    /// Under a scroll region `dump_vt`'s replayed cursor lands where the
+    /// source's is. DECSTBM and DECOM, replayed between the flow and the
+    /// cursor, home it, and a CUU from below the region stops at its top
+    /// margin; the flow-anchored position is saved before them (posh#228).
     #[test]
-    #[ignore = "posh#228: modes replayed after dump_vt's flow move the cursor its relative anchor assumes"]
     fn full_dump_reproduces_a_scroll_region_cursor_at_the_same_height() {
         let t = region_session();
         assert_eq!(mirror(24, 80, &t.dump_vt()).cursor(), t.cursor());
     }
 
-    /// A custom tab stop at the source geometry, no scroll region. Equality
-    /// with `dump_vt` is deliberately NOT asserted: the tab-stop replay
-    /// between `dump_vt`'s flow and its relative cursor anchor moves the
-    /// cursor, so `dump_vt`'s mirror puts it on row 0 (posh#228).
+    /// A custom tab stop at the source geometry, no scroll region: the homed
+    /// branch reproduces the source.
     #[test]
     fn mirror_dump_reproduces_tab_stops_at_the_same_geometry() {
         assert_same_geometry_mirror_reproduces_source(&tab_stop_session());
     }
 
-    /// A custom tab stop on taller mirrors: bounded == full, both inheriting
-    /// posh#228; fixing posh#228 in the shared branch should keep this green.
+    /// A custom tab stop on taller mirrors: bounded == full.
     #[test]
     fn mirror_dump_renders_tab_stops_like_the_full_dump_on_a_taller_mirror() {
         let t = tab_stop_session();
         assert_mirror_renders_like_full(&t, &bounded_heights(&t)[1..]);
     }
 
-    /// The correct behaviour `dump_vt` should have with a custom tab stop.
+    /// With a custom tab stop `dump_vt`'s replayed cursor lands where the
+    /// source's is, although the tab-stop replay between the flow and the
+    /// cursor emits a CUP per stop (posh#228).
     #[test]
-    #[ignore = "posh#228: modes replayed after dump_vt's flow move the cursor its relative anchor assumes"]
     fn full_dump_reproduces_a_tab_stop_session_cursor_at_the_same_height() {
         let t = tab_stop_session();
         assert_eq!(mirror(24, 80, &t.dump_vt()).cursor(), t.cursor());
