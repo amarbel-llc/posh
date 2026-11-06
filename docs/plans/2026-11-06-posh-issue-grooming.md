@@ -126,8 +126,8 @@ No ruling needed, smallest first:
 | 86 | probe: feed `\x1b[38;2;153;153;153m` split at every byte into posh-term; if green, needs a field repro or closes | S |
 | 235 | one call returning a frame dump's shape and bytes (`dump.rs:308,325`, `daemon.rs:631`), before the API freezes | S-M |
 | 237 | stop cloning in `encode_visible` (`posh-proto/src/framesync/producer.rs:204-208` etc.) | S-M |
-| 168 | About shows "requested mux, riding UDP (reason)" (`main.rs:2017-2031`, `remote/client.rs:724`); ruling only on the heading marker | S-M |
-| 245 | height grow must lower `scrollback_total` (`posh-term/src/screen.rs:247-253`); two-viewport no-duplicate test | M |
+| 168 | (About half landed, `Refs #168`; the heading marker still needs a ruling) About shows "requested mux, riding UDP (reason)" (`main.rs:2017-2031`, `remote/client.rs:724`); ruling only on the heading marker | S-M |
+| 245 | **now NEEDS-DECISION.** Option 2 changes wire semantics. For v2, the sender must skip popped rows when they re-scroll, which changes the RFC 0009 re-anchor rule and `evicted_upto`; it also risks losing rows the program overwrote in the meantime. For v1, treating a height grow as a reflow contradicts `reset_scrollback_floors_on_reflow` (a paced client still holds unshipped rows) and needs an RFC 0002 §4 statement | — |
 | 228 + 229 | un-ignore the four `dump_vt` tests (`dump.rs:1608,1633,1707,1756`) on one branch; unblocks #236 option 2 and #233 | M-L |
 | 70 | `POSH_DEBUG_LOG` loopback smoke, modelled on `just debug-agent-e2e` | M |
 | 80 | posht page-per-test alt-screen walk; unblocks #79 | M |
