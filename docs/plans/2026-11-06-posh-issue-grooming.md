@@ -119,7 +119,7 @@ No ruling needed, smallest first:
 | 78 | posht reference-render text for 16/256/truecolor (`posht/tests_visual.go`) | S |
 | 148 | named mutating `AgentOp` variants (`remote/agent.rs:1767`) | S |
 | 153 | one generic frame reassembler (`remote/mux.rs:382` vs `session/ipc.rs:238`; header endianness as a parameter) | S |
-| 163 | loopback closed-port test: does ECONNREFUSED arrive on send or recv; log at the edge | S |
+| 163 | **now NEEDS-DECISION.** A loopback test (kept in the session scratchpad, not committed) showed a *connected* UDP socket gets ECONNREFUSED from a closed port. But `Connection::client` (`datagram.rs`) never `connect()`s; it uses `send_to`, and Linux reports ICMP errors only to connected sockets, so the error surfaces on neither send nor recv. Ruling: connect the client socket, or use `IP_RECVERR`. The `mux.rs` comment calling it a "connected UDP socket" is wrong and should be fixed with that ruling | — |
 | 165 | `-a` + `POSH_AGENT_EXPORT` on detached spawn (`sshwrap.rs:987-1021`; `remote_command` at `:1602` is the model) | S |
 | 192 | palette `render.set` (seam at `remote/client.rs:188-189`) plus an RFC 0005 row | S |
 | 219 | `rerun-if-changed` on HEAD, ref and index in `posh-build/src/lib.rs` (resolve a worktree's `.git` file) | S |
