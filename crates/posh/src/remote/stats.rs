@@ -257,6 +257,22 @@ pub struct PredictSample {
     pub nocredit_matched: u64,
 }
 
+/// Client transport and prediction gauges sampled at flush time
+/// (POSH_DEBUG_LOG). Plain primitives, built at the call site, so `Stats`
+/// stays decoupled from the transport types while the adjacent `u64`s
+/// (`rto`, `send_interval`, `bytes_rx`, `bytes_tx`) are named rather than
+/// positional. `bytes_rx`/`bytes_tx` are cumulative; the rest instantaneous.
+#[derive(Clone, Copy, Default)]
+pub struct ClientGauges {
+    pub srtt: f64,
+    pub rto: u64,
+    pub send_interval: u64,
+    pub predict: PredictSample,
+    pub srtt_trig: bool,
+    pub bytes_rx: u64,
+    pub bytes_tx: u64,
+}
+
 /// One keystroke's time-to-paint, split by phase (µs): `predict` is the
 /// predictor's `on_user_byte` walk over the read's bytes, `compose` the
 /// snapshot + overlay + diff that produced the escape stream, `write` the tty
@@ -899,59 +915,29 @@ impl Stats {
     }
 
     /// Periodic client summary; no-op unless a flush is due.
-    #[allow(clippy::too_many_arguments)]
-    pub fn flush_client(
-        &mut self,
-        now: u64,
-        srtt: f64,
-        rto: u64,
-        send_interval: u64,
-        predict: PredictSample,
-        srtt_trig: bool,
-        bytes_rx: u64,
-        bytes_tx: u64,
-    ) {
+    pub fn flush_client(&mut self, now: u64, gauges: ClientGauges) {
         if self.should_flush(now) {
-            self.emit_client(
-                "client", now, srtt, rto, send_interval, predict, srtt_trig, bytes_rx, bytes_tx,
-            );
+            self.emit_client("client", now, gauges);
         }
     }
 
     /// Final client summary on loop exit; emitted whenever enabled.
-    #[allow(clippy::too_many_arguments)]
-    pub fn final_client(
-        &mut self,
-        now: u64,
-        srtt: f64,
-        rto: u64,
-        send_interval: u64,
-        predict: PredictSample,
-        srtt_trig: bool,
-        bytes_rx: u64,
-        bytes_tx: u64,
-    ) {
+    pub fn final_client(&mut self, now: u64, gauges: ClientGauges) {
         if self.enabled {
-            self.emit_client(
-                "client final", now, srtt, rto, send_interval, predict, srtt_trig, bytes_rx,
-                bytes_tx,
-            );
+            self.emit_client("client final", now, gauges);
         }
     }
 
-    #[allow(clippy::too_many_arguments)]
-    fn emit_client(
-        &mut self,
-        label: &str,
-        now: u64,
-        srtt: f64,
-        rto: u64,
-        send_interval: u64,
-        predict: PredictSample,
-        srtt_trig: bool,
-        bytes_rx: u64,
-        bytes_tx: u64,
-    ) {
+    fn emit_client(&mut self, label: &str, now: u64, gauges: ClientGauges) {
+        let ClientGauges {
+            srtt,
+            rto,
+            send_interval,
+            predict,
+            srtt_trig,
+            bytes_rx,
+            bytes_tx,
+        } = gauges;
         let bw_down = self.bandwidth(now, bytes_rx, self.last_bytes_rx);
         util::log_write(
             "stats",
@@ -1287,13 +1273,14 @@ mod tests {
         s.emit_client(
             "client",
             2000,
-            50.0,
-            200,
-            30,
-            PredictSample::default(),
-            false,
-            4096,
-            1024,
+            ClientGauges {
+                srtt: 50.0,
+                rto: 200,
+                send_interval: 30,
+                bytes_rx: 4096,
+                bytes_tx: 1024,
+                ..Default::default()
+            },
         );
         assert!(!s.dirty, "emit clears the dirty flag");
         assert_eq!(s.last_flush, 2000);
@@ -1390,17 +1377,19 @@ mod tests {
         c.emit_client(
             "client",
             1000,
-            42.0,
-            200,
-            21,
-            PredictSample {
-                active: true,
-                shown: 1,
-                ..Default::default()
+            ClientGauges {
+                srtt: 42.0,
+                rto: 200,
+                send_interval: 21,
+                predict: PredictSample {
+                    active: true,
+                    shown: 1,
+                    ..Default::default()
+                },
+                srtt_trig: false,
+                bytes_rx: 8192,
+                bytes_tx: 256,
             },
-            false,
-            8192,
-            256,
         );
 
         let mut s = enabled_stats();

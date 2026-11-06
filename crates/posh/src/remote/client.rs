@@ -28,7 +28,7 @@ use crate::remote::predict::{
     self, PredictionModel, PredictionRenderer, Predictor, RenderStyle,
 };
 use crate::remote::scrollview::{self, MouseFilter};
-use crate::remote::stats::{FrameKind, PaintSample, PredictSample, Stats};
+use crate::remote::stats::{ClientGauges, FrameKind, PaintSample, PredictSample, Stats};
 use crate::remote::sync::{
     self, ClientMessage, FragmentAssembly, Fragmenter, FrameBody, InputOutbox, ScrollbackRing,
     ServerFrame, HEARTBEAT_INTERVAL,
@@ -1935,13 +1935,15 @@ fn client_loop(
     let predict_stats = st.predict.stats();
     st.stats.final_client(
         now,
-        st.wire.srtt(),
-        st.wire.rto(),
-        st.wire.send_interval(),
-        predict_sample(&predict_stats),
-        predict_stats.srtt_trigger,
-        st.wire.bytes_rx(),
-        st.wire.bytes_tx(),
+        ClientGauges {
+            srtt: st.wire.srtt(),
+            rto: st.wire.rto(),
+            send_interval: st.wire.send_interval(),
+            predict: predict_sample(&predict_stats),
+            srtt_trig: predict_stats.srtt_trigger,
+            bytes_rx: st.wire.bytes_rx(),
+            bytes_tx: st.wire.bytes_tx(),
+        },
     );
     result
 }
@@ -2469,13 +2471,15 @@ fn drive_client(
         let predict_stats = st.predict.stats();
         st.stats.flush_client(
             now,
-            st.wire.srtt(),
-            st.wire.rto(),
-            st.wire.send_interval(),
-            predict_sample(&predict_stats),
-            predict_stats.srtt_trigger,
-            st.wire.bytes_rx(),
-            st.wire.bytes_tx(),
+            ClientGauges {
+                srtt: st.wire.srtt(),
+                rto: st.wire.rto(),
+                send_interval: st.wire.send_interval(),
+                predict: predict_sample(&predict_stats),
+                srtt_trig: predict_stats.srtt_trigger,
+                bytes_rx: st.wire.bytes_rx(),
+                bytes_tx: st.wire.bytes_tx(),
+            },
         );
 
         let session_due = send_now

@@ -17,7 +17,7 @@ use crate::remote::introspect;
 use crate::remote::kittykeys::{match_kitty_seqs, KittyMatch, ESCAPE_KEY, KITTY_PALETTE_SEQS};
 use crate::remote::palette::{composite_palette, Palette, PaletteEvent};
 use crate::remote::scrollview;
-use crate::remote::stats::{FrameKind, PredictSample, Stats};
+use crate::remote::stats::{ClientGauges, FrameKind, Stats};
 use crate::remote::sync::{FrameBody, ScrollbackRing, ServerFrame};
 use crate::session::ipc::{self, FrameBuffer, Tag};
 use crate::session::{daemon, Config};
@@ -2014,13 +2014,11 @@ fn client_loop(
             }
             fr.stats.flush_client(
                 now,
-                0.0,
-                0,
-                0,
-                PredictSample::default(),
-                false,
-                bytes_rx,
-                bytes_tx,
+                ClientGauges {
+                    bytes_rx,
+                    bytes_tx,
+                    ..Default::default()
+                },
             );
         }
     };
@@ -2028,13 +2026,11 @@ fn client_loop(
     if let Some(fr) = frame_renderer.as_mut() {
         fr.stats.final_client(
             util::now_ms(),
-            0.0,
-            0,
-            0,
-            PredictSample::default(),
-            false,
-            bytes_rx,
-            bytes_tx,
+            ClientGauges {
+                bytes_rx,
+                bytes_tx,
+                ..Default::default()
+            },
         );
     }
     // Tear down the palette renderer (if any) on every loop exit — detach,
