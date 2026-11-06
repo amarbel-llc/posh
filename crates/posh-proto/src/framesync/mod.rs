@@ -93,14 +93,41 @@ impl FrameSync {
 /// carry, so an encoder can detect a transition a morph cannot express and
 /// fall back to a keyframe.
 ///
-/// `Clone` so a harness can retain each produced frame's baseline and advance
-/// its "acked" base to any of them deterministically (github #75); production
-/// builds one per frame and never clones.
+/// The owned form, for a harness that retains each produced frame's baseline
+/// and advances its "acked" base to any of them deterministically (github
+/// #75); encoders take the borrowed [`BaselineRef`] ([`Baseline::view`]), so
+/// production's `FrameProducer` hands its acked base over without a copy
+/// (posh#237).
 #[derive(Clone)]
 pub struct Baseline {
     pub num: u64,
     pub dump: Vec<u8>,
     pub snapshot: Snapshot,
+    pub alt_screen: bool,
+    pub rows: u16,
+    pub cols: u16,
+}
+
+impl Baseline {
+    pub fn view(&self) -> BaselineRef<'_> {
+        BaselineRef {
+            num: self.num,
+            dump: &self.dump,
+            snapshot: &self.snapshot,
+            alt_screen: self.alt_screen,
+            rows: self.rows,
+            cols: self.cols,
+        }
+    }
+}
+
+/// A [`Baseline`] borrowed from wherever its owner keeps the acked frame's
+/// state: what an encoder reads.
+#[derive(Clone, Copy)]
+pub struct BaselineRef<'a> {
+    pub num: u64,
+    pub dump: &'a [u8],
+    pub snapshot: &'a Snapshot,
     pub alt_screen: bool,
     pub rows: u16,
     pub cols: u16,
@@ -121,7 +148,7 @@ pub struct CurrentFrame<'a> {
 /// frame's state — first frame, post-loss). The returned body is anchored to
 /// `acked.num` when incremental, or self-contained (`Full`) as a keyframe.
 pub trait FrameEncoder {
-    fn encode(&mut self, acked: Option<&Baseline>, cur: &CurrentFrame<'_>) -> FrameBody;
+    fn encode(&mut self, acked: Option<&BaselineRef<'_>>, cur: &CurrentFrame<'_>) -> FrameBody;
 }
 
 /// What applying a body did to the client model, so the caller can keep its
@@ -285,7 +312,7 @@ mod tests {
                 cols: term_b.cols(),
             };
             let mut enc = MorphDelta::default();
-            let body = enc.encode(Some(&baseline), &cur);
+            let body = enc.encode(Some(&baseline.view()), &cur);
             let escapes_len = match &body {
                 FrameBody::Morph { escapes, .. } => escapes.len(),
                 other => panic!("[{name}] expected Morph for an expressible pair, got {other:?}"),
@@ -342,7 +369,7 @@ mod tests {
                 cols: term_b.cols(),
             };
             let mut enc = MorphDelta::default();
-            matches!(enc.encode(Some(&baseline), &cur), FrameBody::Full(_))
+            matches!(enc.encode(Some(&baseline.view()), &cur), FrameBody::Full(_))
         };
 
         // Alt-screen ENTER: a (primary) -> b (alt screen).
@@ -354,7 +381,7 @@ mod tests {
         assert!(!a.is_alt_screen() && b.is_alt_screen());
         assert!(chose_full(&a, &b), "alt-screen enter must be a Full keyframe");
         assert!(
-            !morph_expressible(&baseline_from(1, &a), &CurrentFrame {
+            !morph_expressible(&baseline_from(1, &a).view(), &CurrentFrame {
                 dump: &b.dump_vt(),
                 snapshot: &Snapshot::from_term(&b),
                 alt_screen: b.is_alt_screen(),

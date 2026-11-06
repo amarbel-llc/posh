@@ -29,7 +29,7 @@ use crate::display;
 use crate::frame::FrameBody;
 
 use super::dumpdiff::DumpDiff;
-use super::{ApplyOutcome, Baseline, CurrentFrame, FrameApplier, FrameEncoder};
+use super::{ApplyOutcome, BaselineRef, CurrentFrame, FrameApplier, FrameEncoder};
 
 #[derive(Default)]
 pub struct MorphDelta {
@@ -43,7 +43,7 @@ pub struct MorphDelta {
 /// Whether the acked→current transition can be expressed as a forward morph,
 /// or must be a `Full` keyframe. Pulled out so the encoder-chooses-Full tests
 /// can assert the boundary directly.
-pub(super) fn morph_expressible(acked: &Baseline, cur: &CurrentFrame<'_>) -> bool {
+pub(super) fn morph_expressible(acked: &BaselineRef<'_>, cur: &CurrentFrame<'_>) -> bool {
     // `new_frame` syncs only the fields a Snapshot carries. Alt-screen and
     // dimensions are not among them, so a transition that changes either is not
     // morph-expressible and must be a keyframe.
@@ -51,11 +51,11 @@ pub(super) fn morph_expressible(acked: &Baseline, cur: &CurrentFrame<'_>) -> boo
 }
 
 impl FrameEncoder for MorphDelta {
-    fn encode(&mut self, acked: Option<&Baseline>, cur: &CurrentFrame<'_>) -> FrameBody {
+    fn encode(&mut self, acked: Option<&BaselineRef<'_>>, cur: &CurrentFrame<'_>) -> FrameBody {
         match acked {
             Some(base) if morph_expressible(base, cur) => {
                 // initialized=true => a forward diff (morph), not a full repaint.
-                let escapes = display::new_frame(true, &base.snapshot, cur.snapshot, false);
+                let escapes = display::new_frame(true, base.snapshot, cur.snapshot, false);
                 FrameBody::Morph {
                     base: base.num,
                     base_sum: None, // server fills it when CAP_BASE_SUM is negotiated
@@ -99,12 +99,12 @@ impl FrameApplier for MorphDelta {
     }
 }
 
-/// Test helper: a [`Baseline`] from a frame number and the terminal at that
-/// frame. The production server builds its baseline from the acked
-/// `FrameState` fields directly (`server.rs`), so this is test-only.
+/// Test helper: a [`super::Baseline`] from a frame number and the terminal at
+/// that frame. The production producer lends its acked base directly
+/// (`FrameProducer::encode_visible`), so this is test-only.
 #[cfg(test)]
-pub(super) fn baseline_from(num: u64, term: &Terminal) -> Baseline {
-    Baseline {
+pub(super) fn baseline_from(num: u64, term: &Terminal) -> super::Baseline {
+    super::Baseline {
         num,
         dump: term.dump_vt(),
         snapshot: crate::display::Snapshot::from_term(term),

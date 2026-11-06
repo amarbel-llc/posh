@@ -84,7 +84,7 @@ impl ServerSide {
             rows: baseline.rows,
             cols: baseline.cols,
         };
-        let body = lane.enc.encode(lane.acked.as_ref(), &cur);
+        let body = lane.enc.encode(lane.acked.as_ref().map(Baseline::view).as_ref(), &cur);
         lane.produced.push_back(baseline);
         lane.send_frame(ServerFrame {
             flags: 0,

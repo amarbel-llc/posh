@@ -9,20 +9,20 @@ use posh_term::Terminal;
 
 use crate::frame::{self, FrameBody};
 
-use super::{ApplyOutcome, Baseline, CurrentFrame, FrameApplier, FrameEncoder};
+use super::{ApplyOutcome, BaselineRef, CurrentFrame, FrameApplier, FrameEncoder};
 
 #[derive(Default)]
 pub struct DumpDiff;
 
 impl FrameEncoder for DumpDiff {
-    fn encode(&mut self, acked: Option<&Baseline>, cur: &CurrentFrame<'_>) -> FrameBody {
+    fn encode(&mut self, acked: Option<&BaselineRef<'_>>, cur: &CurrentFrame<'_>) -> FrameBody {
         // Verbatim from server.rs: diff against the acked dump when we hold it
         // and the diff is a net win, else a full dump. The diff-economics
         // sampling (stats.record_diff_frame / record_full_frame) stays in
         // server.rs where the Stats live; this returns only the chosen body.
         match acked {
             Some(base) => {
-                let diff = frame::make_diff(&base.dump, cur.dump);
+                let diff = frame::make_diff(base.dump, cur.dump);
                 if diff.len() + 8 < cur.dump.len() {
                     FrameBody::Diff {
                         base: base.num,

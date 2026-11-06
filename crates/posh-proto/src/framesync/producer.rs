@@ -24,16 +24,22 @@
 //! and [`FrameProducer::encode_visible`] selects on each call, mirroring the
 //! server's per-message `CAP_MORPH` reading.
 
+use std::rc::Rc;
+
 use crate::display::Snapshot;
 use crate::frame::FrameBody;
 
-use super::{Baseline, CurrentFrame, DumpDiff, FrameEncoder, MorphDelta};
+use super::{BaselineRef, CurrentFrame, DumpDiff, FrameEncoder, MorphDelta};
 
 /// One produced frame's retained state — the diff/morph base a later frame is
 /// encoded against, and the unit of `current`/`outstanding`. Visible and
 /// scrollback frames share the struct (a scrollback frame inherits the visible
 /// fields and only advances `sb_total`), so it is owned by the producer rather
 /// than split.
+///
+/// The dump and snapshot are shared (`Rc`), not copied, between the frames
+/// and the acked base that hold the same screen: a fallback dump is
+/// ring-sized (~1 MiB), and copying it on every ack or encode was posh#237.
 struct ProducedFrame {
     num: u64,
     /// The visible-screen frame dump as of this frame — the bytes the caller
@@ -42,11 +48,11 @@ struct ProducedFrame {
     /// scrollback frame leaves the visible screen unchanged, so it records the
     /// same visible bytes as the frame before it, keeping the diff-base chain
     /// intact across interleaved scrollback frames.
-    data: Vec<u8>,
+    data: Rc<Vec<u8>>,
     /// The rendered screen state as of this frame — the morph base for a later
     /// `Morph` (#15), captured alongside `data` so acking this frame gives the
     /// MorphDelta encoder both bases. Inherited identically by a scrollback frame.
-    snapshot: Snapshot,
+    snapshot: Rc<Snapshot>,
     /// Off-`Snapshot` terminal state at this frame: whether the alt screen is
     /// active and the dimensions. The MorphDelta encoder reads these to detect a
     /// transition a morph cannot express (alt-screen toggle, resize) and fall
@@ -74,10 +80,10 @@ pub struct FrameProducer {
     /// The acked frame's dump (its `ProducedFrame::data`, the byte-diff base),
     /// or `None` when the server no longer holds the acked frame's state and
     /// must send a `Full`.
-    acked_data: Option<Vec<u8>>,
+    acked_data: Option<Rc<Vec<u8>>>,
     /// The acked frame's morph base — rendered snapshot + off-`Snapshot`
     /// alt-screen/dims. `Some` exactly when `acked_data` is.
-    acked_baseline: Option<(Snapshot, bool, (u16, u16))>,
+    acked_baseline: Option<(Rc<Snapshot>, bool, (u16, u16))>,
     /// Frames sent but not yet superseded by the acked-newest, retained so an
     /// ack landing on one of them can recover its base. Bounded to the most
     /// recent 8.
@@ -104,15 +110,15 @@ impl FrameProducer {
         FrameProducer {
             current: ProducedFrame {
                 num: 0,
-                data: Vec::new(),
-                snapshot: Snapshot::blank(rows, cols),
+                data: Rc::default(),
+                snapshot: Rc::new(Snapshot::blank(rows, cols)),
                 alt_screen: false,
                 dims: (rows, cols),
                 sb_total: 0,
             },
             acked_num: 0,
-            acked_data: Some(Vec::new()),
-            acked_baseline: Some((Snapshot::blank(rows, cols), false, (rows, cols))),
+            acked_data: Some(Rc::default()),
+            acked_baseline: Some((Rc::new(Snapshot::blank(rows, cols)), false, (rows, cols))),
             outstanding: Vec::new(),
             // Frame 0 is the implicit blank base both sides share: visible and
             // attested by construction.
@@ -152,7 +158,7 @@ impl FrameProducer {
     /// The acked diff base bytes, for the base-checksum stamp (RFC 0006) the
     /// caller applies after encoding.
     pub fn acked_dump(&self) -> Option<&[u8]> {
-        self.acked_data.as_deref()
+        self.acked_data.as_deref().map(Vec::as_slice)
     }
 
     /// Whether an acked base is held — `false` after a lost base, when the next
@@ -180,8 +186,8 @@ impl FrameProducer {
         self.visible_directly_acked = false;
         self.rotate_current(ProducedFrame {
             num,
-            data: dump,
-            snapshot,
+            data: Rc::new(dump),
+            snapshot: Rc::new(snapshot),
             alt_screen: alt,
             dims,
             sb_total,
@@ -204,8 +210,8 @@ impl FrameProducer {
             match (self.acked_data.clone(), self.acked_baseline.clone()) {
                 (Some(d), Some((s, a, dim))) => (d, s, a, dim),
                 _ => (
-                    self.current.data.clone(),
-                    self.current.snapshot.clone(),
+                    Rc::clone(&self.current.data),
+                    Rc::clone(&self.current.snapshot),
                     self.current.alt_screen,
                     self.current.dims,
                 ),
@@ -237,8 +243,8 @@ impl FrameProducer {
         let num = self.current.num + 1;
         let next = ProducedFrame {
             num,
-            data: self.current.data.clone(),
-            snapshot: self.current.snapshot.clone(),
+            data: Rc::clone(&self.current.data),
+            snapshot: Rc::clone(&self.current.snapshot),
             alt_screen: self.current.alt_screen,
             dims: self.current.dims,
             sb_total,
@@ -251,18 +257,10 @@ impl FrameProducer {
     /// advance paths so the slot machinery is identical for visible and
     /// scrollback frames.
     fn rotate_current(&mut self, next: ProducedFrame) {
-        self.outstanding.push(ProducedFrame {
-            num: self.current.num,
-            data: std::mem::take(&mut self.current.data),
-            snapshot: std::mem::replace(&mut self.current.snapshot, Snapshot::blank(1, 1)),
-            alt_screen: self.current.alt_screen,
-            dims: self.current.dims,
-            sb_total: self.current.sb_total,
-        });
+        self.outstanding.push(std::mem::replace(&mut self.current, next));
         if self.outstanding.len() > 8 {
             self.outstanding.remove(0);
         }
-        self.current = next;
     }
 
     /// Encode the current visible frame's body against the acked baseline with
@@ -271,12 +269,12 @@ impl FrameProducer {
     pub fn encode_visible(&mut self, use_morph: bool) -> FrameBody {
         // The acked baseline (Some exactly when acked_data is) gives the encoder
         // both the byte-diff base (dump) and the morph base (snapshot +
-        // off-Snapshot alt/dims).
+        // off-Snapshot alt/dims), borrowed rather than copied (posh#237).
         let baseline = self.acked_data.as_ref().zip(self.acked_baseline.as_ref()).map(
-            |(dump, (snapshot, alt, dims))| Baseline {
+            |(dump, (snapshot, alt, dims))| BaselineRef {
                 num: self.acked_num,
-                dump: dump.clone(),
-                snapshot: snapshot.clone(),
+                dump,
+                snapshot,
                 alt_screen: *alt,
                 rows: dims.0,
                 cols: dims.1,
@@ -322,8 +320,8 @@ impl FrameProducer {
         // `current` or the retained outstanding frame.
         let acked = if acked_frame == self.current.num {
             Some((
-                self.current.data.clone(),
-                self.current.snapshot.clone(),
+                Rc::clone(&self.current.data),
+                Rc::clone(&self.current.snapshot),
                 self.current.alt_screen,
                 self.current.dims,
                 self.current.sb_total,
@@ -331,8 +329,8 @@ impl FrameProducer {
         } else {
             self.outstanding.iter().find(|f| f.num == acked_frame).map(|f| {
                 (
-                    f.data.clone(),
-                    f.snapshot.clone(),
+                    Rc::clone(&f.data),
+                    Rc::clone(&f.snapshot),
                     f.alt_screen,
                     f.dims,
                     f.sb_total,
@@ -473,8 +471,8 @@ mod tests {
     fn ack_rejects_frames_never_sent_then_advances_on_a_real_ack() {
         let frame = |num: u64, data: &[u8], sb_total: u64| ProducedFrame {
             num,
-            data: data.to_vec(),
-            snapshot: Snapshot::blank(ROWS, COLS),
+            data: Rc::new(data.to_vec()),
+            snapshot: Rc::new(Snapshot::blank(ROWS, COLS)),
             alt_screen: false,
             dims: (ROWS, COLS),
             sb_total,
@@ -482,8 +480,8 @@ mod tests {
         let mut p = FrameProducer {
             current: frame(3, b"current", 7),
             acked_num: 1,
-            acked_data: Some(b"one".to_vec()),
-            acked_baseline: Some((Snapshot::blank(ROWS, COLS), false, (ROWS, COLS))),
+            acked_data: Some(Rc::new(b"one".to_vec())),
+            acked_baseline: Some((Rc::new(Snapshot::blank(ROWS, COLS)), false, (ROWS, COLS))),
             outstanding: vec![frame(1, b"one", 2), frame(2, b"two", 5)],
             last_visible_num: 3,
             visible_directly_acked: false,
@@ -494,14 +492,14 @@ mod tests {
         // Ack for a frame never sent: ignored, nothing moves, no sb_total.
         assert_eq!(p.ack(u64::MAX), None, "ack for a frame never sent is ignored");
         assert_eq!(p.acked_num, 1);
-        assert_eq!(p.acked_data.as_deref(), Some(b"one".as_slice()));
+        assert_eq!(p.acked_dump(), Some(b"one".as_slice()));
         assert_eq!(p.outstanding.len(), 2, "outstanding frames are kept");
 
         // A legitimate ack of the newest frame advances and carries its
         // scrollback coverage forward (RFC 0002 §2).
         assert_eq!(p.ack(3), Some(7), "a real ack returns the frame's sb_total");
         assert_eq!(p.acked_num, 3);
-        assert_eq!(p.acked_data.as_deref(), Some(b"current".as_slice()));
+        assert_eq!(p.acked_dump(), Some(b"current".as_slice()));
         assert!(p.acked_baseline.is_some(), "the morph baseline tracks acked_data");
         assert!(p.outstanding.is_empty());
     }
