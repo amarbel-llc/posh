@@ -2495,6 +2495,56 @@ debug-posh-server-smoke secs="600":
     # per-pid sink (<runtime>/posh/posh-server-<pid>.log), not a pre-armed file.
     env -u POSH_DEBUG_LOG target/debug/posh server new -4 -- sleep '{{ secs }}'
 
+# End-to-end smoke for POSH_DEBUG_LOG (github #70): a loopback roaming server
+# and a real `posh client` over UDP, both armed with ONE temp POSH_DEBUG_LOG,
+# then asserts the log gained `[stats]: client ...` and `[stats]: server ...`
+# lines carrying their keys. Covers the wiring the unit tests cannot: the
+# client needs a tty (it runs under `poshterity record`, which gives it a pty
+# and drives it with a script), and the per-process LOGGER and env are global,
+# so it is a serialized lane of two real processes, not a parallel cargo test.
+# The server's command prints a line every 200 ms so frames keep flowing and
+# both sides have something to flush (stats lines are emitted only when dirty,
+# at most once a second). Prints the matching lines on success; on failure,
+# the whole log. The detached server exits with the client's shutdown (both
+# write a `final` line), or else on its POSH_SERVER_NETWORK_TMOUT (5 s).
+# Debug-only; the hermetic gate is build-rust.
+#
+# smoke-test POSH_DEBUG_LOG over a loopback server + client
+[group("debug")]
+debug-posh-debug-log-smoke:
+    #!/usr/bin/env bash
+    set -euo pipefail
+    cd '{{ justfile_directory() }}'
+    nix develop --command cargo build -q -p posh -p poshterity
+    posh="$PWD/target/debug/posh"; pt="$PWD/target/debug/poshterity"
+    dir="$(mktemp -d /tmp/posh-dlog-XXXXXX)"
+    trap 'rm -rf "$dir"' EXIT
+    log="$dir/debug.log"
+    out=$(POSH_DEBUG_LOG="$log" POSH_SERVER_NETWORK_TMOUT=5 \
+        "$posh" server new -4 -- sh -c 'while :; do echo tick; sleep 0.2; done')
+    read -r port key < <(awk '/POSH CONNECT/ {print $3, $4}' <<<"$out")
+    # Wait for the session on the client's screen, then let both stats
+    # collectors pass a few flush intervals before the script ends and
+    # poshterity hangs the client up.
+    printf 'wait-for tick\nsleep 3\n' >"$dir/drive"
+    POSH_KEY="$key" POSH_DEBUG_LOG="$log" "$pt" record --out "$dir/client.castx" \
+        --size 80x24 --script "$dir/drive" -- "$posh" client -4 127.0.0.1 "$port" >/dev/null
+    missing=()
+    for key in '[stats]: client srtt=' 'frames rx=' 'bytes_rx=' 'predict active=' \
+        'render writes=' 'loop iters=' \
+        '[stats]: server srtt=' 'frames tx=' 'diff_saved=' 'bytes_tx=' 'retransmit='; do
+      grep -qF -- "$key" "$log" || missing+=("$key")
+    done
+    if [ "${#missing[@]}" -gt 0 ]; then
+      echo "debug-posh-debug-log-smoke: FAIL — missing from $log:" >&2
+      printf '  %s\n' "${missing[@]}" >&2
+      echo "== log ==" >&2
+      cat "$log" >&2
+      exit 1
+    fi
+    grep -F '[stats]:' "$log"
+    echo "debug-posh-debug-log-smoke: ok — client and server stats lines present"
+
 # Reproduce the daemon's MAX_CLIENT_BACKLOG (16 MiB) client-drop (github #11):
 # spawn an ISOLATED local session (own POSH_DIR) whose command floods stdout,
 # connect a STALLED reader (a raw unix-socket client that never drains — see
