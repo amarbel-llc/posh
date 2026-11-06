@@ -123,6 +123,51 @@ struct EmitState {
 ///   sequence; `\x1b[3g` alone clears them all, which is worse than inheriting.
 pub const DRAWABLE_STATE_RESET: &str = "\x1b[r\x1b[?6l\x1b[?5l\x1b[?7h\x1b[?12l\x1b[?2026l\x1b[20l\x1b[4l\x1b(B\x1b)B\x0f\x1b[0m\x1b[0\"q\x1b]8;;\x1b\\";
 
+/// A frame dump from [`Terminal::dump_vt_mirror`] together with its shape:
+/// the bytes and the mirror geometry they are bounded for come from one
+/// call, so a caller cannot record a shape its bytes do not have (posh#235).
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct MirrorDump {
+    bytes: Vec<u8>,
+    shaped_for: Option<(u16, u16)>,
+    /// The building terminal's `(rows, cols)`, which decides every other
+    /// geometry `dump_vt_mirror` would answer with these same bytes.
+    source: (u16, u16),
+}
+
+impl MirrorDump {
+    pub fn bytes(&self) -> &[u8] {
+        &self.bytes
+    }
+
+    pub fn into_bytes(self) -> Vec<u8> {
+        self.bytes
+    }
+
+    /// `Some((rows, cols))` when the replay is bounded for a mirror of that
+    /// size (the dump is shaped for it), `None` when these are `dump_vt`'s
+    /// full bytes, which render on a mirror of any size.
+    pub fn shaped_for(&self) -> Option<(u16, u16)> {
+        self.shaped_for
+    }
+
+    /// Whether `dump_vt_mirror(mirror_rows, mirror_cols)` on the terminal
+    /// that built this dump, unchanged since, returns this same dump: what
+    /// lets clients of different sizes share one.
+    pub fn is_dump_for(&self, mirror_rows: u16, mirror_cols: u16) -> bool {
+        match self.shaped_for {
+            Some(geometry) => geometry == (mirror_rows, mirror_cols),
+            None => !mirror_is_bounded(self.source, mirror_rows, mirror_cols),
+        }
+    }
+}
+
+/// The geometry rule of [`Terminal::dump_vt_mirror`]: it bounds the replay
+/// for a mirror of the source's width and at least its height.
+fn mirror_is_bounded(source: (u16, u16), mirror_rows: u16, mirror_cols: u16) -> bool {
+    mirror_cols == source.1 && mirror_rows >= source.0
+}
+
 /// How [`Terminal::dump_cursor`] positions the cursor: `Absolute` (a CUP from
 /// home, for paths that redraw the grid from `\x1b[H`) or `Relative` (anchored to
 /// the bottom of a continuous content flow, for the scrollback-replay path — so a
@@ -306,8 +351,16 @@ impl Terminal {
     ///   shows the head's text instead of blank. The homed branch keeps the
     ///   text and cursor but, as always, drops a grid head's soft-wrap flag,
     ///   which nothing can regenerate by replay.
-    pub fn dump_vt_mirror(&self, mirror_rows: u16, mirror_cols: u16) -> Vec<u8> {
-        let tail = if !self.dump_vt_mirror_is_bounded(mirror_rows, mirror_cols) {
+    ///
+    /// The returned [`MirrorDump`] carries the shape with the bytes: a
+    /// bounded dump is shaped for that mirror size, while the fallback renders
+    /// on a mirror of any size. Callers use the shape to share one dump
+    /// between mirrors ([`MirrorDump::is_dump_for`]), and to know when a
+    /// mirror's resize makes its in-flight frames stale.
+    pub fn dump_vt_mirror(&self, mirror_rows: u16, mirror_cols: u16) -> MirrorDump {
+        let source = (self.rows(), self.cols());
+        let bounded = mirror_is_bounded(source, mirror_rows, mirror_cols);
+        let tail = if !bounded {
             usize::MAX
         } else if mirror_rows == self.rows() {
             0
@@ -315,17 +368,11 @@ impl Terminal {
             // Taller (bounded), so this cannot underflow.
             2 * usize::from(mirror_rows) - usize::from(self.rows())
         };
-        self.dump_vt_tail(tail)
-    }
-
-    /// Whether [`Terminal::dump_vt_mirror`] bounds the scrollback replay for a
-    /// mirror of this geometry (same width, at least this height), as opposed
-    /// to falling back to `dump_vt`'s bytes. A bounded dump is shaped for that
-    /// mirror size; the fallback renders on a mirror of any size. Callers use
-    /// this to share one dump between mirrors that all get the fallback, and
-    /// to know when a mirror's resize makes its in-flight frames stale.
-    pub fn dump_vt_mirror_is_bounded(&self, mirror_rows: u16, mirror_cols: u16) -> bool {
-        mirror_cols == self.cols() && mirror_rows >= self.rows()
+        MirrorDump {
+            bytes: self.dump_vt_tail(tail),
+            shaped_for: bounded.then_some((mirror_rows, mirror_cols)),
+            source,
+        }
     }
 
     /// [`Terminal::dump_vt`] with the scrollback replay bounded to the NEWEST
@@ -1331,7 +1378,7 @@ mod cursor_mismatch_tests {
     fn assert_mirror_renders_like_full(t: &Terminal, heights: &[u16]) {
         let full = t.dump_vt();
         for &rows in heights {
-            let bounded = t.dump_vt_mirror(rows, t.cols());
+            let bounded = t.dump_vt_mirror(rows, t.cols()).into_bytes();
             assert!(
                 bounded.len() < full.len(),
                 "rows={rows}: the bounded dump ({} bytes) must be shorter than dump_vt ({} bytes)",
@@ -1362,23 +1409,43 @@ mod cursor_mismatch_tests {
         assert_mirror_renders_like_full(&t, &bounded_heights(&t));
     }
 
-    /// `dump_vt_mirror_is_bounded` names the rule `dump_vt_mirror` applies:
-    /// over a deep ring, it holds exactly where the dump differs from
-    /// `dump_vt`'s bytes. Every geometry outside "same width, at least as
-    /// tall" gets `dump_vt`'s exact bytes. (This also covers the unbounded row
-    /// tail being `dump_vt`, which `posh history` and the frozen API depend
-    /// on.)
+    /// A mirror dump's shape names the rule that built its bytes: over a deep
+    /// ring, it is bounded exactly where the dump differs from `dump_vt`'s
+    /// bytes. Every geometry outside "same width, at least as tall" gets
+    /// `dump_vt`'s exact bytes. (This also covers the unbounded row tail being
+    /// `dump_vt`, which `posh history` and the frozen API depend on.)
     #[test]
-    fn mirror_dump_is_bounded_agrees_with_dump_vt_mirror() {
+    fn mirror_dump_shape_agrees_with_its_bytes() {
         let t = scrolled(24, 80, 1000, 500);
         let full = t.dump_vt();
         for rows in bounded_heights(&t) {
-            assert!(t.dump_vt_mirror_is_bounded(rows, 80), "{rows}x80 is bounded");
-            assert!(t.dump_vt_mirror(rows, 80) != full, "{rows}x80's dump is bounded");
+            let dump = t.dump_vt_mirror(rows, 80);
+            assert_eq!(dump.shaped_for(), Some((rows, 80)), "{rows}x80 is bounded");
+            assert!(dump.bytes() != full, "{rows}x80's dump is bounded");
         }
         for (rows, cols) in [(0, 0), (10, 80), (23, 80), (24, 120), (32, 120), (24, 60), (32, 60)] {
-            assert!(!t.dump_vt_mirror_is_bounded(rows, cols), "{rows}x{cols} falls back");
-            assert!(t.dump_vt_mirror(rows, cols) == full, "{rows}x{cols}'s dump is dump_vt's");
+            let dump = t.dump_vt_mirror(rows, cols);
+            assert_eq!(dump.shaped_for(), None, "{rows}x{cols} falls back");
+            assert!(dump.bytes() == full, "{rows}x{cols}'s dump is dump_vt's");
+        }
+    }
+
+    /// `is_dump_for` answers exactly where `dump_vt_mirror` would return the
+    /// same dump: a bounded dump serves only its own geometry, the fallback
+    /// every geometry that also falls back.
+    #[test]
+    fn mirror_dump_is_dump_for_exactly_the_geometries_that_build_it() {
+        let t = scrolled(24, 80, 1000, 500);
+        let geometries = [(0, 0), (10, 80), (23, 80), (24, 80), (25, 80), (32, 80), (24, 120), (32, 60)];
+        for &(rows, cols) in &geometries {
+            let dump = t.dump_vt_mirror(rows, cols);
+            for &(r, c) in &geometries {
+                assert_eq!(
+                    dump.is_dump_for(r, c),
+                    t.dump_vt_mirror(r, c) == dump,
+                    "the dump for {rows}x{cols}, asked about {r}x{c}",
+                );
+            }
         }
     }
 
@@ -1388,9 +1455,9 @@ mod cursor_mismatch_tests {
     fn mirror_dump_size_is_independent_of_ring_depth() {
         let t = scrolled(50, 200, 10_000, 20_000);
         assert!(t.dump_vt().len() > 200_000, "premise: the full dump carries the ring");
-        let same = t.dump_vt_mirror(50, 200);
+        let same = t.dump_vt_mirror(50, 200).into_bytes();
         assert!(same.len() < 16_384, "same-geometry dump was {} bytes", same.len());
-        let taller = t.dump_vt_mirror(100, 200);
+        let taller = t.dump_vt_mirror(100, 200).into_bytes();
         assert!(taller.len() < 65_536, "taller-mirror dump was {} bytes", taller.len());
     }
 
@@ -1402,7 +1469,7 @@ mod cursor_mismatch_tests {
         let t = scrolled(24, 80, 1000, 500);
         for rows in bounded_heights(&t).into_iter().skip(1) {
             let tail = 2 * usize::from(rows) - usize::from(t.rows());
-            assert!(t.dump_vt_mirror(rows, 80) == t.dump_vt_tail(tail), "rows={rows}");
+            assert!(t.dump_vt_mirror(rows, 80).into_bytes() == t.dump_vt_tail(tail), "rows={rows}");
         }
     }
 
@@ -1428,7 +1495,7 @@ mod cursor_mismatch_tests {
     fn mirror_dump_clamps_to_the_rows_the_ring_holds() {
         let t = scrolled(24, 80, 1000, 30); // only a handful of rows have scrolled off
         assert!(t.primary_scrollback_len() > 0 && t.primary_scrollback_len() < 10);
-        assert!(t.dump_vt_mirror(25, 80) == t.dump_vt());
+        assert!(t.dump_vt_mirror(25, 80).into_bytes() == t.dump_vt());
     }
 
     /// A scrolled 24x80 session whose grid holds a soft-wrapped line.
@@ -1576,7 +1643,7 @@ mod cursor_mismatch_tests {
         t.process(b"\x1b[3;10HALT-TOP\x1b[24;1HALT-BOTTOM\x1b[12;5HALT-CURSOR");
         assert_mirror_renders_like_full(&t, &bounded_heights(&t));
         for rows in bounded_heights(&t) {
-            let mut bounded = mirror(rows, 80, &t.dump_vt_mirror(rows, 80));
+            let mut bounded = mirror(rows, 80, t.dump_vt_mirror(rows, 80).bytes());
             let mut full = mirror(rows, 80, &t.dump_vt());
             bounded.process(b"\x1b[?1049l");
             full.process(b"\x1b[?1049l");
@@ -1606,7 +1673,7 @@ mod cursor_mismatch_tests {
     /// branch with an absolute CUP, so where `dump_vt` is known to be wrong it
     /// is asserted against the SOURCE (cursor and visible state) instead.
     fn assert_same_geometry_mirror_reproduces_source(t: &Terminal) {
-        let m = mirror(t.rows(), t.cols(), &t.dump_vt_mirror(t.rows(), t.cols()));
+        let m = mirror(t.rows(), t.cols(), t.dump_vt_mirror(t.rows(), t.cols()).bytes());
         assert_eq!(m.cursor(), t.cursor());
         assert_eq!(m.dump_vt_flat(), t.dump_vt_flat());
     }
@@ -1690,7 +1757,7 @@ mod cursor_mismatch_tests {
     #[test]
     fn mirror_dump_reproduces_an_empty_continuation_at_the_same_geometry() {
         let t = empty_continuation_session();
-        let m = mirror(24, 80, &t.dump_vt_mirror(24, 80));
+        let m = mirror(24, 80, t.dump_vt_mirror(24, 80).bytes());
         assert_eq!(m.cursor(), t.cursor());
         assert_eq!(rows_text(&m), rows_text(&t));
         // The one known difference: a soft-wrap flag whose continuation row
@@ -1767,7 +1834,7 @@ mod cursor_mismatch_tests {
     #[test]
     fn mirror_dump_reproduces_a_seam_empty_continuation_at_the_same_geometry() {
         let t = seam_empty_continuation_session();
-        let m = mirror(24, 80, &t.dump_vt_mirror(24, 80));
+        let m = mirror(24, 80, t.dump_vt_mirror(24, 80).bytes());
         assert_eq!(m.cursor(), t.cursor());
         assert_eq!(rows_text(&m), rows_text(&t));
     }

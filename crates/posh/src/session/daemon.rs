@@ -7,7 +7,7 @@ use std::os::fd::{AsRawFd, RawFd};
 use std::os::unix::net::{UnixListener, UnixStream};
 
 use posh_proto::caps::SessionKind;
-use posh_term::{ScreenSwitch, Terminal};
+use posh_term::{MirrorDump, ScreenSwitch, Terminal};
 
 use crate::overlay::{close_overlay, escape_command, Overlay};
 use crate::pty::{self, PtyChild};
@@ -293,8 +293,8 @@ struct ClientConn {
     /// The geometry the newest visible dump built for this client was SHAPED
     /// FOR: `Some((rows, cols))` when `dump_vt_mirror` bounded it for that
     /// mirror size, `None` when it was the full fallback (whose in-flight
-    /// frames still apply at any size) or no visible dump has been built. Recorded where
-    /// the dump is built (`note_visible_dump_shape`), so no later moment has
+    /// frames still apply at any size) or no visible dump has been built. Recorded from
+    /// the dump itself (`note_visible_dump_shape`), so no later moment has
     /// to re-derive it; `owes_regeometry_frame` compares it with the client's
     /// current size (posh#225).
     visible_shaped_for: Option<(u16, u16)>,
@@ -620,17 +620,14 @@ impl ClientConn {
         }
     }
 
-    /// Records which geometry the visible dump about to be built from `src`
-    /// is shaped for (`visible_shaped_for`) and returns it: `Some(size)` when
-    /// `dump_vt_mirror` bounds it for this client's size, `None` for the full
+    /// Records which geometry the visible dump about to be queued is shaped
+    /// for (`visible_shaped_for`), read off the dump itself: `Some(size)` when
+    /// `dump_vt_mirror` bounded it for this client's size, `None` for the full
     /// fallback. The one place both dump-building sites (`build_frame_from`,
-    /// `broadcast_output`) note it; the return value is also
-    /// `broadcast_output`'s dump-cache key.
-    fn note_visible_dump_shape(&mut self, src: &Terminal) -> Option<(u16, u16)> {
-        self.visible_shaped_for = src
-            .dump_vt_mirror_is_bounded(self.rows, self.cols)
-            .then_some((self.rows, self.cols));
-        self.visible_shaped_for
+    /// `broadcast_output`) note it, and it returns the bytes to queue.
+    fn note_visible_dump_shape(&mut self, dump: MirrorDump) -> Vec<u8> {
+        self.visible_shaped_for = dump.shaped_for();
+        dump.into_bytes()
     }
 
     /// Whether this client is owed a frame built for its current geometry: it
@@ -912,9 +909,9 @@ impl ClientConn {
     /// the geometry this dump is shaped for is recorded in
     /// `visible_shaped_for`.
     fn build_frame_from(&mut self, src: &Terminal) -> bool {
-        self.note_visible_dump_shape(src);
+        let dump = self.note_visible_dump_shape(src.dump_vt_mirror(self.rows, self.cols));
         self.queue_frame(
-            src.dump_vt_mirror(self.rows, self.cols),
+            dump,
             Snapshot::from_term(src),
             src.is_alt_screen(),
             (src.rows(), src.cols()),
@@ -1318,33 +1315,34 @@ fn broadcast_output(clients: &mut [ClientConn], term: &Terminal, bcast: &[u8]) {
             (term.rows(), term.cols()),
         )
     });
-    // Clients that would get the same dump share it, keyed by the geometry it
-    // is shaped for (`note_visible_dump_shape`): `Some(size)` for a bounded
-    // geometry, and ONE `None` key for every geometry `dump_vt_mirror` cannot
-    // bound (wider, narrower, shorter, not yet reported), since each would
-    // build the same full ring dump. A dump is copied only for a LATER client
-    // that shares its key; the last client with a key takes it by move, so an
-    // unshared dump (a lone producer, or a geometry no one else has) is never
-    // copied.
-    type DumpKey = Option<(u16, u16)>;
-    // Each client's key in client order; `None` for a client without a
+    // Clients that would get the same dump share it (`MirrorDump::is_dump_for`):
+    // one per bounded geometry, and ONE full ring dump for every geometry
+    // `dump_vt_mirror` cannot bound (wider, narrower, shorter, not yet
+    // reported). A dump is copied only for a LATER client it also serves; the
+    // last such client takes it by move, so an unshared dump (a lone
+    // producer, or a geometry no one else has) is never copied.
+    //
+    // Each client's geometry in client order; `None` for a client without a
     // producer, and for a paced one: its `visible_shaped_for` must keep
     // naming the dump it actually holds.
-    let keys: Vec<Option<DumpKey>> = clients
-        .iter_mut()
-        .map(|c| c.takes_per_read_frames().then(|| c.note_visible_dump_shape(term)))
+    let geometries: Vec<Option<(u16, u16)>> = clients
+        .iter()
+        .map(|c| c.takes_per_read_frames().then_some((c.rows, c.cols)))
         .collect();
-    let mut held: Vec<(DumpKey, Vec<u8>)> = Vec::new();
-    let mut dump_for = |i: usize, c: &ClientConn| -> Vec<u8> {
-        let key = keys[i].expect("only a producer client takes a dump");
-        let dump = match held.iter().position(|(k, _)| *k == key) {
-            Some(at) => held.swap_remove(at).1,
+    let mut held: Vec<MirrorDump> = Vec::new();
+    let mut dump_for = |i: usize, c: &mut ClientConn| -> Vec<u8> {
+        let dump = match held.iter().position(|d| d.is_dump_for(c.rows, c.cols)) {
+            Some(at) => held.swap_remove(at),
             None => term.dump_vt_mirror(c.rows, c.cols),
         };
-        if keys[i + 1..].contains(&Some(key)) {
-            held.push((key, dump.clone()));
+        let shared_later = geometries[i + 1..]
+            .iter()
+            .flatten()
+            .any(|&(rows, cols)| dump.is_dump_for(rows, cols));
+        if shared_later {
+            held.push(dump.clone());
         }
-        dump
+        c.note_visible_dump_shape(dump)
     };
     for (i, c) in clients.iter_mut().enumerate() {
         // posh#239: a connection whose Init is not yet applied is sent
@@ -5436,7 +5434,7 @@ mod tests {
         broadcast_to(&mut c, &term);
         c.write_buf.clear();
         handle_frame_ack(&mut c, &ipc::encode_frame_ack(1, ipc::FRAME_ACK_RESYNC), &term, 0);
-        assert_eq!(only_full_body(&c.write_buf), term.dump_vt_mirror(rows, cols));
+        assert_eq!(only_full_body(&c.write_buf), term.dump_vt_mirror(rows, cols).into_bytes());
         assert_client_renders_as_full_replay(&c, &term);
     }
 
@@ -5451,7 +5449,7 @@ mod tests {
         // Open: the overlay screen, as a Full keyframe for this client's size.
         c.write_buf.clear();
         broadcast_source_swap(std::slice::from_mut(&mut c), &overlay, &overlay.dump_vt_flat());
-        assert_eq!(only_full_body(&c.write_buf), overlay.dump_vt_mirror(rows, cols));
+        assert_eq!(only_full_body(&c.write_buf), overlay.dump_vt_mirror(rows, cols).into_bytes());
         // Close: back to the full-ring session, bounded, rendering unchanged.
         c.write_buf.clear();
         broadcast_source_swap(std::slice::from_mut(&mut c), &session, &session.dump_vt_flat());
@@ -5581,7 +5579,7 @@ mod tests {
         let (mut c, _pc) = lossy_conn(rows, cols, &morph);
         attach(&mut c);
         assert!(resize_like_the_loop(&mut c, &term, rows + 16, cols));
-        assert_eq!(only_full_body(&c.write_buf), term.dump_vt_mirror(rows + 16, cols));
+        assert_eq!(only_full_body(&c.write_buf), term.dump_vt_mirror(rows + 16, cols).into_bytes());
     }
 
     /// The regeometry keyframe must be DURABLE for a morph client: a late ack
@@ -5620,7 +5618,7 @@ mod tests {
         // A late ack for pre-resize frame 2: the next frame must still be a Full.
         c.apply_frame_ack(&ipc::encode_frame_ack(2, 0));
         match output(&mut c, &mut term, b"b") {
-            FrameBody::Full(dump) => assert_eq!(dump, term.dump_vt_mirror(rows + 16, cols)),
+            FrameBody::Full(dump) => assert_eq!(dump, term.dump_vt_mirror(rows + 16, cols).into_bytes()),
             other => panic!("a pre-resize ack restored a morph base: got {other:?}"),
         }
         // Once the client acks a new-geometry frame, morphing resumes.
@@ -5726,7 +5724,10 @@ mod tests {
             c.maybe_enable_frames();
             broadcast_output(std::slice::from_mut(&mut c), &term, b"raw");
             if framed {
-                assert_eq!(only_full_body(&c.write_buf), term.dump_vt_mirror(term.rows(), term.cols()));
+                assert_eq!(
+                    only_full_body(&c.write_buf),
+                    term.dump_vt_mirror(term.rows(), term.cols()).into_bytes()
+                );
             } else {
                 let mut fb = FrameBuffer::new();
                 fb.feed(&c.write_buf);
@@ -6564,7 +6565,7 @@ mod tests {
             let last = c.producer.as_ref().unwrap().last_visible_num();
             c.apply_frame_ack(&ipc::encode_frame_ack(last, 0));
             run.last_screen_delivered = Some(
-                c.producer.as_ref().unwrap().acked_dump() == Some(&term.dump_vt_mirror(rows, cols)[..]),
+                c.producer.as_ref().unwrap().acked_dump() == Some(term.dump_vt_mirror(rows, cols).bytes()),
             );
         }
         run.rows_scrolled = term.primary_scrollback_total() - c.sb_floor;
@@ -7538,7 +7539,7 @@ mod tests {
         c.apply_frame_ack(&ipc::encode_frame_ack(num, 0));
         assert_eq!(
             c.producer.as_ref().unwrap().acked_dump(),
-            Some(&term.dump_vt_mirror(rows, cols)[..]),
+            Some(term.dump_vt_mirror(rows, cols).bytes()),
             "the latest screen, not an intermediate one"
         );
         assert_eq!(c.pacing.as_ref().map(|p| (p.dirty, p.last_fresh)), Some((false, Some(40))));

@@ -2166,7 +2166,7 @@ pub(crate) fn server_loop(
                 // so the next frame is rebuilt for the new geometry even if
                 // the shell is silent.
                 producer.advance_visible(
-                    stats.time_dump_vt(|| src.dump_vt_mirror(client_size.0, client_size.1)),
+                    stats.time_dump_vt(|| src.dump_vt_mirror(client_size.0, client_size.1).into_bytes()),
                     Snapshot::from_term(src),
                     src.is_alt_screen(),
                     (src.rows(), src.cols()),

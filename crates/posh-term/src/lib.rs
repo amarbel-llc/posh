@@ -56,12 +56,16 @@
 //! contract: the frame-dump geometry rule is a bridge that session geometry
 //! on the frame (RFC 0012) is expected to change or retire.
 //!
-//! - `Terminal::dump_vt_mirror(&self, mirror_rows: u16, mirror_cols: u16) -> Vec<u8>`
+//! - `Terminal::dump_vt_mirror(&self, mirror_rows: u16, mirror_cols: u16) -> MirrorDump`
 //!   (`dump_vt` for a ring-less mirror of that size, with the scrollback
 //!   replay bounded where that is proven equivalent; the frame-transport
 //!   serializer, posh#225)
-//! - `Terminal::dump_vt_mirror_is_bounded(&self, mirror_rows: u16, mirror_cols: u16) -> bool`
-//!   (whether `dump_vt_mirror` bounds the replay for that geometry)
+//! - `MirrorDump::bytes(&self) -> &[u8]` / `MirrorDump::into_bytes(self) -> Vec<u8>` /
+//!   `MirrorDump::shaped_for(&self) -> Option<(u16, u16)>` (the geometry the
+//!   replay is bounded for, `None` for the full fallback) /
+//!   `MirrorDump::is_dump_for(&self, mirror_rows: u16, mirror_cols: u16) -> bool`
+//!   (whether `dump_vt_mirror` for that geometry returns this same dump; the
+//!   shape rides with the bytes so the two cannot disagree, posh#235)
 #![forbid(unsafe_code)]
 
 /// Placeholder cell size in pixels, shared by the XTWINOPS reports, kitty
@@ -88,7 +92,7 @@ mod terminal;
 mod wcwidth;
 
 pub use cell::{Cell, Color, Style, UnderlineStyle};
-pub use dump::{sgr_params, DRAWABLE_STATE_RESET};
+pub use dump::{sgr_params, MirrorDump, DRAWABLE_STATE_RESET};
 pub use graphics::{AnimationState, Frame, Image, ImageFormat, Placement};
 pub use kitty_keys::{encode_key, KeyCode, KeyEvent, KeyEventType, KittyFlags, Modifiers};
 pub use modes::{MouseMode, MouseProtocol};

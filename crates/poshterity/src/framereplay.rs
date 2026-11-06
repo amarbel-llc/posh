@@ -63,7 +63,7 @@ impl ServerSide {
     fn baseline_now(&self, num: u64, lane: &ClientLane) -> Baseline {
         Baseline {
             num,
-            dump: self.term.dump_vt_mirror(lane.client.rows, lane.client.cols),
+            dump: self.term.dump_vt_mirror(lane.client.rows, lane.client.cols).into_bytes(),
             snapshot: Snapshot::from_term(&self.term),
             alt_screen: self.term.is_alt_screen(),
             rows: self.term.rows(),

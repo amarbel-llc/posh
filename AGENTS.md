@@ -137,9 +137,8 @@ full story lives; this list is not a tour of the system.
   visible change; `mid_escape()` marks escape-sequence boundaries. Callers
   may ADD to `lib.rs`, never remove or change a signature. The one
   exception is the "Provisional API (not frozen)" section at the end of
-  that list: an entry there (today `dump_vt_mirror` and
-  `dump_vt_mirror_is_bounded`) may still change signature until it is moved
-  into the frozen list.
+  that list: an entry there (today `dump_vt_mirror` and its `MirrorDump`)
+  may still change signature until it is moved into the frozen list.
 - **Stream parsing (ADR-0003):** multi-byte structures (escape sequences,
   framed records) MUST be reassembled across read boundaries via a byte-fed
   state machine — never assume a `read()` delivers a whole sequence.
