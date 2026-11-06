@@ -131,7 +131,7 @@ No ruling needed, smallest first:
 | 228 + 229 | un-ignore the four `dump_vt` tests (`dump.rs:1608,1633,1707,1756`) on one branch; unblocks #236 option 2 and #233 | M-L |
 | 70 | `POSH_DEBUG_LOG` loopback smoke, modelled on `just debug-agent-e2e` | M |
 | 80 | posht page-per-test alt-screen walk; unblocks #79 | M |
-| 212 | the drain half: nothing ever assigns `MuxConnState::Draining` (`mux.rs:469,479`) | M |
+| 212 | **now NEEDS-DECISION.** The drain half cannot be separated from the variant lifecycle. Stamps carry no order, so a daemon receiving a mismatched hello cannot tell a newer client from an older one, and draining on any mismatch lets an old binary drain the current daemon. Where refused same-stamp clients go (the variant, or a per-invocation fallback) is the lifecycle ruling. A `Draining` HelloAck would be a new client-visible RFC 0011 §6 state | — |
 | 210 | `CAP_SESSION_SIZE` per ADR 0006 / RFC 0012; first step `ClientConn::mirror_geometry()` | L |
 
 Ready, but need a small ruling first:
