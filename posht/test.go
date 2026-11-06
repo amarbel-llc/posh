@@ -70,7 +70,7 @@ func registry() []*Test {
 		},
 		{
 			ID: "truecolor", Title: "24-bit truecolor",
-			Desc: "RGB gradients, semicolon and colon SGR forms (38;2 / 38:2::)",
+			Desc: "RGB gradients, semicolon and colon SGR forms (48;2 / 48:2::)",
 			New:  func() TestModel { return staticModel{render: truecolorView} },
 		},
 		{

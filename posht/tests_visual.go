@@ -20,7 +20,14 @@ const reset = "\x1b[0m"
 
 func colors16View(int) string {
 	var b strings.Builder
-	b.WriteString("  Every cell below must be a distinct, solid color.\n\n")
+	b.WriteString("  Every cell below must be a distinct, solid color.\n\n" +
+		"  Reference: each row is 0 black, 1 red, 2 green, 3 yellow,\n" +
+		"  4 blue, 5 magenta, 6 cyan, 7 white, and each bright row is a\n" +
+		"  lighter shade of the same hue as the row above it (bright 0 is\n" +
+		"  a gray, not black). The exact shades are your terminal's\n" +
+		"  theme, so judge only that: a bright row identical to its\n" +
+		"  standard row, or bright text drawn bold instead of lighter,\n" +
+		"  is a fail.\n\n")
 
 	b.WriteString("  fg standard: ")
 	for c := 30; c <= 37; c++ {
@@ -44,7 +51,14 @@ func colors16View(int) string {
 
 func colors256View(int) string {
 	var b strings.Builder
-	b.WriteString("  System colors, a 6x6x6 cube, and a smooth grayscale ramp.\n\n  ")
+	b.WriteString("  System colors, a 6x6x6 cube, and a grayscale ramp.\n\n" +
+		"  Reference: the first row is the 16 colors of the previous\n" +
+		"  test. In the cube, red rises across the six blocks, green\n" +
+		"  down the rows, blue across each block: black top-left, white\n" +
+		"  bottom-right, six even steps per channel. The ramp is 24 even\n" +
+		"  steps from near-black to near-white. These ARE the palette, so\n" +
+		"  visible steps are correct; fewer steps (blocks or ramp cells\n" +
+		"  repeating the 16 system colors) is a fail.\n\n  ")
 	for i := 0; i < 16; i++ {
 		fmt.Fprintf(&b, "\x1b[48;5;%dm  ", i)
 	}
@@ -73,7 +87,12 @@ func truecolorView(width int) string {
 		w = 96
 	}
 	var b strings.Builder
-	b.WriteString("  Each bar must be a perfectly smooth gradient — no banding.\n\n")
+	b.WriteString("  Each bar must be a perfectly smooth gradient — no banding.\n\n" +
+		"  Reference: adjacent cells differ by about 3 of 255 levels, too\n" +
+		"  little to see, so a correct bar shows no steps at all. About 6\n" +
+		"  visible bands (gray: up to ~30) means truecolor was squeezed to\n" +
+		"  the 256-color palette; 2 or 3 (black, then dark and bright red)\n" +
+		"  means 16 colors. Either is a fail, as is a gap or off-hue cell.\n\n")
 	bar := func(label string, rgb func(v int) (int, int, int), colon bool) {
 		fmt.Fprintf(&b, "  %-18s", label)
 		for i := 0; i < w; i++ {
@@ -86,10 +105,10 @@ func truecolorView(width int) string {
 		}
 		b.WriteString(reset + "\n")
 	}
-	bar("red (38;2 form)", func(v int) (int, int, int) { return v, 0, 0 }, false)
+	bar("red (48;2 form)", func(v int) (int, int, int) { return v, 0, 0 }, false)
 	bar("green", func(v int) (int, int, int) { return 0, v, 0 }, false)
 	bar("blue", func(v int) (int, int, int) { return 0, 0, v }, false)
-	bar("gray (38:2:: form)", func(v int) (int, int, int) { return v, v, v }, true)
+	bar("gray (48:2:: form)", func(v int) (int, int, int) { return v, v, v }, true)
 	b.WriteString("\n  The gray bar uses the colon SGR form — it must look as\n" +
 		"  smooth as the others, not fall back to odd colors.\n")
 	return b.String()
