@@ -20,11 +20,11 @@
         ]
       },
       "locked": {
-        "lastModified": 1795369394,
-        "narHash": "sha256-WD4uZwgOfVZjlISDoDWicPGEaXjr1+t1q7y4rUxtVzY=",
-        "rev": "0eb2361546f17d010cef6ff6525bec3eb70227af",
+        "lastModified": 1795785384,
+        "narHash": "sha256-Xb+Bih2I4cVL3yS3iYrecKoIUejQsh+Gh2H9nXXQmWM=",
+        "rev": "7324fb76f9591503185d33b113790f858c9d5da2",
         "type": "tarball",
-        "url": "https://code.linenisgreat.com/bats/archive/0eb2361546f17d010cef6ff6525bec3eb70227af.tar.gz"
+        "url": "https://code.linenisgreat.com/bats/archive/7324fb76f9591503185d33b113790f858c9d5da2.tar.gz"
       },
       "original": {
         "type": "tarball",
@@ -77,11 +77,11 @@
         ]
       },
       "locked": {
-        "lastModified": 1795267479,
-        "narHash": "sha256-EbZNt7xJbHUnfm5Jb12/1VVrUt6OmDHJKdiwRM+90r8=",
-        "rev": "6954e4e5db31ec1478747dcd95b2268b6219a255",
+        "lastModified": 1795783589,
+        "narHash": "sha256-hglxA1RES7bNK0QeCMOrWOQzhdc1j5dfO8uqpXSaVoo=",
+        "rev": "ef7204222121c4f570bcf63d233af761f427b87e",
         "type": "tarball",
-        "url": "https://code.linenisgreat.com/conformist/archive/6954e4e5db31ec1478747dcd95b2268b6219a255.tar.gz"
+        "url": "https://code.linenisgreat.com/conformist/archive/ef7204222121c4f570bcf63d233af761f427b87e.tar.gz"
       },
       "original": {
         "type": "tarball",
@@ -105,11 +105,11 @@
         ]
       },
       "locked": {
-        "lastModified": 1795369891,
-        "narHash": "sha256-JP7kiVtqsA51ysnALesppknAVPhsjVr4ftJMypiWXsg=",
-        "rev": "c1f9e13708c0580c4b2f222a80de9256eba42483",
+        "lastModified": 1795785775,
+        "narHash": "sha256-h2y7Ao7WA7vyQ1/NkSwKNFdHtJjvEdrV5hbXes/RnCk=",
+        "rev": "de4aba31857b9a1a5245dcdfbb8e84287e74cd75",
         "type": "tarball",
-        "url": "https://code.linenisgreat.com/crap/archive/c1f9e13708c0580c4b2f222a80de9256eba42483.tar.gz"
+        "url": "https://code.linenisgreat.com/crap/archive/de4aba31857b9a1a5245dcdfbb8e84287e74cd75.tar.gz"
       },
       "original": {
         "type": "tarball",
@@ -185,11 +185,11 @@
         "treefmt-nix": "treefmt-nix"
       },
       "locked": {
-        "lastModified": 1795266874,
-        "narHash": "sha256-X7TA6k44rszWpMBm/McrovHDEOq+qR/wVpgWg2WDcr8=",
-        "rev": "0feead630641575e04de9dcc277d3bf27fc53205",
+        "lastModified": 1795783033,
+        "narHash": "sha256-PIGHIGOtuOmRtpQ9sUHr7vGO8egmqC6leqdqHuaoqXs=",
+        "rev": "134750a8be076cfdbb260cd61922de1c048f9d6c",
         "type": "tarball",
-        "url": "https://code.linenisgreat.com/igloo/archive/0feead630641575e04de9dcc277d3bf27fc53205.tar.gz"
+        "url": "https://code.linenisgreat.com/igloo/archive/134750a8be076cfdbb260cd61922de1c048f9d6c.tar.gz"
       },
       "original": {
         "type": "tarball",
@@ -229,11 +229,11 @@
         ]
       },
       "locked": {
-        "lastModified": 1795368709,
-        "narHash": "sha256-KI2rP5NUkSTupRBhzgNzNsJmh16a/0SwlLGNVxpYIYo=",
-        "rev": "acf3149a189d5254e041d0f8390170fcdd2208fe",
+        "lastModified": 1795784792,
+        "narHash": "sha256-+i2tTQLjxaHrzhxemOpc2AjzzkH4KIZ25SuGrky0nM4=",
+        "rev": "91d681abfd50d27b5aa488a1fa66f138a301e242",
         "type": "tarball",
-        "url": "https://code.linenisgreat.com/purse-first/archive/acf3149a189d5254e041d0f8390170fcdd2208fe.tar.gz"
+        "url": "https://code.linenisgreat.com/purse-first/archive/91d681abfd50d27b5aa488a1fa66f138a301e242.tar.gz"
       },
       "original": {
         "type": "tarball",
@@ -274,11 +274,11 @@
         ]
       },
       "locked": {
-        "lastModified": 1795173499,
-        "narHash": "sha256-J8IYl3oEdctyvBgWr+/L01MY5Xm0TU4WXwZDccN5jjk=",
+        "lastModified": 1795615686,
+        "narHash": "sha256-/C0FK2Fwq0aWE/GADYyYbAIdQeGfYBbWMin3tfks1NA=",
         "owner": "numtide",
         "repo": "treefmt-nix",
-        "rev": "a0a97e31a897a3537eea5c49df4f8adaa83b3b37",
+        "rev": "b7b56d3c8833016c650ca542b1230e6130299741",
         "type": "github"
       },
       "original": {
