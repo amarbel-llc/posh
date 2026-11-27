@@ -261,6 +261,19 @@ fn parse_color_spec(spec: &str) -> Option<(u8, u8, u8)> {
         return Some((out[0], out[1], out[2]));
     }
     if let Some(hex) = spec.strip_prefix('#') {
+        // SECURITY: the same char-boundary panic class fixed in
+        // `dcs::hex_decode`/`percent_decode` reaches here too — `hex.len()`
+        // is a byte length, so `&hex[i..i+1]`/`&hex[i..i+2]` below panics
+        // whenever a multi-byte UTF-8 character (e.g. "é1", 3 bytes but 2
+        // chars) makes the slice end land mid-character. Reachable from OSC
+        // 4 (palette set) and OSC 10/11/12 (dynamic color set) with
+        // caller-controlled text. Hex digits are always ASCII, so rejecting
+        // non-ASCII input up front — before any byte-range slicing — is
+        // what keeps every subsequent index a char boundary, same as the
+        // other two fixes in this change.
+        if !hex.is_ascii() {
+            return None;
+        }
         let digit = |i: usize| u8::from_str_radix(&hex[i..i + 1], 16).ok();
         return match hex.len() {
             3 => Some((digit(0)? * 17, digit(1)? * 17, digit(2)? * 17)),
@@ -287,14 +300,23 @@ fn parse_file_uri(value: &str) -> String {
     percent_decode(path)
 }
 
+/// SECURITY: the previous implementation sliced `&s[i + 1..i + 3]` by raw
+/// byte range, which panics (crashing the session daemon reading a hostile
+/// OSC 7 `pwd` report) whenever a multi-byte UTF-8 character right after `%`
+/// is 3+ bytes long, e.g. "%€" (`€` = 3 bytes), because `i + 3` then lands
+/// mid-character. Matches
+/// `util::decode_session_name`'s existing byte-indexed idiom, which never
+/// slices `&str` by raw index and so cannot hit a char-boundary panic.
 fn percent_decode(s: &str) -> String {
     let bytes = s.as_bytes();
     let mut out = Vec::with_capacity(bytes.len());
     let mut i = 0;
     while i < bytes.len() {
         if bytes[i] == b'%' && i + 2 < bytes.len() {
-            if let Ok(v) = u8::from_str_radix(&s[i + 1..i + 3], 16) {
-                out.push(v);
+            let hi = (bytes[i + 1] as char).to_digit(16);
+            let lo = (bytes[i + 2] as char).to_digit(16);
+            if let (Some(hi), Some(lo)) = (hi, lo) {
+                out.push((hi * 16 + lo) as u8);
                 i += 3;
                 continue;
             }
@@ -320,10 +342,55 @@ mod tests {
         assert_eq!(parse_color_spec("rgb:ff/00"), None);
     }
 
+    /// Before the fix: `&hex[i..i+1]`/`&hex[i..i+2]` panicked whenever a
+    /// multi-byte UTF-8 character made `hex.len()` (a BYTE length) pick the
+    /// 3- or 6-digit branch while actual char boundaries don't line up, e.g.
+    /// "é1" is 3 bytes (picks the 3-digit branch) but its first char is 2
+    /// bytes, so `&hex[0..1]` lands mid-character.
+    #[test]
+    fn color_spec_hash_form_rejects_non_ascii_instead_of_panicking() {
+        assert_eq!(parse_color_spec("#é1"), None);
+        assert_eq!(parse_color_spec("#1é234"), None);
+    }
+
+    /// Drives the panic through the real escape-sequence paths that reach
+    /// `parse_color_spec` with caller-controlled text: OSC 4 (palette set)
+    /// and OSC 10/11/12 (dynamic color set).
+    #[test]
+    fn osc4_and_osc1x_set_with_non_ascii_hash_color_does_not_panic() {
+        let mut t = crate::terminal::Terminal::new(24, 80);
+        t.process("\x1b]4;5;#é1\x07".as_bytes());
+        t.process("\x1b]10;#é1\x07".as_bytes());
+        t.process("\x1b]11;#1é234\x07".as_bytes());
+        t.process("\x1b]12;#1é234\x07".as_bytes());
+        // No panic is the assertion; the malformed spec is simply ignored.
+    }
+
     #[test]
     fn file_uri_parsing() {
         assert_eq!(parse_file_uri("file://host/home/user"), "/home/user");
         assert_eq!(parse_file_uri("file:///tmp/a%20b"), "/tmp/a b");
         assert_eq!(parse_file_uri("/plain/path"), "/plain/path");
+    }
+
+    /// Before the fix: `&s[i + 1..i + 3]` panicked whenever a 3+ byte UTF-8
+    /// character directly follows `%`, because the end index then lands
+    /// mid-character. Drives it through the real OSC 7 path (not just the
+    /// helper) so this also proves a hostile `pwd` report can't crash the
+    /// session daemon's `Terminal::process` call.
+    #[test]
+    fn osc7_pwd_with_percent_before_a_three_byte_char_does_not_panic() {
+        let mut t = crate::terminal::Terminal::new(24, 80);
+        // "%€": '€' is 3 bytes in UTF-8, so `i + 3` used to land inside it.
+        t.process("\x1b]7;file:///%€\x07".as_bytes());
+        // Not valid hex after '%': passed through literally, not decoded.
+        assert_eq!(t.pwd(), "/%€");
+    }
+
+    #[test]
+    fn percent_decode_handles_multibyte_neighbours_without_panicking() {
+        assert_eq!(percent_decode("%€"), "%€");
+        assert_eq!(percent_decode("a%20b"), "a b");
+        assert_eq!(percent_decode("%2541"), "%41"); // one level of decoding
     }
 }
